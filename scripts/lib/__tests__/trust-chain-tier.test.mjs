@@ -25,13 +25,18 @@ describe('TRUST_CHAIN_TIER_FILES — the in-scope set (#2875)', () => {
       'scripts/lib/delivery-policy.mjs',
       'scripts/lib/disposition-judge.mjs',
       'scripts/lib/disposition-land-seam.mjs',
+      'scripts/lib/drain-red-team-evidence.mjs',
       'scripts/lib/drain-workflow-edit-hold.mjs',
       'scripts/lib/gate-config.mjs',
+      'scripts/lib/lane-git-hardening.mjs',
+      'scripts/lib/red-team-check-run.mjs',
       'scripts/lib/review-core.mjs',
       'scripts/lib/review-escalation.mjs',
       'scripts/lib/review-independence.mjs',
       'scripts/lib/review-policy.mjs',
       'scripts/lib/review-runner-core.mjs',
+      'scripts/lib/seat-ac-rubric.mjs',
+      'scripts/lib/seat-assessment.mjs',
     ]);
   });
 

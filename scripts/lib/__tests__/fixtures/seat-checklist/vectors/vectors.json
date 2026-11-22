@@ -1,0 +1,5388 @@
+{
+ "module": "core/verdict",
+ "release": "0.1.2",
+ "bases": {
+  "asm": "file:live-7236.assessment.json",
+  "ver": "file:live-7236.verdict.json",
+  "rub": "file:merge-path.rubric.json",
+  "acr": "file:pr-7236.ac.rubric.json",
+  "sec": {
+   "lens": "security",
+   "rubric": {
+    "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+    "digest": {
+     "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+    }
+   },
+   "required": "all",
+   "na": {
+    "allowed": true,
+    "neverNa": [
+     "MP1",
+     "MP2",
+     "MP5",
+     "MP7"
+    ],
+    "max": 6
+   },
+   "evidence": {
+    "minKind": "quoted-citation"
+   },
+   "citeScope": "tree",
+   "check": {
+    "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+    "digest": {
+     "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+    }
+   }
+  },
+  "cor": {
+   "lens": "correctness",
+   "rubricFrom": "subject",
+   "required": "all",
+   "na": {
+    "allowed": false
+   },
+   "evidence": {
+    "minKind": "resolved-citation"
+   }
+  },
+  "pc": "file:policy.company.json",
+  "pr": "file:policy.repo.json",
+  "v011": {
+   "_type": "https://in-toto.io/Statement/v1",
+   "subject": [
+    {
+     "name": "pr-7247",
+     "digest": {
+      "gitCommit": "5498d9b96ed2832e04a90c4ac2ab71f869b2bfdc"
+     }
+    }
+   ],
+   "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+   "predicate": {
+    "verdict": "pass",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/policy/merge-gate/v0.1",
+     "digest": {
+      "gitTree": "9f00fad98badc1330e637a0a015d704113498420"
+     }
+    },
+    "evaluatedAt": "2026-11-21T11:00:00-05:00",
+    "evaluator": "https://everstandards.dev/core/fixtures/harness",
+    "examined": {
+     "count": 12,
+     "unit": "files"
+    },
+    "evidence": [
+     {
+      "kind": "unit-tests",
+      "uri": "out/junit.xml",
+      "digest": {
+       "sha256": "a172cedcae47474b615c54d510a5d84a8dea3032e958587430b413538be3f333"
+      },
+      "provenanceTier": "probe"
+     }
+    ],
+    "careLevel": {
+     "level": "high",
+     "scorer": "https://everstandards.dev/core/fixtures/care-scorer",
+     "score": 0.82,
+     "basis": [
+      "blast-radius",
+      "size"
+     ]
+    }
+   }
+  }
+ },
+ "vectors": [
+  {
+   "id": "CORE-VRD-V301",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "valid",
+   "input": {
+    "$base": "asm"
+   },
+   "note": "LIVE: security seat on merged WE PR #7236 at head 6a28dc63"
+  },
+  {
+   "id": "CORE-VRD-V302",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1"
+    }
+   },
+   "note": "wrong predicate type"
+  },
+  {
+   "id": "CORE-VRD-V303",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "rubric": null
+     }
+    }
+   },
+   "note": "no rubric ref"
+  },
+  {
+   "id": "CORE-VRD-V304",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "rubric": {
+       "digest": null
+      }
+     }
+    }
+   },
+   "note": "rubric by URI only (no digest)"
+  },
+  {
+   "id": "CORE-VRD-V305",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "revisionId": "6a28dc63"
+     }
+    }
+   },
+   "note": "abbreviated head"
+  },
+  {
+   "id": "CORE-VRD-V306",
+   "requirement": [
+    "CORE-VRD-039",
+    "CORE-VRD-050"
+   ],
+   "class": "adversarial",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "verdict": "pass"
+     }
+    }
+   },
+   "note": "an assessment carrying its own verdict"
+  },
+  {
+   "id": "CORE-VRD-V307",
+   "requirement": [
+    "CORE-VRD-039"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "seat": {
+       "evaluator": null
+      }
+     }
+    }
+   },
+   "note": "seat with no evaluator"
+  },
+  {
+   "id": "CORE-VRD-V308",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/outcome": "accept"
+    }
+   },
+   "note": "outcome outside pass|fail|n/a"
+  },
+  {
+   "id": "CORE-VRD-V309",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/7/reason": null
+    }
+   },
+   "note": "n/a without a reason"
+  },
+  {
+   "id": "CORE-VRD-V310",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/outcome": "fail"
+    }
+   },
+   "note": "fail without a reason"
+  },
+  {
+   "id": "CORE-VRD-V311",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:itemsUnique",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm"
+    }
+   }
+  },
+  {
+   "id": "CORE-VRD-V312",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemsUnique",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/-": {
+       "itemId": "MP1",
+       "outcome": "pass",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-check-run.mjs",
+          "startLine": 167,
+          "snippet": "Number(run.app?.id) === Number(appId)"
+         },
+         "note": "only check runs from the configured App id count",
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        },
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 110,
+          "snippet": "if (app.ok !== true) return false;"
+         },
+         "note": "no App id resolved: no proof",
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        },
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+          "startLine": 39,
+          "snippet": "foreign app"
+         },
+         "note": "negative test",
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        }
+       ]
+      }
+     }
+    }
+   },
+   "note": "MP1 answered twice"
+  },
+  {
+   "id": "CORE-VRD-V313",
+   "requirement": [
+    "CORE-VRD-040"
+   ],
+   "class": "adversarial",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/outcome": "unknown"
+    }
+   },
+   "note": "unknown is never written: it is the absence of an answer"
+  },
+  {
+   "id": "CORE-VRD-V314",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/evidence": []
+    }
+   },
+   "note": "pass with no evidence"
+  },
+  {
+   "id": "CORE-VRD-V315",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/evidence/0/location/startLine": 0
+    }
+   },
+   "note": "line 0"
+  },
+  {
+   "id": "CORE-VRD-V316",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/evidence/0/location": null
+    }
+   },
+   "note": "evidence with neither location nor ref"
+  },
+  {
+   "id": "CORE-VRD-V317",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/0/evidence/0/location/uri": "/etc/passwd"
+    }
+   },
+   "note": "absolute path, not repo-relative"
+  },
+  {
+   "id": "CORE-VRD-V318",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm"
+    },
+    "minKind": "quoted-citation"
+   }
+  },
+  {
+   "id": "CORE-VRD-V319",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/revisionId": "9505cacb7c710ed17125fcc6cb3669e8ddca6c8c"
+     }
+    },
+    "minKind": "quoted-citation"
+   },
+   "note": "evidence from another head"
+  },
+  {
+   "id": "CORE-VRD-V320",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence": [
+       {
+        "kind": "assertion",
+        "location": {
+         "uri": "scripts/lib/red-team-check-run.mjs",
+         "startLine": 167
+        }
+       }
+      ]
+     }
+    },
+    "minKind": "quoted-citation"
+   },
+   "note": "assertion below the minimum kind"
+  },
+  {
+   "id": "CORE-VRD-V321",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence": [
+       {
+        "kind": "quoted-citation",
+        "location": {
+         "uri": "scripts/lib/red-team-check-run.mjs",
+         "startLine": 167
+        }
+       }
+      ]
+     }
+    },
+    "minKind": "quoted-citation"
+   },
+   "note": "claims quoted-citation without a snippet"
+  },
+  {
+   "id": "CORE-VRD-V322",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence": [
+       {
+        "kind": "verified-test",
+        "location": {
+         "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+         "startLine": 39
+        }
+       }
+      ]
+     }
+    },
+    "minKind": "quoted-citation"
+   },
+   "note": "verified-test with no test-result reference"
+  },
+  {
+   "id": "CORE-VRD-V323",
+   "requirement": [
+    "CORE-VRD-041"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence": [
+       {
+        "kind": "x-org-kind",
+        "location": {
+         "uri": "a.mjs",
+         "startLine": 1
+        }
+       }
+      ]
+     }
+    },
+    "minKind": "quoted-citation"
+   },
+   "note": "an unranked org kind does not meet a ladder minimum"
+  },
+  {
+   "id": "CORE-VRD-V324",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "LIVE: 10 pass + 4 allowed n/a derive pass"
+  },
+  {
+   "id": "CORE-VRD-V325",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/13": null
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "MP14 unanswered: unknown, not pass"
+  },
+  {
+   "id": "CORE-VRD-V326",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/13": null
+     }
+    },
+    "verdict": "unknown",
+    "reason": "missing"
+   },
+   "note": "an unanswered item fails closed as unknown/missing"
+  },
+  {
+   "id": "CORE-VRD-V327",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/2/outcome": "fail",
+      "/predicate/items/2/reason": "sorted by created_at",
+      "/predicate/items/13": null
+     }
+    },
+    "verdict": "fail"
+   },
+   "note": "a known fail wins over a missing item"
+  },
+  {
+   "id": "CORE-VRD-V328",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/outcome": "n/a",
+      "/predicate/items/0/reason": "no app involved"
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "n/a on a neverNa item (MP1)"
+  },
+  {
+   "id": "CORE-VRD-V329",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "na": {
+       "max": 3
+      }
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "4 n/a over a cap of 3: inconclusive"
+  },
+  {
+   "id": "CORE-VRD-V330",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "na": {
+       "allowed": false
+      }
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "n/a not allowed by the seat"
+  },
+  {
+   "id": "CORE-VRD-V331",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "na": {
+       "neverNa": [],
+       "max": null
+      }
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "MP1",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "Number(run.app?.id) === Number(appId)"
+          },
+          "note": "only check runs from the configured App id count",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 110,
+           "snippet": "if (app.ok !== true) return false;"
+          },
+          "note": "no App id resolved: no proof",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "note": "negative test",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP2",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "note": "a missing or unreadable check is not clear",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 24,
+           "snippet": "without a clear check fact pending stays (unknown means pending)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP3",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 175,
+           "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+          },
+          "note": "ordered by run id, not timestamps",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 172,
+           "endLine": 173,
+           "snippet": "ordering unreadable"
+          },
+          "note": "invalid or shared ids refuse",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 45,
+           "snippet": "a newer failing run beats an older success (ordered by id)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP4",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 185,
+           "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 187,
+           "snippet": "skipped: 'pending-gone'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 192,
+           "snippet": "vanished-clear race"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP5",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+          },
+          "note": "the check is bound to the exact head",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 167,
+           "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "re-verified before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 180,
+           "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "last guard right before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 36,
+           "snippet": "a check on an older head does not settle the current head"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP6",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 168,
+           "snippet": "run.external_id === identity"
+          },
+          "note": "a run counts only for this PR identity; another PR's success cannot clear it",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "other PR"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP7",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 182,
+           "snippet": "skipped: 'labels-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 172,
+           "snippet": "skipped: 'thread-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 48,
+           "snippet": "unreadable check runs, unset app id or a throw refuse"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP8",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP9",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 194,
+           "endLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "note": "a crash before the single set call leaves pending (closed); the swap is one call",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP10",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 103,
+           "snippet": "createFreshGh(runGhSync, env)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP11",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 95,
+           "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP12",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 184,
+           "snippet": "skipped: 'blocked-label'"
+          },
+          "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 204,
+           "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP13",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 160,
+           "snippet": "const planWith = (threadNow, clear) =>"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP14",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 115,
+           "snippet": "readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact"
+          },
+          "note": "reuses the merge gate's own evaluators; no new marker or retry machinery",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       }
+      ]
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "every item n/a derives unknown by default"
+  },
+  {
+   "id": "CORE-VRD-V332",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "na": {
+       "neverNa": [],
+       "max": null
+      },
+      "allNa": "pass"
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "MP1",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "Number(run.app?.id) === Number(appId)"
+          },
+          "note": "only check runs from the configured App id count",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 110,
+           "snippet": "if (app.ok !== true) return false;"
+          },
+          "note": "no App id resolved: no proof",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "note": "negative test",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP2",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "note": "a missing or unreadable check is not clear",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 24,
+           "snippet": "without a clear check fact pending stays (unknown means pending)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP3",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 175,
+           "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+          },
+          "note": "ordered by run id, not timestamps",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 172,
+           "endLine": 173,
+           "snippet": "ordering unreadable"
+          },
+          "note": "invalid or shared ids refuse",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 45,
+           "snippet": "a newer failing run beats an older success (ordered by id)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP4",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 185,
+           "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 187,
+           "snippet": "skipped: 'pending-gone'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 192,
+           "snippet": "vanished-clear race"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP5",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+          },
+          "note": "the check is bound to the exact head",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 167,
+           "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "re-verified before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 180,
+           "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "last guard right before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 36,
+           "snippet": "a check on an older head does not settle the current head"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP6",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 168,
+           "snippet": "run.external_id === identity"
+          },
+          "note": "a run counts only for this PR identity; another PR's success cannot clear it",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "other PR"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP7",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 182,
+           "snippet": "skipped: 'labels-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 172,
+           "snippet": "skipped: 'thread-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 48,
+           "snippet": "unreadable check runs, unset app id or a throw refuse"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP8",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP9",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 194,
+           "endLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "note": "a crash before the single set call leaves pending (closed); the swap is one call",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP10",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 103,
+           "snippet": "createFreshGh(runGhSync, env)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP11",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 95,
+           "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP12",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 184,
+           "snippet": "skipped: 'blocked-label'"
+          },
+          "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 204,
+           "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       },
+       {
+        "itemId": "MP13",
+        "outcome": "n/a",
+        "reason": "surface untouched",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 160,
+           "snippet": "const planWith = (threadNow, clear) =>"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP14",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 115,
+           "snippet": "readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact"
+          },
+          "note": "reuses the merge gate's own evaluators; no new marker or retry machinery",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "surface untouched"
+       }
+      ]
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "an org that sets allNa: pass (a loosening; see 048)"
+  },
+  {
+   "id": "CORE-VRD-V333",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/0/text": "Producer identity. Anything goes."
+     }
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "rubric text changed after the review: digest mismatch, stale"
+  },
+  {
+   "id": "CORE-VRD-V334",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "required": [
+       "MP1",
+       "MP99"
+      ]
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "required names an item the rubric lacks"
+  },
+  {
+   "id": "CORE-VRD-V335",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "patch": {
+      "predicate": {
+       "seat": {
+        "lens": "style"
+       }
+      }
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "answers from another lens"
+  },
+  {
+   "id": "CORE-VRD-V336",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "cor"
+    },
+    "rubric": "file:pr-7236.ac.rubric.json",
+    "assessment": "file:pr-7236.ac.assessment.json",
+    "verdict": "pass"
+   },
+   "note": "LIVE: correctness seat answers the PR AC (rubricFrom subject)"
+  },
+  {
+   "id": "CORE-VRD-V337",
+   "requirement": [
+    "CORE-VRD-042"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "cor"
+    },
+    "rubric": {
+     "rubricType": "https://everstandards.dev/core/rubric/v0.1",
+     "id": "https://everstandards.dev/core/fixtures/rubrics/pr-7236-ac",
+     "version": "prep-1",
+     "appliesTo": {
+      "gitCommit": "9505cacb7c710ed17125fcc6cb3669e8ddca6c8c"
+     },
+     "items": [
+      {
+       "id": "AC1",
+       "text": "Tier 1 test \"red-team label settles from the head's check\" (fails on main)."
+      },
+      {
+       "id": "AC2",
+       "text": "Negatives: older head, failure/in-progress/foreign app, unreadable check, open hold, recorded break."
+      }
+     ]
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "correctness",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/pr-7236-ac",
+       "digest": {
+        "sha256": "5a6f6a9457b02ae56e7c235476009f1d6c43cd40763161266fb30bcc5cf8b70d"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "AC1",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 21,
+           "snippet": "a clear check on this head swaps pending to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "AC2",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       }
+      ]
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "AC rubric of another subject, correctly pinned: appliesTo does not match"
+  },
+  {
+   "id": "CORE-VRD-V338",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "$base": "ver"
+    },
+    "outcome": "pass"
+   },
+   "note": "LIVE: verdict cites the assessment and matches the derived pass"
+  },
+  {
+   "id": "CORE-VRD-V339",
+   "requirement": [
+    "CORE-VRD-043",
+    "CORE-VRD-051"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "review-comment",
+        "digest": {
+         "sha256": "3b1f5c8d0a7e9f2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b"
+        },
+        "provenanceTier": "asserted"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "LIVE blank accept: a pass with no cited assessment is a failed seat"
+  },
+  {
+   "id": "CORE-VRD-V340",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "review-comment",
+        "digest": {
+         "sha256": "3b1f5c8d0a7e9f2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b"
+        },
+        "provenanceTier": "asserted"
+       }
+      ]
+     }
+    },
+    "outcome": "not-pass"
+   },
+   "note": "the blank accept does not pass"
+  },
+  {
+   "id": "CORE-VRD-V341",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": []
+     }
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "https://everstandards.dev/core/assessment/v0.1",
+        "digest": {
+         "sha256": "be9f1a0328d641a8e200ccebbfc2f1c4b0d7506a52e3e82cd5110b832cca5187"
+        },
+        "provenanceTier": "replayed"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "cites an assessment with zero items"
+  },
+  {
+   "id": "CORE-VRD-V342",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "MP1",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "Number(run.app?.id) === Number(appId)"
+          },
+          "note": "only check runs from the configured App id count",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 110,
+           "snippet": "if (app.ok !== true) return false;"
+          },
+          "note": "no App id resolved: no proof",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "note": "negative test",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP2",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "note": "a missing or unreadable check is not clear",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 24,
+           "snippet": "without a clear check fact pending stays (unknown means pending)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP3",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 175,
+           "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+          },
+          "note": "ordered by run id, not timestamps",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 172,
+           "endLine": 173,
+           "snippet": "ordering unreadable"
+          },
+          "note": "invalid or shared ids refuse",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 45,
+           "snippet": "a newer failing run beats an older success (ordered by id)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP4",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 185,
+           "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 187,
+           "snippet": "skipped: 'pending-gone'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 192,
+           "snippet": "vanished-clear race"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP5",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+          },
+          "note": "the check is bound to the exact head",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 167,
+           "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "re-verified before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 180,
+           "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "last guard right before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 36,
+           "snippet": "a check on an older head does not settle the current head"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP6",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 168,
+           "snippet": "run.external_id === identity"
+          },
+          "note": "a run counts only for this PR identity; another PR's success cannot clear it",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "other PR"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP7",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 182,
+           "snippet": "skipped: 'labels-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 172,
+           "snippet": "skipped: 'thread-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 48,
+           "snippet": "unreadable check runs, unset app id or a throw refuse"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP8",
+        "outcome": "n/a",
+        "reason": "The change persists no dedupe or state marker: its only write is the label set call itself, so there is nothing to order after the effect.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP9",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 194,
+           "endLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "note": "a crash before the single set call leaves pending (closed); the swap is one call",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP10",
+        "outcome": "n/a",
+        "reason": "The diff adds no token choice: reads go through the existing gh runner with only the read-memo variable removed, and the write goes through the existing label provider.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 103,
+           "snippet": "createFreshGh(runGhSync, env)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP11",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 95,
+           "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "The diff adds no git subprocess, fetch or credential helper; its only environment change removes the read-memo variable from the settle reads."
+       },
+       {
+        "itemId": "MP12",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 184,
+           "snippet": "skipped: 'blocked-label'"
+          },
+          "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 204,
+           "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP13",
+        "outcome": "n/a",
+        "reason": "The change starts no child or uid process; the settle runs synchronously in the caller and writes nothing after it returns.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 160,
+           "snippet": "const planWith = (threadNow, clear) =>"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       }
+      ]
+     }
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "https://everstandards.dev/core/assessment/v0.1",
+        "digest": {
+         "sha256": "a203e798562eb4a4ad6c11b9897587bff9bed5fd726a40e3066424c1df959447"
+        },
+        "provenanceTier": "replayed"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "claims pass over an assessment missing MP14"
+  },
+  {
+   "id": "CORE-VRD-V343",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "$base": "ver",
+     "patch": {
+      "predicate": {
+       "examined": {
+        "count": 3,
+        "unit": "files"
+       }
+      }
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "examined is not the answered criteria count"
+  },
+  {
+   "id": "CORE-VRD-V344",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "$base": "ver",
+     "set": {
+      "/predicate/evidence/0/digest": {
+       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "cites a different assessment digest"
+  },
+  {
+   "id": "CORE-VRD-V345",
+   "requirement": [
+    "CORE-VRD-043"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "MP1",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "Number(run.app?.id) === Number(appId)"
+          },
+          "note": "only check runs from the configured App id count",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 110,
+           "snippet": "if (app.ok !== true) return false;"
+          },
+          "note": "no App id resolved: no proof",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "note": "negative test",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP2",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "note": "a missing or unreadable check is not clear",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 24,
+           "snippet": "without a clear check fact pending stays (unknown means pending)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP3",
+        "outcome": "fail",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 175,
+           "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+          },
+          "note": "ordered by run id, not timestamps",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 172,
+           "endLine": 173,
+           "snippet": "ordering unreadable"
+          },
+          "note": "invalid or shared ids refuse",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 45,
+           "snippet": "a newer failing run beats an older success (ordered by id)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "ordered by created_at"
+       },
+       {
+        "itemId": "MP4",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 185,
+           "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 187,
+           "snippet": "skipped: 'pending-gone'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 192,
+           "snippet": "vanished-clear race"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP5",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+          },
+          "note": "the check is bound to the exact head",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 167,
+           "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "re-verified before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 180,
+           "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "last guard right before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 36,
+           "snippet": "a check on an older head does not settle the current head"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP6",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 168,
+           "snippet": "run.external_id === identity"
+          },
+          "note": "a run counts only for this PR identity; another PR's success cannot clear it",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "other PR"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP7",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 182,
+           "snippet": "skipped: 'labels-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 172,
+           "snippet": "skipped: 'thread-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 48,
+           "snippet": "unreadable check runs, unset app id or a throw refuse"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP8",
+        "outcome": "n/a",
+        "reason": "The change persists no dedupe or state marker: its only write is the label set call itself, so there is nothing to order after the effect.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP9",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 194,
+           "endLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "note": "a crash before the single set call leaves pending (closed); the swap is one call",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP10",
+        "outcome": "n/a",
+        "reason": "The diff adds no token choice: reads go through the existing gh runner with only the read-memo variable removed, and the write goes through the existing label provider.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 103,
+           "snippet": "createFreshGh(runGhSync, env)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP11",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 95,
+           "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "The diff adds no git subprocess, fetch or credential helper; its only environment change removes the read-memo variable from the settle reads."
+       },
+       {
+        "itemId": "MP12",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 184,
+           "snippet": "skipped: 'blocked-label'"
+          },
+          "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 204,
+           "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP13",
+        "outcome": "n/a",
+        "reason": "The change starts no child or uid process; the settle runs synchronously in the caller and writes nothing after it returns.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 160,
+           "snippet": "const planWith = (threadNow, clear) =>"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP14",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 115,
+           "snippet": "readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact"
+          },
+          "note": "reuses the merge gate's own evaluators; no new marker or retry machinery",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       }
+      ]
+     }
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "https://everstandards.dev/core/assessment/v0.1",
+        "digest": {
+         "sha256": "abc5a4535f34d7a141333774fe06f2a4a06533e1e7f5663806acee8278e59ec1"
+        },
+        "provenanceTier": "replayed"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "a pass verdict over a failing item"
+  },
+  {
+   "id": "CORE-VRD-V346",
+   "requirement": [
+    "CORE-VRD-044"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "rubric": {
+       "digest": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+       }
+      }
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "pass"
+   },
+   "note": "the policy pins another rubric version"
+  },
+  {
+   "id": "CORE-VRD-V347",
+   "requirement": [
+    "CORE-VRD-044"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "patch": {
+      "rubric": {
+       "digest": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+       }
+      }
+     }
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": "unknown",
+    "reason": "stale"
+   },
+   "note": "a rubric mismatch is unknown/stale"
+  },
+  {
+   "id": "CORE-VRD-V348",
+   "requirement": [
+    "CORE-VRD-044"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/subject/0/digest/gitCommit": "9505cacb7c710ed17125fcc6cb3669e8ddca6c8c"
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "assessment revision is not the subject head"
+  },
+  {
+   "id": "CORE-VRD-V349",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm"
+    },
+    "tree": "file:live-7236.tree.json",
+    "citeScope": "tree"
+   },
+   "note": "LIVE: every cited line exists at head 6a28dc63 and every snippet matches"
+  },
+  {
+   "id": "CORE-VRD-V350",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/location/startLine": 9999
+     }
+    },
+    "tree": "file:live-7236.tree.json"
+   },
+   "note": "a line past the end of the file"
+  },
+  {
+   "id": "CORE-VRD-V351",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/location/snippet": "Number(run.app?.id) !== Number(appId)"
+     }
+    },
+    "tree": "file:live-7236.tree.json"
+   },
+   "note": "a doctored quote"
+  },
+  {
+   "id": "CORE-VRD-V352",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/location/uri": "scripts/lib/not-there.mjs"
+     }
+    },
+    "tree": "file:live-7236.tree.json"
+   },
+   "note": "a file not in the head tree"
+  },
+  {
+   "id": "CORE-VRD-V353",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/location/startLine": 166
+     }
+    },
+    "tree": "file:live-7236.tree.json"
+   },
+   "note": "the right quote at the wrong line"
+  },
+  {
+   "id": "CORE-VRD-V354",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm"
+    },
+    "tree": "file:live-7236.tree.json",
+    "diffPaths": "file:live-7236.diff.json",
+    "citeScope": "diff"
+   },
+   "note": "every cited file is in the net diff of #7236"
+  },
+  {
+   "id": "CORE-VRD-V355",
+   "requirement": [
+    "CORE-VRD-045"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:citations",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/0/evidence/0/location/uri": "scripts/lib/red-team-status-labels.mjs",
+      "/predicate/items/0/evidence/0/location/startLine": 110,
+      "/predicate/items/0/evidence/0/location/snippet": "app.ok"
+     }
+    },
+    "tree": "file:live-7236.tree.json",
+    "diffPaths": [
+     "scripts/lib/red-team-check-run.mjs"
+    ],
+    "citeScope": "diff"
+   },
+   "note": "diff scope: a cited file outside the diff"
+  },
+  {
+   "id": "CORE-VRD-V356",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "valid",
+   "input": {
+    "$base": "rub"
+   },
+   "note": "the merge-path checklist, MP1..MP14"
+  },
+  {
+   "id": "CORE-VRD-V357",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "invalid",
+   "input": {
+    "$base": "rub",
+    "patch": {
+     "items": []
+    }
+   },
+   "note": "empty rubric"
+  },
+  {
+   "id": "CORE-VRD-V358",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "invalid",
+   "input": {
+    "$base": "rub",
+    "set": {
+     "/items/0/text": ""
+    }
+   },
+   "note": "an item with no text"
+  },
+  {
+   "id": "CORE-VRD-V359",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "invalid",
+   "input": {
+    "$base": "rub",
+    "set": {
+     "/items/0/id": "MP 1"
+    }
+   },
+   "note": "an id with a space"
+  },
+  {
+   "id": "CORE-VRD-V360",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:rubricWellFormed",
+   "expect": "valid",
+   "input": {
+    "rubric": {
+     "$base": "rub"
+    }
+   }
+  },
+  {
+   "id": "CORE-VRD-V361",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:rubricWellFormed",
+   "expect": "invalid",
+   "input": {
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/1/id": "MP1"
+     }
+    }
+   },
+   "note": "two items share an id"
+  },
+  {
+   "id": "CORE-VRD-V362",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubricItem",
+   "expect": "invalid",
+   "input": {
+    "id": "ASVS-1.2.5",
+    "text": "x",
+    "sourceId": ""
+   },
+   "note": "an empty source id"
+  },
+  {
+   "id": "CORE-VRD-V363",
+   "requirement": [
+    "CORE-VRD-046"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/rubricItem",
+   "expect": "valid",
+   "input": {
+    "id": "ASVS-1.2.5",
+    "text": "Verify that the application protects against OS command injection.",
+    "sourceId": "v5.0.0-1.2.5",
+    "source": "https://asvs.owasp.org/"
+   },
+   "note": "an imported ASVS requirement keeps its version-qualified id"
+  },
+  {
+   "id": "CORE-VRD-V364",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/rubricPolicy",
+   "expect": "valid",
+   "input": {
+    "$base": "pc"
+   },
+   "note": "company policy: security rubric + correctness from subject AC"
+  },
+  {
+   "id": "CORE-VRD-V365",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubricPolicy",
+   "expect": "invalid",
+   "input": {
+    "$base": "pc",
+    "set": {
+     "/seats/1/rubric": {
+      "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+      "digest": {
+       "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+      }
+     }
+    }
+   },
+   "note": "a seat with both rubric and rubricFrom"
+  },
+  {
+   "id": "CORE-VRD-V366",
+   "requirement": [
+    "CORE-VRD-047",
+    "CORE-VRD-051"
+   ],
+   "class": "adversarial",
+   "kind": "schema",
+   "target": "#/$defs/rubricPolicy",
+   "expect": "invalid",
+   "input": {
+    "$base": "pc",
+    "set": {
+     "/seats/0/exemptProviders": [
+      "human"
+     ]
+    }
+   },
+   "note": "a provider exemption field does not exist"
+  },
+  {
+   "id": "CORE-VRD-V367",
+   "requirement": [
+    "CORE-VRD-047",
+    "CORE-VRD-051"
+   ],
+   "class": "adversarial",
+   "kind": "schema",
+   "target": "#/$defs/seatPolicy",
+   "expect": "invalid",
+   "input": {
+    "lens": "security",
+    "rubric": {
+     "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+     "digest": {
+      "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+     }
+    },
+    "provider": "codex"
+   },
+   "note": "a seat policy keyed by provider"
+  },
+  {
+   "id": "CORE-VRD-V368",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:policyResolves",
+   "expect": "valid",
+   "input": {
+    "policy": {
+     "$base": "pc"
+    },
+    "rubrics": [
+     {
+      "$base": "rub"
+     }
+    ]
+   }
+  },
+  {
+   "id": "CORE-VRD-V369",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:policyResolves",
+   "expect": "invalid",
+   "input": {
+    "policy": {
+     "$base": "pc",
+     "set": {
+      "/seats/0/required": [
+       "MP1",
+       "MP15"
+      ]
+     }
+    },
+    "rubrics": [
+     {
+      "$base": "rub"
+     }
+    ]
+   },
+   "note": "required MP15 is not in the rubric"
+  },
+  {
+   "id": "CORE-VRD-V370",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:policyResolves",
+   "expect": "invalid",
+   "input": {
+    "policy": {
+     "$base": "pc",
+     "set": {
+      "/seats/0/rubric/digest/sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+     }
+    },
+    "rubrics": [
+     {
+      "$base": "rub"
+     }
+    ]
+   },
+   "note": "rubric ref does not resolve"
+  },
+  {
+   "id": "CORE-VRD-V371",
+   "requirement": [
+    "CORE-VRD-047"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:policyResolves",
+   "expect": "invalid",
+   "input": {
+    "policy": {
+     "$base": "pc",
+     "set": {
+      "/seats/1/lens": "security",
+      "/seats/1/rubricFrom": null,
+      "/seats/1/rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      }
+     }
+    },
+    "rubrics": [
+     {
+      "$base": "rub"
+     }
+    ]
+   },
+   "note": "a lens configured twice"
+  },
+  {
+   "id": "CORE-VRD-V372",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "valid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "$base": "pr"
+     }
+    ]
+   },
+   "note": "repo tightens: adds MP9 to neverNa, lowers the cap to 5"
+  },
+  {
+   "id": "CORE-VRD-V373",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1"
+         ],
+         "max": 8
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "note": "repo loosens neverNa and the cap with no confirmation"
+  },
+  {
+   "id": "CORE-VRD-V374",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "valid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1"
+         ],
+         "max": 8
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        }
+       }
+      ],
+      "confirmations": [
+       {
+        "lens": "security",
+        "setting": "na.neverNa",
+        "level": "company",
+        "owner": "https://everstandards.dev/core/fixtures/owners/company-security",
+        "policyDigest": {
+         "sha256": "21e0b3e6f4f8934f164c93b66d40733ad88e3fd78398e75d8494de2d2aca49e3"
+        }
+       },
+       {
+        "lens": "security",
+        "setting": "na.max",
+        "level": "company",
+        "owner": "https://everstandards.dev/core/fixtures/owners/company-security",
+        "policyDigest": {
+         "sha256": "21e0b3e6f4f8934f164c93b66d40733ad88e3fd78398e75d8494de2d2aca49e3"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "note": "the same loosening, confirmed by the company owner for this exact policy"
+  },
+  {
+   "id": "CORE-VRD-V375",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1"
+         ],
+         "max": 14
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        }
+       }
+      ],
+      "confirmations": [
+       {
+        "lens": "security",
+        "setting": "na.neverNa",
+        "level": "company",
+        "owner": "https://everstandards.dev/core/fixtures/owners/company-security",
+        "policyDigest": {
+         "sha256": "21e0b3e6f4f8934f164c93b66d40733ad88e3fd78398e75d8494de2d2aca49e3"
+        }
+       },
+       {
+        "lens": "security",
+        "setting": "na.max",
+        "level": "company",
+        "owner": "https://everstandards.dev/core/fixtures/owners/company-security",
+        "policyDigest": {
+         "sha256": "21e0b3e6f4f8934f164c93b66d40733ad88e3fd78398e75d8494de2d2aca49e3"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "note": "a confirmation reused after the policy changed again"
+  },
+  {
+   "id": "CORE-VRD-V376",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1",
+          "MP2",
+          "MP5",
+          "MP7",
+          "MP9"
+         ],
+         "max": 5
+        },
+        "evidence": {
+         "minKind": "assertion"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "note": "repo lowers the evidence minimum"
+  },
+  {
+   "id": "CORE-VRD-V377",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1",
+          "MP2",
+          "MP5",
+          "MP7",
+          "MP9"
+         ],
+         "max": 5
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        },
+        "allNa": "pass"
+       }
+      ]
+     }
+    ]
+   },
+   "note": "repo turns all-n/a into pass"
+  },
+  {
+   "id": "CORE-VRD-V378",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "$base": "pc"
+     },
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/repo",
+      "level": "repo",
+      "parent": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "seats": [
+       {
+        "lens": "security",
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1",
+          "MP2",
+          "MP5",
+          "MP7",
+          "MP9"
+         ],
+         "max": 5
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        },
+        "rubricFrom": "subject"
+       }
+      ]
+     }
+    ]
+   },
+   "note": "repo swaps the security checklist for author-written AC"
+  },
+  {
+   "id": "CORE-VRD-V379",
+   "requirement": [
+    "CORE-VRD-048"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:cascade",
+   "expect": "invalid",
+   "input": {
+    "chain": [
+     {
+      "policyType": "https://everstandards.dev/core/rubric-policy/v0.1",
+      "id": "https://everstandards.dev/core/fixtures/policies/company",
+      "level": "team",
+      "seats": [
+       {
+        "lens": "security",
+        "rubric": {
+         "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+         "digest": {
+          "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+         }
+        },
+        "required": "all",
+        "na": {
+         "allowed": true,
+         "neverNa": [
+          "MP1",
+          "MP2",
+          "MP5",
+          "MP7"
+         ],
+         "max": 6
+        },
+        "evidence": {
+         "minKind": "quoted-citation"
+        },
+        "citeScope": "tree",
+        "check": {
+         "uri": "https://everstandards.dev/core/fixtures/checks/seat-gate",
+         "digest": {
+          "sha256": "1f0e3dad99908345f7439f8ffabdffc4c4c5a5e6c0d6f0b8a3b9a3f0c4d6e7f8"
+         }
+        }
+       },
+       {
+        "lens": "correctness",
+        "rubricFrom": "subject",
+        "required": "all",
+        "na": {
+         "allowed": false
+        },
+        "evidence": {
+         "minKind": "resolved-citation"
+        }
+       }
+      ]
+     },
+     {
+      "$base": "pr"
+     },
+     {
+      "$base": "pc"
+     }
+    ]
+   },
+   "note": "levels out of cascade order"
+  },
+  {
+   "id": "CORE-VRD-V380",
+   "requirement": [
+    "CORE-VRD-049"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:itemMapping",
+   "expect": "valid",
+   "input": {
+    "rows": [
+     {
+      "target": "sarif",
+      "outcome": "pass",
+      "to": "pass"
+     },
+     {
+      "target": "sarif",
+      "outcome": "fail",
+      "to": "fail"
+     },
+     {
+      "target": "sarif",
+      "outcome": "n/a",
+      "to": "notApplicable"
+     },
+     {
+      "target": "sarif",
+      "outcome": "unknown",
+      "to": "open"
+     },
+     {
+      "target": "oscal",
+      "outcome": "pass",
+      "to": {
+       "state": "satisfied",
+       "reason": "pass"
+      }
+     },
+     {
+      "target": "oscal",
+      "outcome": "fail",
+      "to": {
+       "state": "not-satisfied",
+       "reason": "fail"
+      }
+     },
+     {
+      "target": "oscal",
+      "outcome": "n/a",
+      "to": null,
+      "loss": true
+     },
+     {
+      "target": "oscal",
+      "outcome": "unknown",
+      "to": null,
+      "loss": true
+     },
+     {
+      "target": "testResult",
+      "outcome": "pass",
+      "to": "passedTests"
+     },
+     {
+      "target": "testResult",
+      "outcome": "fail",
+      "to": "failedTests"
+     },
+     {
+      "target": "testResult",
+      "outcome": "n/a",
+      "to": null,
+      "loss": true
+     },
+     {
+      "target": "testResult",
+      "outcome": "unknown",
+      "to": null,
+      "loss": true
+     }
+    ]
+   },
+   "note": "SARIF 2.1.0 result.kind, OSCAL 1.2.3 objective status, in-toto test-result v0.1"
+  },
+  {
+   "id": "CORE-VRD-V381",
+   "requirement": [
+    "CORE-VRD-049"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemMapping",
+   "expect": "invalid",
+   "input": {
+    "rows": [
+     {
+      "target": "sarif",
+      "outcome": "unknown",
+      "to": "pass"
+     }
+    ]
+   },
+   "note": "unknown exported as a SARIF pass"
+  },
+  {
+   "id": "CORE-VRD-V382",
+   "requirement": [
+    "CORE-VRD-049"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemMapping",
+   "expect": "invalid",
+   "input": {
+    "rows": [
+     {
+      "target": "oscal",
+      "outcome": "n/a",
+      "to": {
+       "state": "satisfied",
+       "reason": "other"
+      }
+     }
+    ]
+   },
+   "note": "n/a exported as OSCAL satisfied"
+  },
+  {
+   "id": "CORE-VRD-V383",
+   "requirement": [
+    "CORE-VRD-049"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemMapping",
+   "expect": "invalid",
+   "input": {
+    "rows": [
+     {
+      "target": "testResult",
+      "outcome": "n/a",
+      "to": "passedTests"
+     }
+    ]
+   },
+   "note": "n/a listed as a passed test"
+  },
+  {
+   "id": "CORE-VRD-V384",
+   "requirement": [
+    "CORE-VRD-049"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemMapping",
+   "expect": "invalid",
+   "input": {
+    "rows": [
+     {
+      "target": "oscal",
+      "outcome": "unknown",
+      "to": null
+     }
+    ]
+   },
+   "note": "a dropped value not reported as loss"
+  },
+  {
+   "id": "CORE-VRD-V385",
+   "requirement": [
+    "CORE-VRD-050"
+   ],
+   "class": "adversarial",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "patch": {
+     "predicate": {
+      "disposition": "blocker"
+     }
+    }
+   },
+   "note": "an assessment is not a finding"
+  },
+  {
+   "id": "CORE-VRD-V386",
+   "requirement": [
+    "CORE-VRD-050"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": null,
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "review-comment",
+        "digest": {
+         "sha256": "3b1f5c8d0a7e9f2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b"
+        },
+        "provenanceTier": "asserted"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "no assessment and no findings: the empty set never passes a rubric seat"
+  },
+  {
+   "id": "CORE-VRD-V387",
+   "requirement": [
+    "CORE-VRD-051"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "$base": "asm"
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://github.com/a-human-reviewer",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "review-comment",
+        "digest": {
+         "sha256": "3b1f5c8d0a7e9f2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d1e3f5a7b9c1d3e5f7a9b"
+        },
+        "provenanceTier": "asserted"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "a human blank accept fails the same way"
+  },
+  {
+   "id": "CORE-VRD-V388",
+   "requirement": [
+    "CORE-VRD-051"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+     "predicate": {
+      "seat": {
+       "lens": "security",
+       "evaluator": "https://github.com/a-human-reviewer"
+      },
+      "rubric": {
+       "uri": "https://everstandards.dev/core/fixtures/rubrics/merge-path",
+       "digest": {
+        "sha256": "6d3cab5df71b9438dfef2eb4f65a2f7b5e0d25a37eff206223f207e8a7994953"
+       }
+      },
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+      "repositoryUri": "https://github.com/web-everything/web-everything",
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "items": [
+       {
+        "itemId": "MP1",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "Number(run.app?.id) === Number(appId)"
+          },
+          "note": "only check runs from the configured App id count",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 110,
+           "snippet": "if (app.ok !== true) return false;"
+          },
+          "note": "no App id resolved: no proof",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "foreign app"
+          },
+          "note": "negative test",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP2",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "note": "a missing or unreadable check is not clear",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 24,
+           "snippet": "without a clear check fact pending stays (unknown means pending)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP3",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 175,
+           "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+          },
+          "note": "ordered by run id, not timestamps",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 172,
+           "endLine": 173,
+           "snippet": "ordering unreadable"
+          },
+          "note": "invalid or shared ids refuse",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 45,
+           "snippet": "a newer failing run beats an older success (ordered by id)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP4",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 185,
+           "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 187,
+           "snippet": "skipped: 'pending-gone'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 192,
+           "snippet": "vanished-clear race"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP5",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 167,
+           "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+          },
+          "note": "the check is bound to the exact head",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 167,
+           "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "re-verified before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 180,
+           "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+          },
+          "note": "last guard right before the write",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 36,
+           "snippet": "a check on an older head does not settle the current head"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP6",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-check-run.mjs",
+           "startLine": 168,
+           "snippet": "run.external_id === identity"
+          },
+          "note": "a run counts only for this PR identity; another PR's success cannot clear it",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 39,
+           "snippet": "other PR"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP7",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 116,
+           "snippet": "} catch { return false; }"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 182,
+           "snippet": "skipped: 'labels-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 172,
+           "snippet": "skipped: 'thread-unreadable'"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 48,
+           "snippet": "unreadable check runs, unset app id or a throw refuse"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP8",
+        "outcome": "n/a",
+        "reason": "The change persists no dedupe or state marker: its only write is the label set call itself, so there is nothing to order after the effect.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP9",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 194,
+           "endLine": 195,
+           "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+          },
+          "note": "a crash before the single set call leaves pending (closed); the swap is one call",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP10",
+        "outcome": "n/a",
+        "reason": "The diff adds no token choice: reads go through the existing gh runner with only the read-memo variable removed, and the write goes through the existing label provider.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 103,
+           "snippet": "createFreshGh(runGhSync, env)"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP11",
+        "outcome": "n/a",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 95,
+           "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ],
+        "reason": "The diff adds no git subprocess, fetch or credential helper; its only environment change removes the read-memo variable from the settle reads."
+       },
+       {
+        "itemId": "MP12",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 184,
+           "snippet": "skipped: 'blocked-label'"
+          },
+          "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         },
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+           "startLine": 204,
+           "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP13",
+        "outcome": "n/a",
+        "reason": "The change starts no child or uid process; the settle runs synchronously in the caller and writes nothing after it returns.",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 160,
+           "snippet": "const planWith = (threadNow, clear) =>"
+          },
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       },
+       {
+        "itemId": "MP14",
+        "outcome": "pass",
+        "evidence": [
+         {
+          "kind": "quoted-citation",
+          "location": {
+           "uri": "scripts/lib/red-team-status-labels.mjs",
+           "startLine": 115,
+           "snippet": "readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact"
+          },
+          "note": "reuses the merge gate's own evaluators; no new marker or retry machinery",
+          "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+         }
+        ]
+       }
+      ]
+     }
+    },
+    "verdict": {
+     "_type": "https://in-toto.io/Statement/v1",
+     "subject": [
+      {
+       "name": "web-everything/web-everything#7236",
+       "uri": "https://github.com/web-everything/web-everything/pull/7236",
+       "digest": {
+        "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      }
+     ],
+     "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+     "predicate": {
+      "verdict": "pass",
+      "policy": {
+       "uri": "https://everstandards.dev/core/fixtures/policies/company",
+       "digest": {
+        "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+       }
+      },
+      "evaluatedAt": "2026-11-21T22:30:00-05:00",
+      "evaluator": "https://github.com/a-human-reviewer",
+      "examined": {
+       "count": 14,
+       "unit": "criteria"
+      },
+      "evidence": [
+       {
+        "kind": "https://everstandards.dev/core/assessment/v0.1",
+        "digest": {
+         "sha256": "d1ee97fcd0fdb76a73a329151424cb90f4c3d6649409ac65b4458c676c9dc78d"
+        },
+        "provenanceTier": "replayed"
+       }
+      ]
+     }
+    },
+    "outcome": "pass"
+   },
+   "note": "a human seat that answers every item passes the same way"
+  },
+  {
+   "id": "CORE-VRD-V389",
+   "requirement": [
+    "CORE-VRD-053"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "valid",
+   "input": {
+    "seat": {
+     "lens": "style"
+    },
+    "rubric": null,
+    "assessment": null,
+    "verdict": {
+     "$base": "v011"
+    },
+    "outcome": "pass"
+   },
+   "note": "a lens with no rubric policy keeps the 0.1.1 gate (non-deciding or not yet configured)"
+  },
+  {
+   "id": "CORE-VRD-V390",
+   "requirement": [
+    "CORE-VRD-053"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:seatGate",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec"
+    },
+    "rubric": {
+     "$base": "rub"
+    },
+    "assessment": null,
+    "verdict": {
+     "$base": "v011"
+    },
+    "outcome": "pass"
+   },
+   "note": "a 0.1.1 bare pass cannot satisfy a seat that has a rubric"
+  },
+  {
+   "id": "CORE-VRD-V391",
+   "requirement": [
+    "CORE-VRD-053"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/verdict",
+   "expect": "valid",
+   "input": {
+    "$base": "ver"
+   },
+   "note": "the 0.1.2 seat verdict is a plain verdict record (no new verdict fields)"
+  },
+  {
+   "id": "CORE-VRD-V392",
+   "requirement": [
+    "CORE-VRD-053"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/verdict",
+   "expect": "valid",
+   "input": {
+    "$base": "v011"
+   },
+   "note": "a 0.1.1 record stays valid"
+  },
+  {
+   "id": "CORE-VRD-V393",
+   "requirement": [
+    "CORE-VRD-053",
+    "CORE-VRD-043"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/verdict",
+   "expect": "invalid",
+   "input": {
+    "$base": "ver",
+    "patch": {
+     "predicate": {
+      "evidence": []
+     }
+    }
+   },
+   "note": "a seat pass citing nothing is not even a valid verdict"
+  },
+  {
+   "id": "CORE-VRD-V394",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "valid",
+   "input": {
+    "$base": "rub",
+    "set": {
+     "/items/7/naWhen": {
+      "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+      "digest": {
+       "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+     }
+    }
+   },
+   "note": "an item declares naWhen as a named check (URI plus digest)"
+  },
+  {
+   "id": "CORE-VRD-V395",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "n/a",
+       "reason": "no state marker is persisted",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 195,
+          "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+         },
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        }
+       ],
+       "naCheck": {
+        "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+        "digest": {
+         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "result": "pass"
+       }
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "n/a with its naWhen check held and a citation"
+  },
+  {
+   "id": "CORE-VRD-V396",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "n/a",
+       "reason": "no state marker is persisted",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 195,
+          "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+         },
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        }
+       ],
+       "naCheck": {
+        "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+        "digest": {
+         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "result": "fail"
+       }
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "n/a whose naWhen check did not hold"
+  },
+  {
+   "id": "CORE-VRD-V397",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/rubric",
+   "expect": "invalid",
+   "input": {
+    "$base": "rub",
+    "set": {
+     "/items/7/naWhen": "diff.paths.every(p => !isMergePath(p))"
+    }
+   },
+   "note": "naWhen as an expression, never allowed (flow D8b)"
+  },
+  {
+   "id": "CORE-VRD-V398",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "n/a",
+       "reason": "no state marker is persisted",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 195,
+          "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+         },
+         "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+        }
+       ],
+       "naCheck": {
+        "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+        "digest": {
+         "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "result": "pass"
+       }
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "the answer names a different check digest than the rubric pins"
+  },
+  {
+   "id": "CORE-VRD-V399",
+   "requirement": [
+    "CORE-VRD-054"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:seatDerive",
+   "expect": "invalid",
+   "input": {
+    "seat": {
+     "$base": "sec",
+     "set": {
+      "/rubric/digest/sha256": "13cd0b37ad2fe36c4500084e558d08d2f08d80e141c2ddca6dc30002ce43cdcd"
+     }
+    },
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    },
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/rubric/digest/sha256": "13cd0b37ad2fe36c4500084e558d08d2f08d80e141c2ddca6dc30002ce43cdcd"
+     }
+    },
+    "verdict": "pass"
+   },
+   "note": "n/a on an item with naWhen but no recorded check: the seat derives unknown, not pass"
+  },
+  {
+   "id": "CORE-VRD-V400",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "positive",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "valid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/7": {
+      "itemId": "MP8",
+      "outcome": "fail",
+      "reason": "a state marker is written before the effect",
+      "evidence": [
+       {
+        "kind": "quoted-citation",
+        "location": {
+         "uri": "scripts/lib/red-team-status-labels.mjs",
+         "startLine": 195,
+         "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+        },
+        "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+       }
+      ]
+     }
+    }
+   },
+   "note": "a fail citing {file, line, head}"
+  },
+  {
+   "id": "CORE-VRD-V401",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "positive",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "valid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "n/a",
+       "reason": "no state marker is persisted",
+       "evidence": []
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub"
+    }
+   },
+   "note": "n/a on an item with no naWhen keeps a reason only"
+  },
+  {
+   "id": "CORE-VRD-V402",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "negative",
+   "kind": "schema",
+   "target": "#/$defs/assessment",
+   "expect": "invalid",
+   "input": {
+    "$base": "asm",
+    "set": {
+     "/predicate/items/7": {
+      "itemId": "MP8",
+      "outcome": "fail",
+      "reason": "a state marker is written before the effect",
+      "evidence": []
+     }
+    }
+   },
+   "note": "a fail with no evidence"
+  },
+  {
+   "id": "CORE-VRD-V403",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "negative",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "fail",
+       "reason": "a state marker is written before the effect",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 195,
+          "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+         }
+        }
+       ]
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "a fail whose citation has no head"
+  },
+  {
+   "id": "CORE-VRD-V404",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "n/a",
+       "reason": "no state marker is persisted",
+       "evidence": [],
+       "naCheck": {
+        "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+        "digest": {
+         "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "result": "pass"
+       }
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "n/a with the check held but no citation"
+  },
+  {
+   "id": "CORE-VRD-V405",
+   "requirement": [
+    "CORE-VRD-055"
+   ],
+   "class": "adversarial",
+   "kind": "rule",
+   "target": "rule:itemEvidence",
+   "expect": "invalid",
+   "input": {
+    "assessment": {
+     "$base": "asm",
+     "set": {
+      "/predicate/items/7": {
+       "itemId": "MP8",
+       "outcome": "fail",
+       "reason": "a state marker is written before the effect",
+       "evidence": [
+        {
+         "kind": "quoted-citation",
+         "location": {
+          "uri": "scripts/lib/red-team-status-labels.mjs",
+          "startLine": 195,
+          "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+         },
+         "revisionId": "0123456789abcdef0123456789abcdef01234567"
+        }
+       ]
+      }
+     }
+    },
+    "minKind": "quoted-citation",
+    "rubric": {
+     "$base": "rub",
+     "set": {
+      "/items/7/naWhen": {
+       "uri": "https://everstandards.dev/core/fixtures/checks/diff-touches-no-merge-path",
+       "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+       }
+      }
+     }
+    }
+   },
+   "note": "a fail citing an old head, not the reviewed one"
+  }
+ ]
+}
