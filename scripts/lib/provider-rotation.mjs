@@ -3,6 +3,8 @@ import { routingArmSupported } from './dispatch-routing-catalog.mjs';
 
 const families = ['openai', 'google', 'anthropic'];
 const keyLenses = ['correctness', 'security', 'red-team'];
+export const isKeyLens = (lens, policy) => keyLenses.includes(lens) ||
+  (Array.isArray(policy?.keyLenses) && policy.keyLenses.includes(lens));
 const requiredStrongShapes = ['security', 'merge-path'];
 const allowedLenses = ['correctness', 'security', 'red-team', 'style', 'simplicity', 'performance',
   'accessibility', 'architecture', 'testing', 'maintainability', 'standards'];
@@ -104,7 +106,7 @@ export function drawArm({ kind, subject, policy, capacity, exclude = [], builder
   const kindLens = kind === 'red-team' ? kind : kind?.startsWith('review-') && kind !== 'review-lens' ? kind.slice(7) : undefined;
   if (kindLens && lens !== undefined && lens !== kindLens) return refuse('kind-lens-mismatch');
   lens ??= kindLens;
-  if (lens !== undefined && !allowedLenses.includes(lens)) return refuse('unknown-lens');
+  if ((kind === 'review-lens' || lens !== undefined) && !allowedLenses.includes(lens)) return refuse('unknown-lens');
   if (!['normal', ...policy.strongShapes].includes(shape)) return refuse('unknown-shape');
   if (typeof counting !== 'boolean') return refuse('invalid-input');
   result.bucket = bucketFor(kind, subject);
@@ -140,10 +142,12 @@ const seatKind = lens => lens === 'red-team' ? 'red-team' :
 
 function seatCandidates(choices, { lens, counting, builder, builderFamily, policy, capacity, shape }) {
   let eligible = choices.filter(a => a.share > 0);
-  if (keyLenses.includes(lens)) {
-    const derived = builder ? familyFor(builder) : null;
-    if ((builder && !derived) || (derived && builderFamily && derived !== builderFamily)) return { refusal: 'unknown-builder-family' };
-    const family = derived ?? builderFamily;
+  if (isKeyLens(lens, policy)) {
+    // A family assertion alone is not evidence: use the same catalog boundary as composePanel.
+    if (!validArm(builder, policy)) return { refusal: 'unknown-builder-family' };
+    const derived = familyFor(builder);
+    if (builderFamily && derived !== builderFamily) return { refusal: 'unknown-builder-family' };
+    const family = derived;
     if (!families.includes(family)) return { refusal: 'unknown-builder-family' };
     eligible = eligible.filter(a => a.family !== family);
     if (!eligible.length) return { refusal: 'no-cross-vendor-seat' };
@@ -154,7 +158,7 @@ function seatCandidates(choices, { lens, counting, builder, builderFamily, polic
     eligible = eligible.filter(a => !small(a, policy) && strong(a, policy));
     if (!eligible.length) return { refusal: 'no-strong-seat' };
   }
-  if (keyLenses.includes(lens)) eligible = eligible.filter(a => !small(a, policy));
+  if (isKeyLens(lens, policy)) eligible = eligible.filter(a => !small(a, policy));
   return { choices: eligible };
 }
 
@@ -219,8 +223,7 @@ export function routeFor({ legacyRoute, ...args } = {}) {
   if (policy?.mode === 'off') return legacyRoute;
   const shadow = drawArm(args);
   // Do not recursively freeze legacyRoute: it must remain caller-owned and byte-identical.
-  if (!validPolicy(policy) || policy.mode === 'shadow') return Object.freeze({ route: legacyRoute, shadow });
-  if (policy.mode === 'on') return frozen({ route: shadow.arm, shadow: null,
+  if (policy?.mode !== 'on') return Object.freeze({ route: legacyRoute, shadow });
+  return frozen({ route: shadow.arm, shadow: null,
     ...(shadow.refusal ? { refusal: shadow.refusal } : {}) });
-  return frozen({ route: null, shadow: null, refusal: 'invalid-policy' });
 }

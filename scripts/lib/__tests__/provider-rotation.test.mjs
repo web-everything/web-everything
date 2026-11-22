@@ -95,7 +95,7 @@ describe('pure provider rotation', () => {
     for (const lens of ['Security', 'SECURITY', 'unknown'])
       expect(panel({ seats: [{ lens, counting: true }, seats[0]] })).toMatchObject({ ok: false, panel: [], refusal: 'unknown-lens' });
   });
-  it('panel keeps observer counting flags and live security routes enforce panel safeguards', () => {
+  it('panel keeps observer counting flags and live security routes enforce panel safeguards (audit 13)', () => {
     const p = clone(policy); p.carbonPromoted = false;
     const result = panel({ policy: p, seats: [{ lens: 'style', counting: true },
       { lens: 'style', counting: true }, { lens: 'style', counting: false }] });
@@ -113,7 +113,8 @@ describe('pure provider rotation', () => {
       expect(route).not.toBeNull();
       expect(route.provider).not.toBe(builderArm.provider); expect(route.model).not.toMatch(/carbon|luna|flash|hydrogen|haiku/);
     }
-    expect(routeFor({ kind: 'review-security', subject: 'repo#1', policy: { ...p, mode: 'on' }, capacity: { codex: capacity.codex }, builder }).route).toBeNull();
+    expect(routeFor({ kind: 'review-security', subject: 'repo#1', policy: { ...p, mode: 'on' }, capacity: { codex: capacity.codex }, builder }))
+      .toMatchObject({ route: null, refusal: 'no-cross-vendor-seat' });
     expect(draw({ kind: 'review-security', lens: 'style', builder })).toMatchObject({ arm: null, refusal: 'kind-lens-mismatch' });
   });
   it('refuses unknown providers, models and efforts against the declared catalog, including builders', () => {
@@ -346,7 +347,7 @@ describe('pure provider rotation', () => {
       expect(panel({ policy: p, shape, builder: { provider: 'agy-gemini', model: 'gemini-4-carbon', effort: 'high' } }))
         .toMatchObject({ ok: true, refusal: null });
   });
-  it('strong-arm model aliases are supported', () => {
+  it('strong-arm model aliases include promoted Carbon and refuse without carbon-high (audit 12)', () => {
     const p = realPolicy(); p.carbonPromoted = true; p.strongArms = ['sol-high', 'carbon-high', 'sonnet-5-5'];
     const result = panel({ policy: p, shape: 'merge-path', builder });
     expect(result.ok).toBe(true);

@@ -6354,6 +6354,16 @@ The shared routing catalog is IO-free so validating rotation does not import a s
 The shipped policy remains shadow with Carbon unpromoted. Go-live option A is inactive data;
 neither its activation flag nor its allocation thresholds participate in routing.
 
+Rotation and live dispatch use separate model allowlists: a rotation catalog entry does not authorize
+a live adapter identity. Review draws need a known lens; key lenses (policy additions plus the three
+built-ins) need a complete, catalog-valid builder arm. A builder-family assertion never substitutes
+for that arm. The observer preserves dispatch identity (red-team stays key), shape and capacity
+eligibility; any refusal records `crossVendor.ok: false` without changing the actual route.
+Malformed `mode: on` policies refuse; absent policies and off/shadow preserve the legacy route.
+Keep the Carbon-alias test promoted with a cross-vendor builder and assert successful live security
+routes before inspecting their safeguards. Negative controls must fail when `carbon-high` is removed
+or those live routes are replaced by null; the S1.2 audit repair exercised both controls red first.
+
 Merge-path checklist answers (this slice observes seat selection and has no gate authority):
 
 | Checklist | Boundary and negative evidence |

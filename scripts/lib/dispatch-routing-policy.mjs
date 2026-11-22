@@ -1,4 +1,5 @@
 /** Pure validation and resolution for the declarative routing policy. */
+import { CODEX_EFFORT_MAP } from './codex-model-routing.mjs';
 import { ROUTING_MODEL_CATALOG as CATALOG, ROUTING_EFFORTS as EFFORTS } from './dispatch-routing-catalog.mjs';
 import { initialRoutingPolicy as defaults } from './dispatch-routing-policy-source.mjs';
 import { rosterForKey } from './dispatch-routing-providers.mjs';

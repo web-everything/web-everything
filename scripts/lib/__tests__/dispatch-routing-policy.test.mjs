@@ -30,8 +30,9 @@ describe('operation routing policy', () => {
       const policy = copy();
       policy.operations.judge = { provider: 'agy-gemini', model, effort: 'high', fallback: [] };
       expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
-      policy.aliases['agy-gemini']['rotation-only'] = model;
-      expect(() => validateRoutingPolicy(policy)).toThrow(/unknown model/);
+      const aliasPolicy = copy();
+      aliasPolicy.aliases['agy-gemini']['rotation-only'] = model;
+      expect(() => validateRoutingPolicy(aliasPolicy)).toThrow(/unknown model/);
     });
   it('valid high inherited effort overlay retains legacy selection while invalid effort refuses (audit 11)', () => {
     const policy = copy(); policy.operations.fix = { inherit: true }; delete policy.taskTypes.bugfix;
