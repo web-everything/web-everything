@@ -10,6 +10,7 @@ import { planRebuild } from '../daemon-rebuild/plan.mjs';
 import { makeGit } from '../daemon-rebuild/shared.mjs';
 import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../daemon-rebuild/adopt.mjs';
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
+import * as auditedTips from '../daemon-rebuild/audited-tip.mjs';
 import * as hotpatchReaders from '../hotpatch-readers.mjs';
 import { admitHotpatch } from '../hotpatch-guards.mjs';
 import { hotpatchFixture } from './fixtures/hotpatch.mjs';
@@ -1072,6 +1073,53 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defe
 
 
 describe('hotpatch canonical evidence at finalization', () => {
+  describe.each(['revoked', 'unreadable'])('%s evidence', evidence => {
+    it.each([
+      ['rollback to last-good finalizes even when hotpatch evidence is revoked or unreadable', true],
+      ['normal finalize refuses the same evidence with ready-audit-revoked', false],
+    ])('%s', async (_name, rollback) => {
+      const f = await fixture();
+      const hotpatchRef = `hotpatch/${f.a}`;
+      const env = { ...process.env, ...f.env,
+        WE_DAEMON_STATE_DIR: join(f.dir, 'state'),
+        WE_DAEMON_OVERLAY_DIR: join(f.dir, 'overlays'),
+      };
+      gitOk(f.root, ['update-ref', `refs/remotes/origin/${hotpatchRef}`, f.a]);
+      const plan = { ...f.adopted, finalSha: f.a, applied: [{ ref: hotpatchRef, sha: f.a }] };
+      const { data, readers } = hotpatchFixture();
+      for (const check of data.checks.check_runs) check.head_sha = f.a;
+      data.workflows.workflow_runs[0].head_sha = f.a;
+      data.audits[0].head = f.a;
+      if (evidence === 'revoked') {
+        data.audits[0].verdict = 'WEAKENED';
+        data.audits[0].findings = ['guard weakened'];
+      } else readers.checks = () => { throw new Error('CI evidence unavailable'); };
+      const factory = vi.spyOn(hotpatchReaders, 'createHotpatchReaders').mockReturnValue(readers);
+      const revoked = vi.spyOn(auditedTips, 'revokedHotpatchTips');
+      try {
+        const done = await finalizeRebuild({
+          root: f.root, env, log: { error() {} },
+          run: (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' }),
+          now: () => Date.now(), prevHead: f.b, plan,
+          lease: { token: rollback ? 'force-adopt-rollback' : 'hotpatch-direct-smoke' },
+        });
+        if (rollback) {
+          expect(done).toMatchObject({ moved: true, adopted: true, head: f.a });
+          expect(revoked).not.toHaveBeenCalled();
+          expect(factory).not.toHaveBeenCalled();
+          expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.a);
+          expect(readRebuildState(f.root, env).adopted.head).toBe(f.a);
+        } else {
+          expect(done).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+          expect(revoked).toHaveBeenCalledOnce();
+          expect(factory).toHaveBeenCalledWith({ cwd: f.root, env });
+          expect(gitOk(f.root, ['rev-parse', 'HEAD'])).toBe(f.b);
+          expect(readRebuildState(f.root, env).adopted?.head).not.toBe(f.a);
+        }
+      } finally { revoked.mockRestore(); factory.mockRestore(); }
+    });
+  });
+
   it.each(['first adoption', 'follow mode'])(
     'finalizeRebuild refuses canonical evidence revoked after preparation: %s', async mode => {
       const f = await fixture();
