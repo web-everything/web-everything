@@ -88,6 +88,23 @@ describe('unaudited-tip plans', () => {
     expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow(StaleReadyPinError);
     expect(() => assertReadyCandidatePins(f.root, ready, f.env)).toThrow('Unaudited ready pin');
   });
+  it('ready-pin-stale loop: a recorded stale pin whose adopted head has no evidence is set aside with one alert, not re-pinned', async () => {
+    const f = await fixture();
+    f.save(); // A's audit row is gone and B was never audited
+    expect((await f.plan()).applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]); // no marker: policy unchanged
+    const plan = await f.plan({ stalePins: { [ref]: f.a } });
+    expect(plan.ok).toBe(true);
+    expect(plan.applied.some((x) => x.ref === ref)).toBe(false);
+    expect(plan.decisions).toContainEqual(expect.objectContaining({ ref, action: 'skip', reason: 'unaudited-tip-held' }));
+    const alerts = plan.alerts.filter((x) => x.kind === 'overlay-unaudited-tip' && x.detail.ref === ref);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0].detail).toMatchObject({ setAside: true, adopted: f.a, newTip: f.b });
+  });
+  it('ready-pin-stale loop: a stale marker never sets aside an overlay whose adopted head is audited again', async () => {
+    const f = await fixture();
+    const plan = await f.plan({ stalePins: { [ref]: f.a } });
+    expect(plan.applied).toEqual([{ ref, pr: 42, sha: f.a, pinnedFrom: f.b }]);
+  });
   it.each(['throw', 'nonzero', 'empty', 'pad-throw'])(
     'retains the audit pin and refuses candidates when the hold-marker write fails: %s', async (failure) => {
       const f = await fixture();

@@ -411,6 +411,9 @@ export async function prepareRebuild({
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
     auditedTip: makeAuditedTipGate(env),
+    // ready-pin-stale loop breaker: refs whose pinned adopted head a ready candidate was discarded for (marker below).
+    stalePins: Object.fromEntries(Object.entries(state.pinnedNotified ?? {})
+      .filter(([, v]) => typeof v === 'string' && v.startsWith('stale-pin:')).map(([k, v]) => [k, v.slice('stale-pin:'.length).split(':')[0]])),
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -439,7 +442,7 @@ export async function prepareRebuild({
     // still log. The record is pruned as soon as a plan stops reporting it.
     if (event.kind === 'overlay-pinned' || event.kind === 'overlay-unaudited-tip') {
       const { ref, pr, newTip, files } = event.detail;
-      const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
+      const noticeKey = event.kind === 'overlay-pinned' ? newTip : (event.detail.setAside ? `stale-pin:${event.detail.adopted}:aside` : `unaudited-tip:${newTip}`);
       pinnedNow[ref] = noticeKey;
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (!strictState && event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
@@ -632,6 +635,15 @@ export async function prepareRebuild({
       catch (error) {
         if (!(error instanceof StaleReadyPinError)) throw new RebuildEvidenceError(error);
         stalePin = true;
+        // Record the discarded pins so the next plan sets an unaudited pinned overlay aside (one alert) instead of
+        // rebuilding the same unadoptable candidate forever. The plan re-checks evidence, so a marker never sets
+        // aside an overlay whose adopted head is audited again; it is pruned once a plan stops reporting it.
+        if (!strictState) {
+          const marks = { ...(state.pinnedNotified ?? {}) };
+          for (const a of ready.adopt.applied ?? []) if (a?.pinnedFrom && a.ref && a.sha) marks[a.ref] = `stale-pin:${a.sha}`;
+          state.pinnedNotified = marks;
+          writeState();
+        }
       }
       // Check before every match, including exact/same-tree smoke reuse. A pin
       // whose proof expired is discarded, never used to authorize adoption.

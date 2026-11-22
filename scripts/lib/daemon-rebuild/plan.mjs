@@ -333,7 +333,7 @@ export async function planOverlayStacks({
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
   prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
-  noPin = new Set(), auditedTip = null,
+  noPin = new Set(), auditedTip = null, stalePins = null,
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -540,6 +540,19 @@ export async function planRebuild({
     const adoptedTip = adoptedTips.get(ref) ?? graduatedTips.get(ref);
     if (typeof auditedTip !== 'function' || !adoptedTip || adoptedTip === tip || establishedRefs.has(ref)
       || inMain(tip) || auditedTip(ref, tip)) return null;
+    // ready-pin-stale loop — adoption re-proves every pin's applied sha against live evidence. A pin at an adopted head
+    // whose evidence is gone builds a candidate adoption then discards (prepare records the discard in `stalePins`).
+    // Break the loop: set the overlay aside for this build (false; it stays registered) with one alert per ref+tip.
+    if (stalePins?.[ref] === adoptedTip && auditedTip(ref, adoptedTip) !== true && !inMain(adoptedTip)) {
+      alerts.push({
+        kind: 'overlay-unaudited-tip',
+        detail: {
+          ref, pr, adopted: adoptedTip, newTip: tip, setAside: true,
+          message: `overlay ${ref} set aside: its adopted head ${adoptedTip.slice(0, 10)} lost its fix-ready + audit record and a build pinned at it was discarded as ready-pin-stale; re-audit and re-load the branch (unaudited-tip)`,
+        },
+      });
+      return false;
+    }
     alerts.push({
       kind: 'overlay-unaudited-tip',
       detail: {
@@ -637,6 +650,10 @@ export async function planRebuild({
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
     let unauditedFrom = null;
     const heldAt = holdUnauditedTip(ref, pr, ovSha);
+    if (heldAt === false) {
+      decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
+      continue;
+    }
     if (heldAt) {
       unauditedFrom = ovSha;
       ovSha = heldAt;
@@ -853,7 +870,9 @@ export async function planRebuild({
     if ((d.tops ?? []).some((t) => appliedRefs().has(t))) continue;
     // unaudited-tip — the set-aside decision carries the registered tip; the fallback is an apply like any other, so an
     // unaudited tip is held at its audited adopted head here too (never applied on the skipped decision's say-so).
-    const fallbackSha = holdUnauditedTip(d.ref, d.pr, d.sha) ?? d.sha;
+    const held = holdUnauditedTip(d.ref, d.pr, d.sha);
+    if (held === false) { lostBases.push(d.ref); continue; }
+    const fallbackSha = held ?? d.sha;
     const pinnedFrom = fallbackSha !== d.sha ? d.sha : null;
     const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, fallbackSha]);
     const tree = String(mt.stdout ?? '').split('\n')[0].trim();
@@ -879,7 +898,7 @@ export async function planRebuild({
     if (holdFailure) return holdRefusal();
     return planRebuild({
       git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]), noPin, auditedTip, stalePins,
     });
   }
 
@@ -1023,7 +1042,7 @@ export async function planRebuild({
       for (const refs of retryPinGroups()) {
         const alt = await planRebuild({
           git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
-          keepIndependent, noPin: new Set(refs), auditedTip,
+          keepIndependent, noPin: new Set(refs), auditedTip, stalePins,
         });
         if (!alt.ok || alt.establishedLost.length > 0) continue;
         const altApplied = new Map(alt.applied.map((a) => [a.ref, a]));
