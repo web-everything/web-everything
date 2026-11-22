@@ -53,6 +53,7 @@ function fixture(test) {
     }
     const job = /\/actions\/jobs\/(\d+)\/logs/.exec(endpoint);
     if (job) {
+      if (!args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
       if (f.logs[job[1]] === undefined) throw new Error('log unavailable');
       return f.logs[job[1]];
     }
@@ -101,6 +102,24 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
     expect(f.guard().hold).toBe(true);
     expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-same-head-retry:'))).toBe(false);
   };
+
+  it('ANSI real vitest failure holds without refresh or retry', () => setup(f => {
+    f.logs[31] = `\x1b[31m${logOf([FILE, NAME])}\x1b[0m`;
+    expectHeld(f);
+    expect(declined(f).join('\n')).not.toContain('job log evidence unreadable');
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('PUT'))).toBe(false);
+    expect(f.exec.mock.calls.find(([, args]) => args.at(-1)?.endsWith('/31/logs'))[1])
+      .toContain('--allow-escape-sequences');
+  }));
+
+  it('404 gate log fails closed with flagged transport', () => setup(f => {
+    f.checks[0].name = 'merge-gate';
+    f.logErrors[31] = new Error('HTTP 404: Not Found');
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('job log evidence unreadable');
+    expect(f.exec.mock.calls.find(([, args]) => args.at(-1)?.endsWith('/31/logs'))[1])
+      .toContain('--allow-escape-sequences');
+  }));
 
   it.each(['throws', 'empty'])('allows one retry with main green and PR CLEAN when the non-gate log %s', kind => setup(f => {
     if (kind === 'empty') f.logs[31] = ' \n';
@@ -251,6 +270,14 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
 });
 
 describe('merge-queue same-head retry for quarantined failures', () => {
+  it('reads ANSI quarantine logs through read1', () => fixture(f => {
+    f.logs[31] = `\x1b[31m${f.logs[31]}\x1b[0m`;
+    expect(f.guard().hold).toBe(false);
+    const reads = f.exec.mock.calls.filter(([, args]) => args.at(-1)?.endsWith('/logs'));
+    expect(reads).toHaveLength(3);
+    expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
+  }));
+
   it('allows one retry when every failing test is in the active quarantine', () => fixture(f => {
     const result = f.guard();
     expect(result.hold).toBe(false);
@@ -575,6 +602,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       if (crId && f.annotations[crId] !== undefined)
         return JSON.stringify({ id: Number(crId), output: { annotations_count: f.annotationCount?.[crId] ?? f.annotations[crId].length } });
       const logId = /\/actions\/jobs\/(\d+)\/logs$/.exec(path)?.[1];
+      if (logId && !args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
       if (logId && f.logs[logId] !== undefined) return f.logs[logId];
       const artifactRun = /\/actions\/runs\/(\d+)\/artifacts$/.exec(path)?.[1];
       if (artifactRun) {
@@ -621,6 +649,14 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.log.mock.calls[0]).toEqual([result.line]);
     expect(f.log.mock.calls.some(([line]) => /^mq-same-head-retry:/.test(line))).toBe(false);
   };
+
+  it('reads ANSI exact-test summary with one shared log read', () => exactFixture(f => {
+    f.logs[31] = `\x1b[31m${f.logs[31]}\x1b[0m`;
+    expectExtraRetry(f);
+    const reads = f.exec.mock.calls.filter(([, args]) => args.at(-1)?.endsWith('/logs'));
+    expect(reads).toHaveLength(1);
+    expect(reads[0][1]).toContain('--allow-escape-sequences');
+  }));
 
   it('#6903 allows exact-test retry 2/2 from structured reports without classifying over-long log lines', () => exactFixture(f => {
     expect(f.logs[31].split('\n')[0].length).toBeGreaterThan(512);
@@ -936,6 +972,8 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       delete f.jobs[33].steps;
     }
     f.artifacts = {}; f.reports = {};
+    // ANSI outside the evidence lines must not make gh refuse the whole log.
+    for (const id of Object.keys(f.logs)) f.logs[id] += '\x1b[0m';
     expect(f.guard().hold).toBe(false);
     expect(f.exec.mock.calls.some(([, args]) => args.some(a => /\/logs$/.test(a)))).toBe(true);
     if (route === 'aggregator log fallback') {

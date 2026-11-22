@@ -2417,7 +2417,8 @@
   "scripts/conveyor/soak/breaks/capacity-routing-ignores-expiring-quota.soak.test.mjs": 0.1,
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
-  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/drain-mq-log-reader-escape-sequences.soak.test.mjs": 1
  },
  "integration": {}
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDrainMqFailureRecoveryIo, routeMqFailureOnHold } from '../drain-mq-failure-recovery-io.mjs';
+import { classifyMqFailureEvidence } from '../mq-failure-evidence.mjs';
 import { createMqFailureLedger } from '../mq-failure-ledger.mjs';
 import { parseMqFailureRoute } from '../mq-failure-route.mjs';
 import { admitMqFailureRoute } from '../../conveyor/mq-failure-intake.mjs';
@@ -56,7 +57,10 @@ function fixture(mode = 'real') {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
+      if (!args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
+      if (mode === '404 log') throw new Error('HTTP 404: Not Found');
       if (mode === 'expired log') throw new Error('410 expired');
+      if (mode === 'ANSI') return `\x1b[31m${failureLog}\x1b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
         : mode === 'oversized log' ? failureLog + 'x'.repeat(300000) : failureLog;
@@ -70,6 +74,24 @@ function fixture(mode = 'real') {
 }
 
 describe('drain MQ failure production adapter', () => {
+  it('404 job log retains the hold without publication', async () => {
+    const f = fixture('404 log');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
+    expect(f.exec.mock.calls.find(([, args]) => args.at(-1)?.endsWith('/901/logs'))[1])
+      .toContain('--allow-escape-sequences');
+  });
+
+  it('job log with ANSI escapes is read and classified, not unreadable', async () => {
+    const f = fixture('ANSI');
+    const evidence = await f.options.io.collectEvidence({ removal: {
+      ...identity, mergeGroupHead: mergeHead, branch,
+    } });
+    expect(evidence.complete).toBe(true);
+    expect(classifyMqFailureEvidence(evidence)).toBe('real');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+  });
+
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {
     const f = fixture();
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true, reason: expect.any(String) });
