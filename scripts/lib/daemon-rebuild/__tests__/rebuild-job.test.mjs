@@ -302,7 +302,7 @@ it.each([{}, { forced: false }, { forced: true }, {
   const env = { WE_DAEMON_STATE_DIR: join(root, 'state') };
   const ready = { kind: 'candidate', forced: false, tree: 'tree', prevHead: 'head', adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: 'main', applied: [] }, passedAt: new Date(0).toISOString(), ...patch };
   writeReadyCandidate(root, ready, env);
-  expect(readReadyCandidateStrict(root, env)).toEqual(ready);
+  expect(readReadyCandidateStrict(root, env)).toEqual({ strictAdopt: true, freshSmoke: null, ...ready });
 });
 
 it.each([true, false].flatMap(launchOnly => ['rebuild', 'ready'].map(kind => [launchOnly, kind])))(
@@ -613,7 +613,7 @@ it.each(['candidate', 'fallback'])('legacy ready %s without forced reaches launc
   expect(result.reason).toBe('ready-pending');
   expect(adopt).toHaveBeenCalledTimes(1);
   expect(adopt).toHaveBeenCalledWith({ readyOnly: true,
-    admissionEvidence: { state: expect.any(Object), ready: { ...ready, forced: false } } });
+    admissionEvidence: { state: expect.any(Object), ready: { ...ready, forced: false, strictAdopt: true, freshSmoke: null } } });
   expect(reattach).not.toHaveBeenCalled();
   expect(store.list().records).toHaveLength(0);
   expect(readFileSync(file, 'utf8')).toBe(bytes);
@@ -625,7 +625,7 @@ it('complete declared state and ready schemas are admitted without coercion', ()
   writeFileSync(rebuildStatePath(root, env), JSON.stringify(completeState()));
   writeFileSync(readyCandidatePath(root, env), JSON.stringify(completeReady()));
   expect(readRebuildStateStrict(root, env)).toEqual(completeState());
-  expect(readReadyCandidateStrict(root, env)).toEqual(completeReady());
+  expect(readReadyCandidateStrict(root, env)).toEqual({ ...completeReady(), strictAdopt: true, freshSmoke: null });
 });
 
 it.each([

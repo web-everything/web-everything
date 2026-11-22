@@ -6,7 +6,7 @@ import { prepareRebuild } from '../prepare.mjs';
 import { gitRun } from '../../main-staleness.mjs';
 import { clearOverlayConflictWake, readOverlayConflictWakes } from '../../overlay-conflict-wake.mjs';
 import { readMainSyncConflicts } from '../overlay-main-sync.mjs';
-import { overlayFilePath } from '../../daemon-overlays.mjs';
+import { overlayFilePath, readOverlayState } from '../../daemon-overlays.mjs';
 import { readRebuildStateStrict, rebuildStatePath, readReadyCandidate, readReadyCandidateStrict, writeReadyCandidate } from '../state.mjs';
 import { SMOKE_CHECKS } from '../../daemon-live-smoke.mjs';
 import { createSetAsideFixture, probeRebuildSetAside } from '../../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
@@ -443,6 +443,23 @@ it('strictAdopt direct finalize refuses a set-aside without fresh smoke and keep
     expect(f.head()).toBe(before);
     expect(f.state().adopted).toEqual(adopted);
     expect(readReadyCandidate(f.root, f.env)).toBeNull();
+  } finally { f.cleanup(); }
+}, 60_000);
+
+it('gate derives strictness from facts: a smoke-fallback drop (no planner decisions) is refused without fresh smoke', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head(), adopted = f.state().adopted;
+    const job = await f.rebuild({ readyOnly: true });
+    const registered = readOverlayState(f.root, { env: f.env }).overlays;
+    expect(registered.length).toBeGreaterThan(0);
+    // The fallback dropped every registered overlay and left no planner decision behind.
+    const plan = { ...job.plan, applied: [], decisions: [] };
+    const result = await finalizeRebuild({ root: f.root, env: f.env, run: gitRun, now: Date.now,
+      plan, prevHead: before, lease: { token: 'normal' } });
+    expect(result).toMatchObject({ moved: false, reason: 'strict-adopt-needs-fresh-smoke' });
+    expect(f.head()).toBe(before);
+    expect(f.state().adopted).toEqual(adopted);
   } finally { f.cleanup(); }
 }, 60_000);
 

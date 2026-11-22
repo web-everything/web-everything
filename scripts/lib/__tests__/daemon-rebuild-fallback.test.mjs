@@ -125,8 +125,10 @@ function makeFixture() {
   };
 }
 
+// A COMPLETE passing table (strict adoption only accepts a fresh complete smoke pass).
+const fullPass = () => ({ verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(c => ({ name: c.name, ok: true })) } });
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => fullPass());
 }
 
 // x5wbsbc — a smoke that fails ONLY the candidate carrying `file` and passes every other tree (in particular the
@@ -134,7 +136,7 @@ function passSmoke() {
 function failsWhenFile(file, result) {
   return vi.fn(async ({ root }) => (existsSync(join(root, file))
     ? result
-    : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    : fullPass()));
 }
 
 const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
@@ -205,7 +207,7 @@ describe('rebuildClone passes candidateSmokeEnv to runSmoke', () => {
     const calls = [];
     const runSmoke = vi.fn(async (args) => {
       calls.push(args);
-      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+      return fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -623,7 +625,7 @@ describe('single-flight build lease across the fallback (x5wbsbc on #2731)', () 
       heldDuring.push(!!readRebuildState(cloneDir, env).building);
       return existsSync(join(root, 'lease-bad.txt'))
         ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
-        : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+        : fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -712,7 +714,7 @@ const loadFail = () => ({
     ],
   },
 });
-const PASS = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+const PASS = () => fullPass();
 
 async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
   const fx = makeFixture();

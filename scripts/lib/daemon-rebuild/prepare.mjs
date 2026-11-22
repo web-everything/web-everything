@@ -33,7 +33,6 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild, planStrictAdopt } from './plan.mjs';
-import { readMainSyncConflicts } from './overlay-main-sync.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
@@ -411,7 +410,11 @@ export async function prepareRebuild({
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   let mainSyncConflicts = {};
-  try { mainSyncConflicts = readMainSyncConflicts(root, env); }
+  try {
+    // The sync worker imports daemon-self-sync/rebuild; load it after module initialization.
+    const { readMainSyncConflicts } = await import('./overlay-main-sync.mjs');
+    mainSyncConflicts = readMainSyncConflicts(root, env);
+  }
   catch (error) { alert('overlay-main-sync-state-unknown', { message: `${error.message}; keeping existing overlay loss protections — repair main-sync state` }); }
   const plan = await planRebuild({
     auditedTip: makeAuditedTipGate(env), mainSyncConflicts, setAside: state.setAside === undefined ? null : state.setAside ?? {},

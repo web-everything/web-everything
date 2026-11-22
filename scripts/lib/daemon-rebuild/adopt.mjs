@@ -506,7 +506,18 @@ async function finalizeRebuildLocked({
   // force, skip-unrelated) goes through. An omission/set-aside build is adopted only on a fresh complete smoke pass of
   // THIS candidate (`freshSmoke` is set only by smoke.mjs from a completeSmokePass of this run, never a cached/ready
   // verdict without that mark). The only exception is the health watch's rollback to last-good.
-  const strict = strictAdopt === true || planStrictAdopt(plan);
+  // Strictness is DERIVED FROM FACTS here, not trusted from planner decisions: the candidate's applied set is missing
+  // any registered, non-retired overlay (smoke-fallback drops included), or the omission/set-aside history is unknown.
+  const live = isRollback ? { overlays: [] } : readOverlayState(root, { env });
+  const appliedRefs = new Set((plan.applied ?? []).map(a => a.ref));
+  const retiredRefs = new Set((plan.decisions ?? []).filter(d => d?.action === 'remove').map(d => d.ref));
+  const factMissing = !isRollback && !live.corrupt && live.overlays.some(o => !appliedRefs.has(o.ref) && !retiredRefs.has(o.ref));
+  // Unknown history only matters when the candidate has lost something the last adoption carried (a missing/unreadable
+  // record cannot explain the loss); a candidate that carries everything the last adoption did owes no history.
+  const lostSinceAdopted = (state.adopted?.applied ?? []).some(a => !appliedRefs.has(a.ref) && !retiredRefs.has(a.ref));
+  const historyUnknown = !isRollback && ((state.setAside === undefined && lostSinceAdopted)
+    || (state.setAside != null && (typeof state.setAside !== 'object' || Array.isArray(state.setAside))));
+  const strict = strictAdopt === true || planStrictAdopt(plan) || factMissing || historyUnknown;
   if (strict && !isRollback && freshSmoke !== plan.finalSha) {
     alert('strict-adopt-refused', { target: plan.finalSha, message: 'a build that omits or sets aside an overlay is adopted only on a fresh complete smoke pass of this candidate; keeping last-good' });
     clearReadyCandidate(root, stEnv);
@@ -520,7 +531,6 @@ async function finalizeRebuildLocked({
   // Registrations can be pinned while smoke runs unlocked. Re-read under the
   // add guard before normal adoption (including already-adopted reconciliation).
   // The health watch must always be able to return to last-good without changing registrations.
-  const live = isRollback ? { overlays: [] } : readOverlayState(root, { env });
   if (live.corrupt) {
     alert('overlay-state-corrupt', { message: 'cannot re-check omitted overlay pins; repair the overlay registry' });
     return terminal({ moved: false, reason: 'overlay-state-corrupt', plan });
