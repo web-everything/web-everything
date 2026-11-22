@@ -95,7 +95,9 @@ export function createRebuildReaders({ strict = false, read = readFileSync } = {
         const discardNotice = object(r) && r.kind === 'needs-you'
           && (r.need === 'ready-candidate-discarded' || (Object.hasOwn(r, 'target') && Object.hasOwn(r, 'refs')));
         // The stale-record-dropped writer names its event with `event` instead of `kind`; both are typed evidence.
-        if (!object(r) || (typeof r.kind !== 'string' && typeof r.event !== 'string')
+        const staleDropped = object(r) && !Object.hasOwn(r, 'kind') && r.event === 'stale-record-dropped' && date(r.at)
+          && !['need', 'target', 'refs', 'ref'].some(key => Object.hasOwn(r, key));
+        if (!object(r) || (typeof r.kind !== 'string' && !staleDropped)
           // Aggregate and auto-rebase events need not name a single ref. The
           // consumers require ref themselves before using per-overlay evidence.
           || (Object.hasOwn(r, 'ref') && typeof r.ref !== 'string')

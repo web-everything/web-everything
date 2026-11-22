@@ -227,6 +227,13 @@ it('accepts production-written pr=0 conflict wakes and `event`-named overlay eve
   expect(() => readers.validate(root, env)).not.toThrow();
   writeFileSync(wakes, JSON.stringify({ 0: { pr: -1, ref: 'lane/x', at: new Date(0).toISOString() } }));
   expect(() => readers.validate(root, env)).toThrow(RebuildEvidenceError);
+  writeFileSync(wakes, JSON.stringify({}));
+  const events = registry.replace(/\.json$/, '.events.jsonl');
+  for (const bad of [{ event: 'unknown' }, { event: 'stale-record-dropped', kind: 123 },
+    { event: 'ready-candidate-discarded', target: 't', refs: [] }]) {
+    writeFileSync(events, JSON.stringify({ at: new Date(0).toISOString(), ...bad }) + '\n');
+    expect(() => readers.validate(root, env)).toThrow(RebuildEvidenceError);
+  }
 });
 
 it('replays production state, ready, pending, registry and aggregate event writer output', () => {
