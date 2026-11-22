@@ -2,6 +2,7 @@
 kind: story
 size: 5
 status: open
+blockedBy: ["2209", "2250", "2251", "2252", "2253"]
 scope: ["we:scripts/check-standards-rules.mjs"]
 dateOpened: "2026-11-22"
 tags: [plateau, design-plan, carried-acceptance]
@@ -13,7 +14,7 @@ Carried from closed #2255: after #2209 ratifies, build the check:branding valida
 
 ## Acceptance
 
-- [A1] **Executable** — npm run check:branding fails on the current icon set and gradient spans and passes after the cleanup; wired into check:standards.
+- [A1] **Executable** — npm run check:branding fails on the current icon set and gradient spans and passes after the cleanup; wired into check:standards. The check enforces every icon viewBox is 0 0 128 128 and every stroke-width is at least 6, and the cleanup fixes the 18 icons below the floor (including weblayout.svg at a 24 viewBox, range-anchor.svg, prefetch.svg and the other 15 named in the closed #2255) so the check passes with none left.
 
 
 
