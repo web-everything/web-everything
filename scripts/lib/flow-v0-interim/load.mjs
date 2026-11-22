@@ -69,6 +69,7 @@ export function load(definition) {
   ];
   for (const [name, s] of Object.entries(def.states)) {
     if (s.kind !== 'final' && !s.key) problems.push(`${name}: FLOW-DEF-009 missing key`);
+    for (const t of s.on ?? []) if (t.outcome === 'wait' && t.route === 'advance') problems.push(`${name}: waiting evidence cannot advance`);
     for (const t of s.on ?? []) if (!t.event || !t.route || (!!t.guard !== !!t.outcome)) problems.push(`${name}: incomplete routed event`);
     if (s.kind === 'confirm' && (!s.confirm.excludes.includes('author') || !s.confirm.excludes.includes('preparers') || s.on.some(t => !t.guard))) problems.push(`${name}: FLOW-DL-009 approval must be guarded and exclude author/preparers`);
   }

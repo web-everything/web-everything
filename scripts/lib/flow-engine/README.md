@@ -41,3 +41,14 @@ No default path, external read, GitHub call or deployment is introduced.
 difference blocks retirement and returns a finding. Live acceptance still requires
 three real PR rounds after an operator enables the hook; unit fixtures are not
 live proof. The log timestamps and executor commit are supplied by the caller.
+
+The P8 hotpatch definition lives at `scripts/conveyor/flows/hotpatch/flow.json`.
+It uses the decision-lifecycle subset: judges name intake, pinned, ready, loaded
+and live evidence; the adapter performs pin, audit, load and unload. Waiting
+evidence cannot advance, and unknown routes escalate without advancing.
+`scripts/hot-patch.mjs request <pr> --daemon=<key>` opens an immutable-head run;
+`status <pr>` reads its journal. Completed B01 Transitions alone enter replay;
+intent rows precede effects and never count as completed registration. Recovery
+rechecks ready and the overlay list before retrying an interrupted add. The
+adapter uses the existing guarded overlay-add path, leaving adoption to the daemon.
+The exported runner tick is for P8-d wiring; this slice installs no scheduler.

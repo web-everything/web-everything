@@ -6352,3 +6352,11 @@ in-process sweep. Persist the retry identity in job input to dedupe the enqueue-
 The shard plan comes from `origin/main` and shards must share the selected test check's suite.
 `daemon-overlay.test.mjs` also exercises the real add lock and store: a green preflight cannot
 authorize add after CI turns red. Keep the production readers independent of lifecycle effects.
+
+## Hotpatch flow recovery (P8)
+
+Hotpatch tests import only `scripts/lib/flow-engine/index.mjs`. Journal intent rows
+carry non-advancing unknown Transitions and are excluded from completion replay.
+Exercise both crash windows: before add, change ready evidence to red; after add,
+retain the registration and require a fresh list read without a second add. Guard
+reader exceptions must escalate, including live evidence: unknown never removes.
