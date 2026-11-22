@@ -1,7 +1,7 @@
 /** Who writes code: routing.builder (claude | codex | auto). Audits and review seats stay on routing.auditProvider. */
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readCodexQuota } from './codex-usage-ledger.mjs';
-import { CAPACITY_DEFAULTS, PROVIDER_DEFAULTS, chooseBuilder, launcherCapacity } from './provider-capacity.mjs';
+import { CAPACITY_DEFAULTS, PROVIDER_DEFAULTS, chooseBuilder, launcherCapacity, liveReadingTimestampValid } from './provider-capacity.mjs';
 import { observeCapacity, recordCapacityDecision } from './provider-capacity-io.mjs';
 import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 
@@ -56,7 +56,8 @@ export function effectiveBuilder({ env = process.env, repo, declared, quota = re
   if (s.builder !== 'auto') return { builder: s.builder, source: s.source, settings: s };
   let q;
   try { q = quota(env); } catch { q = null; }
-  const used = Number.isFinite(q?.used_percent) ? q.used_percent : null;
+  const used = Number.isFinite(q?.used_percent) && q.used_percent >= 0 && q.used_percent <= 100
+    && liveReadingTimestampValid(q, now, { codexRollout: true, staleHours: s.capacity.staleHours }) ? q.used_percent : null;
   // Unreadable quota is not "below threshold": the quota-safe direction is claude.
   const fallback = used !== null && used < s.autoClaudeAbovePercent ? 'codex' : 'claude';
   if (!s.capacity.enabled) return { builder: fallback, source: 'auto', usedPercent: used, settings: s };
