@@ -2,7 +2,7 @@
 kind: story
 size: 3
 status: open
-scope: ["frontierui"]
+scope: ["fui:blocks/"]
 dateOpened: "2026-11-22"
 tags: []
 ---
