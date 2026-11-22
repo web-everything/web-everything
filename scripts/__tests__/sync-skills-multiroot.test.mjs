@@ -16,10 +16,14 @@ import * as skillsSync from '../sync-skills-deploy.mjs';
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'sync-skills-deploy.mjs');
 // Test-owned (not read from the module under test), so a control run stays clean even if the source list shrinks.
 const GIT_REPO_ENV = [
-  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
   'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
   'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+  'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+  'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS',
 ];
+// A case alias only names the same directory on a case-insensitive volume (macOS default, not Linux CI).
+const CASE_INSENSITIVE_FS = existsSync(tmpdir().toUpperCase()) && existsSync(tmpdir().toLowerCase());
 let tmp;
 beforeEach(() => { tmp = mkdtempSync(join(tmpdir(), 'sync-multiroot-')); });
 afterEach(() => { try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ } });
@@ -377,6 +381,22 @@ describe('operator send-back: one home per root spelling', () => {
     expect(summary(spelled)).toEqual(summary(control));
   });
 
+  it.runIf(CASE_INSENSITIVE_FS)('--root naming the default ops root with a letter-case alias exits 0, same as without it', () => {
+    const ops = gitRepoWithSkills('home/workspace/plateau-ops', ['ops-probe']);
+    const args = ['--dry-run', '--json', '--only=ops-probe'];
+    const control = runCli(args);
+    const spelled = runCli([...args, `--root=${join(dirname(ops.root), 'SKILLS')}`]);
+    expect(control.status).toBe(0);
+    expect(summary(spelled)).toEqual(summary(control));
+  });
+
+  it('distinctRoots keeps the first spelling of each real directory and drops the primary', () => {
+    const a = gitRepoWithSkills('we', ['alpha']);
+    const b = gitRepoWithSkills('ops', ['beta']);
+    expect(skillsSync.distinctRoots(`${a.root}/`, [`${b.root}//`, b.root, a.root, join(b.root, '.')]))
+      .toEqual([b.root]);
+  });
+
   it('resolveRoots normalizes each root and keeps one entry per real directory', () => {
     const ops = gitRepoWithSkills('home/workspace/plateau-ops', ['ops-probe']);
     const primary = gitRepoWithSkills('we', ['alpha']);
@@ -407,7 +427,11 @@ describe('operator send-back: inherited Git repository environment', () => {
     ['GIT_DIR + GIT_WORK_TREE', () => ({ GIT_DIR: weGitDir, GIT_WORK_TREE: weTop })],
     ['GIT_INDEX_FILE', () => ({ GIT_INDEX_FILE: join(tmp, 'no-such-index') })],
     ['GIT_CEILING_DIRECTORIES', () => ({ GIT_CEILING_DIRECTORIES: join(tmp, 'home', 'workspace', 'plateau-ops') })],
+    // `git -c core.worktree=<we> commit` exports this to its hooks.
+    ['GIT_CONFIG_PARAMETERS (core.worktree)', () => ({ GIT_CONFIG_PARAMETERS: `'core.worktree'='${weTop}'` })],
+    ['GIT_CONFIG_COUNT (core.worktree)', () => ({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.worktree', GIT_CONFIG_VALUE_0: weTop })],
     ['every repository variable', () => ({
+      GIT_CONFIG_PARAMETERS: `'core.worktree'='${weTop}'`, GIT_IMPLICIT_WORK_TREE: '0',
       GIT_DIR: weGitDir, GIT_WORK_TREE: weTop, GIT_INDEX_FILE: join(tmp, 'no-such-index'),
       GIT_COMMON_DIR: weGitDir, GIT_PREFIX: 'scripts/',
       GIT_CEILING_DIRECTORIES: join(tmp, 'home', 'workspace', 'plateau-ops'), GIT_DISCOVERY_ACROSS_FILESYSTEM: '0',
@@ -432,5 +456,22 @@ describe('operator send-back: inherited Git repository environment', () => {
     } finally {
       if (saved === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = saved;
     }
+  });
+});
+
+describe('operator send-back: path text reaches git literally', () => {
+  it('reads glob characters in a skill path literally', () => {
+    // `a[b]` as a glob also matches the sibling `ab`.
+    const ops = gitRepoWithSkills('ops', ['a[b]', 'ab']);
+    expect(gitTrackedFiles(join(ops.root, 'a[b]'), ops.repo)).toEqual(['SKILL.md']);
+  });
+
+  it('reads non-ASCII names unquoted, so they count as tracked', () => {
+    const ops = gitRepoWithSkills('ops', ['ünï']);
+    writeFileSync(join(ops.root, 'ünï', 'ré.md'), 'x\n');
+    execFileSync('git', ['add', '-A'], { cwd: ops.repo });
+    execFileSync('git', ['commit', '-q', '-m', 'more'], { cwd: ops.repo });
+    const files = gitTrackedFiles(join(ops.root, 'ünï'), ops.repo).map((f) => f.normalize('NFC')).sort();
+    expect(files).toEqual(['SKILL.md', 'ré.md'.normalize('NFC')]);
   });
 });

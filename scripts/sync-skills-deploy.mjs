@@ -99,11 +99,15 @@ export function listFilesRecursive(dir) {
 
 /** Repository-selecting variables a git hook (or a caller's shell) exports. Inherited, they point every
  *  git call at another repo, index or object store, or stop discovery short, so a secondary root's skills
- *  read as untracked or its root reads as "not a git repo". */
+ *  read as untracked or its root reads as "not a git repo". Covers every name `git rev-parse --local-env-vars`
+ *  prints (including `GIT_CONFIG_PARAMETERS` / `GIT_CONFIG_COUNT`, which `git -c core.worktree=…` exports to
+ *  hooks) plus the discovery-limiting and namespace variables. */
 export const GIT_REPO_ENV = Object.freeze([
-  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
+  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_IMPLICIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX',
   'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
   'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+  'GIT_CONFIG', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT',
+  'GIT_GRAFT_FILE', 'GIT_SHALLOW_FILE', 'GIT_REPLACE_REF_BASE', 'GIT_NO_REPLACE_OBJECTS',
 ]);
 
 /** `env` without the repository-selecting git variables. */
@@ -121,9 +125,12 @@ function gitAt(dir, args) {
 /** The files `git` tracks under `srcDir`, as paths relative to `srcDir`. */
 export function gitTrackedFiles(srcDir, repoRoot = REPO_ROOT) {
   // Git discovers physical repo paths; source roots and explicit repo roots may use symlink aliases.
-  const relToRepo = path.relative(fs.realpathSync(repoRoot), fs.realpathSync(srcDir));
-  const out = gitAt(repoRoot, ['ls-files', '--', relToRepo]);
-  return out.split('\n').filter(Boolean).map((p) => path.relative(relToRepo, p));
+  // `.native` also folds letter case on a case-insensitive volume, as git's own paths do.
+  const relToRepo = path.relative(fs.realpathSync.native(repoRoot), fs.realpathSync.native(srcDir));
+  // Literal pathspec (a `*` or `[` in a directory name is not a glob) and NUL-separated, unquoted output
+  // (core.quotePath would otherwise quote a non-ASCII name and it would read as untracked).
+  const out = gitAt(repoRoot, ['--literal-pathspecs', 'ls-files', '-z', '--', relToRepo]);
+  return out.split('\0').filter(Boolean).map((p) => path.relative(relToRepo, p));
 }
 
 /**
@@ -272,14 +279,8 @@ export function buildPlans({ srcRoot = SRC_ROOT, extraRoots = [], destRoot, only
   if (!repoRoot) repoRoot = fs.existsSync(srcRoot) ? gitToplevel(srcRoot) : REPO_ROOT;
   // SK1: one home per skill. Primary root uses `repoRoot`; each extra root is its own git repo (found via
   // `git rev-parse`; fails closed if it is not one).
-  // Two spellings of one directory (trailing slash, `.` segment, symlink alias) are one home, not two.
-  const seen = new Set([realpathOrSelf(srcRoot)]);
-  const uniqueExtras = extraRoots.map((r) => path.resolve(r)).filter((r) => {
-    const key = realpathOrSelf(r);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // Two spellings of one directory (trailing slash, `.` segment, symlink or case alias) are one home, not two.
+  const uniqueExtras = distinctRoots(srcRoot, extraRoots);
   const roots = [{ root: srcRoot, repoRoot }, ...uniqueExtras.map((r) => ({ root: r, repoRoot: gitToplevel(r) }))];
   const home = new Map(); // name -> { root, repoRoot }
   for (const entry of roots) {
@@ -378,21 +379,28 @@ export function resolveRoots(env = process.env, args = { roots: [] }, home = os.
   if (missing.length) throw new Error(`sync-skills-deploy: source root(s) not found: ${missing.join(', ')}`);
   // One entry per real directory: `<ops>/skills/`, `<ops>/skills` and a symlink alias are the same home,
   // so they must not trip the two-homes refusal. A root that is the primary root is the primary root.
-  const seen = new Set([realpath(srcRoot)]);
-  const extraRoots = [];
-  for (const r of [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit].map((p) => path.resolve(p))) {
-    if (!exists(r)) continue;
+  const candidates = [...(env.WE_SKILLS_SRC_ROOT ? [] : [defaultOps]), ...explicit].filter((r) => exists(path.resolve(r)));
+  return { srcRoot, extraRoots: distinctRoots(srcRoot, candidates, realpath) };
+}
+
+/** `candidates`, each `path.resolve`d, keeping the first spelling of each real directory and dropping any
+ *  that is `primary` itself. The one dedupe both `resolveRoots` and `buildPlans` use. */
+export function distinctRoots(primary, candidates, realpath = realpathOrSelf) {
+  const seen = new Set([realpath(path.resolve(primary))]);
+  const out = [];
+  for (const r of candidates.map((p) => path.resolve(p))) {
     const key = realpath(r);
     if (seen.has(key)) continue;
     seen.add(key);
-    extraRoots.push(r);
+    out.push(r);
   }
-  return { srcRoot, extraRoots };
+  return out;
 }
 
-/** realpath, or the resolved path itself when it cannot be read (an injected `exists` probe in tests). */
+/** realpath (`.native`, so a case alias on a case-insensitive volume folds to the on-disk name), or the
+ *  resolved path itself when it cannot be read (an injected `exists` probe in tests). */
 function realpathOrSelf(p) {
-  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+  try { return fs.realpathSync.native(p); } catch { return path.resolve(p); }
 }
 
 async function main() {
