@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { isTrustChainPath, TRUST_CHAIN, TRUST_CHAIN_BASENAMES } from '../lib/gate-config.mjs';
-import { GUARD_FLOOR } from '../lib/audit-settings.mjs';
+import { GUARD_FLOOR } from '../lib/protected-path-floor.mjs';
 import { globsMayIntersect } from '../readiness/scope-lease.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';

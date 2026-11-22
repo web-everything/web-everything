@@ -463,6 +463,7 @@ it.each([
   'fui:scripts/**', 'plateau-app:scripts/settings/',
   'we:scripts/**/gate-*.mjs', 'we:config/*Defaults.ts',
   'we:scripts/operations/build-priority-set-io.mjs',
+  'we:scripts/operations/agy-usage-reader.mjs', 'we:.githooks/', 'we:.claude/settings.json',
   'we:scripts/a.mjs scripts/settings/', 'we:tools/deliveryPolicyDefaul*.ts',
 ])('auto-pick skips scopes covering merge paths: %s', async scope => {
   const f = fixture({ readPriorityList: () => ['42', '43'],
