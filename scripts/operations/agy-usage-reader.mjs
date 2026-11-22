@@ -47,18 +47,23 @@ function parseAgyFrame(screen, now) {
   const group = text.split(/GEMINI MODELS/i).at(-1)?.split(/\n\s*[A-Z][A-Z ]+ MODELS/i)[0];
   if (text.split(/GEMINI MODELS/i).length < 2) throw new Error('Incomplete Gemini usage screen');
   if (!group || !Number.isFinite(now)) throw new Error('Incomplete Gemini usage screen');
-  const window = label => {
+  const window = (label, defaultHours) => {
+    const section = group.match(new RegExp(`${label} Limit Remaining[\\s\\S]*`, 'i'))?.[0]
+      .split(/\n[^\n]*(?:Weekly|Five Hour) Limit Remaining/i)[0] ?? '';
     const match = group.match(new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?(\\d+(?:\\.\\d+)?)%\\s+Refreshes in[ \\t]+(?:(\\d+)h[ \\t]*)?(?:(\\d+)m)?[ \\t]*(?=\\n)`, 'i'));
+    // An unused window has no countdown. Require its explicit availability marker, never infer from a missing time alone.
+    const unused = !/Refreshes in/i.test(section)
+      && new RegExp(`${label} Limit Remaining\\s+[^\\d%\\n+-]*?100\\.00%\\s+Quota available[ \\t]*(?=\\n|$)`, 'i').test(section);
     // A frame that shows a percent or refresh for this window but does not parse is INVALID, never a reason to use older evidence.
     const shown = new RegExp(`${label} Limit Remaining[\\s\\S]*?(?:%|Refreshes in)`, 'i').test(group);
-    if (!match || (!match[2] && !match[3])) throw Object.assign(new Error(`Missing ${label} usage or refresh time`), { invalid: shown });
-    const remaining = Number(match[1]);
-    const seconds = Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60;
+    if (!unused && (!match || (!match[2] && !match[3]))) throw Object.assign(new Error(`Missing ${label} usage or refresh time`), { invalid: shown });
+    const remaining = unused ? 100 : Number(match[1]);
+    const seconds = unused ? defaultHours * 3600 : Number(match[2] || 0) * 3600 + Number(match[3] || 0) * 60;
     if (remaining > 100 || !Number.isSafeInteger(seconds)) throw Object.assign(new Error('Invalid usage bounds'), { invalid: true });
     return { used_percentage: Number((100 - remaining).toFixed(6)), resets_at: Math.floor(now / 1000) + seconds };
   };
-  return { at: new Date(now).toISOString(), session: null, five_hour: window('Five Hour'),
-    seven_day: window('Weekly'), spend_limit: null };
+  return { at: new Date(now).toISOString(), session: null, five_hour: window('Five Hour', 5),
+    seven_day: window('Weekly', 168), spend_limit: null };
 }
 
 /** Run only the PTY wrapper; all process I/O is injectable and bounded. No agy settings are written. */
@@ -67,7 +72,8 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
   maxBytes = 1024 * 1024, descendants = descendantPids } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnFn('sh', ['-c', 'cat | script -q /dev/null agy'], { cwd: home, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    let leaked = false, screen = '', bytes = 0, requested = false, stopping = false, settled = false;
+    let leaked = false, screen = '', loginScreen = '', bytes = 0, requested = false, stopping = false, settled = false;
+    let startupReady = false, started = false;
     const timers = [];
     const later = (fn, ms) => timers.push(setTimeout(fn, ms));
     const finish = (error, value) => {
@@ -86,6 +92,24 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       error ? reject(error) : resolve(value);
     };
     const send = value => { if (!settled) child.stdin.write(value); };
+    const startIfSignedIn = () => {
+      if (settled || started || !startupReady) return;
+      const frame = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+      // A painting/partial startup is unresolved: only the current prompt footer AND rule authorize keys.
+      if (!/\? for shortcuts/.test(frame) || !/─{3,}/.test(frame)) return;
+      started = true;
+      send('\x1b');
+      later(() => {
+        if (settled) return;
+        const current = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+        const notSignedIn = /not signed in/i.test(current), selectLogin = /Select login method/i.test(current);
+        if (notSignedIn || selectLogin) {
+          if (notSignedIn && selectLogin) finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
+          return;
+        }
+        requested = true; screen = ''; send('/usage\r');
+      }, stepMs);
+    };
     child.on('error', error => finish(error));
     child.stdin.on('error', error => finish(error));
     const receive = data => {
@@ -93,9 +117,17 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       bytes += Buffer.byteLength(data);
       if (bytes > maxBytes) return finish(new Error('agy output exceeded bound; inspect agy manually and retry'));
       screen += data.toString();
-      if (/trust this folder/i.test(stripVTControlCharacters(screen))) {
+      // Login evidence survives the usage-only screen reset below, but never a frame break.
+      loginScreen += data.toString();
+      const text = stripVTControlCharacters(screen);
+      if (/trust this folder/i.test(text)) {
         return finish(new Error('agy asks to trust this folder; trust it manually once and retry'));
       }
+      const loginText = stripVTControlCharacters(loginScreen.split(new RegExp(FRAME_BREAK, 'g')).at(-1));
+      if (/not signed in/i.test(loginText) && /Select login method/i.test(loginText)) {
+        return finish(null, { at: new Date(now()).toISOString(), status: 'signed-out' });
+      }
+      startIfSignedIn();
       if (!requested || stopping) return;
       let parsed;
       try { parsed = parseAgyUsage(screen, now()); } catch { return; }
@@ -112,11 +144,20 @@ export function collectAgyUsage({ home = homedir(), timeoutMs = 45000, spawnFn =
       try { finish(null, parseAgyUsage(screen, now())); } catch (error) { finish(error); }
     });
     later(() => finish(new Error('agy usage timed out; inspect agy startup or increase timeoutMs and retry')), timeoutMs);
-    later(() => {
-      send('\x1b');
-      later(() => { requested = true; screen = ''; send('/usage\r'); }, stepMs);
-    }, startupMs);
+    later(() => { startupReady = true; startIfSignedIn(); }, startupMs);
   });
+}
+
+/**
+ * Tick slack for the throttle. A scheduler tick exactly one interval after the last run must collect, even when
+ * process start-up jitter makes it fire a little early or the previous record was stamped at collection end.
+ */
+export const THROTTLE_SLACK_MS = 60000;
+
+/** The skip window: the interval less the slack, capped at a tenth of the interval so short intervals still throttle. */
+export function throttleWindowMs(minIntervalMinutes) {
+  const interval = minIntervalMinutes * 60000;
+  return interval - Math.min(THROTTLE_SLACK_MS, interval / 10);
 }
 
 export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.now,
@@ -127,11 +168,14 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
     const at = Date.parse(previous.at);
     const valid = w => Number.isFinite(w?.used_percentage) && w.used_percentage >= 0 && w.used_percentage <= 100
       && Number.isSafeInteger(w?.resets_at) && w.resets_at > 0;
-    // Only a complete, non-future previous record may suppress collection.
-    if (Number.isFinite(at) && at <= now() && valid(previous.five_hour) && valid(previous.seven_day)
-      && now() - at < settings.minIntervalMinutes * 60000) return { skipped: true };
+    // A recent signed-out result also throttles retries, without claiming any quota evidence.
+    if (Number.isFinite(at) && at <= now()
+      && (previous.status === 'signed-out' || (valid(previous.five_hour) && valid(previous.seven_day)))
+      && now() - at < throttleWindowMs(settings.minIntervalMinutes)) return { skipped: true };
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const result = await collect({ home, timeoutMs: settings.timeoutMs, now });
+  // Stamp the record at collection START, so the time collection takes never shifts the next throttle window.
+  const startedAt = now();
+  const result = { ...await collect({ home, timeoutMs: settings.timeoutMs, now }), at: new Date(startedAt).toISOString() };
   await io.mkdir(join(home, '.plateau'), { recursive: true });
   const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
   try {
@@ -142,5 +186,7 @@ export async function runAgyUsageReader({ home = homedir(), io = fs, now = Date.
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runAgyUsageReader().catch(error => { console.error(error.message); process.exitCode = 1; });
+  runAgyUsageReader().then(result => {
+    if (result.status === 'signed-out') console.log('agy signed out');
+  }).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

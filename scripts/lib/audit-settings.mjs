@@ -63,7 +63,9 @@ const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', '
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
-  'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs']);
+  'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs',
+  // policy-cascade.mjs classifies a setting change's direction with it (loosening vs tightening).
+  'scripts/lib/settings-safe-direction.mjs']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
