@@ -10,8 +10,10 @@ export async function probeReaderYield(sourceRoot, root, lockRoot) {
   const locks = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/daemon-clone-lock.mjs')).href);
   const { runCiHealLoopIteration } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/ci-heal-loop.mjs')).href);
   const reader = { lockRoot, owner: locks.defaultOwner(), probe: () => 'alive' };
-  const writer = { ...reader, owner: 'soak-foreign-writer', waitMs: 0, writerPriorityAfter: 1 };
+  const writer = { ...reader, owner: locks.defaultOwner(process.ppid), pid: process.ppid, waitMs: 0, writerPriorityAfter: 1 };
   let reads = 0;
+  const previousLockRoot = process.env.WE_DAEMON_CLONE_LOCK_ROOT;
+  process.env.WE_DAEMON_CLONE_LOCK_ROOT = lockRoot;
   try {
     if (!locks.acquireRead(root, reader).ok) throw new Error('probe reader not admitted');
     const refused = await locks.acquireWrite(root, writer);
@@ -21,7 +23,6 @@ export async function probeReaderYield(sourceRoot, root, lockRoot) {
     locks.releaseRead(root, reader);
     const result = await runCiHealLoopIteration({
       root,
-      pendingRebuild: () => locks.readPendingRebuild?.(root, reader),
       locks: {
         acquireRead: () => { reads++; return locks.acquireRead(root, { ...reader, writerPriorityAfter: 0 }); },
         releaseRead: () => locks.releaseRead(root, reader), heartbeatRead() {},
@@ -34,6 +35,8 @@ export async function probeReaderYield(sourceRoot, root, lockRoot) {
   } finally {
     locks.releaseRead(root, reader);
     locks.releaseWrite(root, writer);
+    if (previousLockRoot === undefined) delete process.env.WE_DAEMON_CLONE_LOCK_ROOT;
+    else process.env.WE_DAEMON_CLONE_LOCK_ROOT = previousLockRoot;
   }
 }
 
@@ -68,6 +71,6 @@ export default {
       },
     });
   },
-  judge: report => report.violations.filter(v => ['reader-never-yields', 'crash'].includes(v.invariant))
+  judge: report => report.violations.filter(v => ['reader-never-yields', 'crash', 'bounded', 'isolation'].includes(v.invariant))
     .map(v => `${v.invariant}: ${v.detail}`),
 };

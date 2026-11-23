@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { main, resolveCiHealInterval, runCiHealTick, runCiHealLoop, runCiHealLoopIteration } from '../ci-heal-loop.mjs';
 import { HEARTBEAT_INTERVAL_MS } from '../../lib/daemon-clone-lock.mjs';
 import { readLockEntry } from '../../readiness/file-locks.mjs';
@@ -341,6 +341,46 @@ describe('CI heal interval', () => {
 
 
 describe('pending rebuild tick boundaries', () => {
+  beforeEach(async () => {
+    // An observed absent claim resets the process-lifetime budget, just as in production.
+    await runCiHealLoopIteration(fixture());
+  });
+
+  it.each([undefined, '2', 'invalid', '-1', '9007199254740992', '0'])(
+    'bounds consecutive yields (%s) across loop invocations and preserves normal read refusal', async setting => {
+      const deps = fixture();
+      deps.env = { WE_CI_HEAL_MAX_REBUILD_YIELDS: setting };
+      deps.pendingRebuild = () => ({ owner: 'writer', count: 1 });
+      deps.locks.acquireRead.mockReturnValue({ ok: false });
+      const max = setting === '2' ? 2 : setting === '0' ? 0 : 3;
+      for (let i = 0; i < max; i++) {
+        expect(await runCiHealLoop({ ...deps, once: true })).toEqual({ exit: 'rebuild-pending' });
+      }
+      expect(deps.locks.acquireRead).not.toHaveBeenCalled();
+      await runCiHealLoop({ ...deps, once: true });
+      expect(deps.locks.acquireRead).toHaveBeenCalledOnce();
+      expect(deps.tick).not.toHaveBeenCalled();
+      expect(deps.locks.releaseRead).not.toHaveBeenCalled();
+      expect(deps.write.mock.calls.some(([line]) => line.includes('proceeding to normal read admission'))).toBe(true);
+      deps.locks.acquireRead.mockReturnValue({ ok: true });
+      expect(await runCiHealLoopIteration(deps)).toEqual({ healed: true });
+      expect(deps.locks.acquireRead).toHaveBeenCalledTimes(2);
+    });
+
+  it('resets the yield budget only when no claim is pending', async () => {
+    const deps = fixture();
+    deps.env = { WE_CI_HEAL_MAX_REBUILD_YIELDS: '1' };
+    deps.pendingRebuild = () => ({ owner: 'writer', count: 1 });
+    expect(await runCiHealLoopIteration(deps)).toEqual({ exit: 'rebuild-pending' });
+    deps.pendingRebuild = () => { throw new Error('unreadable'); };
+    expect(await runCiHealLoopIteration(deps)).toEqual({ healed: true });
+    deps.pendingRebuild = () => ({ owner: 'other-writer', count: 2 });
+    expect(await runCiHealLoopIteration(deps)).toEqual({ healed: true });
+    deps.pendingRebuild = () => null;
+    expect(await runCiHealLoopIteration(deps)).toEqual({ healed: true });
+    deps.pendingRebuild = () => ({ owner: 'writer', count: 1 });
+    expect(await runCiHealLoopIteration(deps)).toEqual({ exit: 'rebuild-pending' });
+  });
   it('exits before acquiring a read slot or cycle lock', async () => {
     const deps = fixture();
     deps.pendingRebuild = () => ({ owner: 'foreign-writer', count: 1 });

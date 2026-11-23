@@ -10,7 +10,8 @@ import { resolveRecovery } from './recovery.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
@@ -24,7 +25,7 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS, processStartMs,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { rollbackUnverified } from './local-state.mjs';
@@ -32,6 +33,8 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+
+const lastBlockedAlert = new Map();
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -391,6 +394,7 @@ async function rebuildCloneInternal({
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
 
   if (prep.ok) {
+    lastBlockedAlert.delete(root);
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
     if (launchedBy !== 'early' && launchedBy !== 'recovery' && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
       writeRebuildStarvation(root, 0, stEnv);
@@ -403,11 +407,22 @@ async function rebuildCloneInternal({
       const raw = env?.WE_DAEMON_REBUILD_GIVEUP_ALERT_AFTER;
       const parsed = Number(raw);
       const threshold = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 5;
-      const count = inspectCloneLock(root, finalLockOpts).writerClaim?.count ?? 0;
+      const claim = inspectCloneLock(root, finalLockOpts).writerClaim;
+      const count = claim?.count ?? 0;
       if (count >= threshold) {
         const alert = `rebuild blocked: ${count} consecutive give-ups, reader ${prep.heldBy ?? '?'} still ticking (needs a restart of that reader)`;
-        alerts.push(alert);
-        if (count === threshold) log.error?.(alert);
+        const kind = 'rebuild-reader-blocked';
+        alerts.push({ kind, detail: alert });
+        const key = JSON.stringify([finalLockOpts.lockRoot, claim.owner, claim.since, count]);
+        if (lastBlockedAlert.get(root) !== key) {
+          lastBlockedAlert.set(root, key);
+          log.error?.(alert);
+          try {
+            const file = alertsFilePath(root, stEnv);
+            mkdirSync(dirname(file), { recursive: true });
+            appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind, detail: alert })}\n`, 'utf8');
+          } catch { /* best-effort audit trail only, as with prepare alerts */ }
+        }
       }
     } else if (prep.reason === 'reader-priority') {
       // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.

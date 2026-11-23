@@ -25,6 +25,7 @@ const gitRev = (cwd, ref) => execFileSync('git', ['rev-parse', ref], {
 const cloneRoot = () => gitRev(dirname(fileURLToPath(import.meta.url)), '--show-toplevel');
 const cloneHead = root => gitRev(root, 'HEAD');
 let cycleBusy = false;
+let consecutiveRebuildYields = 0;
 const cloneLocks = {
   acquireRead, releaseRead,
   heartbeatRead: (root, { owner }) => heartbeat(cloneLockDirs(root).readersRoot, owner, owner, new Date().toISOString(), process.pid),
@@ -147,11 +148,21 @@ export async function withCiHealCycleLock(fn, { env = process.env, now = Date.no
   }
 }
 
-function yieldToRebuild(pendingRebuild, write) {
+function yieldToRebuild(pendingRebuild, write, env) {
   let claim;
   try { claim = pendingRebuild(); } catch { return null; } // best-effort signal; preserve existing admission on error
-  if (!claim) return null;
-  write(`ci-heal-loop: rebuild pending for ${claim.owner} — exiting at tick boundary`);
+  if (!claim) { consecutiveRebuildYields = 0; return null; }
+  const raw = env.WE_CI_HEAL_MAX_REBUILD_YIELDS;
+  const parsed = Number(raw);
+  const valid = raw !== undefined && /^\d+$/.test(raw) && Number.isSafeInteger(parsed);
+  const max = valid ? parsed : 3;
+  const source = raw === undefined ? 'standard' : valid ? 'env' : 'env-invalid (standard fallback)';
+  if (consecutiveRebuildYields >= max) {
+    write(`ci-heal-loop: rebuild yield limit reached (${max}, source=${source}) — proceeding to normal read admission`);
+    return null;
+  }
+  consecutiveRebuildYields++;
+  write(`ci-heal-loop: rebuild pending for ${claim.owner} — exiting at tick boundary (yield ${consecutiveRebuildYields}/${max}, source=${source})`);
   return { exit: 'rebuild-pending' };
 }
 
@@ -163,7 +174,7 @@ export async function runCiHealLoopIteration({
   interval = setInterval, clearInterval: clearTimer = clearInterval,
   ensureAuth = () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS), write = line => console.error(line),
 } = {}) {
-  const pending = yieldToRebuild(pendingRebuild, write);
+  const pending = yieldToRebuild(pendingRebuild, write, env);
   if (pending) return pending;
   return withCiHealCycleLock(async () => {
     const owner = defaultOwner(process.pid);
@@ -214,7 +225,7 @@ export async function runCiHealLoop({
     const head = knownHead(readHead, root);
     if (!head) return { exit: 'head-unknown' };
     if (head !== bootHead) return { exit: 'head-moved' };
-    const pending = yieldToRebuild(pendingRebuild, write);
+    const pending = yieldToRebuild(pendingRebuild, write, iterationDeps.env ?? process.env);
     if (pending) return pending;
     const { seconds, source } = resolveInterval();
     write(`ci-heal-loop: ciHeal.intervalSec=${seconds} source=${source}`);
