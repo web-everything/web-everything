@@ -247,6 +247,14 @@ function mqRefreshChecksGreen(checks, exec, opts) {
   });
 }
 
+// Parent shape alone also matches an author's local merge of main. Only a
+// verified GitHub web-flow commit can inherit a spent refresh from its parent.
+function mqRefreshSuccessor(commit, head) {
+  return mqOid(commit?.sha) === head && commit.parents?.length === 2
+    && commit.parents.every(parent => mqOid(parent?.sha))
+    && commit.committer?.login === 'web-flow' && commit.commit?.verification?.verified === true;
+}
+
 function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow, retry = false, executed, spent }) {
   const key = `${repo}#${pr}@${head}`;
   const claimKey = retry ? `${key}#retry` : key;
@@ -316,7 +324,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow, retry = fa
       const refreshed = mqOid(after?.headRefOid);
       if (refreshed && refreshed !== head) {
         const commit = JSON.parse(exec('gh', ['api', `repos/${repo}/commits/${refreshed}`], opts));
-        if (mqOid(commit?.sha) === refreshed && commit.parents?.length === 2 && mqOid(commit.parents[0]?.sha) === head)
+        if (mqRefreshSuccessor(commit, refreshed) && mqOid(commit.parents[0]?.sha) === head)
           store.claim(`${repo}#${pr}@${refreshed}`);
       }
     } catch { log(`${prefix}post-write head binding unavailable; inspect refresh ledger before further recovery`); }
@@ -342,7 +350,7 @@ function readMqMergeState({ repo, pr, head, exec }) {
 
 // Logs can veto the refresh in favour of the fixer; they never release admission.
 // Match failure output across the WHOLE normalized log; command headers are not failure evidence.
-const realMqFailure = /^[\t ]*(?:\d{4}-\d\d-\d\dT[\d:.]+Z[\t ]+)?(?:##\[error\][\t ]*)?(?:FAIL(?:ED)?\b|AssertionError\b|(?:Type|Reference|Syntax|Range)Error:|Error:[\t ]*(?:expect\b|assert(?:ion)?\b|expected\b)|Expected:|Received:|(?:[⎯─━-]+[\t ]*)?Unhandled (?:Rejection|Error)s?\b|Errors[\t ]+\d+ errors?\b|[✗×❯](?=\s))/mi;
+const realMqFailure = /^[\t ]*(?:\d{4}-\d\d-\d\dT[\d:.]+Z[\t ]+)?(?:##\[error\][\t ]*)?(?:FAIL(?:ED)?[\t ]+(?:\S+[/\\]\S+|\S+\.[cm]?[jt]sx?\b|[^\r\n]+[\t ]>[\t ])|AssertionError\b|(?:Type|Reference|Syntax|Range)Error:|Error:[\t ]*(?:expect\b|assert(?:ion)?\b|expected\b)|Expected:|Received:|(?:[⎯─━-]+[\t ]*)?Unhandled (?:Rejection|Error)s?\b|Errors[\t ]+\d+ errors?\b|[✗×❯](?=\s))/mi;
 function readMqFailureLog({ repo, removal, exec }) {
   const unknown = detail => ({ realFailure: false, detail });
   const commit = mqOid(removal.beforeCommit?.oid);
@@ -442,7 +450,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           retry = !spent;
         }
         // Recover successor binding if the process died or the post-write read failed.
-        // A normal author commit has one parent and receives its own attempt.
+        // Author commits, including local two-parent merges, receive their own attempt.
         if (!spent && !retry && store?.hasPr?.(repo, pr) === true) {
           const commit = JSON.parse(exec('gh', ['api', `repos/${repo}/commits/${currentHead}`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
@@ -451,7 +459,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           if (mqOid(commit?.sha) !== currentHead || !Array.isArray(commit.parents)
             || ![1, 2].includes(commit.parents.length) || commit.parents.some(parent => !mqOid(parent?.sha)))
             throw new Error('refresh successor binding unavailable');
-          if (commit.parents.length === 2 && store.has(`${repo}#${pr}@${mqOid(commit.parents[0].sha)}`)) {
+          if (mqRefreshSuccessor(commit, currentHead) && store.has(`${repo}#${pr}@${mqOid(commit.parents[0].sha)}`)) {
             if (!dryRun) store.claim(key);
             spent = true;
           }
@@ -481,9 +489,14 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           logMqRefreshDecision({ pr, head: currentHead, log, retry, executed, spent },
             diagnostic.realFailure ? 'held-fixer' : 'not-evaluated',
             diagnostic.realFailure ? detail : 'refresh unavailable');
-        if (refresh && !dryRun && !diagnostic.realFailure
-          && mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh, retry, executed, spent }) === true)
-          retriesExhausted = true;
+        if (!dryRun && !diagnostic.realFailure) {
+          if (refresh && mqSameHeadRefresh({ repo, pr, head: currentHead, exec, log, ...refresh, retry, executed, spent }) === true)
+            retriesExhausted = true;
+          else {
+            recoveryAction = 'fixer';
+            detail = 'single refresh unavailable or refused by preconditions; hold for fixer inspection';
+          }
+        }
       }
       log(`mq-same-head-recovery: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${detail}`);
     }

@@ -62,7 +62,35 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     if (result.status !== 0) throw new Error(`${name}: exit code ${result.status}${result.signal ? ` (signal ${result.signal})` : ''}`);
     return result.stdout;
   };
+  const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+  const remoteHeads = pattern => run('git', ['ls-remote', '--heads', 'origin', pattern], 30_000)
+    .trim().split('\n').filter(Boolean).map(line => {
+      const match = /^([a-fA-F0-9]{40})\t(refs\/heads\/[^\s]+)$/.exec(line);
+      if (!match) throw new Error('unreadable remote heads');
+      return { sha: match[1], branch: match[2].slice('refs/heads/'.length) };
+    });
   return {
+    branchTip(branch) {
+      const name = branch.replace(/^refs\/heads\//, '');
+      const matches = remoteHeads(`refs/heads/${name}`).filter(entry => entry.branch === name);
+      return matches.length === 1 ? matches[0].sha : null;
+    },
+    findBranch(head) {
+      const matches = remoteHeads('refs/heads/lane/*').filter(entry => entry.sha === head);
+      return matches.length === 1 ? matches[0].branch : null;
+    },
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    nowMs: () => Date.now(),
+    readRecords: () => fs.readFileSync(recordPath(), 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)),
+    isAncestor(basis, head) {
+      if (basis === head) return false;
+      const result = spawnSync('git', ['merge-base', '--is-ancestor', basis, head],
+        { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 });
+      if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('ancestry unavailable');
+      return result.status === 0;
+    },
+    diffFiles: (basis, head) => run('git', ['diff', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000)
+      .split('\0').filter(Boolean),
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
@@ -90,7 +118,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       }
     },
     appendRecord(record) {
-      const path = resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+      const path = recordPath();
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },
