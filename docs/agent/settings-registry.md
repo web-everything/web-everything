@@ -115,7 +115,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
 | fixDispatch | scripts/dispatch-settings.json, scripts/settings/fix-empty-steps.json | 8 | {"borrowBuildSlots":"on","borrowAfterMinutes":15,"borrowExe… | pr | no | Fix slot borrowing, parked-run accounting and completion release policy. |
 | fixDispatchMaxConcurrent | scripts/dispatch-settings.json | 1 | 2 | pr | no | Maximum concurrent fix dispatches. |
-| fixExecutor | scripts/settings/fix-executor.json | 2 | {"fallbackChain":["codex","codex-alt","claude"],"criticalCl… | pr | no | Fix executor fallback chain and critical Claude routing rung. |
+| fixExecutor | scripts/settings/fix-executor.json | 2 | {"fixSeatMix":["codex","codex-alt","gemini","claude"],"crit… | pr | no | Fix executor fallback chain and critical Claude routing rung. |
 | fixLoop | scripts/settings/exhausted-retry.json | 5 | {"exhaustedRetry":{"enabled":true,"onMainMove":true,"maxRet… | pr | no | Retry policy for exhausted fixes after main advances. |
 | fixPassBudget | scripts/settings/fix-pass-budget.json | 7 | {"fixMs":120000,"notesMs":90000,"orphanGuardMs":60000,"stuc… | pr | no | Per-pass time budgets for fixer recovery and draft promotion. |
 | fixScope | scripts/settings/fix-scope.json | 1 | {"regionMarginLines":3} | pr | no | Line margin around a finding region in fix scope. |
