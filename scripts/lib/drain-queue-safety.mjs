@@ -117,6 +117,9 @@ export function readMqTimeline({ repo, pr, exec = execFileSync } = {}) {
 export const mqSameHeadRefreshStatePath = (env = process.env) => env.WE_DRAIN_MQ_REFRESH_STATE_PATH
   || join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json');
 
+/** Marker for a refresh-generated head: its claim was inherited from an executed refresh, never time-checked. */
+export const mqRefreshSuccessorMarker = key => `${key}#successor`;
+
 /** Append-only claims with sidecar times. Writers share a lock, never a cached snapshot. */
 export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath() } = {}) {
   const load = () => {
@@ -139,15 +142,21 @@ export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath
     has: key => load().has(key),
     claimedAt: key => loadTimes()[key] ?? null,
     hasPr: (repo, pr) => [...load()].some(key => key.startsWith(`${repo}#${pr}@`)),
-    claim(key) {
+    claim(key, { successor = false } = {}) {
       // Contention never falls back to an unlocked write. Failed requests retain their claims.
+      // A successor claim and its marker land in ONE ledger write, so a crash never leaves the
+      // generated head time-checked against its own already-created CI run.
       mkdirSync(dirname(path), { recursive: true });
       return withFileLock(`${path}.lock`, () => {
         const keys = load();
-        if (keys.has(key)) return false;
+        const wanted = successor ? [key, mqRefreshSuccessorMarker(key)] : [key];
+        if (wanted.every(k => keys.has(k))) return false;
         const times = loadTimes();
-        times[key] = Date.now();
-        keys.add(key);
+        for (const k of wanted) {
+          if (keys.has(k)) continue;
+          times[k] = Date.now();
+          keys.add(k);
+        }
         writeJsonAtomic(`${path}.times.json`, times, { mode: 0o600 });
         writeJsonAtomic(path, [...keys], { mode: 0o600 });
         return true;
@@ -325,7 +334,7 @@ function mqSameHeadRefresh({ repo, pr, head, exec, log, store, allow, retry = fa
       if (refreshed && refreshed !== head) {
         const commit = JSON.parse(exec('gh', ['api', `repos/${repo}/commits/${refreshed}`], opts));
         if (mqRefreshSuccessor(commit, refreshed) && mqOid(commit.parents[0]?.sha) === head)
-          store.claim(`${repo}#${pr}@${refreshed}`);
+          store.claim(`${repo}#${pr}@${refreshed}`, { successor: true });
       }
     } catch { log(`${prefix}post-write head binding unavailable; inspect refresh ledger before further recovery`); }
   } catch (error) {
@@ -430,8 +439,11 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
         spent = store?.has(key) === true;
         if (spent) {
           const retryClaimed = store.has(`${key}#retry`);
-          const claimedAt = store.claimedAt(retryClaimed ? `${key}#retry` : key);
-          executed = false;
+          // A generated successor exists only because its parent's refresh executed. Its claim time
+          // follows its own CI run's creation, so run timing can never prove it unexecuted.
+          const successor = !retryClaimed && store.has(mqRefreshSuccessorMarker(key));
+          const claimedAt = successor ? null : store.claimedAt(retryClaimed ? `${key}#retry` : key);
+          executed = successor;
           if (claimedAt !== null) {
             runEvidenceUnreadable = true;
             const runs = JSON.parse(exec('gh', ['api', `repos/${repo}/actions/runs?head_sha=${currentHead}&per_page=100`], {
@@ -460,7 +472,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
             || ![1, 2].includes(commit.parents.length) || commit.parents.some(parent => !mqOid(parent?.sha)))
             throw new Error('refresh successor binding unavailable');
           if (mqRefreshSuccessor(commit, currentHead) && store.has(`${repo}#${pr}@${mqOid(commit.parents[0].sha)}`)) {
-            if (!dryRun) store.claim(key);
+            if (!dryRun) store.claim(key, { successor: true });
             spent = true;
           }
         }

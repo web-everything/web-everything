@@ -11,11 +11,16 @@ const removed = (testedHead = head) => ({ __typename: 'RemovedFromMergeQueueEven
   beforeCommit: { oid: merge, parents: { nodes: [{ oid: 'c'.repeat(40) }, { oid: testedHead }] } },
   createdAt: '2026-11-21T12:00:00Z' });
 const added = { __typename: 'AddedToMergeQueueEvent' };
+// Run evidence is explicit per fixture: CI created just after the lookup (so after any earlier claim),
+// or CI created before every claim (a generated head's own run precedes its binding timestamp).
+const ciRanAfterClaim = () => ({ total_count: 1, workflow_runs: [{ created_at: new Date(Date.now() + 1000).toISOString() }] });
+const ciRanBeforeClaim = { total_count: 1, workflow_runs: [{ created_at: '2000-01-01T00:00:00Z' }] };
 
 function fixture(test) {
   const dir = mkdtempSync(join(tmpdir(), 'mq-single-refresh-'));
   const path = join(dir, 'ledger.json');
-  const f = { path, head, events: [removed()], text: new Error('HTTP 404'), logs: [], writes: [], log: vi.fn() };
+  const f = { path, head, events: [removed()], text: new Error('HTTP 404'), logs: [], writes: [], runLookups: [],
+    runs: ciRanAfterClaim, log: vi.fn() };
   const exec = vi.fn((file, args, options) => {
     expect(file).toBe('gh');
     expect(options.env.WE_GH_READ_MEMO_DIR).toBeUndefined();
@@ -32,10 +37,11 @@ function fixture(test) {
     if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, mergeStateStatus: f.mergeState ?? 'CLEAN',
       statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }], labels: ['ready-to-merge'] });
     const endpoint = args.find(a => a.startsWith('repos/'));
-    if (endpoint?.includes('/actions/runs?head_sha=') && f.runs instanceof Error) throw f.runs;
-    if (endpoint?.includes('/actions/runs?head_sha=') && f.runs) return JSON.stringify(f.runs);
-    if (endpoint?.includes('/actions/runs?head_sha=')) return JSON.stringify({ total_count: 1,
-      workflow_runs: [{ created_at: '2099-01-01T00:00:00Z' }] });
+    if (endpoint?.includes('/actions/runs?head_sha=')) {
+      f.runLookups.push(endpoint.match(/head_sha=([0-9a-f]+)/)[1]);
+      if (f.runs instanceof Error) throw f.runs;
+      return JSON.stringify(typeof f.runs === 'function' ? f.runs() : f.runs);
+    }
     if (endpoint?.includes('/check-runs') && f.checksOverride) return JSON.stringify(f.checksOverride);
     if (endpoint?.includes('/check-runs')) return JSON.stringify({ total_count: 1, check_runs: [{
       id: 12, name: 'test-shard (1)', head_sha: merge, status: 'completed', conclusion: 'failure',
@@ -262,10 +268,41 @@ describe('same-head failures never authorize re-enqueue from logs', () => {
   }));
   it('re-reads after update and binds the generated refresh head to the spent ledger', () => fixture(f => {
     f.afterHead = 'e'.repeat(40);
+    f.runs = ciRanBeforeClaim;
     f.run();
     f.events.push(removed(f.head));
     expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
     expect(f.writes).toHaveLength(1);
+  }));
+  // The generated head's own CI run is created before its binding claim is stamped. Run timing must
+  // never reopen a retry for it: the binding is executed by construction (immediate and recovered).
+  it.each([['immediate', false], ['recovered', true]])(
+    '%s successor binding stays spent when its CI run predates the binding claim', (_, postReadFails) => fixture(f => {
+      f.afterHead = 'e'.repeat(40); f.postReadFails = postReadFails;
+      f.runs = ciRanBeforeClaim;
+      f.run();
+      f.postReadFails = false;
+      f.events.push(removed(f.head));
+      for (let i = 0; i < 3; i++) {
+        expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+        f.events.push(added, removed(f.head));
+      }
+      expect(f.writes).toHaveLength(1);
+      expect(f.runLookups).not.toContain(f.head);
+      const store = createMqSameHeadRefreshStore({ path: f.path });
+      expect(store.has(`${repo}#${pr}@${f.head}#successor`)).toBe(true);
+      expect(store.has(`${repo}#${pr}@${f.head}#retry`)).toBe(false);
+      expect(decisions(f).at(-1)).toContain('retry=false executed=true spent=true outcome=held-fixer');
+    }));
+  it('a successor claim writes its marker atomically and upgrades a legacy unmarked binding', () => fixture(f => {
+    const store = createMqSameHeadRefreshStore({ path: f.path });
+    const key = `${repo}#${pr}@${'e'.repeat(40)}`;
+    expect(store.claim(key)).toBe(true);
+    expect(store.claim(key)).toBe(false);
+    expect(store.has(`${key}#successor`)).toBe(false);
+    expect(store.claim(key, { successor: true })).toBe(true);
+    expect(store.claim(key, { successor: true })).toBe(false);
+    expect(store.has(key) && store.has(`${key}#successor`)).toBe(true);
   }));
   it.each([false, true])('author merge receives its own refresh (races post-write read: %s)', racesRead => fixture(f => {
     if (racesRead) { f.afterHead = 'e'.repeat(40); f.authorMerge = true; }

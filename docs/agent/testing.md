@@ -6346,9 +6346,18 @@ the head before the write, including refused requests. Re-read after the write a
 head to the spent attempt; a new author head gets its own attempt. A second failure holds for the fixer.
 Normalization `ok:false` never supplies success or real-failure proof; recovery evidence stays incomplete.
 
+A persisted claim on an authored head blocks a second refresh once an Actions run on that head was created
+after the claim, or once its single `#retry` claim is spent; a claim with no later run (the write never
+executed) earns exactly one retry. A generated successor binding (immediate or recovered) is written with a
+`#successor` marker in the same locked ledger write and counts as executed by construction: its own CI run
+predates its binding timestamp, so run timing is never consulted for it. Unreadable run evidence holds for
+the fixer.
+
 Keep negative tests for real failures (zero refreshes), unreadable/normalization-failed logs (one refresh),
-repeat failures and persisted ledger entries (no second refresh), new author heads (one new refresh), and
-the merge gate refusing non-green group members. The unreadable-log soak probes the refresh path itself.
+repeat failures, persisted claims followed by a run (no second refresh), persisted claims with no later run
+(one retry, then fixer), successor bindings whose CI predates the binding (no second refresh, no run lookup),
+new author heads (one new refresh), and the merge gate refusing non-green group members. The unreadable-log
+soak probes the refresh path itself.
 
 Refresh refusal is terminal for the guard's automatic refresh path: missing options/store, failed eligibility,
 or refused/unreadable approval selects fixer inspection without spending a refresh claim. Dry-run stays
@@ -6396,9 +6405,10 @@ Receipt fields: `check`, `observedAt`, `currentHead`, `incidentHead`, `mergeGrou
 `successorHead`, `successorCommitter`, `successorVerified`, `subsequentCiHead`, `subsequentCiUrl`,
 `subsequentCiConclusion`, `admissionHeldUntilGreen`, `result`, `evidenceLocation`. No live receipt was
 available in the offline repair; these three acceptance rows remain open until recorded by the launcher/operator.
-The offline caller sweep also found that `scripts/merge-ai-prs.mjs` returns the same-head hold without
-invoking `routeMqFailureOnHold`. This existing caller is outside the repair's listed file scope; guard/adapter
-fixtures do not prove production fixer dispatch. Resolve that wiring gap before claiming incident recovery.
+No live incident proof is claimed by any PR in this stack until those receipts are recorded.
+`scripts/merge-ai-prs.mjs` routes a same-head hold to the fixer through `createDrainMqRouteWiring`
+(`mqFixerRoutes.start`, settled before the pass exits); `merge-ai-prs-mq-fixer-route.test.mjs` pins that
+wiring. Fixture coverage of the wiring is still not a live incident receipt.
 
 ## Orphan exclusions precede stand-down answers
 
