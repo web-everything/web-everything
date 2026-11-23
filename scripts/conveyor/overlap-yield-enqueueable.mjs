@@ -13,6 +13,21 @@ const LANDABLE_ENV_KEY = 'WE_DRAIN_OVERLAP_YIELD_REQUIRES_LANDABLE';
 const LANDABLE_ENABLE_FLAG = '--overlap-yield-requires-landable';
 const LANDABLE_DISABLE_FLAG = '--no-overlap-yield-requires-landable';
 
+/** Only confirmed failed-check removals release overlap waiters. The outcome kind
+ * also covers missing live evidence. Inspect the detail AND appended decline text;
+ * uncertain evidence keeps the existing yield budget/operator inspection path.
+ */
+export function isAffirmativeMqSameHeadFailure(outcome) {
+  if (outcome?.outcome !== 'not-enqueued' || outcome.kind !== 'mq-same-head-failed'
+    || typeof outcome.reason !== 'string') return false;
+  const detail = /^mq-same-head-failed: #\d+ head \S+ — (.+)$/.exec(outcome.reason)?.[1];
+  if (!detail || /unreadable|mismatched|incomplete|unknown|inspect queue/i.test(detail)) return false;
+  // Allow only hold details actually emitted by decideMqSameHead, before any
+  // operator guidance/decline suffix. A generic "failed" is not bound evidence.
+  const hold = detail.split(';', 1)[0];
+  return /^failed_checks(?: \((?:\d+ removals on this head|cancelled\/regroup retries already spent: \d+\/[12]|the two infrastructure retries were already spent|re-queued after the failed removal without retry evidence)\))?$/.test(hold);
+}
+
 /** drain.overlapYieldOnlyToEnqueueable: CLI > env > default ON.
  * Env accepts 1/0, on/off, true/false. Conflicting flags and invalid env values
  * are usage errors, matching the overlap-yield overrides' handling.

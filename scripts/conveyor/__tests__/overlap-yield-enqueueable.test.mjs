@@ -20,6 +20,59 @@ function waits(rows) {
 
 afterEach(() => vi.unstubAllEnvs());
 
+describe('affirmative same-head failure evidence', () => {
+  const outcome = detail => ({ outcome: 'not-enqueued', kind: 'mq-same-head-failed',
+    reason: `mq-same-head-failed: #7369 head ${'a'.repeat(40)} — ${detail}` });
+
+  it.each([
+    'unreadable or mismatched live merge-queue state; inspect queue before retrying',
+    'mismatched live merge-queue state',
+    'failed_checks; retry evidence unreadable or incomplete',
+    'failed_checks (exact-test proof missing, unreadable or incomplete); operator must inspect history and enqueue manually',
+    'failed_checks; PR is not CLEAN (unknown)',
+    'failed_checks; inspect queue before retrying',
+    'unknown removal reason; operator must inspect history and enqueue manually',
+    'no commit binding for merge-queue removal; operator must inspect history and enqueue manually',
+    'some new failure wording',
+    'failed_checks possibly failed',
+  ])('retains the yield for missing or unknown evidence: %s', async detail => {
+    const { isAffirmativeMqSameHeadFailure } = await load();
+    expect(isAffirmativeMqSameHeadFailure(outcome(detail))).toBe(false);
+  });
+
+  it('accepts the real confirmed-failed reason emitted by decideMqSameHead', async () => {
+    const { decideMqSameHead } = await import('../../lib/drain-queue-safety.mjs');
+    const { isAffirmativeMqSameHeadFailure } = await load();
+    const head = 'a'.repeat(40);
+    const decision = decideMqSameHead({ pr: 7369, head, timeline: { hasPreviousPage: false, nodes: [{
+      __typename: 'RemovedFromMergeQueueEvent', reason: 'failed_checks',
+      beforeCommit: { parents: { nodes: [{ oid: 'b'.repeat(40) }, { oid: head }] } },
+    }] } });
+    expect(decision.hold).toBe(true);
+    expect(decision.line).toBe(outcome('failed_checks').reason);
+    expect(isAffirmativeMqSameHeadFailure({ ...outcome(''), reason: decision.line })).toBe(true);
+  });
+
+  it.each([
+    'failed_checks; non-infrastructure failed check(s): test; main was not red at removal',
+    'failed_checks (3 removals on this head); operator must inspect history and enqueue manually; retry bound reached (this head already had its single retry)',
+    'failed_checks (the two infrastructure retries were already spent); operator must inspect history and enqueue manually',
+    'failed_checks (cancelled/regroup retries already spent: 2/2); operator must inspect history and enqueue manually; cancelled/regroup retry bound reached; operator must inspect history and enqueue manually',
+    'failed_checks (re-queued after the failed removal without retry evidence); operator must inspect history and enqueue manually',
+  ])('accepts confirmed failures with known hold and decline text: %s', async detail => {
+    const { isAffirmativeMqSameHeadFailure } = await load();
+    expect(isAffirmativeMqSameHeadFailure(outcome(detail))).toBe(true);
+  });
+
+  it('refuses absent, malformed and unrelated outcomes', async () => {
+    const { isAffirmativeMqSameHeadFailure } = await load();
+    for (const value of [undefined, {}, outcome(''), { ...outcome('failed_checks'), reason: 'failed_checks' },
+      { ...outcome('failed_checks'), outcome: 'enqueued' }, { ...outcome('failed_checks'), kind: 'other' }]) {
+      expect(isAffirmativeMqSameHeadFailure(value)).toBe(false);
+    }
+  });
+});
+
 describe('enqueueable overlap targets through buildOverlapRows', () => {
   it('replans a waiter in the same pass after an enqueue hold while the original verdict remains merge', () => {
     vi.stubEnv(landableEnv, '1');
