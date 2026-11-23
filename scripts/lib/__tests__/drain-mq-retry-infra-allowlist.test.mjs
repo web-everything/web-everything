@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mqSameHeadGuard, readDrainQueueSafety } from '../drain-queue-safety.mjs';
+import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
 
 // Exercise the production readSettings().drain path without reading developer settings.
 const settings = vi.hoisted(() => ({ drain: {} }));
@@ -10,7 +10,6 @@ vi.mock('../settings-files.mjs', async importOriginal => ({
 const repo = 'fixture/drain', pr = 6215;
 const head = 'a'.repeat(40), mergeCommit = 'b'.repeat(40);
 const now = Date.parse('2026-11-01T14:00:00Z');
-const standard = ['could not fetch \\S+ from promisor remote'];
 const infraLog = 'fatal: could not fetch deadbeef from promisor remote\n';
 const testLog = 'FAIL test/shard.test.ts > adds numbers\nAssertionError: expected 2 to be 3\n';
 const MAX_JOBS = 10, MAX_LOG_BYTES = 4 * 1024 * 1024;
@@ -80,10 +79,8 @@ function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
 }
 
 // The reader is private: the public retry line exposes its infra classification.
-function expectInfraRetry(decision) {
-  expect(decision.hold).toBe(false);
-  expect(decision.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
-  expect(decision.line).toContain('main run 102');
+function expectFailureHold(decision) {
+  expect(decision.hold).toBe(true);
 }
 
 function expectVisibleDecision(decision, reason, mainRunId = 102) {
@@ -126,9 +123,9 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST'))).toEqual([]);
   });
 
-  it('accepts failure-conclusion test shards only when every failed job log matches the standard allowlist', () => {
+  it('holds failure-conclusion test shards even when every log prints an infrastructure signature', () => {
     const f = fixture({ checks: [job(21), job(22)], logs: new Map([[21, infraLog], [22, infraLog]]) });
-    expectInfraRetry(f.guard());
+    expectFailureHold(f.guard());
     expect(f.logReads.map(read => read.id).sort()).toEqual([21, 22]);
   });
 
@@ -167,49 +164,37 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(f.logReads).toHaveLength(0);
   });
 
-  it('reads a custom drain setting through readSettings and changes the verdict in both directions', () => {
+  it('ignores a retired custom signature setting', () => {
     settings.drain = { mqInfraSignatures: ['fixture infrastructure outage'] };
-    expectInfraRetry(fixture({ logs: new Map([[21, 'fixture infrastructure outage\n']]) }).guard());
-    expect(fixture().guard().hold).toBe(true);
+    expectFailureHold(fixture({ logs: new Map([[21, 'fixture infrastructure outage\n']]) }).guard());
+    expectFailureHold(fixture().guard());
   });
 
-  it('resolves and logs the standard allowlist and its provenance through the drain cascade', () => {
-    const log = vi.fn();
-    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log });
-    expect(r.value.mqInfraSignatures).toEqual(standard);
-    expect(r.sources.mqInfraSignatures).toBe('standard');
-    expect(log.mock.calls.flat().join('\n')).toMatch(/mqInfraSignatures=.*\(standard\)/);
+  it.each(['title', 'summary'])('holds Runner disconnected in output.%s with assertion failures in the log', field => {
+    const f = fixture({ checks: [{ ...job(21), output: { [field]: 'Runner disconnected' } }],
+      logs: new Map([[21, testLog]]) });
+    expectFailureHold(f.guard());
+    expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
-  it('resolves platform then tool allowlists with effective-value provenance', () => {
-    const platform = { mqInfraSignatures: ['platform outage'] }, log = vi.fn();
-    const p = readDrainQueueSafety({ env: {}, tool: {}, platform, log });
-    expect(p.value.mqInfraSignatures).toEqual(platform.mqInfraSignatures);
-    expect(p.sources.mqInfraSignatures).toBe('platform');
-    const tool = { mqInfraSignatures: ['tool outage'] };
-    const t = readDrainQueueSafety({ env: {}, tool, platform, log });
-    expect(t.value.mqInfraSignatures).toEqual(tool.mqInfraSignatures);
-    expect(t.sources.mqInfraSignatures).toBe('tool');
-    expect(log.mock.calls.flat().join('\n')).toMatch(/mqInfraSignatures=.*tool outage.*\(tool\)/);
+  it('holds TAP not ok output alongside a printed infrastructure signature', () => {
+    const f = fixture({ logs: new Map([[21, 'not ok 1 - adds numbers\n' + infraLog]]) });
+    expectFailureHold(f.guard());
+    expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
-  it.each([
-    ['empty source', ['']], ['star catch-all', ['.*']], ['anchor catch-all', ['^']],
-    ['plus catch-all', ['.+']], ['non-string entry', [42]], ['uncompilable', ['[']],
-    ['mixed valid and invalid entries', [...standard, '.*']], ['non-array', 'outage'],
-  ])('rejects %s, reports validation, and falls back to the standard default', (_name, value) => {
-    const r = readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: value }, platform: {} });
-    expect(r.value.mqInfraSignatures).toEqual(standard);
-    expect(r.sources.mqInfraSignatures).toBe('standard');
-    expect(r.invalid.join('\n')).toContain('mqInfraSignatures');
-    settings.drain = { mqInfraSignatures: value };
-    expectInfraRetry(fixture().guard());
-    expect(fixture({ logs: new Map([[21, testLog]]) }).guard().hold).toBe(true);
+  it('holds summary-only runner loss with failure conclusion, green main and CLEAN PR', () => {
+    const f = fixture({ checks: [{ ...job(21), output: { summary: 'Runner disconnected' } }],
+      logs: new Map([[21, 'Process exited with code 1\n']]) });
+    const decision = f.guard();
+    expectFailureHold(decision);
+    expectVisibleDecision(decision, /non-infrastructure/);
+    expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
   it('fetches only failed jobs using bounded, throttled exec calls', () => {
     const f = fixture({ checks: [job(21), job(22, 'success'), job(23, 'neutral'), job(24, 'skipped')] });
-    expectInfraRetry(f.guard());
+    expectFailureHold(f.guard());
     expect(f.logReads.map(read => read.id)).toEqual([21]);
     const opts = f.logReads[0].opts;
     expect(opts.encoding).toBe('utf8');
@@ -220,10 +205,10 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(opts.timeout).toBeLessThanOrEqual(60_000);
   });
 
-  it('accepts exactly ten matching failed jobs without fetching any job twice', () => {
+  it('holds exactly ten matching failed jobs without fetching any job twice', () => {
     const checks = Array.from({ length: MAX_JOBS }, (_, i) => job(21 + i));
     const f = fixture({ checks, logs: new Map(checks.map(check => [check.id, infraLog])) });
-    expectInfraRetry(f.guard());
+    expectFailureHold(f.guard());
     expect(f.logReads.map(read => read.id).sort()).toEqual(checks.map(check => check.id).sort());
   });
 
@@ -242,10 +227,10 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
-  it('tail-scans oversized returned text and recognizes a signature at the end', () => {
+  it('holds oversized returned text with a signature at the end', () => {
     // Injected IO may return more than maxBuffer; the classifier must bound its scan too.
     const f = fixture({ logs: new Map([[21, 'x'.repeat(MAX_LOG_BYTES * 2) + '\n' + infraLog]]) });
-    expectInfraRetry(f.guard());
+    expectFailureHold(f.guard());
     expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
@@ -258,10 +243,10 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(decision.reason ?? decision.line).toMatch(/(?:log|evidence).*operator.*inspect/i);
   });
 
-  it('returns the accept reason and deciding main run for catch-up outcome visibility', () => {
+  it('returns the hold reason and deciding main run for catch-up outcome visibility', () => {
     const decision = fixture().guard();
-    expectInfraRetry(decision);
-    expectVisibleDecision(decision, /infra retry 1\/2/);
+    expectFailureHold(decision);
+    expectVisibleDecision(decision, /non-infrastructure/);
   });
 
   it('returns the decline reason and deciding main run on the guard result consumed by merge-ai-prs', () => {
