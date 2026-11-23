@@ -47,7 +47,9 @@ export const AUDITOR_FLOOR = Object.freeze([
   'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
   'scripts/codex-direct-task.mjs', 'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
-const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/protected-path-floor.mjs', 'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
+const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/protected-path-floor.mjs',
+  'scripts/lib/guard-path-floor.mjs', 'scripts/lib/guard-auditor-roots.json',
+  'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
@@ -101,6 +103,7 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
   'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
@@ -122,6 +125,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
   'scripts/settings/review-red-team-on-skip.json',
+  // Decides which red-main timeouts the safety net quarantines at once (quarantine-early slice 2).
+  'scripts/settings/test-timeout-policy.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
@@ -153,6 +158,8 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The CI retry allowance is consumed with an exclusive `wx` create.
+  'scripts/ci/rerun-failed-once.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
