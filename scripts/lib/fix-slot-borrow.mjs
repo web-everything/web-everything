@@ -26,7 +26,7 @@ import { BUILD_DISPATCH_POLICY } from '../conveyor/build-dispatch-policy.mjs';
 import { gateLaunch } from './resource-gate.mjs';
 import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
-import { pickChainRung } from './fix-executor-chain.mjs';
+import { pickChainRung, resolveFixExecutionMode } from './fix-executor-chain.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
 // Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
@@ -61,7 +61,7 @@ export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddress
 }
 
 /** Pure; provider-routing leaves existing provider/borrow selection in control. */
-export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, chain, critical = false, ...entry } = {}) {
+function chooseBareFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, chain, critical = false, ...entry } = {}) {
   const source = setting.source ?? 'default';
   const claude = (reason) => ({ executor: 'claude', reason, source });
   if (setting.value === 'claude') return claude('fix.executor=claude');
@@ -74,7 +74,7 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
     const trigger = entry.takeover ? 'takeover' : entry.rulingNotAddressed ? 'ruling-not-addressed'
       : entry.strongerModel || (entry.round ?? 1) >= 3 ? 'stronger-model' : null;
     return { ...pickChainRung({ chain: chain.value, rungs: chain.rungs, trigger, codexUnproductive: entry.codexUnproductive,
-      critical, criticalClaudeFromRung: chain.criticalClaudeFromRung, criticalSource: chain.criticalClaudeFromRungSource,
+      critical,
       launcherAvailable: available }), source: chain.source ?? 'default' };
   }
   const only = claudeOnlyReason(entry);
@@ -83,8 +83,14 @@ export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'd
   return { executor: 'codex', reason: 'codex-first ordinary repair', source };
 }
 
-export const formatFixExecutorLog = ({ executor, rung, policyRoute, reason, source }) =>
-  `fix executor: ${executor}${rung ? ` rung=${rung} model=${policyRoute?.model ?? 'default'} effort=${policyRoute?.effort ?? 'default'}` : ''} (${reason}, source ${source})`;
+export function chooseFixExecutor(input = {}) {
+  const decision = chooseBareFixExecutor(input);
+  return { ...decision, rung:decision.rung ?? decision.executor, provider:decision.policyRoute?.provider ?? decision.executor,
+    ...(input.chain?.mode ? {mode:input.chain.mode,modeSource:input.chain.modeSource} : resolveFixExecutionMode({kind:input.kind})), requiresReview:!!input.critical };
+}
+
+export const formatFixExecutorLog = ({ executor, rung, provider, mode = resolveFixExecutionMode().mode, modeSource, requiresReview, policyRoute, reason, source }) =>
+  `fix executor: ${executor}${rung ? ` rung=${rung} model=${policyRoute?.model ?? 'default'} effort=${policyRoute?.effort ?? 'default'}` : ''} provider=${provider ?? policyRoute?.provider ?? executor} mode=${mode} modeSource=${modeSource} requiresReview=${!!requiresReview} (${reason}, source ${source})`;
 
 /** Stamp routing separately from `borrowed`: builder accounting must never count this as a borrowed slot. */
 export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fixDispatchClaimRoot(), decision }) {
@@ -92,7 +98,7 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
   const claim = readLockEntry(lockRoot, resource);
   if (!claim || claim.owner !== owner) return false;
   return heartbeat(lockRoot, resource, owner, new Date().toISOString(), claim.pid ?? null,
-    { ...claim.meta, fixExecutor: { executor: decision.executor, reason: decision.reason } });
+    { ...claim.meta, fixExecutor: { executor: decision.executor, rung: decision.rung, provider: decision.provider, mode: decision.mode, requiresReview: !!decision.requiresReview, reason: decision.reason } });
 }
 
 /**
@@ -114,7 +120,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
     }
     const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
     if (decision.executor === null) return { held: true, reason: decision.reason };
-    const nonClaude = decision.executor !== 'claude';
+    const nonClaude = decision.executor !== 'claude' && decision.mode !== 'wrapped';
     const sinks = createSinks({ ...options, ...(nonClaude ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
       const profile = profileFor(options.repo ?? planned.repo ?? 'we');
@@ -134,6 +140,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       // Observe the existing provider's actual choice without changing that choice.
       const entries = Object.entries(sinks);
       for (const [key, sink] of entries) sinks[key] = async (...args) => {
+        stampExecutor({repo:options.repo ?? planned.repo ?? 'we',pr:planned.pr,kind:'ci-heal',owner:args[0]?.claimOwner,lockRoot:args[0]?.claimRoot,decision});
         const out = await sink(...args);
         if (!out?.held) console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog({ ...decision, executor: out?.dispatch?.executor ?? 'claude' })}`);
         return out;

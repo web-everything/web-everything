@@ -128,7 +128,9 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
+import picomatch from 'picomatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
+import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
 import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
@@ -171,7 +173,6 @@ import { loadFixerLadder } from './fixer-ladder.mjs';
 import { mainRedPriorityRank } from './main-ci-red-core.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
-import { CLAUDE_NATIVE_MODEL_BY_TIER } from '../lib/dispatch-contracts.mjs';
 import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routing-policy-io.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
@@ -1310,14 +1311,19 @@ function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readR
     strongerModel: !!planned.strongerModel || !!roundEscalationFor(planned, { fixSettings, loadLadder }) };
 }
 
+function criticalFixEntry(p, globs = resolveFixCriticalGlobs()) {
+  return ((p.risk === 'high' || p.humanRequired === true || p.tags?.includes('security'))
+    && criticalWorkVerdict({ ...p, filesTouched: p.scope }).critical)
+    || !Array.isArray(p.scope) || !p.scope.length || p.scope.some(path => typeof path !== 'string' || !path.trim()
+    || picomatch.isMatch(path.trim().replace(/^[^/:]+:/, '').replace(/^\.\//, ''), globs, { nocase: true, dot: true }));
+}
+
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
 export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLadder, launcherAvailable, readRouted,
   loadFixItems = () => defaultLoadItems(REPO_ROOT),
-  criticalFor = p => criticalWorkVerdict({ taskType: p.kind === 'ci-heal' ? 'ci-heal' : 'fix', filesTouched: p.scope ?? [] }).critical }) {
+  criticalFor = p => criticalFixEntry(p, chain?.criticalGlobs) }) {
   let critical = true;
   try { critical = criticalFor(planned); } catch { /* unknown verdict fails closed */ }
-  if (!chain?.value?.includes('argon'))
-    return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted }), setting, chain, critical, launcherAvailable });
   let item;
   try { item = planned.itemNum ? loadFixItems().find(i => String(i.num) === String(planned.itemNum)
     || String(i.bornAs) === String(planned.itemNum)) : planned; } catch { item = null; }
@@ -1328,20 +1334,11 @@ export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLad
   return { ...decision, ...(decision.executor === 'antigravity' ? { agyAdmission: admission } : {}) };
 }
 
-/** Every Claude fix gets an explicit policy model, including send-backs without a ladder route.
- * Uses the same critical-work verdict supplied to provider-routing's CRITICAL_WORK_GATE; a rung alone is no risk signal. */
+/** Every Claude escalation uses the configured repair model, regardless of review requirements. */
 export function launchTableFor(planned, roundEscalation, { fixSettings = resolveFixSettings(), capacityRoute } = {}) {
   const table = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
-  const verdict = criticalWorkVerdict({ ...planned, taskType: 'fix', filesTouched: planned.scope ?? [] });
-  if (verdict.critical) {
-    const route = resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', available: ['claude'], gateClosed: true,
-      inheritedRoute: { provider: 'claude', model: CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: 'high', fallback: [] } });
-    // Inherited (including omitted) routes retain the critical-work model, never the escalation rung's model.
-    return { ...table, model: route?.model ?? CLAUDE_NATIVE_MODEL_BY_TIER.opus, effort: route?.effort ?? 'high',
-      reason: `${route ? 'routing-policy fix:critical-work' : 'critical-work fallback'} (${verdict.reasons.map(r => r.proxy).join(', ')})` };
-  }
   if (capacityRoute?.provider === 'claude' && capacityRoute.model && !roundEscalation
-    && !planned.takeover && !planned.rulingNotAddressed && !planned.mainFix && !planned.strongerModel) {
+    && !planned.takeover && !planned.rulingNotAddressed && !planned.mainFix && !planned.strongerModel && !criticalFixEntry(planned)) {
     return { model: capacityRoute.model, effort: capacityRoute.effort ?? 'high', reason: 'configured capacity winner' };
   }
   const configured = fixSettings.claudeEscalationModel ?? 'sonnet';
@@ -1580,9 +1577,10 @@ export function dispatchFix(planned, {
   if (safety.value.resetOnRepeatedFinding) {
     try { repeat = repeatedFindingPlan(readHistoryInputs({ repo, pr: planned.pr })?.comments); } catch { /* launcher re-reads */ }
   }
-  const decision = repeat.action !== 'patch' ? { executor: 'codex', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
+  const routed = repeat.action !== 'patch' ? { executor: 'codex', mode: 'direct', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
     ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
   }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
+  const decision = {rung:routed.executor,provider:routed.policyRoute?.provider ?? routed.executor,...resolveFixExecutionMode(),...routed};
   if (decision.executor === null) return { held: true, reason: decision.reason, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane };
   const claim = acquireClaim({
     repo, pr: planned.pr, kind: 'fix', headSha: planned.headRefOid, scope: planned.overlapScope ?? planned.scope, owner: claimOwner, lockRoot: claimRoot,
@@ -1620,7 +1618,9 @@ export function dispatchFix(planned, {
       ...tokens,
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
     // Card xx0055i — round N>1 carries the previous rounds; the takeover carries ALL rounds plus its own section.
-    const prompt = briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff });
+    const prompt = (decision.executor === 'claude' ? 'You are the repair executor. Apply the changes yourself.\n\n'
+      : decision.mode === 'wrapped' ? `Supervise this repair using scripts/${decision.executor === 'codex' ? 'codex' : 'gemini'}-direct-task.mjs under the WE_ROOT supplied below. Provider=${decision.provider}, model=${decision.policyRoute?.model ?? 'default'}, effort=${decision.policyRoute?.effort ?? 'default'}.\n\n` : '')
+      + briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff });
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
     // Card xrbu1bp — an ordinary round at or past `fix.strongerModelFromRound` runs on the stronger-model rung.
@@ -1653,8 +1653,8 @@ export function dispatchFix(planned, {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
-    if (!borrowed && decision.executor !== 'claude') stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
-    if (decision.executor !== 'claude') {
+    stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
+    if (decision.executor !== 'claude' && decision.mode !== 'wrapped') {
       // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
       const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
       let handle;
@@ -2366,7 +2366,7 @@ export function runReconcileFixDispatch({
     }
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
-    if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
+    if (entry.isConflict && !borrowed && (!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && !entry.restack) {
       let attempt;
       try {
         attempt = fixStep('resume', () => tryResume(entry, { root, repo: repoKey }), entry.pr);
@@ -2384,7 +2384,7 @@ export function runReconcileFixDispatch({
     // Card xrbu1bp — round N>1 of an ordinary fix: resume the previous round's own session first (lane-free, like the
     // conflict resume above). A declined or failed resume falls through to the cold start with the history brief; a
     // throw here never aborts the pass, it only means a cold start.
-    if (executorDecision?.executor !== 'codex' && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
+    if ((!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
       let attempt = null;
       try {
         attempt = fixStep('resume-round', () => tryResumeRound(entry, { root, repo: repoKey }), entry.pr);
