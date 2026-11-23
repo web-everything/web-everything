@@ -1,27 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/conveyor/soak/daemon-soak.soak.test.mjs",
-      "brokenSha": "70001b920c55f4423d028a2a18d3d79c8a8b2757",
-      "owner": "orchestrator",
-      "reason": "daemon-soak 50-tick test hits its 1020s timeout (passed in 1017s on the parent); fix #7372 raises the limit; R1087 / rule 29",
-      "addedAt": 1795391776243,
-      "expiresAt": 1795406176243,
-      "job": "soak-shard (1)"
-    },
-    {
-      "test": "scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs",
-      "brokenSha": "3382d8b4912dbdb6a9a72ba6676b0f17e67b2db4",
-      "owner": "orchestrator",
-      "reason": "soak break large-reap-backlog-starves-dispatch fails (expected [] got 1 item) on main 3382d8b4; rule 29, named failing test quarantined at once; worker diagnosing",
-      "addedAt": 1795395354720,
-      "expiresAt": 1795409754720,
-      "job": "soak-shard (7)"
-    }
-  ],
-  "fixPrs": [
-    7373
-  ],
+  "entries": [],
   "mode": "quarantine"
 }
