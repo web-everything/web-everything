@@ -441,8 +441,8 @@ describe('createEnqueueOnEvent', () => {
     [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, true],
     [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, false],
   ])('reports bounded stderr for exit %s with JSON %j (diagnostic=%s)', async (code, json, diagnostic) => {
-    const stderr = `${'old noise '.repeat(100)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
-    const tail = stderr.replace(/\s+/g, ' ').trim().slice(-300);
+    const stderr = `${'old noise '.repeat(400)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
+    const tail = stderr.slice(-2000).replace(/\s+/g, ' ').trim().slice(-2000);
     const { handle, children, lines, advance } = setup({ manualFinish: true });
     handle.notePoll({ ok: true, marked: [mark()] });
     advance(15_000);
@@ -1641,13 +1641,13 @@ describe('actual enqueue outcomes and membership', () => {
     expect(handle.misses().has(42)).toBe(false);
   });
 
-  it('includes queue timeline evidence and the collapsed last 300 stderr characters in a miss', async () => {
-    const { handle } = membershipSetup({ drainStderr: 'x'.repeat(400) + '\n batching   blocked',
+  it('includes queue timeline evidence and the collapsed last 2000 stderr characters in a miss', async () => {
+    const { handle } = membershipSetup({ drainStderr: 'x'.repeat(2400) + '\n batching   blocked',
       readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-10-14', reason: 'checks failed' }] }),
     });
     const [ran] = await handle.catchUp();
     expect(ran.what).toContain('RemovedFromMergeQueueEvent at 2026-10-14: checks failed');
-    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(400) + ' batching blocked').slice(-300));
+    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(2400) + '\n batching   blocked').slice(-2000).replace(/\s+/g, ' ').trim());
   });
 
   it('does not count failed membership reads as misses', async () => {

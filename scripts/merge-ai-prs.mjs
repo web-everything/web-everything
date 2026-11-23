@@ -4829,7 +4829,7 @@ export function basisTouchesEngineTier(score) {
  * @returns {boolean} always `false` until `#3493` unblocks
  */
 /**
- * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS gh's own last stderr line.
+ * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS a bounded stderr tail.
  * Also used by the per-PR merge catch to preserve the merge failure's stderr cause.
  * Enqueue errors carry `githubMessage`: preserve that diagnostic verbatim, including multiple lines.
  * `execFile`'s message is only "Command failed: gh pr list …" — the actual cause (secondary rate limit, 401,
@@ -4839,8 +4839,7 @@ export function basisTouchesEngineTier(score) {
 export function ghListErrText(e) {
   if (e?.githubMessage != null) return e.githubMessage;
   const head = String((e && e.message) || e).split('\n')[0];
-  const lines = String((e && e.stderr) || '').split('\n').map((l) => l.trim()).filter(Boolean);
-  const cause = lines.length ? lines[lines.length - 1].slice(0, 300) : '';
+  const cause = String(e?.stderr || '').replace(/\s+/g, ' ').trim().slice(-2000);
   return cause && !head.includes(cause) ? `${head} — gh: ${cause}` : head;
 }
 
@@ -5487,10 +5486,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     map: defaultBranchByRepo,
     readLive: async repo => {
       const { stdout } = await execFileP('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
-        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+        // The App shim routes positional `repo view` calls by GH_REPO, otherwise by cwd.
+        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, GH_REPO: repo } });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${ghListErrText(e)}) — deferring merge/enqueue; retry on the next pass\n`),
   });
   const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient

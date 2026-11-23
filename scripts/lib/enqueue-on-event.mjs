@@ -1184,7 +1184,7 @@ export function createEnqueueOnEvent({
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
         if (!r.timedOut && (r.code !== 0 || !json)) {
-          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
           if (stderr) what += ` (stderr: ${stderr})`;
         }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
@@ -1237,7 +1237,7 @@ export function createEnqueueOnEvent({
             verified = false;
             missed = true;
             const events = (membership.lastEvents || []).map(e => `${e.__typename}${e.createdAt ? ` at ${e.createdAt}` : ''}${e.reason ? `: ${e.reason}` : ''}`).join('; ') || 'no AddedToMergeQueue event';
-            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
             what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${events}; fast-drain stderr: ${stderr}) — retrying on the next catch-up`;
           }
         }
