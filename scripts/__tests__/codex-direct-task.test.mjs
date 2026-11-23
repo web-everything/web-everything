@@ -1843,10 +1843,13 @@ describe('detached jobs', () => {
       expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
       worker.kill('SIGKILL');
       await exited;
-      // The worker is already dead, so this returns at once; the budget is only headroom for a loaded CI host
-      // (a 1 s budget expired as code 75 on main @ d4b20a90b while 14 shards ran at once).
-      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000 }))
+      // The worker is already dead, so recovery must happen on the FIRST probe pass: no poll sleep. That is the
+      // bound this test keeps, deterministically; a 1 s wall-clock budget expired as code 75 on a loaded CI
+      // host (main @ d4b20a90b, 14 shards at once), so the budget is only headroom for slow file IO.
+      const sleep = vi.fn(async () => { throw new Error('recovery must not poll'); });
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000, sleep }))
         .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+      expect(sleep).not.toHaveBeenCalled();
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {
       worker.kill('SIGKILL');
@@ -2068,9 +2071,12 @@ describe('detached jobs', () => {
     const record = { id: 'pid-reused', pid: process.pid, pidStart: 'Thu Jan  1 00:00:00 1970', status: 'running',
       exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
-    // Real `ps` probes run inside the budget; the dead-job outcome returns at once, so extra headroom costs nothing.
-    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000 }))
+    // Real `ps` probes run inside the budget. The bound kept is deterministic: detection and the failed record
+    // land on the first pass, with no poll sleep; the wall-clock budget is only headroom for a loaded host.
+    const sleep = vi.fn(async () => { throw new Error('recovery must not poll'); });
+    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000, sleep }))
       .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
+    expect(sleep).not.toHaveBeenCalled();
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
   });
 
