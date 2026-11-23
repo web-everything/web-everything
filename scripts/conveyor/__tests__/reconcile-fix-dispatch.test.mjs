@@ -877,9 +877,9 @@ describe('dispatchFix — the composition: plan → fill → mint → spawn', ()
       // #3606 — the standing-identity system prompt, without which a correctly-filled brief reads as an
       // unfilled template and the agent self-aborts (live 3/3: fix-2127/fix-2130/fix-2003).
       '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
-      // The scope is the repair-dispatch chain itself, which is critical work since the agy confinement audit (R1062 S7): Opus.
-      '--effort', 'high', '--model', 'opus',
-      `${NO_PROMPT_COMMAND_RULES}\n\n` + '# fix brief for 1764 (item 3438)\n'
+      // Direct-exec routing uses configured Sonnet on the final Claude repair rung, even for critical scope.
+      '--effort', 'high', '--model', 'sonnet',
+      `${NO_PROMPT_COMMAND_RULES}\n\nYou are the repair executor. Apply the changes yourself.\n\n` + '# fix brief for 1764 (item 3438)\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --lane=9 --session=fix-1764 '
       + '--scope=we:scripts/conveyor/reconcile-fix-dispatch.mjs --base=lane/3438-wire-reconcile-pass\n'
       + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',

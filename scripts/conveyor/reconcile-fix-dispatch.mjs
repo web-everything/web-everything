@@ -128,7 +128,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
-import picomatch from 'picomatch';
+import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
 import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
@@ -1315,7 +1315,7 @@ function criticalFixEntry(p, globs = resolveFixCriticalGlobs()) {
   return ((p.risk === 'high' || p.humanRequired === true || p.tags?.includes('security'))
     && criticalWorkVerdict({ ...p, filesTouched: p.scope }).critical)
     || !Array.isArray(p.scope) || !p.scope.length || p.scope.some(path => typeof path !== 'string' || !path.trim()
-    || picomatch.isMatch(path.trim().replace(/^[^/:]+:/, '').replace(/^\.\//, ''), globs, { nocase: true, dot: true }));
+    || micromatch.isMatch(path.trim().replace(/^[^/:]+:/, '').replace(/^\.\//, ''), globs, { nocase: true, dot: true }));
 }
 
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
