@@ -1,0 +1,6 @@
+{
+  "description": "Review start timing, early-start mode and cancellation on CI failure.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

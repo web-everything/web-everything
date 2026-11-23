@@ -288,3 +288,4 @@ merit, not prioritization.
   regression fixture, and the Fork 6 rubric + methodology research topic is its knowledge base.
 - **Review surface:** any brand-asset change regenerates `plateau:branding.html`
   (`npm run gen:branding`) — the standing before/after visual-check surface for branding edits.
+- **Ratify step:** the ratification of these forks lives here in #2209. The rollout work after ratification stays on #2255, which is kept open.

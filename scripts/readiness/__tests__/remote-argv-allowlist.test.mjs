@@ -20,8 +20,9 @@ function mainGateArgv() {
       throw Error(`unexpected git invocation: ${args.join(' ')}`);
     },
   });
-  // Tokenize the real gate command; sample paths contain no quotes or spaces.
-  expect(gate.testCommand).toMatch(/^npx vitest related /);
+  // Tokenize the real gate command; sample paths contain no quotes or spaces. The changed tests are named
+  // directly, so the default gate is the explicit-list `vitest run` form, not `vitest related`.
+  expect(gate.testCommand).toMatch(/^npx vitest run /);
   return gate.testCommand.match(/'[^']*'|\S+/g).map(word => word.replace(/^'|'$/g, ''));
 }
 

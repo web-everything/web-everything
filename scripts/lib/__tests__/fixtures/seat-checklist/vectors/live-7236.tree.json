@@ -1,0 +1,40 @@
+{
+ "scripts/lib/__tests__/red-team-label-settle.test.mjs": {
+  "21": "  it('a clear check on this head swaps pending to clear', () => {",
+  "24": "  it('without a clear check fact pending stays (unknown means pending)', () => {",
+  "36": "  it('the fact: a check on an older head does not settle the current head', () => {",
+  "39": "  it('the fact: failure, in-progress, foreign app, other PR and missing all refuse', () => {",
+  "45": "  it('the fact: a newer failing run beats an older success (ordered by id)', () => {",
+  "48": "  it('the fact: unreadable check runs, unset app id or a throw refuse', () => {",
+  "192": "    it('vanished-clear race: pending gone on the last read means no clear is written', () => {",
+  "204": "    it('a blocked label on the fresh state vetoes the settle to clear', () => {"
+ },
+ "scripts/lib/red-team-check-run.mjs": {
+  "167": "    && typeof run.head_sha === 'string' && run.head_sha.toLowerCase() === headSha.toLowerCase() && Number(run.app?.id) === Number(appId));",
+  "168": "  const runs = candidates.filter(run => run.external_id === identity);",
+  "172": "  if (runs.some(run => !Number.isSafeInteger(run.id) || run.id <= 0) || new Set(runs.map(run => run.id)).size !== runs.length)",
+  "173": "    return failure('red-team check run ordering unreadable; inspect check history');",
+  "175": "  runs.sort((a, b) => Number(b.id) - Number(a.id));"
+ },
+ "scripts/lib/red-team-status-labels.mjs": {
+  "95": "    delete env[WE_GH_READ_MEMO_DIR];",
+  "103": "export const settleGhFor = (env = process.env) => (isUnderTest() || isUnderTest(env) ? undefined : createFreshGh(runGhSync, env));",
+  "105": "/** Is the head's red-team check run a trusted, completed success with no open publication hold? Every unreadable or",
+  "109": "    const app = resolveWeAppId({ env });",
+  "110": "    if (app.ok !== true) return false;",
+  "115": "    return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact({ ...options, strictSummary: true }).ok === true;",
+  "116": "  } catch { return false; }",
+  "133": "  if (state.headRefOid !== head) return { add: null, remove: [], skipped: 'head-moved' };",
+  "135": "  // The verified standing-ruling scope (PR #5758): given by the caller, else read fresh; unreadable = no automatic credit.",
+  "160": "  const planWith = (threadNow, clear) => planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: threadNow, standingRuling: scope, headFiles, headVerified, checkClear: clear });",
+  "167": "    if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };",
+  "172": "    if (!Array.isArray(threadNow)) return { add: null, remove: [], skipped: 'thread-unreadable' };",
+  "180": "    if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };",
+  "182": "    if (!Array.isArray(lastLabels)) return { add: null, remove: [], skipped: 'labels-unreadable' };",
+  "184": "      return { add: null, remove: [], skipped: 'blocked-label' };",
+  "185": "    // Compare-and-swap: clear is written only while pending is still on the fresh labels and the check is still clear for this head.",
+  "187": "      if (!lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) return { add: null, remove: [], skipped: 'pending-gone' };",
+  "194": "    if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);",
+  "195": "    provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+ }
+}

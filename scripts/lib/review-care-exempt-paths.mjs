@@ -65,25 +65,26 @@ export function resolveReviewCareExemptPaths({ env = process.env, file = SETTING
   readFile = p => readFileSync(p, 'utf8'), log = logOnce } = {}) {
   let tool;
   let invalid = false;
+  let envInvalid = false;
   try { tool = JSON.parse(String(readFile(file)))?.careExemptPaths; }
   catch (error) { if (error?.code !== 'ENOENT') invalid = true; }
   let envValue;
   if (env.WE_REVIEW_CARE_EXEMPT_PATHS !== undefined) {
     try { envValue = JSON.parse(env.WE_REVIEW_CARE_EXEMPT_PATHS); }
-    catch { invalid = true; }
+    catch { envInvalid = true; }
   }
-  for (const value of [tool, envValue]) {
+  for (const [value, isEnv] of [[tool, false], [envValue, true]]) {
     if (value === undefined) continue;
     // Validation is atomic: never retain the valid subset of a refused list.
     let refused = false;
     validateCareExemptPaths(value, { warn: () => { refused = true; } });
-    invalid ||= refused;
+    if (isEnv) envInvalid ||= refused; else invalid ||= refused;
   }
-  if (invalid) {
-    console.warn('review.careExemptPaths: refused invalid or too-broad setting; using built-in defaults');
-    tool = undefined;
-    envValue = undefined;
-  }
+  // D15: env may only tighten. A bad env value is dropped alone; it must never discard the tool layer (that would
+  // restore the built-in exemptions). A bad tool layer still resets the whole list to built-in.
+  if (invalid || envInvalid) console.warn('review.careExemptPaths: refused invalid or too-broad setting; using built-in defaults');
+  if (invalid) tool = undefined;
+  if (invalid || envInvalid) envValue = undefined;
   const result = cascadePolicy('review.careExemptPaths', tool, {
     standard: [...DEFAULT_CARE_EXEMPT_PATHS], platform: null, env,
     envValues: { '': envValue }, log: () => {},

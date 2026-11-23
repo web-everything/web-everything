@@ -1,0 +1,6 @@
+{
+  "description": "Prevention card batching and filing limits.",
+  "owner": "scripts/settings/prevention-batch.json",
+  "changeVia": "pr",
+  "instant": false
+}

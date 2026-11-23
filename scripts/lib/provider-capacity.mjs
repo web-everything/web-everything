@@ -9,7 +9,7 @@ export const CAPACITY_DEFAULTS = {
   aheadPenalty: 0.7, behindBoost: 1.2, burnWindowHours: 24, burnUnusedPercent: 40,
   longKinds: [], resetAtPercent: 95, maxBurnBoost: 3,
   workingHours: { start: '09:00', end: '20:00', tz: 'America/New_York', days: [1, 2, 3, 4, 5] },
-  claudeUsageAccount: null, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
+  claudeUsageAccount: null, claudeAccountMap: {}, expectedDemandPerDay: null, activateAfterShortfallDays: 3,
   criticalKinds: ['critical', 'security', 'audit', 'audit-full'], allowUnknownEmergency: false,
 };
 const HOUR = 3600000;
@@ -17,6 +17,13 @@ const lengths = { five_hour: 5, seven_day: 168, daily: 24, weekly: 168 };
 const windowKey = name => name === 'seven_day' ? 'weekly' : name;
 const epoch = v => typeof v === 'number' ? (v < 1e12 ? v * 1000 : v) : Date.parse(v);
 const options = s => ({ ...CAPACITY_DEFAULTS, ...(s?.routing?.capacity ?? s ?? {}) });
+/** Live evidence needs an age; only actively appended Codex rollouts allow read-time skew. */
+export function liveReadingTimestampValid(raw, now, { codexRollout = false, staleHours = CAPACITY_DEFAULTS.staleHours } = {}) {
+  const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
+  return Number.isFinite(at) && at <= now + (codexRollout ? 60000 : 0)
+    && now - at <= Math.min(24, staleHours) * HOUR;
+}
+
 export const bindingWindow = cap => cap.windows.filter(w => Number.isFinite(w.usedPercent))
   .reduce((a, b) => !a || b.usedPercent > a.usedPercent ? b : a, null);
 
@@ -43,14 +50,26 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       const def = { ...owner, ...entry, ...account };
       let raw, windows = [];
       try { raw = readers[account.id]?.(env) ?? readers[owner.id]?.(env); } catch { /* unknown */ }
-      // The shared Claude file cannot identify an account. Never attribute it to both accounts.
-      if (owner.id === 'claude' && owner.accounts && s.claudeUsageAccount !== account.id) raw = null;
+      // An explicit file identity must be mapped. The legacy setting covers identity-less files only.
+      const usageAccount = owner.id === 'claude' && owner.accounts
+        ? raw?.account == null ? s.claudeUsageAccount
+          : typeof raw.account === 'string' && Object.hasOwn(s.claudeAccountMap ?? {}, raw.account) ? s.claudeAccountMap[raw.account] : null
+        : null;
+      const usageIdentityRejected = owner.id === 'claude' && Boolean(owner.accounts) && raw?.account != null
+        && !owner.accounts.some(a => a.id === usageAccount);
+      if (owner.id === 'claude' && owner.accounts && usageAccount !== account.id) raw = null;
       const at = epoch(raw?.at ?? raw?.asOf ?? raw?.mtime);
       const seed = env.WE_CAPACITY_READERS === 'off' ? undefined : def.operatorReading, seedAt = epoch(seed?.asOf);
-      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > s.operatorReadingMaxAgeHours * HOUR);
-      const timestampMissing = raw?.at == null && raw?.asOf == null && raw?.mtime == null;
-      const liveUsable = Number.isFinite(at) ? at <= now && now - at <= s.staleHours * HOUR
-        : timestampMissing && Boolean(raw) && owner.readers?.some(r => r.type === 'codex-rollout');
+      const operatorReadingStale = Boolean(seed) && (!Number.isFinite(seedAt) || seedAt > now || now - seedAt > Math.min(24, s.operatorReadingMaxAgeHours) * HOUR);
+      const liveStale = Number.isFinite(at) && now - at > Math.min(24, s.staleHours) * HOUR;
+      const liveUsable = liveReadingTimestampValid(raw, now, { staleHours: s.staleHours,
+        codexRollout: (account.readers ?? owner.readers)?.some(r => r.type === 'codex-rollout') });
+      let status;
+      try { status = readers.signedOut?.(account.id, env); } catch { /* unknown status */ }
+      // Signed-out status must carry its own `at`: never asOf or the file mtime, no future skew, live-reading expiry.
+      const freshSignedOut = value => value?.status === 'signed-out' && value.at != null
+        && liveReadingTimestampValid({ at: value.at }, now, { staleHours: s.staleHours });
+      const signedOut = freshSignedOut(raw) || freshSignedOut(status);
       const add = (name, w, source = 'live') => {
         const usedPercent = w?.usedPercent ?? w?.used_percent ?? w?.used_percentage;
         const resetsAt = epoch(w?.resetsAt ?? w?.resets_at);
@@ -62,7 +81,7 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
             lengthHours: w.lengthHours ?? (w.window_minutes > 0 ? w.window_minutes / 60 : null) ?? configured?.lengthHours ?? lengths[name] ?? null });
         }
       };
-      if (liveUsable) {
+      if (!signedOut && liveUsable && raw?.status !== 'signed-out') {
         if (owner.readers?.some(r => r.type === 'codex-rollout')) {
           const name = (w, fallback) => w?.window_minutes > 0
             ? def.windows?.find(x => x.lengthHours * 60 === w.window_minutes)?.name
@@ -78,14 +97,16 @@ export function readProviderCapacity({ env = {}, now = Date.now(), readers = {},
       }
       // An absent timestamp does not prove the live observation predates the operator seed.
       // Preserve independent live constraints even when this single-window seed is newer.
-      if (seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
-      if (!windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
+      if (!signedOut && seed && !operatorReadingStale && seedAt <= now && (!raw || (Number.isFinite(at) && at < seedAt))) add(def.windows?.[0]?.name ?? 'weekly', seed, 'operator');
+      if (!signedOut && !windows.length) for (const [name, rule] of Object.entries(def.calendar ?? s.calendar?.[owner.id] ?? {})) {
         const resetsAt = calendarReset(rule, now);
         if (resetsAt) windows.push({ name, usedPercent: null, resetsAt, source: 'configured', lengthHours: lengths[name] ?? null });
       }
       let held = false;
       try { held = Boolean(readers.hold?.(owner.id, now)); } catch { held = true; }
-      return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held ? 0 : 1,
+      return { ...def, provider: entry.id, account: account.id, configuredWindows: def.windows, windows, held, health: held || signedOut ? 0 : 1,
+        ...(signedOut ? { signedOut: true } : {}), usageAccount: raw ? usageAccount : null, usageIdentityRejected,
+        stale: !windows.some(w => Number.isFinite(w.usedPercent)) && (liveStale || operatorReadingStale),
         operatorReadingStale, known: windows.some(w => Number.isFinite(w.usedPercent)), now };
     });
   });
@@ -100,7 +121,9 @@ export function launcherCapacity(capacities, settings = {}) {
     const def = providers.find(p => p.id === provider);
     const owner = providers.find(p => p.id === def?.quotaOf) ?? def;
     if ((owner?.accounts?.length ?? new Set(observations.map(c => c.account)).size) <= 1) return observations;
-    const attributed = owner?.id === 'claude' || provider === 'claude' ? settings.claudeUsageAccount : null;
+    const attributed = owner?.id === 'claude' || provider === 'claude'
+      ? observations.find(c => c.usageAccount === c.account)?.account
+        ?? (observations.some(c => c.usageIdentityRejected) ? null : settings.claudeUsageAccount) : null;
     const live = attributed && observations.find(c => c.account === attributed);
     return live ? [live] : [{ ...observations[0], account: null, windows: [], known: false,
       held: observations.some(c => c.held) }];
@@ -123,9 +146,9 @@ export function scoreProvider(cap, kind, settings = {}) {
   const pace = planner.pace;
   const burn = planner.action === 'burn' || planner.pacingAction === 'burn' || planner.burnAggressively;
   const paceFactor = (pace === 'ahead' ? s.aheadPenalty : burn || pace === 'behind' ? s.behindBoost : 1) * (1 + (planner.scoreBoost ?? 0));
-  const label = (cap.active ?? def?.active) === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
+  const label = cap.signedOut ? 'signed-out' : (cap.active ?? def?.active) === false ? 'inactive' : cap.held ? 'held' : !w || w.resetsAt <= now ? 'unknown' : usedPercent >= s.exhaustedPercent ? 'exhausted'
     : !fit ? 'tier-excluded' : effectiveUsed >= 100 ? 'reserve-only' : pace === 'ahead' ? 'ahead' : pace === 'behind' ? 'behind' : 'normal';
-  const excluded = ['inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
+  const excluded = ['signed-out', 'inactive', 'held', 'unknown', 'exhausted', 'tier-excluded', 'reserve-only'].includes(label);
   const remaining = spare * hoursToReset;
   return { provider: cap.provider, account: cap.account ?? null, planner, model: cap.model ?? def?.model, launcher: cap.launcher ?? def?.launcher, usedPercent, effectiveUsed, resetsAt: w?.resetsAt ?? null,
     spare, urgency, health: cap.health, fit, pace, paceFactor, remaining, label,

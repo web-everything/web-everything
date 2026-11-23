@@ -1,0 +1,6 @@
+{
+  "description": "Duration before low remote execution share raises an alert.",
+  "owner": "scripts/settings/forge-share.json",
+  "changeVia": "pr",
+  "instant": false
+}

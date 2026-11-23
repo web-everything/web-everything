@@ -1,0 +1,6 @@
+{
+  "description": "Quarantine duration and test population bounds for red main.",
+  "owner": "scripts/settings/red-main-hold.json",
+  "changeVia": "pr",
+  "instant": false
+}
