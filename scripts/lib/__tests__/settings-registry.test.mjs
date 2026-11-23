@@ -223,11 +223,12 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the original registry plus the intentional shadow rotation description', t => {
+test('migration preserves the original registry with the intentional drain and shadow rotation descriptions', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
   const expectedMetadata = structuredClone(originalMetadata);
+  expectedMetadata.settings.drain.description = 'Merge drain grouping and asynchronous facts shadow policy.';
   expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
   f.write(META, expectedMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
@@ -344,11 +345,16 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', () => {
+test('generated documentation preserves the shadow rotation snapshot except the per-key instruction and removed drain retry policy', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
-  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes this PR's providerRotation defaults and description.
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction)
+    // Restore only the two inventory effects of deleting drain-mq-retry.json;
+    // keep main's shadow rotation digest pinned so every other byte remains guarded.
+    .replace('- Declared leaves: 624 (platform copies counted separately).', '- Declared leaves: 627 (platform copies counted separately).')
+    .replace('| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json | 4 |',
+      '| drain | scripts/settings/drain-async-shadow.json, scripts/settings/drain-card-group.json, scripts/settings/drain-mq-retry.json | 7 |')
+    .replace('Merge drain grouping and asynchronous facts shadow policy.', originalMetadata.settings.drain.description);
   assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
