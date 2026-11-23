@@ -6,6 +6,13 @@ import { fileURLToPath } from 'node:url';
 import { buildChangeEvidence } from '../change-evidence/record.mjs';
 import { writeChangeEvidenceForMerged, backfillChangeEvidence } from '../change-evidence/writer.mjs';
 
+// Pin #7289's principals before marker-authorship reads its import-time roster.
+// The global test setup disables configured delivery App identities.
+vi.hoisted(() => {
+  process.env.WE_AUTOMATION_LOGINS = 'plateau-reviewer[bot],plateau-merger[bot]';
+  process.env.WE_OPERATOR_LOGINS = 'chalbert';
+});
+
 const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/change-evidence');
 const read = name => JSON.parse(fs.readFileSync(path.join(fixtures, name), 'utf8'));
 function input() {
