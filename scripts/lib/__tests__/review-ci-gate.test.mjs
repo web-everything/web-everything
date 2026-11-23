@@ -15,7 +15,8 @@ describe('merge-gate workflow provenance', () => {
     const failing = diagnostic.context ? { ...diagnostic, state: 'failure' } : { ...diagnostic, conclusion: 'failure' };
     expect(review([pinned, failing])).toMatchObject({ allowed: true });
     expect(review([diagnostic])).toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }] });
-    expect(review([pinned, { ...failing, head_sha: 'other' }])).toMatchObject({ allowed: true });
+    expect(review([pinned, { ...failing, head_sha: 'other' }])).toMatchObject({ allowed: false,
+      affected: [{ name: 'merge-gate', reason: 'wrong-head' }] });
   });
 });
 describe('strict review CI prerequisite', () => {

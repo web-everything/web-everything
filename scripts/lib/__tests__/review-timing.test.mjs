@@ -10,6 +10,14 @@ const head = 'a'.repeat(40);
 const check = (name, conclusion = 'success', extra = {}) => ({ name, head_sha: head, status: 'completed', conclusion, ...extra });
 const fast = review.fastChecks.we;
 describe('pending-CI start policy', () => {
+  it.each(['shadow', 'on'])('unpinned merge-gate success cannot register missing pinned CI under startEarly=%s', startEarly => {
+    const result = reviewStartGate({ rowsComplete: true, rowsHead: head, headSha: head,
+      requiredChecks: ['merge-gate'], checks: [check('merge-gate', 'success', { workflowPinned: false })],
+      policy: { ...review, startAfter: 'ci-green', startEarly } });
+    expect(result).toMatchObject({ allowed: false, reason: 'ci-not-registered',
+      affected: [{ name: 'merge-gate', reason: 'missing' }] });
+    expect(result.wouldStartEarly).not.toBe(true);
+  });
   it.each(['ci-green', 'fast-checks'])('verification marker cannot bypass wrong-head strict evidence under %s', startAfter => {
     for (const requiredChecks of [['test'], ['integration']]) {
       const input = { rowsComplete: true, rowsHead: head, headSha: head, requiredChecks, verifyGreen: true,

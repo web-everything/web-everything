@@ -33,17 +33,44 @@ it.each([
   const rows = readReviewChecks({ repo: 'o/p', headSha, run });
   expect(rows[0].workflowPinned).toBe(pinned);
   expect(original.workflowPinned).toBe(true);
-  expect(rows.rowsComplete).toBe(true);
+  const incomplete = [null, 'lookup-failure', 'missing-run-id'].includes(path);
+  expect(rows.rowsComplete).toBe(!incomplete);
   expect(run).toHaveBeenCalledTimes(path === 'missing-run-id' ? 2 : 3);
   const review = checks => reviewCiGate({ headSha, rowsHead: rows.rowsHead, rowsComplete: rows.rowsComplete,
     requiredChecks: ['merge-gate'], checks });
-  if (!pinned) {
+  if (incomplete) {
+    expect(review(rows)).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
+  } else if (!pinned) {
     const trusted = { ...original, id: 1, workflowPinned: true };
     expect(review([{ ...trusted, conclusion: 'failure' }, ...rows]).allowed).toBe(false);
     expect(review([trusted, { ...rows[0], conclusion: 'failure' }]).allowed).toBe(true);
     expect(review(rows)).toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }] });
   } else expect(review(rows).allowed).toBe(true);
 });
+
+it.each(['throws', 'invalid-json', 'null', 'missing-run-id'])(
+  'unreadable newer merge-gate provenance (%s) cannot vanish behind pinned success', failure => {
+    const headSha = 'a'.repeat(40);
+    const pinned = { id: 1, name: 'merge-gate', status: 'completed', conclusion: 'success',
+      head_sha: headSha, app: { id: 15368 }, check_suite: { id: 123 },
+      details_url: 'https://github.com/o/p/actions/runs/41/job/7' };
+    const newer = { ...pinned, id: 2, conclusion: 'failure',
+      details_url: failure === 'missing-run-id' ? '' : 'https://github.com/o/p/actions/runs/42/job/8' };
+    const rows = readReviewChecks({ repo: 'o/p', headSha, run: argv => {
+      if (argv[1] === 'repos/o/p/actions/runs/41') return JSON.stringify({
+        path: '.github/workflows/merge-gate.yml@refs/heads/main', head_sha: headSha, check_suite_id: 123 });
+      if (argv[1] === 'repos/o/p/actions/runs/42') {
+        if (failure === 'throws') throw new Error('lookup failed');
+        return failure === 'null' ? 'null' : '{';
+      }
+      return JSON.stringify(argv[3].includes('/check-runs?')
+        ? [{ total_count: 2, check_runs: [pinned, newer] }] : [{ total_count: 0, statuses: [] }]);
+    } });
+    expect(rows[0].workflowPinned).toBe(true);
+    expect(rows.rowsComplete).toBe(false);
+    expect(reviewCiGate({ headSha, rowsHead: rows.rowsHead, rowsComplete: rows.rowsComplete,
+      requiredChecks: ['merge-gate'], checks: rows })).toMatchObject({ allowed: false, reason: 'rows-incomplete' });
+  });
 
 it.each([
   ['different suite', { check_suite: { id: 456 } }, {}],

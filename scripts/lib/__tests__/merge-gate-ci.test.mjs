@@ -1487,6 +1487,8 @@ if (/^repo view/.test(a))`), { mode: 0o755 });
     expect(out.workflowCheck).toMatchObject({ ok: false, reason: expect.stringContaining('differs from main') });
     expect(out.ok).toBe(false);
     expect(out.reason).toMatch(/^workflow self-check failed — fail closed/);
+    for (const mode of ['shadow', 'enforce']) expect(applyGateMode({ mode, source: 'repo',
+      childStatus: r.status, report: out }).exitCode).toBe(1);
     // control: the same run with the workflow equal to main's reports the self-check ok (so the reason above came from it)
     const same = run(ctx, ['--pr=7', '--json'], { env: { ...env, GITHUB_WORKFLOW_SHA: ctx.git(ctx.clone, 'rev-parse', 'origin/main') }, pr: { headRefOid: edited } });
     expect(JSON.parse(same.stdout).workflowCheck.ok).toBe(true);
@@ -1507,6 +1509,8 @@ if (/^repo view/.test(a))`), { mode: 0o755 });
     } });
     expect(r.stderr).toContain('workflow self-check — ok:');
     expect(r.stderr).toContain('workflow final self-check — FAIL:');
+    for (const mode of ['shadow', 'enforce']) expect(applyGateMode({ mode, source: 'repo',
+      childStatus: r.status, report: JSON.parse(r.stdout) }).exitCode).toBe(1);
     expect(r.status, r.stderr).toBe(1);
     expect(JSON.parse(r.stdout)).toMatchObject({ ok: false,
       reason: expect.stringMatching(/^workflow self-check failed — fail closed:.*differs from main/),
@@ -1631,10 +1635,15 @@ describe('applyGateMode changes only the exit code', () => {
     }
   });
 
-  it('a hold that is not one rule (workflow self-check) is still named in shadow', () => {
-    const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: { ok: false, reason: 'workflow self-check failed — fail closed: x', prs: [passing] } });
-    expect(out.exitCode).toBe(0);
-    expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
+  it.each(['shadow', 'enforce'])('non-deferred workflow self-check failures stay fatal in %s', mode => {
+    for (const reason of ['unreadable workflow', 'differs from main']) {
+      const out = applyGateMode({ mode, source: 'standard', childStatus: 1, report: {
+        ok: false, reason: `workflow self-check failed — fail closed: ${reason}`, prs: [passing],
+        workflowCheck: { ok: false, reason } } });
+      expect(out.exitCode).toBe(1);
+      expect(out.text).toContain('workflow self-check failed');
+      expect(out.text).not.toMatch(/SHADOW/);
+    }
   });
 
   it.each(['enforce', 'shadow'])('rejects every deferral even with exit 0 and a fabricated pinnedRun in %s', mode => {

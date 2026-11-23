@@ -50,7 +50,7 @@ const log4965 = complete(log4965Raw);
 const candidacy = complete(log4965Raw.split('\n').filter(l => !l.includes('test-gaming')).join('\n'));
 const candidacyWithCodeqlHold = candidacy.replace(/^(  )pass(\s+codeql\s)/m, '$1hold$2');
 const sha = 'a'.repeat(40);
-const row = { name: 'merge-gate', id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
+const row = { name: 'merge-gate', workflowPinned: true, id: 123, status: 'COMPLETED', conclusion: 'FAILURE' };
 const green = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' };
 const verdict = (log = candidacy) => ({ ...parsePrResultTable(log, log.includes('#5008') ? 5008 : 4965), head_sha: sha, completed_at: '2026-10-12T11:56:08Z' });
 const classify = (results, extra = {}) => classifyMergeGateHold({ results, prLabels: ['review:pending'], ...extra });
@@ -426,7 +426,7 @@ describe('fresh review CI merge-gate holds', () => {
     const readMergeGateVerdict = vi.fn(() => verdict());
     expect(gate({ readChecks: ({ headSha: rowsHead }) => completeCheckRows([{ context: 'merge-gate', state: 'failure' },
       { context: 'legacy', state: 'success' }], rowsHead), readMergeGateVerdict })).toMatchObject({
-      allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }],
+      allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }],
     });
     expect(readMergeGateVerdict).not.toHaveBeenCalled();
   });
@@ -450,7 +450,7 @@ describe('red-team hold is candidacy, not CI repair', () => {
   hold              red-team               no red-team check run on head
   pass              codeql                 no failed CodeQL run
 merge-gate: HOLD — held`;
-  const failed = { name: 'merge-gate', status: 'completed', conclusion: 'failure', head_sha: sha,
+  const failed = { name: 'merge-gate', workflowPinned: true, status: 'completed', conclusion: 'failure', head_sha: sha,
     details_url: 'https://github.com/owner/repo/actions/runs/100/job/123' };
   const probe = (extra = {}) => readReviewCiGate({ policy: { startAfter: 'ci-green', startEarly: 'off' }, repo: 'owner/repo', pr: 4965,
     readHead: () => sha, readLabels: () => [], readChecks: ({ headSha: rowsHead }) => completeCheckRows([failed, { name: 'test', status: 'completed', conclusion: 'success', head_sha: sha }], rowsHead),

@@ -487,8 +487,9 @@ export function applyGateMode({ mode, source, childStatus, report }) {
   }
   const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
   const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
-  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
-  const exitCode = report.ok || shadowLine ? 0 : 1;
+  const workflowFailed = report.workflowCheck?.ok === false;
+  const shadowLine = !workflowFailed && !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
+  const exitCode = !workflowFailed && (report.ok || shadowLine) ? 0 : 1;
   const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
   const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
   return { exitCode, holds, text, summary };

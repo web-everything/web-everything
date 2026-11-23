@@ -45,7 +45,7 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => {
   // can reappear under a new ID, so IDs alone cannot establish that this feed is complete.
   const uniqueContexts = statuses.every(row => typeof row?.context === 'string' && row.context.length > 0)
     && new Set(statuses.map(row => row.context)).size === statuses.length;
-  const rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses) && uniqueContexts;
+  let rowsComplete = delivered(runPages, runs) && delivered(statusPages, statuses) && uniqueContexts;
   const attestedRuns = runs.map(row => {
     if (row?.name !== 'merge-gate') return row;
     let workflowPinned = false;
@@ -53,14 +53,15 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => {
     if (id) {
       try {
         const workflow = JSON.parse(run(['api', `repos/${repo}/actions/runs/${id}`]));
+        if (!workflow || typeof workflow.path !== 'string') throw new Error('unreadable workflow run');
         workflowPinned = row.app?.id === 15368 && typeof workflow.path === 'string'
           && Number.isSafeInteger(row.check_suite?.id) && row.check_suite.id > 0
           && row.check_suite.id === workflow.check_suite_id
           && typeof headSha === 'string' && headSha.trim() !== ''
           && row.head_sha === headSha && workflow.head_sha === headSha
           && /^(?:[^/]+\/[^/]+\/)?\.github\/workflows\/merge-gate\.yml@refs\/heads\/main$/.test(workflow.path);
-      } catch { /* Unreadable workflow evidence cannot attest this row. */ }
-    }
+      } catch { rowsComplete = false; }
+    } else rowsComplete = false;
     return { ...row, workflowPinned };
   });
   return Object.defineProperties([...attestedRuns, ...statuses.map(({ context, state, target_url }) => ({ context, state, target_url }))],

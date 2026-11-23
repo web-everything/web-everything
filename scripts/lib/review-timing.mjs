@@ -1,5 +1,5 @@
 /** Pure review/fixer timing decisions. Inputs always describe one pinned head. */
-import { reviewCiGate, reviewCiPrerequisites, rowsProvenOnHead } from './review-ci-gate.mjs';
+import { reviewCiGate, reviewCiPrerequisites, reviewCiRows, rowsProvenOnHead } from './review-ci-gate.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 
@@ -152,9 +152,9 @@ function readableEarlyChecks(checks, headSha) {
 function registeredStartGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete }) {
   const strict = reviewCiGate({ headSha, checks, requiredChecks, rowsHead, rowsComplete });
   if (!checkNames(requiredChecks) || typeof headSha !== 'string' || !headSha.trim()) return strict;
-  const latest = new Map(collapseRollupToLatestPerName(checks).map(row => [row?.name ?? row?.context, row]));
   // Keep raw rows for readability checks; share normalization and head-before-implication with the strict gate.
   // wrongHeads is judged on every RAW row, so a newer current-head run cannot hide a foreign-head run of its name.
+  const latest = new Map(collapseRollupToLatestPerName(reviewCiRows(checks)).map(row => [row?.name ?? row?.context, row]));
   const { needed, wrongHeads } = reviewCiPrerequisites({ headSha, requiredChecks, checks });
   const affected = needed.flatMap(name => {
     const row = latest.get(name);

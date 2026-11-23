@@ -16,17 +16,21 @@ function statusAsCheckRow(row) {
   return row;
 }
 
+/** Only main-pinned workflow rows may satisfy or supersede merge-gate. */
+export const reviewCiRows = checks => (Array.isArray(checks) ? checks : []).filter(row =>
+  (row?.name !== 'merge-gate' && row?.context !== 'merge-gate') || row.workflowPinned === true);
+
 /**
  * Shared head-bound prerequisite selection; foreign rows cannot imply required checks away. Heads are validated on
  * EVERY raw row before the per-name collapse (PR #7160): collapsing first lets a newer current-head run of a name
  * hide an older run of that name explicitly bound to another head, so the foreign evidence was never seen.
  */
 export function reviewCiPrerequisites({ headSha, requiredChecks, checks }) {
-  // Only the main-pinned workflow may satisfy or supersede the deciding check.
-  const rows = (Array.isArray(checks) ? checks : []).filter(row =>
-    (row?.name !== 'merge-gate' && row?.context !== 'merge-gate') || row.workflowPinned === true);
-  const wrongHeads = new Set(rows.filter(row => row?.head_sha != null && row.head_sha !== headSha)
+  const rawRows = Array.isArray(checks) ? checks : [];
+  const wrongHeads = new Set(rawRows.filter(row => row?.head_sha != null && row.head_sha !== headSha)
     .map(row => row?.name ?? row?.context));
+  // Only the main-pinned workflow may satisfy or supersede, after validating every raw head.
+  const rows = reviewCiRows(rawRows);
   const latest = new Map(collapseRollupToLatestPerName(rows).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
   const currentRows = [...latest].filter(([name]) => !wrongHeads.has(name)).map(([, row]) => row);
   const needed = withoutImpliedRequiredChecks(requiredChecks, currentRows);

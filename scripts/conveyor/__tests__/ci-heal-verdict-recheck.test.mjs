@@ -768,6 +768,16 @@ describe('R272 fail-closed evidence across every row', () => {
 });
 
 describe('hydrated CI evidence for escalation retirement', () => {
+  it('foreign-head successful unpinned merge-gate cannot retire escalation', () => {
+    const evidence = { headSha: input.headSha, rowsHead: input.headSha, rowsComplete: true,
+      requiredChecks: ['merge-gate'] };
+    const pinned = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'SUCCESS',
+      head_sha: input.headSha, workflowPinned: true, id: 1 };
+    const foreign = { ...pinned, head_sha: 'other', workflowPinned: false, id: 2 };
+    expect(ciGreenForEscalation({ ...evidence, rollup: [pinned] })).toBe(true);
+    expect(ciGreenForEscalation({ ...evidence, rollup: [foreign] })).toBe(false);
+    expect(ciGreenForEscalation({ ...evidence, rollup: [pinned, foreign] })).toBe(false);
+  });
   it.each(['SUCCESS', 'FAILURE'])('foreign-head optional CodeQL %s cannot retire escalation', conclusion => {
     const test = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: input.headSha };
     const codeql = { name: 'CodeQL', status: 'COMPLETED', conclusion, head_sha: 'other' };
