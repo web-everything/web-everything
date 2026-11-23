@@ -14,7 +14,7 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedHotpatchTips, revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
-import { readForceWatch } from '../daemon-force-adopt.mjs';
+import { readCurrentForceWatch } from '../daemon-force-adopt.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
   'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
@@ -486,9 +486,9 @@ async function finalizeRebuildLocked({
   let dropsPending = false;
   try { dropsPending = readPendingDrops(root, env).length > 0; } catch { dropsPending = true; }
   const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
-  // A rollback may skip evidence only for the saved last-good head (the watch preserves it across forced adoption).
+  // Use the watch tick's disk-or-retained obligation: a failed marker write must not lose last-good authorization.
   const isRollback = lease?.token === 'force-adopt-rollback' && !!plan.finalSha
-    && plan.finalSha === (readForceWatch(root, stEnv)?.lastGood?.head ?? state.adopted?.head);
+    && plan.finalSha === (readCurrentForceWatch(root, stEnv)?.lastGood?.head ?? state.adopted?.head);
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });

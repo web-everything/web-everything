@@ -78,7 +78,9 @@ export function revokedAppliedTips({
   return (applied ?? [])
     .filter((a) => {
       if (!a?.ref || !a.sha) return false;
-      if (a.ref.startsWith('hotpatch/')) return a.ref !== `hotpatch/${a.sha}` || typeof auditedTip !== 'function' || auditedTip(a.ref, a.sha) !== true;
+      // Follow mode defers canonical hotpatch evidence to finalizeRebuild; it is not a negative audit.
+      if (a.ref.startsWith('hotpatch/')) return a.ref !== `hotpatch/${a.sha}`
+        || (typeof auditedTip === 'function' && auditedTip(a.ref, a.sha) !== true);
       // A live hold on the applied sha itself always wins over any pin.
       if (held.some((x) => x.detail.ref === a.ref && x.detail.newTip === a.sha)) return true;
       // pinnedFrom is the rejected tip, not evidence for the applied sha: it never exempts. The applied sha is judged below.

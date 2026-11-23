@@ -123,7 +123,7 @@ const pendingRollbacks = new Map();
 /** The in-process marker applies only to the build it was recorded for: a later watch on the same path starts clean. */
 const pendingFor = (root, env, sha) => { const p = pendingRollbacks.get(watchPath(root, env)); return p && p.sha === sha ? p.reason : undefined; };
 /** The watch on disk, else the one an unsaved obligation is kept for in memory (a rollback owed must not vanish with its file). */
-const currentWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
+export const readCurrentForceWatch = (root, env) => readForceWatch(root, env) ?? pendingRollbacks.get(watchPath(root, env))?.watch ?? null;
 
 // ── THE one writer ───────────────────────────────────────────────────────────────────────────────────────────────
 const WATCH_LOCK_WAIT_MS = 2000;
@@ -298,7 +298,7 @@ export function evaluateForceWatch({ watch, healthy, restarts = 0, maxRestarts =
 /** One tick of the post-force health watch. `probe(root)` -> { healthy, restarts? }; `rollback(lastGood, { sha })` -> { ok } or
  *  { superseded, head } when HEAD is no longer the watched build. */
 export async function runForceWatchTick({ root, env = process.env, probe, rollback, emit, now = Date.now, notBefore = null, currentHead = null }) {
-  let watch = currentWatch(root, env);
+  let watch = readCurrentForceWatch(root, env);
   if (!watch) return { action: 'none' };
   const p = watchPath(root, env);
   // A watch opened by THIS tick's own forced adoption starts COUNTING at the next tick, but its health is still checked now: the
@@ -413,7 +413,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   // The probe is async: a concurrent tick may have recorded an owed rollback, moved, or closed the watch since our first read. Decide
   // from the CURRENT record, never the stale snapshot, so a healthy result can neither erase a mandatory rollback nor
   // count down / re-create a watch another tick already closed.
-  const fresh = unsaved ? watch : currentWatch(root, env); // an unsaved move is the only record this tick has: the disk still holds the old sha
+  const fresh = unsaved ? watch : readCurrentForceWatch(root, env); // an unsaved move is the only record this tick has: the disk still holds the old sha
   if (!fresh || fresh.sha !== watch.sha) return { action: 'none' };
   watch = { ...fresh, adoptedSeen: fresh.adoptedSeen === true || watch.adoptedSeen === true };
   if (headNow !== null && headNow !== watch.sha) {
@@ -455,7 +455,7 @@ export async function runForceWatchTick({ root, env = process.env, probe, rollba
   let saved = markOwed();
   // `sha` lets the rollback verify, under the clone's write lock, that the watched build is STILL head before it reverts anything.
   try { result = await rollback(watch.lastGood, { sha: watch.sha }); } catch { result = { ok: false }; }
-  const cur = currentWatch(root, env);
+  const cur = readCurrentForceWatch(root, env);
   if (!cur || cur.sha !== recordSha) return { action: 'none' }; // another tick closed (or moved) this watch during the rollback: it owns the outcome
   if (result?.superseded === true) {
     // HEAD is no longer the watched build (a successor was adopted while the probe/rollback waited): nothing to revert HERE, and the
