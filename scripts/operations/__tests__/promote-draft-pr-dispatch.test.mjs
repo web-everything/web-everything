@@ -635,18 +635,18 @@ describe('fresh operator park guard', () => {
   );
 });
 
-describe('fresh status:parked label guard', () => {
+describe('fresh review-status:draft-withdrawn label guard', () => {
   const entry = { kind: 'promote-draft', prNumber: 3432, headRefOid: 'a'.repeat(40) };
   const run = (readPrLabels, ready) => runReconcilePromoteDraftDispatch({
     root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
     reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
     readComments: () => [], readPrLabels, provider: { ready }, clearAwaitingCi: NOOP_STATUS,
   });
-  it.each(['status:parked', { name: 'status:parked' }])('refuses a fresh parked label %j and promotes only after removal', label => {
+  it.each(['review-status:draft-withdrawn', { name: 'review-status:draft-withdrawn' }])('refuses a fresh parked label %j and promotes only after removal', label => {
     const ready = vi.fn();
     let labels = [label];
     const read = vi.fn(() => labels);
-    expect(run(read, ready).refusals).toEqual([expect.objectContaining({ kind: 'operator-parked' })]);
+    expect(run(read, ready).refusals).toEqual([expect.objectContaining({ kind: 'draft-withdrawn' })]);
     expect(read).toHaveBeenCalledWith({ repoSlug: 'plateauapp/plateau-app', prNumber: 3432 });
     expect(ready).not.toHaveBeenCalled();
     labels = [];

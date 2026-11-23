@@ -68,7 +68,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { isParkedByLabel, isOperatorParked, validatePrLabels } from '../conveyor/draft-promotion-rule.mjs';
+import { WITHDRAWN_LABEL, isOperatorParked, validatePrLabels } from '../conveyor/draft-promotion-rule.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -138,15 +138,6 @@ export function defaultReadHeadCheckState({
     : requiredChecks;
   const result = reduceCheckState(rows, promotionChecks);
   return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
-}
-
-/** Pre-write label guard. Unreadable evidence refuses. */
-function draftParkLabelRefusal(labels) {
-  try { validatePrLabels(labels); } catch {
-    return { kind: 'draft-state-unreadable', why: 'could not read draft hold labels before promoting; retry next tick' };
-  }
-  return isParkedByLabel(labels) ? { kind: 'operator-parked',
-    why: 'draft PR is operator-parked by status:parked label — explicit release is required before promotion' } : null;
 }
 
 /** Fresh draft hold labels, scoped to the target PR and repository; fail closed on unreadable data. */
@@ -400,9 +391,7 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
-    const labelPark = draftParkLabelRefusal(labels);
-    if (labelPark) { refusals.push({ pr: entry.prNumber, headSha: sha, ...labelPark }); continue; }
-    if (labels.some(label => (typeof label === 'string' ? label : label.name) === 'review-status:draft-withdrawn')) {
+    if (labels.some(label => (typeof label === 'string' ? label : label.name) === WITHDRAWN_LABEL)) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-withdrawn', headSha: sha,
         why: 'draft PR is withdrawn — explicit release is required before promotion',
