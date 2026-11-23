@@ -87,7 +87,7 @@ export function ownerFromRemoteUrl(url) {
 
 /**
  * The repo owner a `gh` invocation targets, from its argv: `--repo X/Y`, `--repo=X/Y`, `-R X/Y`, `-RX/Y`, or an
- * `api repos/X/Y/...` path. `null` when the call names no repo (then the caller consults the checkout remote).
+ * `api repos/X/Y/...` path or GraphQL owner + name/repo fields. `null` when the call names no repo (then the caller consults the checkout remote).
  * @param {string[]} argv
  */
 export function ownerFromGhArgv(argv) {
@@ -109,6 +109,19 @@ export function ownerFromGhArgv(argv) {
       const m = /^\/?repos\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/.exec(a);
       if (m) return canonicalOwner(m[1], m[2]);
     }
+  }
+  if (args[0] === 'api' && args[1] === 'graphql') {
+    let owner = null, name = null;
+    for (let i = 2; i < args.length; i += 1) {
+      const a = args[i];
+      let field;
+      if (['-f', '-F', '--field', '--raw-field'].includes(a)) field = args[++i];
+      else field = /^(?:-[fF]|--(?:raw-)?field=)(.*)$/.exec(a)?.[1];
+      const m = /^(owner|name|repo)=([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(field ?? '');
+      if (m?.[1] === 'owner') owner = m[2];
+      else if (m) name = m[2];
+    }
+    if (owner && name && /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) return canonicalOwner(owner, name);
   }
   return null;
 }

@@ -52,6 +52,14 @@ export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
+/** Safe, bounded diagnostic persisted beside a parked run and carried into operator alerts. */
+export function sanitizeAcceptHoldReason(value) {
+  return typeof value === 'string' ? value
+    .replace(/[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, '')
+    .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|Bearer\s+[^\s]+|x-access-token:[^\s/@]+/gi, '[REDACTED]')
+    .slice(0, 300) : '';
+}
+
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
  * A run suspended at human confirmation has completed its panel, although the operation is pending.
  * Misnamed-record recovery requires a recognized review verdict as well as completion timing. */
@@ -126,6 +134,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(run.acceptHoldReason ? { acceptHoldReason: sanitizeAcceptHoldReason(run.acceptHoldReason) } : {}),
       ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
@@ -146,6 +155,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
+    ...(run.acceptHoldReason ? { acceptHoldReason: sanitizeAcceptHoldReason(run.acceptHoldReason) } : {}),
     ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
     ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
     // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
@@ -566,8 +576,11 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   const head = pr.headRefOid;
   // Past the last release: the permanent hold main has always had, now also raised to the operator (needs-you).
   const noVerdictExhausted = noVerdict && retryAt === null;
+  const lastParkReason = noVerdict ? sanitizeAcceptHoldReason(
+    latestReviewAttempt(history.filter(r => r.acceptHoldReason))?.acceptHoldReason) : '';
   const why = `${REFERRAL_HOLD_MARKER} head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + (noVerdict ? ` (no verdict ever landed on the PR for those runs, and the ${VERDICT_RETRY_EXTRA} automatic re-runs are spent: a person must look at why the review's write-back fails)` : '')
+    + (lastParkReason ? `; last park reason: ${lastParkReason}` : '')
     + (retryAt !== null ? `; the next automatic re-run is due at ${new Date(retryAt).toISOString()}` : '');
   // stale-hold-resume — every attempt since the wake, finished or not: the resume-once bound must count a review that
   // died before `advise` too, or a failing review would be resumed every tick.
@@ -575,6 +588,7 @@ export function decideSameHeadHold(pr, runs, { repo, env = process.env, now = Da
   return { kind: 'same-head', head, episode: hash([repo, pr.number, head, wake, 'same-head']), count, attemptsSinceWake,
     reviewStartedAt: Number.isFinite(last.startedAt) ? last.startedAt : null,
     why, retryAt, persistenceFailed: false, exhausted: false,
+    ...(lastParkReason ? { lastParkReason } : {}),
     ...(noVerdict ? { noVerdict: { exhausted: noVerdictExhausted, releasesSpent: Math.max(0, Math.min(spent, releases)),
       releases, source: retry?.source ?? 'standard' } } : {}) };
 }
@@ -868,8 +882,10 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
       if (isUnderTest(process.env)) return false;
       publish = item => publishAttention(item, { now });
     }
-    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
-      reason: `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
+    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict', reviewRunCount: hold.count,
+      ...(hold.lastParkReason ? { lastParkReason: sanitizeAcceptHoldReason(hold.lastParkReason) } : {}),
+      reason: (hold.lastParkReason ? `${sanitizeAcceptHoldReason(hold.lastParkReason)}; ` : '')
+        + `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
       pick: `https://github.com/${repo}/pull/${prNumber}` };
     const announce = () => log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
       + `${hold.noVerdict?.releasesSpent ?? 0}/${hold.noVerdict?.releases ?? 0} cool-down retries spent `
@@ -878,10 +894,10 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     try {
       actions = store ?? createActionStore({ root: needsYouClaimRoot(dir), now: () => now });
       resource = actionResource(repo, { type: 'pr', id: String(prNumber) });
-      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head
+      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head && r.evidence?.count === hold.count
         && r.state === 'terminal' && r.outcome === 'settled');
       if (done) return false;
-      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head },
+      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head, count: hold.count },
         reconcile: record => actions.reconcile(record, { listAgents: () => [], findEffect: () => ({ found: false }),
           postconditionHolds: () => true, owner }) });
     } catch (e) {
@@ -896,7 +912,7 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     // Claiming may have reconciled an expired attempt for this head into `settled` (it had published): then it is done.
     try {
       if (actions.attempts(resource).some(r => r.attempt !== rec.attempt && r.kind === NO_VERDICT_NEEDS_YOU_KIND
-        && r.evidence?.head === hold.head && r.state === 'terminal' && r.outcome === 'settled')) {
+        && r.evidence?.head === hold.head && r.evidence?.count === hold.count && r.state === 'terminal' && r.outcome === 'settled')) {
         actions.release(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev });
         return false;
       }

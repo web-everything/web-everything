@@ -1011,6 +1011,43 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   }));
   const oldWhy = count => `review paused: head ${head.slice(0, 9)} was already reviewed ${count} time(s); it resumes on a new push or an explicit re-arm`
     + " (no verdict ever landed on the PR for those runs, and the 2 automatic re-runs are spent: a person must look at why the review's write-back fails)";
+  it.each(['ghp_secret', 'gho_secret', 'ghu_secret', 'ghs_secret', 'ghr_secret',
+    'github_pat_secret_123', 'Bearer secret', 'x-access-token:secret'])
+  ('redacts credential %s when projecting historical park reasons', credential => {
+    const raw = run();
+    raw.acceptHoldReason = `Unattended accept parked: live referrals unavailable: ${credential}; detail: ` + 'x'.repeat(500);
+    const reason = reviewRunEvidence(raw).acceptHoldReason;
+    expect(reason).toHaveLength(300);
+    expect(reason).toContain('[REDACTED]');
+    expect(reason).not.toContain('secret');
+  });
+  it('alerts once per exhausted head and run-count with the latest sanitized park reason', () => {
+    const raw = run();
+    raw.acceptHoldReason = 'Unattended accept parked: live referrals unavailable: ghp_secret Bearer secret x-access-token:secret\n detail: ' + 'x'.repeat(500);
+    const evidence = reviewRunEvidence(raw);
+    expect(evidence.acceptHoldReason).toHaveLength(300);
+    expect(evidence.acceptHoldReason).not.toMatch(/secret|[\x00-\x1f\x7f]/);
+    const rows = lostRuns(3).map((r, i) => ({ ...r, acceptHoldReason: i === 0 ? evidence.acceptHoldReason : 'older reason' }));
+    const decide = (prs = labelled(['review:pending']), runs = rows) => decideSameHeadHold(prs, runs,
+      { repo, env: {}, now: at + 86400_000, retry: { cooldownReleases: 0 } });
+    const hold = decide(), dir = temp(), path = join(dir, 'events.jsonl'), post = vi.fn(), log = vi.fn();
+    const publish = vi.fn(item => publishAttention(item, { path, now: at + 86400_000 }));
+    expect(hold.why).toContain(evidence.acceptHoldReason);
+    const notify = h => notifyReferralHold({ repo, prNumber: 1, hold: h, dir, publishNeedsYou: publish, post, log });
+    notify(hold); notify(hold);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish.mock.calls[0][0].reason).toContain(evidence.acceptHoldReason);
+    const more = [...rows, lost({ id: 'new-run', startedAt: at + 1, completedAt: at + 2, acceptHoldReason: 'latest reason' })];
+    notify(decide(undefined, more));
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(publish.mock.calls[1][0].reason).toContain('latest reason');
+    expect(unacknowledged({ path })).toEqual([
+      expect.objectContaining({ reviewRunCount: 3, lastParkReason: evidence.acceptHoldReason }),
+      expect.objectContaining({ reviewRunCount: 4, lastParkReason: 'latest reason' }),
+    ]);
+    notify(decide(labelled(['review:accepted'])));
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
   it('does not spend no-verdict retries on four completed CI-held publishes', () => {
     const p = labelled(['review:pending']), runs = lostRuns(4);
     const opts = { repo, env: {}, now: at + 30 * 60_000 };
@@ -1361,9 +1398,23 @@ describe('same-head hold never silences a review whose verdict never landed (liv
       expect(log.mock.calls.flat().filter(l => l.includes('NEEDS-YOU review-no-verdict'))).toHaveLength(1);
       expect(log.mock.calls.flat().find(l => l.includes('NEEDS-YOU'))).toContain('source=tool');
       const rows = storeAt(dir, T0).attempts(`${repo}#pr:${p.number}`);
-      expect(rows).toEqual([expect.objectContaining({ kind: NO_VERDICT_NEEDS_YOU_KIND, state: 'terminal', outcome: 'settled', evidence: { head } })]);
+      expect(rows).toEqual([expect.objectContaining({ kind: NO_VERDICT_NEEDS_YOU_KIND, state: 'terminal', outcome: 'settled', evidence: { head, count: held.count } })]);
       expect(raiseNoVerdictNeedsYou({ repo, prNumber: p.number, hold: { ...held, head: 'b'.repeat(40) }, dir, log, publish, now: T0 + 10 })).toBe(true);
       expect(publish).toHaveBeenCalledTimes(2);
+    });
+    it('a legacy settled claim without a run-count does not silence the current count', () => {
+      const dir = temp(), actions = storeAt(dir, T0), publish = vi.fn();
+      const claimed = actions.claim({ resource: res, kind: NO_VERDICT_NEEDS_YOU_KIND, owner: 'legacy', evidence: { head } });
+      let rec = claimed.record;
+      for (const [from, to, patch] of [['intent', 'dispatching', { dispatchingSince: T0 }],
+        ['dispatching', 'observed', { handle: 'needs-you-feed' }], ['observed', 'terminal', { outcome: 'settled' }]]) {
+        const result = actions.transition(res, rec.attempt, { token: rec.ownerToken, rev: rec.rev, from, to, patch });
+        expect(result.ok).toBe(true);
+        rec = result.record;
+      }
+      expect(raise(dir, T0 + 1, { publish })).toBe(true);
+      expect(raise(dir, T0 + 2, { publish })).toBe(false);
+      expect(publish).toHaveBeenCalledTimes(1);
     });
     it('interleaved concurrent reclaim of an EXPIRED claim: exactly one reclaimer publishes', () => {
       const dir = temp(), a = vi.fn(), b = vi.fn();

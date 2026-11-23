@@ -81,7 +81,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence, sanitizeAcceptHoldReason } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -625,7 +625,7 @@ export async function runReviewLoopOnce({
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
   // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:
   // the run's own filing receipt names this reviewed head and this finding set. A bare `--answer=accept` has none.
-  const acceptHold = (run, { filed = false } = {}) => {
+  const evaluateAcceptHold = (run, { filed = false } = {}) => {
     if (!requiresCleanReferrals) return null;
     try {
       // A `changes` round the round-cards rule cards and accepts goes through the same live-referral gate.
@@ -638,6 +638,14 @@ export async function runReviewLoopOnce({
       return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
     } catch (error) { return `live referrals unavailable: ${error.message}`; }
+  };
+  const acceptHold = (run, options) => {
+    const hold = sanitizeAcceptHoldReason(evaluateAcceptHold(run, options));
+    if (hold && run.pending?.kind === 'confirm') {
+      run.acceptHoldReason = sanitizeAcceptHoldReason(`Unattended accept parked: ${hold}`);
+      store.write(run);
+    }
+    return hold || null;
   };
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {

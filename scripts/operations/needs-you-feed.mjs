@@ -158,7 +158,9 @@ function resultAgrees(body, parsed) {
 // Items whose verdict came from a live read of the PR (the only evidence that may retire a confirmed-break alert).
 const LIVE_VERIFIED = new WeakSet();
 const verified = item => { LIVE_VERIFIED.add(item); return item; };
-const keyOf = i => `${i.repo}#${i.pr}@${i.head}:${i.kind}`;
+const keyOf = i => `${i.repo}#${i.pr}@${i.head}:${i.kind}`
+  + (i.kind === 'review-no-verdict' && Number.isSafeInteger(i.reviewRunCount) && i.reviewRunCount > 0
+    ? `~${i.reviewRunCount}` : '');
 /** Queue text is display data: bound it and remove terminal controls, line separators and bidi/invisible formatting. */
 export function sanitizeForFeed(text, max) {
   return String(text).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').slice(0, max);
@@ -176,7 +178,9 @@ const sanitizeItem = item => Object.fromEntries(Object.entries(item).map(([field
 function fromKey(key) {
   const m = /^(.*)#(\d+)@(.*):([^:]+)$/.exec(key);
   if (!m) throw new Error(`needs-you-feed: invalid state key ${key}`);
-  return { repo: m[1], pr: Number(m[2]), head: m[3], was: m[4] };
+  const counted = /^(review-no-verdict)~([1-9][0-9]*)$/.exec(m[4]);
+  return { repo: m[1], pr: Number(m[2]), head: m[3], was: counted ? counted[1] : m[4],
+    ...(counted ? { reviewRunCount: Number(counted[2]) } : {}) };
 }
 export function diffFeed(prevOpenKeys, items, now, { incomplete = items.incomplete, clearKinds = null, alsoClear = null, retainKeys = [] } = {}) {
   const at = new Date(now).toISOString(), prev = new Set(prevOpenKeys), current = new Map(items.map(sanitizeItem).map(i => [keyOf(i), i]));

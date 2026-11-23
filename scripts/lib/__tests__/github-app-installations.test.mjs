@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync } from 'node:fs';
+import { describe, it, expect, afterEach } from 'vitest';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -37,6 +37,26 @@ describe('owner -> installation selection', () => {
     expect(ownerFromGhArgv(['api', 'repos/frontier-ui/frontierui/pulls'])).toBe('frontier-ui');
     expect(ownerFromGhArgv(['auth', 'status'])).toBeNull();
   });
+  it.each([['plateauapp', 'plateau-app'], ['web-everything', 'web-everything'], ['frontier-ui', 'frontierui']])
+  ('routes GraphQL fields to %s', (owner, name) => {
+    for (const flag of ['-f', '-F', '--field', '--raw-field']) {
+      expect(ownerFromGhArgv(['api', 'graphql', flag, `owner=${owner}`, flag, `name=${name}`])).toBe(owner);
+    }
+    expect(ownerFromGhArgv(['api', 'graphql', `-fowner=${owner}`, `--field=repo=${name}`])).toBe(owner);
+  });
+  it.each([
+    ['api', 'graphql', '-f', 'owner=plateauapp'],
+    ['api', 'graphql', '-f', 'query=owner=plateauapp name=plateau-app'],
+    ['api', 'graphql'], ['api', 'user', '-f', 'owner=plateauapp', '-f', 'name=plateau-app'],
+  ])('does not infer a repository from incomplete or unrelated argv: %j', (...argv) => {
+    expect(ownerFromGhArgv(argv)).toBeNull();
+  });
+  it('canonicalizes GraphQL legacy owners and preserves explicit repo precedence', () => {
+    const fields = ['-f', 'owner=chalbert', '-f', 'repo=plateau-app'];
+    expect(ownerFromGhArgv(['api', 'graphql', ...fields])).toBe('plateauapp');
+    expect(ownerFromGhArgv(['api', 'graphql', ...fields, '-R', 'frontier-ui/frontierui'])).toBe('frontier-ui');
+    expect(ownerFromGhArgv(['api', 'repos/web-everything/web-everything/pulls', ...fields])).toBe('web-everything');
+  });
   it('reads the owner from https and ssh remotes, masking credentials', () => {
     expect(ownerFromRemoteUrl('https://github.com/plateauapp/plateau-app.git')).toBe('plateauapp');
     expect(ownerFromRemoteUrl('git@github.com:frontier-ui/frontierui.git')).toBe('frontier-ui');
@@ -71,8 +91,11 @@ describe('minter keeps one cache per installation', () => {
 });
 
 describe('generated shim picks the token by repo owner', () => {
+  const dirs = [];
+  afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
   const setup = () => {
     const dir = mkdtempSync(join(tmpdir(), 'shim-owner-'));
+    dirs.push(dir);
     const fakeGh = join(dir, 'gh');
     writeFileSync(fakeGh, '#!/bin/sh\necho "token=$GH_TOKEN"\n');
     chmodSync(fakeGh, 0o755);
@@ -83,9 +106,9 @@ describe('generated shim picks the token by repo owner', () => {
     }
     const shim = join(dir, 'shim.js');
     writeFileSync(shim, renderGhShimScript({ realGhPath: fakeGh, cachePath, ghThrottleCliPath: join(dir, 'missing-throttle.mjs') }));
-    const run = (args) => spawnSync(process.execPath, [shim, ...args], { encoding: 'utf8', cwd: dir, env: { ...process.env, GH_TOKEN: '', GH_REPO: '', HOME: dir,
+    const run = (args, env = {}) => spawnSync(process.execPath, [shim, ...args], { encoding: 'utf8', cwd: dir, env: { ...process.env, GH_TOKEN: '', GH_REPO: '', HOME: dir,
       // A daemon-run verify inherits these markers, which put the shim in refuse mode.
-      WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined } });
+      WE_GH_DAEMON_CALLER: undefined, XPC_SERVICE_NAME: undefined, WE_GH_AUTH_PERSONAL_FALLBACK: undefined, ...env } });
     return { run, cachePath };
   };
   it.each([
@@ -95,6 +118,15 @@ describe('generated shim picks the token by repo owner', () => {
   ])('uses the %s installation token', (slug, expected) => {
     const { run } = setup();
     expect(run(['pr', 'list', '--repo', slug]).stdout).toContain(`token=${expected}`);
+  });
+  it('routes GraphQL to plateauapp instead of the cwd origin installation', () => {
+    const { run } = setup();
+    const env = { GIT_DIR: join(process.cwd(), '.git'), GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'remote.origin.url', GIT_CONFIG_VALUE_0: 'https://github.com/web-everything/web-everything.git' };
+    expect(run(['api', 'user'], env).stdout).toContain('token=T-web-everything');
+    const result = run(['api', 'graphql', '-f', 'owner=plateauapp', '-f', 'name=plateau-app'], env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('token=T-plateauapp');
   });
   it('falls back to personal auth with a warning for an unknown owner', () => {
     const { run } = setup();
