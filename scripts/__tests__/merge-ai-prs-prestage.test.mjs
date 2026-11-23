@@ -146,6 +146,9 @@ describe('real drain pre-stage path', () => {
     expect((source.slice(0, definition.index) + source.slice(end)).match(/mergeStrategy\.enqueue\s*\(/g) || []).toHaveLength(0);
   });
   it.each([false, true])('same-head failed_checks holds and revalidates refused refresh recovery through cascade/prestage (green event: %s)', green => world(async ({pr,run}) => {
+    // Supply the durable review record behind review:accepted so the pre-landing
+    // coverage notice does not obscure this test's no-recovery-publication check.
+    pr.comments[0].body = `✅ review — accepted\n\nNet basis: \`${'c'.repeat(40)}..${sha}\`\n\n${pr.comments[0].body}`;
     if (green) expect((await run()).stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
