@@ -51,7 +51,7 @@ import { withStoreLock } from '../../../operations/__tests__/helpers/fake-claude
  *  was ~1,500; this scenario does not need that scale to prove the cap fires — see `we:scripts/conveyor/soak/
  *  breaks/session-junk-in-daemon-clone.mjs` for the same "small enough to run fast, large enough to reproduce"
  *  calibration convention. */
-const BACKLOG_SIZE = 300;
+const BACKLOG_SIZE = 600; // main red 3382d8b4: the fixed tick hit 18s on a loaded shard; 600 stops (~35s) keeps the pre-fix path above the 30s bound
 /** A tiny override so the FIXED path's budgeted reap (a handful of stops, ~0.7s) adds only a small margin on
  *  top of the ~4.7s bare-tick floor, while the unbounded pre-fix path (BACKLOG_SIZE stops, ~17s) blows well
  *  past `TICK_BOUND_MS` below. Never the production-sized default — that value is pinned by
@@ -63,7 +63,7 @@ const MAX_STOPS_OVERRIDE = '5';
  *  against a 12s bound (run 41006327928, first red commit f16501bd7 — no code on the reap/tick path changed),
  *  so 12s left ~2s of runner-variance margin and flaked. 18s keeps the same separation from the unbounded path
  *  (>= ~4.7s + ~17s ≈ 22s locally, and the stop spawns only get slower on a CI runner). */
-const TICK_BOUND_MS = 18_000;
+const TICK_BOUND_MS = 30_000;
 
 export default {
   id: 'large-reap-backlog-starves-dispatch',

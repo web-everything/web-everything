@@ -130,8 +130,8 @@ jobs:
           esac
 
           # B. Required checks — LATEST run per required name must be success.
-          got=$(gh api "repos/${{ github.repository }}/commits/$DEPLOY_SHA/check-runs?filter=latest" \
-                  --jq '[.check_runs[] | select(.name=="test" or .name=="smoke")
+          got=$(gh api --paginate "repos/${{ github.repository }}/commits/$DEPLOY_SHA/check-runs?filter=latest&per_page=100" \
+                  | jq -s '[.[].check_runs[] | select(.name=="test" or .name=="smoke")
                          | {name, conclusion, started_at}] | sort_by(.name)')
           echo "required check-runs (latest per name): $got"
           checks_ok=$(printf '%s' "$got" | jq -r '

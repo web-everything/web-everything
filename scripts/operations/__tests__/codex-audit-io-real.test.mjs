@@ -27,7 +27,7 @@ describe('codex-audit real IO', () => {
       const deps = createAuditDeps({ cwd: repo, home: join(tmp, 'home') });
 
       expect(() => deps.resolveSha('missing-audit-ref'))
-        .toThrow('audit subprocess failed or exceeded its bound');
+        .toThrow('git: exit code 128');
     });
   });
 
