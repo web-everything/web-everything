@@ -1133,7 +1133,36 @@ that both drive modes preserve provider effort while retaining the request fallb
 
 ## Shadow reviewer agreement evidence
 
-`promotionReplaces` names the existing seat Carbon replaces on manual promotion (default `claude`); the pure `assertCrossVendorPanel` helper checks that the resulting panel retains a non-builder vendor, with tests preserving seat count for Claude, Codex and agy builders.
+Manual `shadowSeats.antigravity.promoted: true` with `promotionReplaces: claude` replaces
+correctness with a deciding Carbon seat. A valid Carbon accept counts without invoking Claude.
+Reads must be bound to the reviewed head and cover every changed file; clean answers require
+whole-file reads. Errors, timeouts, missing reads, invalid answers and ledger failures invoke the
+fallback reviewer, never a synthetic accept. Historical companion blockers remain enforced on resume.
+Correctness, security and red-team each require a different vendor from the builder, including
+fallbacks and observed model identities. Unknown builder or unavailable independent providers hold
+the review with an operator-visible WAIT. Gemini builders use Claude or Codex correctness.
+Other lenses may use any vendor. The human gate remains unchanged.
+
+Watch-only Carbon shadows, the agy advisory reviewer and enabled post-accept advisory snapshots use the
+existing deterministic PR hash sampler at a default rate of 0.1. The repository post-accept observer
+remains off after shadow retirement. Post-accept loop/rating evidence
+continues recording so later outcomes can be joined to sampled snapshots. Settings log provenance.
+
+Historical review fixtures must pin promotion state and a consistent builder provider/model pair.
+Inject builder-ledger reads and seat-ledger writes instead of using host state. Provider failure tests
+need a sampled-in PR identity; sampling tests cover sampled-out and invalid inputs separately and
+assert explicit not-launched telemetry. Explicit tool-free provider pins still refuse tool-bearing
+requests before independence routing; automatically selected independent fallbacks retain their own tools policy.
+
+`scripts/lib/__tests__/review-shadow-model.test.mjs` covers Carbon evidence and failure boundaries;
+`scripts/lib/__tests__/review-seat-independence.test.mjs` covers the builder/seat assignment table,
+sampling defaults and success ledger. New deciding attempts append to `review-seat-success.jsonl`
+beside the existing promotion ledger; extras and red-team retain their scorecards. Run
+`node scripts/lib/agy-shadow-trial-report.mjs --seats --no-gh` to read counts by seat, provider and
+seat/provider, including counted verdicts, agreement, confirmed findings, false positives and timeouts.
+Unknown outcomes remain pending; missing corroboration never establishes a false positive.
+The existing `--promotion` report remains available for Carbon attempt history.
+
 
 The agy mandatory-seat shadows are off by default (operator 2026-10-16).
 `review.shadowSeats.antigravity.enabled` / `WE_REVIEW_SHADOW_AGY_ENABLED` enables shadows only within the selected scope.
@@ -5191,9 +5220,9 @@ reservation. Keep the pinned-head co-author read ahead of routing; the scratch c
 is created only after provider selection. Standard daily caps are Codex 80 (the tool
 settings explicitly raise it to 600), agy-gemini 0
 (off; operator opt-in through `review.seatDailyCaps.agy-gemini` or `enabledProviders`), agy-claude 10 (red-team emergency only). Codex builders prefer agy-gemini;
-if disabled or capped, use Codex and log same-vendor acceptance. Claude builders prefer
-Codex, then agy-gemini at cap. Unknown builders and `routeByBuilder=false` retain policy
-routing among the ordinary providers. Log each cap fallback, including reservation races.
+if disabled or capped, use an independent Claude provider or wait. Claude builders prefer
+Codex, then agy-gemini at cap. Gemini builders use Codex or Claude. Unknown builders wait;
+`routeByBuilder=false` preserves policy preference while still enforcing vendor independence. Log each cap fallback, including reservation races.
 Never choose agy-claude by default: only exhaustion of both ordinary providers' budgets
 permits the logged emergency route. Exhausting even the emergency budget retains the
 existing cap hold. Tests cover emergency selection, all budgets exhausted, and missing

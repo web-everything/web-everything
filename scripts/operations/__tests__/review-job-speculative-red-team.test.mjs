@@ -3,6 +3,7 @@
  * and keeps it only when the review accepts. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,7 +28,7 @@ const REV = 'a'.repeat(40);
 const NOW = Date.parse('2026-10-10T14:00:00Z');
 
 const read = (rev = REV) => ({
-  title: 'fix the thing', body: 'Claims: adds a guard.', diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
+  title: 'fix the thing', body: 'Claims: adds a guard.\n' + buildDelegationMarker({ provider: 'claude', model: 'claude-sonnet-5-5', taskType: 'bugfix' }), diffText: 'diff --git a/x.mjs b/x.mjs\n+export const f = (n) => 10 / n;\n',
   netChangedFiles: ['x.mjs'], netBasis: { base: 'b'.repeat(40), rev },
 });
 const payload = (verdict, r = read()) => ({
@@ -412,6 +413,7 @@ function seatsIo(over = {}) {
     newId: (() => { let n = 0; return () => `call-${++n}`; })(),
     log: () => {},
     readRecords: () => rows.slice(),
+    readBuilderRecords: () => [],
     reserveCalls: ({ provider, want, dailyCap, now }) => {
       const r = reserveSeatCalls({ ledger: ledger[provider] ?? null, records: [], want, dailyCap, now, newId: io.newId, provider });
       ledger[provider] = r.ledger;

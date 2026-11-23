@@ -1,4 +1,5 @@
 import { settleRedTeamSkip } from '../../lib/red-team-skip-outcome.mjs';
+import { buildDelegationMarker } from '../../lib/delegation-marker.mjs';
 import { createRedTeamCarryIo } from '../../lib/red-team-carry-io.mjs';
 import { readRedTeamCarry } from '../../lib/red-team-carry-machine.mjs';
 import { describe, it, expect, vi } from 'vitest';
@@ -24,7 +25,10 @@ vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
 });
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
-const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
+// Recovery fixtures predate builder routing: pin a Claude builder so Codex remains independent.
+const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: {
+  body: buildDelegationMarker({ provider: 'claude', model: 'claude-sonnet-5-5', taskType: 'bugfix' }), netBasis: { rev: head },
+} } });
 
 // Migrate legacy normalized fixtures to raw witnesses; the production reader is exercised below
 // and in review-recovery-witness.test.mjs. Each queued fixture persists its panel read first.
@@ -195,7 +199,7 @@ function runSharedRecovery(input, { status, records = [], recordsUnreadable = fa
     const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
     let firstStatusRead = true;
     const result = await runRedTeam({ ...input, env }, {
-      now: () => 1000, log: () => {},
+      now: () => 1000, log: () => {}, readBuilderRecords: () => [],
       readRecords: options => recordsUnreadable ? readStore({ ...options, path: 'injected-scorecards.json',
         exists: () => true, read: () => { throw Object.assign(Error('transient EIO'), { code: 'EIO' }); } }).records : records,
       readRedTeamStatus: () => { if (staleStatus && firstStatusRead) { firstStatusRead = false; return status; } return env.WE_SHARED_RUNS_DIR ? readRedTeamStatus({ repo: input.repo, pr: input.pr, head: input.loopPayload.findings.read.netBasis.rev, env }) : status; },
@@ -228,7 +232,7 @@ function runStoredRecovery(input, { status, prior, saved, failComment = false, f
     const calls = { model: 0, recheck: 0, reserve: 0, provider: 0 };
     const forbid = key => () => { calls[key]++; throw Error('unexpected ' + key); };
     const result = await runRedTeam({ ...input, env: { WE_RED_TEAM_SKIP_CARD_ONLY: '1' } }, {
-      now: () => 1000, log: () => {},
+      now: () => 1000, log: () => {}, readBuilderRecords: () => [],
       readRecords: options => failStore ? readStore({ ...options, path: 'injected-scorecards.json', exists: () => true,
         read: () => { throw Object.assign(Error('temporary store failure'), { code: 'EIO' }); } }).records : [prior, ...rows],
       readRedTeamStatus: () => status, readRecoveryComments: () => comments,
@@ -1287,7 +1291,7 @@ describe('red-team-only review job', () => {
         const records = [...(cap === 'snapshot' ? [spent] : cap === 'quota-hold' ? [held] : []), ...saved.rows];
         const ledger = { version: 1, reservations: [{ callId: 'spent', provider: 'codex', at: spent.scoredAt }] };
         const result = await runRedTeam({ ...input, env: { WE_REVIEW_SEAT_CAP_CODEX: cap === 'quota-hold' ? '100' : '1' } }, {
-          now: () => at, log: () => {}, readRecords: () => records,
+          now: () => at, log: () => {}, readRecords: () => records, readBuilderRecords: () => [],
           readRedTeamStatus: () => status,
           readRecoveryComments: () => saved.comments,
           cliAvailable: provider => provider === 'codex',

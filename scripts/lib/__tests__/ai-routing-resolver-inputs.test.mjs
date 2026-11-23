@@ -87,11 +87,11 @@ describe('aiRouting resolver inputs: audit regressions', () => {
   });
 
   it('explicit default shadow coordinator preserves mandatory review routing', () => {
-    const resolved = resolve({ review: { coordinator: { provider: 'agy-claude', model: 'opus-5-5', effort: 'high' } } });
+    const resolved = resolve({ review: { coordinator: { provider: 'agy-claude', model: 'sonnet', effort: 'high' } } });
     expect(resolved.invalid).toEqual([]);
     const options = { operation: 'review-seat', taskType: 'mandatory:correctness', operatorKeys: [] };
     const baseline = resolveOperationRoute(options);
-    expect(baseline).toMatchObject({ provider: 'agy-claude', mode: 'shadow' });
+    expect(baseline).toMatchObject({ provider: 'agy-claude', model: 'claude-sonnet-5-5-high', mode: 'shadow' });
     expect(resolveOperationRoute({ ...options, aiRouting: aiRoutingInputs('review', resolved).coordinator })).toEqual(baseline);
   });
 

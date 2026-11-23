@@ -102,12 +102,14 @@ describe('operator routing overrides', () => {
         .toThrow(/disabled providers/);
       if (taskType !== 'red-team') {
         // R1062: an unpromoted Carbon (the agy-gemini seat model) is never seated as a counted non-shadow seat.
+        vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'false');
         const unpromoted = reviewSeatRoutes({ routingPolicy: policy, available: ['agy-gemini'] });
         expect(unpromoted.routes.find(route => route.key === taskType)).toBeUndefined();
         vi.stubEnv('WE_REVIEW_SHADOW_AGY_PROMOTED', 'true');
         try {
           const plan = reviewSeatRoutes({ routingPolicy: policy, available: ['agy-gemini'] });
           expect(plan.routes.find(route => route.key === taskType)).toMatchObject({ provider: 'agy-gemini' });
+          expect(plan.routes.some(route => ['codex', 'agy-claude'].includes(route.provider))).toBe(false);
         } finally { vi.unstubAllEnvs(); }
       }
     });

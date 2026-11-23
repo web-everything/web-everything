@@ -1431,6 +1431,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     url: String(detail.url || ''),
     headRefName: String(raw.headRefName || ''),
     body: String(raw.body || ''),
+    headMessage: String(raw.headMessage || ''),
     // #xwk0tzu — WHAT THE INDEPENDENCE CHECK ANSWERED, recorded even when it did not refuse. A status that
     // only ever appears in a thrown message is invisible on every run that proceeds, and the two statuses
     // that proceed WITHOUT proving independence (`unknown-author`, `stamp-lost`) are exactly the ones a
@@ -1595,6 +1596,7 @@ export function buildReviewJudgeRequest({ read, lens, aim = '', seatProvider = n
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
     lens,
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     model: JUDGE_MODEL,
     effort: JUDGE_EFFORT,
     budget: JUDGE_BUDGET_USD,
@@ -1668,6 +1670,7 @@ export const CODEX_ADVISORY_SANDBOX_CORRECTION = [
  */
 export function buildReviewAdvisoryJudgeRequest({ read, aim = '' }) {
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     // #xqa9ttq — `CODEX_ADVISORY_SANDBOX_CORRECTION` is appended, not spliced in: it corrects the shared
     // mandate's "no tools at all" framing for THIS seat only, without touching `buildPanelMandate`'s text
     // (shared by every other, genuinely tool-free-or-tool-bearing, panel seat).
@@ -1770,6 +1773,7 @@ export function buildReviewCorrectnessAdvisoryMandate({ read, aim = '' }) {
  */
 export function buildReviewCorrectnessAdvisoryJudgeRequest({ read, aim = '' }) {
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     mandate: buildReviewCorrectnessAdvisoryMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -1858,6 +1862,15 @@ export function buildReviewAntigravityMandate({ read, aim = '' }) {
   return parts.join(' ');
 }
 
+function agyAdvisorySampleSkip(read, sampleRate) {
+  const status = shadowSeatStatus({ shadowPolicy: { shadowEnabled: true, scope: 'sampled', sampleRate } }, read);
+  if (status === 'sampled') return {};
+  return { skipSpawn: {
+    answer: { summary: `agy advisory ${status}`, findings: [], skipped: { reason: status } },
+    telemetry: { fallbackDecision: status === 'off (sample)' ? 'skip-not-sampled' : 'skip-sample-refused', modelEvidence: 'not-launched' },
+  } };
+}
+
 /**
  * #3383 — THE FIFTH SEAT'S RECIPE. Same shape as {@link buildReviewCorrectnessAdvisoryJudgeRequest} — no
  * `allowedTools`, no `model` (the provider boundary in `cli-adapter.mjs#resolveJudgeProvider` pins
@@ -1870,8 +1883,10 @@ export function buildReviewAntigravityMandate({ read, aim = '' }) {
  * @param {string} [o.aim] - the caller's #3094 hypothesis, or `''`.
  * @returns {object} the judge request.
  */
-export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
+export function buildReviewAntigravityJudgeRequest({ read, aim = '', sampleRate = 0.1 }) {
   return {
+    ...agyAdvisorySampleSkip(read, sampleRate),
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
     mandate: buildReviewAntigravityMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -1889,6 +1904,7 @@ export function buildReviewAntigravityJudgeRequest({ read, aim = '' }) {
 function withSeatContext(directive, read, seat) {
   return {
     ...directive, seat, repo: read.repo, pr: read.pr, head: read.netBasis?.rev ?? null,
+    ...(directive.promoted ? { citationScope: read.degraded === true ? [] : read.netChangedFiles } : {}),
     ...(Array.isArray(read.findingIdentity) && read.findingIdentity.length ? { identityTable: read.findingIdentity } : {}),
   };
 }
@@ -1924,8 +1940,10 @@ export function buildReviewAgyCorrectnessMandate({ read, aim = '' }) {
  * (`mode: 'agy'`, `onEscape: 'skip'`) routes it to the agy juror, and an escape or failure records the seat as
  * skipped rather than spending a Claude juror on an advisory opinion. PURE.
  */
-export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model }) {
+export function buildReviewAgyCorrectnessJudgeRequest({ read, aim = '', model, sampleRate = 0.1 }) {
   return {
+    reviewContext: { repo: read.repo, pr: read.pr, head: read.netBasis?.rev, body: read.body, headMessage: read.headMessage },
+    ...agyAdvisorySampleSkip(read, sampleRate),
     mandate: buildReviewAgyCorrectnessMandate({ read, aim }),
     input: renderJudgeInput(read),
     shape: REVIEW_JUDGE_SHAPE,
@@ -2822,6 +2840,7 @@ export function reviewPrOperation({
           read: view.findings.read,
           aim: typeof view.input.aim === 'string' ? view.input.aim : '',
           model: seatSettings.agyModel,
+          sampleRate: seatSettings.shadowPolicy?.sampleRate ?? 0.1,
         }),
       }),
     } : {}),
@@ -3054,6 +3073,29 @@ export function reviewPrOperation({
           if (answer.skipped) skippedSeats.push({ lens: seat.lens, reason: String(answer.skipped.reason ?? seatSummary) });
         }
 
+        // Historical persisted companion runs retain their blockers when resumed.
+        // Keep its blockers even when a prior referral is already covered: dedupe the referral,
+        // never erase the finding (including its prevention guard) or turn it into an accept.
+        let carbonSendBack = false;
+        for (const seat of seats.filter(s => s.lens === 'correctness')) {
+          const blockers = (seat.answer?.carbonBlocking?.findings ?? [])
+            .filter(f => deriveVerdict({ findings: [f] }) === VERDICTS.CHANGES);
+          if (!blockers.length) continue;
+          const scoped = scopeFindingsToCitedFiles(blockers, { scope: citationScope });
+          const carbonLens = 'carbon-correctness';
+          lensFindings[carbonLens] = [...(lensFindings[carbonLens] ?? []), ...scoped.findings];
+          lensAdmitted[carbonLens] = [...(lensAdmitted[carbonLens] ?? []), ...scoped.admitted];
+          carbonSendBack ||= scoped.admitted.length > 0;
+          citationScopeEnforced ||= scoped.enforced;
+          unverifiableCitations.push(...scoped.unverifiable);
+          const roundScoped = classifyReferralsByRound(
+            blockers.filter(requiresMandatoryReferral).map(original => ({ seat: seat.step, original })),
+            { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix,
+              lens: 'correctness', openHeads: read.referralOpenHeads },
+          );
+          referrals.push(...roundScoped.kept);
+        }
+
         // TAGGED WITH THEIR LENS, by `buildPanelFindings` — so a merged list never loses which juror said it.
         // That provenance is what makes the operator-facing comment readable with two seats: without it, a
         // security finding and a correctness finding are indistinguishable rows.
@@ -3104,7 +3146,7 @@ export function reviewPrOperation({
         const retiredOnOneAnswer = uncorroboratedRetirements({ downgraded: unverifiedClaims,
           known: knownVerifications(read.referralVerified, read.netBasis?.rev), settled: settledClaims,
           reasons: knownVerificationReasons(read.referralVerified, read.netBasis?.rev) });
-        const panelVerdict = operatorSendBackVerdict(derivePanelVerdict({
+        let panelVerdict = operatorSendBackVerdict(derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
           humanRequired: read.humanRequired === true,
           // #xu2pp2m — THE BASIS THIS PANEL ACTUALLY JUDGED ON. `read.degraded` is already the fact every
@@ -3123,6 +3165,7 @@ export function reviewPrOperation({
           // It is the verdict basis WITHOUT the advisory Codex seat.
           findings: buildPanelFindings(verdictAdmitted),
         }), read.openOperatorSendBacks);
+        if (carbonSendBack && panelVerdict !== VERDICTS.NEEDS_HUMAN) panelVerdict = VERDICTS.CHANGES;
         // Held: every verdict the loop can turn into an accept by itself — a clean accept, and a prevention-outstanding one (the loop
         // files the guard, then accepts). A `changes` verdict still bounces to the fixer; the round-cards accept refuses it
         // (`roundCardsRefusal`), and `planRecordDecision` refuses any agent-addressed accept while this list is non-empty.

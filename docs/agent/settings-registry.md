@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 627 (platform copies counted separately).
+- Declared leaves: 628 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -58,7 +58,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | acceptCarryForward | scripts/settings/accept-carry-forward.json | 1 | "on" | pr | no | Carry an accept to a new head with an identical reviewed net diff. |
 | accounts | scripts/settings/claude-accounts.json | 6 | {"a":{"service":"we.claude-code.oauth","account":"acct-a","… | pr | no | Claude account IDs mapped to Keychain credentials, without secret values. |
 | adoption | scripts/settings/prototype-load.json | 2 | {"timeoutMs":600000,"pollMs":15000} | pr | no | Prototype load adoption timeout and polling interval. |
-| advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
+| advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"off"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
@@ -154,7 +154,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | operatorUsernameSha256 | scripts/settings/privacy-terms-allowlist.json | 1 | ["cb89fdbcb4b894166b90fca32c9a56935d21f27c40f0f8c1611ee4624… | pr | no | Hashed operator usernames recognized by the portability gate. |
 | overlayDropped | scripts/settings/overlay-dropped.json | 1 | {"freshMinutes":30} | pr | no | Freshness window for detecting dropped overlays. |
 | parallelSeats | scripts/settings/review.json | 1 | "on" | pr | no | Enable parallel review seats. |
-| postAcceptAdvisory | scripts/settings/review.json | 1 | {"mode":"off"} | pr | no | Advisory review mode after acceptance; retired observer defaults off. |
+| postAcceptAdvisory | scripts/settings/review.json | 2 | {"mode":"off","sampleRate":0.1} | pr | no | Advisory review mode after acceptance; retired observer defaults off. |
 | prLandReady | scripts/settings/pr-land-ready.json | 1 | {"guardConfigPaths":["scripts/settings/prototype-load.json"… | pr | no | Configuration paths requiring guarded landing readiness. |
 | prLimit | scripts/settings/pr-limit.json | 4 | {"excludeCardOnly":true,"excludeStackedAwaitingBase":true,"… | pr | no | PR limit exclusions and explicit focus references. |
 | prListPaging | scripts/settings/pr-list-paging.json | 1 | {"pageSize":20} | pr | no | Page size for GitHub PR listing. |

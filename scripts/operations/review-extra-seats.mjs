@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { resolveBuilder } from '../lib/review-builder.mjs';
+import { isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
 import { redTeamRouteByBuilder, readReviewSeatPolicy } from '../lib/review-seat-caps.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { renderNoPromptCommandRules } from '../lib/no-prompt-command-rules.mjs';
@@ -92,7 +94,6 @@ export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
-import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
@@ -1388,16 +1389,7 @@ function missRowRecorded(records, row) {
  * provider/model/taskType), else the `Co-Authored-By: Claude …` trailer of the reviewed head commit, else unknown. PURE.
  * @returns {{provider:string, model:string, taskType:(string|null), delegated:boolean, source:string}}
  */
-export function resolveBuilder({ body = '', headMessage = '' } = {}) {
-  const d = parseDelegationMarker(String(body ?? ''));
-  if (d) return { provider: d.provider, model: d.model, taskType: d.taskType, delegated: true, source: 'delegation-marker' };
-  const m = String(headMessage ?? '').match(/^Co-Authored-By:\s*Claude\s+([^<\n]+?)\s*</im);
-  if (m) {
-    const model = `claude-${m[1].replace(/\([^)]*\)/g, '').trim().toLowerCase().replace(/\s+/g, '-')}`;
-    return { provider: 'claude', model, taskType: null, delegated: false, source: 'co-authored-by' };
-  }
-  return { provider: 'unknown', model: 'unknown', taskType: null, delegated: false, source: 'none' };
-}
+export { resolveBuilder } from '../lib/review-builder.mjs';
 
 /**
  * The red team's brief. PURE. Same two shapes as {@link buildSeatTask}: `inline` for a tool-free seat (Gemini),
@@ -1920,10 +1912,10 @@ export async function speculateRedTeam({
     const readSeatSettings = io.readSeatSettings ?? (options => readReviewSeatPolicy({ ...options, log: io.log }));
     const routeByBuilder = redTeamRouteByBuilder(env, readSeatSettings);
     let builderHeadMessage = '';
-    if (routeByBuilder) {
-      try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
-    }
-    const builder = resolveBuilder({ body: read.body, headMessage: builderHeadMessage });
+    // Vendor independence also applies when builder-based preference is switched off.
+    try { builderHeadMessage = io.readHeadMessage(lanePath, rev) ?? ''; } catch { /* unknown builder keeps routing */ }
+    const builder = resolveBuilder({ repo, pr, head: rev, body: read.body, headMessage: builderHeadMessage }, { readRecords: io.readBuilderRecords });
+    const codexBuilder = builder.provider === 'codex';
     const preferred = !routeByBuilder ? null : builder.provider === 'codex' ? 'agy-gemini'
       : ['claude', 'agy-claude'].includes(builder.provider) ? 'codex' : null;
     const operatorKeys = (io.readRoutingPolicy ?? readRoutingPolicy).operatorKeys?.() ?? [];
@@ -1956,6 +1948,13 @@ export async function speculateRedTeam({
       }
       available.push(p);
     }
+    const independent = available.filter(p => isIndependentReviewSeat('red-team', p, builder.model !== 'unknown' ? builder.model : builder.provider));
+    if (available.length && !independent.length) {
+      const reason = `WAIT: no cross-vendor red-team provider available; no available route (${unavailable.join('; ') || 'builder vendor only or unknown builder'})`;
+      io.log(`red team skipped: ${reason}`);
+      return { status: 'skipped', deferredByCap: true, reason };
+    }
+    available = independent;
     let provider = null;
     let callId = null;
     let lastReason = null;
@@ -1963,7 +1962,7 @@ export async function speculateRedTeam({
     for (let attempt = 0; attempt <= providers.length && available.length && !callId; attempt += 1) {
       // Default selection reserves agy-claude for emergencies; explicit operator chains may use it.
       const emergency = ['codex', 'agy-gemini'].every(p => capped.has(p));
-      const candidates = available.filter(p => p !== 'agy-claude' || operatorRoute || emergency);
+      const candidates = available.filter(p => p !== 'agy-claude' || codexBuilder || operatorRoute || emergency);
       if (!candidates.length) break;
       let routeError = null;
       try {
@@ -1995,6 +1994,12 @@ export async function speculateRedTeam({
       }
       let pick = configuredRoute ? { provider: configuredRoute.provider, reasoning: 'routing-policy' } : selectReviewSeatProvider({ lens: RED_TEAM_SEAT.key, available: candidates, scorecards: records });
       if (!pick.provider) { lastReason = pick.reasoning; break; }
+      if (!isIndependentReviewSeat('red-team', configuredRoute?.model ?? pick.provider, builder.model !== 'unknown' ? builder.model : builder.provider)) {
+        lastReason = 'WAIT: red-team requires a cross-vendor provider';
+        io.log(`red team: ${lastReason}; retrying independent fallback`);
+        available = available.filter(p => p !== pick.provider);
+        continue;
+      }
       // Check the resolved model, including builder/AI overrides, before spending its budget.
       // Keep runSeat's guard too: promotion can be withdrawn between admission and execution.
       const candidateModel = configuredRoute?.model ?? RED_TEAM_MODELS[pick.provider].model;
@@ -2020,11 +2025,16 @@ export async function speculateRedTeam({
           continue;
         }
       }
+      if (!isIndependentReviewSeat('red-team', configuredRoute?.model ?? pick.provider, builder.model !== 'unknown' ? builder.model : builder.provider)) {
+        available = available.filter(p => p !== pick.provider);
+        lastReason = 'WAIT: fallback red-team model is not cross-vendor';
+        continue;
+      }
       if (deferredByCap) io.log(`red team: capped route (${unavailable.join('; ') || lastReason}); fallback to ${pick.provider}`);
       if (pick.provider === 'agy-claude') io.log(operatorRoute
         ? 'red team: explicit operator route to agy-claude'
-        : 'red team: emergency fallback to agy-claude — codex and agy-gemini at cap');
-      if (preferred === 'agy-gemini' && pick.provider === 'codex') io.log('red team: same-vendor codex fallback accepted for Codex builder');
+        : emergency ? 'red team: emergency fallback to agy-claude — codex and agy-gemini at cap'
+          : 'red team: cross-vendor fallback to agy-claude for Codex builder');
       let reservation;
       try {
         reservation = io.reserveCalls({ provider: pick.provider, want: 1, dailyCap: caps[pick.provider], now });
@@ -2171,7 +2181,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
     const reason = ran ? null : (seatRow.reason || seatRow.error || `red-team seat ${seatRow.status}`);
     const confirmed = findings.filter((f) => f.confirmedByRecheck);
     const foldedVerdict = foldRedTeamVerdict({ ran, findings: confirmed });
-    const builder = resolveBuilder({ body: pass.body, headMessage: pass.headMessage ?? '' });
+    const builder = resolveBuilder({ repo, pr, head: rev, body: pass.body, headMessage: pass.headMessage ?? '' }, { readRecords: io.readBuilderRecords });
 
     const row = {
       ...seatRow,
