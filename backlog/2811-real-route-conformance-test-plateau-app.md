@@ -7,7 +7,7 @@ status: parked
 parkedReason: maturityGated
 maturityTrigger: "adoptionSignal: the board is mounted in the new shell (plan step PD-BOARD), so the real-route oracle has a final route."
 dateParked: "2026-11-22"
-blockedBy: ["2809", "2810", "xho1snv"]
+blockedBy: ["2809", "2810", "8703"]
 scope:
   - plateau-app:tests/visual/real-route-fidelity.spec.ts
 dateOpened: "2026-08-01"
