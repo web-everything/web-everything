@@ -85,8 +85,11 @@ export default {
       return /DEFAULT_REAP_MAX_STOPS_PER_PASS/.test(readFileSync(join(root, 'scripts/conveyor/session-reaper.mjs'), 'utf8'));
     } catch { return false; }
   },
-  run({ log } = {}) {
-    return runSoak({
+  async run({ log } = {}) {
+    // Deterministic proof of the per-tick budget, independent of runner speed: how many seeded backlog
+    // sessions were actually `claude stop`ped by the first tick (read at the start of round 1).
+    const reapStats = { stoppedAfterFirstTick: null };
+    const report = await runSoak({
       name: 'break:large-reap-backlog-starves-dispatch',
       rounds: 2,
       daemons: ['review'],
@@ -95,6 +98,12 @@ export default {
       env: { WE_SESSION_REAP_MAX_STOPS: MAX_STOPS_OVERRIDE },
       bounds: { tickBoundMs: TICK_BOUND_MS, owedGraceTicks: 0 },
       log,
+      perRound(w, round) {
+        if (round === 1) {
+          reapStats.stoppedAfterFirstTick = w.claude.sessions()
+            .filter((s) => String(s.id).startsWith('oldsess') && s.state === 'stopped').length;
+        }
+      },
       setup(w) {
         // Seeded BEFORE the review daemon's very first tick — the live incident's own shape: the whole
         // backlog is already there the moment the daemon (re)starts, not accumulated gradually across ticks.
@@ -109,13 +118,24 @@ export default {
         });
       },
     });
+    return { ...report, reapStats };
   },
   judge(report) {
     // 'bounded' is the direct proof: an unbounded reap blows the per-tick bound (pre-fix) vs a budgeted one
     // comfortably finishing (post-fix). 'owed' is the FUNCTIONAL consequence when a tick isn't outright
     // aborted by the harness's own IPC timeout — either signal alone means the break reproduced.
-    return report.violations
-      .filter((v) => ['bounded', 'owed'].includes(v.invariant))
+    const found = report.violations
+      .filter((v) => ['bounded', 'owed', 'crash', 'isolation'].includes(v.invariant))
       .map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
+    // The wall-clock bound is deliberately generous (runner variance); the cap itself is asserted by COUNT so
+    // the scenario can never pass by skipping the reap or by exceeding the budget.
+    if (report.fatal) found.push(`[fatal] ${report.fatal}`);
+    if (!report.ticks || report.ticks.length < 1) found.push('[ticks] no review tick completed');
+    const stopped = report.reapStats?.stoppedAfterFirstTick;
+    const cap = Number(MAX_STOPS_OVERRIDE);
+    if (stopped == null) found.push('[reap] first-tick reap count was never observed');
+    else if (stopped < 1) found.push('[reap] the first tick reaped none of the backlog — the budgeted reap did not run');
+    else if (stopped > cap) found.push(`[reap] the first tick stopped ${stopped} backlog sessions, over the per-tick cap of ${cap}`);
+    return found;
   },
 };
