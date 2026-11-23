@@ -5487,10 +5487,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     map: defaultBranchByRepo,
     readLive: async repo => {
       const { stdout } = await execFileP('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
-        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+        // The App shim routes positional `repo view` calls by GH_REPO, otherwise by cwd.
+        { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, GH_REPO: repo } });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${ghListErrText(e)}) — deferring merge/enqueue; retry on the next pass\n`),
   });
   const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
