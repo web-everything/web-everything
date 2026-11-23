@@ -44,6 +44,7 @@ import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvid
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { readQueuePlannerBlock } from './red-team-queue-state.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
@@ -226,6 +227,7 @@ export function createDrainMergeStrategy({
   postConflictFinding = defaultPostConflictFinding, now = () => Date.now(),
   cancelObsoleteRuns = cancelObsoleteQueueRuns, batching,
   env = process.env, queueSafety, labelProvider, readRedTeamEvidence = readDrainRedTeamEvidence, requestRedTeam = null, readRedTeamCheck = null,
+  readRedTeamQueueBlock = readQueuePlannerBlock,
   cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
   // The located primary checkout, if any. A corrupt `cwd` self-heals only when it is a different clone (never the
   // primary itself); unknown (null) never heals.
@@ -534,6 +536,14 @@ export function createDrainMergeStrategy({
           }
           before.redTeamPending[key] = wait;
           writeState(statePath, before);
+          let plannerBlock;
+          try { plannerBlock = readRedTeamQueueBlock({ repo: slugOf(c.repo), pr: c.num, head: headSha, env, readFile }); }
+          catch { /* Unknown queue state never supplies clearance. */ }
+          if (typeof plannerBlock === 'string' && plannerBlock.trim()) {
+            // Annotate only: the deadline, re-request and operator-notification paths below must still run.
+            wait.reason = `${reason} (red-team planner blocked: ${plannerBlock})`;
+            writeState(statePath, before);
+          }
           const outcome = pendingOutcome(c, wait);
           // Before the deadline, and for a confirmed break (its own send-back routing), the hold is the whole answer.
           if (!outcome.healthSmell || reason.includes('requiring send-back')) return outcome;
