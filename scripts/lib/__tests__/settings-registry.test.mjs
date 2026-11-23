@@ -372,14 +372,14 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('fresh render matches the shadow rotation snapshot with per-key, gitignored-doc authoring instructions', () => {
+test('fresh render matches the shadow rotation and audit debounce snapshot with per-key, gitignored-doc authoring instructions', () => {
   // The doc is generated locally and never committed, so pin a fresh render instead of a tracked file.
   const doc = renderMarkdown(buildRegistry({ root: ROOT }));
   assert.ok(doc.includes('scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json'));
   assert.ok(doc.includes('`npm run docs:settings-registry` to generate the local, gitignored doc; never commit it'));
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes this PR's providerRotation defaults and description.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
+  // Reconciled snapshot includes providerRotation and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'c925611b7ad32c041e28b23880c6598f490afaebf8aada02d502ef1f2f87cdf2');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
