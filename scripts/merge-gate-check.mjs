@@ -27,7 +27,7 @@
  * YAML from the merge ref and `merge_group` YAML from the group commit; the ruleset pins required workflows to main.
  * So (1) the PR-leg run holds any PR whose PINNED change list touches a workflow or action for a HUMAN (`facts.gatePaths` → `workflowEditFact`), and a PR must pass that run to enter the queue;
  * (2) the evaluation refuses to pass unless the RUNNING workflow file is byte-identical to main's
- * (`verifyRunningWorkflow`; fail closed); (3) a YAML edit that never reaches this script (`exit 0`, or a new
+ * (`verifyRunningWorkflow`; a differing pull_request run defers without evaluating); (3) a YAML edit that never reaches this script (`exit 0`, or a new
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
@@ -113,7 +113,8 @@ export function bodyHistoryOf(liveBody, edits) {
  * the group commit, so a PR can change what the required check does). Reads `GITHUB_WORKFLOW_REF`
  * (`owner/repo/<path>@<ref>`) and `GITHUB_WORKFLOW_SHA` (the commit the YAML came from) and compares
  * `git show <sha>:<path>` with `git show origin/<main>:<path>`. Outside Actions there is no running workflow:
- * `{ok:true, local:true}`. Any unreadable piece fails closed. Never throws.
+ * `{ok:true, local:true}`. A readable mismatch on pull_request returns `{ok:false, deferred:true}`;
+ * the main-pinned run decides. Any unreadable piece fails closed. Never throws.
  * HONEST LIMIT: this runs only when the YAML still reaches this script; a YAML edited to `exit 0` never does —
  * that case is closed only by the ruleset `workflows` pin (refs/heads/main) and the Actions integration id.
  */
@@ -131,7 +132,7 @@ export function verifyRunningWorkflow({ env = process.env, cwd, defaultBranch = 
     git(['fetch', '--quiet', '--end-of-options', 'origin', `+${defaultBranch}:refs/remotes/origin/${defaultBranch}`]);
     const running = git(['show', `${sha}:${path}`]);
     const onMain = git(['show', `refs/remotes/origin/${defaultBranch}:${path}`]);
-    if (running !== onMain) return { ok: false, path, reason: `running workflow ${path} at ${sha.slice(0, 9)} differs from ${defaultBranch}'s — a PR may not change the gate that judges it` };
+    if (running !== onMain) return { ok: false, ...(env.GITHUB_EVENT_NAME === 'pull_request' ? { deferred: true } : {}), path, reason: `running workflow ${path} at ${sha.slice(0, 9)} differs from ${defaultBranch}'s — a PR may not change the gate that judges it` };
     return { ok: true, path, reason: `running workflow ${path} matches ${defaultBranch}` };
   } catch (e) { return { ok: false, path, reason: `running workflow could not be compared with ${defaultBranch}'s: ${firstLine(e)}` }; }
 }
@@ -516,6 +517,17 @@ async function main() {
   let defaultBranch = null;
   try { defaultBranch = ghJson(['repo', 'view', repo, '--json', 'defaultBranchRef'], execFileSync)?.defaultBranchRef?.name || null; } catch { /* fail closed per gate */ }
 
+  // This check is main-sourced, never a decision delegated to the PR's YAML. A malicious PR YAML
+  // could exit 0 anyway: ruleset 24930207 pins the deciding workflow to refs/heads/main.
+  // Deferral is only a courtesy to honest YAML edits, and must precede every gate evaluation.
+  const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
+  if (wfCheck.deferred) {
+    const reason = 'deferred to the main-pinned run — running pull_request workflow differs from main';
+    if (f.json) writeAllSync(1, `${JSON.stringify({ deferred: true, reason, workflowCheck: wfCheck })}\n`);
+    else writeAllSync(1, `merge-gate: ${reason}\n`);
+    process.exit(0);
+  }
+
   let nums;
   let groupDup = null;
   let membership = null;
@@ -553,7 +565,6 @@ async function main() {
   const setting = loadMergeGateHoldSetting({ key: 'prEventCandidacyHoldsPass' });
   const prs = factsOf.map((facts) => deferCandidacyHoldsOnPrEvent(
     evaluatePrGates(facts, { policy, blockOnCodeQL, mergeEvent }), { mergeEvent, setting }));
-  const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
   const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };

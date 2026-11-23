@@ -508,14 +508,21 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
     : no('newest Merge gate workflow run did not end startup_failure');
 }
 
-// The per-workflow endpoint lists no startup_failure runs; use the repo-wide one across both PR events,
-// then filter by event and path in the classifier. Require a complete list before classifying.
+// The per-workflow endpoint lists no startup_failure runs. Bound each PR event separately so unrelated
+// events cannot exhaust the page. An incomplete event list requires operator inspection; never refresh it.
 function readMergeGateRuns({ repo, headSha }) {
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api',
-    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&per_page=100`],
-  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
-  if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
-  return out.workflow_runs;
+  const runs = [];
+  for (const event of ['pull_request_target', 'pull_request']) {
+    const out = JSON.parse(execFileSyncThrottled('gh', ['api',
+      `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&per_page=100&event=${event}`],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
+    if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count)
+        || out.total_count > 100 || out.total_count !== out.workflow_runs.length) {
+      throw new Error(`workflow run list incomplete or unreadable (${event}); inspect workflow runs manually before retrying`);
+    }
+    runs.push(...out.workflow_runs);
+  }
+  return runs;
 }
 
 function everyOtherRequiredGreen(requiredChecks, rollup) {

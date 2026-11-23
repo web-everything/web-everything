@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
@@ -1244,6 +1244,25 @@ describe('verifyRunningWorkflow', () => {
   const env = (sha, ref = `o/r/${WF}@refs/pull/7/merge`) => ({ GITHUB_ACTIONS: 'true', GITHUB_WORKFLOW_REF: ref, GITHUB_WORKFLOW_SHA: sha });
   const run = (clone, e) => verifyRunningWorkflow({ env: e, cwd: clone, defaultBranch: 'main', exec: (c, a, o) => execFileSync(c, a, { ...o, cwd: clone }) });
 
+  it.each(['pull_request', 'merge_group', 'workflow_dispatch', 'pull_request_target', undefined])('only defers a readable differing workflow on pull_request: %s', event => {
+    const e = { ...env('a'.repeat(40)), GITHUB_EVENT_NAME: event };
+    const exec = (_cmd, args) => args[0] === 'show' ? (args[1].startsWith('refs/remotes/') ? 'main YAML' : 'PR YAML') : '';
+    const result = verifyRunningWorkflow({ env: e, exec });
+    expect(result.ok).toBe(false);
+    expect(result.deferred === true).toBe(event === 'pull_request');
+  });
+  it.each(['ref', 'sha', 'main'])('never defers unreadable evidence on pull_request: %s', missing => {
+    const e = { ...env('a'.repeat(40)), GITHUB_EVENT_NAME: 'pull_request' };
+    if (missing === 'ref') delete e.GITHUB_WORKFLOW_REF;
+    if (missing === 'sha') delete e.GITHUB_WORKFLOW_SHA;
+    const result = verifyRunningWorkflow({ env: e, exec: (_cmd, args) => {
+      if (args[0] === 'show' && args[1].startsWith('refs/remotes/')) throw new Error('main unreadable');
+      return 'PR YAML';
+    } });
+    expect(result.ok).toBe(false);
+    expect(result.deferred).not.toBe(true);
+  });
+
   it('passes when the running workflow file is byte-identical to main, and outside Actions is local-only', () => {
     const { clone, commit } = setup();
     const sha = commit('lane/x', 'docs/a.md', 'x\n');
@@ -1300,7 +1319,7 @@ describe('merge-gate-check.mjs main() (spawned CLI)', () => {
 const a = process.argv.slice(2).join(' ');
 const out = (o) => { process.stdout.write(JSON.stringify(o)); process.exit(0); };
 if (/^repo view/.test(a)) out({ defaultBranchRef: { name: 'main' } });
-if (/^pr view \\d+ .*--json number,title/.test(a)) out(JSON.parse(process.env.FAKE_PR_JSON));
+if (/^pr view \\d+ .*--json number,title/.test(a)) { if (process.env.EVALUATION_MARKER) require('node:fs').writeFileSync(process.env.EVALUATION_MARKER, 'evaluator reached'); out(JSON.parse(process.env.FAKE_PR_JSON)); }
 if (/userContentEdits/.test(a)) out({ data: { repository: { pullRequest: { userContentEdits: { totalCount: 0, nodes: [] } } } } });
 if (/mergeQueue/.test(a)) out({ data: { repository: { mergeQueue: { entries: { nodes: [] } } } } });
 if (/^api repos\\/[^ ]+\\/commits\\/[0-9a-f]+\\/pulls/.test(a)) out([]);
@@ -1334,6 +1353,31 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
     git(clone, 'fetch', '--quiet', 'origin');
     return { base, head, prHead };
   };
+
+  it('defers a differing pull_request before evaluation and emits no green verdict through the wrapper', () => {
+    const ctx = setup();
+    ctx.commit('main', WF, 'name: Merge gate\n');
+    ctx.git(ctx.work, 'checkout', '--quiet', '-b', 'lane/x');
+    const edited = ctx.commit('lane/x', WF, 'name: Edited gate\n');
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request', GITHUB_WORKFLOW_REF: `o/r/${WF}@refs/pull/7/merge`, GITHUB_WORKFLOW_SHA: edited, EVALUATION_MARKER: join(ctx.clone, 'evaluation-marker') };
+    const r = run(ctx, ['--pr=7', '--json'], { env });
+    expect(r.status, r.stderr).toBe(0);
+    expect(existsSync(env.EVALUATION_MARKER)).toBe(false);
+    const report = JSON.parse(r.stdout);
+    expect(report).toMatchObject({ deferred: true, workflowCheck: { ok: false, deferred: true } });
+    expect(report).not.toHaveProperty('ok');
+    expect(report).not.toHaveProperty('prs');
+    const summaries = [];
+    const output = [];
+    expect(runGate({ argv: ['--', script, '--pr=7'], modeInfo: { mode: 'enforce', source: 'repo' },
+      spawn: () => r, write: s => output.push(s), appendSummary: s => summaries.push(s) })).toBe(0);
+    expect(summaries.join('')).toContain('deferred to the main-pinned run');
+    expect([r.stdout, r.stderr, ...output, ...summaries].join('')).not.toMatch(/PASS|all pass|"ok":\s*true|evaluator reached/);
+    const equal = run(ctx, ['--pr=7', '--json'], { env: { ...env, GITHUB_WORKFLOW_SHA: ctx.git(ctx.work, 'rev-parse', 'main') } });
+    expect(existsSync(env.EVALUATION_MARKER)).toBe(true);
+    expect(JSON.parse(equal.stdout).prs).toHaveLength(1);
+    expect(JSON.parse(equal.stdout).workflowCheck.ok).toBe(true);
+  });
 
   it('the workflow self-check forces HOLD: a running workflow that differs from main fails the verdict closed', () => {
     const ctx = setup();

@@ -434,14 +434,39 @@ describe('startup-failure stale merge-gate refresh', () => {
     expect((await handleStaleMergeGate(o)).handled).toBe(false);
     expect(o.readGateRuns).not.toHaveBeenCalled();
   });
-  it('uses the throttled workflow endpoint once with bounded output and time', async () => {
+  it('queries both events separately with bounded output and time', async () => {
     execFileSyncThrottled.mockClear();
-    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }));
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }))
+      .mockReturnValueOnce(JSON.stringify({ total_count: 0, workflow_runs: [] }));
     const o = options({ readGateRuns: undefined });
     expect((await handleStaleMergeGate(o)).handled).toBe(true);
-    expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
-    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&per_page=100`],
+    expect(execFileSyncThrottled).toHaveBeenCalledTimes(2);
+    for (const event of ['pull_request_target', 'pull_request']) expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&per_page=100&event=${event}`],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
+  });
+  it.each(['pull_request_target', 'pull_request'])('fails closed when the %s page exceeds 100; requires operator inspection', async event => {
+    if (event === 'pull_request') execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 101, workflow_runs: Array.from({ length: 100 }, () => startupRun()) }));
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('inspect workflow runs manually before retrying') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it.each(['pull_request_target', 'pull_request'])('throws when the %s read fails and never refreshes', async event => {
+    if (event === 'pull_request') execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 0, workflow_runs: [] }));
+    execFileSyncThrottled.mockImplementationOnce(() => { throw new Error('event read failed'); });
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: false, reason: expect.stringContaining('event read failed') });
+    expect(o.refreshStalePr).not.toHaveBeenCalled();
+  });
+  it('combines both pages and selects the highest trusted id, ignoring newer PR-sourced success', async () => {
+    execFileSyncThrottled.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun({ id: 100, conclusion: 'success' })] }))
+      .mockReturnValueOnce(JSON.stringify({ total_count: 2, workflow_runs: [
+        startupRun({ id: 200, event: 'pull_request', path: '.github/workflows/merge-gate.yml@refs/heads/main' }),
+        startupRun({ id: 300, event: 'pull_request', path: '.github/workflows/merge-gate.yml@refs/pull/7/merge', conclusion: 'success' }),
+      ] }));
+    const o = options({ readGateRuns: undefined });
+    expect(await handleStaleMergeGate(o)).toMatchObject({ handled: true });
+    expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ runId: 200 }));
   });
   it('ignores other workflows\' runs and path-less runs when picking the newest Merge gate run', () => {
     const other = startupRun({ id: 900, path: '.github/workflows/ci.yml', conclusion: 'success' });
@@ -910,11 +935,12 @@ describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED st
     const slug = repo || localSlug;
     const o = options({ c: { ...candidate, repo: slug }, readGateRuns: undefined });
     const transport = vi.mocked(execFileSyncThrottled);
-    transport.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }));
+    transport.mockReturnValueOnce(JSON.stringify({ total_count: 1, workflow_runs: [startupRun()] }))
+      .mockReturnValueOnce(JSON.stringify({ total_count: 0, workflow_runs: [] }));
     try {
       expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: true });
       expect(transport).toHaveBeenLastCalledWith('gh', ['api',
-        `repos/${slug}/actions/runs?head_sha=${HEAD}&per_page=100`], expect.any(Object));
+        `repos/${slug}/actions/runs?head_sha=${HEAD}&per_page=100&event=pull_request`], expect.any(Object));
       expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ repo: slug, runId: 123 }));
       expect(o.record).toHaveBeenCalledWith(o.staleStatePath, `${slug}#6940`, expect.objectContaining({ fromHead: HEAD }));
       // An explicit slug on the next pass must share the local alias's atomic claim.

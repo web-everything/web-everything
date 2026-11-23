@@ -476,6 +476,12 @@ function loadGateSetting(key, envName, { env = process.env, platformPath = PLATF
  */
 export function applyGateMode({ mode, source, childStatus, report }) {
   const head = `merge-gate mode: ${mode} (source: ${source})`;
+  // Only the main-sourced checker produces this non-verdict after comparing the running YAML.
+  if (childStatus === 0 && report?.deferred === true && report.workflowCheck?.deferred === true
+      && report.workflowCheck.ok === false && !('ok' in report) && !('prs' in report)) {
+    const line = 'merge-gate: deferred to the main-pinned run — no gate evaluation performed';
+    return { exitCode: 0, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n${line}\n` };
+  }
   const wellFormed = report && typeof report.ok === 'boolean' && Array.isArray(report.prs);
   const consistent = wellFormed && ((report.ok && childStatus === 0) || (!report.ok && childStatus === 1));
   if (!consistent) {
