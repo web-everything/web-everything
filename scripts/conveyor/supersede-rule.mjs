@@ -26,7 +26,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import MarkdownIt from 'markdown-it';
+import { createRequire } from 'node:module';
 import { isAutomationAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { supersedeHoldsOn } from './stand-down.mjs';
 
@@ -88,8 +88,13 @@ const withoutCodeSpans = (line) => line.replace(/(`+)[^]*?\1/g, '');
  *  does not read it as fenced. Where they disagree it is a sloppily indented example (`1. ```` then a line left of the
  *  item's column): GitHub shows it as text, but the author meant code, and a missed hold costs one wasted fixer run
  *  while a false hold stops an unrelated PR until an operator answers. So the tracker can only hide lines, never add. */
-const md = new MarkdownIt({ html: true }).disable('reference'); // `reference` is quadratic in markdown-it 13 (3 s on a
-// 64 KB body of definitions); without it a definition parses as a paragraph, which `REF_DEF_START_RE` skips.
+const require = createRequire(import.meta.url);
+let md;
+function markdown() {
+  // Importing this module must work in the deps install job's snapshot, before packages exist.
+  // `reference` is quadratic in markdown-it 13; REF_DEF_START_RE skips definitions instead.
+  return md ??= new (require('markdown-it'))({ html: true }).disable('reference');
+}
 
 /** Raw HTML elements whose text a reader sees as code or struck out, or never sees. Counted across the whole body:
  *  a browser carries one left open into the next paragraph. */
@@ -139,7 +144,7 @@ function visibleLines(inline, from, marked, ch, depth) {
   const lines = inline.content.split('\n');
   for (const i of marked) lines[i - from] = `${ch}${i}${ch}${lines[i - from]}`;
   const sentinelRe = new RegExp(`${ch}(\\d+)${ch}`, 'gu');
-  const [parsed] = md.parseInline(lines.join('\n'), {});
+  const [parsed] = markdown().parseInline(lines.join('\n'), {});
   const seen = new Set();
   let strike = 0;
   for (const c of parsed?.children ?? []) {
@@ -160,7 +165,7 @@ function proseMarkerLines(body, candidates) {
   const ch = sentinelChar(body);
   let hiddenFrom = Infinity;
   let depth = 0;
-  const tokens = md.parse(body, {});
+  const tokens = markdown().parse(body, {});
   for (let t = 0; t < tokens.length; t++) {
     const tok = tokens[t];
     if (!tok.map || tok.map[0] >= hiddenFrom) continue;

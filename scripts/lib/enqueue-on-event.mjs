@@ -1181,6 +1181,10 @@ export function createEnqueueOnEvent({
         const json = lastJsonLine(r.stdout);
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
+        if (!r.timedOut && (r.code !== 0 || !json)) {
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          if (stderr) what += ` (stderr: ${stderr})`;
+        }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
         const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);

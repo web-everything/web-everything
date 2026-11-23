@@ -434,6 +434,31 @@ describe('createEnqueueOnEvent', () => {
     expect(calls).toEqual([]);
   });
 
+  it.each([
+    [1, null, true],
+    [0, null, true],
+    [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, true],
+    [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, false],
+  ])('reports bounded stderr for exit %s with JSON %j (diagnostic=%s)', async (code, json, diagnostic) => {
+    const stderr = `${'old noise '.repeat(100)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
+    const tail = stderr.replace(/\s+/g, ' ').trim().slice(-300);
+    const { handle, children, lines, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    const run = handle.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    if (json) children[0].stdout.emit('data', JSON.stringify(json));
+    children[0].stderr.emit('data', stderr);
+    children[0].emit('close', code);
+    const [result] = await run;
+    expect(result.what.includes(` (stderr: ${tail})`)).toBe(diagnostic);
+    if (!json) {
+      expect(result.what).toBe(`no JSON result (stderr: ${tail})`);
+      expect(result.outcome).toBe('other');
+    }
+    expect(lines.some((line) => line.includes(result.what))).toBe(true);
+  });
+
   it('logs spawn errors without rejecting tick', async () => {
     const { handle, lines, advance } = setup({ spawnImpl: () => { throw new Error('fake spawn failure'); } });
     handle.notePoll({ ok: true, marked: [mark()] });
