@@ -37,6 +37,42 @@ describe('owner -> installation selection', () => {
     expect(ownerFromGhArgv(['api', 'repos/frontier-ui/frontierui/pulls'])).toBe('frontier-ui');
     expect(ownerFromGhArgv(['auth', 'status'])).toBeNull();
   });
+  it.each([
+    [['-iH', 'Accept: x', 'repos/plateauapp/plateau-app'], 'plateauapp'],
+    [['-XPOST', '--cache=1h', 'repos/plateauapp/plateau-app'], 'plateauapp'],
+    [['--template', 'repos/plateauapp/plateau-app', 'user'], null],
+    [['--field', 'repos/plateauapp/plateau-app', 'user'], null],
+    [['user', 'repos/plateauapp/plateau-app'], null],
+    [['graphql', '-fquery=owner=wrong', '-Fowner=chalbert', '--field=name=plateau-app'], 'plateauapp'],
+    [['graphql', '--template', 'owner=wrong', '-fowner=plateauapp', '-fname=plateau-app'], 'plateauapp'],
+    [['graphql', '--template', '--field=owner=x'], null],
+    [['graphql', '-f=owner', '-fquery=anything'], null],
+    [['graphql', '-fowner=plateauapp', '-fname=plateau-app', '-Frepo=other'], false],
+    [['graphql', '-fowner=plateauapp', '-Frepo=other', '-fname=plateau-app'], false],
+    [['graphql', '-Fowner=@owner.txt', '-Fname=plateau-app'], false],
+    [['graphql', '-fowner=plateauapp', '-fowner=frontier-ui', '-fname=plateau-app'], false],
+    [['graphql', '-fowner=plateauapp'], false],
+    [['graphql', '-fowner=plateauapp\n', '-fname=plateau-app'], false],
+    [['graphql', '-f=owner', '-fname=plateau-app'], false],
+    [['graphql', '-fowner', '-fname=plateau-app'], false],
+    [['graphql', '-fquery=query { viewer { login } }'], null],
+    [['graphql', '-fowner=plateauapp', '-fname=plateau-app', '-Frepo=plateau-app'], 'plateauapp'],
+  ])('parses api argv %j without mistaking option content for targets', (args, expected) => {
+    expect(ownerFromGhArgv(['api', ...args])).toBe(expected);
+  });
+  it.each([
+    ['-H', 'Accept: x'], ['--header', 'Accept: x'],
+    ['-X', 'GET'], ['--method', 'GET'],
+    ['-f', 'query=owner=ignored'], ['--raw-field', 'query=owner=ignored'],
+    ['-F', 'query=owner=ignored'], ['--field', 'query=owner=ignored'],
+    ['--input', 'request.json'], ['-q', '.name'], ['--jq', '.name'],
+    ['-t', 'owner=ignored'], ['--template', 'owner=ignored'],
+    ['--cache', '1h'], ['--hostname', 'github.com'],
+    ['-R', 'plateauapp/plateau-app'], ['--repo', 'plateauapp/plateau-app'],
+    ['-p', 'cors'], ['--preview', 'cors'],
+  ])('skips value-taking api option %s before a sibling endpoint', (option, value) => {
+    expect(ownerFromGhArgv(['api', option, value, 'repos/plateauapp/plateau-app'])).toBe('plateauapp');
+  });
   it('reads the owner from https and ssh remotes, masking credentials', () => {
     expect(ownerFromRemoteUrl('https://github.com/plateauapp/plateau-app.git')).toBe('plateauapp');
     expect(ownerFromRemoteUrl('git@github.com:frontier-ui/frontierui.git')).toBe('frontier-ui');
@@ -95,6 +131,14 @@ describe('generated shim picks the token by repo owner', () => {
   ])('uses the %s installation token', (slug, expected) => {
     const { run } = setup();
     expect(run(['pr', 'list', '--repo', slug]).stdout).toContain(`token=${expected}`);
+  });
+  it.each([
+    ['--preview', 'cors'], ['-p', 'cors'], ['--preview=cors'], ['-pcors'], ['-ip', 'cors'],
+  ])('selects sibling credentials with preview option %j before the endpoint', (...preview) => {
+    const { run } = setup();
+    const result = run(['api', ...preview, 'repos/plateauapp/plateau-app']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('token=T-plateauapp');
   });
   it('falls back to personal auth with a warning for an unknown owner', () => {
     const { run } = setup();
