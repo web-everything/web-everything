@@ -2050,6 +2050,7 @@
   "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/graphql-owner-fields-route-to-sibling-app.soak.test.mjs": 2,
     "scripts/conveyor/soak/breaks/verify-related-cap-ceiling.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
   "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
