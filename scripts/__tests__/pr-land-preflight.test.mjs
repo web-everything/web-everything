@@ -12,7 +12,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
   body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
   sha = 'a'.repeat(40), remoteTip = '', forkTip = '', remoteError = false, ancestor = true, refusePush = false,
   shallow = 'false', fetchUrls = null, pushUrls = null, dryRun = false, createFails = false, fallbackGit = false,
-  getUrl = null, realGit = null, lease = null } = {}) {
+  getUrl = null, realGit = null, lease = null, ref = 'lane/preflight', trackerText = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -65,6 +65,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       effect([cmd, args]);
       if (cmd === process.execPath && /guard-(?:git-push|prototype-tracker)\\.mjs$/.test(args[0])) {
         // Run the actual hook guards in fresh processes, with only Git/forge ports stubbed.
+        effect(['guard-input', args[0], opts.input]);
         if (${refusePush}) return execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' });
         return execFileSync(cmd, ['--import', ${JSON.stringify(preload)}, ...args], opts);
       }
@@ -84,6 +85,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
         return urls ?? 'https://github.com/web-everything/web-everything.git';
       }
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
+      if (args[0] === 'diff' && args[1] === '--name-only' && args[2] === args[3]) return '';
       if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
       // ls-remote --get-url: the URL ls-remote would contact after its own insteadOf pass (default: unchanged).
       if (args[0] === 'ls-remote' && args[1] === '--get-url') return ${JSON.stringify(getUrl)} ?? args[3];
@@ -100,15 +102,16 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       // The fallback merge is recorded, then refused, so the run stops before any lock, push or heal effect.
       if (args[0] === 'merge') throw new Error('fixture refuses the fallback merge');
       if (args[0] === 'push') return ${refusePush} ? execFileSync('sh', [${JSON.stringify(hook)}], { encoding: 'utf8' }) : '';
+      if (args[0] === 'show' && args[1]?.includes(':backlog/3383-') && ${JSON.stringify(trackerText)} !== null) return ${JSON.stringify(trackerText)};
       if (args[0] === 'show') throw new Error('no ready config');
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${realGit?.repo ?? dir}`,
-      '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
+      `--ref=${ref}`, '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(dryRun ? ['--dry-run'] : []), ...(fallbackGit ? ['--fallback-git'] : []),
       ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: dir, env: { ...(realGit ? realGit.env : process.env), TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', ...(fallbackGit ? { WE_MERGE_BREAK_GLASS: '1' } : {}) },
+    { cwd: dir, env: { ...(realGit ? realGit.env : process.env), TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', PROTOTYPE_TRACKER_PUSH_OK: '0', ...(fallbackGit ? { WE_MERGE_BREAK_GLASS: '1' } : {}) },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, stderr: child.stderr, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
@@ -182,6 +185,21 @@ describe('pr-land lane publish remote-tip check', () => {
   const tip = value => `${value}\trefs/heads/lane/preflight`;
   const publish = options => run({ check: false, count: 0, ...options });
   const pushes = effects => effects.filter(([cmd, args]) => cmd === 'git' && args[0] === 'push');
+
+  it.each(['lane/daemon-poc', 'lane/mechanical-dispatcher'])('already-published %s with a stale tracker reaches PR creation with empty guard updates', ref => {
+    const { status, result, effects, stderr } = publish({
+      ref, remoteTip: `${sha}\trefs/heads/${ref}`,
+      trackerText: '# Prototype tracker\n\n## Session update (2000-01-01) — stale fixture\nNo recent work.\n',
+    });
+    expect(result.reason).not.toBe('push-failed');
+    expect(status).toBe(0);
+    expect(pushes(effects)).toEqual([]);
+    expect(effects.filter(([cmd]) => cmd === 'guard-input').map(([, path, input]) => [path.split('/').at(-1), input])).toEqual([
+      ['guard-git-push.mjs', ''], ['guard-prototype-tracker.mjs', ''],
+    ]);
+    expect(effects.some(([cmd]) => cmd === 'create')).toBe(true);
+    expect(stderr).toContain(`push skipped: origin already at ${sha}`);
+  });
 
   it('origin equals HEAD: runs the pre-push hook, skips the network push and reaches PR creation', () => {
     const { effects, stderr } = publish({ remoteTip: tip(sha) });

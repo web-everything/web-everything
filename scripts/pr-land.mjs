@@ -1207,7 +1207,8 @@ async function runCli() {
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
   // Only an exact, readable remote tip can authorize skipping the network push. The repository's
-  // pre-push guards still run with the same ref payload, including pinned/corrupt lease enforcement.
+  // pre-push guards still run, including pinned/corrupt lease enforcement. Like Git, an up-to-date ref
+  // supplies no update entries: a synthetic same-SHA update would incorrectly trigger the tracker guard.
   const pushTarget = pushSkipDecision();
   const { remoteTip, validRefSha, alreadyPublished } = pushTarget;
   if (!alreadyPublished && validRefSha && remoteTip) completeHistoryForPush(pushTarget);
@@ -1218,7 +1219,7 @@ async function runCli() {
       for (const guard of ['./guard-git-push.mjs', './guard-prototype-tracker.mjs']) {
         execFileSync(process.execPath, [fileURLToPath(new URL(guard, import.meta.url)), REMOTE, pushTarget.pushUrl], {
           cwd: REPO, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
-          input: `${refSha} ${refSha} refs/heads/${REF} ${remoteTip}\n`, timeout: 30_000, maxBuffer: 1024 * 1024,
+          input: '', timeout: 30_000, maxBuffer: 1024 * 1024,
         });
       }
     } catch (e) {
