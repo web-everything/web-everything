@@ -1,0 +1,10 @@
+{
+  "subject": "standards",
+  "round": 1,
+  "roundCap": 3,
+  "calls": [
+    { "label": "redteam:standards:r1", "result": { "findings": [] } },
+    { "label": "redteam-reduce:standards:r1", "error": "reducer agent failed" }
+  ],
+  "expected": { "verdict": "needs-human", "outcome": "escalate", "findings": [] }
+}
