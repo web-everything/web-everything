@@ -522,7 +522,8 @@ async function main() {
   // This check is main-sourced, never a decision delegated to the PR's YAML. A malicious PR YAML
   // could exit 0 anyway: ruleset 24930207 pins the deciding workflow to refs/heads/main.
   // Deferral is only for pull_request PR-merge-ref YAML edits, and must precede every gate evaluation.
-  const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
+  const workflowEnv = { ...process.env }; // Keep the running definition SHA fixed throughout evaluation.
+  let wfCheck = verifyRunningWorkflow({ env: workflowEnv, cwd, defaultBranch: defaultBranch || 'main' });
   if (wfCheck.deferred) {
     const reason = 'running pull_request workflow differs from main; this diagnostic run cannot pass the gate. The main-pinned merge-gate check decides, including exact-head human clearance for workflow edits';
     if (f.json) writeAllSync(1, `${JSON.stringify({ deferred: true, ok: false, reason, workflowCheck: wfCheck })}\n`);
@@ -573,10 +574,16 @@ async function main() {
   // Re-read both red-main sources last: the facts above can take minutes, and a freeze published (or main turning
   // red) meanwhile must still hold. Only a run made entirely of main-fix PRs may pass a red main.
   const mainCiRecheck = preRecheck.ok ? readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' }) : null;
-  const verdict = preRecheck.ok
+  let verdict = preRecheck.ok
     ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy }), {
       mainCi, mainCiRecheck, exempt: factsOf.length > 0 && factsOf.every((x) => isMainFixPr(x.pr, mainCiRecheck?.redShas || [])) })
     : preRecheck;
+  const workflowRecheck = verifyRunningWorkflow({ env: workflowEnv, cwd, defaultBranch: defaultBranch || 'main' });
+  if (!workflowRecheck.ok) {
+    wfCheck = workflowRecheck;
+    verdict = { ...verdict, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${verdict.reason}` };
+  }
+  process.stderr.write(`merge-gate: workflow final self-check — ${workflowRecheck.ok ? 'ok' : 'FAIL'}: ${workflowRecheck.reason}\n`);
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);

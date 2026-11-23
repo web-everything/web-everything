@@ -3,6 +3,21 @@ import { reviewCiGate, reviewCiPrerequisites } from '../review-ci-gate.mjs';
 const headSha = 'a'.repeat(40);
 const success = name => ({ name, status: 'completed', conclusion: 'success' });
 const gate = checks => reviewCiGate({ rowsComplete: true, rowsHead: headSha, headSha, requiredChecks: ['test', 'daemon-soak'], checks });
+describe('merge-gate workflow provenance', () => {
+  const review = checks => reviewCiGate({ rowsComplete: true, rowsHead: headSha, headSha, requiredChecks: ['merge-gate'], checks });
+  it.each([
+    { ...success('merge-gate'), id: 2 },
+    { ...success('merge-gate'), id: 2, workflowPinned: false },
+    { context: 'merge-gate', state: 'success', id: 2 },
+  ])('unpinned rows cannot satisfy or supersede in either direction: %j', diagnostic => {
+    const pinned = { ...success('merge-gate'), id: 1, workflowPinned: true };
+    expect(review([{ ...pinned, conclusion: 'failure' }, diagnostic])).toMatchObject({ allowed: false });
+    const failing = diagnostic.context ? { ...diagnostic, state: 'failure' } : { ...diagnostic, conclusion: 'failure' };
+    expect(review([pinned, failing])).toMatchObject({ allowed: true });
+    expect(review([diagnostic])).toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }] });
+    expect(review([pinned, { ...failing, head_sha: 'other' }])).toMatchObject({ allowed: true });
+  });
+});
 describe('strict review CI prerequisite', () => {
   it('admits complete success, ignoring an advisory failure', () => {
     expect(gate([success('test'), success('daemon-soak'), { name: 'review-gate', status: 'completed', conclusion: 'failure' }]).allowed).toBe(true);

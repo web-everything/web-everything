@@ -1447,7 +1447,7 @@ if (/^repo view/.test(a))`), { mode: 0o755 });
       const diagnostic = { id: 200, head_sha: head, status: 'completed',
         name: mergeGateJobName(gateContext(ref, event, '')),
         conclusion: wrapped(r, mode) === 0 ? 'success' : 'failure' };
-      const pinned = { id: 100, head_sha: head, status: 'completed',
+      const pinned = { id: 100, head_sha: head, status: 'completed', workflowPinned: true,
         name: mergeGateJobName(gateContext('refs/heads/main', event, '')), conclusion: 'success' };
       const review = checks => reviewCiGate({ headSha: head, requiredChecks: ['merge-gate'],
         checks, rowsHead: head, rowsComplete: true });
@@ -1491,6 +1491,26 @@ if (/^repo view/.test(a))`), { mode: 0o755 });
     const same = run(ctx, ['--pr=7', '--json'], { env: { ...env, GITHUB_WORKFLOW_SHA: ctx.git(ctx.clone, 'rev-parse', 'origin/main') }, pr: { headRefOid: edited } });
     expect(JSON.parse(same.stdout).workflowCheck.ok).toBe(true);
     expect(JSON.parse(same.stdout).reason).not.toMatch(/workflow self-check failed/);
+  });
+
+  it('rechecks the fixed running workflow SHA and fails closed when main changes during fact gathering', () => {
+    const ctx = setup();
+    const runningSha = ctx.commit('main', WF, 'name: Merge gate\n');
+    const nextSha = ctx.commit('next', WF, 'name: Changed gate\n');
+    const origin = join(ctx.work, '..', 'origin.git');
+    const moveMain = `require('node:child_process').execFileSync('git', ['--git-dir', ${JSON.stringify(origin)}, 'update-ref', 'refs/heads/main', ${JSON.stringify(nextSha)}]); `;
+    writeFileSync(join(ctx.bin, 'gh'), FAKE_GH.replace(
+      "if (process.env.EVALUATION_MARKER)", `${moveMain}if (process.env.EVALUATION_MARKER)`), { mode: 0o755 });
+    const r = run(ctx, ['--pr=7', '--json'], { env: {
+      GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request', GITHUB_WORKFLOW_SHA: runningSha,
+      GITHUB_WORKFLOW_REF: `o/r/${WF}@refs/heads/main`,
+    } });
+    expect(r.stderr).toContain('workflow self-check — ok:');
+    expect(r.stderr).toContain('workflow final self-check — FAIL:');
+    expect(r.status, r.stderr).toBe(1);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: false,
+      reason: expect.stringMatching(/^workflow self-check failed — fail closed:.*differs from main/),
+      workflowCheck: { ok: false, reason: expect.stringContaining(runningSha.slice(0, 9)) } });
   });
 
   it('--list-group refuses an incomplete group (no numbers printed, exit 1) and prints a complete one', () => {

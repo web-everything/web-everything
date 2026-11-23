@@ -94,7 +94,7 @@ describe('classifyStartupFailureGate', () => {
 });
 
 describe('startup-failure stale merge-gate refresh', () => {
-  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS', ...(name === 'merge-gate' ? { workflowPinned: true } : {}) });
   function options(extra = {}) {
     return {
       c: { num: 5006, repo: 'o/r', headRef: 'lane/test', decision: 'skip', state: 'BLOCKED', reason: 'merge state BLOCKED' },
@@ -908,7 +908,7 @@ describe('isAlreadyQueuedError (card 257: a PR another path already enqueued is 
 
 describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED stale-gate path', () => {
   const MESSAGE = `Pull request Required workflows 'Merge gate' failed Required status check "merge-gate" is expected.`;
-  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' });
+  const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS', ...(name === 'merge-gate' ? { workflowPinned: true } : {}) });
   function options(extra = {}) {
     return {
       c: { num: 6940, repo: 'o/r', headRef: 'lane/test', mergeGateExpected: true }, key: 'o/r#6940', headSha: HEAD,

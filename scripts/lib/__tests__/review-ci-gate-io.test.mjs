@@ -5,6 +5,70 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getRequiredStatusChecks } from '../required-status-checks.mjs';
 import { readReviewCiGate as readGate, readReviewHead, readReviewChecks, formatReviewCiSkip } from '../review-ci-gate-io.mjs';
+import { reviewCiGate } from '../review-ci-gate.mjs';
+
+it.each([
+  ['.github/workflows/merge-gate.yml@refs/heads/main', 15368, true],
+  ['owner/repo/.github/workflows/merge-gate.yml@refs/heads/main', 15368, true],
+  ['.github/workflows/other.yml@refs/heads/main', 15368, false],
+  ['.github/workflows/merge-gate.yml@refs/pull/7/merge', 15368, false],
+  ['.github/workflows/merge-gate.yml', 15368, false],
+  ['.github/workflows/merge-gate.yml@refs/heads/main', 1, false],
+  [null, 15368, false],
+  ['lookup-failure', 15368, false],
+  ['missing-run-id', 15368, false],
+])('attests merge-gate only for main-pinned Actions evidence: path=%s app=%s', (path, appId, pinned) => {
+  const headSha = 'a'.repeat(40);
+  const original = { id: 2, name: 'merge-gate', status: 'completed', conclusion: 'success', app: { id: appId },
+    check_suite: { id: 123 }, head_sha: headSha,
+    details_url: path === 'missing-run-id' ? '' : 'https://github.com/o/p/actions/runs/42/job/7', workflowPinned: true };
+  const run = vi.fn(argv => {
+    if (argv[0] === 'api' && argv[1] === 'repos/o/p/actions/runs/42') {
+      if (path === 'lookup-failure') throw new Error('unreadable workflow');
+      return JSON.stringify({ path, check_suite_id: 123, head_sha: headSha });
+    }
+    return JSON.stringify(argv[3].includes('/check-runs?')
+      ? [{ total_count: 1, check_runs: [original] }] : [{ total_count: 0, statuses: [] }]);
+  });
+  const rows = readReviewChecks({ repo: 'o/p', headSha, run });
+  expect(rows[0].workflowPinned).toBe(pinned);
+  expect(original.workflowPinned).toBe(true);
+  expect(rows.rowsComplete).toBe(true);
+  expect(run).toHaveBeenCalledTimes(path === 'missing-run-id' ? 2 : 3);
+  const review = checks => reviewCiGate({ headSha, rowsHead: rows.rowsHead, rowsComplete: rows.rowsComplete,
+    requiredChecks: ['merge-gate'], checks });
+  if (!pinned) {
+    const trusted = { ...original, id: 1, workflowPinned: true };
+    expect(review([{ ...trusted, conclusion: 'failure' }, ...rows]).allowed).toBe(false);
+    expect(review([trusted, { ...rows[0], conclusion: 'failure' }]).allowed).toBe(true);
+    expect(review(rows)).toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }] });
+  } else expect(review(rows).allowed).toBe(true);
+});
+
+it.each([
+  ['different suite', { check_suite: { id: 456 } }, {}],
+  ['missing check suite', { check_suite: undefined }, {}],
+  ['missing run suite', {}, { check_suite_id: undefined }],
+  ['both suites missing', { check_suite: undefined }, { check_suite_id: undefined }],
+  ['different check head', { head_sha: 'b'.repeat(40) }, {}],
+  ['different run head', {}, { head_sha: 'b'.repeat(40) }],
+  ['both heads foreign', { head_sha: 'b'.repeat(40) }, { head_sha: 'b'.repeat(40) }],
+  ['missing check head', { head_sha: undefined }, {}],
+  ['missing run head', {}, { head_sha: undefined }],
+])('rejects a forged merge-gate check pointing at a trusted run: %s', (_case, checkOverrides, runOverrides) => {
+  const headSha = 'a'.repeat(40);
+  const check = { id: 2, name: 'merge-gate', status: 'completed', conclusion: 'success', app: { id: 15368 },
+    check_suite: { id: 123 }, head_sha: headSha, details_url: 'https://github.com/o/p/actions/runs/42/job/7', ...checkOverrides };
+  const workflow = { path: '.github/workflows/merge-gate.yml@refs/heads/main', check_suite_id: 123, head_sha: headSha, ...runOverrides };
+  const rows = readReviewChecks({ repo: 'o/p', headSha, run: argv => JSON.stringify(
+    argv[1] === 'repos/o/p/actions/runs/42' ? workflow : argv[3].includes('/check-runs?')
+      ? [{ total_count: 1, check_runs: [check] }] : [{ total_count: 0, statuses: [] }]) });
+  expect(rows[0].workflowPinned).toBe(false);
+  expect(rows.rowsComplete).toBe(true);
+  expect(reviewCiGate({ headSha, rowsHead: rows.rowsHead, rowsComplete: rows.rowsComplete,
+    requiredChecks: ['merge-gate'], checks: rows }))
+    .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'missing' }] });
+});
 
 // Overlapping pages must not substitute duplicate rows for missing evidence.
 it.each(['check_runs', 'statuses'])('refuses duplicate pagination identities in %s', feed => {

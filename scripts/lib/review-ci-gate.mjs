@@ -22,7 +22,9 @@ function statusAsCheckRow(row) {
  * hide an older run of that name explicitly bound to another head, so the foreign evidence was never seen.
  */
 export function reviewCiPrerequisites({ headSha, requiredChecks, checks }) {
-  const rows = Array.isArray(checks) ? checks : [];
+  // Only the main-pinned workflow may satisfy or supersede the deciding check.
+  const rows = (Array.isArray(checks) ? checks : []).filter(row =>
+    (row?.name !== 'merge-gate' && row?.context !== 'merge-gate') || row.workflowPinned === true);
   const wrongHeads = new Set(rows.filter(row => row?.head_sha != null && row.head_sha !== headSha)
     .map(row => row?.name ?? row?.context));
   const latest = new Map(collapseRollupToLatestPerName(rows).map(row => [row?.name ?? row?.context, statusAsCheckRow(row)]));
