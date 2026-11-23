@@ -13,6 +13,19 @@ import { planReconcile } from '../reconcile-core.mjs';
 import { rememberOwedFixRecoveryInput } from '../reconcile-pass.mjs';
 import { recoveryTransaction } from '../owed-fix-recovery.mjs';
 
+// Vitest can snapshot native named exports before fixture() installs its spies.
+// Forward them at call time; syncBuiltinESMExports below still covers native/preloaded consumers.
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal();
+  const methods = ['exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork'];
+  return { ...actual, ...Object.fromEntries(methods.map(method =>
+    [method, (...args) => actual.default[method](...args)])) };
+});
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, homedir: () => actual.default.homedir() };
+});
+
 const head = 'a'.repeat(40), start = Date.parse('2026-11-20T12:00:00Z'), minute = 60_000;
 let root;
 afterEach(() => {
@@ -123,10 +136,21 @@ describe('owed-fix-default-io-smoke', () => {
       mkdirSync(dir, { recursive: true });
       if (fault === 'claim') writeFileSync(join(dir, 'lock.json'), '{broken');
     }
-    expect((await f.tick(30)).dispatched).toEqual([]);
+    const refused = await f.tick(30);
+    expect(refused.dispatched).toEqual([]);
+    const why = {
+      auth: 'auth paused or unknown; restore login before retrying',
+      head: 'head moved or unreadable; refresh PR evidence',
+      json: 'head moved or unreadable; refresh PR evidence',
+      claim: 'invalid claim; inspect claim store',
+      'missing-claim': 'claim record missing; inspect claim store',
+    }[fault];
+    expect(refused.reconcileRefusalDetails).toContainEqual({ kind: 'owed-fix-no-fixer', prNumber: 7307, why });
     expect((await f.tick(61)).dispatched).toEqual([]);
     expect(f.claim()).toEqual(f.originalClaim);
     expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.auth).toHaveBeenCalledTimes(['auth', 'head', 'json'].includes(fault) ? 2 : 0);
+    expect(f.gh).toHaveBeenCalledTimes(['head', 'json'].includes(fault) ? 2 : 0);
     expect(f.unexpected).not.toHaveBeenCalled();
     expect(f.state().retryAt).toBeUndefined();
     expect(existsSync(join(root, 'needs-you.jsonl'))).toBe(false);
