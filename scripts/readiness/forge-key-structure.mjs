@@ -170,6 +170,33 @@ function encodedText(text) {
 }
 
 // All representations (including mixed base64 alphabets) converge here, before detection.
+// Last index of anything that could form or hide the JWK member name `kty`: the literal, any backslash escape,
+// a computed or spread member (`[` or `...` after `{`, `,`, `*`, get/set/async, whitespace/comments skipped), or a
+// quote next to `+`. Conservative: a comment before the `[`/`...` always counts. -1 when none.
+function lastSignal(text) {
+  let last=text.lastIndexOf('\\');
+  // Lowercase `kty` (jwkFinding's exact-case member name), and a quote or `+` touching a comment.
+  for(const match of text.matchAll(/kty|["'`]\s*(?:\+|\/[*\/])|\+\s*(?:["'`]|\/[*\/])|\*\/\s*\+/g))last=Math.max(last,match.index);
+  // Forward-only line state (last newline, last `//`) keeps the scan linear however many brackets there are.
+  let scanned=0,lastNl=-1,lastSlash=-1;
+  const computed=at=>{
+    let i=at-1;
+    while(i>=0&&/\s/.test(text[i]))i--;
+    if(i<0)return false;
+    const c=text[i];
+    for(;scanned<=i;scanned++) {
+      const code=text.charCodeAt(scanned);
+      if(code===10)lastNl=scanned;
+      else if(code===47&&text.charCodeAt(scanned+1)===47)lastSlash=scanned;
+    }
+    // A line comment before this member on its line may hide the real previous token: count it.
+    if(lastSlash>lastNl)return true;
+    return c==='{'||c===','||c==='*'||c==='/'||/(?:^|\W)(?:get|set|async)$/.test(text.slice(Math.max(0,i-5),i+1));
+  };
+  for(const match of text.matchAll(/\[|\.\.\./g))if(computed(match.index))last=Math.max(last,match.index);
+  return last;
+}
+
 function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   const text=bytes.toString('utf8');
   // JSON token boundaries preserve object scope and decode JSON string escapes once.
@@ -210,8 +237,14 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // (an odd count before a JWK swallows its opening brace). Every `{` is therefore matched on its own, string-aware
   // from that brace only, bounded in length, so nothing before it can hide the object.
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
-  if(/kty|\\/i.test(text)) {
-    const pieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+  const lastSig=lastSignal(text);
+  if(lastSig>=0||/kty|\\/i.test(text)) {
+    // A candidate that ends with the document matches terminated literals only, exactly as before: a lone quote
+    // inside a real object must not swallow its closing `}`.
+    const closedPieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    // A window cut at the bound lets unterminated literals consume the rest of it, including a trailing escape,
+    // so truncation never exposes a `}` inside a long string as the candidate's closing brace.
+    const cutPieces=/"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -220,15 +253,23 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       // No lookahead bound: whitespace or comments of any length between the brace and the name must not hide it.
       if(!startsObjectMember(text,at+1))continue;
       tick();
-      const limit=Math.min(text.length,at+65536);
-      let depth=0,closed=false;
-      pieces.lastIndex=at;
-      for(let piece=pieces.exec(text);piece&&pieces.lastIndex<=limit;piece=pieces.exec(text)) {
+      // Bound the regex input itself: checking lastIndex after exec would still scan an arbitrarily long
+      // unmatched string/comment or token-free tail. Every candidate shares the global processing budget.
+      const candidate=text.slice(at,at+65536);
+      const pieces=at+candidate.length<text.length?cutPieces:closedPieces;
+      let depth=0;
+      pieces.lastIndex=0;
+      for(let piece=pieces.exec(candidate);piece;piece=pieces.exec(candidate)) {
+        tick();
         if(piece[0]==='{')depth++;
-        else if(piece[0]==='}'&&--depth===0) {emit(Buffer.from(text.slice(at,pieces.lastIndex)),{expand:false});closed=true;break;}
+        else if(piece[0]==='}'&&--depth===0) {
+          emit(Buffer.from(candidate.slice(0,pieces.lastIndex)),{expand:false});
+          depth=-1;break;
+        }
       }
-      // A candidate longer than the bound is never silently skipped: fail closed.
-      if(!closed&&at+65536<text.length)throw EXHAUSTED;
+      // Incomplete evidence past the bound always refuses remote admission, even when the signal preceded
+      // this brace. A truncated token at the window edge cannot turn an oversized candidate into a pass.
+      if(depth>=0&&at+candidate.length<text.length)throw EXHAUSTED;
     }
   }
   // Decimal/signed/0x byte arrays: comments are whitespace, never squeezed into numbers.
