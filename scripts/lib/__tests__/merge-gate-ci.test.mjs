@@ -1244,12 +1244,14 @@ describe('verifyRunningWorkflow', () => {
   const env = (sha, ref = `o/r/${WF}@refs/pull/7/merge`) => ({ GITHUB_ACTIONS: 'true', GITHUB_WORKFLOW_REF: ref, GITHUB_WORKFLOW_SHA: sha });
   const run = (clone, e) => verifyRunningWorkflow({ env: e, cwd: clone, defaultBranch: 'main', exec: (c, a, o) => execFileSync(c, a, { ...o, cwd: clone }) });
 
-  it.each(['pull_request', 'merge_group', 'workflow_dispatch', 'pull_request_target', undefined])('only defers a readable differing workflow on pull_request: %s', event => {
-    const e = { ...env('a'.repeat(40)), GITHUB_EVENT_NAME: event };
+  it.each(['pull_request', 'merge_group', 'workflow_dispatch', 'pull_request_target', undefined].flatMap(event =>
+    ['refs/pull/7/merge', 'refs/heads/main', 'refs/heads/lane/x', 'refs/pull/7/head', 'refs/pull/x/merge', 'refs/pull/7/merge@refs/heads/main', 'garbage', undefined].map(ref => [event, ref])
+  ))('only defers a readable differing PR merge-ref workflow: event=%s ref=%s', (event, ref) => {
+    const e = { ...env('a'.repeat(40)), GITHUB_EVENT_NAME: event, GITHUB_WORKFLOW_REF: ref === undefined ? undefined : `o/r/${WF}@${ref}` };
     const exec = (_cmd, args) => args[0] === 'show' ? (args[1].startsWith('refs/remotes/') ? 'main YAML' : 'PR YAML') : '';
     const result = verifyRunningWorkflow({ env: e, exec });
     expect(result.ok).toBe(false);
-    expect(result.deferred === true).toBe(event === 'pull_request');
+    expect(result.deferred === true).toBe(event === 'pull_request' && ref === 'refs/pull/7/merge');
   });
   it.each(['ref', 'sha', 'main'])('never defers unreadable evidence on pull_request: %s', missing => {
     const e = { ...env('a'.repeat(40)), GITHUB_EVENT_NAME: 'pull_request' };
@@ -1354,7 +1356,7 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
     return { base, head, prHead };
   };
 
-  it('defers a differing pull_request before evaluation and emits no green verdict through the wrapper', () => {
+  it('defers only a differing pull_request PR merge ref before evaluation and emits no green verdict through the wrapper', () => {
     const ctx = setup();
     ctx.commit('main', WF, 'name: Merge gate\n');
     ctx.git(ctx.work, 'checkout', '--quiet', '-b', 'lane/x');
@@ -1373,6 +1375,12 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
       spawn: () => r, write: s => output.push(s), appendSummary: s => summaries.push(s) })).toBe(0);
     expect(summaries.join('')).toContain('deferred to the main-pinned run');
     expect([r.stdout, r.stderr, ...output, ...summaries].join('')).not.toMatch(/PASS|all pass|"ok":\s*true|evaluator reached/);
+    const pinned = run(ctx, ['--pr=7', '--json'], { env: { ...env, GITHUB_WORKFLOW_REF: `o/r/${WF}@refs/heads/main` } });
+    expect(pinned.status, pinned.stderr).toBe(1);
+    expect(JSON.parse(pinned.stdout)).toMatchObject({ ok: false, workflowCheck: { ok: false } });
+    expect(JSON.parse(pinned.stdout).workflowCheck).not.toHaveProperty('deferred');
+    expect(runGate({ argv: ['--', script, '--pr=7'], modeInfo: { mode: 'enforce', source: 'repo' },
+      spawn: () => pinned, write: () => {}, appendSummary: () => {} })).not.toBe(0);
     const equal = run(ctx, ['--pr=7', '--json'], { env: { ...env, GITHUB_WORKFLOW_SHA: ctx.git(ctx.work, 'rev-parse', 'main') } });
     expect(existsSync(env.EVALUATION_MARKER)).toBe(true);
     expect(JSON.parse(equal.stdout).prs).toHaveLength(1);
