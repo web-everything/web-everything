@@ -110,7 +110,19 @@ export function ownerFromGhArgv(argv) {
       if (m) return canonicalOwner(m[1], m[2]);
     }
   }
-  if (args[0] === 'api' && args.includes('graphql')) {
+  // The endpoint is the first positional after `api`, past flags and their values (a flag VALUE such as
+  // `--template graphql` is not the endpoint).
+  let endpoint = null;
+  if (args[0] === 'api') {
+    const valueFlags = new Set(['-f', '-F', '-H', '-X', '-q', '-t', '-p', '--field', '--raw-field', '--header', '--method',
+      '--jq', '--template', '--input', '--hostname', '--cache', '--preview']);
+    for (let i = 1; i < args.length; i += 1) {
+      const a = args[i];
+      if (valueFlags.has(a)) i += 1;
+      else if (!a.startsWith('-')) { endpoint = a; break; }
+    }
+  }
+  if (endpoint === 'graphql') {
     let owner = null, name = null;
     for (let i = 1; i < args.length; i += 1) {
       const a = args[i];

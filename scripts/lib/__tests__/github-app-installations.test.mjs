@@ -14,6 +14,13 @@ it('routes graphql owner/name fields when options precede the endpoint', () => {
   expect(ownerFromGhArgv(['api', '--paginate', 'graphql', '-f', 'owner=plateauapp', '-f', 'name=plateau-app'])).toBe('plateauapp');
 });
 
+it('does not treat a flag value or a later positional named graphql as the graphql endpoint', () => {
+  const f = ['-f', 'owner=plateauapp', '-f', 'name=plateau-app'];
+  expect(ownerFromGhArgv(['api', 'user', '--template', 'graphql', ...f])).toBeNull();
+  expect(ownerFromGhArgv(['api', '--jq', 'graphql', 'user', ...f])).toBeNull();
+  expect(ownerFromGhArgv(['api', 'user', 'graphql', ...f])).toBeNull();
+});
+
 describe('owner -> installation selection', () => {
   it('maps each new org to its installation, case-insensitively', () => {
     expect(installationForOwner('web-everything')).toBe('167640002');

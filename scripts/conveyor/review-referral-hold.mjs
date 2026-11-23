@@ -58,7 +58,7 @@ export function sanitizeAcceptHoldReason(value) {
   // invisible/format controls are dropped (so `ghp_s<ZWSP>ecret` is one token); only then is it redacted.
   return typeof value === 'string' ? value
     .replace(/[\t\n\r\v\f\u0085\u2028\u2029]/g, ' ')
-    .replace(/[\x00-\x1f\x7f-\x9f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g, '')
+    .replace(/[\x00-\x1f\x7f-\x9f\p{Cf}\p{Cc}\u180e]/gu, '')
     .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|Bearer\s+[^\s]+|x-access-token:[^\s/@]+/gi, '[REDACTED]')
     .slice(0, 300) : '';
 }
