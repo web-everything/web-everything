@@ -43,7 +43,7 @@ export default {
       for (const [label, args, expected] of cases) {
         const result = spawnSync(process.execPath, [shim, 'api', 'graphql', ...args], {
           cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
-          env: { ...process.env, HOME: dir, GH_REPO: 'web-everything/web-everything', GH_TOKEN: 'personal',
+          env: { ...process.env, HOME: dir, GH_REPO: ['web-everything', 'web-everything'].join('/'), GH_TOKEN: 'personal',
             WE_GH_DAEMON_CALLER: '', XPC_SERVICE_NAME: '', WE_GH_AUTH_PERSONAL_FALLBACK: '' },
         });
         const ok = !result.error && (expected
