@@ -4,6 +4,7 @@ import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import childProcess from 'node:child_process';
 import * as underTest from '../../lib/under-test.mjs';
+import { DEBUG_CAPTURE_BUFFER_FACTOR } from '../../lib/gh-throttle.mjs';
 import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
 import { acquireFixDispatchClaim } from '../fix-dispatch-claim.mjs';
 import { fixDispatchClaimRoot, fixDispatchResource, readFixDispatchClaim } from '../fix-claim-store.mjs';
@@ -38,11 +39,13 @@ afterEach(() => {
   root = null;
 });
 
-function fixture(claimKind = 'fixing') {
+function fixture(claimKind = 'fixing', costHeaders = '1') {
   root = mkdtempSync(join(tmpdir(), 'owed-default-io-'));
   vi.stubEnv('WE_COORDINATION_ROOT', join(root, 'coordination'));
   vi.stubEnv('WE_DAEMON_STATE_DIR', join(root, 'daemon'));
   vi.stubEnv('WE_GH_THROTTLE_LOCK_ROOT', join(root, 'gh-throttle'));
+  vi.stubEnv('WE_GH_THROTTLE_COST_HEADERS', costHeaders);
+  vi.stubEnv('GH_DEBUG', '');
   vi.stubEnv('WE_MAINTENANCE_MARKER', join(root, 'maintenance.json'));
   vi.stubEnv('WE_NEEDS_YOU_FEED', join(root, 'needs-you.jsonl'));
   // Isolate the default handoff path without replacing its resolver or changing HOME.
@@ -54,7 +57,11 @@ function fixture(claimKind = 'fixing') {
     expect(command).toBe('gh');
     expect(args).toEqual(['pr', 'view', '7307', '--repo', 'web-everything/web-everything',
       '--json', 'headRefOid,state,isDraft,labels']);
-    expect(options).toMatchObject({ timeout: 30_000, maxBuffer: 1024 * 1024 });
+    // The capture transport reserves extra room for header traces, then reapplies
+    // the caller's stdout limit. The direct-exec transport keeps the caller's cap.
+    expect(options).toMatchObject({ timeout: 30_000,
+      maxBuffer: 1024 * 1024 * (costHeaders === '1' ? DEBUG_CAPTURE_BUFFER_FACTOR : 1) });
+    if (costHeaders === '1') expect(options.env.GH_DEBUG).toBe('api');
     return JSON.stringify(facts);
   });
   const auth = vi.fn((command, args, options) => {
@@ -100,9 +107,12 @@ function fixture(claimKind = 'fixing') {
   return { tick, claim, originalClaim, dispatch, state, gh, auth, unexpected, facts, claimKind };
 }
 
-describe('owed-fix-default-io-smoke', () => {
+describe.each([
+  { transport: 'header capture', costHeaders: '1' },
+  { transport: 'direct exec', costHeaders: '0' },
+])('owed-fix-default-io-smoke ($transport)', ({ costHeaders }) => {
   it('shares the command boundary with named imports and the default auth probe', async () => {
-    const f = fixture();
+    const f = fixture('fixing', costHeaders);
     const { execFileSync } = await import('node:child_process');
     expect(execFileSync).toBe(childProcess.execFileSync);
     expect(os.homedir()).toBe(root);
@@ -112,7 +122,7 @@ describe('owed-fix-default-io-smoke', () => {
   });
 
   it.each(['fixing', 'fix', 'ci-heal'])('releases a production %s claim once and publishes the second miss once', async kind => {
-    const f = fixture(kind);
+    const f = fixture(kind, costHeaders);
     expect((await f.tick(29)).dispatched).toEqual([]);
     expect(f.claim()).toEqual(f.originalClaim);
     const recovered = await f.tick(30);
@@ -127,6 +137,8 @@ describe('owed-fix-default-io-smoke', () => {
     expect(f.dispatch).toHaveBeenCalledTimes(1);
     expect(f.gh).toHaveBeenCalledTimes(3);
     expect(f.auth).toHaveBeenCalledTimes(1);
+    expect(childProcess.spawnSync).toHaveBeenCalledTimes(costHeaders === '1' ? 3 : 0);
+    expect(childProcess.execFileSync).toHaveBeenCalledTimes(costHeaders === '1' ? 1 : 4);
     expect(f.unexpected).not.toHaveBeenCalled();
     expect(f.state()).toMatchObject({ attention: true, update: true });
     const feed = readFileSync(join(root, 'needs-you.jsonl'), 'utf8').trim().split('\n');
@@ -137,7 +149,7 @@ describe('owed-fix-default-io-smoke', () => {
   });
 
   it.each(['auth', 'auth-error', 'auth-json', 'head', 'json', 'claim', 'missing-claim'])('refuses %s failure with production recovery IO', async fault => {
-    const f = fixture();
+    const f = fixture('fixing', costHeaders);
     if (fault === 'auth') f.auth.mockReturnValue('{"loggedIn":false}');
     if (fault === 'auth-error') f.auth.mockImplementation(() => { throw new Error('auth command unavailable'); });
     if (fault === 'auth-json') f.auth.mockReturnValue('{broken');
