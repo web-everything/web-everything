@@ -16,7 +16,10 @@ export default {
   // Behaviour decides the verdict: keep this present when the routing regresses.
   fixPresent: root => existsSync(join(root, SHIM)),
   async run({ sourceRoot = ROOT, log } = {}) {
-    const { renderGhShimScript } = await import(pathToFileURL(join(sourceRoot, SHIM)).href);
+    // Render in a plain node process: the shim embeds functions via toString(), which a vitest transform would corrupt.
+    const render = opts => spawnSync(process.execPath, ['--input-type=module', '-e',
+      'const m = await import(process.argv[1]); process.stdout.write(m.renderGhShimScript(JSON.parse(process.argv[2])));',
+      pathToFileURL(join(sourceRoot, SHIM)).href, JSON.stringify(opts)], { encoding: 'utf8', timeout: 20000, maxBuffer: 4194304 }).stdout;
     const dir = mkdtempSync(join(tmpdir(), 'soak-graphql-owner-'));
     const violations = [];
     try {
@@ -28,7 +31,7 @@ export default {
           expiresAt: new Date(Date.now() + 3600e3).toISOString() }));
       }
       const shim = join(dir, 'shim.cjs');
-      writeFileSync(shim, renderGhShimScript({ realGhPath: realGh, cachePath,
+      writeFileSync(shim, render({ realGhPath: realGh, cachePath,
         ghThrottleCliPath: join(dir, 'missing-throttle.mjs') }));
       const cases = [
         ['sibling', ['-f', 'query=query { repository(owner:$owner,name:$name) { id } }', '-F', 'owner=plateauapp', '-F', 'name=plateau-app'], 'sibling'],
@@ -47,7 +50,7 @@ export default {
           ? result.status === 0 && result.stdout.trim() === expected
           : result.status === 1 && result.stdout === '' && result.stderr.includes('REFUSING personal-auth fallback: unresolved GraphQL'));
         log?.(label + ': ' + (ok ? 'ok' : 'failed'));
-        if (!ok) violations.push(label + ': GraphQL installation routing/refusal failed');
+        if (!ok) violations.push(label + ': GraphQL installation routing/refusal failed ' + JSON.stringify([result.status, result.stdout.slice(0, 80), String(result.stderr).slice(0, 300), String(result.error || '')]));
       }
     } finally { rmSync(dir, { recursive: true, force: true }); }
     return { violations };
