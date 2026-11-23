@@ -349,11 +349,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the intake and shadow rotation snapshot with per-key authoring instructions', () => {
+test('generated documentation matches the intake, shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot: the intake row plus main's providerRotation defaults and description.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '7ec41faf0ab4c3e0808f5b515324eefff1511688c7b8c5db1fb2e79d4582f0d3');
+  // Reconciled snapshot includes intake, providerRotation and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '4076abf57534acfdce08a1f05b0b6dac2cabecbef6496681ceefa2dce0c9e34d');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
