@@ -30,7 +30,7 @@ function replay({ old = false, proof = true, rerun = false, entries = [], mutate
     readLog: () => parseVitestFailures(fixture.log),
     readList: () => ({ ok: true, list: { version: 1, entries } }), log: () => {},
   });
-  return { out, line: JSON.parse(readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim()) };
+  return { out, line: readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse).find(line => line.wouldDo) };
 }
 it('replays the old coverage gap and records its none decision', () => {
   const { out, line } = replay({ old: true });
