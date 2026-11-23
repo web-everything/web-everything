@@ -87,6 +87,49 @@ it('rejects typo keys and explicit null platform namespace', () => {
   const args = settingsArgs(); delete args.platform;
   expectClosed(loadPoolSettings({ ...args, env: { WE_PLATFORM_PREFERENCES_FILE: file } }));
 });
+it.each(['tool', 'platform'])('class aliases and invalid bounds cannot be hidden in %s', layer => {
+  for (const value of [
+    { class: {}, classes: {} }, { class: { 2: { max: -1 } }, classes: {} },
+    { class: {}, classes: { 2: { max: 65 } } },
+    ...['class', 'classes'].flatMap(key => [null, [], { 2: { reserve: 9, max: 8 } }]
+      .map(bounds => ({ [key]: bounds }))),
+  ]) {
+    const args = settingsArgs();
+    if (layer === 'tool') args.read = () => ({ value, taint: [] });
+    else args.platform = value;
+    expectClosed(loadPoolSettings(args));
+  }
+});
+it('raw platform layers stay unknown when later preferences or tool settings overwrite invalid values', async () => {
+  const { LEGACY_PLATFORM_PREFERENCES_PATHS, PLATFORM_PREFERENCES_PATH, operatorPreferencesPath } = await import('../policy-cascade.mjs');
+  const files = new Map();
+  const spy = vi.spyOn(await import('node:fs'), 'readFileSync').mockImplementation(path => {
+    if (files.has(path)) return JSON.stringify(files.get(path));
+    throw Object.assign(Error('absent'), { code: 'ENOENT' });
+  });
+  try {
+    for (const value of [null, [], { mode: {} }, { builderFloor: -1 },
+      { class: { 2: { max: 65 } } }, { classes: { 2: { reserve: 9, max: 8 } } },
+      { class: {}, classes: {} }]) {
+      files.set(LEGACY_PLATFORM_PREFERENCES_PATHS[0], { resourcePool: value });
+      files.set(PLATFORM_PREFERENCES_PATH, { resourcePool: POOL_DEFAULTS });
+      files.set(operatorPreferencesPath({}), { resourcePool: POOL_DEFAULTS });
+      const args = settingsArgs(); delete args.platform;
+      expectClosed(loadPoolSettings(args));
+    }
+  } finally { spy.mockRestore(); }
+});
+it.each([undefined, null, ''])('active lane without purpose %j and an unknown session fails closed', purpose => {
+  expect(read('workers', { laneStatus: () => ({ lanes: [{ path: laneDir, leased: true,
+    lease: { ...lease(), session: 'unclassified-1', purpose } }] }) }))
+    .toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+});
+it.each([{ session: 'builder-1', purpose: 'build' }, { session: 'build-123' },
+  { session: 'conveyor-123' }, { session: 'ordinary-1', purpose: 'manual-work' }])(
+  'ordinary non-fix lane %j stays empty', identity => {
+    expect(read('workers', { laneStatus: () => ({ lanes: [{ path: laneDir, leased: true,
+      lease: { ...lease(), ...identity } }] }) })).toMatchObject({ ok: true, holders: [] });
+  });
 it('duplicate numeric override keys including escaped equivalents invalidate evidence', () => {
   const file = join(coord, 'overrides.json');
   for (const key of ['resourcePool.builderFloor', 'resourcePool.builderFlo\\u006fr']) {

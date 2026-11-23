@@ -17,6 +17,7 @@ import { pidStartTime, pidNamespace } from './pid-alive.mjs';
 import { liveReviewRoundBudget } from '../../skills-src/conveyor/review-daemon.mjs';
 import { operatorOverridesPath, CAPACITY_LEAVES } from './operator-override-reader.mjs';
 import { cascadePolicy, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { parseSessionSlug } from '../conveyor/session-slug.mjs';
 import { readEnumOverride } from './operator-enum-store.mjs';
 import { readSettingsChecked, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 // No red-team job can legitimately retain a lease beyond one day.
@@ -111,11 +112,15 @@ export function loadPoolSettings({ env = process.env, read = readPoolSettingsChe
     if (Object.keys(p).some(k => !['mode', 'builderFloor', 'classes', 'class'].includes(k))) error = 'unrecognized resourcePool key';
     if (Object.hasOwn(p, 'mode') && !['off', 'shadow', 'enforce'].includes(p.mode)) error = 'invalid resourcePool mode';
     if (Object.hasOwn(p, 'builderFloor') && !integer(p.builderFloor)) error = 'invalid resourcePool builderFloor';
+    if (Object.hasOwn(p, 'class') && Object.hasOwn(p, 'classes')) error = 'ambiguous resourcePool class aliases';
+    for (const key of ['class', 'classes'].filter(k => Object.hasOwn(p, k))) {
+      if (!object(p[key]) || Object.entries(p[key]).some(([c, v]) =>
+        !['1', '2', '3', '4'].includes(c) || !object(v) || Object.entries(v).some(([k, n]) =>
+          !['reserve', 'max', ...(c === '1' ? ['class1Overdraw'] : [])].includes(k) || !integer(n))
+        || (Object.hasOwn(v, 'reserve') && Object.hasOwn(v, 'max') && v.reserve > v.max))) error = 'invalid resourcePool class bounds';
+    }
     const { classes, ...rest } = p;
     const value = { ...rest, ...(classes === undefined ? {} : { class: classes }) };
-    if (value.class !== undefined && (!object(value.class) || Object.entries(value.class).some(([c, v]) =>
-      !['1', '2', '3', '4'].includes(c) || !object(v) || Object.entries(v).some(([k, n]) =>
-        !['reserve', 'max', ...(c === '1' ? ['class1Overdraw'] : [])].includes(k) || !integer(n))))) error = 'invalid resourcePool class bounds';
     return value;
   };
   let tool;
@@ -124,7 +129,11 @@ export function loadPoolSettings({ env = process.env, read = readPoolSettingsChe
     if (!object(checked?.value) || !Array.isArray(checked.taint) || checked.taint.length) throw Error('unreadable/tainted resourcePool settings');
     tool = project(checked.value);
     if (platform === undefined) {
-      const result = readPlatformPreferences({ env });
+      const result = readPlatformPreferences({ env, readFile: (path, encoding) => {
+        const text = fs.readFileSync(path, encoding), data = JSON.parse(String(text));
+        if (object(data) && Object.hasOwn(data, 'resourcePool')) project(data.resourcePool);
+        return text;
+      } });
       if (result.errors.length) error = 'unreadable platform settings';
       platform = Object.hasOwn(result.prefs, 'resourcePool') ? result.prefs.resourcePool : {};
     }
@@ -204,7 +213,13 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
           || (row.leased && !row.lease)) throw Error('malformed lane status; inspect lane-pool manually');
         if (row.leased !== poolLaneLeased(row.lease, nowMs)) throw Error('inconsistent lane lease status; inspect lane-pool manually');
         // Both conveyor-fix and conveyor-ci-heal consume a class-3 fixer slot.
-        if (!row.leased || ![row.lease.purpose, row.lease.session].some(v => /^(?:conveyor-)?(?:fix|ci-heal)(?:-|$)/.test(v ?? ''))) continue;
+        if (!row.leased) continue;
+        if (![row.lease.purpose, row.lease.session].some(v => /^(?:conveyor-)?(?:fix|ci-heal)(?:-|$)/.test(v ?? ''))) {
+          // Purposes are free-form. With none, require a known non-fix session identity.
+          if (!row.lease.purpose?.trim() && !/^build(?:er)?(?:-|$)/.test(row.lease.session) && !parseSessionSlug(row.lease.session))
+            throw Error('unknown lane holder identity; inspect lane-pool manually');
+          continue;
+        }
         if (lanes.has(row.path)) throw Error('duplicate lane status');
         lanes.add(row.path);
         add('fix', `${row.lease.session} (${row.path})`, 3, 2, row.lease.session);

@@ -210,6 +210,47 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+// Literal B1 oracle: never derive these declarations from the live metadata.
+const poolMetadata = {
+  settings: { resourcePool: {
+    description: 'S1a shadow studio ledger: builder floor and maxima; reserves validated for later slices. Enforce is refused as unknown.',
+    owner: 'scripts/settings/resource-pool.json', changeVia: 'pr', instant: false,
+    leaves: {
+      builderFloor: { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.builderFloor' },
+      'classes.1.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.1.reserve' },
+      'classes.1.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.1.max' },
+      'classes.2.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.2.reserve' },
+      'classes.2.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.2.max' },
+      'classes.3.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.3.reserve' },
+      'classes.3.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.3.max' },
+      'classes.4.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.4.reserve' },
+      'classes.4.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.4.max' },
+      mode: { range: 'off | shadow | enforce', unit: 'mode', note: 'instant via resourcePool.mode enum override; enforce is refused as unknown in S1a' },
+    },
+  } },
+  capacityLeaves: {
+    'resourcePool.builderFloor': { description: 'Protected builder capacity floor in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.1.reserve': { description: 'Class 1 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.1.max': { description: 'Maximum units for class 1 repair work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.2.reserve': { description: 'Class 2 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.2.max': { description: 'Maximum units for class 2 review work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.3.reserve': { description: 'Class 3 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.3.max': { description: 'Maximum units for class 3 fix work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.4.reserve': { description: 'Class 4 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.4.max': { description: 'Maximum units for class 4 builder work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+  },
+};
+const poolValue = { mode: 'shadow', builderFloor: 4, classes: {
+  1: { reserve: 2, max: 4, class1Overdraw: 2 }, 2: { reserve: 6, max: 8 },
+  3: { reserve: 2, max: 6 }, 4: { reserve: 4, max: 64 },
+} };
+const poolCapacityValues = {
+  'resourcePool.builderFloor': 4,
+  'resourcePool.class.1.reserve': 2, 'resourcePool.class.1.max': 4,
+  'resourcePool.class.2.reserve': 6, 'resourcePool.class.2.max': 8,
+  'resourcePool.class.3.reserve': 2, 'resourcePool.class.3.max': 6,
+  'resourcePool.class.4.reserve': 4, 'resourcePool.class.4.max': 64,
+};
 function split(f) {
   for (const section of ['settings', 'capacityLeaves']) {
     for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
@@ -227,14 +268,8 @@ test('migration preserves the original registry plus the intentional shadow rota
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  // Keep the original entries as the migration oracle, adding metadata only for
-  // declarations introduced since that snapshot. Both layouts see all live keys.
-  const legacyMetadata = structuredClone(originalMetadata), currentMetadata = readMetadata();
-  for (const section of ['settings', 'capacityLeaves']) {
-    for (const [key, value] of Object.entries(currentMetadata[section])) {
-      if (!Object.hasOwn(legacyMetadata[section], key)) legacyMetadata[section][key] = value;
-    }
-  }
+  const legacyMetadata = structuredClone(originalMetadata);
+  for (const section of ['settings', 'capacityLeaves']) Object.assign(legacyMetadata[section], poolMetadata[section]);
   legacyMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
   f.write(META, legacyMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
@@ -351,19 +386,17 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation for the original keys matches the shadow rotation snapshot with per-key authoring instructions', () => {
-  // The frozen digest covers the migration's original key set. New declarations
-  // remain covered by the complete live registry/document equality test above.
+test('generated documentation includes literal B1 declarations in the frozen snapshot', () => {
   const registry = buildRegistry();
   assert.deepEqual(registry.problems, []);
-  const doc = renderMarkdown({ ...registry,
-    rows: registry.rows.filter(row => Object.hasOwn(originalMetadata.settings, row.key)),
-    capacityRows: registry.capacityRows.filter(row => Object.hasOwn(originalMetadata.capacityLeaves, row.key)),
-  });
+  assert.deepEqual(registry.rows.find(row => row.key === 'resourcePool').value, poolValue);
+  for (const [key, value] of Object.entries(poolCapacityValues))
+    assert.equal(CAPACITY_LEAVES[key].failClosedFallback, value);
+  const doc = renderMarkdown(registry);
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
+  // Frozen snapshot includes the original registry and the literal B1 resourcePool declarations.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '97030b605b9c951a52c0feac9192bcb387de648be8a015cb845f11d58ba1151c');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
 
