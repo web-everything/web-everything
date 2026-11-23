@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { loadFixerLadder as loadLadder, readFixerEscalationOverride } from '../fixer-ladder.mjs';
 import { fixerTableFor, withRulingNotAddressed } from '../reconcile-fix-dispatch.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -116,9 +122,9 @@ describe('what the dispatch does with a rung', () => {
   it('stronger model: the routing-policy table, which buildAgentArgv turns into --model sonnet', () => {
     const table = fixerTableFor(ruling(3));
     expect(table).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'high', reason: 'fixer-escalation rung stronger-model' });
-    const argv = buildAgentArgv({ sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix' }, table });
+    const argv = buildAgentArgv({ root: '/repo', sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix', lane: 7 }, table });
     expect(argv[argv.indexOf('--model') + 1]).toBe('sonnet');
-    const plain = buildAgentArgv({ sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix' } });
+    const plain = buildAgentArgv({ root: '/repo', sessionId: 's', payload: { prompt: 'BRIEF', sessionSlug: 'fix-3794', launchKind: 'fix', lane: 7 } });
     expect(plain).toContain('--model');
   });
   it('a route to a provider the fix dispatch cannot launch is refused, never silently run on Claude', () => {

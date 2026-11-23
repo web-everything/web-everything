@@ -1,5 +1,11 @@
 /** @file #101 — the operator send-back body leads the fixer's prompt as its must-fix items. */
 import { describe, it, expect, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { dispatchFix, readFixBriefTemplate, withOperatorSendBack } from '../reconcile-fix-dispatch.mjs';
 
 describe('withOperatorSendBack', () => {

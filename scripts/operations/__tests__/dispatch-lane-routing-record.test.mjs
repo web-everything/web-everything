@@ -21,6 +21,12 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('./helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { readFileSync } from 'node:fs';
 
 import { advanceWhileRunning, startRun } from '../engine.mjs';
@@ -600,14 +606,14 @@ describe('(e) buildAgentArgv with a table, and resolveWorkerModel\'s own shape',
   const payload = { prompt: '# build #9001', sessionSlug: 'conveyor-9001' };
 
   it.each([...LAUNCH_KINDS, 'review', 'inspect'])('%s always gets exactly one explicit model', (launchKind) => {
-    const argv = buildAgentArgv({ payload: { ...payload, launchKind } });
+    const argv = buildAgentArgv({ root: '/repo', payload: { ...payload, launchKind, lane: 7 } });
     expect(argv.filter((arg) => arg === '--model')).toHaveLength(1);
     expect(argv[argv.indexOf('--model') + 1]).toBe(launchKind === 'prepare-decision' ? 'opus' : 'sonnet');
   });
 
   it.each(LAUNCH_KINDS)('the Claude provider forwards the %s kind to model resolution', (launchKind) => {
     let argv;
-    defaultClaudeProvider({ prompt: payload.prompt, launchKind }, {
+    defaultClaudeProvider({ dispatchRoot: '/repo', prompt: payload.prompt, launchKind, lane: 7 }, {
       spawnAgent: (args) => { argv = args; return 'backgrounded · abc123 · worker'; },
     });
     expect(argv.filter((arg) => arg === '--model')).toHaveLength(1);

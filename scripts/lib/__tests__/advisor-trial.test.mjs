@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 
 import {
   ADVISOR_BRIEF_LINE, advisorArgv, advisorForLaunch, advisorLedgerPath, advisorLedgerRow, decideAdvisor,
@@ -83,7 +88,7 @@ describe('advisor trial — flag building', () => {
   });
 
   it('buildAgentArgv adds the flag and brief line only when on, and never touches --model', () => {
-    const base = { sessionId: 's', payload: { prompt: 'fix PR #1', sessionSlug: 'fix-1', launchKind: 'fix' } };
+    const base = { root: '/repo', sessionId: 's', payload: { prompt: 'fix PR #1', sessionSlug: 'fix-1', launchKind: 'fix', lane: 7 } };
     const plain = buildAgentArgv(base);
     const withOff = buildAgentArgv({ ...base, advisor: off });
     const withOn = buildAgentArgv({ ...base, advisor: on });

@@ -275,6 +275,12 @@ export function parseBgArgv(argv) {
     if (a.startsWith('--model=')) { model = a.slice('--model='.length); continue; }
     if (a === '--effort') { effort = argv[i += 1]; continue; }
     if (a.startsWith('--effort=')) { effort = a.slice('--effort='.length); continue; }
+    // PR #7332 — the lean fix/ci-heal session flags (real claude --help options): `--tools <list>` takes one
+    // value; the rest are bare switches. Accepted for argv fidelity, not interpreted.
+    if (a === '--tools') { i += 1; continue; }
+    // The lane grant: `--add-dir <dir>`, one directory per flag as `buildAgentArgv` emits it.
+    if (a === '--add-dir') { i += 1; continue; }
+    if (a === '--restricted' || a === '--strict-mcp-config' || a === '--disable-slash-commands') continue;
     if (a.startsWith('-')) return { error: `unknown option ${a}` };
     operands.push(a);
   }

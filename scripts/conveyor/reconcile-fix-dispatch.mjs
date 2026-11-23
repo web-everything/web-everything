@@ -1703,10 +1703,12 @@ export function dispatchFix(planned, {
     } catch { /* see above */ }
     const argv = buildAgentArgv({
       sessionId,
+      root,
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix' },
+      // Carry the planner's named lane through the restricted grant; never grant its whole pool.
+      payload: { prompt: renderNoPromptCommandRules(withPlannedContext(prompt, planned), 'fix'), sessionSlug, launchKind: 'fix', repo, scope: planned.scope, lane: planned.lane },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,

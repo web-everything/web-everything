@@ -1,4 +1,10 @@
-import { it, expect } from 'vitest';
+import { it, expect, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('./helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { buildCodexDirectTaskArgv } from '../../codex-direct-task.mjs';
 it('passes resolved effort to the actual Codex, Gemini and native Claude argv builders', async () => {
   const { DEFAULT_ROUTING_POLICY, resolveOperationRoute } = await import('../../lib/dispatch-routing-policy.mjs');
@@ -19,6 +25,6 @@ it('passes resolved effort to the actual Codex, Gemini and native Claude argv bu
   expect(buildAgyDirectTaskArgv(gemini)).toEqual(expect.arrayContaining(['--model', 'gemini-3.8-flash', '--effort', 'low']));
   const native = resolveOperationRoute({ operation: 'build', gateClosed: true });
   // Codex builds use medium; the native Claude fallback retains its own high effort.
-  expect(buildAgentArgv({ payload: { prompt: 'repair', launchKind: 'fix' }, table: native })).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
+  expect(buildAgentArgv({ root: '/repo', payload: { prompt: 'repair', launchKind: 'fix', lane: 7 }, table: native })).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
   expect(() => buildAgentArgv({ payload: { prompt: 'repair' }, extraArgs: ['--effort=typo'] })).toThrow(/unknown effort/);
 });

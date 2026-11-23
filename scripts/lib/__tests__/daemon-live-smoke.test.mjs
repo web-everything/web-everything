@@ -22,7 +22,7 @@
  *   bug this item removes).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, cpSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -1847,13 +1847,16 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
     // copied, and the pass-level part (live `gh` reads) is skipped — this test needs no GitHub credential.
     const copyTree = () => {
       const dest = mkdtempSync(join(tmpdir(), 'dispatch-dry-run-'));
-      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore']) {
+      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore', '.claude/settings.json']) {
+        // PR #7332 — fix/ci-heal dispatches derive their lean hooks from the repo's own .claude/settings.json.
         cpSync(join(REPO_ROOT, rel), join(dest, rel), {
           recursive: true,
           filter: (src) => !src.includes(`${sep}node_modules`) && !src.includes(`${sep}.git${sep}`) && !src.endsWith(`${sep}.git`),
         });
       }
       symlinkSync(join(REPO_ROOT, 'node_modules'), join(dest, 'node_modules'));
+      mkdirSync(join(dest, '.fixture-home/workspace'), { recursive: true });
+      symlinkSync(dest, join(dest, '.fixture-home/workspace/.guard-main'), 'dir');
       return dest;
     };
     const childEnv = { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0' };
@@ -1867,7 +1870,9 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       expect(original).toContain(NEEDLE); // sanity: the fix is really there to revert
       writeFileSync(ciHealPath, original.replace(NEEDLE, REVERTED));
 
-      const preFixOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], { cwd: tmpRoot, encoding: 'utf8', env: childEnv });
+      const preFixOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
+        cwd: tmpRoot, encoding: 'utf8', env: { ...childEnv, HOME: join(tmpRoot, '.fixture-home') },
+      });
       const preFixRows = JSON.parse(preFixOut);
       const preFixCiHeal = preFixRows.find((r) => r.kind === 'ci-heal-worst-case');
       expect(preFixRows.every((r) => Number.isFinite(r.ms) && r.ms >= 0)).toBe(true);
@@ -1877,7 +1882,9 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       const preFixCiHealOrdinary = preFixRows.find((r) => r.kind === 'ci-heal-ordinary');
       expect(preFixCiHealOrdinary.ok).toBe(true);
 
-      const realOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], { cwd: realRoot, encoding: 'utf8', env: childEnv });
+      const realOut = execFileSync(process.execPath, ['--input-type=module', '-e', DISPATCH_DRY_RUN_SCRIPT], {
+        cwd: realRoot, encoding: 'utf8', env: { ...childEnv, HOME: join(realRoot, '.fixture-home') },
+      });
       const realRows = JSON.parse(realOut);
       expect(realRows.length).toBeGreaterThan(0);
       expect(realRows.every((r) => Number.isFinite(r.ms) && r.ms >= 0)).toBe(true);
@@ -1885,7 +1892,7 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
       expect(failures).toEqual([]);
       // Exercise the check's actual child env even when the caller explicitly enabled wrapping.
       const result = await dispatchDryRunCheck({ root: realRoot, budgets: { dispatchDryRunMs: 60_000 },
-        env: { ...childEnv, WE_WORKER_WRAPPER: 'on', WE_SMOKE_ALLOW_REAL_WORKER: '0' },
+        env: { ...childEnv, HOME: join(realRoot, '.fixture-home'), WE_WORKER_WRAPPER: 'on', WE_SMOKE_ALLOW_REAL_WORKER: '0' },
         runChild: (_cmd, args, opts) => execFileSync(process.execPath, args, { cwd: opts.cwd, env: opts.env, encoding: 'utf8', timeout: opts.timeoutMs }),
       });
       expect(result).toEqual({ ok: true, detail: expect.stringContaining('dispatch dry-run ok') });

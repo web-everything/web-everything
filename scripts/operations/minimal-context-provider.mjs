@@ -32,8 +32,12 @@
  * `deliver-item-wrapper.mjs`'s own convention) so every export here is unit-testable with no real subprocess.
  */
 import { execFileSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { pinnedHookScript, pinnedStopHookScript } from '../lib/pinned-hook-command.mjs';
 
 // #3383 — the delivery-telemetry recorder. Imported here, in the ONE module all six dispatch wrappers share,
 // so `lane.acquire` and `verify.gate` spans are captured for EVERY dispatch kind from a single edit rather
@@ -140,6 +144,139 @@ export function laneHasCommitAhead({ lane, base = 'origin/main', run: runFn = ru
  *  for a Bash call under `--tools=default` came back "no shell tool available"). This is what a minimal-context
  *  agent needs to build/edit + report; extend it here, in the one place, if a future brief needs more. */
 export const RESTRICTED_PROVIDER_TOOLS = 'Bash,Edit,Write,Read,Glob,Grep';
+
+/** Fix and ci-heal briefs require an adversarial subagent review, so their allowlist also carries `Agent`. */
+export const LEAN_FIX_TOOLS = `${RESTRICTED_PROVIDER_TOOLS},Agent`;
+
+/** Every guard and broadcast hook a lean repair session must keep, by event and the lean tools it must cover
+ *  (`tools` absent = an event with no tool matcher). Each `script` (with its mode flag, where the blocking mode
+ *  needs one) must resolve to an existing target in a synchronous command whose matcher covers every listed
+ *  tool. Matcher presence alone is not enough: an entry that survives with one guard dropped, swapped,
+ *  renamed or narrowed off a lean tool fails the dispatch closed. Extend it here when a guard is added: a test
+ *  fails while any hook in the repo settings that covers a lean tool is not listed here. */
+const LEAN_EDIT_GUARDS = ['scripts/guard-lane.mjs', 'scripts/lint-locus-prefix.mjs --pre', 'scripts/lint-invisible-characters.mjs',
+  'scripts/check-memory.mjs --pre', 'scripts/backlog-guard.mjs --pre', 'scripts/guard-backward-edge.mjs'];
+export const LEAN_FIX_REQUIRED_GUARDS = Object.freeze([
+  { event: 'PreToolUse', tools: ['Bash'], scripts: ['scripts/guard-bash.mjs'] },
+  { event: 'PreToolUse', tools: ['Edit', 'Write'], scripts: LEAN_EDIT_GUARDS },
+  { event: 'PreToolUse', tools: ['Agent'], scripts: ['scripts/guard-prep.mjs'] },
+  // `--stop-hook` is the launcher mode that makes these scripts block a stop, so it is part of the token.
+  { event: 'Stop', scripts: ['--stop-hook scripts/guard-stop-passive-wait.mjs'] },
+  { event: 'SubagentStop', scripts: ['--stop-hook scripts/guard-stop-passive-wait.mjs',
+    '--stop-hook scripts/guard-stop-background-running.mjs'] },
+  // The post-edit checks (post-mode lint and backlog guard, touch record) run after every Edit/Write too.
+  { event: 'PostToolUse', tools: ['Edit', 'Write'],
+    scripts: ['scripts/lint-locus-prefix.mjs', 'scripts/readiness/record-touch.mjs', 'scripts/backlog-guard.mjs'] },
+  // The broadcast hook is the operator's stop channel: it must fire after every lean tool and on every prompt.
+  { event: 'PostToolUse', tools: LEAN_FIX_TOOLS.split(','), scripts: ['scripts/broadcast-inject.mjs'] },
+  { event: 'UserPromptSubmit', scripts: ['scripts/broadcast-inject.mjs'] },
+].map(rule => Object.freeze({ ...rule, scripts: Object.freeze([...rule.scripts]) })));
+
+/** Claude Code matcher semantics: absent, empty or `*` matches every tool; otherwise an anchored regex
+ *  (`Edit|Write` is the common pipe-list case). An unparseable matcher covers nothing (fail closed). */
+function matcherCovers(matcher, tool) {
+  if (matcher === undefined || matcher === '' || matcher === '*') return true;
+  if (typeof matcher !== 'string') return false;
+  try { return new RegExp(`^(?:${matcher})$`).test(tool); } catch { return false; }
+}
+
+const shellQuote = value => `'${value.replace(/'/g, "'\\''")}'`;
+
+/** Resolve the actual file, refusing missing files and symlink substitutions. No shell is evaluated. */
+function hookFile(root, script) {
+  const expected = resolve(realpathSync(root), script);
+  if (realpathSync(expected) !== expected || !statSync(expected).isFile()) {
+    throw new Error(`invalid repair hook target: ${script}`);
+  }
+  return expected;
+}
+
+/** Recognize only the committed pinned wrappers or a single node invocation. A script name in echo,
+ * comments, shell branches or extra arguments is never execution evidence. Unknown forms fail closed. */
+function resolveRepairHook(hook, { repoRoot, guardRoot }) {
+  if (hook?.type !== 'command' || typeof hook.command !== 'string' || (hook.async !== undefined && hook.async !== false)) {
+    throw new Error('repair hooks must be synchronous commands');
+  }
+  const command = hook.command;
+  const pinned = pinnedHookScript(command);
+  const stop = pinnedStopHookScript(command);
+  if (pinned || stop) {
+    const launcher = hookFile(guardRoot, 'scripts/hooks/run-pinned-guard.mjs');
+    hookFile(guardRoot, pinned || stop);
+    const flags = command.slice(command.indexOf(pinned || stop) + (pinned || stop).length).match(/^(?: --[\w-]+)*/)[0];
+    // Bind execution to the file we validated even if the worker receives a different HOME.
+    const body = command.slice("sh -c '".length, -1).replace(
+      'launcher="$HOME/workspace/.guard-main/scripts/hooks/run-pinned-guard.mjs"', `launcher=${shellQuote(launcher)}`,
+    );
+    return { hook: { ...hook, command: `sh -c ${shellQuote(body)}` },
+      script: `${stop ? '--stop-hook ' : ''}${pinned || stop}${flags}`, pinned: true };
+  }
+  // Simple literal argv only; quoted paths support checkouts containing spaces. Shell syntax is refused.
+  const match = /^node (?:"([^"$`\\]+)"|'([^']+)'|([^\s'"$`\\;|&<>]+))((?: [\w-]+)*)$/.exec(command);
+  if (!match) throw new Error('unrecognized repair hook command');
+  const path = match[1] ?? match[2] ?? match[3];
+  const root = realpathSync(repoRoot);
+  const absolute = resolve(root, path);
+  const script = absolute.slice(root.length + 1);
+  if (!absolute.startsWith(`${root}/`) || !/^scripts\/(?:[\w-]+\/)*[\w-]+\.mjs$/.test(script)) {
+    throw new Error('repair hook outside repository scripts');
+  }
+  const target = hookFile(root, script);
+  return { hook: { ...hook, command: `node ${shellQuote(target)}${match[4]}` }, script: `${script}${match[4]}`, pinned: false };
+}
+
+/** Every {@link LEAN_FIX_REQUIRED_GUARDS} requirement the given `hooks` object does not meet, as
+ *  `<event>[<tool>] <script>` strings (empty = all present). Unknown or malformed shapes count as missing. */
+export function leanFixGuardGaps(hooks, options = {
+  repoRoot: REPO_ROOT, guardRoot: resolve(homedir(), 'workspace/.guard-main'),
+}) {
+  const missing = [];
+  for (const { event, tools = [undefined], scripts } of LEAN_FIX_REQUIRED_GUARDS) {
+    const entries = Array.isArray(hooks?.[event]) ? hooks[event] : [];
+    for (const tool of tools) {
+      const commands = entries.filter(entry => tool === undefined || matcherCovers(entry?.matcher, tool))
+        .flatMap(entry => (Array.isArray(entry?.hooks) ? entry.hooks : []))
+        .flatMap(hook => {
+          try {
+            const resolved = resolveRepairHook(hook, options);
+            // Pre/Stop guards must execute through the pinned clone, never a mutable lane copy.
+            return ['PreToolUse', 'Stop', 'SubagentStop'].includes(event) && !resolved.pinned ? [] : [resolved.script];
+          } catch { return []; }
+        });
+      for (const script of scripts) {
+        if (!commands.includes(script)) missing.push(`${event}${tool ? `[${tool}]` : ''} ${script}`);
+      }
+    }
+  }
+  return missing;
+}
+
+/** Derive restricted repair hooks from this checkout at call time; never silently omit repo guards. */
+export function LEAN_FIX_HOOKS_SETTINGS(settingsPath = resolve(dirname(fileURLToPath(import.meta.url)), '../../.claude/settings.json'), {
+  repoRoot = resolve(dirname(settingsPath), '..'), guardRoot = resolve(homedir(), 'workspace/.guard-main'),
+} = {}) {
+  const { hooks, permissions = {} } = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) throw new Error('missing hooks');
+  const validEntry = (entry) => Array.isArray(entry?.hooks) && entry.hooks.length > 0
+    && entry.hooks.every(hook => hook?.type === 'command' && typeof hook.command === 'string' && hook.command.trim());
+  // Retain every event, matcher and option; bind executable paths for the scratch cwd and worker HOME.
+  const all = Object.values(hooks).flatMap(entries => (Array.isArray(entries) ? entries : [null]));
+  if (!all.every(validEntry)) throw new Error('incomplete repair hook entries');
+  const options = { repoRoot, guardRoot };
+  const missing = leanFixGuardGaps(hooks, options);
+  if (missing.length) throw new Error(`missing required repair guards: ${missing.join('; ')}`);
+  if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)
+      || ['allow', 'deny', 'ask'].some(key => permissions[key] !== undefined
+        && (!Array.isArray(permissions[key]) || !permissions[key].every(rule => typeof rule === 'string')))) {
+    throw new Error('invalid repair permissions');
+  }
+  return {
+    hooks: Object.fromEntries(Object.entries(hooks).map(([event, entries]) => [event,
+      entries.map(entry => ({ ...entry, hooks: entry.hooks.map(hook => resolveRepairHook(hook, options).hook) })),
+    ])),
+    permissions,
+  };
+}
 
 // ================================================================================================
 // 1. The `CLAUDE_RESTRICTED_PROVIDER` argv shape — VERIFIED against the real CLI (v2.1.266) while building

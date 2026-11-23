@@ -21,6 +21,12 @@ import { PROVIDER_DEFAULTS, readProviderCapacity } from '../../lib/provider-capa
 
 import { renderBuildRequirements } from '../../lib/build-policy.mjs';
 import { afterAll, beforeAll, describe, it, expect, vi } from 'vitest';
+
+// Repair argv uses the validated committed hook fixture, independent of the operator's HOME.
+vi.mock('../minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('./helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';

@@ -118,6 +118,9 @@ function buildWeTemplate() {
       // clone's own `scripts/operations/` — and `completion-store.mjs` (so `lane-pool.mjs provision`, every
       // daemon) imports it transitively. Without it every sim-world `lane-pool.mjs` call dies on import ENOENT.
       'schemas/worker-result.v1.json',
+      // PR #7332 — fix and ci-heal dispatches derive their lean repair hooks from the clone's own
+      // `.claude/settings.json` (`LEAN_FIX_HOOKS_SETTINGS`), and refuse to dispatch without it (fail closed).
+      '.claude/settings.json',
     ],
     { cwd: INVOKING_ROOT, encoding: 'utf8' },
   ).split('\n').filter(Boolean).filter((path) =>
@@ -246,6 +249,9 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
   // (c) fake HOME
   const home = join(root, 'home');
   mkdirSync(home, { recursive: true });
+  // Dispatch validates the pinned launcher and targets even when the fake CLI never runs hooks.
+  mkdirSync(join(home, 'workspace'), { recursive: true });
+  symlinkSync(simClone, join(home, 'workspace/.guard-main'), 'dir');
 
   // (d) lane pool root (provisioned below, once the merged env exists)
   const lanePoolRoot = join(root, 'lanes');

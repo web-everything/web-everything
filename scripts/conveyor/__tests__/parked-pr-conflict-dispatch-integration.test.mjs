@@ -31,16 +31,23 @@
  * real subprocess cost does not belong in the ~2000-file unit pool) and `vitest.integration.config.ts`'s
  * `test.include` (so `npm run test:integration:vitest`, CI's own gate, still runs it before merge).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { withRealRepo, git } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { withFakeClaude } from '../../operations/__tests__/helpers/fake-claude.mjs';
-import { defaultSpawnAgent, defaultListAgents, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE } from '../../operations/dispatch-lane-io.mjs';
+import { defaultSpawnAgent, defaultListAgents, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, leanRepairGrant } from '../../operations/dispatch-lane-io.mjs';
+import { LEAN_FIX_HOOKS_SETTINGS, LEAN_FIX_TOOLS } from '../../operations/minimal-context-provider.mjs';
 import { stopSession } from '../../operations/dispatch-abort.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
+
+// Validate hooks against fixture files and pin the planner's single lane grant.
+vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
+  const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
+  return withLeanRepairSettingsFixture(await original());
+});
 
 import {
   isParkedConflictTarget, planConflictLabelChange, isStatuteTierConflict, buildConflictFindingBody,
@@ -242,6 +249,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
           mintSessionId: () => 'ffffffff-0000-0000-0000-000000000000',
           spawnAgent: (argv, opts) => defaultSpawnAgent(argv, { ...opts, env }),
         });
+        const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 13 }, null, { root });
 
         expect(result.resumed).toBe(false);
         expect(result.sessionId).toBe('ffffffff-0000-0000-0000-000000000000');
@@ -252,7 +260,15 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
         // bg-isolation override every dispatch path now applies (isolateDispatchSession).
         expect(fake.lastArgv()).toEqual([
           '--bg', '-n', 'fix-8802',
-          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' } }),
+          // PR #7332 — a fix dispatch is a lean repair session: repo hooks + tool allowlist ride `--settings`,
+          // and the restricted-session flags follow it.
+          // Round 2: `--restricted` ignores settings.local.json, so the lane grant rides `--settings` and `--add-dir`.
+          '--settings', JSON.stringify({ env: { WE_CONVEYOR_WORKER: '1' }, worktree: { bgIsolation: 'none' }, ...LEAN_FIX_HOOKS_SETTINGS(),
+            permissions: { ...LEAN_FIX_HOOKS_SETTINGS().permissions,
+              allow: [...new Set([...LEAN_FIX_HOOKS_SETTINGS().permissions.allow, ...LEAN_GRANT.allow])],
+              additionalDirectories: LEAN_GRANT.additionalDirectories } }),
+          ...LEAN_GRANT.additionalDirectories.flatMap(dir => ['--add-dir', dir]),
+          '--restricted', '--tools', LEAN_FIX_TOOLS, '--strict-mcp-config', '--disable-slash-commands',
           '--append-system-prompt-file', DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
           // WE routing policy — every fresh launch also carries an explicit per-operation --effort (fix → high).
           '--effort', 'high',
