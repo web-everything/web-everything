@@ -2395,6 +2395,8 @@
   "scripts/conveyor/soak/breaks/orphan-guard-bounded-per-pr.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/orphan-guard-settles.mjs": 1,
   "scripts/conveyor/soak/breaks/orphan-guard-settles.soak.test.mjs": 2,
+  "scripts/conveyor/soak/breaks/standdown-answer-after-rearm.mjs": 1,
+  "scripts/conveyor/soak/breaks/standdown-answer-after-rearm.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/overlay-main-sync-corrupt-alerts.soak.test.mjs": 0.07,
   "scripts/conveyor/soak/breaks/pass-exit-leaves-process-group.soak.test.mjs": 0.28,
   "scripts/conveyor/soak/breaks/pass-reattach-during-launch.soak.test.mjs": 0.18,

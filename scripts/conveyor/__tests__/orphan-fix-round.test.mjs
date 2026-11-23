@@ -10,6 +10,8 @@ import {
 } from '../orphan-fix-round.mjs';
 import * as fixDispatch from '../reconcile-fix-dispatch.mjs';
 import * as reconcilePass from '../reconcile-pass.mjs';
+import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { buildStandDownComment } from '../stand-down.mjs';
 import { STAND_DOWN_MARKER } from '../stand-down.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from '../fix-procedure.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -138,6 +140,19 @@ describe('defaultRearm child diagnostics', () => {
 });
 
 describe('planOrphanFixRound — the #4715 shapes', () => {
+  it('holds a new unanswered stand-down after rearm but permits non-rearm answered redispatch', () => {
+    const stamp = (body, id) => ({ ...c('2026-10-10T15:22:00Z', body), id });
+    const stop = id => stamp(buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD }), id);
+    const answer = (id, disposition) => stamp(buildOperatorAnswer({ standDownId: id,
+      reason: 'ruled', actor: 'chalbert', channel: 'chat', ...(disposition ? { disposition } : {}) }), 'answer-' + id);
+    const comments = [VERDICT, BEGIN, stop('old'), answer('old', 'rearm-review'), BEGIN, stop('new')];
+    const plan = comments => planOrphanFixRound({ pr: pr4715(comments), nowMs: NOW });
+    expect(plan(comments)).toMatchObject({ decision: 'none', reason: 'stood down — the stand-down answer owns it' });
+    expect(plan([...comments, answer('old', 'rearm-review')]).decision).toBe('none');
+    expect(plan([...comments, { ...answer('new'), author: { login: 'outsider' }, viewerDidAuthor: true }]).decision).toBe('none');
+    expect(plan([...comments, answer('new')]).decision).toBe('redispatch');
+  });
+
   it.each([
     ['not bounced', pr4715([], { labels: [] })],
     ['human-cleared head', pr4715([
