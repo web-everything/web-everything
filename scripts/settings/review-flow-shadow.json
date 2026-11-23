@@ -1,0 +1,4 @@
+{
+  "$comment": "Observe review completion evidence with FlowEngine/v0; never changes review or merge decisions. Null file resolves to <coordination dir>/flow-v0-shadow.jsonl. WE_FLOW_V0_SHADOW_FILE overrides the log destination (not an input file).",
+  "reviewLoop": { "flowShadow": { "enabled": true, "file": null } }
+}

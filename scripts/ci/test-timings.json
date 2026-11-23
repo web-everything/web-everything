@@ -1092,6 +1092,7 @@
   "scripts/lib/__tests__/fix-push-policy.test.mjs": 0.01,
   "scripts/lib/__tests__/fix-slot-borrow.test.mjs": 0.22,
   "scripts/lib/__tests__/fixer-escalation-policy.test.mjs": 0.04,
+  "scripts/lib/__tests__/flow-engine.contract.test.mjs": 0.03,
   "scripts/lib/__tests__/for-each-repo.test.mjs": 0.01,
   "scripts/lib/__tests__/forge-land-provider.test.mjs": 0.03,
   "scripts/lib/__tests__/forge-share.test.mjs": 0.05,

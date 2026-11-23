@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 166 (168 declaration rows).
-- Declared leaves: 632 (platform copies counted separately).
-- Instant top-level keys: 1; not instant: 165.
+- Top-level keys: 167 (169 declaration rows).
+- Declared leaves: 634 (platform copies counted separately).
+- Instant top-level keys: 1; not instant: 166.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -190,6 +190,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | review | scripts/settings/human-clearance-carry.json, scripts/settings/identical-net-patch.json, scripts/settings/numbering-human-clearance.json, scripts/settings/review-precedents.json | 8 | {"humanClearanceCarryForward":true,"carryEquivalence":"cont… | pr | no | Review equivalence, human clearance and precedent policy. |
 | reviewChurn | scripts/settings/review.json | 3 | {"sameTree":"off","capMode":"off","maxLoopsPerPr":8} | pr | no | Review churn detection and loop cap policy. |
 | reviewHeadIndex | scripts/settings/review-head-index.json | 0 | {} | pr | no | Retention and log compaction bounds for reviewed heads. |
+| reviewLoop | scripts/settings/review-flow-shadow.json | 2 | {"flowShadow":{"enabled":true,"file":null}} | env | no | Review-loop shadow observation controls and append-only log destination; never changes review or merge results. |
 | reviewNoVerdictRetry | scripts/settings/review-no-verdict-retry.json | 1 | {"cooldownReleases":6} | pr | no | Bounded cooldown releases when a review verdict never lands. |
 | rounds | scripts/settings/round-judge.json | 3 | {"judge":{"mode":"shadow","maxGrants":20},"nonConverging":{… | pr | no | Shadow round judge grants and non-convergence detection. |
 | routes | scripts/settings/delivery-routes.json | 15 | {"forge":"debug","red-main":"debug","incident":"debug-to-me… | pr | no | Task type to delivery mode routing. |
