@@ -115,6 +115,7 @@ const FLOOR_SETTINGS = Object.freeze([
   // literal of its full name as a direct reader.
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
   // The advisory-merge floor module names it as a regeneration input of the settings registry doc.
+  // Legacy generated metadata is not committed (npm run settings:registry); authoring fragments remain protected.
   'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/**/*.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
@@ -282,6 +283,8 @@ export const LOCK_USERS = Object.freeze([
   // PR #6606: the one host-local red-team check lock (withRedTeamCheckLock over atomic-json-file#withFileLock).
   'scripts/lib/red-team-check-run.mjs',
   'scripts/lib/required-status-checks.mjs', 'scripts/lib/resource-admission.mjs', 'scripts/lib/salvage-index.mjs',
+  // Read-only inventory imports the file-lock primitive to validate observed claims and slots.
+  'scripts/lib/resource-pool-io.mjs',
   'scripts/lib/scheduled-lane-maintenance.mjs', 'scripts/lib/target-registry.mjs',
   'scripts/lib/verdict-ledger-outbox-spool.mjs', 'scripts/lib/verdict-ledger.mjs', 'scripts/lib/verify-shard-run.mjs',
   'scripts/merge-ai-prs.mjs', 'scripts/operations/action-ground-truth.mjs', 'scripts/operations/action-store.mjs',

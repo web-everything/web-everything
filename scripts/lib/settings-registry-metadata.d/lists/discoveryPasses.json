@@ -1,0 +1,6 @@
+[
+  {"pass": "B","family": "Codex","scope": "scripts/conveyor, scripts/lib, scripts/operations, skills-src (top 60)","newItems": 60,"newHighImpactItems": 45}, {"pass": "C","family": "Claude","scope": "scripts/readiness, ci, hooks, operator, autofix, backlog, top-level scripts","newItems": 50,"newHighImpactItems": 15},
+  {"pass": "D","family": "Codex","scope": "conveyor/operations remainder, skills-src remainder, workflows, model pins","newItems": 56,"newHighImpactItems": 17}, {"pass": "E","family": "Claude","scope": "top-level scripts, conveyor drain/merge/red-team/overlay/rebuild","newItems": 50,"newHighImpactItems": 14},
+  {"pass": "F","family": "Codex","scope": "lib/readiness/operations/skills-src files not named before","newItems": 18,"newHighImpactItems": 1}, {"pass": "G","family": "Claude","scope": "whole scripts/ and skills-src/ sweep","newItems": 40,"newHighImpactItems": 7},
+  {"pass": "H","family": "Codex","scope": "whole sweep incl. workflows","newItems": 17,"newHighImpactItems": 2}, {"pass": "I","family": "Claude","scope": "whole sweep incl. workflows","newItems": 23,"newHighImpactItems": 0}
+]
