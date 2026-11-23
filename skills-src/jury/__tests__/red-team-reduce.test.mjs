@@ -36,13 +36,25 @@ describe('lost red-team reduce fails closed', () => {
     expect(result).toMatchObject(closed);
   });
   it.each([
-    [{ verdict: 'accept' }, { verdict: 'accept', outcome: 'land' }],
-    [{ verdict: 'changes', outcome: 'continue' }, { verdict: 'changes', outcome: 'continue' }],
+    [{ verdict: 'accept', outcome: 'land' }, { verdict: 'accept', outcome: 'land' }],
+    [{ verdict: 'changes', outcome: 'escalate' }, { verdict: 'changes', outcome: 'escalate' }],
     [{ verdict: 'needs-human' }, closed],
   ])('honours a present reducer verdict in both implementations: %j', async (reduced, expected) => {
     expect(core.redTeamReduceFallback({ reduced, findings: [] })).toEqual(expected);
     const agent = vi.fn().mockResolvedValueOnce({ findings: [] }).mockResolvedValueOnce(reduced);
     expect(await loadGate(agent)(roster(), '', '', 1, 3)).toMatchObject(expected);
+  });
+  const invalidPairs = [
+    ...['needs-human', 'changes', 'prevention-outstanding', 'unknown'].flatMap(verdict =>
+      ['land', 'continue'].map(outcome => ({ verdict, outcome }))),
+    ...['continue', 'escalate', 'unknown', '', null, undefined].map(outcome => ({ verdict: 'accept', outcome })),
+  ];
+  it.each(invalidPairs)('pure fallback escalates an unsafe verdict/outcome pair: %j', (reduced) => {
+    expect(core.redTeamReduceFallback({ reduced })).toEqual({ verdict: reduced.verdict, outcome: 'escalate' });
+  });
+  it.each(invalidPairs)('actual workflow escalates an unsafe verdict/outcome pair: %j', async (reduced) => {
+    const agent = vi.fn().mockResolvedValueOnce({ findings: [] }).mockResolvedValueOnce(reduced);
+    expect(await loadGate(agent)(roster(), '', '', 1, 3)).toMatchObject({ verdict: reduced.verdict, outcome: 'escalate' });
   });
   it('replays the recorded empty-findings reducer failure as a hold/escalation', async () => {
     const run = JSON.parse(readFileSync('skills-src/jury/__tests__/fixtures/red-team-reducer-failure.json', 'utf8'));
