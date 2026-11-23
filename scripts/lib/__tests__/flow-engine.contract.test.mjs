@@ -405,6 +405,38 @@ test('shadow derives synthetic completion evidence and appends three contiguous 
   } finally { f.cleanup(); }
 });
 
+for (const changed of [
+  { head: 'd'.repeat(40) },
+  { netDiff: 'e'.repeat(64) },
+  { head: 'd'.repeat(40), netDiff: 'e'.repeat(64) },
+]) {
+  test(`shadow refuses changed ${Object.keys(changed).join('/')} before appending replay evidence`, async () => {
+    const f = shadowFixture();
+    try {
+      await shadowReviewStep(f.actual, f.options);
+      assert.equal(f.rows().length, 1);
+      const before = readFileSync(f.logFile, 'utf8');
+      Object.assign(f.actual.classified, changed);
+      f.done(2);
+      let appends = 0;
+      await shadowReviewStep(f.actual, { ...f.options, engine: { ...engine, appendTransition: (...args) => {
+        appends += 1;
+        return engine.appendTransition(...args);
+      } } });
+      assert.equal(readFileSync(f.logFile, 'utf8'), before, 'incompatible identity must leave log bytes unchanged');
+      assert.equal(appends, 0, 'refuse before append');
+      assert(f.logs.some(s => s.includes('Invalid replay subject/version binding')));
+
+      // Refusal must leave the original evidence usable for a later matching round.
+      Object.assign(f.actual.classified, { head: ctx.head, netDiff: ctx.netDiff });
+      f.done(3);
+      await shadowReviewStep(f.actual, f.options);
+      assert.deepEqual(f.rows().map(r => r.predicate.seq), [1, 2]);
+      assert.deepEqual(f.rows().map(r => r.predicate.round), [1, 3]);
+    } finally { f.cleanup(); }
+  });
+}
+
 test('shadow compares route and target, and reports unknown and empty-plan disagreement', async () => {
   for (const change of [{ route: 'wait' }, { to: 'parked' }, null]) {
     const f = shadowFixture();

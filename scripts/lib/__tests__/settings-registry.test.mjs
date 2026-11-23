@@ -350,7 +350,7 @@ test('generated documentation matches the shadow rotation and audit debounce sna
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation and the two audit debounce/delta leaves.
+  // Reconciled snapshot includes providerRotation, the two audit debounce/delta leaves and this PR's reviewLoop row.
   assert.equal(createHash('sha256').update(original).digest('hex'), 'c274675d067afb3f962dfea05f9e5fed66d5b4c9ac90526e29d8cc290863acaa');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
