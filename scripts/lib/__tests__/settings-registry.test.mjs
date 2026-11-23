@@ -387,8 +387,9 @@ test('fresh render matches the historical shadow rotation and audit debounce sna
   assert.ok(doc.includes('`npm run docs:settings-registry` to generate the local, gitignored doc; never commit it'));
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
+  // Reconciled snapshot includes providerRotation, ciUnitRerun, the two audit debounce/delta leaves
+  // and the fixExecutor fixSeatMix row (PR 7384).
+  assert.equal(createHash('sha256').update(original).digest('hex'), '84b5dbdc91d7cfb37ee64398febdfbe39dd5cfa4a52aa78f65c02ea6dec2c442');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
 
