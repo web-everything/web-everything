@@ -1,6 +1,11 @@
 /** Pure capacity arithmetic. All observations and clocks are supplied by the caller; times are epoch ms. */
 import { planCapacity } from './capacity-planner.mjs';
-import defaults from '../settings/provider-capacity.json' with { type: 'json' };
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+// Read, not `import … with { type: 'json' }`: on Node 22.1 a JSON-module import prints an ExperimentalWarning on
+// every process that loads this module, ahead of a daemon's own output (build-dispatch-daemon's boot test).
+const defaults = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../settings/provider-capacity.json'), 'utf8'));
 export const PROVIDER_DEFAULTS = defaults.providerCapacity;
 export const PROVIDERS = PROVIDER_DEFAULTS.providers.map(p => p.id);
 export const CAPACITY_DEFAULTS = {

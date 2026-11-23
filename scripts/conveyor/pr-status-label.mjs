@@ -69,6 +69,23 @@ function requiredCiRed(pr, labels, requiredChecks, settings) {
       || ['FAILURE', 'ERROR'].includes(c.state)));
 }
 
+/** PURE: every required check passed at the live head. Unknown list, missing, pending or other-head checks are not green. */
+function requiredCiGreen(pr, requiredChecks, settings) {
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length
+    || Array.from(requiredChecks).some(n => typeof n !== 'string' || !n.trim())) return false;
+  const checks = Array.isArray(pr?.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const head = String(pr?.headRefOid ?? '').toLowerCase();
+  const names = requiredChecks.filter(n => !(settings.reviewGateSignal === 'review' && n === 'review-gate'));
+  const required = withoutImpliedRequiredChecks(names, checks);
+  const green = (c) => !(c.headSha && String(c.headSha).toLowerCase() !== head)
+    && ((c.status === 'COMPLETED' && ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(c.conclusion)) || c.state === 'SUCCESS');
+  // Every run of a required check must be green: an older success never masks a newer pending rerun.
+  return required.every((name) => {
+    const runs = checks.filter((c) => (c.name ?? c.context) === name);
+    return runs.length > 0 && runs.every(green);
+  });
+}
+
 /** PURE: classify a planner refusal using only this caller's required checks. */
 function reviewCiWait(row, { pr, defaultBranch, requiredChecks, settings }) {
   if (!['required-checks-not-successful', 'required-review-gate-conflict'].includes(row.ci?.reason)
@@ -140,7 +157,12 @@ export function derivePrStatusLabel({ pr = {}, labels, reviewStatus = null, rows
   if (!reviewBlock && l.includes('review:accepted') && !l.includes('ready-to-merge')
     && reviewStatus?.role === 'review' && ['reviewing', 'review-stalled'].includes(rs)
     && settings.acceptedRedTeamStatus === 'red-team') return 'red-team';
-  if (!reviewBlock && l.includes('review:accepted')) return 'ready-to-merge';
+  if (!reviewBlock && l.includes('review:accepted')) {
+    if (l.includes('red-team:pending')) return 'red-team';
+    if (redTeamQueueReason(subject)) return 'sent-back-red-team';
+    if (!requiredCiGreen(subject, requiredChecks, settings)) return 'awaiting-ci';
+    return 'ready-to-merge';
+  }
   if (liveFix) return takeoverUnjudged(comments) && reviewStatus.role === 'fix' ? 'takeover-running' : 'fixing';
   const escalated = list.some((r) => (r.kind === 'cap-exhausted' && ESCALATED.has(r.takeover))
     || r.kind === 'ruling-dispute' || r.takeoverNotConverging === true);
