@@ -16,7 +16,7 @@
  * `dispatch-lane-defaults.test.mjs`'s own `spyExec` seam for the OTHER subprocess calls this file makes) so
  * this never touches a real `.claude/settings.local.json` or spawns a real `claude`.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { conflictHelperAllowRules, rearmReviewAllowRules } from '../../lib/conflict-helper-allow.mjs';
 
@@ -25,6 +25,11 @@ import { createDispatchSinks, laneDirFor, laneRootsFor, dispatchLaneGrant } from
 
 const ROOT = '/Users/op/workspace/webeverything';
 const existsOnly = (paths) => (p) => paths.includes(p);
+
+// These synthetic checkout fixtures exercise default pool derivation. The shared Vitest setup
+// supplies LANE_POOL_ROOT; explicitly disable that override and restore it after each test.
+beforeEach(() => { vi.stubEnv('LANE_POOL_ROOT', ''); });
+afterEach(() => { vi.unstubAllEnvs(); });
 
 describe('laneDirFor — the ONE lane a dispatch will use, resolved to its absolute path', () => {
   it('prefers whichever pool-dir basename actually exists on this host', () => {

@@ -40,9 +40,12 @@ afterAll(() => { vi.doUnmock('../../lib/gh-app-shim.mjs'); });
 beforeEach(() => {
   priorRole = process.env[ROLE]; process.env[ROLE] = 'observer';
   tmp = mkdtempSync(join(tmpdir(), 'ci-heal-role-'));
+  // Exercise the real grant plumbing against this fixture's configured pool.
+  vi.stubEnv('LANE_POOL_ROOT', join(tmp, 'pool'));
   mkdirSync(join(tmp, 'bin')); writeFileSync(join(tmp, 'bin', 'gh'), '');
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   if (priorRole === undefined) delete process.env[ROLE]; else process.env[ROLE] = priorRole;
   rmSync(tmp, { recursive: true, force: true });
 });
@@ -121,7 +124,7 @@ it('binds the owner brief and launch grant to the selected lane', async () => {
   const provider = sinkOptions.provider;
   sinkOptions.provider = request => {
     expect(request.prompt).toContain('--lane=7 --session=ci-heal-main');
-    expect(request.laneGrant.additionalDirectories).toEqual([join(tmp, '../.lanes/web-everything/lane-7')]);
+    expect(request.laneGrant.additionalDirectories).toEqual([join(tmp, 'pool/web-everything/lane-7')]);
     return provider(request);
   };
   await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);

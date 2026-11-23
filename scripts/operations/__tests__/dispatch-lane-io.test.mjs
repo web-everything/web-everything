@@ -125,6 +125,8 @@ describe('lean repair security boundaries', () => {
 });
 
 describe('lean repair background argv', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
   const options = (launchKind) => ({
     root: '/repo',
     payload: { launchKind, lane: 7, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
@@ -377,6 +379,8 @@ describe('lean repair background argv', () => {
   });
 
   it('derives the grant from the payload lane and scope when none is passed (the direct reconcile fix path)', () => {
+    // Exercise checkout-derived pools independently of Vitest's temporary pool override.
+    vi.stubEnv('LANE_POOL_ROOT', '');
     const payload = { ...options('fix').payload, lane: 12, scope: ['we:scripts/a.mjs'] };
     const argv = buildAgentArgv({ ...options('fix'), payload });
     expect(addDirsOf(argv)).toEqual([expect.stringMatching(/\/\.lanes\/web(?:-)?everything\/lane-12$/)]);
@@ -384,6 +388,7 @@ describe('lean repair background argv', () => {
   });
 
   it('validates an explicit grant against the dispatcher root, refusing another workspace', () => {
+    vi.stubEnv('LANE_POOL_ROOT', '');
     const payload = { ...options('fix').payload, lane: 7 };
     const root = '/portable/workspace/we';
     const laneGrant = leanRepairGrant(payload, null, { root, exists: () => false });
@@ -400,6 +405,7 @@ describe('lean repair background argv', () => {
   // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
   // repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
   it('grants only the named lane in the dispatch repo, whatever the scope lists first', () => {
+    vi.stubEnv('LANE_POOL_ROOT', '');
     for (const repo of ['frontierui', 'frontier-ui/frontierui']) {
       for (const scope of [undefined, [], ['we:scripts/a.mjs', 'frontierui:src/b.ts']]) {
         const payload = { ...options('fix').payload, lane: 3, repo, scope };
