@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching' } = {}) {
+  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching', soakTiming } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -40,6 +40,14 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     './conveyor/fix-procedure.mjs': 'export const pushRefusal = () => null; export const repoKeyForCheckout = () => "we";',
     './conveyor/infra-blocked.mjs': 'export const originSlugOf = () => "web-everything/web-everything";',
   };
+  const soakTest = 'scripts/conveyor/soak/breaks/preflight.soak.test.mjs';
+  if (soakTiming !== undefined) {
+    // Use the real precheck/reader for these CLI wiring cases. Keep the source and
+    // target checkout distinct so a reader using cwd or its module root fails.
+    delete stubs['./lib/soak-precheck-at-open.mjs'];
+    mkdirSync(join(dir, 'scripts/conveyor/soak/breaks'), { recursive: true });
+    if (soakTiming !== null) writeFileSync(join(dir, `${soakTest}.timing.json`), soakTiming);
+  }
   const loader = join(dir, 'loader.mjs');
   writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)}; const root = ${JSON.stringify(pathToFileURL(root + '/').href)};
     export async function resolve(specifier, context, next) {
@@ -59,7 +67,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
-      if (args[0] === 'diff') return args.includes('--name-status') ? 'M\\tblocks/example.ts' : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
+      if (args[0] === 'diff') return args.includes('--name-status') ? ${JSON.stringify(soakTiming !== undefined ? `A\t${soakTest}` : 'M\tblocks/example.ts')} : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
       if (args[0] === 'push') return '';
       if (args[0] === 'show') throw new Error('no ready config');
       return '';
@@ -68,7 +76,7 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
       '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0' },
+    { cwd: soakTiming !== undefined ? root : dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', WE_PR_OPEN_SOAK_PRECHECK: '1' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
@@ -77,6 +85,18 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
 }
 
 describe('pr-land pre-push checkpoint', () => {
+  it.each([null, '{', '{"seconds":0}'])('real soak precheck refuses missing or invalid sidecar %s before push/create', soakTiming => {
+    const { status, result, effects } = run({ count: 0, soakTiming });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(result.detail).toContain('preflight.soak.test.mjs.timing.json');
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it('real soak precheck reads a valid sidecar from --repo when cwd is different', () => {
+    const { status, result } = run({ count: 0, soakTiming: '{"seconds":0.25}' });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('check-ok');
+  });
   it.each(['different', 'missing', 'unreadable'])('green checks with %s PR head evidence refuse before ready-to-merge is ever applied', headEvidence => {
     const { status, result, effects } = run({ check: false, count: 0, labelOnGreen: true, headEvidence });
     expect(status).toBe(3);

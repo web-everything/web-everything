@@ -1,5 +1,8 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { SOAK_PRECHECK_ENV, soakPrecheckEnabled, soakPrecheckAtOpen } from '../soak-precheck-at-open.mjs';
 import { HOME_REASONS } from '../../operations/pr-land-reasons.mjs';
 
@@ -11,23 +14,96 @@ const fix = {
 };
 
 describe('soak precheck at PR open', () => {
-
+  const roots = [];
+  afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
   const breakTest = 'scripts/conveyor/soak/breaks/new-untimed-break.soak.test.mjs';
   const unitTest = 'scripts/lib/__tests__/new-untimed-unit.test.mjs';
+  function fixture(timing) {
+    const repoRoot = mkdtempSync(join(tmpdir(), 'soak-timing-'));
+    roots.push(repoRoot);
+    const sidecar = join(repoRoot, `${breakTest}.timing.json`);
+    mkdirSync(dirname(sidecar), { recursive: true });
+    if (timing !== undefined) writeFileSync(sidecar, timing);
+    return { repoRoot, sidecar };
+  }
+  const withTest = (changeType = 'ADDED') => [...fix.files, { path: breakTest, changeType }];
 
-  it.each(['ADDED', 'RENAMED'])('passes a daemon fix with an untimed %s soak break and added unit test', (changeType) => {
-    // Neither new test has a timing entry; the PR does not edit test-timings.json.
-    const verdict = soakPrecheckAtOpen({ ...fix, files: [...fix.files,
+  it.each(['ADDED', 'RENAMED'])('passes a daemon fix with a timed %s soak break and untimed unit test', (changeType) => {
+    const { repoRoot } = fixture('{"seconds":0.25}');
+    const verdict = soakPrecheckAtOpen({ ...fix, repoRoot, files: [...fix.files,
       { path: 'scripts/conveyor/soak/breaks/new-untimed-break.mjs', changeType },
       { path: breakTest, changeType },
       { path: unitTest, changeType: 'ADDED' },
     ] });
     expect(verdict).toMatchObject({ ok: true, applicable: true });
   });
-  it('passes a test-only PR adding an untimed soak break test and unit test', () => {
-    expect(soakPrecheckAtOpen({ ...fix, title: 'test: add soak coverage', body: '',
+  it('passes a test-only PR with a timed soak break and untimed unit test', () => {
+    const { repoRoot } = fixture('{"seconds":0.25}');
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, title: 'test: add soak coverage', body: '',
       files: [breakTest, unitTest].map(path => ({ path, changeType: 'ADDED' })),
     })).toMatchObject({ ok: true, applicable: false });
+  });
+  it.each(['ADDED', 'RENAMED'])('refuses a missing sidecar for an %s soak test even with a shared timing', changeType => {
+    const { repoRoot } = fixture();
+    mkdirSync(join(repoRoot, 'scripts/ci'), { recursive: true });
+    writeFileSync(join(repoRoot, 'scripts/ci/test-timings.json'), JSON.stringify({ soak: { [breakTest]: 1 } }));
+    const verdict = soakPrecheckAtOpen({ ...fix, repoRoot, files: withTest(changeType) });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toContain(`${breakTest}.timing.json`);
+  });
+  it.each([
+    ['malformed JSON', '{'], ['null', 'null'], ['array', '[]'], ['scalar', '1'],
+    ['missing seconds', '{}'], ['unknown field', '{"seconds":1,"other":true}'],
+    ['string seconds', '{"seconds":"1"}'], ['boolean seconds', '{"seconds":true}'],
+    ['null seconds', '{"seconds":null}'], ['zero', '{"seconds":0}'],
+    ['negative', '{"seconds":-1}'], ['non-finite', '{"seconds":1e400}'],
+  ])('refuses %s timing evidence', (_name, timing) => {
+    const { repoRoot } = fixture(timing);
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: withTest() }).ok).toBe(false);
+  });
+  it('refuses an unreadable sidecar instead of throwing or admitting', () => {
+    const { repoRoot, sidecar } = fixture();
+    mkdirSync(sidecar); // deterministic read failure, even for privileged test runners
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: withTest() }).ok).toBe(false);
+  });
+  it.each(['test: add soak coverage', fix.title])('refuses untimed tests for %s even with a waiver', title => {
+    const { repoRoot } = fixture();
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, title, body: 'soak-waiver: existing coverage',
+      files: [{ path: breakTest, changeType: 'ADDED' }],
+    }).ok).toBe(false);
+  });
+  it('requires timing for every added test, not only the first', () => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: [...withTest(),
+      { path: breakTest.replace('new-untimed', 'second'), changeType: 'ADDED' },
+    ] }).ok).toBe(false);
+  });
+  it.each([
+    'scripts/conveyor/soak/new-baseline.soak.test.mjs',
+    'scripts/conveyor/soak/breaks/nested/new.soak.test.mjs',
+  ])('requires timing for a soak test at %s', path => {
+    const { repoRoot } = fixture();
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: [{ path, changeType: 'ADDED' }] }).ok).toBe(false);
+  });
+  it.each(['..', '.', '', '\\'])('refuses non-canonical path segment %s even if it resolves to a valid sidecar', segment => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    const path = breakTest.replace('/new-untimed', `/${segment}/new-untimed`);
+    const sidecar = join(repoRoot, `${path}.timing.json`);
+    mkdirSync(dirname(sidecar), { recursive: true });
+    writeFileSync(sidecar, '{"seconds":1}');
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: [{ path, changeType: 'ADDED' }] }).ok).toBe(false);
+  });
+  it.each(['MODIFIED', 'DELETED'])('does not require a new sidecar for a %s soak test', changeType => {
+    const { repoRoot } = fixture();
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, title: 'test: existing coverage', body: '',
+      files: [{ path: breakTest, changeType }],
+    }).ok).toBe(true);
+  });
+  it('does not require timing sidecars for unit tests', () => {
+    const { repoRoot } = fixture();
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, title: 'test: unit coverage', body: '',
+      files: [{ path: unitTest, changeType: 'ADDED' }],
+    }).ok).toBe(true);
   });
   it('still refuses a daemon fix adding only a unit test without a soak break', () => {
     expect(soakPrecheckAtOpen({ ...fix, files: [...fix.files,

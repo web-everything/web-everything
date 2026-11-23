@@ -955,7 +955,7 @@ async function runCli() {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
       return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
     }
-    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
+    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, repoRoot: REPO });
   }
 
   if (DRY_RUN) {

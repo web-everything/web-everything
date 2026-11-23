@@ -6362,8 +6362,17 @@ in-process sweep. Persist the retry identity in job input to dedupe the enqueue-
 
 The scheduled bot refresh (`.github/workflows/ci-timings-refresh.yml`, currently weekly)
 owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks should
-leave that file to the bot. Files without timing entries get their suite's median
-stored timing and still land in exactly one shard. The PR-open soak precheck requires
-break coverage for daemon-scope bug fixes as before; timing entries are not evidence
-for that requirement. The balance diagnostic still requires measurements for every
-file before claiming measured balance; it is not a PR admission requirement.
+leave that file to the bot. Files without entries in that shared sharding map get their
+suite's median stored timing and still land in exactly one shard.
+
+Every added or renamed `.soak.test.mjs` under `scripts/conveyor/soak/` needs a committed
+sidecar named `<test>.timing.json` next to it (for example,
+`example.soak.test.mjs.timing.json`). Its entire schema is `{"seconds":0.25}`: one
+`seconds` field containing a positive finite number measured for that test. The test
+author owns the sidecar: measure the test when adding or renaming it, and refresh the
+measurement when its runtime changes. The scheduled refresh bot does not update these
+sidecars. Missing, unreadable, malformed or invalid sidecars refuse PR-open admission,
+including test-only PRs; a shared timing entry or soak waiver cannot replace them.
+The PR-open soak precheck also requires break coverage for daemon-scope bug fixes as
+before. The balance diagnostic still requires measurements for every file before
+claiming measured balance; it is not a PR admission requirement.

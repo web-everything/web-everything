@@ -12,8 +12,8 @@
  *
  * New files: a file with no stored timing gets the MEDIAN of the stored timings for its suite (most test files are
  * small, so the median is a fair guess), so a brand-new test lands in a shard automatically with no list to edit.
- * The weekly bot (`.github/workflows/ci-timings-refresh.yml`) owns the stored timings; PR authors need no
- * timing entries for new tests. The bot refreshes from real CI data; a stale table only costs balance, never
+ * The weekly bot (`.github/workflows/ci-timings-refresh.yml`) owns this shared map; PR authors leave it
+ * to the bot. The bot refreshes from real CI data; a stale table only costs balance, never
  * correctness.
  *
  * CLI:
