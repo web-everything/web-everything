@@ -33,7 +33,7 @@ function main() {
     }
     // Bind the API answer to the revision under test: a newer push means this run is stale and must not pass.
     const liveHead = execFileSync('gh', ['api', `repos/${REPO}/pulls/${PR_NUMBER}`, '--jq', '.head.sha'], {
-      encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
     if (liveHead.toLowerCase() !== HEAD_SHA.toLowerCase()) {
       console.error(`Cannot verify ${FILE}: the PR head moved to a newer commit; rerun CI on the new head. Only ${OWNER} owns it.`);
