@@ -23,6 +23,8 @@
  *   Audit trail (`events.jsonl`, same commit): quarantine changes and `card-owed` repair obligations.
  */
 
+import { timeoutOutcomes, allSoft } from './test-timeout-policy.mjs';
+
 export const QUARANTINE_BRANCH = 'ops/quarantine';
 export const QUARANTINE_REF = `refs/heads/${QUARANTINE_BRANCH}`;
 export const QUARANTINE_LIST_PATH = 'quarantine.json';
@@ -303,7 +305,7 @@ function repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt = 1, touc
  * @returns {{action:'add'|'prune'|'none', tests?:string[], names?:string[], why:string, mainGreen?:boolean|null,
  *   fixPrs?:number[]|null}}
  */
-export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {}, flakeProof = {}, repeatRuns = [], latestRunId = null, latestAttempt = 1, touchedFiles = null }) {
+export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {}, flakeProof = {}, repeatRuns = [], latestRunId = null, latestAttempt = 1, touchedFiles = null, timeoutPolicy = {} }) {
   const s = { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...settings };
   const entries = list?.entries ?? [];
   if (status === 'green') return entries.length ? { action: 'prune', mainGreen: true, why: 'main is green' } : { action: 'none', why: 'main is green; list empty' };
@@ -329,9 +331,12 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
     if (unitRe.test(job)) {
       const f = jobFailures?.[job];
       if (!f?.complete) return none(`failing tests of ${job} unknown (not a known-failing-test red)`);
+      const outcomes = timeoutOutcomes(f, timeoutPolicy, job);
+      if (outcomes.some(o => ['hard', 'unconfigured'].includes(o.class))) return none(`timeout policy: ${job}: ${outcomes.map(o => o.class).join(', ')}; red-main process required`);
+      const soft = allSoft(f, outcomes);
       for (const file of f.files) {
         let proof = validFlakeProof(flakeProof?.[job]) ? flakeProof[job] : undefined;
-        if (!proof && s.requireProvenFlake) {
+        if (!soft && !proof && s.requireProvenFlake) {
           const repeat = s.repeatFailureProof ? repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt, touchedFiles, count: s.repeatFailureCount }) : { why: 'repeat proof disabled' };
           if (!repeat.proof) {
             return none(`not a proven flake: ${job} (no green re-run of the failing commit; ${repeat.why})`);
@@ -339,7 +344,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
           proof = repeat.proof;
         }
         const localJob = localJobName(job);
-        origins.set(JSON.stringify([file, localJob]), { test: file, job: localJob, proof });
+        origins.set(JSON.stringify([file, localJob]), { test: file, job: localJob, proof, ...(soft ? { timeouts: outcomes.filter(o => o.file === file) } : {}) });
       }
       files.push(...f.files);
       names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
