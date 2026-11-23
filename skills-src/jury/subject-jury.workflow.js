@@ -853,8 +853,8 @@ async function reducePanel(panel, round, roundCap) {
  * subject snapshot, then folds its findings to a verdict + negotiation outcome through the SAME shared review core
  * the panel reduce uses (single-sourced — the harness re-decides nothing). FAIL-CLOSED, mirroring the engine's
  * `foldRedTeamVerdict` rule: a red-team that did NOT run NEVER ratifies (→ needs-human → escalate — the
- * fabricated-ratings guard, no signal is a FAILING signal); a red-team that broke the accept bounces (→ changes,
- * whose findings feed the round loop → continue/escalate); only a red-team that ran CLEAN ratifies (→ accept →
+ * fabricated-ratings guard, no signal is a FAILING signal); a red-team that broke the accept escalates for
+ * human review; only a red-team that ran CLEAN ratifies (→ accept →
  * land). Appends the red-team's juror-running / finding / verdict ledger events under a single `red-team` juror id.
  */
 async function redTeamGate(roster, material, materialFile, round, roundCap) {
@@ -888,12 +888,10 @@ async function redTeamGate(roster, material, materialFile, round, roundCap) {
     { label: `redteam-reduce:${subject}:r${round}`, phase: 'Red-team', schema: VERDICT_SCHEMA },
   ).catch(() => null);
 
-  // Fail-closed on a lost fold too: findings present but no verdict back ⇒ do NOT silently ratify. Match
-  // foldRedTeamVerdict — outstanding findings ⇒ changes, a clean red-team ⇒ accept; a missing outcome falls to the
-  // safe terminal step (land only on a clean accept, else escalate — never a silent `continue` on lost signal).
-  let verdict = (r && r.verdict) || (findings.length ? 'changes' : 'accept');
-  let outcome = (r && typeof r.outcome === 'string') ? r.outcome : null;
-  if (!outcome) outcome = verdict === 'accept' ? 'land' : 'escalate';
+  // Mirror redTeamReduceFallback inline (this workflow has no imports). A lost verdict is missing evidence,
+  // even with empty findings; only an explicit accept/land pair ratifies, all other pairs escalate.
+  const verdict = (r && r.verdict) || 'needs-human';
+  const outcome = verdict === 'accept' && r.outcome === 'land' ? 'land' : 'escalate';
 
   const taggedFindings = findings.map((f) => ({ ...f, category: f.category || RED_TEAM_LENS }));
   ledger.push(verdictEvent(jurorId, verdict, round));

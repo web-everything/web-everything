@@ -45,3 +45,5 @@ Blocked agent moves the card to Needs you · only closed-vocabulary agent fields
 
 1. **Executable** — every slice above is resolved.
 2. **Live** — with a conveyor build running, /wip on a phone shows that card's agent line change within 5 s of a new step; with no /wip page open, the laptop publisher's log shows zero `agent-delta` sends over 5 minutes.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

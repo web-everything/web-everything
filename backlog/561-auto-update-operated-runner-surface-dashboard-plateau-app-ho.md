@@ -2,10 +2,12 @@
 kind: story
 size: 8
 parent: "554"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: #554 unparks (hosted runner dashboard)."
+dateParked: "2026-11-22"
 humanGate: { kind: setup, what: "The operated/hosted tier (plateau-app Phase 2/3) is gated on the #554 SaaS-phase go/no-go — a founder decision to enter the SaaS phase and provision hosting/accounts. Its slice deps (#558/#559/#560) are resolved; what remains is out-of-phase behind the defer-live-serve roadmap, not agent-buildable until the operated tier is on the roadmap." }
 dateOpened: "2026-06-14"
-dateParked: "2026-06-14"
 tags: [auto-update, runner, plateau-app, hosted, dashboard, live-serve, parked, out-of-phase]
 ---
 
@@ -16,3 +18,7 @@ Slice 4 of the #497 ruling (Fork 1 → A — the [constellation-placement](docs/
 > **PARKED at creation 2026-06-14 — out of phase, not active work.** This is the backend-backed operated
 > tier (plateau-app Phase 2/3). It stays parked behind the defer-live-serve strategy and under #554.
 > **Unpark when** slices 1–3 are built *and* running a deployed Plateau SaaS is on the roadmap.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: #554 unparks (hosted runner dashboard).
+
+Not kept open with blockedBy: #554 is its epic parent, so a blockedBy edge on it would deadlock; it stays parked under #554.
