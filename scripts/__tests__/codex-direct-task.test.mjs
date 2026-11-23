@@ -1843,7 +1843,9 @@ describe('detached jobs', () => {
       expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
       worker.kill('SIGKILL');
       await exited;
-      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+      // The worker is already dead, so this returns at once; the budget is only headroom for a loaded CI host
+      // (a 1 s budget expired as code 75 on main @ d4b20a90b while 14 shards ran at once).
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000 }))
         .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {
@@ -2066,7 +2068,8 @@ describe('detached jobs', () => {
     const record = { id: 'pid-reused', pid: process.pid, pidStart: 'Thu Jan  1 00:00:00 1970', status: 'running',
       exitCode: null, resultPath: 'result.json' };
     writeJobRecord(record, { jobsDir });
-    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+    // Real `ps` probes run inside the budget; the dead-job outcome returns at once, so extra headroom costs nothing.
+    expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 30_000 }))
       .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
     expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
   });
