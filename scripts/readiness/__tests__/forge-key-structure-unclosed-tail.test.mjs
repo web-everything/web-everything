@@ -18,9 +18,32 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
   it('refuses the real settings registry promptly when an oversized candidate cannot be closed',()=>{
     const bytes=readFileSync(new URL('../../../docs/agent/settings-registry.md',import.meta.url));
     const started=Date.now();
-    // The operator requires fail-closed overflow even when the last signal precedes a truncated table cell.
+    // Operator ruling (round 2) supersedes the original "registry scans to null" acceptance: the registry has
+    // truncated table cells (`{"a":{"service":…`) and the any-case `kty` gate matches `byTaskType`, so an
+    // oversized unclosed candidate must refuse remote admission. This pins the refusal and that it is prompt.
     expect(keyStructureFinding(bytes)).toBe(EXH);
     expect(Date.now()-started).toBeLessThan(5000);
+  });
+  it('still finds a key object holding a lone quote when the candidate ends with the document',()=>{
+    const members=[
+      '"kty":"oct","k":"YQ",note:it\'s',
+      '"kty":"oct","k":"YQ",x:\'',
+      '"kty":"oct","k":"YQ",x:'+q,
+      'note:it\'s,"kty":"oct","k":"YQ"',
+    ];
+    for(const member of members) {
+      for(const prefix of [stray,stray+'\\| ']) {
+        const bytes=Buffer.from(prefix+'{'+member+'} tail text');
+        expect(keyStructureFinding(bytes),member).toBe(FINDING);
+        expect(credentialBufferFinding(bytes),member).toBe(FINDING);
+      }
+    }
+  });
+  it('fails closed, never open, on a lone quote inside an object whose window is cut',()=>{
+    for(const lone of ["'",q]) {
+      const bytes=Buffer.from(kt+' '+q+' {"a":1,x:'+lone+'}'+pad(66000)+lone);
+      expect(keyStructureFinding(bytes)).toBe(EXH);
+    }
   });
   it('does not exhaust on truncated cells without any recognized signal',()=>{
     expect(keyStructureFinding(Buffer.from(truncated+prose+'a b'))).toBeNull();

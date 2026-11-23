@@ -239,9 +239,12 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
   // Any escape can hide the key type: stringValue also supports identity escapes and line continuations.
   const lastSig=lastSignal(text);
   if(lastSig>=0||/kty|\\/i.test(text)) {
-    // Unterminated literals consume the rest of the window, including a trailing escape. Truncation must
-    // never expose a `}` inside a long string as the candidate's closing brace.
-    const pieces=/"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    // A candidate that ends with the document matches terminated literals only, exactly as before: a lone quote
+    // inside a real object must not swallow its closing `}`.
+    const closedPieces=/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
+    // A window cut at the bound lets unterminated literals consume the rest of it, including a trailing escape,
+    // so truncation never exposes a `}` inside a long string as the candidate's closing brace.
+    const cutPieces=/"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}]/g;
     for(let at=text.indexOf('{');at!==-1;at=text.indexOf('{',at+1)) {
       // A brace the pass above already treated as a container opener is detected there; only the rest (hidden by
       // quote pairing or rejected as prose) needs its own candidate, which keeps ordinary large JSON linear.
@@ -253,6 +256,7 @@ function canonicalize(bytes,emit,tick,{comments=true,utf16=true}={}) {
       // Bound the regex input itself: checking lastIndex after exec would still scan an arbitrarily long
       // unmatched string/comment or token-free tail. Every candidate shares the global processing budget.
       const candidate=text.slice(at,at+65536);
+      const pieces=at+candidate.length<text.length?cutPieces:closedPieces;
       let depth=0;
       pieces.lastIndex=0;
       for(let piece=pieces.exec(candidate);piece;piece=pieces.exec(candidate)) {
