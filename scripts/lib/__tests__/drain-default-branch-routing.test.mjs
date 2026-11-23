@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildOpenPrPageQuery } from '../pr-list-paged.mjs';
-import { ghStderrTail } from '../gh-stderr-tail.mjs';
+import { classifyChildFailure } from '../child-failure-class.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 import { daemonAppEnv } from '../../__tests__/fixtures/daemon-app-env.mjs';
@@ -37,10 +37,10 @@ function fixture(unreadable = null, stderr = null) {
     }
     return { stdout: 'trunk\n' };
   };
-  const create = new Function('createLiveDefaultBranchReader', 'defaultBranchByRepo', 'execFileP', 'process', 'ghListErrText', 'ghStderrTail',
+  const create = new Function('createLiveDefaultBranchReader', 'defaultBranchByRepo', 'execFileP', 'process', 'ghListErrText', 'classifyChildFailure',
     `${readerSource}; return newDefaultBranchReader;`)(
     options => createLiveDefaultBranchReader({ ...options, writeCache: () => {} }), map, exec,
-    { env: { GH_REPO: localRepo }, stderr: { write: line => warnings.push(line) } }, errorText, ghStderrTail);
+    { env: { GH_REPO: localRepo }, stderr: { write: line => warnings.push(line) } }, errorText, classifyChildFailure);
   return { create, warnings, calls, map };
 }
 
@@ -51,11 +51,12 @@ it('resolves every constellation default branch with the target owner despite am
   expect(f.warnings).toEqual([]);
 });
 
-it('refuses an unreadable sibling branch and logs its stderr cause for the next-pass retry', async () => {
+it('refuses an unreadable sibling branch and logs its fixed error class for the next-pass retry', async () => {
   const f = fixture(repos[1]);
   expect(await f.create()(repos[1])).toBeNull();
   expect(f.map.get(repos[1])).toBeNull();
-  expect(f.warnings.join('')).toContain('Could not resolve to a Repository for frontier-ui/frontierui');
+  expect(f.warnings.join('')).toContain('class=gh-not-found');
+  expect(f.warnings.join('')).not.toContain('Could not resolve');
   expect(f.warnings.join('')).toContain('retry on the next pass');
 });
 
@@ -66,23 +67,15 @@ it('keeps shared gh errors on the last nonempty line with the historical 300-cha
     .toBe(`Command failed — gh: ${'x'.repeat(300)}`);
 });
 
-it('keeps a collapsed 300-character stderr tail only in the default-branch warning', async () => {
-  const stderr = `discarded ${'x'.repeat(2400)}\n actual\t cause`;
-  const f = fixture(repos[1], stderr);
-  expect(await f.create()(repos[1])).toBeNull();
-  expect(f.warnings.join('')).toContain(ghStderrTail({ stderr }, 300).replace(/\s+/g, ' '));
-  expect(f.warnings.join('')).not.toContain('x'.repeat(301));
-  expect(f.warnings.join('')).not.toContain('discarded');
-});
-
-it('redacts credentials before bounding and collapsing default-branch warning stderr', async () => {
-  const secret = 'ghs_' + 'A'.repeat(2100);
-  const f = fixture(repos[1], `Authorization: Bearer ${secret}\nhttps://user:password@example.test\nGraphQL: denied`);
+it('publishes only a fixed class for hostile default-branch stderr', async () => {
+  const secret = 'ghp_' + 'A'.repeat(2100);
+  const f = fixture(repos[1], 'Authorization: Negotiate ' + secret + '\nGraphQL: denied');
   expect(await f.create()(repos[1])).toBeNull();
   const warning = f.warnings.join('');
-  expect(warning).toContain('GraphQL: denied');
-  expect(warning).toContain('[redacted]');
-  expect(warning).not.toMatch(/A{20}|user:password/);
+  expect(warning).toContain('class=unknown');
+  expect(warning).not.toContain(secret);
+  expect(warning).not.toContain('GraphQL: denied');
+  expect(warning).not.toContain('Authorization');
 });
 
 // Exercise the actual CLI and its App refusal shim. Positional `repo view` must
@@ -183,7 +176,8 @@ it.each(repos)('catch-up snapshot refuses unreadable branch %s before merge or e
   expect(r.error, r.stderr).toBeUndefined();
   expect(r.status, r.stderr).toBe(1);
   expect(r.stderr).toContain('fast-drain: incomplete pass context (default branch unresolved live)');
-  expect(r.stderr).toContain(`for ${repo}`);
+  expect(r.stderr).toContain(`${repo}: default branch unresolved live (class=gh-not-found)`);
+  expect(r.stderr).not.toContain('Could not resolve to a Repository');
   expect(r.stdout.trim()).toBe('');
   expect(r.round).toBeNull();
   expect(r.calls.some(c => c.args[0] === 'pr' && ['merge', 'edit'].includes(c.args[1]))).toBe(false);

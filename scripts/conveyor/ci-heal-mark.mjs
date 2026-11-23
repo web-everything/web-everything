@@ -315,12 +315,11 @@ export function redactSecrets(text) {
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[redacted private key]')
     .replace(/(\/\/)[^/\s@]+@/g, '$1[redacted]@')
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{16,}|npm_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*)/g, '[redacted]')
-    .replace(/\b((?:Proxy-)?Authorization)[ \t]*:[ \t]*Digest[^\r\n]*/gi, '$1=[redacted]')
-    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [redacted]')
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '$1 [redacted]')
     // key=value, key: value, "key": "value", --key value — quoted values may hold spaces.
     // The leading run is BOUNDED: an unbounded `[A-Za-z0-9_]*` re-scans a long alphanumeric run from every start
     // position (quadratic — 80k chars took ~17s), and callers now redact before they cut.
-    .replace(/(["']?)(--?)?([A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|auth|credential)[A-Za-z0-9_-]*)\1(\s*[=:]\s*|\s+)((?:"[^"]*"|'[^']*')+|\S+)/gi, (m, _q, dashes, key, sep) => (dashes || /[=:]/.test(sep) ? `${dashes ?? ''}${key}=[redacted]` : m))
+    .replace(/(["']?)(--?)?([A-Za-z0-9_]{0,48}(?:token|secret|password|passwd|api[_-]?key|auth|credential)[A-Za-z0-9_-]*)\1(\s*[=:]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi, (m, _q, dashes, key, sep) => (dashes || /[=:]/.test(sep) ? `${dashes ?? ''}${key}=[redacted]` : m))
     .replace(/(?:\/Users|\/home)\/[^/\s]+|[A-Za-z]:\\Users\\[^\\\s]+/g, '~')
     .replace(/<!--|-->/g, '[comment]')
     .replace(/@(?=[A-Za-z0-9])/g, `@${ZERO_WIDTH_SPACE}`);
