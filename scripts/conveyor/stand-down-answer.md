@@ -23,6 +23,9 @@ head by clearing earlier fix claims and the reviewed-head baseline; a fix-begin 
 a new round and still requires a change. The answer may be posted by the human operator or relayed on
 their explicit instruction by an allowlisted automation identity using its inherited credentials. Both
 readers recognize that same posted answer, so it needs no second post under human credentials.
+A new trusted stand-down after a later fix-begin reopens the answer window for that newest stand-down,
+even on the same head. A later fix-begin alone preserves the answered rearm; its new claims still count.
+Each stand-down can be rearmed only once, and a stale target cannot clear newer claims.
 Unrelated or nonexistent targets and other answers do not grant this exception.
 `--disposition=close-superseded` retains its existing close behavior.
 

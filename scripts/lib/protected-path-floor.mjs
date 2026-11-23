@@ -47,7 +47,9 @@ export const AUDITOR_FLOOR = Object.freeze([
   'scripts/lib/audit-settings.mjs', 'scripts/lib/audit-path.mjs', 'scripts/lib/policy-cascade.mjs', 'scripts/settings/codex-audit.json',
   'scripts/codex-direct-task.mjs', 'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
 /** Modules the auditor imports or launches directly that no other floor entry names (the source-scan test pins each). */
-const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/protected-path-floor.mjs', 'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
+const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/protected-path-floor.mjs',
+  'scripts/lib/guard-path-floor.mjs', 'scripts/lib/guard-auditor-roots.json',
+  'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/under-test.mjs',
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
@@ -101,6 +103,7 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
   'scripts/settings/red-team.json', 'scripts/settings/github-auth.json', 'scripts/settings/human-review-surfaces.json',
@@ -112,6 +115,7 @@ const FLOOR_SETTINGS = Object.freeze([
   // literal of its full name as a direct reader.
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
   // The advisory-merge floor module names it as a regeneration input of the settings registry doc.
+  // Legacy generated metadata is not committed (npm run settings:registry); authoring fragments remain protected.
   'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/**/*.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
