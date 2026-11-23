@@ -122,6 +122,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
   'scripts/settings/review-red-team-on-skip.json',
+  // Decides which red-main timeouts the safety net quarantines at once (quarantine-early slice 2).
+  'scripts/settings/test-timeout-policy.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
   // Read by card-dedupe.mjs and citation-check.mjs.

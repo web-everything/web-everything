@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync, statSync, lstatSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readSettingsChecked, settingsLeaves } from './settings-files.mjs';
+import { readSettingsChecked, settingsLeaves, STANDALONE_POLICY_FILES } from './settings-files.mjs';
 import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -120,7 +120,7 @@ export function buildRegistry({ root = ROOT } = {}) {
   const sources = new Set(['dispatch-settings.json']);
   // Enumerate declarations for ownership only; checked validation above owns merge safety.
   try {
-    for (const file of readdirSync(join(root, 'scripts/settings')).filter(file => file.endsWith('.json')).sort()) sources.add(`settings/${file}`);
+    for (const file of readdirSync(join(root, 'scripts/settings')).filter(file => file.endsWith('.json') && !STANDALONE_POLICY_FILES.includes(file)).sort()) sources.add(`settings/${file}`);
   } catch (error) { problems.push(`scripts/settings: ${error.message}`); }
   for (const source of sources) {
     const path = `scripts/${source}`;
