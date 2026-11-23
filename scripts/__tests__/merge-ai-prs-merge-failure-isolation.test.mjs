@@ -114,7 +114,7 @@ describe('#4389 merge failure isolation', () => {
     const error = Object.assign(new Error('Command failed: gh pr merge 2879\nwrapper details'), {
       githubMessage, stderr: Buffer.from('warning\nGraphQL: Pull request is not mergeable\n'),
     });
-    expect(drain.ghListErrText(error)).toBe('Command failed: gh pr merge 2879 — gh: GraphQL: Pull request is not mergeable');
+    expect(drain.ghListErrText(error)).toBe('Command failed: gh pr merge 2879 — gh: warning GraphQL: Pull request is not mergeable');
   });
 
   it('preserves an explicitly empty GitHub diagnostic', () => {
