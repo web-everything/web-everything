@@ -5,7 +5,7 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { pinnedStatus, planStrictAdopt } from './plan.mjs';
+import { pinnedStatus, pinnedConflictSkippable, planStrictAdopt } from './plan.mjs';
 import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -445,6 +445,7 @@ export async function finalizeRebuild(options) {
 async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
   strictAdopt = false, freshSmoke = null, mainOnly = false,
+  pinPlan = plan,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -539,8 +540,19 @@ async function finalizeRebuildLocked({
   const pinnedOmitted = live.overlays.filter(o => {
     if (included.has(o.ref)) return false;
     const tip = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
-    if (tip && gitTipInMain(git, plan.mainSha, tip)) return false;
-    return !tip || pinnedStatus(git, o, plan.mainSha, tip).pinned;
+    // A pin carried by an applied top is still present, even without its own applied row.
+    if (tip && gitTipInMain(git, plan.finalSha, tip)) return false;
+    if (!tip) return true;
+    const pin = pinnedStatus(git, o, plan.mainSha, tip);
+    if (!pin.pinned) return false;
+    // Preserve the planner's existing newcomer mechanism skip. Bind it to the current
+    // registration and tip, and re-prove skippability under the add guard: a new explicit
+    // pin, changed tip, missing mechanism or unreadable proof still refuses adoption.
+    const skipped = pinPlan.mainSha === plan.mainSha && pinPlan.decisions?.some(d => d.ref === o.ref
+      && (d.pr ?? null) === (o.pr ?? null) && d.sha === tip
+      && d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped')
+      && Array.isArray(pinPlan.establishedLost) && !pinPlan.establishedLost.some(d => d.ref === o.ref);
+    return !(skipped && pinnedConflictSkippable(git, plan.mainSha, tip, pin.why).skippable);
   });
   if (pinnedOmitted.length) {
     const refs = pinnedOmitted.map(o => o.ref);

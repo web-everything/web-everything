@@ -47,7 +47,7 @@ export const PINNED_OVERLAY_GONE_MESSAGE = 'pinned overlay is gone (ref deleted 
  *  fallback, and no first-adoption exemption (stack bases are audit-checked before being skipped). */
 export function planStrictAdopt(plan) {
   return Array.isArray(plan?.decisions)
-    && plan.decisions.some((d) => d?.setAside || d?.action === 'drop' || d?.reason === 'unaudited-tip-held');
+    && plan.decisions.some((d) => d?.setAside || d?.action === 'drop' || d?.action === 'skip');
 }
 
 export function pinnedStatus(git, raw, mainSha, ovSha) {
@@ -83,7 +83,7 @@ const REBUILD_COMMITTER = REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL;
  * Fail closed on any git error.
  * @returns {{skippable:boolean, why:string, paths?:string[]}}
  */
-function pinnedConflictSkippable(git, mainSha, ovSha, pinnedBy) {
+export function pinnedConflictSkippable(git, mainSha, ovSha, pinnedBy) {
   if (pinnedBy !== 'mechanism') return { skippable: false, why: pinnedBy === 'flag' ? 'explicit-pin' : 'pin-unknown' };
   const mb = git(['merge-base', mainSha, ovSha]);
   const base = String(mb.stdout ?? '').trim();

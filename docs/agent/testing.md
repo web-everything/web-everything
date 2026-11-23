@@ -6380,6 +6380,13 @@ and retain the durable set-aside record through failed smoke, then clear it only
 
 ### Set-aside adoption and unknown history
 
+Rebuild fixtures that promise a successful smoke must return one passing row per
+`SMOKE_CHECKS` entry. Empty or partial tables cannot prove a fresh smoke for an omitted
+registration, including ready reuse and a skipped mechanism overlay. Keep partial tables
+in tests of incomplete evidence. Exercise newcomer mechanism skips both inline and through
+ready adoption; an explicit pin added during smoke must still refuse, while a pin carried
+by an applied top remains present in the candidate.
+
 Prepare must leave omission history unchanged until smoke and adoption succeed; finalize
 publishes the new `setAside` records and clears repaired entries on success. Missing files
 and legacy snapshots without `setAside` have unknown history, so audited mode requires

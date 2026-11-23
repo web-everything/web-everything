@@ -773,6 +773,7 @@ export async function prepareRebuild({
           stateOpts,
           now,
           plan: m.adopt,
+          pinPlan: plan,
           prevHead,
           lease: { token: ready.token ?? null },
           mainOnly,
