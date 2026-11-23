@@ -51,7 +51,9 @@ describe('forge key structure: bounded unclosed object scans fail closed',()=>{
       return exec.call(this,text);
     });
     try {
-      for(const tail of [pad(400000),q+pad(400000)+q,'/*'+pad(400000)+'*/','{a:1 '.repeat(1000)+pad(400000)]) {
+      // Close the prose quote around repeated braces so the primary pass skips them instead of reaching
+      // its nesting limit before the independent scanner can exercise its own window bound.
+      for(const tail of [pad(400000),q+pad(400000)+q,'/*'+pad(400000)+'*/','{a:1 '.repeat(1000)+pad(400000)+q]) {
         lengths.length=0;
         const finding=keyStructureFinding(Buffer.from(kt+' '+q+' {a:1 '+tail));
         expect(lengths.length).toBeGreaterThan(0);
