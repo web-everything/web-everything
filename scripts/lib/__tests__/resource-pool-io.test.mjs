@@ -2,12 +2,15 @@
 import { afterEach, beforeEach, it, expect, vi } from 'vitest';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-const guard = vi.hoisted(() => ({ active: false, writes: [], children: [], checkout: '' }));
+const guard = vi.hoisted(() => ({ active: false, writes: [], children: [], checkout: '', ledgerReads: null }));
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
   const wrap = api => Object.fromEntries(Object.entries(api).map(([key, value]) => {
     if (typeof value !== 'function') return [key, value];
     return [key, Object.assign((...args) => {
+      if (guard.ledgerReads && String(args[0]).endswith('pool-shadow.jsonl')) {
+        guard.ledgerReads.push(key); throw Error('grant path attempted ledger IO');
+      }
       const mutation = /^(?:write|append|mkdir|mkdtemp|rm|rmdir|unlink|rename|copy|cp|link|symlink|truncate|chmod|chown|utimes|lutimes|fchmod|fchown|futimes|ftruncate|createWriteStream)/.test(key)
         || (/^open(?:Sync)?$/.test(key) && args[1] !== actual.constants.O_RDONLY
           && args[1] !== (actual.constants.O_RDONLY | actual.constants.O_NONBLOCK | actual.constants.O_NOFOLLOW));
@@ -33,8 +36,9 @@ const fs = await vi.importActual('node:fs');
 const { mkdirSync, writeFileSync } = fs;
 import { execFileSync } from 'node:child_process';
 import { readPoolSource, readPoolJson, readPoolHeavyHeld, poolPidAlive, poolSourcePaths,
-  SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
+  collectResourcePool, appendShadowRows, SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
 import { POOL_DEFAULTS, grantDecision } from '../resource-pool.mjs';
+import { admit, shadowAdmission, resolveResourcePolicy } from '../resource-admission.mjs';
 import { readPoolLaneStatus } from '../resource-pool-lanes.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 let coord, paths, env, laneDir;
@@ -369,4 +373,92 @@ it('valid red-team identity delegates to the real probe for live, replaced and d
     .toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
   for (const options of [{ processAlive: () => false }, { processAlive: () => true, readStart: () => 'replacement' }])
     expect(read('redTeam', { slotAlive: undefined, ...options })).toMatchObject({ ok: true, holders: [] });
+});
+
+
+const validPoolSource = source => ({ source, ok: true, holders: [],
+  ...(source === 'snapshot' ? { budget: { unknown: false, units: 30 } } : {}) });
+const collectPool = (options = {}) => collectResourcePool({ env: {}, coord, paths, nowMs,
+  settings: { value: structuredClone(POOL_DEFAULTS), configuredMode: 'shadow', unknown: false },
+  readSource: validPoolSource, legacy: () => ({ verdict: 'admit', unknown: false }), ...options });
+const expectPoolClosed = report => {
+  expect(report.unknown).toBe(true);
+  expect(report.rows).toHaveLength(3);
+  expect(report.rows.every(row => row.unknown && row.poolDecision === 'hold')).toBe(true);
+  expect(report.digest).toContain('?/?');
+};
+
+it.each(Object.keys(SOURCES))('collector fails closed for failing, malformed or missing %s even with no holders', source => {
+  for (const broken of [() => { throw Error('source unreadable'); },
+    () => { throw Object.assign(Error('missing source'), { code: 'ENOENT' }); },
+    () => undefined, () => null, () => ({}),
+    () => ({ source, ok: false, holders: [], error: 'bad source' }),
+    () => ({ source, ok: true, holders: null }),
+    () => ({ source: 'wrong', ok: true, holders: [] })]) {
+    const report = collectPool({ readSource: name => name === source ? broken() : validPoolSource(name) });
+    expectPoolClosed(report);
+    expect(report.holders).toEqual([]);
+    expect(report.sources.find(row => row.source === source).ok).toBe(false);
+  }
+});
+
+it.each([{ class: 0 }, { class: 4 }, { class: '3' }, { size: 0 }, { size: 3 }, { size: '2' }])(
+  'collector invalidates a source with bad holder class/size %j', patch => {
+    const report = collectPool({ readSource: source => ({ ...validPoolSource(source), holders: source === 'fix'
+      ? [{ resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, ...patch }] : [] }) });
+    expectPoolClosed(report);
+    expect(report.sources.find(row => row.source === 'fix').ok).toBe(false);
+    expect(report.holders).toEqual([]);
+  });
+
+it('off mode appends nothing', () => {
+  const append = vi.fn();
+  expect(appendShadowRows([{ kind: 'fix' }], { coord, mode: 'off', append })).toBe(false);
+  expect(append).not.toHaveBeenCalled();
+});
+
+it.each([() => false, () => { throw Error('disk full'); }])('append failure returns false without throwing', append => {
+  expect(appendShadowRows([{}, {}], { coord, append })).toBe(false);
+});
+
+it('duplicate fix jobId across claim and workers counts once while unrelated and unidentified jobs remain', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? [
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job' },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: `${source}-other` },
+      { resource: 'studio.units', source, kind: 'fix', class: 3, size: 2 },
+    ] : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders).toHaveLength(5);
+  expect(report.summary['studio.units'].classes[3]).toBe(10);
+});
+
+it('the ledger is never read by collector, pool grants, legacy admission or shadow admission', () => {
+  const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
+  mkdirSync(join(coord, 'resource'), { recursive: true });
+  writeFileSync(ledger, 'malformed ledger: must never become admission evidence');
+  guard.ledgerReads = [];
+  try {
+    const policy = resolveResourcePolicy();
+    const legacy = args => admit({ ...args, policy });
+    const before = collectPool({ readSource: source => read(source), legacy });
+    for (const kind of ['build', 'review', 'fix']) {
+      expect(legacy({ kind, root: coord, nowMs, env: {} })).toBeTruthy();
+      shadowAdmission({ kind, root: coord, nowMs, env: { WE_RESOURCE_SHADOW: 'on' }, log: () => {} });
+    }
+    expect(grantDecision({ budget: 30, held: [], class: 3, size: 2 }).decision).toBe('grant');
+    // Changing ledger content cannot change a grant or the collector's observations.
+    writeFileSync(ledger, JSON.stringify({ poolDecision: 'grant', budget: 999 }));
+    expect(collectPool({ readSource: source => read(source), legacy })).toEqual(before);
+    expect(guard.ledgerReads).toEqual([]);
+  } finally { guard.ledgerReads = null; }
+});
+
+it('collector grants only with complete evidence and appends its three comparison rows to the shadow path', () => {
+  const report = collectPool();
+  expect(report.unknown).toBe(false);
+  expect(report.rows.every(row => row.poolDecision === 'grant' && row.legacyDecision === 'grant')).toBe(true);
+  const append = vi.fn();
+  expect(appendShadowRows(report.rows, { coord, append })).toBe(true);
+  expect(append.mock.calls).toEqual(report.rows.map(row => [join(coord, 'resource', 'pool-shadow.jsonl'), row]));
 });
