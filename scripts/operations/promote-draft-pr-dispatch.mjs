@@ -68,7 +68,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { isOperatorParked } from '../conveyor/draft-promotion-rule.mjs';
+import { isParkedByLabel, isOperatorParked } from '../conveyor/draft-promotion-rule.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -146,6 +146,15 @@ function validatePrLabels(labels) {
     return typeof name !== 'string' || name.trim().length === 0;
   })) throw new Error('PR labels must be an array of label names or {name} records');
   return labels;
+}
+
+/** Shared pre-write label guard, also used by batch sealing. Unreadable evidence refuses. */
+export function draftParkLabelRefusal(labels) {
+  try { validatePrLabels(labels); } catch {
+    return { kind: 'draft-state-unreadable', why: 'could not read draft hold labels before promoting; retry next tick' };
+  }
+  return isParkedByLabel(labels) ? { kind: 'operator-parked',
+    why: 'draft PR is operator-parked by status:parked label — explicit release is required before promotion' } : null;
 }
 
 /** Fresh draft hold labels, scoped to the target PR and repository; fail closed on unreadable data. */
@@ -388,6 +397,18 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
+    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
+    let comments;
+    try {
+      comments = readComments(entry.prNumber, { repo: repoSlug });
+      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
+    } catch (e) {
+      refusals.push({
+        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
+        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
+      });
+      continue;
+    }
     // Final read closes the stale-plan gap; GitHub does not offer an atomic label-check/ready write.
     let labels;
     try {
@@ -395,10 +416,12 @@ export function runReconcilePromoteDraftDispatch({
     } catch (e) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read draft hold labels before promoting: ${String(e?.message ?? e).split('\n')[0]}`,
+        why: `could not read draft hold labels before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
       });
       continue;
     }
+    const labelPark = draftParkLabelRefusal(labels);
+    if (labelPark) { refusals.push({ pr: entry.prNumber, headSha: sha, ...labelPark }); continue; }
     if (labels.some(label => (typeof label === 'string' ? label : label.name) === 'review-status:draft-withdrawn')) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-withdrawn', headSha: sha,
@@ -417,18 +440,6 @@ export function runReconcilePromoteDraftDispatch({
     }
     const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
     if (refusal) { refusals.push({ pr: entry.prNumber, ...refusal }); continue; }
-    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
-    let comments;
-    try {
-      comments = readComments(entry.prNumber, { repo: repoSlug });
-      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
-    } catch (e) {
-      refusals.push({
-        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
-      });
-      continue;
-    }
     if (isOperatorParked(comments)) {
       refusals.push({ pr: entry.prNumber, kind: 'operator-parked', headSha: sha,
         why: 'draft PR is operator-parked — explicit release is required before promotion' });

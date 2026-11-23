@@ -26,6 +26,13 @@ const viewOf = (d, over = {}) => ({
 
 const T = { author: { login: 'web-everything' } };
 describe('isDraftOwedPromotion', () => {
+  it.each([['status:parked'], [{ name: 'status:parked' }]])('refuses a parked label even after a comment release: %j', label => {
+    const pr = draft({ labels: [label], comments: [{ ...T, body: OPERATOR_PARK_RELEASE_MARKER }] });
+    expect(isDraftOwedPromotion({ pr, checks: green })).toMatchObject({
+      owed: false, reason: 'operator-parked', why: expect.stringContaining('status:parked'),
+    });
+    expect(isPromotionCandidate(pr)).toBe(false);
+  });
   it('isDraftOwedPromotion refuses a lane draft carrying the operator-park marker (converted to draft after open, no withdrawn label)', () => {
     const pr = draft({ comments: [{ ...T, body: `${OPERATOR_PARK_MARKER}\nConverted to draft after open.` }] });
     expect(isDraftOwedPromotion({ pr, checks: green })).toMatchObject({ owed: false, reason: 'operator-parked' });
@@ -191,6 +198,29 @@ describe('replay: #4567/#4563/#4535 green drafts left unpromoted (2026-10-09)', 
     }) });
     expect(readied).toEqual([]);
     expect(result.rows.every(r => r.action === 'skip' && r.reason === 'operator-parked')).toBe(true);
+  });
+  it('a status:parked label applied on the last read stops ready and logs the park', () => {
+    const reads = new Map();
+    const { readied, result } = run({ readPrView: ({ prNumber }) => {
+      const count = (reads.get(prNumber) ?? 0) + 1;
+      reads.set(prNumber, count);
+      return viewOf(fixture.drafts.find(d => d.number === prNumber), { labels: count > 1 ? ['status:parked'] : [] });
+    } });
+    expect(readied).toEqual([]);
+    expect(result.rows.every(r => r.action === 'skip' && r.reason === 'operator-parked' && r.why.includes('parked'))).toBe(true);
+  });
+  it('removing status:parked allows a legitimate promotion on the next pass', () => {
+    let labels = ['status:parked'];
+    const options = { readPrView: ({ prNumber }) => viewOf(fixture.drafts.find(d => d.number === prNumber), { labels }) };
+    expect(run(options).readied).toEqual([]);
+    labels = [];
+    expect(run(options).readied.sort()).toEqual([...fixture.expectPromoted].sort());
+  });
+  it('the reconcile classifier refuses a status:parked draft', () => {
+    const pr = viewOf(draft(), { labels: ['status:parked'] });
+    const plan = planReconcile({ repo: 'we', prs: [pr], agents: [], requiredChecks: ['test'], now: NOW });
+    expect(plan.dispatch.some(d => d.kind === 'promote-draft')).toBe(false);
+    expect(plan.refusals).toContainEqual(expect.objectContaining({ why: 'draft PR is operator-parked — explicit release is required before promotion' }));
   });
   it('a failed read or write is a row, never a throw', () => {
     const { result } = run({ ready: () => { throw new Error('boom'); } });

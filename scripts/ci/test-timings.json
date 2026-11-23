@@ -2207,6 +2207,7 @@
   "scripts/conveyor/soak/breaks/prepare-repeat-refusal-readmitted-after-30min.soak.test.mjs": 0.5,
   "scripts/conveyor/soak/breaks/prevention-card-lands-in-daemon-clone.soak.test.mjs": 8.8,
   "scripts/conveyor/soak/breaks/promote-draft-blocked-by-stale-clone-and-silent.soak.test.mjs": 0.87,
+  "scripts/conveyor/soak/breaks/draft-park-label-respected.soak.test.mjs": 0.41,
   "scripts/conveyor/soak/breaks/promote-draft-cross-repo.soak.test.mjs": 0.41,
   "scripts/conveyor/soak/breaks/queue-cleared-hash-never-resolves-after-jit-number.soak.test.mjs": 0.62,
   "scripts/conveyor/soak/breaks/queue-split-across-checkouts.soak.test.mjs": 0.13,

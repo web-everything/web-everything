@@ -169,7 +169,7 @@ import {
   isLatestAdvisoryFindingAddressed, isAdvisoryMechanismStandDownSuperseded,
 } from './advisory-fix-mark.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
-import { isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from './draft-promotion-rule.mjs';
+import { isParkedByLabel, isOperatorParked, OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from './draft-promotion-rule.mjs';
 // advisory-after-cap (web-everything/web-everything#2766 live incident, 2026-09-27) — see the ADVISORY-FIX
 // cap-exhausted branch below for why the "is a fresh review owed on a stale advisory note" check reuses these
 // two, never a second reimplementation of "does the newest advisory comment name this PR's CURRENT head".
@@ -2919,7 +2919,7 @@ export function planReconcile({
         refuse('draft', { ...withPhase, why: 'draft PR comments are missing or malformed — re-read the complete thread before promotion' });
         continue;
       }
-      if (isOperatorParked(pr.comments)) {
+      if (isParkedByLabel(pr.labels) || isOperatorParked(pr.comments)) {
         refuse('draft', { ...withPhase, why: 'draft PR is operator-parked — explicit release is required before promotion' });
         continue;
       }

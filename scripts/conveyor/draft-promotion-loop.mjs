@@ -170,6 +170,7 @@ export function runDraftPromotionStep({
       let writeView;
       try {
         writeView = readPrView({ repoSlug: repo, prNumber: n });
+        if (!Array.isArray(writeView?.labels)) throw new Error('pr view has no label list');
         if (!Array.isArray(writeView?.comments)) throw new Error('pr view has no comment list');
       } catch (e) { row('error', `pre-write pr view (retry next step): ${oneLine(e)}`); continue; }
       if (isOperatorParked(writeView.comments)) {

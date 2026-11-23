@@ -34,6 +34,7 @@ import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-w
 
 export const DRAFT_PROMOTION_ENV = Object.freeze({ loop: 'WE_DRAFT_PROMOTION_LOOP', intervalSeconds: 'WE_DRAFT_PROMOTION_INTERVAL_SECONDS' });
 export const DRAFT_PROMOTION_DEFAULTS = Object.freeze({ loop: false, intervalSeconds: 60 });
+export const PARKED_LABEL = 'status:parked';
 export const WITHDRAWN_LABEL = 'review-status:draft-withdrawn';
 export const OPERATOR_PARK_MARKER = '<!-- operator-park -->';
 export const OPERATOR_PARK_RELEASE_MARKER = '<!-- operator-park-release -->';
@@ -68,6 +69,8 @@ export function resolveDraftPromotionSettings(env = process.env, { path = draftP
 
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
+export const isParkedByLabel = labels => labelNames(labels).includes(PARKED_LABEL);
+
 /** PURE. The last exact first-line park/release marker in comment order wins. */
 export function isOperatorParked(comments) {
   let parked = false;
@@ -97,6 +100,7 @@ export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOp
   if (pr?.isCrossRepository === true) return { owed: false, why: 'cross-repository (fork) branch — a lane/ prefix there is not agent authorship' };
   if (!String(pr?.headRefName ?? '').startsWith(AGENT_HEAD_PREFIX)) return { owed: false, why: 'not an agent lane branch (draft-first covers lane/* only)' };
   if (labelNames(pr?.labels).includes(WITHDRAWN_LABEL)) return { owed: false, why: 'draft is withdrawn — explicit release is required before promotion' };
+  if (isParkedByLabel(pr.labels)) return { owed: false, reason: 'operator-parked', why: 'draft PR is operator-parked by status:parked label — explicit release is required before promotion' };
   if (isOperatorParked(pr.comments)) return { owed: false, reason: 'operator-parked', why: 'draft PR is operator-parked — explicit release is required before promotion' };
   const redTeamHold = labelNames(pr?.labels).find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
   if (redTeamHold) return { owed: false, why: `${redTeamHold} — a draft held by red team is never promoted` };
