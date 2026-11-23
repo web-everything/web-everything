@@ -344,11 +344,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', () => {
+test('generated documentation matches the shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation defaults and ciUnitRerun.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '433791f37d91bf80092f6bb4b1fb511f7949be9cea712137c1824d66f1d705b3');
+  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

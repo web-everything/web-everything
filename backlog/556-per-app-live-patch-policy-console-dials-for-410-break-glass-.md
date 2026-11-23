@@ -22,3 +22,5 @@ tags: [dev-browser, live-patch, deployed-app, saas, policy, governance, hosted]
 
 Pure configuration surface for already-ratified axes — no new policy semantics, just their management home.
 Sibling hosted work: the collaboration epic (#555) and the audit/compliance dashboard (#557).
+
+Ruled PARK in the master plan (2026-11-22); kept open with blockedBy #410 instead, so it re-enters readiness when #410 resolves.

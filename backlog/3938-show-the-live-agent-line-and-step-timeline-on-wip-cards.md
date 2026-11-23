@@ -18,3 +18,5 @@ plateau:src/wip/wip-view.ts renders the live L1 line (role · phase · rail · c
 
 1. **Executable** — `npx vitest run src/wip` renders each listed state from fixtures, one test per state number in §5 of the design doc.
 2. **Executable** — a Playwright check at 390px against the running dev server shows no horizontal page scroll with a 40-step run open, in light and dark.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).
