@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildOverlapRows } from '../../merge-ai-prs.mjs';
+import { buildOverlapRows, planLabelDrain } from '../../merge-ai-prs.mjs';
 import { computeOverlapContext, overlapRowKey, overlapYieldWaits } from '../land-overlap-yield.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -21,6 +21,24 @@ function waits(rows) {
 afterEach(() => vi.unstubAllEnvs());
 
 describe('enqueueable overlap targets through buildOverlapRows', () => {
+  it('replans a waiter in the same pass after an enqueue hold while the original verdict remains merge', () => {
+    vi.stubEnv(landableEnv, '1');
+    const input = fixture('merge');
+    const heldKeys = new Set();
+    const remaining = input.verdicts.map(v => ({ ...v }));
+    const replan = () => planLabelDrain(remaining, {
+      overlapContext: waits(buildOverlapRows({ ...input, candidates: remaining, heldKeys })),
+      overlapLocalSlug: repo,
+    });
+    expect(replan().deferred.find(v => v.num === 5482).waitOn).toEqual(['overlap-yield:#5461']);
+    // Match the enqueue loop: only remaining flips to skip; pass-start verdicts are unchanged.
+    remaining[1].decision = 'skip';
+    heldKeys.add(`${repo}#5461`);
+    expect(replan().ready.map(v => v.num)).toEqual([5482]);
+    expect(replan().deferred).toEqual([]);
+    expect(input.verdicts[1].decision).toBe('merge');
+  });
+
   it.each([
     ['skip', 'red-team-pending'], ['skip', 'carry-refused'], ['skip', 'checks-pending'],
     ['park', 'parked'], ['skip', 'unrecognized-reason'],
@@ -113,6 +131,21 @@ describe('enqueueable overlap targets through buildOverlapRows', () => {
 });
 
 describe('pure overlap target filter and setting provenance', () => {
+  it('excludes mq-held keys only when landability is required, leaving other repos and rows unchanged', async () => {
+    const { filterEnqueueableOverlapRows } = await load();
+    const rows = [
+      { number: 7369, repo: null, requiredCheckGreen: true, labels: ['ready-to-merge'] },
+      { number: 7369, repo: 'other/repo', requiredCheckGreen: true, labels: ['ready-to-merge'] },
+      { number: 7399, repo, requiredCheckGreen: true, labels: ['ready-to-merge'] },
+    ];
+    const heldKeys = new Set([`${repo}#7369`]);
+    for (const enabled of [true, false]) {
+      expect(filterEnqueueableOverlapRows({ openPrRows: rows, localSlug: repo, heldKeys, enabled })).toEqual(rows.slice(1));
+      expect(filterEnqueueableOverlapRows({ openPrRows: rows, localSlug: repo, heldKeys, enabled, requiresLandable: false })).toEqual(rows);
+    }
+    expect([...heldKeys]).toEqual([`${repo}#7369`]);
+  });
+
   it('scopes verdict identities by repository, normalizes local keys, and never mutates inputs', async () => {
     const { filterEnqueueableOverlapRows } = await load();
     const rows = [Object.freeze({ number: 5461, repo, requiredCheckGreen: true, labels: ['ready-to-merge'] }), Object.freeze({ number: 5461, repo: 'other/repo', requiredCheckGreen: true, labels: [{ name: 'ready-to-merge' }] })];

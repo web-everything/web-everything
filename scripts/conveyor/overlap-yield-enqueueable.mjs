@@ -64,13 +64,15 @@ export function formatOverlapYieldRequiresLandableSetting({ value, source }) {
 /** Filter only the Y side. Normalize verdict keys exactly as buildOverlapRows
  * normalizes listing rows: local null repo -> localSlug, numbers scoped by repo.
  * All non-merge verdicts are excluded regardless of their reason vocabulary.
+ * heldKeys carries enqueue declines learned after verdicts were built, scoped by repo.
  * Candidate rows and the verdicts themselves remain owned by the existing gates.
  */
-export function filterEnqueueableOverlapRows({ openPrRows = [], verdicts = [], localSlug = null, enabled = true, requiresLandable = true } = {}) {
+export function filterEnqueueableOverlapRows({ openPrRows = [], verdicts = [], localSlug = null, enabled = true, requiresLandable = true, heldKeys = new Set() } = {}) {
   if (!enabled && !requiresLandable) return openPrRows;
   const byKey = new Map((Array.isArray(verdicts) ? verdicts : []).map((v) => [overlapRowKey({ repo: v.repo || localSlug, number: v.num }), v]));
   return openPrRows.filter((row) => {
     if (requiresLandable) {
+      if (heldKeys.has(overlapRowKey({ ...row, repo: row.repo || localSlug }))) return false;
       const labels = new Set((Array.isArray(row.labels) ? row.labels : []).map((label) => typeof label === 'string' ? label : label?.name));
       if (!row.requiredCheckGreen || !labels.has('ready-to-merge')
         || ['blocked', 'ci:failed', 'review:changes', 'red-team:pending', 'red-team:blocked', 'review:human'].some((label) => labels.has(label))) return false;

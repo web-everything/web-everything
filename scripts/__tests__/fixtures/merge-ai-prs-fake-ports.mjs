@@ -4,7 +4,14 @@ import { drainScoredGit } from './drain-scored-git.mjs';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
-const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const a = process.argv.slice(2), primary = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const prs = [primary, ...(primary.fixturePeers || [])];
+const request = a.join(' ');
+const requestedNum = a[0] === 'pr' && a[1] === 'view' ? Number(a[2])
+  : Number(/(?:(?:number|pr)=|number:\s*|\/(?:pulls|issues)\/)(\d+)/.exec(request)?.[1]);
+const pr = prs.find(p => p.number === requestedNum)
+  || prs.find(p => request.includes(`/commits/${p.headRefOid}/`) || request.includes(p.id)) || primary;
+const queueMarker = process.env.PRESTAGE_PR + (pr === primary ? '' : '.' + pr.number) + '.queued';
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\n\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
@@ -14,7 +21,7 @@ if (a[0] === 'repo') {
 }
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
-if (a[0] === 'pr' && a[1] === 'list') out([pr]);
+if (a[0] === 'pr' && a[1] === 'list') out(prs);
 if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
@@ -23,7 +30,8 @@ if (a[0] === 'api') {
   if (path.endsWith('/branches/main')) out({ protected:false });
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
-  if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
+  if (path.includes('/files')) out([pr.files.map(f => ({ filename:f.path, status:'modified', additions:f.additions, deletions:f.deletions }))]);
+  if (primary.fixturePeers && path.includes('/events')) out([{event:'labeled',label:{name:'ready-to-merge'},created_at:new Date().toISOString()}]);
   if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
   // Complete pages carry the server's total_count: the strict reader attests rows only when delivered === total.
   const runRows = pr.statusCheckRollup.filter(c => c.name).map((c, i) => ({ ...c, id: c.id ?? -(i + 1) }));
@@ -35,15 +43,15 @@ if (a[0] === 'api') {
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
     } } } } });
-    if (q.includes('enqueuePullRequest')) { fs.writeFileSync(process.env.PRESTAGE_PR+'.queued',''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
+    if (q.includes('enqueuePullRequest')) { fs.writeFileSync(queueMarker,''); out({ data: { enqueuePullRequest: { mergeQueueEntry: { id:'E',position:1,state:'QUEUED' } } } }); }
     if (q.includes('isInMergeQueue')) {
       const reads = fs.readFileSync(process.env.PRESTAGE_LOG,'utf8').split('\n').filter(line => line.includes('isInMergeQueue')).length;
-      out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:(!!pr.inQueue && (!pr.loseQueueAfterAdmission || reads === 1)) || fs.existsSync(process.env.PRESTAGE_PR+'.queued') } } } });
+      out({ data: { repository: { pullRequest: { headRefOid:pr.headRefOid, isInMergeQueue:(!!pr.inQueue && (!pr.loseQueueAfterAdmission || reads === 1)) || fs.existsSync(queueMarker) } } } });
     }
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
-    out(page([pr], q));
+    out(page(prs, q));
   }
 }
 out([]);

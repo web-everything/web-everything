@@ -22,6 +22,39 @@ const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, 
 const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
 
 describe('real drain pre-stage path', () => {
+  it('a real mq refusal continues a no-merge cascade, attempts the released waiter, and never retries the held target', () => world(async ({pr,run}) => {
+    pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
+    pr.files[0] = {path:'README.md',changeType:'MODIFIED',additions:100,deletions:0};
+    pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
+      beforeCommit:{oid:'b'.repeat(40),parents:{nodes:[{oid:'c'.repeat(40)},{oid:sha}]}} }];
+    const waiterSha = 'd'.repeat(40);
+    const waiter = structuredClone(pr);
+    Object.assign(waiter, {number:43,id:'PR_WAITER',headRefOid:waiterSha,headRefName:'lane/waiter',mqTimeline:[],
+      files:[{path:'README.md',changeType:'MODIFIED',additions:1,deletions:0}],
+      commits:[{...pr.commits[0],oid:waiterSha}],
+      statusCheckRollup:[{...pr.statusCheckRollup[0],head_sha:waiterSha}],
+      comments:[{...pr.comments[0],body:'<!-- reviewed-sha: '+waiterSha+' -->'}]});
+    pr.fixturePeers = [waiter];
+    const next = await run(false, {onlyPr:null,overlapYield:true});
+    // No merge can drive progression: L is refused, and S is only enqueued on the next iteration.
+    expect(next.report.merged ?? []).toEqual([]);
+    expect(next.report.enqueueOutcomes, next.stderr).toMatchObject([
+      {num:42,outcome:'not-enqueued',kind:'mq-same-head-failed'},
+      {num:43,outcome:'enqueued'},
+    ]);
+    expect(next.report.enqueueOutcomes).toHaveLength(2);
+    expect(next.report.deferred ?? []).toEqual([]);
+    // S entered the real overlap budget reader before L's admission refusal.
+    const budgetRead = next.calls.findIndex(a => a.some(x => x.includes('/issues/43/events')));
+    const admissions = next.calls.filter(a => a.some(x => x.includes('timelineItems(')));
+    expect(budgetRead).toBeGreaterThanOrEqual(0);
+    expect(budgetRead).toBeLessThan(next.calls.findIndex(a => a.some(x => x.includes('timelineItems('))));
+    expect(admissions.filter(a => a.includes('number=42'))).toHaveLength(1);
+    // S is checked at admission and rechecked immediately before the enqueue mutation.
+    expect(admissions.map(a => a.find(x => x.startsWith('number=')))).toEqual(['number=42', 'number=43', 'number=43']);
+    expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(1);
+  }));
+
   it.each(['check-runs', 'status'])('fresh cascade revalidation refuses unreadable %s evidence', endpoint => world(async ({pr,run}) => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     pr.unreadableCheckRows = endpoint;

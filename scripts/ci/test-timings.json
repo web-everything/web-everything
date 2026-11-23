@@ -2233,6 +2233,7 @@
   "scripts/conveyor/soak/breaks/shallow-clone-unrelated-histories.soak.test.mjs": 48.67,
   "scripts/conveyor/soak/breaks/short-job-behind-full-suite.soak.test.mjs": 5.47,
   "scripts/conveyor/soak/breaks/skipped-tick-ontick.soak.test.mjs": 17.87,
+  "scripts/conveyor/soak/breaks/overlap-yield-skips-mq-held-target.soak.test.mjs": 0.01,
   "scripts/conveyor/soak/breaks/small-pr-lands-over-large-in-review.soak.test.mjs": 64.52,
   "scripts/conveyor/soak/breaks/smoke-expired-gh-token.soak.test.mjs": 34.96,
   "scripts/conveyor/soak/breaks/smoke-failfast-env-checks.soak.test.mjs": 1,

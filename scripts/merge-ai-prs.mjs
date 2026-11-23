@@ -2712,7 +2712,7 @@ const OVERLAP_FILES_PAGE_CAP = 100;
  * {@link overlapRowKey} on an ALREADY-normalized row — never re-inline the `${repo||''}#${num}` template.
  * @returns {{candidateRows:object[], openPrRows:object[]}}
  */
-export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), localSlug = null, requiredCheck = 'test' } = {}) {
+export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPrKeys = new Set(), heldKeys = new Set(), localSlug = null, requiredCheck = 'test' } = {}) {
   const verdictByKey = new Map();
   for (const v of (Array.isArray(verdicts) ? verdicts : [])) verdictByKey.set(overlapRowKey({ repo: v.repo || localSlug, number: v.num }), v);
   const rowsByKey = new Map();
@@ -2747,7 +2747,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
     if (!base) continue; // no raw listing row — should not happen for a candidate drawn from this same listing
     candidateRows.push({ ...base, exempt: isExemptItem(c.item) });
   }
-  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
+  return { candidateRows, openPrRows: filterEnqueueableOverlapRows({ openPrRows, verdicts, localSlug, heldKeys, enabled: resolveOverlapYieldOnlyToEnqueueableSetting({ argv, env: process.env }).value, requiresLandable: resolveOverlapYieldRequiresLandableSetting({ argv, env: process.env }).value }) };
 }
 
 const overlapNetDiffCache = new Map();
@@ -7336,7 +7336,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     lastDrainOrderLog = sig;
     process.stderr.write(`${lines.join('\n')}\n`);
   };
-  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
+  // Enqueue declines arrive after the pass-start verdicts; keep them across every replan.
+  const overlapHeldKeys = new Set();
+  const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), heldKeys: overlapHeldKeys, localSlug, requiredCheck: REQUIRED });
   const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
   const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
@@ -7368,7 +7370,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // (openPrContext.prsByRepo is a pass-START snapshot and would otherwise still show a landed PR as open —
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
-    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
+    const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, heldKeys: overlapHeldKeys, localSlug, requiredCheck: REQUIRED });
     const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
     const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
@@ -7657,6 +7659,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       staleLandedOpenItems = plan.staleLandedOpenItems || [];
       if (!plan.ready.length) break;
       let progressed = false;
+      const enqueueOutcomeStart = enqueueOutcomes.length;
+      const overlapHeldCount = overlapHeldKeys.size;
       // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
       // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
       coupleStep.ordered = prioritizeQueue(coupleStep.ordered);
@@ -8017,7 +8021,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
         },
       });
-      if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
+      // A newly held Y releases overlap waiters even when nothing merged. Replan once for
+      // that new evidence; held candidates are already skip in remaining, so cannot retry.
+      for (const outcome of enqueueOutcomes.slice(enqueueOutcomeStart)) {
+        if (outcome.outcome === 'not-enqueued' && outcome.kind === 'mq-same-head-failed') {
+          overlapHeldKeys.add(overlapRowKey({ repo: outcome.repo || localSlug, number: outcome.num }));
+        }
+      }
+      if (!progressed && overlapHeldKeys.size === overlapHeldCount) break; // no new merge or overlap relief
     }
     // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
     if (requiredWorkflowsRefusals.length) {
