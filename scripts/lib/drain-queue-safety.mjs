@@ -1,5 +1,5 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
@@ -11,7 +11,7 @@ import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
@@ -547,10 +547,27 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
+/** Trusted, publishable evidence bound to this PR and exact live head. PURE; unreadable is absent proof. */
+export function redTeamClearProof({ comments, pr, head } = {}) {
+  try {
+    if (Array.isArray(comments)) {
+      const result = redTeamForHead(comments, pr, head);
+      if (isPublishableRedTeamResult(result)) return { ok: true, kind: result.policyClear ? 'policy-clear' : 'result' };
+    }
+  } catch { /* An unreadable thread never proves clearance. */ }
+  return { ok: false, reason: 'unknown(missing)' };
+}
+
+export const redTeamClearHoldReason = head => `post-accept red team unknown(missing) on ${String(head ?? '').slice(0, 12)}: no result, policy-clear or carry for this head; re-run the red team on the head`;
+
 export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  let disposition;
+  try {
+    if (!Array.isArray(comments)) return redTeamClearHoldReason(head);
+    disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  } catch { return redTeamClearHoldReason(head); }
   // A hold that is only "publication pending" (PR #6622) is no break: it still holds, but after the unknown-evidence
   // reason, so a capped scan is reported as such.
   const pendingOnly = redTeamHoldPendingOnly(disposition);
@@ -560,7 +577,14 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
+  // Proof from a completed pass cannot release a different pass that is still running.
+  if (inFlight && redTeamEnabled(env)) return 'post-accept red team has no recorded result on the live head';
+  if (isPublishableRedTeamResult(disposition.result)) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly })) {
+    // Kill switch thrown (WE_REVIEW_RED_TEAM / WE_REVIEW_EXTRA_SEATS off): enqueue without a result still works.
+    if (!redTeamEnabled(env)) return null;
+    return redTeamClearProof({ comments, pr, head }).ok ? null : redTeamClearHoldReason(head);
+  }
   return 'post-accept red team has no recorded result on the live head';
 }
 

@@ -145,7 +145,7 @@ describe('real drain pre-stage path', () => {
     expect(body.match(/mergeStrategy\.enqueue\s*\(/g)).toHaveLength(1);
     expect((source.slice(0, definition.index) + source.slice(end)).match(/mergeStrategy\.enqueue\s*\(/g) || []).toHaveLength(0);
   });
-  it.each([false, true])('same-head failed_checks holds without enqueueing through the cascade/prestage path (green event: %s)', green => world(async ({pr,run}) => {
+  it.each([false, true])('same-head failed_checks holds and revalidates refused refresh recovery through cascade/prestage (green event: %s)', green => world(async ({pr,run}) => {
     if (green) expect((await run()).stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     pr.mqTimeline = [{ __typename:'RemovedFromMergeQueueEvent', reason:'failed_checks', createdAt:'2026-11-01T12:00:00Z',
@@ -154,7 +154,15 @@ describe('real drain pre-stage path', () => {
     const line = `mq-same-head-failed: #42 head ${sha} — failed_checks`;
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
     expect(next.stderr).toContain(line);
-    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(1);
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'not-enqueued',kind:'mq-same-head-failed'}]);
+    // The fixture is BLOCKED: refresh refuses it, then fixer recovery independently
+    // rereads the timeline and refuses the same non-CLEAN head before publication.
+    expect(next.stderr).toContain('skipped (not CLEAN)');
+    expect(next.stderr).toContain('mq-failure-recovery: #42 Live head or CLEAN main-base evidence unavailable; operator inspection required');
+    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(2);
+    expect(next.calls.some(a => a.some(x => x.includes('/update-branch')))).toBe(false);
+    expect(next.calls.some(a => a[0] === 'pr' && ['comment', 'edit'].includes(a[1]))).toBe(false);
+    expect(next.calls.some(a => a[0] === 'api' && a.includes('POST'))).toBe(false);
   }));
   it.each([false, true])('manual removal permits re-enqueue through the cascade/prestage path (green event: %s)', green => world(async ({pr,run}) => {
     if (green) expect((await run()).stderr).toContain('eligible=true');
