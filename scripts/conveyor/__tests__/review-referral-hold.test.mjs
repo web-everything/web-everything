@@ -1021,12 +1021,17 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     expect(reason).toContain('[REDACTED]');
     expect(reason).not.toContain('secret');
   });
-  it.each(['Bearer\tsecretJWT', 'Bearer\nsecretJWT', 'Bear​er secretJWT'])('redacts a credential split by control characters: %j', credential => {
+  it.each(['Bearer\tsecretJWT', 'Bearer\nsecretJWT', 'Bear​er secretJWT', 'ghp_s​ecret', 'github_pat_s\u0000ecret'])('redacts a credential split by control characters: %j', credential => {
     const raw = run();
     raw.acceptHoldReason = `parked: ${credential}`;
     const reason = reviewRunEvidence(raw).acceptHoldReason;
     expect(reason).toContain('[REDACTED]');
-    expect(reason).not.toContain('secretJWT');
+    expect(reason).not.toMatch(/ecret/);
+  });
+  it('drops directionality marks and line separators from park reasons', () => {
+    const raw = run();
+    raw.acceptHoldReason = 'a؜b c d';
+    expect(reviewRunEvidence(raw).acceptHoldReason).toBe('ab c d');
   });
   it('alerts once per exhausted head and run-count with the latest sanitized park reason', () => {
     const raw = run();

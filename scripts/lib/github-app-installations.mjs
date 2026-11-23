@@ -110,9 +110,9 @@ export function ownerFromGhArgv(argv) {
       if (m) return canonicalOwner(m[1], m[2]);
     }
   }
-  if (args[0] === 'api' && args[1] === 'graphql') {
+  if (args[0] === 'api' && args.includes('graphql')) {
     let owner = null, name = null;
-    for (let i = 2; i < args.length; i += 1) {
+    for (let i = 1; i < args.length; i += 1) {
       const a = args[i];
       let field;
       if (['-f', '-F', '--field', '--raw-field'].includes(a)) field = args[++i];

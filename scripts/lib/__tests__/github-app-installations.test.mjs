@@ -10,6 +10,10 @@ import {
 import { renderGhShimScript } from '../gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv, resolveGithubAppEnvConfig, CACHE_VERSION } from '../github-app-auth-env.mjs';
 
+it('routes graphql owner/name fields when options precede the endpoint', () => {
+  expect(ownerFromGhArgv(['api', '--paginate', 'graphql', '-f', 'owner=plateauapp', '-f', 'name=plateau-app'])).toBe('plateauapp');
+});
+
 describe('owner -> installation selection', () => {
   it('maps each new org to its installation, case-insensitively', () => {
     expect(installationForOwner('web-everything')).toBe('167640002');
