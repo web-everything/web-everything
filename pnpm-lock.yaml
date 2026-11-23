@@ -206,6 +206,9 @@ importers:
       ajv:
         specifier: ^8.20.0
         version: 8.20.0
+      ajv-formats:
+        specifier: ^2.1.1
+        version: 2.1.1(ajv@8.20.0)
       concurrently:
         specifier: ^9.2.1
         version: 9.2.1

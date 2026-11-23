@@ -3,9 +3,16 @@ import { mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { explainWhy, lastMentionLine, whyOperation } from '../operator-why.mjs';
+import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
+import { advisoryHeadMoveState } from '../../conveyor/reconcile-core.mjs';
 import { createWhyReader } from '../operator-why-io.mjs';
+import { buildReviewedShaMarker, buildClearedHumanMarker } from '../../lib/review-escalation.mjs';
 
 const base = { subject: { kind: 'pr', id: 5017 }, repo: 'web-everything/web-everything', pr: { state: 'OPEN', labels: [] }, logs: [], checks: [], gaps: [] };
+const HEAD7 = 'f7c7dcd37' + '0'.repeat(31), OLD7 = '1c2cf7cc9' + '0'.repeat(31);
+const staleAdvisoryPr = (extra = {}) => ({ state: 'OPEN', labels: ['review:human'], headRefOid: HEAD7,
+  commits: [{ oid: OLD7, messageHeadline: 'fix' }, { oid: HEAD7, messageHeadline: 'ci: recover missing PR checks', messageBody: 'Conveyor-Missing-Run-Recovery: x' }],
+  comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** accept\n\nok\n\n---\n\nNet basis: \`${'c'.repeat(40)}..${OLD7}\` — 1 net changed file(s) vs current main` }], ...extra });
 const item = { ...base, subject: { kind: 'item', id: '5754' }, card: { status: 'open' } };
 describe('why first-match owner rules', () => {
   const rows = [
@@ -32,6 +39,41 @@ describe('why first-match owner rules', () => {
     if (op) for (const flag of ['--preview', '--actor=<login>', '--channel=<where>', '--reason="<why>"']) expect(out.suggestedOp).toContain(flag);
     expect(out.sections.map(s => s.name)).toEqual(['state', 'checks', 'daemons', 'holds', 'queue', 'owner']);
     expect(out.screen.split('\n').length).toBeLessThanOrEqual(40);
+  });
+  it('why names review daemon when advisory is stale', () => {
+    const pr = staleAdvisoryPr();
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' });
+    expect(out.owner).toBe('review daemon');
+    expect(out.waitingFor).toBe('advisory re-run on f7c7dcd37');
+  });
+  it('why says so when the advisory is unreadable', () => {
+    const pr = staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] });
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toMatch(/advisory unreadable/);
+  });
+  it.each(['off', undefined])('why keeps human ownership when advisory setting is %s', advisoryReviewOnHumanHandoff => {
+    const pr = staleAdvisoryPr();
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toBe('human review / park');
+  });
+  it.each(['off', undefined])('why does not claim an unreadable rerun was refused when setting is %s', advisoryReviewOnHumanHandoff => {
+    const pr = staleAdvisoryPr({ comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] });
+    const out = explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff });
+    expect(out.owner).toBe('operator');
+    expect(out.waitingFor).toBe('human review / park');
+  });
+  it.each(['verdict', 'human clearance'])('why does not report unreadable history over current-head %s', kind => {
+    const pr = staleAdvisoryPr({ comments: [
+      { author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` },
+      { author: { login: 'web-everything' }, body: `${buildReviewedShaMarker(HEAD7)}\n${kind === 'human clearance' ? buildClearedHumanMarker('chalbert') : ''}` },
+    ] });
+    expect(explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' }).waitingFor).toBe('human review / park');
+  });
+  it('why excludes advisory:changes from head-moved ownership', () => {
+    const pr = staleAdvisoryPr({ labels: ['review:human', 'advisory:changes'] });
+    expect(explainWhy({ ...base, pr, advisoryHeadMove: advisoryHeadMoveState(pr), advisoryReviewOnHumanHandoff: 'on' }).owner).toBe('operator');
   });
   for (const [name, extra, owner, op] of [
     ['build hold', { buildHolds: [{ reason: 'manual' }] }, 'nobody (parked: manual)', 'unpark'],
@@ -96,6 +138,37 @@ it('injects all external reads and preserves failed-source gaps', () => {
   expect(facts.gaps).toContainEqual({ source: 'build holds', error: 'offline' });
   expect(facts.logs.find(l => l.name === 'fix').line).toContain('#5017');
   expect(read({ pr: 0, item: '5754', repo: base.repo }).card.queued).toBe(true);
+});
+
+it.each(['readable', 'unreadable'].flatMap(history => ['on', 'off', 'unreadable'].map(setting => ({ history, setting }))))
+('why honours setting $setting with $history history through the real io seam (commits requested)', ({ history, setting }) => {
+  const pr = staleAdvisoryPr(history === 'unreadable'
+    ? { comments: [{ author: { login: 'web-everything' }, body: `${ADVISORY_NOTE_MARKER}\n\nno basis` }] } : {});
+  const run = (cmd, args) => {
+    const joined = [cmd, ...(args ?? [])].join(' ');
+    if (!/ pr view /.test(` ${joined} `)) return '';
+    const fields = args[args.indexOf('--json') + 1].split(',');
+    return JSON.stringify(Object.fromEntries(['number', 'state', 'isDraft', 'labels', 'headRefOid', 'mergeable', 'statusCheckRollup', 'commits']
+      .filter(k => fields.includes(k)).map(k => [k, k === 'number' ? 5017 : k === 'labels' ? [{ name: 'review:human' }] : pr[k] ?? null])));
+  };
+  const read = createWhyReader({
+    run, readAgents: () => [], readComments: () => pr.comments,
+    readOwnershipSettings: () => {
+      if (setting === 'unreadable') throw new Error('settings unavailable');
+      return { advisoryReviewOnHumanHandoff: { value: setting, source: 'repo' } };
+    },
+    readRequiredChecks: () => [], readChecks: () => [],
+    listPlists: () => [], listFiles: () => [], tail: () => ({ text: '' }), readClaims: () => [], readBuildHolds: () => [],
+    readBackoffs: () => [], readPrepareFailures: () => ({ failures: {} }), listPrs: () => [], readCard: () => null, now: () => 0,
+  });
+  const facts = read({ pr: 5017, item: '', repo: base.repo });
+  const out = explainWhy(facts);
+  expect(facts.advisoryReviewOnHumanHandoff).toBe(setting === 'on' ? 'on' : 'off');
+  expect(out.owner).toBe(setting === 'on' && history === 'readable' ? 'review daemon' : 'operator');
+  expect(out.waitingFor).toBe(setting === 'on'
+    ? history === 'readable' ? 'advisory re-run on f7c7dcd37' : 'human review / park (advisory unreadable, no re-run dispatched)'
+    : 'human review / park');
+  if (setting === 'unreadable') expect(facts.gaps).toContainEqual({ source: 'advisory setting', error: 'settings unavailable' });
 });
 
 it('keeps the screen bounded while retaining all structured evidence and gaps', () => {

@@ -1,0 +1,6 @@
+{
+  "description": "Delivery modes used when daemon tooling is degraded.",
+  "owner": "scripts/settings/delivery-routes.json",
+  "changeVia": "pr",
+  "instant": false
+}

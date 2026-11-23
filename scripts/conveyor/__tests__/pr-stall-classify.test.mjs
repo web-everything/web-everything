@@ -15,7 +15,7 @@ const ACTOR = { 'system:fix-stood-down': 'system', 'system:ledger-write-miss': '
   'awaiting-review': 'reviewer', 'human-review-pending-advisory': 'reviewer', 'red-team-pending': 'red-team', 'drain-skip:red-team-pending': 'red-team',
   fixing: 'fixer', 'sent-back-red-team': 'fixer', draft: 'fixer', 'ci-failed': 'fixer', 'awaiting-ci': 'ci', 'ready-to-merge': 'drain',
   'in-merge-queue': 'drain', 'drain-skip:queue-file-overlap': 'drain', 'drain-skip:overlap-yield': 'drain', 'drain-skip:ready-not-reached': 'drain',
-  'drain-skip:conflicting': 'fixer', 'drain-skip:checks-pending': 'ci' };
+  'drain-skip:conflicting': 'fixer', 'drain-skip:checks-pending': 'ci', 'drain-skip:checks-failed': 'ci' };
 const row = (waitingOn, o = {}) => ({ repo: REPO, number: 77, waitingOn, actor: ACTOR[waitingOn] ?? 'operator', stalled: true, liveJob: null,
   why: 'x', evidence: ['e1', 'e2', 'e3', 'e4'], next: { summary: 's', command: `next-for ${waitingOn}` }, ...o });
 const finding = (cls, file = 'scripts/foo.mjs') => ({ file, line: 3, summary: `${cls}: the claim must be released before the push`, cls, priorAppearances: 0 });
@@ -70,6 +70,7 @@ const FIXED = {
   'in-merge-queue': ['system', 'tooling-card'], 'drain-skip:queue-file-overlap': ['system', 'tooling-card'],
   'drain-skip:ready-not-reached': ['system', 'tooling-card'], 'drain-skip:overlap-yield': ['system', 'tooling-card'],
   'drain-skip:conflicting': ['system', 'tooling-card'], 'drain-skip:checks-pending': ['system', 'tooling-card'],
+  'drain-skip:checks-failed': ['system', 'tooling-card'],
   'drain-skip:escalated': ['operator', 'unclassified'], 'drain-skip:unknown': ['operator', 'unclassified'],
   'ruling-needed:dispute': ['operator', 'ruling-needed:dispute'], 'needs-decision:note': ['operator', 'needs-decision:note'],
   'draft-withdrawn': ['operator', 'draft-withdrawn'], 'needs-you': ['operator', 'needs-you'], 'human-review': ['operator', 'human-review'],

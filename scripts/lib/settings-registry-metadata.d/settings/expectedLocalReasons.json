@@ -1,0 +1,6 @@
+{
+  "description": "Local execution reasons excluded from remote-share warnings.",
+  "owner": "scripts/settings/forge-share.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Allow main-fix work beyond the ordinary fix cap.",
+  "owner": "scripts/settings/main-fix-capacity.json",
+  "changeVia": "pr",
+  "instant": false
+}

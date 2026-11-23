@@ -1,0 +1,6 @@
+{
+  "description": "Daily cap on stale red-team redispatches.",
+  "owner": "scripts/settings/review-red-team-on-skip.json",
+  "changeVia": "pr",
+  "instant": false
+}

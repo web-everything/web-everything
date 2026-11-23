@@ -1,0 +1,6 @@
+{
+  "description": "Target fraction of heavy work executed remotely.",
+  "owner": "scripts/settings/forge-share.json",
+  "changeVia": "pr",
+  "instant": false
+}

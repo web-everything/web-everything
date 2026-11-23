@@ -1,0 +1,6 @@
+{
+  "description": "Minimum free memory percentage for dispatch admission.",
+  "owner": "scripts/dispatch-settings.json",
+  "changeVia": "pr",
+  "instant": false
+}
