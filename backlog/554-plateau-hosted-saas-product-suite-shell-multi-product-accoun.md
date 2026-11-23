@@ -1,10 +1,12 @@
 ---
 kind: epic
 parent: "089"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: Phase 1 earns revenue on flat cost and live-serve is on the roadmap (#089/#097); then account, sign-in and cross-product billing."
+dateParked: "2026-11-22"
 humanGate: { kind: setup, short: "Founder go/no-go to enter the SaaS phase + provision hosting, accounts & billing.", what: "Standing up the Plateau hosted-SaaS suite is a founder go/no-go to enter the SaaS phase and provision hosting/accounts/billing — a human business decision, not agent-mechanical work." }
 dateOpened: "2026-06-14"
-dateParked: "2026-06-14"
 tags: [monetization, plateau, saas, hosted, product-suite, live-serve, deferred]
 ---
 
@@ -44,3 +46,5 @@ it unparks. Listed only to scope what "settle the suite" means:
 - [#398](/backlog/398-build-the-web-docs-product-fui-open-primitives-plateau-app-o/) — the Web Docs product build; a candidate first tenant of the suite.
 - [#402](/backlog/402-plateau-platform-manager-product-graph-aggregation-impact-an/) — the platform-manager product; another candidate tenant.
 - [#183](/backlog/183-payments-merchant-of-record/) — the billing rail (Lemon Squeezy MoR) the suite's billing surface would compose.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: Phase 1 earns revenue on flat cost and live-serve is on the roadmap (#089/#097); then account, sign-in and cross-product billing.
