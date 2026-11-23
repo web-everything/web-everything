@@ -800,8 +800,18 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
     );
   }
 
+  // The CLI's result envelope reports the models that actually incurred usage. Never
+  // infer this from --model (an alias/request) or from the model-written answer.
+  // Ambiguous/malformed usage stays unobserved so deciding seats continue to WAIT.
+  const usedModels = parsed.modelUsage && typeof parsed.modelUsage === 'object' && !Array.isArray(parsed.modelUsage)
+    ? Object.keys(parsed.modelUsage) : [];
+  const usageEntry = usedModels.length === 1 ? parsed.modelUsage[usedModels[0]] : null;
+  const servedModel = usageEntry && typeof usageEntry === 'object' && !Array.isArray(usageEntry)
+    && /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(usedModels[0])
+    ? usedModels[0] : null;
   return {
     value,
+    ...(servedModel ? { servedModel, modelEvidence: 'claude-model-usage' } : {}),
     sessionId: parsed.session_id ?? '',
     costUsd: typeof parsed.total_cost_usd === 'number' ? parsed.total_cost_usd : 0,
     durationMs: typeof parsed.duration_ms === 'number' ? parsed.duration_ms : 0,

@@ -729,6 +729,8 @@ function buildProviderRequest(effective, cwd, effectiveProviderName) {
     budget: effective.budget,
     runId: effective.runId,
     lens: effective.lens,
+    ...(effectiveProviderName === 'codex' && effective.reviewContext && INDEPENDENT_REVIEW_SEATS.includes(effective.lens)
+      ? { requireModelEvidence: true } : {}),
     ...(effective.allowedTools ? { allowedTools: effective.allowedTools } : {}),
     // #4446 - keyed on the tool-free capability (codex AND antigravity), not on a provider-name literal.
     // #xqa9ttq (PR #2117 review, CONFIRMED) - a codex request NEVER receives the factory's lane cwd: the seat

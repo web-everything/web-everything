@@ -493,13 +493,39 @@ function parseInvalidSchemaError(message) {
  *   never reaches stdout at all).
  * @param {string|null} [o.lastMessage] - the `--output-last-message` file's content, or `null` if it was
  *   never written (a kill before the file was created, probe 6).
+ * @param {boolean} [o.requireModelEvidence] - parse the native text renderer's startup header and last-message
+ *   file instead of JSONL; required for deciding review seats since JSONL omits model identity.
+ * @param {number|null} [o.exitCode] - the child exit code, required to accept text-mode output.
  * @returns {{value: object, sessionId: string, costUsd: number, numTurns: number, stopReason: string,
  *            usage: object}}
  * @throws {CodexInvalidSchemaError} on OpenAI's strict-schema 400.
  * @throws {Error} on any other terminal failure, or on no terminal event at all (the timeout caller handles
  *   that case separately — see `codexJudgeSpawn`).
  */
-export function parseCodexJudgeOutcome({ stdout, stderr = '', lastMessage = null } = {}) {
+export function parseCodexJudgeOutcome({ stdout, stderr = '', lastMessage = null, requireModelEvidence = false, exitCode = null } = {}) {
+  if (requireModelEvidence) {
+    // `exec --json` omits the model (observed on 0.162.1). The text renderer's
+    // startup header reports it before any user/model/tool text. Only accept that
+    // first, bounded header, a clean process exit, and the schema output file.
+    const header = String(stderr).slice(0, 8192).match(/^(?:Reading additional input from stdin\.\.\.\r?\n)?OpenAI Codex v[^\r\n]+\r?\n--------\r?\n([\s\S]*?)\r?\n--------\r?\n/);
+    const fields = header ? header[1].split(/\r?\n/) : [];
+    const field = name => {
+      const values = fields.filter(line => line.startsWith(`${name}: `));
+      return values.length === 1 ? values[0].slice(name.length + 2) : null;
+    };
+    const servedModel = field('model'), sessionId = field('session id');
+    if (exitCode !== 0 || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(servedModel ?? '')
+      || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionId ?? '')) {
+      throw new Error('codex-judge-spawn: WAIT: clean exit and CLI model/session header required');
+    }
+    let value;
+    try { value = JSON.parse(lastMessage); } catch { /* shape checked below */ }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('codex-judge-spawn: no schema-constrained last-message object');
+    }
+    return { value: stripNulls(value), sessionId, servedModel, modelEvidence: 'codex-cli-header',
+      costUsd: 0, numTurns: 0, stopReason: 'process.completed', usage: {} };
+  }
   const lines = String(stdout).split('\n').map(parseJsonlLine).filter(Boolean);
 
   // THE TERMINAL EVENT IS THE LAST ONE, NEVER THE FIRST (probe 5). Scan from the end for the two events that
@@ -685,6 +711,8 @@ export function persistCodexJudgeTranscript({
  *   header (round-2 review finding, #xqa9ttq). A caller that genuinely needs the child to see more passes its own
  *   `env` explicitly.
  * @param {string} [opts.cli]
+ * @param {boolean} [opts.requireModelEvidence] - use the text header for CLI-observed model identity.
+ *   This mode preserves raw streams but has no structured token/turn/tool-event telemetry.
  * @param {number} [opts.timeoutMs] - PARENT-IMPOSED wall; Codex has no CLI timeout flag (`#3371` probe 6).
  * @param {Function} [opts.spawnFn]
  * @param {(prefix: string) => string} [opts.mkTempDir] - injectable `mkdtempSync`, for tests.
@@ -705,6 +733,7 @@ export async function codexJudgeSpawn({
   model,
   effort, mandatoryLens, care, log, lens, repo, pr, card,
   allowedTools = null,
+  requireModelEvidence = false,
   cwd = null,
   env = null,
   cli = CODEX_CLI,
@@ -745,7 +774,8 @@ export async function codexJudgeSpawn({
   const outputLastMessageFile = join(workDir, 'last-message.txt');
   writeFile(schemaFile, JSON.stringify(shape));
 
-  const argv = buildCodexJudgeArgv({ route, schemaFile, outputLastMessageFile, cwd: spawnCwd, model, effort });
+  const jsonArgv = buildCodexJudgeArgv({ route, schemaFile, outputLastMessageFile, cwd: spawnCwd, model, effort });
+  const argv = requireModelEvidence ? [...jsonArgv.filter(arg => arg !== '--json'), '--color', 'never'] : jsonArgv;
   const prompt = buildCodexPrompt(mandate, input);
 
   const startedAt = Date.now();
@@ -814,8 +844,14 @@ export async function codexJudgeSpawn({
   // went on to succeed, fail its schema, or hit the timeout wall. Best-effort: `persistTranscript` never
   // throws (see its own header), so a disk-write failure here can never turn a completed judge call into a
   // failed one.
-  const judgeThreadId = extractCodexJudgeThreadId(result.stdout);
-  const transcriptFile = persistTranscript({ stdout: result.stdout, threadId: judgeThreadId, dir: transcriptDir });
+  // Preserve both raw text streams for the observed-model mode; a diagnostic event
+  // cannot be mistaken for structured JSONL tool/read evidence by transcript readers.
+  const transcript = requireModelEvidence
+    ? `${JSON.stringify({ type: 'codex.exec.text', stdout: result.stdout, stderr: result.stderr })}\n`
+    : result.stdout;
+  // Text stdout is model-written content, never a trusted thread event or filename.
+  const judgeThreadId = requireModelEvidence ? null : extractCodexJudgeThreadId(result.stdout);
+  const transcriptFile = persistTranscript({ stdout: transcript, threadId: judgeThreadId, dir: transcriptDir });
   // #3383 mechanical-dispatcher Bug 2 fix — score + record THIS run's own scorecard, off the RAW stdout this
   // function already captured (never off `transcriptFile` — scoring needs no disk round-trip, and must not
   // depend on the write above having succeeded). Placed BEFORE the timeout/parse branches below (which may go
@@ -823,11 +859,12 @@ export async function codexJudgeSpawn({
   // worth capturing. Best-effort, never throws (`recordCodexRunScorecard`'s own header) — a recording failure
   // can never turn an otherwise-completed judge call into a failed one.
   recordScorecard({
-    stdout: result.stdout, dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review',
+    stdout: transcript, dispatchKind: 'advisory-review', kind: 'review', role: 'advisory-review',
     provider: 'codex', model, effort,
   });
 
   if (result.timedOut) {
+    if (requireModelEvidence) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout: result.stdout, stderr: result.stderr });
     let outcome = null;
     try { outcome = parseCodexJudgeOutcome({ stdout: result.stdout, stderr: result.stderr, lastMessage }); } catch { outcome = null; }
     if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout: result.stdout, stderr: result.stderr });
@@ -839,7 +876,7 @@ export async function codexJudgeSpawn({
   const outcome = parseCodexJudgeOutcome({
     stdout: result.stdout,
     stderr: result.stderr || (result.code === 0 ? '' : `exit code ${result.code}`),
-    lastMessage,
+    lastMessage, requireModelEvidence, exitCode: result.code,
   });
   return {
     ...outcome, durationMs: wallMs, wallMs, timedOut: false,

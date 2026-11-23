@@ -5297,6 +5297,18 @@ non-object and incomplete transcripts void the run for incomplete escape evidenc
 Successful fixtures supply realistic tool events and a successful terminal result;
 never relax the evidence rule to accommodate an empty fixture. Refused evidence
 requires a fresh run with a complete transcript before its answer can count.
+
+`review-promotion-audit.test.mjs` also drives native result parsers through the
+observed-model guard and the Carbon-to-Claude fallback. Claude evidence comes from
+an unambiguous `modelUsage` entry; missing, malformed or multiple entries retain WAIT.
+Codex deciding seats use the native text renderer's bounded startup model/session
+header, a clean exit, and the schema-constrained last-message file: CLI 0.162.1's
+JSON stream omits model identity. The adapter regression checks the actual argv,
+observed versus requested model, nonzero exit and timeout. Ephemeral isolation is
+retained. Text-mode transcripts preserve raw stdout/stderr as a diagnostic event;
+they supply no structured token, turn-count or tool-read evidence. Other Codex
+judge calls retain JSONL. Missing or changed headers require an adapter update;
+requested models and model-written answers never substitute for observation.
 ## Owed CI rerun execution
 
 The review daemon executes its planned `ci-timeout-rerun` rows independently of fixer seats.
