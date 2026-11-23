@@ -1,12 +1,16 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { SOAK_PRECHECK_ENV, soakPrecheckEnabled, soakPrecheckAtOpen } from '../soak-precheck-at-open.mjs';
 import { HOME_REASONS } from '../../operations/pr-land-reasons.mjs';
 
+vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
+
 const fix = {
+  refSha: 'a'.repeat(40),
   title: 'fix(daemon-rebuild): stop losing a passing candidate',
   body: 'Preserve the passing candidate.',
   files: [{ path: 'scripts/lib/daemon-rebuild.mjs', changeType: 'MODIFIED' }],
@@ -14,6 +18,14 @@ const fix = {
 };
 
 describe('soak precheck at PR open', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset().mockImplementation((cmd, args, options) => {
+      expect(cmd).toBe('git');
+      expect(args[0]).toBe('show');
+      expect(args[1]).toMatch(/^a{40}:/);
+      return readFileSync(join(options.cwd, args[1].slice(41)), 'utf8');
+    });
+  });
   const roots = [];
   afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
   const breakTest = 'scripts/conveyor/soak/breaks/new-untimed-break.soak.test.mjs';
@@ -27,6 +39,48 @@ describe('soak precheck at PR open', () => {
     return { repoRoot, sidecar };
   }
   const withTest = (changeType = 'ADDED') => [...fix.files, { path: breakTest, changeType }];
+
+  it.each([undefined, null, '', 'UNKNOWN', 'A', 'COPIED', 'ADDED\n'])('refuses unknown change type %s', changeType => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    const verdict = soakPrecheckAtOpen({ ...fix, repoRoot,
+      files: [{ path: breakTest, changeType }] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toContain('change type');
+  });
+  it.each([
+    '"scripts/conveyor/soak/breaks/\\303\\251.soak.test.mjs"',
+    '"scripts/conveyor/soak/breaks/a\\tname.soak.test.mjs"',
+    '"scripts/conveyor/soak/breaks/a\\"name.soak.test.mjs"',
+  ])('refuses Git-quoted path %s rather than skipping timing validation', path => {
+    const verdict = soakPrecheckAtOpen({ ...fix, title: 'test: coverage',
+      files: [{ path, changeType: 'ADDED' }] });
+    expect(verdict.ok).toBe(false);
+    expect(verdict.message).toContain('path');
+  });
+  it('refuses missing ref evidence even when the working sidecar is valid', () => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('missing at ref'); });
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: withTest() }).ok).toBe(false);
+  });
+  it.each([undefined, '', '--help', 'HEAD'])('refuses an unresolved ref sha %s', refSha => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, refSha, files: withTest() }).ok).toBe(false);
+    expect(execFileSync).not.toHaveBeenCalled();
+  });
+  it.each(['ENOBUFS', 'ETIMEDOUT'])('refuses a bounded Git read failure (%s) without falling back to the working copy', code => {
+    const { repoRoot } = fixture('{"seconds":1}');
+    vi.mocked(execFileSync).mockImplementation(() => { throw Object.assign(new Error('read limit'), { code }); });
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: withTest() }).ok).toBe(false);
+    expect(execFileSync).toHaveBeenCalledWith('git', ['show', `${fix.refSha}:${breakTest}.timing.json`],
+      expect.objectContaining({ cwd: repoRoot, timeout: 10_000, maxBuffer: 64 * 1024 }));
+  });
+  it.each([undefined, null, {}, [null], [{ path: '' }]])('refuses incomplete file metadata %j', files => {
+    expect(soakPrecheckAtOpen({ ...fix, title: 'test: coverage', files }).ok).toBe(false);
+  });
+  it('treats a bare path as added and requires its committed timing', () => {
+    const { repoRoot } = fixture();
+    expect(soakPrecheckAtOpen({ ...fix, repoRoot, files: [breakTest] }).ok).toBe(false);
+  });
 
   it.each(['ADDED', 'RENAMED'])('passes a daemon fix with a timed %s soak break and untimed unit test', (changeType) => {
     const { repoRoot } = fixture('{"seconds":0.25}');

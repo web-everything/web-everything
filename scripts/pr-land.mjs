@@ -950,12 +950,20 @@ async function runCli() {
     if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
     let files;
     try {
-      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]));
-    } catch (e) {
-      process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
-      return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
+      const diff = gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]);
+      // The shared parser defaults unknown statuses to MODIFIED and drops malformed rows.
+      // Admission cannot treat either as evidence that no test was added.
+      const rows = diff ? diff.split('\n') : [];
+      if (rows.some(row => !/^(?:[AMD]\t[^\t\n]+|[RC](?:100|[0-9]{1,2})\t[^\t\n]+\t[^\t\n]+)$/.test(row))) {
+        throw new Error('unknown or malformed name-status record');
+      }
+      files = parseNameStatus(diff);
+    } catch {
+      const reason = 'diff unavailable or invalid';
+      return { ok: false, reason,
+        message: `soak precheck: ${reason}. Fix: make the base and source commits available, resolve unsupported diff records, and retry.` };
     }
-    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, repoRoot: REPO });
+    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, refSha, repoRoot: REPO });
   }
 
   if (DRY_RUN) {
@@ -1094,7 +1102,7 @@ async function runCli() {
     if (!bodyGuard.ok) collect('body', bodyGuard.code, bodyGuard.reason);
     const soak = soakCreatePrecheck();
     if (!soak.ok) collect('soak-declaration', 'soak-declaration', soak.message);
-    if (!AS_JSON && !soak.skipped?.startsWith('diff unavailable')) {
+    if (!AS_JSON) {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: ${soak.skipped || soak.reason}\n`);
     }
   }

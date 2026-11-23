@@ -6410,6 +6410,12 @@ author owns the sidecar: measure the test when adding or renaming it, and refres
 measurement when its runtime changes. The scheduled refresh bot does not update these
 sidecars. Missing, unreadable, malformed or invalid sidecars refuse PR-open admission,
 including test-only PRs; a shared timing entry or soak waiver cannot replace them.
+Admission reads sidecars from the exact source commit (`git show <sha>:<path>`),
+so a valid working copy cannot mask missing or invalid committed evidence. Diff
+failures, unknown change types, and Git-quoted paths refuse admission; restore the
+base/source commits or supply canonical unquoted paths and retry. Sidecar reads are
+limited to 64 KiB and ten seconds; an oversized or stalled read refuses admission
+and requires correcting the sidecar or repository before retrying.
 The PR-open soak precheck also requires break coverage for daemon-scope bug fixes as
 before. The balance diagnostic still requires measurements for every file before
 claiming measured balance; it is not a PR admission requirement.

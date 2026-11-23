@@ -1,5 +1,4 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { evaluateSoakReplayGate } from './soak-replay-gate.mjs';
 
 export const SOAK_PRECHECK_ENV = 'WE_PR_OPEN_SOAK_PRECHECK';
@@ -9,21 +8,38 @@ export function soakPrecheckEnabled(env = process.env) {
 }
 
 // The bot-owned shared timing map is optional; per-test sidecars supply admission evidence.
-export function soakPrecheckAtOpen({ title, body, files, env, repoRoot = process.cwd() }) {
+export function soakPrecheckAtOpen({ title, body, files, env, refSha, repoRoot = process.cwd() }) {
   if (!soakPrecheckEnabled(env)) return { ok: true, skipped: 'disabled' };
   const gate = evaluateSoakReplayGate({ title, body, files });
+  const refuseMetadata = reason => ({ ok: false, applicable: gate.applicable, reason,
+    message: `soak precheck (${SOAK_PRECHECK_ENV}): ${reason}. Fix: supply a complete diff with canonical, unquoted paths and known change types, then retry.` });
+  if (!Array.isArray(files)) return refuseMetadata('unavailable file list');
   // Admission evidence belongs to the test, not the bot-owned shared sharding map.
   // Check all added/renamed soak tests, including test-only PRs and waived fixes.
-  for (const file of Array.isArray(files) ? files : []) {
+  for (const file of files) {
     const path = typeof file === 'string' ? file : file?.path;
-    if (typeof path !== 'string' || !path.startsWith('scripts/conveyor/soak/') || !path.endsWith('.soak.test.mjs')) continue;
-    if (typeof file !== 'string' && !/^(ADDED|RENAMED)$/i.test(file.changeType ?? '')) continue;
+    // Git's C-quoted paths must never fall through the prefix/suffix filter.
+    if (typeof path !== 'string' || path.startsWith('"') || /[\\\x00-\x1f\x7f]/.test(path) ||
+        path.split('/').some(part => !part || part === '.' || part === '..')) {
+      return refuseMetadata('invalid or Git-quoted file path');
+    }
+    const changeType = typeof file === 'string' ? 'ADDED'
+      : typeof file.changeType === 'string' ? file.changeType.toUpperCase() : '';
+    if (!['ADDED', 'RENAMED', 'MODIFIED', 'DELETED'].includes(changeType)) {
+      return refuseMetadata('unknown file change type');
+    }
+    if (!path.startsWith('scripts/conveyor/soak/') || !path.endsWith('.soak.test.mjs')) continue;
+    if (changeType === 'MODIFIED' || changeType === 'DELETED') continue;
     const sidecar = `${path}.timing.json`;
     try {
-      if (path.includes('\\') || path.split('/').some(part => !part || part === '.' || part === '..')) {
-        throw new Error('invalid soak test path');
+      if (typeof refSha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(refSha)) {
+        throw new Error('missing or invalid ref sha');
       }
-      const timing = JSON.parse(readFileSync(resolve(repoRoot, sidecar), 'utf8'));
+      // Read the immutable commit being published; uncommitted working files are not evidence.
+      const timing = JSON.parse(execFileSync('git', ['show', `${refSha}:${sidecar}`], {
+        cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000, maxBuffer: 64 * 1024,
+      }));
       if (!timing || typeof timing !== 'object' || Array.isArray(timing) ||
           Object.keys(timing).length !== 1 || !Object.hasOwn(timing, 'seconds') ||
           !Number.isFinite(timing.seconds) || timing.seconds <= 0) {

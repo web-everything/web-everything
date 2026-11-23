@@ -8,7 +8,8 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching', soakTiming } = {}) {
+  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching', soakTiming,
+  committedTiming = soakTiming, diffFailure = false, soakStatus = 'A', quotedPath = false, rawDiff } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -67,9 +68,15 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (args[0] === 'rev-parse') return args.includes('--absolute-git-dir') ? ${JSON.stringify(dir)} : ${JSON.stringify(sha)};
       if (args[0] === 'log') return 'fix: admission';
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
-      if (args[0] === 'diff') return args.includes('--name-status') ? ${JSON.stringify(soakTiming !== undefined ? `A\t${soakTest}` : 'M\tblocks/example.ts')} : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
+      if (args[0] === 'diff') {
+        if (args.includes('--name-status') && ${diffFailure}) throw new Error('diff failed');
+        return args.includes('--name-status') ? ${JSON.stringify(rawDiff ?? (soakTiming !== undefined ? `${soakStatus}\t${quotedPath ? `"${soakTest.replace('preflight', '\\303\\251')}"` : soakTest}` : 'M\tblocks/example.ts'))} : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
+      }
       if (args[0] === 'push') return '';
-      if (args[0] === 'show') throw new Error('no ready config');
+      if (args[0] === 'show') {
+        if (args[1] === ${JSON.stringify(`${sha}:${soakTest}.timing.json`)} && ${JSON.stringify(committedTiming != null)}) return ${JSON.stringify(committedTiming ?? '')};
+        throw new Error('missing at ref');
+      }
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
@@ -85,6 +92,51 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
 }
 
 describe('pr-land pre-push checkpoint', () => {
+  it.each([true, false])('refuses a failed diff before push/create, check=%s', check => {
+    const { status, result, effects } = run({ count: 0, check, diffFailure: true });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(result.detail).toContain('diff unavailable');
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it.each(['X', 'U', 'T'])('refuses unknown diff status %s before push/create', soakStatus => {
+    const { status, result, effects } = run({ count: 0, check: false, soakTiming: '{"seconds":1}', soakStatus });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it.each(['missing-tab', 'A\t', 'R100\told', 'M\tREADME.md\n\nA\tnew'])('refuses malformed diff %j before push/create', rawDiff => {
+    const { status, result, effects } = run({ count: 0, check: false, rawDiff });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it.each(['R100', 'C100'])('requires committed timing for the destination of a %s record', code => {
+    const rawDiff = `${code}\told.soak.test.mjs\tscripts/conveyor/soak/breaks/preflight.soak.test.mjs`;
+    const missing = run({ count: 0, check: false, rawDiff, soakTiming: '{"seconds":1}', committedTiming: null });
+    expect(missing.status).toBe(3);
+    expect(missing.result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(missing.effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+    expect(run({ count: 0, rawDiff, soakTiming: '{"seconds":1}' }).status).toBe(0);
+  });
+  it('refuses a Git-quoted Unicode test path before push/create', () => {
+    const { status, result, effects } = run({ count: 0, check: false, soakTiming: null, quotedPath: true });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it.each([null, '{', '{"seconds":0}'])('refuses missing/invalid committed timing %s despite a valid working copy', committedTiming => {
+    const { status, result, effects } = run({ count: 0, check: false, soakTiming: '{"seconds":1}', committedTiming });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it('accepts valid committed timing despite a corrupt working copy', () => {
+    const { status, result, effects } = run({ count: 0, soakTiming: '{', committedTiming: '{"seconds":1}' });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('check-ok');
+    expect(effects).toContainEqual(['git', ['show', `${'a'.repeat(40)}:scripts/conveyor/soak/breaks/preflight.soak.test.mjs.timing.json`]]);
+  });
   it.each([null, '{', '{"seconds":0}'])('real soak precheck refuses missing or invalid sidecar %s before push/create', soakTiming => {
     const { status, result, effects } = run({ count: 0, soakTiming });
     expect(status).toBe(3);
@@ -92,7 +144,7 @@ describe('pr-land pre-push checkpoint', () => {
     expect(result.detail).toContain('preflight.soak.test.mjs.timing.json');
     expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
   });
-  it('real soak precheck reads a valid sidecar from --repo when cwd is different', () => {
+  it('real soak precheck reads a valid sidecar from the ref in --repo when cwd is different', () => {
     const { status, result } = run({ count: 0, soakTiming: '{"seconds":0.25}' });
     expect(status).toBe(0);
     expect(result.reason).toBe('check-ok');
