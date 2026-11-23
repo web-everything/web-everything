@@ -382,7 +382,7 @@ describe('runner freshness policy', () => {
       expect(records).toEqual([]);
       expect(out.lines).toHaveLength(1);
       expect(JSON.parse(out.lines[0]).verdict).toEqual({ ok: false, code: 3, stdout: '',
-        stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' });
+        stderr: 'UNPARSEABLE audit (missing final message): incomplete or failed evidence; retry or request human review of the full diff.\n' });
     });
     it.each([
       ['NOT WEAKENED', [], 0],

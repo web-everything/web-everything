@@ -223,7 +223,7 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the registry built from the original repository metadata JSON', t => {
+test('migration preserves the original registry plus the intentional shadow rotation description', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
@@ -235,6 +235,7 @@ test('migration preserves the registry built from the original repository metada
       if (!Object.hasOwn(legacyMetadata[section], key)) legacyMetadata[section][key] = value;
     }
   }
+  legacyMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
   f.write(META, legacyMetadata);
   assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
 });
@@ -350,7 +351,7 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation for the original keys preserves bytes except the per-key authoring instruction', () => {
+test('generated documentation for the original keys matches the shadow rotation snapshot with per-key authoring instructions', () => {
   // The frozen digest covers the migration's original key set. New declarations
   // remain covered by the complete live registry/document equality test above.
   const registry = buildRegistry();
@@ -361,6 +362,7 @@ test('generated documentation for the original keys preserves bytes except the p
   });
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+  // Reconciled snapshot includes main's providerRotation defaults and description.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
