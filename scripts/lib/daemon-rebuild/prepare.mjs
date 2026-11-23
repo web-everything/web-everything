@@ -736,7 +736,7 @@ export async function prepareRebuild({
           run,
           stateOpts,
           now,
-          plan: m.adopt,
+          plan: { ...m.adopt, decisions: plan.decisions },
           prevHead,
           lease: { token: ready.token ?? null },
           onAdopted: m.dropRefs.length
