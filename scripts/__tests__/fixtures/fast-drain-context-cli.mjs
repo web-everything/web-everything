@@ -11,7 +11,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  snapshotState = 'fresh', mainChanged = false, lockLost = false, dryRun = true,
+  snapshotState = 'fresh', snapshotStates = {}, mainChanged = false, lockLost = false, dryRun = true,
   catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
@@ -29,14 +29,15 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
         statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }] };
     });
     for (const repo of ['fixture/web-everything', 'fixture/frontierui', 'fixture/plateau-app']) {
-      if (snapshotState === 'cold') continue;
-      writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`), JSON.stringify({ v: snapshotState === 'unsupported' ? -1 : PR_SNAPSHOT_VERSION,
-        repo, fetchedAtMs: Date.now() - (snapshotState === 'stale' ? 100000 : snapshotState === 'dirty-after-warm' ? 20000 : 0), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
+      const state = snapshotStates[repo] ?? snapshotState;
+      if (state === 'cold') continue;
+      const path = join(snapshots, `${repo.replace('/', '__')}.json`);
+      writeFileSync(path, JSON.stringify({ v: state === 'unsupported' ? -1 : PR_SNAPSHOT_VERSION,
+        repo, fetchedAtMs: Date.now() - (state === 'stale' ? 100000 : state === 'dirty-after-warm' ? 20000 : 0), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
         prs: repo === 'fixture/web-everything' ? rows : [] }));
+      if (state === 'corrupt') writeFileSync(path, '{');
+      if (state === 'unreadable') { rmSync(path); mkdirSync(path); }
     }
-    const localSnapshot = join(snapshots, 'fixture__web-everything.json');
-    if (snapshotState === 'corrupt') writeFileSync(localSnapshot, '{');
-    if (snapshotState === 'unreadable') { rmSync(localSnapshot); mkdirSync(localSnapshot); }
     if (snapshotState === 'dirty-after-warm') {
       const env = { WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots };
       const warmed = readSharedOpenPrs({ repo: 'fixture/web-everything', fields: SNAPSHOT_FIELDS, env,
@@ -153,6 +154,14 @@ out({});
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
+      // Fail closed on every command outside the fixture's known read-only transports.
+      mutationCalls: calls.filter(a => !(
+        a[0] === 'repo' && a[1] === 'view'
+        || a[0] === 'pr' && ['view', 'list'].includes(a[1])
+        || a[0] === 'api' && (!a.includes('--method') || a[a.indexOf('--method') + 1] === 'GET')
+          && (a[1] === 'graphql' ? a.some(v => v.startsWith('query=') && /^query=\s*(query\b|\{)/.test(v)) && !a.some(v => /\bmutation\b/.test(v))
+            : !a.some(v => ['-f', '-F', '--field', '--raw-field', '--input'].includes(v)))
+      )),
       bareCheckReads: existsSync(join(dir, 'calls.jsonl.bare-checks'))
         ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))

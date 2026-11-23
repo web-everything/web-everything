@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'nod
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
-import { SnapshotColdError, readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
+import { SnapshotColdError, readFastDrainContext, readFastDrainPassInventory, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
   fastDrainListingAfterBranches, validateLeanOpenPrs, listLeanOpenPrsPaged, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
 import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch, createLiveDefaultBranchReader } from '../lib/default-branch-cache.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-snapshot.mjs';
@@ -493,10 +493,45 @@ for (const snapshotState of ['cold', 'stale', 'dirty-after-warm']) {
     assert.deepEqual(JSON.parse(result.stdout), { ok: true, considered: 0, enqueueOutcomes: [
       { num: 7, repo: 'fixture/web-everything', outcome: 'not-enqueued', kind: 'snapshot-cold' },
     ] });
-    assert.equal(result.calls.some(a => a.some(v => /mutation|enqueuePullRequest/.test(v))
-      || a[0] === 'pr' && ['merge', 'edit', 'comment', 'close', 'review'].includes(a[1])
-      || a.includes('--method') && a[a.indexOf('--method') + 1] !== 'GET'), false);
+    assert.deepEqual(result.mutationCalls, []);
   });
+}
+
+test('catch-up cold first repo and corrupt second repo exits 1 instead of snapshot-cold', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 2, dryRun: false,
+    snapshotStates: { 'fixture/web-everything': 'cold', 'fixture/frontierui': 'corrupt' } });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /snapshot corrupt/);
+  assert.doesNotMatch(result.stdout, /snapshot-cold/);
+  assert.deepEqual(result.mutationCalls, []);
+});
+
+for (const pass of [false, true]) {
+  for (const reason of ['cold', 'stale', 'corrupt', 'unreadable', 'disabled', 'unsupported']) {
+    test(`${pass ? 'pass' : 'context'} reader visits every repo and arbitrates cold then ${reason}`, async () => {
+      const visited = [], repos = [repo, other, 'fixture/third'];
+      const failure = ['cold', 'stale'].includes(reason) ? new SnapshotColdError(reason) : new Error(`snapshot ${reason}`);
+      const options = { repos, targetRepo: repo, onlyPr: 7, failClosed: true, concurrency: 1,
+        readSnapshot: r => {
+          visited.push(r);
+          if (r === repo) throw new SnapshotColdError('cold');
+          if (r === other) throw failure;
+          return [];
+        },
+      };
+      const read = pass ? readFastDrainPassInventory({ ...options, path: 'unused', env: {},
+        read: () => { throw new Error('cache miss'); }, lock: async fn => ({ ok: true, value: await fn(() => true) }),
+        readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
+      }) : readFastDrainContext(options);
+      await assert.rejects(read, error => {
+        const cause = pass ? error : error.cause;
+        if (failure instanceof SnapshotColdError) assert.equal(cause.code, 'cold');
+        else assert.equal(cause, failure);
+        return true;
+      });
+      assert.deepEqual(visited, repos);
+    });
+  }
 }
 for (const [name, options, message] of [
   ['validation failure', { livePatches: { 7: { body: null } } }, /full PR evidence incomplete/],
@@ -514,7 +549,14 @@ test('fast-drain-context freshness logic stays unchanged outside error typing an
   const after = readFileSync('scripts/lib/fast-drain-context.mjs', 'utf8');
   const original = after.replace("export class SnapshotColdError extends Error {\n  constructor(reason) { super(`snapshot ${reason}`); this.code = reason; }\n}\n\n", '')
     .replace("  const failures = results.filter(r => Object.hasOwn(r, 'error')).map(r => r.error);\n  if (failures.length) throw failures.find(error => !(error instanceof SnapshotColdError)\n    || !['cold', 'stale'].includes(error.code)) ?? failures[0];",
-      "  const failed = results.find(r => Object.hasOwn(r, 'error'));\n  if (failed) throw failed.error;");
+      "  const failed = results.find(r => Object.hasOwn(r, 'error'));\n  if (failed) throw failed.error;")
+    .replace('const readSources = async () => new Map(await readFastDrainFacts(repos, concurrency, repo => {',
+      'const readSources = () => new Map(repos.map(repo => {')
+    .replace('    await readSources();', '    readSources();')
+    .replace('const loadInventory = async () => {', 'const loadInventory = () => {')
+    .replace('const snapshots = new Map(await readFastDrainFacts(repos, concurrency, repo => {',
+      'const snapshots = new Map(repos.map(repo => {')
+    .replace('else { base = await loadInventory();', 'else { base = loadInventory();');
   assert.equal(createHash('sha256').update(original).digest('hex'), 'ed03ea706e61bedca9426e33a4b8d5c9d94f92d64c2e2019f6a5cf3417bb5739');
 });
 

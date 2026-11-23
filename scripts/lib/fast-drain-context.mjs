@@ -158,7 +158,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return Number.isFinite(age) && age >= 0 && age < ttlSec * 1000;
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
-  const readSources = () => new Map(repos.map(repo => {
+  const readSources = async () => new Map(await readFastDrainFacts(repos, concurrency, repo => {
     const rows = readSnapshot(repo);
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
@@ -215,7 +215,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     const hit = cached();
     if (hit) return revalidateMembership(hit);
     const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    readSources();
+    await readSources();
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
@@ -283,9 +283,9 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
   readManifests = entries => readManifestEntries(entries, readManifest, concurrency),
   readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {} }) {
   try {
-    const loadInventory = () => {
+    const loadInventory = async () => {
       if (readInventory) return readInventory();
-      const snapshots = new Map(repos.map(repo => {
+      const snapshots = new Map(await readFastDrainFacts(repos, concurrency, repo => {
         const rows = readSnapshot(repo);
         if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty');
         return [repo, rows];
@@ -297,7 +297,7 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
     let base, target;
     if (readInventory) [base, target] = await readFastDrainFacts(
       [() => time('listing.inventory', loadInventory), readTarget], 2, read => read());
-    else { base = loadInventory(); target = await readTarget(); }
+    else { base = await loadInventory(); target = await readTarget(); }
     const { snapshots, inventories } = base;
     const liveReads = new Set([fastDrainPrKey(targetRepo, onlyPr)]);
     const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency, refreshPr }));
