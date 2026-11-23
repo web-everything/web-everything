@@ -1388,8 +1388,14 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
       { key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, blocked: 'planner-skip', blockedReason: reason },
     ]) });
     const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, strategyExtra: { readRedTeamQueueBlock } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
+    const outcome = h.s.enqueue({ num: 5283 }, HEAD);
+    expect(outcome).toMatchObject({ enqueued: false });
+    expect(JSON.stringify(outcome)).toContain(reason);
+    expect(JSON.stringify(Object.values(h.state()?.redTeamPending ?? {}))).toContain(reason);
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    // A null reader adds no annotation (negative case).
+    const none = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, strategyExtra: { readRedTeamQueueBlock: () => null } });
+    expect(JSON.stringify(none.s.enqueue({ num: 5283 }, HEAD))).not.toContain('planner blocked');
     // Past the deadline the operator is still notified exactly once; the block never suppresses escalation.
     const late = pastDeadline({ strategyExtra: { readRedTeamQueueBlock } });
     expect(late.h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
