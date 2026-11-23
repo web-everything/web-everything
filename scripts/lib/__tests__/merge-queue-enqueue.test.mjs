@@ -26,7 +26,9 @@ const nonStaleRuns = [
   ['no runs', []],
   ['older startup failure with newer success', [startupRun({ id: 124, conclusion: 'success' }), startupRun()]],
   ['other head', [startupRun({ head_sha: 'b'.repeat(40) })]],
-  ['other event', [startupRun({ event: 'pull_request' })]],
+  ['push event', [startupRun({ event: 'push' })]],
+  ['dispatch event', [startupRun({ event: 'workflow_dispatch' })]],
+  ['other event', [startupRun({ event: 'issues' })]],
 ];
 const unreadableRuns = [
   ['undefined', undefined], ['null', null], ['object', {}], ['string', 'bad JSON'],
@@ -37,6 +39,24 @@ const unreadableRuns = [
 ];
 
 describe('classifyStartupFailureGate', () => {
+  it('accepts pull_request startup failures', () => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ event: 'pull_request' })] }))
+      .toMatchObject({ stale: true, runId: 123 });
+  });
+  it.each([false, true])('new pull_request success supersedes old target startup failure (reverse order %s)', reverse => {
+    const runs = [startupRun({ id: 100 }), startupRun({ id: 200, event: 'pull_request', conclusion: 'success' })];
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: reverse ? runs.reverse() : runs }))
+      .toMatchObject({ stale: false });
+  });
+  it.each([false, true])('new pull_request startup failure supersedes old target success (reverse order %s)', reverse => {
+    const runs = [startupRun({ id: 100, conclusion: 'success' }), startupRun({ id: 200, event: 'pull_request' })];
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: reverse ? runs.reverse() : runs }))
+      .toMatchObject({ stale: true, runId: 200 });
+  });
+  it.each(['push', 'workflow_dispatch', 'issues'])('ignores a newer %s success when a PR startup failure exists', event => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), startupRun({ id: 200, event, conclusion: 'success' })] }))
+      .toMatchObject({ stale: true, runId: 123 });
+  });
   it('selects the highest integer id regardless of input order, name, or path', () => {
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ id: 122, conclusion: 'success' }), startupRun(), startupRun({ id: 121 })] }))
       .toEqual({ stale: true, runId: 123, reason: 'newest Merge gate workflow run 123 ended startup_failure' });
@@ -404,7 +424,7 @@ describe('startup-failure stale merge-gate refresh', () => {
     const o = options({ readGateRuns: undefined });
     expect((await handleStaleMergeGate(o)).handled).toBe(true);
     expect(execFileSyncThrottled).toHaveBeenCalledTimes(1);
-    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`],
+    expect(execFileSyncThrottled).toHaveBeenCalledWith('gh', ['api', `repos/o/r/actions/runs?head_sha=${HEAD}&per_page=100`],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 });
   });
   it('ignores other workflows\' runs and path-less runs when picking the newest Merge gate run', () => {
@@ -878,7 +898,7 @@ describe('the "merge-gate is expected" enqueue refusal routes to the VERIFIED st
     try {
       expect(await handleRequiredWorkflowsRefusal(o)).toMatchObject({ handled: true });
       expect(transport).toHaveBeenLastCalledWith('gh', ['api',
-        `repos/${slug}/actions/runs?head_sha=${HEAD}&event=pull_request_target&per_page=100`], expect.any(Object));
+        `repos/${slug}/actions/runs?head_sha=${HEAD}&per_page=100`], expect.any(Object));
       expect(o.refreshStalePr).toHaveBeenCalledWith(expect.objectContaining({ repo: slug, runId: 123 }));
       expect(o.record).toHaveBeenCalledWith(o.staleStatePath, `${slug}#6940`, expect.objectContaining({ fromHead: HEAD }));
       // An explicit slug on the next pass must share the local alias's atomic claim.

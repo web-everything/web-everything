@@ -4,7 +4,7 @@
 # (reuses the drain's own pure functions). Gate list + where each gate lives: scripts/lib/merge-gate-inventory.mjs
 # (a test fails when the drain gains a gate this check does not account for).
 #
-# Runs on `pull_request_target` (so a PR can be added to the queue) and on `merge_group` (each PR in the group is
+# Runs on `pull_request` (so a PR can be added to the queue) and on `merge_group` (each PR in the group is
 # re-evaluated against the group's commit right before GitHub merges it). `workflow_dispatch` is the dry run.
 #
 # SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter the
@@ -12,15 +12,19 @@
 # git read is pinned to the PR's exact head SHA (the event's `pull_request.head.sha`, or for `merge_group` each PR's
 # sha inside the group commit) — never the branch name; an unfetchable sha or a head that moved fails closed.
 # No secret is exposed: the job has only the read-scoped GITHUB_TOKEN and never executes PR code.
-# WHY `pull_request_target`, NOT `pull_request` (PR #4708 round 6): for `pull_request` GitHub reads the workflow
-# file from the PR's merge ref, so a PR could edit THIS file to `exit 0` and turn its own required check green.
-# For `pull_request_target` GitHub reads the YAML from the base branch (main). Its usual danger — running PR code
-# with a write token — does not apply: the job checks out `ref: main`, never the PR ref, never runs PR code, and the
-# token is read-only (`permissions` below). A fork head is refused (pinnedHeadOf).
-# WHAT IS STILL NOT PINNED BY THIS FILE: for `merge_group`, GitHub reads this workflow YAML from the group commit,
-# which contains the PR's edits. Four layers, outermost first:
-#   (1) HUMAN-ONLY WORKFLOW EDITS IN THE PR RUN: the PR-leg run (main's YAML + main's scripts) holds, for a HUMAN,
-#       any PR whose change list at the pinned head (git, both sides of a rename) touches .github/workflows/** or
+# WHY `pull_request`, NOT `pull_request_target` (PRT-MIGRATE): GitHub blocks pull_request_target by default
+# for public repos from Dec 2; trial blocks ended our runs in startup_failure on Nov 9 and Nov 16.
+# The cost: GitHub reads the workflow file from the PR's merge ref for `pull_request`, so a PR can edit THIS
+# file to `exit 0`. The org ruleset pins merge-gate.yml to refs/heads/main so the required check runs main's YAML;
+# the `merge-gate` check comes from integration 15368 only. Together with the human-only workflow-edit hold in
+# the PR run, the enqueue refusal, and the self-check verifyRunningWorkflow, these are the four protections.
+# The new first guard step fails closed on a fork head or an unset MERGE_GATE_MODE. A skipped job would count
+# as passing, so this is a step, not an `if:`. Scripts still come from main and the token stays read-only.
+# For `merge_group`, GitHub also reads the workflow YAML from the group commit unless the ruleset pins it.
+# The four layers in detail:
+#   (1) HUMAN-ONLY WORKFLOW EDITS IN THE PR RUN: the `pull_request` leg (main's YAML via the ruleset + main's scripts)
+#       holds, for a HUMAN, any PR whose change list at the pinned head (git, both sides of a rename) touches
+#       .github/workflows/** or
 #       .github/actions/**, unless a clear-human ceremony reviewed that exact sha (workflowEditFact in
 #       scripts/lib/merge-gate-ci.mjs). An AI-reviewable escalation cannot clear it. Since a PR must pass its
 #       required checks before GitHub lets it into the queue, a PR that edits a workflow never reaches a merge_group
@@ -62,14 +66,14 @@
 # <rules>" to the step summary, and exits 0; it changes only the exit code, never a verdict, and never masks a run
 # with no verdict. Shadow until the shared red-main freeze source lands (#4715 flips the repo setting to enforce).
 # The ruleset step (making `merge-gate` required) needs enforce.
-# TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge, gate:refresh — a neutral label the drain toggles after an acceptance restamp so the gate re-reads the thread,
+# TRIGGERS: `pull_request` head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge, gate:refresh — a neutral label the drain toggles after an acceptance restamp so the gate re-reads the thread,
 # review:*). Any other label event is skipped under a DIFFERENT job name (a skipped job counts as passing for a
 # required check, so it must never post as `merge-gate`) and in its own concurrency group (it never cancels a real
 # run). Body edits do not re-run the PR leg; the merge_group run re-evaluates everything before GitHub merges.
 name: Merge gate
 
 on:
-  pull_request_target:
+  pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
   merge_group:
@@ -93,7 +97,7 @@ permissions:
   actions: read # readMainCiFact (scripts/merge-gate-check.mjs) lists main's CI runs with `gh run list`
 
 concurrency:
-  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  group: merge-gate-${{ github.workflow_ref }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -103,6 +107,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: "Guard: refuse fork heads and an unset mode"
+        env:
+          MODE: ${{ vars.MERGE_GATE_MODE }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$MODE" ]; then
+            echo "::error::merge-gate: MERGE_GATE_MODE is unset — failing closed." >&2
+            exit 1
+          fi
+          if [ "$EVENT" = "pull_request" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "::error::merge-gate: fork head or missing head repository — failing closed." >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -121,7 +141,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          # no `cache:` — a pull_request_target run must not write the base branch's cache scope
+          # no `cache:` — a pull_request run must not write the base cache scope in a way a PR controls
 
       - name: Install
         run: npm ci --ignore-scripts

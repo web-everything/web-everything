@@ -860,24 +860,67 @@ describe('merge-gate workflow structure', () => {
     expect(wf.permissions).toMatchObject({ checks: 'read', statuses: 'read' });
   });
 
-  it('runs on pull_request_target, merge_group and workflow_dispatch', () => {
-    expect(Object.keys(triggersOf(wf))).toEqual(expect.arrayContaining(['pull_request_target', 'merge_group', 'workflow_dispatch']));
+  it('runs exactly on pull_request, merge_group and workflow_dispatch', () => {
+    expect(Object.keys(triggersOf(wf)).sort()).toEqual(['merge_group', 'pull_request', 'workflow_dispatch']);
+    expect(triggersOf(wf).pull_request?.branches).toEqual(['main']);
   });
 
-  // PR #4708 round 6 (ruled block): for `pull_request` GitHub reads the YAML from the PR merge ref, so a PR could
-  // edit this file to `exit 0`. `pull_request_target` reads it from main. Its classic danger (PR code + write
-  // token) is pinned out: main checkout, read-only token, no cache write.
-  it('never runs on `pull_request` (whose YAML the PR controls), and the pull_request_target leg stays read-only on main', () => {
-    expect(Object.keys(triggersOf(wf))).not.toContain('pull_request');
-    expect(triggersOf(wf).pull_request_target.branches).toEqual(['main']);
-    for (const [scope, level] of Object.entries(wf.permissions)) expect(level, scope).toBe('read');
+  it('keeps the PR leg read-only on main with no secrets or SHA fallback', () => {
+    expect(wf.permissions).toEqual({ contents: 'read', 'pull-requests': 'read', checks: 'read', statuses: 'read', actions: 'read' });
     expect(job.permissions).toBeUndefined();
     for (const step of job.steps) {
       if (/actions\/checkout/.test(step.uses || '')) expect(step.with?.ref, 'checkout must be main').toBe('main');
-      if (/actions\/setup-node/.test(step.uses || '')) expect(step.with?.cache, 'no cache write from pull_request_target').toBeUndefined();
+      if (/actions\/setup-node/.test(step.uses || '')) expect(step.with?.cache, 'no cache write').toBeUndefined();
       expect(String(step.run || ''), 'no PR code is executed').not.toMatch(/github\.event\.pull_request\.head\.(ref|sha)\s*}}\s*$|checkout[^\n]*PR_HEAD/m);
     }
-    expect(JSON.stringify(wf)).not.toMatch(/secrets\./);
+    const text = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8');
+    expect(text).not.toMatch(/secrets\./);
+    // The explanatory header must name the retired event; the workflow body must not.
+    expect(text.split('\nname:')[1]).not.toContain('pull_request_target');
+    expect(evaluate.env.PR_HEAD_SHA).toBe('${{ github.event.pull_request.head.sha }}');
+    expect(text).not.toMatch(/github\.sha|GITHUB_SHA/);
+  });
+
+  it('places an unconditional run guard first, before checkout or any other run step', () => {
+    const guard = job.steps[0];
+    expect(guard.run, 'first step must be the pre-checkout guard').toEqual(expect.any(String));
+    expect(guard).toBe(job.steps.find(step => typeof step.run === 'string'));
+    expect(guard.uses).toBeUndefined();
+    expect(guard.if).toBeUndefined();
+    expect(guard.env).toMatchObject({
+      MODE: '${{ vars.MERGE_GATE_MODE }}', EVENT: '${{ github.event_name }}',
+      HEAD_REPO: '${{ github.event.pull_request.head.repo.full_name }}', REPO: '${{ github.repository }}',
+    });
+    expect(guard.run).not.toContain('${{');
+  });
+
+  it.each([
+    ['empty mode on same-repo PR', '', 'pull_request', 'o/r', 1],
+    ['empty mode on merge group', '', 'merge_group', '', 1],
+    ['empty mode on dispatch', '', 'workflow_dispatch', '', 1],
+    ['fork PR', 'enforce', 'pull_request', 'fork/r', 1],
+    ['missing PR head repository', 'enforce', 'pull_request', '', 1],
+    ['same-repo PR', 'enforce', 'pull_request', 'o/r', 0],
+    ['merge group', 'enforce', 'merge_group', '', 0],
+    ['manual dispatch', 'enforce', 'workflow_dispatch', '', 0],
+  ])('executes the pre-checkout guard: %s', (_name, MODE, EVENT, HEAD_REPO, expected) => {
+    const guard = job.steps[0];
+    expect(guard.run, 'missing pre-checkout guard script').toEqual(expect.any(String));
+    const proc = spawnSync('bash', ['-e', '-c', guard.run], {
+      env: { PATH: process.env.PATH, MODE, EVENT, HEAD_REPO, REPO: 'o/r' }, encoding: 'utf8', timeout: 5000,
+    });
+    expect(proc.error).toBeUndefined();
+    expect(proc.status, proc.stderr).toBe(expected);
+  });
+
+  it('isolates ruleset-pinned and PR-merge-ref concurrency groups for the same PR', () => {
+    const group = wf.concurrency.group;
+    expect(group).toContain('${{ github.workflow_ref }}');
+    const render = workflowRef => group.replaceAll('${{ github.workflow_ref }}', workflowRef)
+      .replace(/\$\{\{[\s\S]*?\}\}/g, '7');
+    expect(render('o/r/.github/workflows/merge-gate.yml@refs/heads/main'))
+      .not.toBe(render('o/r/.github/workflows/merge-gate.yml@refs/pull/7/merge'));
+    expect(wf.concurrency['cancel-in-progress']).toBe(true);
   });
 
   it('checks out main, never the PR ref, before running the scripts', () => {
@@ -898,13 +941,14 @@ describe('merge-gate workflow structure', () => {
     }
   });
 
-  it('does not claim the YAML itself is pinned to main (only the scripts are)', () => {
+  it('explains WHY pull_request, not pull_request_target, and the protections for PR-sourced YAML', () => {
     const header = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8').split('\nname:')[0];
-    expect(header).not.toMatch(/cannot neuter its\s+own gate/i);
-    expect(header).toMatch(/not pinned[^\n]*workflow YAML/i);
-    expect(header).toMatch(/workflow\s*(?:#\s*)?file from the PR's merge ref/i);
-    expect(header).toMatch(/pull_request_target[^\n]*reads the YAML from the base branch/i);
-    expect(header).toMatch(/from the group commit/i);
+    expect(header).toMatch(/WHY\s+`?pull_request`?,\s*not\s+`?pull_request_target`?/i);
+    expect(header).toMatch(/pull_request_target[^\n]*(blocked|retired|default)/i);
+    expect(header).toMatch(/(?:YAML|workflow\s*(?:#\s*)?file)[^\n]*from the PR(?:'s)? merge ref/i);
+    expect(header).toMatch(/(?:org|organization)[^\n]*ruleset/i);
+    expect(header).toMatch(/ruleset[^\n]*pin/i);
+    expect(header).toMatch(/human.only[\s\S]*workflow[\s\S]*hold/i);
   });
 
   it('names the ruleset required-workflow pin as the defence for the unpinned YAML, not only escalation', () => {
@@ -1500,7 +1544,7 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
   });
 
   it('runs on head changes and label changes only (no edited / ready_for_review)', () => {
-    expect(triggersOf(wf).pull_request_target.types).toEqual(['opened', 'synchronize', 'reopened', 'labeled', 'unlabeled']);
+    expect(triggersOf(wf).pull_request?.types).toEqual(['opened', 'synchronize', 'reopened', 'labeled', 'unlabeled']);
     expect(Object.keys(triggersOf(wf))).toContain('merge_group');
   });
 
@@ -1512,6 +1556,6 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
 
   it('one live run per PR, superseded runs cancelled, and an unwatched-label run can never cancel a real one', () => {
     expect(wf.concurrency['cancel-in-progress']).toBe(true);
-    expect(wf.concurrency.group).toBe(`merge-gate-\${{ ${UNWATCHED} && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}`);
+    expect(wf.concurrency.group).toBe(`merge-gate-\${{ github.workflow_ref }}-\${{ ${UNWATCHED} && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}`);
   });
 });

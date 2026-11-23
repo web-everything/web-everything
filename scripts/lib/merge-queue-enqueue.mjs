@@ -482,7 +482,8 @@ export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMerg
   return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
 }
 
-/** Pure: the workflow endpoint scopes these runs to Merge gate; never infer freshness from a check-run. */
+/** Pure: select the newest Merge gate PR run across pull_request and historical pull_request_target runs.
+ * Other events are ignored; never infer freshness from a check-run. */
 export function classifyStartupFailureGate({ runs, headSha } = {}) {
   const no = reason => ({ stale: false, reason });
   if (!Array.isArray(runs) || typeof headSha !== 'string' || !headSha.trim()) return no('workflow runs or head unreadable');
@@ -490,7 +491,7 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
   for (const run of runs) {
     if (!run || typeof run !== 'object' || Array.isArray(run)) return no('workflow run unreadable');
     if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
-    if (run.head_sha !== headSha || run.event !== 'pull_request_target') continue;
+    if (run.head_sha !== headSha || (run.event !== 'pull_request' && run.event !== 'pull_request_target')) continue;
     if (typeof run.path !== 'string') return no('workflow run path unreadable');
     if (run.path.split('@')[0] !== '.github/workflows/merge-gate.yml') continue;
     if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
@@ -503,10 +504,11 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
     : no('newest Merge gate workflow run did not end startup_failure');
 }
 
-// The per-workflow endpoint lists no startup_failure runs; the repo-wide one does, so filter by path in the classifier.
+// The per-workflow endpoint lists no startup_failure runs; use the repo-wide one across both PR events,
+// then filter by event and path in the classifier. Require a complete list before classifying.
 function readMergeGateRuns({ repo, headSha }) {
   const out = JSON.parse(execFileSyncThrottled('gh', ['api',
-    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&event=pull_request_target&per_page=100`],
+    `repos/${repo}/actions/runs?head_sha=${encodeURIComponent(headSha)}&per_page=100`],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 2 * 1024 * 1024, timeout: 30_000 }));
   if (!Array.isArray(out?.workflow_runs) || !Number.isSafeInteger(out.total_count) || out.total_count !== out.workflow_runs.length) throw new Error('workflow run list incomplete or unreadable');
   return out.workflow_runs;
