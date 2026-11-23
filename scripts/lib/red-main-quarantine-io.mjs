@@ -28,6 +28,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { resolveOrchestratorAuthority } from './orchestrator-authority-settings.mjs';
+import { parseTimeouts, timeoutOutcomes, allSoft, softRecord } from './test-timeout-policy.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -277,7 +278,7 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 export function readJobFailures(jobId, { exec, repoSlug }) {
   // gh refuses a log with terminal escape sequences unless allowed (2026-11-22: every soak-shard read threw, so the net never acted).
   const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
-  return parseVitestFailures(String(text ?? ''));
+  return { ...parseVitestFailures(String(text ?? '')), timeouts: parseTimeouts(text) };
 }
 
 /**
@@ -324,6 +325,7 @@ const composeChanges = (steps) => (cur) => {
 export function runSafetyNet({
   mainCiRuns, now = Date.now(), dir, board = process.cwd(), live = true, repoSlug = CONSTELLATION_REPOS.we.slug,
   mode = resolveRedMainMode(), settings = resolveQuarantineSettings(),
+  timeoutPolicy = readJson(join(dirname(fileURLToPath(import.meta.url)), '../settings/test-timeout-policy.json')) ?? {},
   exec = execFileSyncThrottled, readJobs = (runId, options = {}) => readFailedJobs(runId, { exec, repoSlug, ...options }),
   readLog = (jobId) => readJobFailures(jobId, { exec, repoSlug }),
   touchedFiles = (fromSha, toSha) => readTouchedFiles(fromSha, toSha, { board }),
@@ -336,12 +338,15 @@ export function runSafetyNet({
   const shadowPath = join(dir, SAFETY_NET_SHADOW_LOG);
   const ledger = readJson(ledgerPath) ?? { version: 1, reds: {}, shadowList: { version: 1, entries: [] } };
   ledger.reds ??= {};
+  ledger.tests ??= {};
   const isLive = mode.value === 'quarantine' && live === true;
   const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false, liveEntries: [] };
   let sha = null;
   let activeKey = null;
   let shadowChanged = false;
+  let listEmpty = true;
+  let timeoutAlerts = [];
   try {
     // Successful reruns have no failed-job snapshot: count the observed successful attempt too.
     for (const red of Object.values(ledger.reds)) {
@@ -412,6 +417,7 @@ export function runSafetyNet({
     }
     let read = { ok: true, list: ledger.shadowList ?? { version: 1, entries: [] } };
     if (isLive) read = readList();
+    if (read.ok) listEmpty = activeEntries(read.list, { now }).length === 0;
     if (!read.ok) { out.plan = { action: 'none', why: `quarantine list unreadable (${read.error})` }; return out; }
     // An entry on the shared list that was added for this red counts as "added for this red" whether or not this
     // ledger recorded it (a push that landed but threw, a lost ledger): it must not be re-added once it expires.
@@ -424,8 +430,11 @@ export function runSafetyNet({
       else if (ledger.publishedMode !== 'quarantine') { ledger.publishedMode = 'stop'; ledger.publishedModeAt = now; }
     }
     if (isLive && read.list?.mode === 'quarantine') out.liveEntries = activeEntries(read.list, { now });
-    const flakeProof = settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
-    let repeatRuns = settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
+    timeoutAlerts = Object.entries(jobFailures).flatMap(([job, f]) => timeoutOutcomes(f, timeoutPolicy, job)).filter(o => o.class === 'unconfigured');
+    const softOnly = Array.isArray(failedJobs) && failedJobs.filter(j => new RegExp(settings.value.unitJobPattern).test(j)).length > 0
+      && failedJobs.filter(j => new RegExp(settings.value.unitJobPattern).test(j)).every(j => allSoft(jobFailures[j], timeoutOutcomes(jobFailures[j], timeoutPolicy, j)));
+    const flakeProof = !softOnly && settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
+    let repeatRuns = !softOnly && settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
       ? readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings: settings.value }) : [];
     const failingRun = mainCiRuns?.runs?.find((r) => r?.databaseId === mainCiRuns?.failing?.runId);
     const attempt = failingRun?.attempt === undefined ? 1 : failingRun.attempt;
@@ -466,9 +475,16 @@ export function runSafetyNet({
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
       status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, repeatRuns, latestRunId: mainCiRuns?.failing?.runId, latestAttempt: attempt, touchedFiles, list: read.list, fixPrs,
-      addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
+      addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value, timeoutPolicy,
     });
     out.plan = plan;
+    const softHistory = {};
+    for (const entry of plan.entries ?? []) if (entry.timeouts) {
+      entry.timeout = softRecord(entry, { history: softHistory[entry.test] ?? ledger.tests[entry.test]?.softQuarantines, now, run: mainCiRuns?.failing?.runId, head: failingRun?.headSha ?? sha });
+      softHistory[entry.test] = [...(softHistory[entry.test] ?? ledger.tests[entry.test]?.softQuarantines ?? []), entry.timeout];
+      const card = plan.cards.find(c => c.test === entry.test);
+      if (card) Object.assign(card, { priority: entry.timeout.priority, ref: `${entry.timeout.id}:fix-card`, title: card.title.replace('flaky test', 'soft timeout') });
+    }
     const steps = [];
     const ttlMs = settings.value.ttlMin * 60_000;
     if (plan.action === 'add') {
@@ -476,7 +492,14 @@ export function runSafetyNet({
         // Recheck the cap against the transport's fresh tip.
         const liveFiles = activeEntries(cur, { now }).map((e) => e.test.split('::')[0]);
         if (new Set([...liveFiles, ...plan.tests]).size > settings.value.maxTests) return { ok: false, error: `quarantine cap ${settings.value.maxTests} reached` };
-        const changes = plan.entries.map(({ test, job, proof }) => (list) => addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR, reason: `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs }));
+        const changes = plan.entries.map(({ test, job, proof, timeout }) => (list) => {
+          const r = addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR,
+            reason: timeout ? JSON.stringify(timeout.outcomes) : `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs });
+          if (r.ok && timeout && r.events.length) {
+            for (const e of [...r.list.entries, ...r.events]) if (e.test === test && e.job === job) Object.assign(e, { timeout, release: timeout.release, note: timeout.note });
+          }
+          return r;
+        });
         const result = composeChanges(changes)(cur);
         if (result.ok && isLive) {
           const added = new Set(result.events.filter((e) => e.type === 'quarantine-added').map((e) => e.test));
@@ -542,6 +565,11 @@ export function runSafetyNet({
       out.events = r.events;
       shadowChanged = true;
     }
+    if (out.applied) for (const entry of plan.entries ?? []) if (entry.timeout && out.events.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type))) {
+      const test = ledger.tests[entry.test] ??= { softQuarantines: [] };
+      test.softQuarantines ??= [];
+      if (!test.softQuarantines.some(e => e.id === entry.timeout.id)) test.softQuarantines.push(entry.timeout);
+    }
     // Live and shadow additions are tracked apart: a shadow "would add" must not block the first real add after a
     // stop → quarantine flip within the same red window.
     if (plan.action === 'add' && rec) {
@@ -554,6 +582,19 @@ export function runSafetyNet({
     return out;
   } finally {
     const rec = ledger.reds[activeKey];
+    const emit = (output) => {
+      const line = { at: now, shadow: !isLive, ...output };
+      mkdirSync(dirname(shadowPath), { recursive: true });
+      appendFileSync(shadowPath, JSON.stringify(line) + '\n');
+      log(`red-main-quarantine: ${JSON.stringify(line)}`);
+    };
+    try {
+      for (const entry of out.plan?.entries ?? []) if (entry.timeout && (!isLive || out.applied && out.events.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type)))) {
+        for (const output of entry.timeout.outputs) emit({ ...output, test: entry.test, outcomes: entry.timeout.outcomes });
+      }
+      for (const outcome of timeoutAlerts) if (!listEmpty) emit({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome });
+      if (state.status === 'red' && listEmpty && !out.applied) emit({ type: 'alert', ref: `red-main:${sha}`, why: out.error ?? out.plan?.why ?? 'no action; quarantine list empty' });
+    } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     if (!isLive && out.plan && (shadowChanged || (state.status === 'red' && rec && rec.shadowWhy !== out.plan.why))) {
       const plan = out.plan;
       const line = { at: new Date(now).toISOString(), mode: mode.value, modeSource: mode.source, wouldDo: plan.action, tests: plan.tests ?? [], entries: plan.entries ?? [], cards: plan.cards ?? [], names: plan.names ?? [], fixPrs: plan.fixPrs ?? null, firstRedSha: sha, why: plan.why, settingsSources: settings.sources ?? {} };

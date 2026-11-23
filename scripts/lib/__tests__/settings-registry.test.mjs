@@ -352,3 +352,11 @@ test('generated documentation matches the shadow rotation snapshot with per-key 
   assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
+});
