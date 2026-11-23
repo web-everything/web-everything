@@ -73,6 +73,14 @@ const MAX_STOPS_OVERRIDE = '5';
  *  bound. The red path costs at most the bound (the harness IPC timeout aborts the tick). */
 const TICK_BOUND_MS = 18_000;
 const BASELINE_MULTIPLE = 2.5;
+/** Independent ceiling on the runner-relative bound: even a very slow baseline can never raise the acceptance
+ *  threshold past this, and it stays below the ~87s+ the unbounded 1,500-stop reap costs on its own. */
+const TICK_BOUND_CEILING_MS = 60_000;
+
+/** Seeded backlog sessions `claude stop` has ended (never unrelated dispatched sessions). */
+function countStoppedBacklog(w) {
+  return w.claude.sessions().filter((s) => String(s.id).startsWith('oldsess') && s.state === 'stopped').length;
+}
 
 export default {
   id: 'large-reap-backlog-starves-dispatch',
@@ -99,8 +107,13 @@ export default {
       bounds: { tickBoundMs: 120_000, owedGraceTicks: 0 },
       log,
     });
-    const floorMs = Number(baseline.ticks?.[0]?.ms) || 0;
-    const tickBoundMs = Math.max(TICK_BOUND_MS, Math.ceil(BASELINE_MULTIPLE * floorMs));
+    const floorMs = Number(baseline.ticks?.[0]?.ms);
+    reapStats.baselineProblems = [
+      ...baseline.violations.map((v) => `[${v.invariant}] ${v.detail}`),
+      ...(baseline.fatal ? [`fatal: ${baseline.fatal}`] : []),
+      ...(Number.isFinite(floorMs) && floorMs > 0 ? [] : ['no baseline tick timing']),
+    ];
+    const tickBoundMs = Math.min(TICK_BOUND_CEILING_MS, Math.max(TICK_BOUND_MS, Math.ceil(BASELINE_MULTIPLE * (floorMs || 0))));
     reapStats.tickBoundMs = tickBoundMs;
     const report = await runSoak({
       name: 'break:large-reap-backlog-starves-dispatch',
@@ -114,7 +127,7 @@ export default {
       perRound(w, round) {
         // Cumulative count of ALL sessions in the fake store that `claude stop` has ended, observed at the start
         // of every round (= after the previous round's tick); the judge turns it into a per-tick stop count.
-        reapStats.stoppedBeforeTick[round] = w.claude.sessions().filter((s) => s.state === 'stopped').length;
+        reapStats.stoppedBeforeTick[round] = countStoppedBacklog(w);
       },
       setup(w) {
         // Seeded BEFORE the review daemon's very first tick — the live incident's own shape: the whole
@@ -123,7 +136,7 @@ export default {
           for (let i = 0; i < BACKLOG_SIZE; i += 1) {
             store.sessions.push({
               id: `oldsess${i}`, sessionId: `oldsess${i}-0000-0000-0000-000000000000`,
-              name: `review-old-${i}`, kind: 'background', state: 'done', cwd: w.simCloneRoot,
+              name: `stale-finished-${i}`, kind: 'background', state: 'done', cwd: w.simCloneRoot,
               startedAt: new Date(Date.now() - 86_400_000).toISOString(),
             });
           }
@@ -140,6 +153,7 @@ export default {
     // itself is asserted by COUNT, every tick, so the scenario can never pass by skipping the reap or by
     // exceeding the per-tick budget.
     if (report.fatal) found.push(`[fatal] ${report.fatal}`);
+    for (const problem of report.reapStats?.baselineProblems ?? ['baseline not run']) found.push(`[baseline] ${problem}`);
     if (!report.ticks || report.ticks.length < 3) found.push(`[ticks] only ${report.ticks?.length ?? 0} of 3 review ticks completed`);
     const cap = Number(MAX_STOPS_OVERRIDE);
     const at = report.reapStats?.stoppedBeforeTick ?? {};
@@ -152,7 +166,8 @@ export default {
       stops.push(at[r] - (r === 1 ? 0 : at[r - 1] ?? 0));
     }
     stops.forEach((n, k) => {
-      if (k === 0 && n < 1) found.push('[reap] the first tick reaped none of the backlog — the budgeted reap did not run');
+      // The backlog (1,500) far exceeds 3 ticks x the cap, so every tick must keep reaping up to its budget.
+      if (n < 1) found.push(`[reap] tick ${k} reaped none of the backlog — the budgeted reap did not run`);
       if (n > cap) found.push(`[reap] tick ${k} stopped ${n} sessions, over the per-tick cap of ${cap}`);
     });
     return found;
