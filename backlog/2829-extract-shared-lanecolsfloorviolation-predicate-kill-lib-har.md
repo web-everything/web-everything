@@ -4,12 +4,9 @@ kind: story
 size: 2
 tier: pinned
 parent: "2804"
-status: parked
-parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: #2811 is unparked (shared floor predicate)."
-dateParked: "2026-11-22"
+status: open
 dateOpened: "2026-08-02"
-blockedBy: ["2810"]
+blockedBy: ["2810", "2811"]
 scope:
   - plateau-app:scripts/dev/fidelity-render.mjs
   - plateau-app:tests/visual/geometry-theme.ts
@@ -194,4 +191,4 @@ Introspection capture from the independent review of plateau-app PR #133 (the #2
 a live defect — a DRY hazard surfaced while the reviewer traced why the lib and the harness both own a
 `grid-collapsed` code path. Filed so the third shared predicate lands the same way the first two did.
 
-Parked 2026-11-22 (plateau ruling, master plan). Unpark when: #2811 is unparked (shared floor predicate).
+Ruled PARK in the master plan (2026-11-22); kept open with blockedBy #2811 instead, so it re-enters readiness when #2811 resolves.
