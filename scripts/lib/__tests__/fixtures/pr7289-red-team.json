@@ -1,0 +1,67 @@
+{
+  "pr": 7289,
+  "head": "1076a86e00000000000000000000000000000000",
+  "earlierHead": "e9d5d57400000000000000000000000000000000",
+  "labels": [
+    "review:accepted",
+    "ready-to-merge"
+  ],
+  "loopPayload": {
+    "verdict": {
+      "verdict": "accept"
+    },
+    "findings": {
+      "read": {
+        "headSha": "e9d5d57400000000000000000000000000000000",
+        "netChangedFiles": [
+          "backlog/7289-card.md"
+        ],
+        "netRenameSources": []
+      }
+    }
+  },
+  "timeline": [
+    {
+      "at": "2026-11-21T09:46:01Z",
+      "event": "labeled",
+      "label": "red-team:clear",
+      "head": "e9d5d57400000000000000000000000000000000"
+    },
+    {
+      "at": "2026-11-21T10:23:27Z",
+      "event": "head-moved",
+      "head": "1076a86e00000000000000000000000000000000"
+    },
+    {
+      "at": "2026-11-21T10:35:02Z",
+      "event": "unlabeled",
+      "label": "red-team:clear",
+      "actor": "plateau-merger[bot]"
+    }
+  ],
+  "comments": [
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "<!-- reviewed-sha: e9d5d57400000000000000000000000000000000 -->\nAccepted; review read was card-only."
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "<!-- we:red-team-advisory pr=7289 rev=e9d5d57400000000000000000000000000000000 -->\nAdvisory only: synthetic earlier review \u00b7 recorded verdict `accept`.\nThe red team tried to break this change and reported nothing."
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "Acceptance re-stamped after numbering at 1076a86e00000000000000000000000000000000 (no new review)."
+    }
+  ],
+  "skip": {
+    "event": 13922,
+    "head": "1076a86e00000000000000000000000000000000",
+    "reason": "red team skipped (policy-clear comment failed: carry refused: policy, hold, head or review evidence)"
+  }
+}
