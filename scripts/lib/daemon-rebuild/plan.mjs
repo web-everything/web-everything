@@ -654,16 +654,27 @@ export async function planRebuild({
     return keep ? recordHold(ref, pr, keep, null) : false;
   };
 
-  // strictAdopt: a stack top that contains an omitted (set-aside) base carries that base's unaudited tip under its own
-  // first-adoption exemption. The base is skipped as stack-contained BEFORE the omission audit check, so check it here
-  // and hold every containing top until the base has audit evidence.
+  // An overlay can carry an omitted base under its own first-adoption exemption in
+  // either stack mode. Audit containment is independent of stack grouping, including
+  // equal tips and bases kept independent by a stack fallback.
   const heldByOmittedBase = new Map();
   if (typeof auditedTip === 'function') {
-    for (const [baseRef, aside] of stacks.setAside) {
+    const tips = listed.filter(o => o?.ref).map(o => ({
+      ref: o.ref, sha: verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`),
+    }));
+    for (const { ref: baseRef, sha: baseSha } of tips) {
       if (!(((setAside === null && !carriedRefs.has(baseRef)) || setAside?.[baseRef]))) continue;
-      const baseSha = aside.sha;
       if (!baseSha || tipInMain(git, mainSha, baseSha) || auditedTip(baseRef, baseSha)) continue;
-      for (const t of aside.tops ?? []) heldByOmittedBase.set(t.ref, { base: baseRef, sha: baseSha });
+      const held = { base: baseRef, sha: baseSha };
+      // Retain the moved-base protection for tops carrying a proven older head.
+      for (const t of stacks.setAside.get(baseRef)?.tops ?? []) heldByOmittedBase.set(t.ref, held);
+      for (const top of tips) {
+        if (top.ref === baseRef || !top.sha) continue;
+        // Only proven non-containment releases a candidate when ancestry is unreadable.
+        if (top.sha === baseSha || git(['merge-base', '--is-ancestor', baseSha, top.sha]).status !== 1) {
+          heldByOmittedBase.set(top.ref, held);
+        }
+      }
     }
   }
 
@@ -688,13 +699,6 @@ export async function planRebuild({
       continue;
     }
 
-    // 1b. a stack base set aside for its tops (held item 212): skipped this pass, never dropped or removed.
-    const aside = stacks.setAside.get(ref);
-    if (aside) {
-      decisions.push({ ref, pr, action: 'skip', reason: aside.reason, sha: aside.sha, tops: aside.tops.map((t) => t.ref) });
-      continue;
-    }
-
     // 2. resolve the overlay ref's remote-tracking tip.
     let ovSha = verifyRev(git, `refs/remotes/origin/${ref}^{commit}`);
     if (!ovSha) {
@@ -709,6 +713,13 @@ export async function planRebuild({
       decisions.push({ ref, pr, action: 'skip', reason: 'unaudited-tip-held', sha: ovSha });
       alerts.push({ kind: 'overlay-unaudited-tip', detail: { ref, pr, newTip: ovSha,
         message: `overlay ${ref} remains set aside: tip ${ovSha.slice(0, 10)} needs a fix-ready + audit record (unaudited-tip)` } });
+      continue;
+    }
+    // Check omission evidence before stack deferral: otherwise the fallback could
+    // reapply an unaudited base after all its containing tops were held.
+    const aside = stacks.setAside.get(ref);
+    if (aside) {
+      decisions.push({ ref, pr, action: 'skip', reason: aside.reason, sha: aside.sha, tops: aside.tops.map((t) => t.ref) });
       continue;
     }
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.

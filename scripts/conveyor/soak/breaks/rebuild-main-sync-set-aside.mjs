@@ -18,8 +18,10 @@ export default {
       try {
         const mainOnly = await probeOmissionEvidence({ mainOnly: true });
         const deferred = await probeOmissionEvidence({ readyOnly: true });
+        const containing = await probeOmissionEvidence({ containing: 'descendant', stackMode: 'independent' });
         process.exitCode = p.mainSyncSetAside?.(f.git, { ref: f.ref }, f.main, f.tip)?.eligible === true
-          && mainOnly.adopted && deferred.aside && deferred.held ? 0 : 1;
+          && mainOnly.adopted && deferred.aside && deferred.held
+          && containing.childHeld && containing.applied === 0 && !containing.carriesRepair ? 0 : 1;
       } finally { f.cleanup(); }
     `], { cwd: root, encoding: 'utf8', timeout: 30_000, maxBuffer: 65536 });
     return result.status === 0;
@@ -28,12 +30,17 @@ export default {
     const r = await probeRebuildSetAside();
     const mainOnly = await probeOmissionEvidence({ mainOnly: true, cached: true });
     const deferred = await probeOmissionEvidence({ readyOnly: true });
+    const containing = await probeOmissionEvidence({ containing: 'descendant', stackMode: 'independent' });
+    const audited = await probeOmissionEvidence({ containing: 'descendant', stackMode: 'independent', auditedBase: true });
     const ok = r.adopted && r.onMain && r.alerts === 1 && r.rebuildAlerts === 1 && r.repaired && r.reapplied && r.cleared
       && r.aside?.ref === 'lane/set-aside' && r.aside?.reason === 'main-sync-conflict'
       && JSON.stringify(r.aside.files) === JSON.stringify(['worker.mjs'])
       && mainOnly.adopted && mainOnly.onTarget && mainOnly.checks.every(c => c.changedFiles === null && !c.reuseCode)
-      && deferred.adopted && deferred.aside && deferred.beforeAdopt === null && deferred.held && deferred.applied === 0 && deferred.audits > 0;
-    return { ...r, mainOnly, deferred, violations: ok ? [] : ['main-sync set-aside, full smoke, deferred history or repair guarantee failed'] };
+      && deferred.adopted && deferred.aside && deferred.beforeAdopt === null && deferred.held && deferred.applied === 0 && deferred.audits > 0
+      && containing.childHeld && containing.applied === 0 && !containing.carriesRepair
+      && !audited.childHeld && audited.repairAdopted && audited.carriesRepair;
+    return { ...r, mainOnly, deferred, containing, audited,
+      violations: ok ? [] : ['main-sync set-aside, full smoke, deferred history or containment audit guarantee failed'] };
   },
   judge(report) { return report.violations; },
 };

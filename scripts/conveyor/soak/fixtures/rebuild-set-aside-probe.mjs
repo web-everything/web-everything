@@ -13,7 +13,9 @@ import { finalizeRebuild, matchReadyCandidate } from '../../../lib/daemon-rebuil
 import { planRebuild } from '../../../lib/daemon-rebuild/plan.mjs';
 
 /** Real smoke/ready/adopt/state/planner wiring with synthetic Git; never writes a Git repository. */
-export async function probeOmissionEvidence({ mainOnly = false, readyOnly = false, cached = false, match = 'exact', failReset = false, fallback = false } = {}) {
+export async function probeOmissionEvidence({ mainOnly = false, readyOnly = false, cached = false, match = 'exact', failReset = false, fallback = false,
+  containing = null, stackMode = 'independent', continuity = 'recorded', auditedBase = false, auditedChild = false,
+  reverse = false, ancestryError = false, keepIndependentBase = false } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'rebuild-omission-evidence-'));
   const root = join(base, 'clone');
   mkdirSync(root);
@@ -23,6 +25,7 @@ export async function probeOmissionEvidence({ mainOnly = false, readyOnly = fals
     WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' };
   const previous = 'a'.repeat(40), main = 'b'.repeat(40), tip = 'c'.repeat(40), tree = 'd'.repeat(40);
   const replacement = 'e'.repeat(40), next = 'f'.repeat(40), ref = 'lane/docs';
+  const childRef = 'lane/top', child = '2'.repeat(40), ancestors = new Map();
   let head = previous, branch = tip;
   const ok = (stdout = '') => ({ status: 0, stdout });
   const run = args => {
@@ -33,11 +36,17 @@ export async function probeOmissionEvidence({ mainOnly = false, readyOnly = fals
       if (rev === 'HEAD') return ok(head);
       if (rev === 'origin/main^{commit}') return ok(main);
       if (rev === `refs/remotes/origin/${ref}^{commit}`) return ok(branch);
+      if (rev === `refs/remotes/origin/${childRef}^{commit}`) return ok(containing === 'same-tip' ? replacement : child);
       if (rev === 'refs/remotes/origin/lane/bad^{commit}') return ok(next);
       return ok(rev.replace(/\^\{commit\}$/, ''));
     }
-    if (args[0] === 'merge-base') return args[1] === '--is-ancestor'
-      ? { status: args[2] === args[3] ? 0 : 1, stdout: '' } : ok(main);
+    if (args[0] === 'merge-base') {
+      if (ancestryError && args[1] === '--is-ancestor' && args[2] === replacement && args[3] === child) {
+        return { status: 128, stdout: '' };
+      }
+      return args[1] === '--is-ancestor'
+        ? { status: args[2] === args[3] || ancestors.get(args[3])?.has(args[2]) ? 0 : 1, stdout: '' } : ok(main);
+    }
     if (args[0] === 'diff') return ok(args.includes('--') ? '' : 'README.md\n');
     if (args[0] === 'reset') {
       if (failReset && args.at(-1) !== previous) return { status: 1, stdout: '' };
@@ -46,7 +55,11 @@ export async function probeOmissionEvidence({ mainOnly = false, readyOnly = fals
     if (args[0] === 'show') return { status: 1, stdout: '' };
     if (args[0] === 'merge-tree') return ok('1'.repeat(40));
     if (args[0] === 'cherry') return ok(`+ ${branch}\n`);
-    if (args[0] === 'commit-tree') return ok(next);
+    if (args[0] === 'commit-tree') {
+      const parents = args.filter((_, i) => args[i - 1] === '-p');
+      ancestors.set(next, new Set(parents.flatMap(p => [p, ...(ancestors.get(p) ?? [])])));
+      return ok(next);
+    }
     if (['worktree', 'ls-tree', 'ls-files', 'status', 'rev-list', 'log', 'config'].includes(args[0])) return ok();
     if (args[0] === 'cat-file') return ok();
     throw new Error(`unexpected synthetic Git call: ${JSON.stringify(args)}`);
@@ -95,14 +108,35 @@ export async function probeOmissionEvidence({ mainOnly = false, readyOnly = fals
     }
     const state = readRebuildState(root, env);
     branch = replacement;
+    const overlays = [{ ref }];
+    if (containing) {
+      ancestors.set(replacement, new Set([main]));
+      ancestors.set(child, new Set(containing === 'unrelated' ? [main] : [main, replacement]));
+      addOverlay(root, { ref: childRef }, { env });
+      overlays.push({ ref: childRef });
+      if (reverse) overlays.reverse();
+    }
     let audits = 0;
-    const repaired = await planRebuild({ git: run, headSha: head, mainRef: 'origin/main', overlays: [{ ref }],
-      edgeResolve: false, setAside: state.setAside === undefined ? null : state.setAside ?? {},
-      auditedTip: () => { audits++; return false; } });
+    const auditedTip = (auditRef, sha) => {
+      audits++;
+      return (auditedBase && auditRef === ref && sha === replacement) || (auditedChild && auditRef === childRef);
+    };
+    const repaired = await planRebuild({ git: run, headSha: head, mainRef: 'origin/main', overlays, stackMode,
+      edgeResolve: false, setAside: continuity === 'unknown' ? null : state.setAside === undefined ? null : state.setAside ?? {},
+      auditedTip, keepIndependent: new Set(keepIndependentBase ? [ref] : []) });
+    let repairResult = null;
+    if (containing) {
+      await options.runSmoke({ changedFiles: null, reuseCode: false, reuseRows: [] });
+      repairResult = await finalizeRebuild({ ...options, plan: repaired, prevHead: head, overlaysBefore: overlays,
+        auditedTip, strictAdopt: true, freshSmoke: repaired.finalSha });
+    }
     return { adopted: result.adopted === true, reason: result.reason, checks, readyMatch,
       beforeAdopt, aside: state.setAside?.[ref] ?? null, recordedDecisions: ready?.adopt?.decisions,
       onTarget: head === (match === 'same-tree' ? next : main), unchanged: head === previous,
-      audits, held: repaired.decisions.some(d => d.reason === 'unaudited-tip-held'), applied: repaired.applied.length };
+      audits, held: repaired.decisions.some(d => d.reason === 'unaudited-tip-held'), applied: repaired.applied.length,
+      childHeld: repaired.decisions.some(d => d.ref === childRef && d.reason === 'unaudited-tip-held'),
+      repairAdopted: repairResult?.adopted === true, carriesRepair: ancestors.get(head)?.has(replacement) ?? false,
+      appliedRefs: repaired.applied.map(o => o.ref) };
   } finally { rmSync(base, { recursive: true, force: true }); }
 }
 

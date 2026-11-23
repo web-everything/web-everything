@@ -3,6 +3,48 @@ import { probeOmissionEvidence } from '../../../conveyor/soak/fixtures/rebuild-s
 import { planStrictAdopt, adoptionDecisions } from '../plan.mjs';
 import { readReadyCandidateStrict } from '../state.mjs';
 
+it.each(['independent', 'tops'])('omitted base cannot return through a new child in %s mode', async stackMode => {
+  expect(await probeOmissionEvidence({ containing: 'descendant', stackMode })).toMatchObject({
+    adopted: true, childHeld: true, applied: 0, carriesRepair: false,
+  });
+});
+
+it.each(['descendant', 'same-tip'])('independent mode holds %s carriers regardless of registration order', async containing => {
+  expect(await probeOmissionEvidence({ containing, reverse: true })).toMatchObject({
+    childHeld: true, applied: 0, carriesRepair: false,
+  });
+});
+
+it('unknown omission history also holds a containing child', async () => {
+  expect(await probeOmissionEvidence({ containing: 'descendant', continuity: 'unknown', auditedChild: true })).toMatchObject({
+    childHeld: true, applied: 0, carriesRepair: false,
+  });
+});
+
+it('tops mode still holds carriers when the base is kept independent for retry', async () => {
+  expect(await probeOmissionEvidence({ containing: 'descendant', stackMode: 'tops', keepIndependentBase: true })).toMatchObject({
+    childHeld: true, applied: 0, carriesRepair: false,
+  });
+});
+
+it('unreadable containment holds the child until ancestry can be proved', async () => {
+  expect(await probeOmissionEvidence({ containing: 'descendant', ancestryError: true })).toMatchObject({
+    childHeld: true, applied: 0, carriesRepair: false,
+  });
+});
+
+it.each(['independent', 'tops'])('audit evidence releases the base and child in %s mode', async stackMode => {
+  const result = await probeOmissionEvidence({ containing: 'descendant', stackMode, auditedBase: true });
+  expect(result).toMatchObject({ childHeld: false, repairAdopted: true, carriesRepair: true });
+  expect(result.appliedRefs).toContain('lane/top');
+});
+
+it('a held base does not block an unrelated new overlay', async () => {
+  expect(await probeOmissionEvidence({ containing: 'unrelated' })).toMatchObject({
+    childHeld: false, repairAdopted: true, carriesRepair: false, appliedRefs: ['lane/top'],
+  });
+});
+
 it.each([false, true])('main-only omission collects full smoke despite cached=%s', async cached => {
   const result = await probeOmissionEvidence({ mainOnly: true, cached });
   expect(result).toMatchObject({ adopted: true, onTarget: true });

@@ -6384,6 +6384,11 @@ the skip-unrelated path. Ready records carry omission decisions through exact,
 same-tree, superseded and fallback adoption; only successful adoption persists them.
 The repaired tip must then reach the audit gate. The set-aside soak includes these
 omission probes alongside its real-Git conflict scenario.
+Containing overlays must remain held in both stack modes until the omitted base has
+audit evidence, including equal tips, reversed registration order, unknown history,
+unreadable ancestry and bases kept independent during retry. The synthetic probe
+drives the production planner and locked finalizer and checks the adopted ancestry;
+its positive controls release audited bases and allow unrelated new overlays.
 
 `daemon-rebuild/__tests__/main-sync-set-aside.test.mjs` drives the real Git fixture in
 `conveyor/soak/fixtures/rebuild-set-aside-probe.mjs`. Clear the sync worker's existing
