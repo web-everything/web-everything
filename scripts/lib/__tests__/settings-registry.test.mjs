@@ -344,11 +344,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation and operator Forge slots snapshot with per-key authoring instructions', () => {
+test('generated documentation matches the shadow rotation, audit debounce and operator Forge slots snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Includes shadow rotation and operator-private Forge hosts: forgeSlots has one leaf; total leaves are 625.
-  assert.equal(createHash('sha256').update(original).digest('hex'), 'cfd9283b22b56a0f03b8bc58a21ef8793c5e1319e172a3268f7f68f04aceef6b');
+  // Includes providerRotation, both audit debounce/delta leaves and operator-private Forge hosts: 627 leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '68a0864d4a70ad52a73f6fd8dec90798998c74bbc72da223607fb0fb90908fcb');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
