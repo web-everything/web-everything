@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import * as shared from '../protected-path-floor.mjs';
@@ -33,7 +35,7 @@ function dataOnly(source) {
 
 describe('shared protected-path floor', () => {
   it('contains only data declarations, with no imports, settings resolution or runtime IO', () => {
-    const source = readFileSync(new URL('../protected-path-floor.mjs', import.meta.url), 'utf8');
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../protected-path-floor.mjs'), 'utf8');
     expect(dataOnly(source)).toBe(true);
   });
   it('the data-only rule accepts literal composition', () => {
