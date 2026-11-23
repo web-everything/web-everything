@@ -1652,6 +1652,7 @@ export async function runTickAllRepos({
     autoRoundGrants: notes.autoGrants ?? [], // standing-ruling card-only round grants this tick decided
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
     awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
+    orphanGuard,
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
@@ -1885,8 +1886,8 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         log.error(`ruling-resolves-stand-down: setting=${setting} (source: ${settingSource})`);
         for (const row of rows) log.error(`ruling-resolves-stand-down: ${row.repo}#${row.pr} ${row.action} stand-down=${row.standDownId ?? '?'}${row.why ? ` — ${row.why}` : ''}`);
       }
-      const orphan = stuckFixers?.orphanRounds;
-      log.error(`orphan-guard: settled ${orphan?.newlySettled?.length ?? 0} PR(s) (skipped ${orphan?.settledSkipped?.length ?? 0} cached)`);
+      const orphan = result?.orphanGuard;
+      log.error(`orphan-guard: settled ${orphan?.newlySettled?.length ?? 0} PR(s) (deferred ${orphan?.deferredSettled?.length ?? 0} cached)`);
       // card xiqtf7w — one line per supersede hold planned or posted.
       for (const line of formatSupersedeLines(supersede)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.

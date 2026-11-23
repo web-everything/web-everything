@@ -11,8 +11,9 @@ export function probe(checkout) {
     import { join } from 'node:path';
     import { pathToFileURL } from 'node:url';
     const [checkout, repo] = process.argv.slice(1);
-    const { runOrphanFixRoundPass } = await import(
+    const { runOrphanFixRoundPass, ORPHAN_GUARD_MARKER } = await import(
       pathToFileURL(join(checkout, 'scripts/conveyor/orphan-fix-round.mjs')));
+    const { FIX_END_MARKER } = await import(pathToFileURL(join(checkout, 'scripts/conveyor/fix-procedure.mjs')));
     const settled = new Map();
     const reads = [];
     const options = {
@@ -40,6 +41,33 @@ export function probe(checkout) {
     deepStrictEqual(reads, [1, 2], 'cached wrapped PR must not be read again');
     strictEqual(second.handled, 1, 'cached PR must not count as handled');
     deepStrictEqual(second.rows, [], 'stable no-fix verdicts must not act');
+    strictEqual(second.deferredSettled.length, 1, 'cached budget deferral must be separate');
+    let cursor = second.repoCursors;
+    for (let pass = 0; pass < 4; pass++) {
+      const result = await runOrphanFixRoundPass({ ...options, cursor });
+      cursor = result.repoCursors;
+      if (pass >= 2) strictEqual(result.deferred.length, 0, 'uncached holds must drain to zero');
+    }
+    const live = { ...options, deadlineAt: Infinity,
+      listBounced: () => options.listBounced().slice(0, 1) };
+    const refreshed = await runOrphanFixRoundPass({ ...live, nowMs: options.nowMs + 1 });
+    strictEqual(refreshed.handled, 1, 'cached PR must receive a live check');
+    strictEqual(settled.get(repo + '#1').at, options.nowMs + 1, 'visit must refresh cache age');
+    const unreadable = await runOrphanFixRoundPass({ ...live,
+      readComments: async () => { throw new Error('incomplete thread'); } });
+    strictEqual(unreadable.rows[0]?.decision, 'error', 'cached unreadable thread must fail closed');
+    await runOrphanFixRoundPass(live);
+    let escalated = false;
+    const stamp = body => ({ body, createdAt: '2026-10-10T11:00:00Z',
+      includesCreatedEdit: false, author: { login: 'web-everything' } });
+    const orphan = await runOrphanFixRoundPass({ ...live,
+      readComments: async pr => [...await options.readComments(pr),
+        stamp(ORPHAN_GUARD_MARKER + ' — re-dispatched a fixer'),
+        stamp(ORPHAN_GUARD_MARKER + ' — re-dispatched a fixer'), stamp(FIX_END_MARKER)],
+      escalate: async () => { escalated = true; return { ok: true }; }, postComment: () => {} });
+    strictEqual(orphan.rows[0]?.decision, 'escalate', 'later same-head orphan must be detected');
+    ok(escalated, 'cached orphan must escalate');
+    ok(!settled.has(repo + '#1'), 'live orphan must invalidate settlement');
   `, checkout, ghRepoSlug('we')], { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 });
   return { violations: child.status === 0 ? [] : [
     `settled orphan-guard replay failed: ${child.error?.message ?? child.stderr ?? child.signal ?? child.status}`,

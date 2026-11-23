@@ -453,11 +453,11 @@ describe('runOrphanFixRoundPass — IO shell', () => {
       const result = await runOrphanFixRoundPass({ ...s, cursor });
       cursor = result.repoCursors;
       deferred.push(result.deferred.length);
-      expect(result.newlySettled).toHaveLength(pass < 5 ? 1 : 0);
-      expect(result.settledSkipped).toHaveLength(Math.min(pass, 5));
+      expect(result.newlySettled).toHaveLength(1);
+      expect(result.deferredSettled).toHaveLength(Math.min(pass, 4));
     }
     expect(deferred).toEqual([4, 3, 2, 1, 0, 0]);
-    expect(readComments).toHaveBeenCalledTimes(5);
+    expect(readComments).toHaveBeenCalledTimes(6);
   });
 
   it.each(['head moved', 'TTL expired', 'missing head', 'future timestamp'])('re-reads settled evidence when %s', async reason => {
@@ -468,20 +468,53 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     const readComments = vi.fn(async () => [VERDICT]);
     const result = await runOrphanFixRoundPass(seams([], { settled, readComments }));
     expect(readComments).toHaveBeenCalledOnce();
-    expect(result.settledSkipped).toEqual([]);
+    expect(result.deferredSettled).toEqual([]);
     expect(result.newlySettled).toEqual([{ repo: repos[0].slug, pr: 4715 }]);
     expect(settled.get(`${repos[0].slug}#4715`)).toEqual({ head: HEAD, at: NOW });
   });
 
-  it('skips a cached same-head PR before budget deferral and all per-PR reads', async () => {
-    const settled = new Map([[`${repos[0].slug}#4715`, { head: HEAD, at: NOW - 9 }]]);
-    const s = seams([], { settled, settledTtlMs: 10, deadlineAt: 0, now: () => 0,
-      readComments: vi.fn(), isOwned: vi.fn() });
-    const result = await runOrphanFixRoundPass(s);
-    expect(result).toMatchObject({ handled: 0, deferred: [], newlySettled: [],
-      settledSkipped: [{ repo: repos[0].slug, pr: 4715 }] });
-    expect(s.isOwned).not.toHaveBeenCalled();
-    expect(s.readComments).not.toHaveBeenCalled();
+  it('uses leftover budget to read cached PRs oldest first after all uncached PRs', async () => {
+    const settled = new Map([1, 2].map(number => [`${repos[0].slug}#${number}`, { head: HEAD, at: NOW - number }]));
+    const readComments = vi.fn(async () => [VERDICT]);
+    const result = await runOrphanFixRoundPass(seams([], { settled, readComments,
+      listBounced: () => [1, 2, 3].map(number => pr4715([], { number })),
+      cursor: { [repos[0].slug]: 2 } }));
+    expect(readComments.mock.calls.map(([pr]) => pr)).toEqual([3, 2, 1]);
+    expect(result.deferredSettled).toEqual([]);
+    expect(settled.get(`${repos[0].slug}#2`).at).toBe(NOW);
+  });
+
+  it('defers cached PRs without holds or cursor entries when uncached work spends the budget', async () => {
+    const settled = new Map([[`${repos[0].slug}#1`, { head: HEAD, at: NOW - 9 }]]);
+    const readComments = vi.fn(async () => [VERDICT]);
+    const result = await runOrphanFixRoundPass(seams([], { settled, readComments, deadlineAt: 0, now: () => 0,
+      listBounced: () => [1, 2, 3].map(number => pr4715([], { number })) }));
+    expect(readComments.mock.calls.map(([pr]) => pr)).toEqual([2]);
+    expect(result.deferred).toEqual([{ repo: repos[0].slug, pr: 3 }]);
+    expect(result.deferredSettled).toEqual([{ repo: repos[0].slug, pr: 1 }]);
+    expect(result.repoCursors).toEqual({ [repos[0].slug]: 3 });
+    expect(settled.get(`${repos[0].slug}#1`).at).toBe(NOW - 9);
+  });
+
+  it('detects a later same-head orphan on a cached PR and escalates it', async () => {
+    const settled = new Map();
+    const s = seams([VERDICT], { settled });
+    await runOrphanFixRoundPass(s);
+    // A dispatch and round end arrive as comments only; no evidence was recorded.
+    const result = await runOrphanFixRoundPass({ ...s, readComments: async () => [VERDICT,
+      c('2026-10-10T12:00:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+      c('2026-10-10T14:00:00Z', `${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`), END] });
+    expect(result.rows[0]).toMatchObject({ decision: 'escalate', result: 'escalated' });
+    expect(s.escalate).toHaveBeenCalledOnce();
+    expect(settled.size).toBe(0);
+  });
+
+  it('fails closed with an error row when a cached PR thread is unreadable', async () => {
+    const settled = new Map([[`${repos[0].slug}#4715`, { head: HEAD, at: NOW - 1 }]]);
+    const result = await runOrphanFixRoundPass(seams([], { settled,
+      readComments: async () => { throw new Error('incomplete thread'); } }));
+    expect(result.rows).toEqual([expect.objectContaining({ pr: 4715, decision: 'error', result: 'error: incomplete thread' })]);
+    expect(settled.size).toBe(0);
   });
 
   it.each(['grace', 'owned', 'draft'])('never caches a non-stable %s none', async reason => {

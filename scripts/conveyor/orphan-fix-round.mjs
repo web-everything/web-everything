@@ -81,7 +81,7 @@ export function verdictReviewedHead(body) {
  * Decide what one PR is owed. PURE.
  * @param {{pr:{number:number, labels?:Array, headRefOid?:string, isDraft?:boolean, comments?:Array}, owned?:boolean,
  *   nowMs:number, graceMs?:number, cap?:number, repo?:string, cardReadable?:Function}} o
- * Stable none decisions may be cached for the same head until expiry or a fix dispatch.
+ * Stable none decisions may suppress budget holds for the same head until expiry or a fix dispatch.
  * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, stable?:boolean, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
 export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
@@ -264,7 +264,7 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
  * ONE guard pass over every constellation repo. Never throws; one PR's failure never stops the rest.
  * Optional `settled` retains stable none verdicts between passes, keyed by `${slug}#${pr}` → {head, at}.
  * `cursor` is the per-repo map a previous pass returned as `repoCursors` (or a legacy single `{repo, pr}`).
- * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, settledSkipped:Array<object>, newlySettled:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
+ * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, deferredSettled:Array<object>, newlySettled:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
  */
 export async function runOrphanFixRoundPass({
   env = process.env,
@@ -289,7 +289,7 @@ export async function runOrphanFixRoundPass({
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
 } = {}) {
   const enabled = orphanGuardEnabled(env);
-  const rows = [], deferred = [], settledSkipped = [], newlySettled = [];
+  const rows = [], deferred = [], deferredSettled = [], newlySettled = [];
   let handled = 0, redispatched = false, deferring = false;
   // Each repo keeps its OWN resume point (PR #7330): a pass that reaches only some repos must not overwrite the
   // deferred progress of a repo it never listed. A legacy single `{repo, pr}` cursor migrates to one entry.
@@ -306,23 +306,31 @@ export async function runOrphanFixRoundPass({
     const own = [...(prs ?? [])].sort((a, b) => a.number - b.number);
     for (const p of own) (at != null && p.number < at ? wrapped : head).push({ key, slug, p });
   }
-  const ordered = [...head, ...wrapped];
-  for (const { key, slug, p } of ordered) {
+  const uncached = [], cachedPrs = [];
+  for (const entry of [...head, ...wrapped]) {
+    const { slug, p } = entry;
     const cacheKey = `${slug}#${p.number}`;
     const cached = settled?.get(cacheKey);
     const age = nowMs - cached?.at;
-    // Check before the deadline, including wrapped PRs: settled PRs must never become holds again.
     if (typeof p.headRefOid === 'string' && p.headRefOid.length > 0
       && cached?.head === p.headRefOid && age >= 0 && age < settledTtlMs) {
-      settledSkipped.push({ repo: slug, pr: p.number });
+      cachedPrs.push({ ...entry, cachedAt: cached.at });
+    } else {
+      settled?.delete(cacheKey);
+      uncached.push(entry);
+    }
+  }
+  // Settlement changes scheduling and budget holds only: comments can change without a head move.
+  // Refresh the oldest cached evidence first, after all uncached work (including wrapped PRs).
+  const ordered = [...uncached, ...cachedPrs.sort((a, b) => a.cachedAt - b.cachedAt)];
+  for (const { key, slug, p, cachedAt } of ordered) {
+    const cacheKey = `${slug}#${p.number}`;
+    if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
+      deferring = true;
+      (cachedAt === undefined ? deferred : deferredSettled).push({ repo: slug, pr: p.number });
       continue;
     }
     settled?.delete(cacheKey);
-    if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
-      deferring = true;
-      deferred.push({ repo: slug, pr: p.number });
-      continue;
-    }
     handled += 1;
     const row = { repo: slug, pr: p.number };
     try {
@@ -367,7 +375,7 @@ export async function runOrphanFixRoundPass({
   const nextRepoCursors = { ...repoCursors };
   for (const { key, slug } of listed) { delete nextRepoCursors[key]; delete nextRepoCursors[slug]; }
   for (const d of deferred) nextRepoCursors[d.repo] ??= d.pr;
-  return { enabled, rows, handled, deferred, settledSkipped, newlySettled, nextCursor: deferred[0] ?? null,
+  return { enabled, rows, handled, deferred, deferredSettled, newlySettled, nextCursor: deferred[0] ?? null,
     repoCursors: Object.keys(nextRepoCursors).length ? nextRepoCursors : null };
 }
 
