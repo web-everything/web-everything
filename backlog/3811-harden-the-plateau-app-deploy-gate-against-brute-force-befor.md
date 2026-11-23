@@ -2,7 +2,10 @@
 bornAs: xtzs1ch
 kind: story
 size: 3
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: the first-external-access gate card (8694) is scheduled"
+dateParked: "2026-11-22"
 scope: ["plateau:worker.js", "plateau:wrangler.toml", "plateau:scripts/worker-gate.test.mjs"]
 dateOpened: "2026-09-21"
 preparedDate: "2026-10-01"
@@ -74,3 +77,7 @@ Plateau's new automated throttle/session tests pass, real preview evidence demon
 - Reconsider Cloudflare Access later under a separate decision; option B does not establish per-person identity or prevent a revoked visitor who still knows the shared code from signing in again. Rotate the shared code for that case.
 - Tune limits from observed preview usage; monitor global-limit denial of service and shared-IP contention. Broader distributed abuse defenses and active WebSocket termination on revocation require separate work.
 - Testing lesson: Node's package module mode can prevent direct import of an otherwise valid Worker. Use each repo's existing Vitest harness for implementation verification and separately exercise actual durable bindings in preview. Keep this lesson here; do not append it to shared agent documentation.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: before any external user gets access (first customer or public beta).
+
+Gate card: 8694 (First external access (beta) release gate) refuses outside access while this card is not resolved. Unpark when the first-external-access gate card is scheduled.

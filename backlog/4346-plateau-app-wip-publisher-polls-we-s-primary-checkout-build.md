@@ -65,3 +65,5 @@ builder's own `--dry-run` from `~/workspace/wev-control` and check whether `load
 
 1. **Executable** — the plateau-app unit test pinning the cadence passes and fails on main.
 2. **Live** — the publisher tree uses under 40 CPU-s in a 4-minute sample.
+
+Will be closed when plan step PD-LIVE (delivery plan) delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).

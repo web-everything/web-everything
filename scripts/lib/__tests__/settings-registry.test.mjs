@@ -349,7 +349,15 @@ test('generated documentation pins change-evidence, shadow rotation and audit de
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes changeEvidence, providerRotation and the two audit debounce/delta leaves.
-  assert.equal(createHash('sha256').update(original).digest('hex'), 'f2159cb3651be865bfe8e02bc5d5c3cceaedee4b6ed4dadb5a3c8929f71d56a7');
+  // Reconciled snapshot includes changeEvidence, providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'b6292425a6e377a6ea418445b555bcc563a4b9f3e798e500c72e70f44e3759c7');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
+});
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });
