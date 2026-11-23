@@ -15,7 +15,9 @@ const LIMIT = 32 * 1024 * 1024;
 const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (32 MiB maximum)');
 
 function loadAllowlist(path) {
-  const entries = JSON.parse(readFileSync(path, 'utf8'));
+  // The shipped file is `{ "entries": [...] }`: a bare array would be refused by the Forge non-object-json rule.
+  const parsed = JSON.parse(readFileSync(path, 'utf8'));
+  const entries = Array.isArray(parsed) ? parsed : parsed?.entries;
   if (!Array.isArray(entries) || entries.some(entry => !entry
     || typeof entry.path !== 'string' || !entry.path || /[*?\[\]\\\x00-\x1f]/.test(entry.path)
     || entry.path.startsWith('/') || entry.path.split('/').some(part => !part || part === '.' || part === '..')

@@ -160,7 +160,7 @@ it('runs an isolated read-only PR workflow using only existing action pins', () 
   expect(job.if).toBe("${{ github.event_name == 'pull_request' }}");
   expect(JSON.stringify(job)).not.toMatch(/secrets\s*\./);
   expect(job.steps.filter(step => step.uses).map(step => step.uses)).toEqual(['actions/checkout@v4', 'actions/checkout@v4', 'actions/setup-node@v4']);
-  expect(job.steps[0].with).toMatchObject({ 'fetch-depth': 0, 'persist-credentials': false, ref: '${{ github.sha }}' });
+  expect(job.steps[0].with).toMatchObject({ 'fetch-depth': 2,'persist-credentials': false, ref: '${{ github.sha }}' });
   expect(job.steps[1].with).toMatchObject({ ref: '${{ github.event.pull_request.base.sha }}', path: 'trusted', 'persist-credentials': false });
   expect(job.steps[2].with['node-version']).toBe(22);
   const run = job.steps.find(step => step.run);
@@ -204,7 +204,9 @@ it.each([false, true])('runs the workflow with the pre-change trusted scanner (c
   mkdirSync(join(dir, 'trusted/scripts/ci'), { recursive: true });
   mkdirSync(join(dir, 'trusted/scripts/readiness'), { recursive: true });
   copyFileSync(new URL('./fixtures/secret-scan-pre-repo.txt', import.meta.url), join(dir, 'trusted/scripts/ci/secret-scan.mjs'));
-  copyFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), join(dir, 'trusted/scripts/ci/secret-scan-allowlist.json'));
+  // The pre-change scanner only reads a bare array; the shipped file is `{ entries }`.
+  writeFileSync(join(dir, 'trusted/scripts/ci/secret-scan-allowlist.json'),
+    JSON.stringify(JSON.parse(readFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), 'utf8')).entries));
   for (const name of ['forge-exec-manifest.mjs', 'forge-key-structure.mjs']) {
     copyFileSync(new URL('../../readiness/' + name, import.meta.url), join(dir, 'trusted/scripts/readiness', name));
   }
