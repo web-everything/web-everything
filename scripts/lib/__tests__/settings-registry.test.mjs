@@ -4,15 +4,16 @@
  * Run through host admission: node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/lib/__tests__/settings-registry.test.mjs
  */
 import { test } from 'vitest';
+import { spawnSync, execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildRegistry, readMetadata, renderMarkdown } from '../settings-registry.mjs';
+import { fixture as mergeFixture, snapshot, DOC, CLOSURE } from './fixtures/generated-merge.mjs';
 import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -120,13 +121,13 @@ test('render round-trips backslashes and pipes in one table cell', t => {
     assert.deepEqual(actual, original.map(cell => cell === 'Fixture beta.' ? value : cell));
   });
 });
-test('real repository metadata is complete and committed documentation matches the render', () => {
+test('real repository metadata is complete and fresh renders are byte-equal', () => {
   const registry = buildRegistry({ root: ROOT }); assert.deepEqual(registry.problems, []);
   assert.ok([0, 10].includes(registry.toSettle.filter(row => row.top === true).length));
   const identities = registry.toSettle.map(row => `${row.identifier}:${row.where.replace(/:\d+$/, '')}`);
   assert.equal(new Set(identities).size, identities.length, 'identifier+file pairs must be unique');
   assert.equal(registry.capacityRows.length, Object.keys(CAPACITY_LEAVES).length);
-  assert.equal(readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8'), renderMarkdown(registry));
+  assert.equal(renderMarkdown(buildRegistry({ root: ROOT })), renderMarkdown(registry));
 });
 test('top proposals allow zero or ten and refuse incomplete, oversized or non-boolean selections', t => {
   const f = fixture(t);
@@ -206,6 +207,33 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   const md = renderMarkdown(buildRegistry({ root: ROOT }));
   assert.ok(md.includes('H-impact discovery converged'));
   assert.ok(md.includes('M-impact tail has not converged'));
+});
+
+test('--check succeeds without a tracked or local doc and writes nothing', t => {
+  const tracked = spawnSync('git', ['ls-files', '--', DOC], { cwd: ROOT, encoding: 'utf8' });
+  assert.equal(tracked.status, 0); assert.equal(tracked.stdout, '');
+  const ignored = spawnSync('git', ['check-ignore', '--', DOC], { cwd: ROOT, encoding: 'utf8' });
+  assert.equal(ignored.status, 0); assert.equal(ignored.stdout.trim(), DOC);
+  const f = mergeFixture(); t.onTestFinished(f.cleanup);
+  f.ok(['rm', '--', DOC]); f.write('.gitignore', `${DOC}\n`); f.commit('untrack doc');
+  const before = snapshot(f);
+  f.generate('--check'); f.generate('--check');
+  assert.equal(existsSync(join(f.root, DOC)), false);
+  assert.deepEqual(snapshot(f), before);
+  f.generate('--write'); assert.ok(existsSync(join(f.root, DOC)));
+  assert.equal(f.ok(['status', '--porcelain']), '');
+  f.json(META, {});
+  assert.throws(() => f.generate('--check'), /invalid metadata section/);
+});
+
+test('--check refuses unequal fresh renders without writing the doc', t => {
+  const f = mergeFixture(); t.onTestFinished(f.cleanup);
+  rmSync(join(f.root, DOC));
+  f.write(CLOSURE[0], readFileSync(join(f.root, CLOSURE[0]), 'utf8')
+    .replace('return out.join', 'return String(globalThis.renderCount = (globalThis.renderCount ?? 0) + 1) + out.join'));
+  const before = snapshot(f);
+  assert.throws(() => f.generate('--check'), /render is not deterministic/);
+  assert.deepEqual(snapshot(f), before);
 });
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
@@ -352,8 +380,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the historical shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
-  const doc = renderMarkdown(originalRegistry(buildRegistry()));
+test('fresh render matches the historical shadow rotation and audit debounce snapshot with per-key, gitignored-doc authoring instructions', () => {
+  // The doc is generated locally and never committed, so pin a fresh render instead of a tracked file.
+  const doc = renderMarkdown(originalRegistry(buildRegistry({ root: ROOT })));
+  assert.ok(doc.includes('scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json'));
+  assert.ok(doc.includes('`npm run docs:settings-registry` to generate the local, gitignored doc; never commit it'));
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
   // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
