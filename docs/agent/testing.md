@@ -6332,6 +6332,35 @@ the loaded graph. Resetting the entire daemon graph twice inside the CLI test ex
 60-second deadline on a coverage shard. Keep the file/standalone output comparison and zero-GitHub
 assertions intact; consumers without callable entries retain the fresh-import path.
 
+## Resource pool S1a shadow observation (R1094)
+
+`resource-pool.test.mjs` pins queued priority, maxima, the 4u builder floor, bounded C1
+overdraw, no preemption and unknown-evidence holds. `resource-pool-io.test.mjs` covers
+missing/malformed sources, liveness failures, companion files, oversized evidence and
+settings bounds. `operations/__tests__/resource-pool.test.mjs` tests the readout and CLI sink.
+Only sampler memory/swap/CPU, live review rounds, canonical red-team statuses and class-3
+fix claims are inventoried. Claims and workers share the canonical dispatch session name
+(`fixDispatchSessionName`); collection counts overlapping claim/lane/heavy-slot evidence
+once. Different repo/kind jobs and workers without a shared identity stay separately counted.
+The cross-source IO regression pins one holder and 2u for the three overlapping records.
+The digest is a **partial** inventory, never total host occupancy;
+no shrink claim is made. Claim expiry follows the existing 10-minute lease contract.
+Red-team status files use the writer's encoded-repo/PR/40-hex-head filename; companions
+are excluded before parsing. Check a claim's valid heartbeat for expiry before validating
+holder metadata; expired legacy metadata cannot hold capacity. Unreadable claims or invalid
+heartbeats remain unknown. Red-team rows older than the hard 24-hour lease ceiling
+expire by file mtime regardless of PID or host; the readout reports the ignored count.
+Rows exactly at the ceiling remain subject to liveness checks. Fresher queued/running
+rows with live PIDs hold capacity; missing PIDs or ambiguous host/process evidence remain
+unknown. Unreadable or malformed status evidence stays fail-closed. The IO suite pins
+25-hour expiry, the exact boundary, and one-hour foreign-host/live-local cases.
+Unknown evidence holds every hypothetical start; inspect the named source and rerun.
+The comparison column observes `resource-admission.admit` only, excluding dispatch caps.
+No existing caller consumes this pool. Enforce remains shadow; off disables the explicit
+CLI shadow sink. Mode has an instant enum leaf; bounds use the numeric override store.
+Reserves are retained/validated policy leaves for later slices; this slice's rule subtracts
+queued higher-class demand and protects unoccupied builderFloor without double counting reserves.
+Run these scoped tests and `check:standards` through heavy-admission, with one bounded wait.
 ## Orphan exclusions precede stand-down answers
 
 The fix-dispatch orphan guard must reach `runReconcilePass` before R123 enrichment,

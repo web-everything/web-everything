@@ -1,0 +1,5 @@
+{
+  "description": "Maximum units for class 2 review work in shadow allocation decisions.",
+  "range": "integer 0–64",
+  "unit": "units"
+}
