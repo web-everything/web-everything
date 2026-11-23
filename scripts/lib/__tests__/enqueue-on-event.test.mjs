@@ -19,6 +19,7 @@ import * as enqueueModule from '../enqueue-on-event.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { redactSecrets } from '../../conveyor/ci-heal-mark.mjs';
 
 const REPO = 'web-everything/web-everything';
 const GREEN = 'check_suite.completed=success@12';
@@ -458,7 +459,7 @@ describe('createEnqueueOnEvent', () => {
     [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, false],
   ])('reports bounded stderr for exit %s with JSON %j (diagnostic=%s)', async (code, json, diagnostic) => {
     const stderr = `${'old noise '.repeat(400)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
-    const tail = stderr.slice(-2000).replace(/\s+/g, ' ').trim().slice(-2000);
+    const tail = stderr.slice(-2000).replace(/\s+/g, ' ').trim().slice(-300);
     const { handle, children, lines, advance } = setup({ manualFinish: true });
     handle.notePoll({ ok: true, marked: [mark()] });
     advance(15_000);
@@ -1657,13 +1658,13 @@ describe('actual enqueue outcomes and membership', () => {
     expect(handle.misses().has(42)).toBe(false);
   });
 
-  it('includes queue timeline evidence and the collapsed last 2000 stderr characters in a miss', async () => {
+  it('includes queue timeline evidence and the collapsed last 300 stderr characters in a miss', async () => {
     const { handle } = membershipSetup({ drainStderr: 'x'.repeat(2400) + '\n batching   blocked',
       readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-10-14', reason: 'checks failed' }] }),
     });
     const [ran] = await handle.catchUp();
     expect(ran.what).toContain('RemovedFromMergeQueueEvent at 2026-10-14: checks failed');
-    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(2400) + '\n batching   blocked').slice(-2000).replace(/\s+/g, ' ').trim());
+    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(2400) + '\n batching   blocked').slice(-2000).replace(/\s+/g, ' ').trim().slice(-300));
   });
 
   it('redacts child stderr credentials in membership-miss reports', async () => {
@@ -2200,6 +2201,110 @@ describe('child pass timings', () => {
   it('returns null when stderr contains no pass timings', () => {
     expect(extractPassTimings('starting\n{"skipReasons":[]}\n')).toBeNull();
   });
+  it.each([
+    ['Authorization: Bearer abcdefghijklmnop', {}],
+    ...['TOKEN', 'SECRET', 'PASSWORD', 'KEY', 'CREDENTIAL'].map(name =>
+      ['opaque.$[value]-12345', { ['SERVICE_' + name]: 'opaque.$[value]-12345' }]),
+  ])('redacts child diagnostics and pass timings for %s', async (secret, env) => {
+    const { handle, lines, advance } = setup({ env,
+      drainStderr: `merge-ai-prs · pass timings: ${secret}\n${secret}`,
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    await handle.tick();
+    const logged = lines.find(line => line.includes('fast drain exit'));
+    expect(logged).toContain(' · phases: ');
+    expect(logged).toContain('[redacted]');
+    expect(logged).not.toContain(secret);
+  });
+
+  it('caps extracted pass timings at 300 characters', async () => {
+    const { handle, lines, advance } = setup({
+      drainStderr: 'merge-ai-prs · pass timings: ' + 'x'.repeat(200_000),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    await handle.tick();
+    expect(lines.find(line => line.includes('fast drain exit')).split(' · phases: ')[1]).toHaveLength(300);
+  });
+
+  it.each([
+    ['password="' + 'q'.repeat(9000) + '"', {}],
+    ['Authorization: Bearer ' + 'q'.repeat(9000), {}],
+    ['q'.repeat(9000), { SERVICE_SECRET: 'q'.repeat(9000) }],
+  ])('discards a credential suffix crossing the stderr truncation boundary (%#)', async (credential, env) => {
+    const source = readFileSync(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
+    const runChild = new Function('redactSecrets', 'extractPassTimings',
+      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(redactSecrets, extractPassTimings);
+    for (const ending of ['', '\nGraphQL: denied']) {
+      const stderr = credential + ending;
+      const child = new EventEmitter();
+      child.stderr = new EventEmitter();
+      const pending = runChild({ env, args: [], timeoutMs: 1000, spawnImpl: () => child });
+      child.stderr.emit('data', stderr);
+      child.emit('close', 1);
+      const result = await pending;
+      expect(result.stderrTail).not.toContain('q'.repeat(20));
+      if (ending) expect(result.stderrTail).toContain('GraphQL: denied');
+      else expect(result.stderrTail).toContain('incomplete leading line omitted');
+
+      const { handle, children, lines, advance } = setup({ env, manualFinish: true });
+      handle.notePoll({ ok: true, marked: [mark()] });
+      advance(15_000);
+      const tick = handle.tick();
+      await new Promise(resolve => setImmediate(resolve));
+      children[0].stderr.emit('data', stderr);
+      children[0].emit('close', 1);
+      const [diagnostic] = await tick;
+      expect([diagnostic.what, ...lines].join('\n')).not.toContain('q'.repeat(20));
+    }
+  });
+
+  it.each([true, false])('omits multiline private-key material crossing the stderr boundary (closed=%s)', async closed => {
+    const source = readFileSync(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
+    const runChild = new Function('redactSecrets', 'extractPassTimings',
+      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(redactSecrets, extractPassTimings);
+    const stderr = '-----BEGIN RSA PRIVATE KEY-----\n' + ('keyMaterial1234567890'.repeat(3) + '\n').repeat(180)
+      + (closed ? '-----END RSA PRIVATE KEY-----\nGraphQL: denied' : '');
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const pending = runChild({ env: {}, args: [], timeoutMs: 1000, spawnImpl: () => child });
+    child.stderr.emit('data', stderr);
+    child.emit('close', 1);
+    const result = await pending;
+    expect(result.stderrTail).not.toContain('keyMaterial');
+    expect(result.stderrTail).toContain('private-key material omitted');
+    if (closed) expect(result.stderrTail).toContain('GraphQL: denied');
+
+    const { handle, children, lines, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    const tick = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    children[0].stderr.emit('data', stderr);
+    children[0].emit('close', 1);
+    const [diagnostic] = await tick;
+    expect([diagnostic.what, ...lines].join('\n')).not.toContain('keyMaterial');
+    expect(diagnostic.what).toContain('private-key material omitted');
+  });
+
+  it('bounds hostile 200k stderr before redaction and finishes in well under one second', async () => {
+    const source = readFileSync(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
+    const redact = vi.fn(redactSecrets);
+    const runChild = new Function('redactSecrets', 'extractPassTimings',
+      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(redact, extractPassTimings);
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    const pending = runChild({ env: {}, args: [], timeoutMs: 1000, spawnImpl: () => child });
+    child.stderr.emit('data', 'a='.repeat(100_000));
+    const start = performance.now();
+    child.emit('close', 1);
+    const result = await pending;
+    expect(performance.now() - start).toBeLessThan(500);
+    expect(Math.max(...redact.mock.calls.map(([input]) => input.length))).toBeLessThanOrEqual(8000);
+    expect(result.stderrTail.length).toBeLessThanOrEqual(2000);
+  });
+
   it.each(['close', 'error'])('logs split timings after they leave the stderr tail on child %s', async (event) => {
     const { handle, lines, advance, children } = setup({ manualFinish: true });
     handle.notePoll({ ok: true, marked: [mark()] });

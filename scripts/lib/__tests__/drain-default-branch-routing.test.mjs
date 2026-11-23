@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildOpenPrPageQuery } from '../pr-list-paged.mjs';
 import { ghStderrTail } from '../gh-stderr-tail.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
@@ -65,11 +66,12 @@ it('keeps shared gh errors on the last nonempty line with the historical 300-cha
     .toBe(`Command failed — gh: ${'x'.repeat(300)}`);
 });
 
-it('keeps a collapsed 2000-character stderr tail only in the default-branch warning', async () => {
+it('keeps a collapsed 300-character stderr tail only in the default-branch warning', async () => {
   const stderr = `discarded ${'x'.repeat(2400)}\n actual\t cause`;
   const f = fixture(repos[1], stderr);
   expect(await f.create()(repos[1])).toBeNull();
-  expect(f.warnings.join('')).toContain(ghStderrTail({ stderr }, 2000).replace(/\s+/g, ' '));
+  expect(f.warnings.join('')).toContain(ghStderrTail({ stderr }, 300).replace(/\s+/g, ' '));
+  expect(f.warnings.join('')).not.toContain('x'.repeat(301));
   expect(f.warnings.join('')).not.toContain('discarded');
 });
 
@@ -85,7 +87,7 @@ it('redacts credentials before bounding and collapsing default-branch warning st
 
 // Exercise the actual CLI and its App refusal shim. Positional `repo view` must
 // select the target owner's installation through GH_REPO, even with a local ambient repo.
-function catchUpCli(unreadable = '') {
+function catchUpCli(unreadable = '', probeQuery = null) {
   const dir = mkdtempSync(join(tmpdir(), 'branch-routing-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -124,6 +126,10 @@ if (a[0] === 'repo' && a[1] === 'view') {
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/trunk')) { process.stdout.write('a'.repeat(40)); process.exit(0); }
 if (a[0] === 'api' && a[1] === 'graphql') {
   const query = a.find(v => v.startsWith('query=')) || '';
+  const expected = ${JSON.stringify(repos.map(repo => 'query=' + buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true })))};
+  if (!expected.includes(query)) {
+    process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
+  }
   const rows = query.includes('owner:"web-everything"') && query.includes('name:"web-everything"') ? [target] : [];
   const page = openPrPageFixture(rows, query);
   page.data.repository.pullRequests.nodes.forEach(p => { p.state = 'OPEN'; });
@@ -133,6 +139,10 @@ if (a[0] === 'pr' && a[1] === 'view' && a[2] === '7') out(target);
 // Refuse every mutation and unknown call instead of silently making the fixture pass.
 process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
 `, { mode: 0o755 });
+    if (probeQuery !== null) return spawnSync(process.execPath, [join(bin, 'gh'), 'api', 'graphql', '-f', `query=${probeQuery}`], {
+      encoding: 'utf8', env: { ...process.env, GH_REPO: localRepo,
+        ROUTING_CALLS: join(dir, 'calls.jsonl'), ROUTING_TARGET: join(dir, 'target.json') },
+    });
     const round = join(dir, 'round.json');
     const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../merge-ai-prs.mjs', import.meta.url)),
       '--only=7', '--this-repo', '--json', '--from-catch-up', `--listing-snapshot=${round}`,
@@ -145,8 +155,13 @@ process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
         WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1', WE_GH_THROTTLE_COST_HEADERS: '0',
         ROUTING_UNREADABLE: unreadable, ROUTING_CALLS: join(dir, 'calls.jsonl'), ROUTING_TARGET: join(dir, 'target.json') },
     });
-    return { ...result, calls: readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
-      round: existsSync(round) ? JSON.parse(readFileSync(round, 'utf8')) : null };
+    expect(result.stderr).not.toContain('unported fixture call');
+    const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+    const expected = repos.map(repo => 'query=' + buildOpenPrPageQuery({ repo, pageSize: 100, inventoryOnly: true }));
+    for (const call of calls.filter(c => c.args[0] === 'api' && c.args[1] === 'graphql')) {
+      expect(expected).toContain(call.args.find(a => a.startsWith('query=')));
+    }
+    return { ...result, calls, round: existsSync(round) ? JSON.parse(readFileSync(round, 'utf8')) : null };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -172,5 +187,15 @@ it.each(repos)('catch-up snapshot refuses unreadable branch %s before merge or e
   expect(r.stdout.trim()).toBe('');
   expect(r.round).toBeNull();
   expect(r.calls.some(c => c.args[0] === 'pr' && ['merge', 'edit'].includes(c.args[1]))).toBe(false);
-  expect(r.calls.some(c => c.args[0] === 'api' && c.args.some(a => /enqueuePullRequest|POST/.test(a)))).toBe(false);
+  expect(r.calls.some(c => c.args[0] === 'api' && c.args.some(a => /enqueuePullRequest|mergePullRequest|\bmutation\b|POST/.test(a)))).toBe(false);
 }, 40_000);
+
+it.each([
+  'mutation { mergePullRequest(input:{pullRequestId:"PR_7"}) { clientMutationId } }',
+  'mutation { enqueuePullRequest(input:{pullRequestId:"PR_7"}) { clientMutationId } }',
+  'query Unexpected { viewer { login } }',
+])('fake gh refuses unexpected GraphQL: %s', query => {
+  const result = catchUpCli('', query);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('unported fixture call');
+});

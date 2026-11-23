@@ -741,7 +741,38 @@ export function extractPassTimings(stderr) {
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
-    const output = () => ({ stdout, stderrTail: redactSecrets(stderr).slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
+    const secrets = Object.entries(env ?? {}).filter(([name, value]) =>
+      /token|secret|password|key|credential/i.test(name) && typeof value === 'string' && value.length >= 8)
+      .map(([, value]) => value);
+    const redact = (text) => {
+      for (const secret of secrets) text = text.split(secret).join('[redacted]');
+      return redactSecrets(text);
+    };
+    const output = () => {
+      const timings = extractPassTimings(stderr);
+      let tail = stderr.slice(-8000);
+      // A cut line may have lost its credential prefix. Omit it rather than log an unrecognisable suffix.
+      if (stderr.length > 8000) {
+        // Scan only PEM delimiters in the discarded prefix; full redaction still sees at most 8000 chars.
+        let inPrivateKey = false;
+        for (const marker of stderr.matchAll(/-----(BEGIN|END) [A-Z ]*PRIVATE KEY-----/g)) {
+          if (marker.index >= stderr.length - 8000) break;
+          inPrivateKey = marker[1] === 'BEGIN';
+        }
+        let omitted = 'incomplete leading line omitted';
+        if (inPrivateKey) {
+          const end = /-----END [A-Z ]*PRIVATE KEY-----/.exec(tail);
+          tail = end ? tail.slice(end.index + end[0].length) : '';
+          omitted = 'private-key material omitted';
+        } else {
+          const newline = tail.indexOf('\n');
+          tail = newline < 0 ? '' : tail.slice(newline + 1);
+        }
+        tail = '[stderr truncated: ' + omitted + ']\n' + redact(tail);
+      } else tail = redact(tail);
+      return { stdout, stderrTail: tail.slice(-2000),
+        passTimings: timings ? redact(timings.slice(0, 300)).slice(0, 300) : null, timedOut };
+    };
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
@@ -1185,7 +1216,7 @@ export function createEnqueueOnEvent({
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
         if (!r.timedOut && (r.code !== 0 || !json)) {
-          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
           if (stderr) what += ` (stderr: ${stderr})`;
         }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
@@ -1238,7 +1269,7 @@ export function createEnqueueOnEvent({
             verified = false;
             missed = true;
             const events = (membership.lastEvents || []).map(e => `${e.__typename}${e.createdAt ? ` at ${e.createdAt}` : ''}${e.reason ? `: ${e.reason}` : ''}`).join('; ') || 'no AddedToMergeQueue event';
-            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
+            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
             what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${events}; fast-drain stderr: ${stderr}) — retrying on the next catch-up`;
           }
         }
