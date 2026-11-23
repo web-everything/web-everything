@@ -13,8 +13,9 @@ function probe(mqSameHeadGuard) {
     ['summary-only runner loss', { summary: 'Runner disconnected' }, 'Process exited with code 1\n'],
     ['TAP failure with printed signature', {}, 'not ok 1 - assertion\nfatal: could not fetch X from promisor remote\n'],
     ['printed signature alone', {}, 'fatal: could not fetch X from promisor remote\n'],
+    ['oversized line with main red at removal', {}, 'x'.repeat(513) + '\n', true],
   ];
-  for (const [name, output, text] of cases) {
+  for (const [name, output, text, mainRedAtRemoval] of cases) {
     let logReads = 0;
     const response = pullRequest => JSON.stringify({ data: { repository: { pullRequest } } });
     const exec = (command, args) => {
@@ -34,15 +35,21 @@ function probe(mqSameHeadGuard) {
       }] });
       if (endpoint === `repos/${repo}/actions/jobs/9021/logs`) { logReads++; return text; }
       if (endpoint?.includes('/actions/workflows/ci.yml/runs?')) return JSON.stringify({ total_count: 1, workflow_runs: [{
-        id: 102, conclusion: 'success', status: 'completed', created_at: '2026-11-01T13:20:00Z',
-        updated_at: '2026-11-01T13:20:00Z', path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
+        id: mainRedAtRemoval && !endpoint.includes('created=<') ? 103 : 102,
+        conclusion: mainRedAtRemoval && endpoint.includes('created=<') ? 'failure' : 'success',
+        status: 'completed',
+        created_at: mainRedAtRemoval && !endpoint.includes('created=<') ? '2026-11-01T13:50:00Z' : '2026-11-01T13:20:00Z',
+        updated_at: mainRedAtRemoval && !endpoint.includes('created=<') ? '2026-11-01T13:50:00Z' : '2026-11-01T13:20:00Z',
+        path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push',
       }] });
       throw new Error('unexpected evidence read');
     };
     const decision = mqSameHeadGuard({ repo, pr: 6215, head, exec, now: Date.parse('2026-11-01T14:00:00Z'),
       quarantine: { readList: null } });
     if (decision.hold !== true) violations.push(`${name}: text authorized retry`);
-    if (logReads !== 1 || decision.mainRunId !== 102 || !/non-infrastructure/.test(decision.reason ?? ''))
+    if (mainRedAtRemoval && !decision.reason?.includes('non-infrastructure job log within 512-character line scan limit; operator must inspect failed jobs and enqueue manually'))
+      violations.push(`${name}: missing oversized-line operator inspection reason`);
+    if (logReads !== 1 || decision.mainRunId !== (mainRedAtRemoval ? 103 : 102) || !/non-infrastructure/.test(decision.reason ?? ''))
       violations.push(`${name}: missing readable-log, green-main non-infrastructure hold evidence`);
   }
   return violations;

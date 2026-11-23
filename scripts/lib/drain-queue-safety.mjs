@@ -20,6 +20,8 @@ const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.t
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
+const MQ_INFRA_SCAN_BYTES = 64 * 1024;
+const MQ_INFRA_LINE_CHARS = 512;
 const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 
@@ -900,6 +902,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
+          const tail = Buffer.from(text).subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
+          if (tail.split('\n').some(line => line.length > MQ_INFRA_LINE_CHARS))
+            logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
           // Readability alone never proves infrastructure.
         } catch (error) {
           unreadable.add(check.id);

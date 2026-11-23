@@ -227,6 +227,15 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
+  it('holds a readable oversized log line despite main red at removal and a CLEAN PR', () => {
+    const f = fixture({ logs: new Map([[21, 'x'.repeat(513) + '\n']]),
+      runs: [run(103, 'success', '2026-11-01T13:50:00Z'), run(102, 'failure')], mergeState: 'CLEAN' });
+    const decision = f.guard();
+    expect(decision.hold).toBe(true);
+    expect(decision.reason).toContain('non-infrastructure job log within 512-character line scan limit; operator must inspect failed jobs and enqueue manually');
+    expect(f.logReads.map(read => read.id)).toEqual([21]);
+  });
+
   it('holds oversized returned text with a signature at the end', () => {
     // Injected IO may return more than maxBuffer; the classifier must bound its scan too.
     const f = fixture({ logs: new Map([[21, 'x'.repeat(MAX_LOG_BYTES * 2) + '\n' + infraLog]]) });
