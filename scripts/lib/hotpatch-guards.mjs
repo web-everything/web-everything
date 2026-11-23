@@ -41,6 +41,9 @@ export async function receiptGuard(sha, readers) {
     for (const check of data.check_runs) {
       if (check.head_sha !== sha) return unknown();
       if (check.status !== 'completed') return result('wait', 'hotpatch-needs-ci-receipt');
+      // ci.yml intentionally disables the optional visual job (#2232); required suites still execute below.
+      if (check.name === 'visual' && check.conclusion === 'skipped' && check.app.id === TEST_CHECK_APP_ID
+        && testWorkflowBound({ suiteIds: [check.check_suite.id] }, workflows, sha)) continue;
       if (check.conclusion !== 'success') return result('fail', 'hotpatch-incomplete-ci-receipt');
     }
     if (await readers.fullSuite(sha, workflows) !== true) return result('unknown', 'hotpatch-full-suite-unproven');

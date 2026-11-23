@@ -47,6 +47,36 @@ describe('hotpatch admission', () => {
     const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].conclusion = 'skipped';
     expect((await receiptGuard(SHA, readers)).outcome).not.toBe('pass');
   });
+  it('permits the disabled visual job in an otherwise complete CI receipt', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.checks.check_runs.push({ ...data.checks.check_runs[0], id: 50, name: 'visual', conclusion: 'skipped' });
+    data.checks.total_count++;
+    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'pass' });
+  });
+  it.each(['test', 'test-shard (1)', 'test-shard (2)', 'smoke', 'daemon-soak'])(
+    'still refuses skipped required job %s alongside disabled visual', async name => {
+      const { data, readers } = hotpatchFixture();
+      data.checks.check_runs.push({ ...data.checks.check_runs[0], id: 50, name: 'visual', conclusion: 'skipped' });
+      data.checks.total_count++;
+      data.checks.check_runs.find(check => check.name === name).conclusion = 'skipped';
+      expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'fail' });
+    },
+  );
+  it.each(['other job', 'other app', 'other suite', 'other head', 'queued', 'failed', 'neutral'])(
+    'does not extend the disabled visual exception to %s', async kind => {
+      const { data, readers } = hotpatchFixture();
+      const check = { ...data.checks.check_runs[0], id: 50, name: 'visual', conclusion: 'skipped' };
+      if (kind === 'other job') check.name = 'optional';
+      if (kind === 'other app') check.app = { id: 1 };
+      if (kind === 'other suite') check.check_suite = { id: 99 };
+      if (kind === 'other head') check.head_sha = 'b'.repeat(40);
+      if (kind === 'queued') { check.status = 'queued'; check.conclusion = null; }
+      if (kind === 'failed') check.conclusion = 'failure';
+      if (kind === 'neutral') check.conclusion = 'neutral';
+      data.checks.check_runs.push(check); data.checks.total_count++;
+      expect((await receiptGuard(SHA, readers)).outcome).not.toBe('pass');
+    },
+  );
   it('missing or queued shards wait and shards from another suite cannot fill gaps', async () => {
     const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].check_suite = { id: 99 };
     expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait' });
@@ -135,6 +165,15 @@ describe('hotpatch production readers', () => {
   it('production receipts refuse successful jobs whose suite step was skipped', async () => {
     const f = production(); f.jobs[0].steps[0].conclusion = 'skipped';
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
+  });
+  it('production admission accepts disabled visual while proving required suite execution', async () => {
+    const f = production();
+    f.data.checks.check_runs.push({ ...f.data.checks.check_runs[0], id: 50, name: 'visual', conclusion: 'skipped' });
+    f.data.checks.total_count++;
+    f.jobs.push({ id: 50, name: 'visual', head_sha: SHA, status: 'completed', conclusion: 'skipped', steps: [] });
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
+    f.jobs[0].steps[0].conclusion = 'skipped';
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown', detail: 'hotpatch-full-suite-unproven' });
   });
   it('production receipts read escape-coded execution logs through the shared transport', async () => {
     const f = production(); f.logs[8] = `\x1b[32m${f.logs[8]}\x1b[0m`;
