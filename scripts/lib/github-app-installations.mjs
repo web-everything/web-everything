@@ -92,6 +92,32 @@ export function ownerFromRemoteUrl(url) {
  */
 export function ownerFromGhArgv(argv) {
   const args = Array.isArray(argv) ? argv.map(String) : [];
+  if (args[0] === 'api') {
+    // Parse `gh api` by option arity: an option's VALUE (--template, --jq, -H ...) is never an endpoint or a field.
+    // Self-contained: the daemon shim embeds this function via toString().
+    const valueFlags = ['-f', '-F', '-H', '-X', '-q', '-t', '-p', '--field', '--raw-field', '--header', '--method',
+      '--jq', '--template', '--input', '--hostname', '--cache', '--preview'];
+    const fieldFlags = ['-f', '-F', '--field', '--raw-field'];
+    let endpoint = null, owner = null, name = null;
+    for (let i = 1; i < args.length; i += 1) {
+      const a = args[i];
+      let field = null;
+      if (fieldFlags.includes(a)) field = args[++i];
+      else if (valueFlags.includes(a)) { i += 1; continue; }
+      else if (/^--(?:raw-)?field=/.test(a)) field = a.slice(a.indexOf('=') + 1);
+      else if (/^-[fF]./.test(a)) field = a.slice(2);
+      else if (a.startsWith('-')) continue;
+      else { if (endpoint === null) endpoint = a; continue; }
+      const m = /^(owner|name|repo)=([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(field ?? '');
+      if (m?.[1] === 'owner') owner = m[2];
+      else if (m) name = m[2];
+    }
+    if (endpoint === 'graphql') {
+      return owner && name && /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner) ? canonicalOwner(owner, name) : null;
+    }
+    const m = /^\/?repos\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/.exec(endpoint ?? '');
+    return m ? canonicalOwner(m[1], m[2]) : null;
+  }
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
     let v = null;
@@ -103,37 +129,6 @@ export function ownerFromGhArgv(argv) {
       const parts = v.split('/');
       return ownerOfSlug(parts.slice(-2).join('/'));
     }
-  }
-  if (args[0] === 'api') {
-    for (const a of args.slice(1)) {
-      const m = /^\/?repos\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/.exec(a);
-      if (m) return canonicalOwner(m[1], m[2]);
-    }
-  }
-  // The endpoint is the first positional after `api`, past flags and their values (a flag VALUE such as
-  // `--template graphql` is not the endpoint).
-  let endpoint = null;
-  if (args[0] === 'api') {
-    const valueFlags = new Set(['-f', '-F', '-H', '-X', '-q', '-t', '-p', '--field', '--raw-field', '--header', '--method',
-      '--jq', '--template', '--input', '--hostname', '--cache', '--preview']);
-    for (let i = 1; i < args.length; i += 1) {
-      const a = args[i];
-      if (valueFlags.has(a)) i += 1;
-      else if (!a.startsWith('-')) { endpoint = a; break; }
-    }
-  }
-  if (endpoint === 'graphql') {
-    let owner = null, name = null;
-    for (let i = 1; i < args.length; i += 1) {
-      const a = args[i];
-      let field;
-      if (['-f', '-F', '--field', '--raw-field'].includes(a)) field = args[++i];
-      else field = /^(?:-[fF]|--(?:raw-)?field=)(.*)$/.exec(a)?.[1];
-      const m = /^(owner|name|repo)=([A-Za-z0-9][A-Za-z0-9._-]*)$/.exec(field ?? '');
-      if (m?.[1] === 'owner') owner = m[2];
-      else if (m) name = m[2];
-    }
-    if (owner && name && /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) return canonicalOwner(owner, name);
   }
   return null;
 }

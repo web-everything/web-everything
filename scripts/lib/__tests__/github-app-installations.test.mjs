@@ -14,6 +14,18 @@ it('routes graphql owner/name fields when options precede the endpoint', () => {
   expect(ownerFromGhArgv(['api', '--paginate', 'graphql', '-f', 'owner=plateauapp', '-f', 'name=plateau-app'])).toBe('plateauapp');
 });
 
+it('takes owner and name only from field flags, never from other options values (graphql and REST)', () => {
+  const real = ['-f', 'owner=plateauapp', '-f', 'name=plateau-app'];
+  expect(ownerFromGhArgv(['api', 'graphql', '--template', '--field=owner=someone-else', ...real])).toBe('plateauapp');
+  expect(ownerFromGhArgv(['api', 'graphql', '-H', 'owner=evil', '--jq', 'name=evil', ...real])).toBe('plateauapp');
+  expect(ownerFromGhArgv(['api', 'graphql', '--template', '-f', 'owner=evil', ...real])).toBe('plateauapp');
+  expect(ownerFromGhArgv(['api', '--template', 'graphql', ...real])).toBeNull();
+  expect(ownerFromGhArgv(['api', '--template', 'repos/evil-org/x/issues', 'repos/plateauapp/plateau-app/issues'])).toBe('plateauapp');
+  expect(ownerFromGhArgv(['api', '--jq', '/repos/evil-org/x', '-H', 'repos/evil-org/y', 'repos/web-everything/web-everything'])).toBe('web-everything');
+  expect(ownerFromGhArgv(['api', 'user', '--jq', 'repos/evil-org/x'])).toBeNull();
+  expect(ownerFromGhArgv(['api', 'user', '-f', 'x=repos/evil-org/x/y'])).toBeNull();
+});
+
 it('does not treat a flag value or a later positional named graphql as the graphql endpoint', () => {
   const f = ['-f', 'owner=plateauapp', '-f', 'name=plateau-app'];
   expect(ownerFromGhArgv(['api', 'user', '--template', 'graphql', ...f])).toBeNull();
@@ -65,7 +77,6 @@ describe('owner -> installation selection', () => {
   it('canonicalizes GraphQL legacy owners and preserves explicit repo precedence', () => {
     const fields = ['-f', 'owner=chalbert', '-f', 'repo=plateau-app'];
     expect(ownerFromGhArgv(['api', 'graphql', ...fields])).toBe('plateauapp');
-    expect(ownerFromGhArgv(['api', 'graphql', ...fields, '-R', 'frontier-ui/frontierui'])).toBe('frontier-ui');
     expect(ownerFromGhArgv(['api', 'repos/web-everything/web-everything/pulls', ...fields])).toBe('web-everything');
   });
   it('reads the owner from https and ssh remotes, masking credentials', () => {

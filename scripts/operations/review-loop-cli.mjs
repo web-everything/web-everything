@@ -81,7 +81,7 @@ import { recordPostAcceptAdvisoryShadow, recordPostAcceptAdvisoryLoops, recordPo
 import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPolicy } from '../lib/unattended-review-accept.mjs';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
-import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence, sanitizeAcceptHoldReason } from '../conveyor/review-referral-hold.mjs';
+import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence, acceptHoldErrorReason } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -637,12 +637,15 @@ export async function runReviewLoopOnce({
       const live = unattendedAcceptableVerdict(run?.verdict, { roundCards }) ? readAcceptancePr(run.input) : {};
       return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
-    } catch (error) { return `live referrals unavailable: ${error.message}`; }
+    } catch (error) { holdErrorReason = acceptHoldErrorReason(error); return `live referrals unavailable: ${error.message}`; }
   };
+  let holdErrorReason = null;
   const acceptHold = (run, options) => {
-    const hold = sanitizeAcceptHoldReason(evaluateAcceptHold(run, options));
+    holdErrorReason = null;
+    const hold = evaluateAcceptHold(run, options);
     if (hold && run.pending?.kind === 'confirm') {
-      run.acceptHoldReason = sanitizeAcceptHoldReason(`Unattended accept parked: ${hold}`);
+      // Only a fixed class and the exit code are persisted; the raw error text never leaves the in-memory hold string.
+      run.acceptHoldReason = holdErrorReason ?? 'accept-hold:not-met';
       store.write(run);
     }
     return hold || null;

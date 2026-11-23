@@ -52,15 +52,28 @@ export const REFERRAL_RETRY_MS = [15, 30, 60].map(n => n * 60_000);
 const sha = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
-/** Safe, bounded diagnostic persisted beside a parked run and carried into operator alerts. */
+/** Fixed error classes for a park reason. Raw error text is never persisted or alerted (it can carry credentials). */
+export const PARK_ERROR_CLASSES = Object.freeze(['repo-not-resolved', 'auth', 'not-found', 'rate-limit', 'network', 'timeout', 'unknown']);
+const PARK_ERROR_PATTERNS = [
+  ['repo-not-resolved', /could not resolve to a repository/i],
+  ['rate-limit', /rate limit|secondary rate|abuse detection|\b429\b/i],
+  ['auth', /bad credentials|\b40[13]\b|requires authentication|resource not accessible|forbidden/i],
+  ['not-found', /\b404\b|not found/i],
+  ['timeout', /timed? ?out|ETIMEDOUT/i],
+  ['network', /ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|network|could not connect/i],
+];
+/** `live-referrals-unavailable:<class>:<exit code|none>` from a thrown error. Only table values leave this function. */
+export function acceptHoldErrorReason(error) {
+  let text = '';
+  try { text = `${error?.stderr ?? ''}\n${error?.message ?? ''}`; } catch { /* unreadable error text classifies as unknown */ }
+  const cls = PARK_ERROR_PATTERNS.find(([, re]) => re.test(text))?.[0] ?? 'unknown';
+  const code = Number.isSafeInteger(error?.status) ? error.status : Number.isSafeInteger(error?.code) ? error.code : null;
+  return `live-referrals-unavailable:${cls}:${code ?? 'none'}`;
+}
+/** A persisted or alerted park reason: a value shaped by {@link acceptHoldErrorReason} (or the fixed `accept-hold:not-met`), else ''. */
 export function sanitizeAcceptHoldReason(value) {
-  // Whitespace-like controls and line separators become a space (keeps `Bearer<TAB>token` redactable); the remaining
-  // invisible/format controls are dropped (so `ghp_s<ZWSP>ecret` is one token); only then is it redacted.
-  return typeof value === 'string' ? value
-    .replace(/[\t\n\r\v\f\u0085\u2028\u2029]/g, ' ')
-    .replace(/[\x00-\x1f\x7f-\x9f\p{Cf}\p{Cc}\u180e]/gu, '')
-    .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|Bearer\s+[^\s]+|x-access-token:[^\s/@]+/gi, '[REDACTED]')
-    .slice(0, 300) : '';
+  return typeof value === 'string' && (value === 'accept-hold:not-met'
+    || new RegExp(`^live-referrals-unavailable:(?:${PARK_ERROR_CLASSES.join('|')}):(?:-?[0-9]{1,4}|none)$`).test(value)) ? value : '';
 }
 
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
@@ -137,7 +150,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
-      ...(run.acceptHoldReason ? { acceptHoldReason: sanitizeAcceptHoldReason(run.acceptHoldReason) } : {}),
+      ...(sanitizeAcceptHoldReason(run.acceptHoldReason) ? { acceptHoldReason: run.acceptHoldReason } : {}),
       ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
@@ -158,7 +171,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
-    ...(run.acceptHoldReason ? { acceptHoldReason: sanitizeAcceptHoldReason(run.acceptHoldReason) } : {}),
+    ...(sanitizeAcceptHoldReason(run.acceptHoldReason) ? { acceptHoldReason: run.acceptHoldReason } : {}),
     ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
     ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
     // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
@@ -885,9 +898,9 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
       if (isUnderTest(process.env)) return false;
       publish = item => publishAttention(item, { now });
     }
-    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict', reviewRunCount: hold.count,
-      ...(hold.lastParkReason ? { lastParkReason: sanitizeAcceptHoldReason(hold.lastParkReason) } : {}),
-      reason: (hold.lastParkReason ? `${sanitizeAcceptHoldReason(hold.lastParkReason)}; ` : '')
+    const item = { repo, pr: Number(prNumber), head: hold.head, kind: 'review-no-verdict',
+      ...(sanitizeAcceptHoldReason(hold.lastParkReason) ? { lastParkReason: sanitizeAcceptHoldReason(hold.lastParkReason) } : {}),
+      reason: (sanitizeAcceptHoldReason(hold.lastParkReason) ? `${sanitizeAcceptHoldReason(hold.lastParkReason)}; ` : '')
         + `review verdict never landed after ${hold.count} runs and ${hold.noVerdict?.releasesSpent ?? 0} cool-down retries; held until a push or re-arm`,
       pick: `https://github.com/${repo}/pull/${prNumber}` };
     const announce = () => log(`${repo}#${prNumber} NEEDS-YOU review-no-verdict head ${hold.head.slice(0, 9)}: ${hold.count} runs, `
@@ -897,10 +910,10 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     try {
       actions = store ?? createActionStore({ root: needsYouClaimRoot(dir), now: () => now });
       resource = actionResource(repo, { type: 'pr', id: String(prNumber) });
-      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head && r.evidence?.count === hold.count
+      const done = actions.attempts(resource).some(r => r.kind === NO_VERDICT_NEEDS_YOU_KIND && r.evidence?.head === hold.head
         && r.state === 'terminal' && r.outcome === 'settled');
       if (done) return false;
-      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head, count: hold.count },
+      claimed = actions.claim({ resource, kind: NO_VERDICT_NEEDS_YOU_KIND, owner, evidence: { head: hold.head },
         reconcile: record => actions.reconcile(record, { listAgents: () => [], findEffect: () => ({ found: false }),
           postconditionHolds: () => true, owner }) });
     } catch (e) {
@@ -915,7 +928,7 @@ export function raiseNoVerdictNeedsYou({ repo, prNumber, hold, dir, now = Date.n
     // Claiming may have reconciled an expired attempt for this head into `settled` (it had published): then it is done.
     try {
       if (actions.attempts(resource).some(r => r.attempt !== rec.attempt && r.kind === NO_VERDICT_NEEDS_YOU_KIND
-        && r.evidence?.head === hold.head && r.evidence?.count === hold.count && r.state === 'terminal' && r.outcome === 'settled')) {
+        && r.evidence?.head === hold.head && r.state === 'terminal' && r.outcome === 'settled')) {
         actions.release(resource, rec.attempt, { token: rec.ownerToken, rev: rec.rev });
         return false;
       }

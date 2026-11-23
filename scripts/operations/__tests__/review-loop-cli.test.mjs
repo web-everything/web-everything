@@ -1484,21 +1484,15 @@ describe('unattended acceptance safety boundary', () => {
   // Undeclared impact still requires prevention capture, without a `broken` finding.
   const noBroken = { ...PREVENTION_ANSWER,
     findings: PREVENTION_ANSWER.findings.map(({ impactIfUnfixed, ...f }) => f) };
-  it.each(['ghp_secret', 'gho_secret', 'ghu_secret', 'ghs_secret', 'ghr_secret',
-    'github_pat_secret_123', 'Bearer secret', 'x-access-token:secret'])
-  ('persists a bounded redacted live-referral park reason for credential %s', async credential => {
+  it.each([['Could not resolve to a Repository ghp_secret', 'repo-not-resolved', 1], ['HTTP 401 Bad credentials Bearer secret', 'auth', 1], ['boom x-access-token: secret', 'unknown', 1]])
+  ('persists only a fixed error class and exit code as the live-referral park reason: %s', async (message, cls, status) => {
     const { declaration, registry } = registryFor({ rev: HEAD_A });
     const store = createMemoryRunStore();
     const out = await driveReviewLoopOnce({ declaration, registry, argv: BASE_ARGV, store,
       sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'park-reason',
-      readAcceptancePr: () => { throw new Error(credential + '\u001b\n detail: ' + 'x'.repeat(500)); } });
+      readAcceptancePr: () => { throw Object.assign(new Error(message), { status }); } });
     expect(out.stopped).toBe('confirm');
-    const reason = store.read(out.run.id).acceptHoldReason;
-    expect(reason).toHaveLength(300);
-    expect(reason).toMatch(/^Unattended accept parked: live referrals unavailable:/);
-    expect(reason).toContain('[REDACTED]');
-    expect(reason).not.toMatch(/secret|[\x00-\x1f\x7f]/);
-    expect(out.lines.join('\n')).not.toContain('secret');
+    expect(store.read(out.run.id).acceptHoldReason).toBe(`live-referrals-unavailable:${cls}:${status}`);
   });
   it('prevention-outstanding with clean referrals and no broken finding files then accepts', async () => {
     const { declaration, registry } = registryFor({ rev: HEAD_A });
