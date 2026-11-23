@@ -1843,7 +1843,9 @@ describe('detached jobs', () => {
       expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
       worker.kill('SIGKILL');
       await exited;
-      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+      // The budget must outlast one slow real `ps` probe (PID_START_TIMEOUT_MS) on a loaded shard, or the
+      // wait ends 'running' before it can observe the exit.
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 8000 }))
         .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {
