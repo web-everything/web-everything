@@ -3,8 +3,7 @@ bornAs: xykd1x3
 kind: story
 size: 2
 status: open
-scopeRationale: "only we:.conveyor/queue.json is exempt: it is the stale in-checkout path being replaced, not a deliverable; the two plateau files in scope stay fully checked"
-scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts"]
+scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts", "we:.conveyor/queue.json"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-09-30"
 preparedAgainstSha: "c95b5628eb1aefc7b7e52a12cd9fb17597303dce"

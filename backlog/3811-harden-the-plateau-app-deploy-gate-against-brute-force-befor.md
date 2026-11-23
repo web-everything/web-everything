@@ -80,4 +80,4 @@ Plateau's new automated throttle/session tests pass, real preview evidence demon
 
 Parked 2026-11-22 (plateau ruling, master plan). Unpark when: before any external user gets access (first customer or public beta).
 
-Gate card: x9sujbc (First external access (beta) release gate) is blockedBy this card. Unpark when the first-external-access gate card is scheduled.
+Gate card: x9sujbc (First external access (beta) release gate) refuses outside access while this card is not resolved. Unpark when the first-external-access gate card is scheduled.

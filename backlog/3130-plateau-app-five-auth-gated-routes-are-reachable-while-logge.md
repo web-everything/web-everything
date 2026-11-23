@@ -15,4 +15,4 @@ Found while preparing #2512 (route-prefix migration). plateau-app:src/main.ts's 
 
 Parked 2026-11-22 (PL-BETA-GUARDS: park until beta; beats the master-plan merge into DZ-SHELL). Unpark when: first external user gets access (first customer or public beta). The new route table (DZ-SHELL) should still declare a guard per route.
 
-Gate card: x9sujbc (First external access (beta) release gate) is blockedBy this card. Unpark when the first-external-access gate card is scheduled.
+Gate card: x9sujbc (First external access (beta) release gate) refuses outside access while this card is not resolved. Unpark when the first-external-access gate card is scheduled.
