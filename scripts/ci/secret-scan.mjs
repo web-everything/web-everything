@@ -63,7 +63,7 @@ function addedStructureFinding(bytes, gaps = []) {
   // A zero-context diff may contain only new private members of an existing public
   // JWK. Supply a conservative type witness to the SAME detector around fragments
   // and unclosed objects only. Complete added objects must supply their own key
-  // evidence: injecting a type into {p:"Paragraph"} would invent a private key.
+  // evidence: injecting a type into {p:"Paragraph"} would invent private material.
   // `oct` covers asymmetric and symmetric private members; missing-context member
   // fragments remain ambiguous and are intentionally rejected conservatively.
   // Skip literals/comments so braces inside them cannot corrupt the member view.
