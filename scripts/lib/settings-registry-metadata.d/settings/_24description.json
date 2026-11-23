@@ -1,0 +1,6 @@
+{
+  "description": "Documentation of tests-first delivery policy.",
+  "owner": "scripts/settings/tests-first.json",
+  "changeVia": "pr",
+  "instant": false
+}

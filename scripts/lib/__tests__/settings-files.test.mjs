@@ -172,6 +172,16 @@ describe('readSettingsChecked — fail-closed evidence', () => {
     finally { rmSync(root, { recursive: true, force: true }); }
   }
 
+  it('standalone timeout policy never becomes a conveyor namespace, including unreadable policy bytes', () => fixture((options) => {
+    writeFileSync(join(options.dir, 'test-timeout-policy.json'), '{"tests":{"a.test.mjs":{"soft":"PT1S"}}}');
+    expect(readSettingsChecked(options)).toEqual({ value: {}, taint: [], duplicates: [] });
+    expect(readDeclaredSettings(options).sources).not.toContain('settings/test-timeout-policy.json');
+    writeFileSync(join(options.dir, 'test-timeout-policy.json'), '{invalid');
+    expect(readSettingsChecked(options)).toEqual({ value: {}, taint: [], duplicates: [] });
+    writeFileSync(join(options.dir, 'other-policy.json'), '{"tests":{"a.test.mjs":{"soft":"PT1S"}}}');
+    expect(readSettingsChecked(options).taint).toEqual([{ source: 'settings/other-policy.json', reason: 'dotted key' }]);
+  }));
+
   it('clean reads select whole trees, subtrees and leaves with empty taint', () => fixture((options) => {
     writeFileSync(options.legacyPath, '{"fixDispatch":{"parkedCapFactor":2}}');
     writeFileSync(join(options.dir, 'a.json'), '{"fixDispatch":{"other":3},"cap":4}');
@@ -465,7 +475,10 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     // Inventories inspect individual files for ownership, but also read scripts/settings/ through the checked
     // loader. Keep them out of LEGACY_ONLY_READERS: overlay-dropped uses that list to warn about lost settings.
     // settings-registry.test.mjs covers feature-file values, shared ownership and fail-closed checked reads.
-    const declarationInventories = ['scripts/lib/settings-registry.mjs'];
+    // The generated-doc merge resolver and its soak break only LIST the settings files as regeneration inputs
+    // (a digest of paths); neither reads a setting value from the legacy file.
+    const declarationInventories = ['scripts/lib/settings-registry.mjs', 'scripts/lib/daemon-rebuild/advisory-merge.mjs',
+      'scripts/conveyor/soak/breaks/settings-registry-doc-conflict-regenerated.mjs'];
     const root = join(SETTINGS_DIR, '..', '..');
     const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     const direct = [];

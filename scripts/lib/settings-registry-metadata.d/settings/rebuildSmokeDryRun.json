@@ -1,0 +1,6 @@
+{
+  "description": "PR sample, snapshot age and lane list cache for dry-run smoke.",
+  "owner": "scripts/settings/rebuild-smoke.json",
+  "changeVia": "pr",
+  "instant": false
+}

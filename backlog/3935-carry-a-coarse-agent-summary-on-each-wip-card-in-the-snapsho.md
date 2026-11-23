@@ -17,3 +17,5 @@ tags: []
 ## Done when
 
 1. **Executable** — `npx vitest run src/wip` in plateau-app passes with new cases: the relay refuses a snapshot whose `agent.state` is outside the vocabulary or has an unknown field; the view renders a stale snapshot's agent line with "as of N min ago" and never as running; a failed `agents` source (new `WipSource`) renders `?`, never "No agent found".
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

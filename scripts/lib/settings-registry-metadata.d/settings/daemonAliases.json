@@ -1,0 +1,6 @@
+{
+  "description": "Alias names mapped to canonical daemon roles.",
+  "owner": "scripts/settings/prototype-load.json",
+  "changeVia": "pr",
+  "instant": false
+}

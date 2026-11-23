@@ -218,9 +218,9 @@ describe('red-team probe policy cascade', () => {
       sources: { recheckReadsRepo: 'standard', skipCardOnly: 'standard' } });
   });
   it('resolves each key independently through platform, tool and env', () => {
-    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false, skipCardOnly: false },
-      file: { redTeam: { recheckReadsRepo: true } }, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'on' } }))
-      .toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: true }, sources: { recheckReadsRepo: 'tool', skipCardOnly: 'env' } });
+    expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false, skipCardOnly: true },
+      file: { redTeam: { recheckReadsRepo: true } }, env: { WE_RED_TEAM_SKIP_CARD_ONLY: 'off' } }))
+      .toMatchObject({ value: { recheckReadsRepo: true, skipCardOnly: false }, sources: { recheckReadsRepo: 'tool', skipCardOnly: 'env' } });
     expect(resolveRedTeamProbes({ platform: { recheckReadsRepo: false } }).sources.recheckReadsRepo).toBe('platform');
   });
   it('invalid overrides retain the lower layer', () => {
@@ -562,4 +562,33 @@ describe('planRedTeamActions: class deferral × confirmed × impact', () => {
     const setting = { ...CONFIRMED_BREAKS_DEFAULTS, unconfirmed: 'send-back', findingClasses: deferredClasses };
     expect(where(planRedTeamActions({ findings: [f] }, setting), f)).toBe('sendBack');
   });
+});
+
+it('a later policy-clear cannot supersede an unresolved confirmed break without a stored seal', () => {
+  const comments = [
+    bot(BODY_4722),
+    bot(`<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->
+Red team not required on this head: card-only diff.`, '2026-10-10T03:04:41Z'),
+  ];
+  const disposition = readRedTeamDisposition({ comments, pr: 4722, head: HEAD, env: {} });
+  expect(disposition.result.findings.some(f => f.confirmed)).toBe(true);
+  expect(disposition.sendBack.map(f => f.index)).toContain(1);
+});
+
+
+it.each([
+  ['incomplete marker', `<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->`],
+  ['completed clean review', renderRedTeamComment({ pr: 4722, rev: HEAD, findings: [],
+    provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' })],
+])('a policy-clear after an intervening %s cannot bury an earlier confirmed break', (_name, body) => {
+  const comments = [
+    bot(BODY_4722),
+    bot(body, '2026-10-10T03:04:41Z'),
+    bot(`<!-- we:red-team-advisory pr=4722 rev=${HEAD} -->
+Red team not required on this head: card-only diff.`, '2026-10-10T04:04:41Z'),
+  ];
+  const disposition = readRedTeamDisposition({ comments, pr: 4722, head: HEAD, env: {}, sealed: null });
+  expect(disposition.result.policyClear).not.toBe(true);
+  expect(disposition.result.findings.some(f => f.confirmed)).toBe(true);
+  expect(disposition.sendBack.map(f => f.index)).toContain(1);
 });

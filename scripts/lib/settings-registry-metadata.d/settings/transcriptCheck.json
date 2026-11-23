@@ -1,0 +1,6 @@
+{
+  "description": "Post-run Codex transcript diagnostics mode and token cap.",
+  "owner": "scripts/settings/codex-transcript-check.json",
+  "changeVia": "pr",
+  "instant": false
+}

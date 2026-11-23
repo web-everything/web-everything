@@ -1,0 +1,415 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://everstandards.dev/core/0.1.0/verdict.schema.json",
+  "title": "core/verdict v0.1: three-state verdict and the separate finding, as in-toto Statement v1 predicates (status: draft)",
+  "$comment": "Type ids https://everstandards.dev/core/verdict/v0.1 and https://everstandards.dev/core/finding/v0.1. Traces: standards.D7 (Fork 1 a, R5, R6), standards.D6. Predicates are closed (noted per the in-toto README); the Statement level stays open.",
+  "$defs": {
+    "coreReason": {
+      "description": "[CORE-VRD-013] Core unknown reasons.",
+      "enum": [
+        "missing",
+        "stale",
+        "inconclusive",
+        "not-run",
+        "unverifiable",
+        "error"
+      ]
+    },
+    "reason": {
+      "description": "[CORE-VRD-013] A core reason, a private-use x- reason, or a registered reason named by an absolute https URI. Unrecognised reasons fail closed (CORE-VRD-015).",
+      "type": "string",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/coreReason"
+        },
+        {
+          "pattern": "^x-[a-z0-9][a-z0-9-]{0,62}$"
+        },
+        {
+          "format": "uri",
+          "pattern": "^https://"
+        }
+      ]
+    },
+    "party": {
+      "description": "[CORE-VRD-014] Who owes the proof: 'creator' or an absolute https URI.",
+      "type": "string",
+      "anyOf": [
+        {
+          "const": "creator"
+        },
+        {
+          "format": "uri",
+          "pattern": "^https://"
+        }
+      ]
+    },
+    "policyRef": {
+      "description": "[CORE-VRD-016] The evaluated policy, bound by URI and digest (e.g. the gate definition's git tree).",
+      "type": "object",
+      "required": [
+        "uri",
+        "digest"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri"
+        },
+        "digest": {
+          "$ref": "evidence.schema.json#/$defs/digestSet"
+        }
+      },
+      "additionalProperties": false
+    },
+    "examined": {
+      "description": "[CORE-VRD-018] What was actually examined; count >= 1 is required on pass.",
+      "type": "object",
+      "required": [
+        "count",
+        "unit"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verdictPredicate": {
+      "type": "object",
+      "required": [
+        "verdict",
+        "policy",
+        "evidence",
+        "evaluatedAt"
+      ],
+      "properties": {
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "unknown"
+          ],
+          "description": "[CORE-VRD-003]"
+        },
+        "reason": {
+          "$ref": "#/$defs/reason"
+        },
+        "owedBy": {
+          "$ref": "#/$defs/party"
+        },
+        "attempted": {
+          "type": "string",
+          "minLength": 1
+        },
+        "policy": {
+          "$ref": "#/$defs/policyRef"
+        },
+        "evaluatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "[CORE-VRD-009]"
+        },
+        "evaluator": {
+          "type": "string",
+          "format": "uri",
+          "description": "[CORE-VRD-024] SHOULD"
+        },
+        "examined": {
+          "$ref": "#/$defs/examined"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "evidence.schema.json#/$defs/evidenceRef"
+          },
+          "description": "[CORE-VRD-017]"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "const": "unknown"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "enum": [
+                  "pass",
+                  "fail"
+                ]
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "unverifiable"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "owedBy",
+              "attempted"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "owedBy"
+                  ]
+                },
+                {
+                  "required": [
+                    "attempted"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "const": "pass"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "examined"
+            ],
+            "properties": {
+              "examined": {
+                "type": "object",
+                "properties": {
+                  "count": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              },
+              "evidence": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "verdict": {
+      "description": "[CORE-VRD-012] Verdict Statement.",
+      "type": "object",
+      "required": [
+        "_type",
+        "subject",
+        "predicateType",
+        "predicate"
+      ],
+      "properties": {
+        "_type": {
+          "const": "https://in-toto.io/Statement/v1"
+        },
+        "subject": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "evidence.schema.json#/$defs/subject"
+          },
+          "description": "[CORE-VRD-002]"
+        },
+        "predicateType": {
+          "const": "https://everstandards.dev/core/verdict/v0.1"
+        },
+        "predicate": {
+          "$ref": "#/$defs/verdictPredicate"
+        }
+      }
+    },
+    "findingPredicate": {
+      "description": "[CORE-VRD-021][CORE-VRD-022] One result. Never a verdict.",
+      "type": "object",
+      "required": [
+        "ruleId",
+        "disposition"
+      ],
+      "properties": {
+        "ruleId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "disposition": {
+          "enum": [
+            "blocker",
+            "carve-out",
+            "nit"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "location": {
+          "type": "string"
+        },
+        "fingerprints": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "[CORE-VRD-023] SARIF partialFingerprints/fingerprints, reused for the cross-round link"
+        },
+        "unverifiable": {
+          "type": "object",
+          "required": [
+            "owedBy",
+            "attempted"
+          ],
+          "properties": {
+            "owedBy": {
+              "$ref": "#/$defs/party"
+            },
+            "attempted": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "native": {
+          "type": "object",
+          "description": "the native SARIF 2.1.0 result, kept as-is (D7 R1)"
+        }
+      },
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "verdict"
+            ]
+          },
+          {
+            "required": [
+              "reason"
+            ]
+          }
+        ]
+      },
+      "additionalProperties": false
+    },
+    "finding": {
+      "description": "[CORE-VRD-021] Finding Statement, its own predicate type.",
+      "type": "object",
+      "required": [
+        "_type",
+        "subject",
+        "predicateType",
+        "predicate"
+      ],
+      "properties": {
+        "_type": {
+          "const": "https://in-toto.io/Statement/v1"
+        },
+        "subject": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "evidence.schema.json#/$defs/subject"
+          }
+        },
+        "predicateType": {
+          "const": "https://everstandards.dev/core/finding/v0.1"
+        },
+        "predicate": {
+          "$ref": "#/$defs/findingPredicate"
+        }
+      }
+    },
+    "mapping": {
+      "description": "[CORE-VRD-008][CORE-VRD-020] Outward-only mapping table.",
+      "type": "object",
+      "required": [
+        "passingValues",
+        "rows"
+      ],
+      "properties": {
+        "module": {
+          "type": "string"
+        },
+        "$comment": {
+          "type": "string"
+        },
+        "passingValues": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "from"
+            ],
+            "properties": {
+              "from": {
+                "enum": [
+                  "pass",
+                  "fail",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

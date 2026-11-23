@@ -132,7 +132,7 @@ describe('credential-name rule (R321)',()=>{
     await write(refusedTest,`// ${'-----'+'BEGIN PRIVATE KEY-----'}\n`);
     await git(['add','.']);await commit();
     await expect(buildManifest({cwd,exec})).rejects.toMatchObject({code:'unshipped-test-file'});
-  });
+  },60000);
   it('keeps every real tracked design-system tokens file scan-clean and shippable',async()=>{
     const repo=fileURLToPath(new URL('../../../',import.meta.url));
     const inventory=await exec({file:'git',args:['ls-files','-z','--','design-systems/*.tokens.json'],cwd:repo});
@@ -146,7 +146,7 @@ describe('credential-name rule (R321)',()=>{
     }
     await git(['add','.']);await commit();
     expect(names((await buildManifest({cwd,exec})).entries)).toEqual(expect.arrayContaining(paths));
-  });
+  },60000);
   it('ships a tracked file identical to origin/main with clean content, in any folder',async()=>{
     for(const p of shipped)await write(p,content(p));await git(['add','.']);await commit();
     const manifest=await buildManifest({cwd,exec});

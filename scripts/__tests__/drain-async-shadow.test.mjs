@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { createAsyncShadow, summarize } from '../lib/drain-async-shadow.mjs';
 
 const roots = [];
-const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'async-shadow-')); roots.push(dir); return dir; };
+const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'async-shadow-')); roots.push(dir); return dir; };
 const lines = path => readFileSync(path, 'utf8').trim().split('\n').map(JSON.parse);
 const candidate = { repo: 'owner/repo', num: 7, headSha: 'head-a', readyAtMs: 10 };
 const key = c => `${c.repo}#${c.num}@${c.headSha}`;
@@ -252,15 +253,15 @@ describe('drain async shadow mode resolution', () => {
   const observe = shadow => { shadow.observePass({ candidates: [candidate] }); shadow.recordActual(candidate); };
   const rowsAt = root => join(root, 'drain-async-shadow', 'shadow.jsonl');
 
-  it('createAsyncShadow with WE_ASYNC_DRAIN unset records rows (shadow is the default)', () => {
+  it('createAsyncShadow with WE_ASYNC_DRAIN unset writes nothing (retired default)', () => {
     const root = temp();
     observe(createAsyncShadow({ env: { WE_COORDINATION_ROOT: root }, now: () => 100 }));
-    expect(lines(rowsAt(root))).toHaveLength(1);
+    expect(existsSync(rowsAt(root))).toBe(false);
   });
 
-  it('the repo tool-layer setting drain.asyncShadow is shadow, never a plist env', () => {
+  it('the repo tool-layer setting drain.asyncShadow is off, never a plist env', () => {
     const file = JSON.parse(readFileSync(join(process.cwd(), 'scripts', 'settings', 'drain-async-shadow.json'), 'utf8'));
-    expect(file.drain.asyncShadow).toBe('shadow');
+    expect(file.drain.asyncShadow).toBe('off');
   });
 
   it('explicit off (env or option) is the opt-out and writes nothing', () => {

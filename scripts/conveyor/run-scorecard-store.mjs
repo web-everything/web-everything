@@ -44,6 +44,7 @@ import { dirname, join, resolve } from 'node:path';
 import { scrubReasons } from '../lib/secret-scrub.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-rebuild.mjs';
 import { withInfraLock } from './infra-blocked.mjs';
+import { appendRotationShadow } from '../lib/provider-rotation-shadow.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -367,10 +368,25 @@ function appendRowToStore(row, io, alreadyJudged = () => false) {
     if (alreadyJudged(store.records)) return null;
     store.records.push(stamped);
     writeStore(store, io);
+    observeRecords = store.records;
     return stamped;
   };
-  if (io.write !== undefined) return appendRow();
-  return withStoreLock(io.path ?? resolveScorecardStorePath(), appendRow, io.requireLock === true);
+  // The shadow observation runs AFTER the lock is released: a slow or throwing observer must never delay or
+  // lose a scorecard write (the lock has a 5 s unlocked fallback and 15 s stale-lock theft).
+  let observeRecords = null;
+  const observe = () => {
+    if (observeRecords === null) return;
+    try {
+      appendRotationShadow(stamped, { storePath: io.path ?? resolveScorecardStorePath(), records: observeRecords,
+        // In-memory store fixtures have no sidecar unless explicitly requested.
+        ...(io.write !== undefined && io.rotationShadow === undefined ? { append: () => {} } : {}),
+        ...io.rotationShadow });
+    } catch { /* Shadow observations must never alter or fail a scored dispatch. */ }
+  };
+  const result = io.write !== undefined ? appendRow()
+    : withStoreLock(io.path ?? resolveScorecardStorePath(), appendRow, io.requireLock === true);
+  observe();
+  return result;
 }
 
 /**
