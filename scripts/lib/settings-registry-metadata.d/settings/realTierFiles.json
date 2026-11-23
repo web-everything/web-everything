@@ -1,5 +1,5 @@
 {
-  "description": "Required inventory of real-process test files; an empty manifest permits the scheduled tier scaffold to collect no tests.",
+  "description": "Required non-empty inventory of real-process test files; each file must contain an unmocked subprocess call reachable from an active test.",
   "owner": "scripts/settings/real-tier-manifest.json",
   "changeVia": "pr",
   "instant": false

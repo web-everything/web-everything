@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 166 (168 declaration rows).
-- Declared leaves: 620 (platform copies counted separately).
+- Declared leaves: 629 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 166.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -169,11 +169,11 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
-| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
+| providerRotation | scripts/settings/provider-rotation.json | 33 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
-| realTierFiles | scripts/settings/real-tier-manifest.json | 1 | ["scripts/__tests__/merge-ai-prs-listing-dedupe.real.test.m… | pr | no | Required inventory of real-process test files; an empty manifest permits the scheduled tier scaffold to collect no tests. |
+| realTierFiles | scripts/settings/real-tier-manifest.json | 1 | ["scripts/__tests__/merge-ai-prs-listing-dedupe.real.test.m… | pr | no | Required non-empty inventory of real-process test files; each file must contain an unmocked subprocess call reachable from an active test. |
 | rebuildSmoke | scripts/settings/rebuild-smoke.json | 5 | {"reuseEnabled":true,"reuseHours":12,"bootSignalRetries":1,… | pr | no | Reuse of passing rebuild proofs and boot retry/concurrency bounds. |
 | rebuildSmokeDryRun | scripts/settings/rebuild-smoke.json | 3 | {"prSample":12,"snapshotStaleOkMs":900000,"lanePoolListCach… | pr | no | PR sample, snapshot age and lane list cache for dry-run smoke. |
 | rebuildSmokeReadMemo | scripts/settings/rebuild-smoke.json | 1 | {"enabled":true} | pr | no | Share identical read-only GitHub calls within a rebuild smoke. |

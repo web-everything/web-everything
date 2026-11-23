@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 concurrency:
   group: real-tests
@@ -28,6 +27,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -39,11 +39,33 @@ jobs:
 
       - name: Real-process suite
         id: real
-        continue-on-error: true
         run: npm run test:real -- --reporter=default --reporter=json --outputFile=real-tests.json
 
-      - name: Report a failure as a health smell (never fails the workflow)
-        if: steps.real.outcome == 'failure'
+      - name: Preserve failure details when available
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-test-results
+          path: real-tests.json
+          if-no-files-found: ignore
+
+  # A fresh runner reports setup/install failures and job timeouts too. No suite-step output is required.
+  report:
+    needs: real
+    if: failure() || cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Download details if the suite produced them
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: real-test-results
+
+      - name: Report a failure as a health smell
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -72,11 +94,3 @@ jobs:
           else
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label health-smell --body "$body"
           fi
-
-      # The issue above is the card; the run itself must not read green when the tier failed. Scheduled, so
-      # this reddens only this workflow and never a PR or main gate.
-      - name: Fail the run when the tier failed
-        if: steps.real.outcome == 'failure'
-        run: |
-          echo "::error::real-process tier failed; health-smell issue opened or updated."
-          exit 1

@@ -208,16 +208,12 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   assert.ok(md.includes('M-impact tail has not converged'));
 });
 
-// Immutable compact snapshot captured before the per-key migration (not regenerated).
-const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
-function originalRepositoryFixture(t) {
-  const f = { ...fixture(t), meta: structuredClone(originalMetadata) };
+// Reconstruct the monolithic layout from today's per-key metadata and declarations.
+function liveRepositoryFixture(t) {
+  const f = { ...fixture(t), meta: readMetadata({ root: ROOT }) };
   rmSync(join(f.root, 'scripts/settings/feature.json'));
-  // Later settings must not change the historical migration input or its pinned document hash.
   for (const row of buildRegistry().rows) for (const owner of row.owners) {
-    const declared = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
-    f.write(owner, Object.fromEntries(Object.entries(declared).filter(([key]) =>
-      key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
+    f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
   }
   f.write(META, f.meta);
   return f;
@@ -235,12 +231,21 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the registry built from the original repository metadata JSON', t => {
-  const f = originalRepositoryFixture(t), before = buildRegistry({ root: f.root });
-  assert.deepEqual(before.problems, []);
+test('migration preserves the LIVE registry with all current per-key metadata', t => {
+  const f = liveRepositoryFixture(t), live = buildRegistry({ root: ROOT });
+  assert.deepEqual(live.problems, []);
+  assert.deepEqual(buildRegistry({ root: f.root }), live);
   split(f);
-  assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
-  assert.deepEqual(buildRegistry({ root: f.root }), before);
+  assert.deepEqual(readMetadata({ root: f.root }), readMetadata({ root: ROOT }));
+  assert.deepEqual(buildRegistry({ root: f.root }), live);
+});
+test('live comparison detects drift in a per-key description', t => {
+  const f = liveRepositoryFixture(t);
+  split(f);
+  const path = `${META_DIR}/settings/providerRotation.json`;
+  const metadata = JSON.parse(readFileSync(join(f.root, path), 'utf8'));
+  f.write(path, { ...metadata, description: 'Stale provider rotation description.' });
+  assert.throws(() => assert.deepEqual(buildRegistry({ root: f.root }), buildRegistry({ root: ROOT })));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -354,12 +359,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('historical documentation preserves original bytes except the intentional per-key authoring instruction', t => {
-  const f = originalRepositoryFixture(t);
-  split(f);
-  const doc = renderMarkdown(buildRegistry({ root: f.root }));
-  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
-  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+test('generated documentation hash matches the current LIVE registry', () => {
+  const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
+  const generated = renderMarkdown(buildRegistry({ root: ROOT }));
+  const hash = text => createHash('sha256').update(text).digest('hex');
+  assert.equal(hash(doc), hash(generated));
+  assert.notEqual(hash(doc + '\nStale inventory\n'), hash(generated));
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
