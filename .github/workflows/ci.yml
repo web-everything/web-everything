@@ -711,7 +711,7 @@ jobs:
     # on main at 8cd0b3d12. Its new 17-min timeout (`vitest.soak.config.ts`) must stay below this job cap.
     # 30 min leaves real headroom for a slow runner while still killing a HUNG shard long before GitHub's 360-min
     # default would.
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

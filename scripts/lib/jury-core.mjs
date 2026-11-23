@@ -1953,13 +1953,13 @@ export function buildPanelFindings(lensFindings = {}) {
  * @verdicts-total — every `VERDICTS` member is handled explicitly (needs-human, changes, prevention-outstanding,
  *   accept); the `check:standards` verdict-totality gate enforces it, so a new enum member can't be dropped here.
  * @param {{lensVerdicts: Object<string, 'accept'|'changes'|'needs-human'|'prevention-outstanding'>, humanRequired?: boolean,
- *   conflict?: boolean, degradedBasis?: boolean, mandatoryLenses?: string[], findings: Array<object>}} o -
+ *   conflict?: boolean, degradedBasis?: boolean, mandatoryLenses?: string[], findings: Array<object>, seatGates?: Object<string, 'pass'|'not-pass'>, seatGateNotes?: string[]}} o -
  *   `findings` (REQUIRED) is the WHOLE panel's list (`buildPanelFindings(lensFindings)`); the prevention scan
  *   reads it, immune to per-lens verdict flattening. `degradedBasis` (#xu2pp2m) defaults to `false`, so every
  *   pre-existing caller is byte-stable.
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
-export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, conflict = false, degradedBasis = false, mandatoryLenses = MANDATORY_LENSES, findings, bar = PREVENTION_IMPACT_BAR } = {}) {
+export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, conflict = false, degradedBasis = false, mandatoryLenses = MANDATORY_LENSES, findings, bar = PREVENTION_IMPACT_BAR, seatGates, seatGateNotes } = {}) {
   if (findings === undefined) {
     throw new Error('derivePanelVerdict: `findings` is required — pass buildPanelFindings(lensFindings) (or an explicit [] to assert none). A defaulted [] silently reinstates the #2823 advisory-prevention leak on the drain path.');
   }
@@ -1983,6 +1983,15 @@ export function derivePanelVerdict({ lensVerdicts = {}, humanRequired = false, c
   // bounce is more actionable than a park, and it costs nothing), while both of the outcomes that mechanically
   // CLEAR a PR are taken off the table. See this function's own docblock for the PR #2122 measurement.
   if (degradedBasis) return VERDICTS.NEEDS_HUMAN;
+  // CKLST-B: only explicitly enforced callers supply this map. Shadow omits it entirely.
+  // Check before either mechanically clearing outcome, including prevention-outstanding.
+  if (seatGates !== undefined) {
+    const blank = mandatoryLenses.filter(lens => seatGates?.[lens] !== 'pass');
+    if (blank.length) {
+      if (Array.isArray(seatGateNotes)) seatGateNotes.push(`blank accept: answer ${blank.map(lens => `${lens} rubric items`).join(', ')}`);
+      return VERDICTS.CHANGES;
+    }
+  }
   // #2823 round-2 finding 4 — derive "the panel owes a guard" from the FINDINGS, not the per-lens verdicts (the
   // structural fix). A RESOLVED finding whose named prevention is neither captured nor filed owes a guard, whatever
   // its lens's single verdict flattened to (an advisory lens with a co-resident unresolved finding would flatten to

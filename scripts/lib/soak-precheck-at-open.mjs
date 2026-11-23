@@ -8,6 +8,7 @@ export function soakPrecheckEnabled(env = process.env) {
   return !/^(0|false|off|no)$/i.test(String(env[SOAK_PRECHECK_ENV] ?? ''));
 }
 
+// The bot-owned shared timing map is optional; per-test sidecars supply admission evidence.
 export function soakPrecheckAtOpen({ title, body, files, env, repoRoot = process.cwd() }) {
   if (!soakPrecheckEnabled(env)) return { ok: true, skipped: 'disabled' };
   const gate = evaluateSoakReplayGate({ title, body, files });

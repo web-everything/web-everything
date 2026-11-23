@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://everstandards.dev/core/0.1.0/evidence.schema.json",
+  "title": "core/evidence v0.1: in-toto Statement v1 evidence and the non-counting observation (status: draft)",
+  "$comment": "Type ids https://everstandards.dev/core/evidence/v0.1 and https://everstandards.dev/core/observation/v0.1. Traces: standards.D7 (Fork 2 c, Fork 3 a, R2 in-toto v1), standards.D6. Statement level stays open (in-toto: consumers MUST ignore unrecognized fields); the two predicates are closed, as the in-toto README allows ('unless otherwise noted in the predicate specification').",
+  "$defs": {
+    "digestSet": {
+      "description": "[CORE-EVD-002] in-toto DigestSet. Known algorithms must have their full hex length (local rule).",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9]*$" },
+      "properties": {
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+        "sha384": { "type": "string", "pattern": "^[0-9a-fA-F]{96}$" },
+        "sha512": { "type": "string", "pattern": "^[0-9a-fA-F]{128}$" },
+        "sha1": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "gitCommit": { "type": "string", "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$" },
+        "gitTree": { "type": "string", "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$" },
+        "gitBlob": { "type": "string", "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$" }
+      },
+      "additionalProperties": { "type": "string", "pattern": "^[0-9a-fA-F]{16,}$" }
+    },
+    "provenanceTier": {
+      "description": "[CORE-EVD-003] Closed trust rungs: probe > replayed > asserted (D7 Fork 3 a).",
+      "enum": ["probe", "replayed", "asserted"]
+    },
+    "subject": {
+      "description": "[CORE-EVD-002] An examined input. in-toto: each subject MUST have digest set.",
+      "type": "object",
+      "required": ["digest"],
+      "properties": {
+        "name": { "type": "string" },
+        "uri": { "type": "string", "format": "uri" },
+        "digest": { "$ref": "#/$defs/digestSet" },
+        "mediaType": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "evidenceRef": {
+      "description": "[CORE-EVD-012] How a verdict cites evidence: digest of the exact input examined plus its tier. A URI alone is never evidence.",
+      "type": "object",
+      "required": ["kind", "digest", "provenanceTier"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "uri": { "type": "string", "format": "uri-reference" },
+        "digest": { "$ref": "#/$defs/digestSet" },
+        "provenanceTier": { "$ref": "#/$defs/provenanceTier" },
+        "subTier": { "type": "string", "format": "uri", "description": "[CORE-EVD-004] org sub-tier; never replaces provenanceTier" },
+        "statement": { "$ref": "#/$defs/digestSet", "description": "digest of the evidence Statement, when one exists" },
+        "provEntity": { "type": "string", "format": "uri" },
+        "native": { "type": "object", "description": "native fields of the bound norm, kept as-is (D7 R1)" }
+      },
+      "additionalProperties": false
+    },
+    "evidencePredicate": {
+      "type": "object",
+      "required": ["kind", "provenanceTier", "producedAt", "producer"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "provenanceTier": { "$ref": "#/$defs/provenanceTier" },
+        "subTier": { "type": "string", "format": "uri" },
+        "producedAt": { "type": "string", "format": "date-time", "description": "[CORE-EVD-011]" },
+        "producer": { "type": "string", "format": "uri", "description": "[CORE-EVD-011]" },
+        "method": { "type": "string" },
+        "result": {
+          "type": "object", "required": ["digest"],
+          "properties": { "uri": { "type": "string", "format": "uri-reference" }, "digest": { "$ref": "#/$defs/digestSet" } },
+          "additionalProperties": false
+        },
+        "native": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "description": "[CORE-EVD-001] Evidence Statement.",
+      "type": "object",
+      "required": ["_type", "subject", "predicateType", "predicate"],
+      "properties": {
+        "_type": { "const": "https://in-toto.io/Statement/v1" },
+        "subject": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/subject" } },
+        "predicateType": { "const": "https://everstandards.dev/core/evidence/v0.1" },
+        "predicate": { "$ref": "#/$defs/evidencePredicate" }
+      }
+    },
+    "observationPredicate": {
+      "description": "[CORE-EVD-008] A note that never counts. It has no verdict, reason or disposition.",
+      "type": "object",
+      "required": ["note", "observedAt", "observer"],
+      "properties": {
+        "note": { "type": "string", "minLength": 1 },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "observer": { "type": "string", "format": "uri" },
+        "refs": { "type": "array", "items": { "type": "string", "format": "uri-reference" } }
+      },
+      "not": { "anyOf": [ { "required": ["verdict"] }, { "required": ["reason"] }, { "required": ["disposition"] } ] },
+      "additionalProperties": false
+    },
+    "observation": {
+      "description": "[CORE-EVD-008] Observation Statement: its own predicateType, so a verdict consumer filtering on the verdict type never sees it.",
+      "type": "object",
+      "required": ["_type", "subject", "predicateType", "predicate"],
+      "properties": {
+        "_type": { "const": "https://in-toto.io/Statement/v1" },
+        "subject": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/subject" } },
+        "predicateType": { "const": "https://everstandards.dev/core/observation/v0.1" },
+        "predicate": { "$ref": "#/$defs/observationPredicate" }
+      }
+    },
+    "gateConfig": {
+      "description": "[CORE-EVD-005][CORE-EVD-007] Org gate settings: an optional minimum tier; signing may be required only above L1.",
+      "type": "object",
+      "properties": {
+        "level": { "enum": ["L1", "L2", "L3"] },
+        "minTier": { "$ref": "#/$defs/provenanceTier" },
+        "requireSigned": { "type": "boolean" }
+      },
+      "if": { "properties": { "requireSigned": { "const": true } }, "required": ["requireSigned"] },
+      "then": { "required": ["level"], "properties": { "level": { "enum": ["L2", "L3"] } } },
+      "additionalProperties": false
+    },
+    "dsseEnvelope": {
+      "description": "[CORE-EVD-006] Optional signing binding: DSSE envelope carrying an in-toto Statement.",
+      "type": "object",
+      "required": ["payload", "payloadType", "signatures"],
+      "properties": {
+        "payload": { "type": "string", "pattern": "^[A-Za-z0-9+/]*={0,2}$", "minLength": 4 },
+        "payloadType": { "const": "application/vnd.in-toto+json" },
+        "signatures": {
+          "type": "array", "minItems": 1,
+          "items": {
+            "type": "object", "required": ["sig"],
+            "properties": { "keyid": { "type": "string" }, "sig": { "type": "string", "minLength": 4, "pattern": "^[A-Za-z0-9+/]*={0,2}$" } },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

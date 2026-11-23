@@ -3,7 +3,10 @@ bornAs: xdq6hx5
 kind: story
 size: 5
 parent: "3383"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 scope: ["we:scripts/operations/wip-report.mjs", "we:scripts/operations/wip-report-io.mjs", "we:scripts/operations/__tests__/wip-report.test.mjs"]
 dateOpened: "2026-09-20"
 tags: []
