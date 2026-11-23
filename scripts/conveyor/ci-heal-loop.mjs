@@ -8,7 +8,7 @@ import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS, isGithubAppAuthGuardError } from '../lib/github-app-auth-env.mjs';
 import { isPidAlive } from '../lib/dispatch-throttle.mjs';
-import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS } from '../lib/daemon-clone-lock.mjs';
+import { acquireRead, releaseRead, defaultOwner, cloneLockDirs, HEARTBEAT_INTERVAL_MS, readPendingRebuild } from '../lib/daemon-clone-lock.mjs';
 import { cloneDispatchBlock } from '../lib/daemon-self-sync.mjs';
 import { readEnumOverride } from '../lib/operator-enum-store.mjs';
 import { readCloneIdentity } from '../lib/daemon-background-build.mjs';
@@ -25,6 +25,7 @@ const gitRev = (cwd, ref) => execFileSync('git', ['rev-parse', ref], {
 const cloneRoot = () => gitRev(dirname(fileURLToPath(import.meta.url)), '--show-toplevel');
 const cloneHead = root => gitRev(root, 'HEAD');
 let cycleBusy = false;
+let consecutiveRebuildYields = 0;
 const cloneLocks = {
   acquireRead, releaseRead,
   heartbeatRead: (root, { owner }) => heartbeat(cloneLockDirs(root).readersRoot, owner, owner, new Date().toISOString(), process.pid),
@@ -147,13 +148,34 @@ export async function withCiHealCycleLock(fn, { env = process.env, now = Date.no
   }
 }
 
+function yieldToRebuild(pendingRebuild, write, env) {
+  let claim;
+  try { claim = pendingRebuild(); } catch { return null; } // best-effort signal; preserve existing admission on error
+  if (!claim) { consecutiveRebuildYields = 0; return null; }
+  const raw = env.WE_CI_HEAL_MAX_REBUILD_YIELDS;
+  const parsed = Number(raw);
+  const valid = raw !== undefined && /^\d+$/.test(raw) && Number.isSafeInteger(parsed);
+  const max = valid ? parsed : 3;
+  const source = raw === undefined ? 'standard' : valid ? 'env' : 'env-invalid (standard fallback)';
+  if (consecutiveRebuildYields >= max) {
+    write(`ci-heal-loop: rebuild yield limit reached (${max}, source=${source}) — proceeding to normal read admission`);
+    return null;
+  }
+  consecutiveRebuildYields++;
+  write(`ci-heal-loop: rebuild pending for ${claim.owner} — exiting at tick boundary (yield ${consecutiveRebuildYields}/${max}, source=${source})`);
+  return { exit: 'rebuild-pending' };
+}
+
 export async function runCiHealLoopIteration({
   tick = runCiHealTick, now = Date.now, env = process.env, lock = cycleLock({ env, now }),
-  root = cloneRoot(), locks = cloneLocks, bootHead, bootIdentity, readHead = cloneHead,
+  root = cloneRoot(), pendingRebuild = () => readPendingRebuild(root, { owner: defaultOwner(process.pid) }),
+  locks = cloneLocks, bootHead, bootIdentity, readHead = cloneHead,
   dispatchBlock = () => cloneDispatchBlock({ root, env, knownIdentity: bootIdentity }),
   interval = setInterval, clearInterval: clearTimer = clearInterval,
   ensureAuth = () => ensureFreshGithubAppEnv(FLEET_APP_AUTH_OPTS), write = line => console.error(line),
 } = {}) {
+  const pending = yieldToRebuild(pendingRebuild, write, env);
+  if (pending) return pending;
   return withCiHealCycleLock(async () => {
     const owner = defaultOwner(process.pid);
     if (locks.acquireRead(root, { owner })?.ok !== true) return { skipped: 'read-locked' };
@@ -188,7 +210,8 @@ export async function runCiHealLoopIteration({
 export async function runCiHealLoop({
   parentPid, parentAlive = isPidAlive, resolveInterval = resolveCiHealInterval, once = false,
   iteration = runCiHealLoopIteration, enabled = () => resolveCiHealLoopEnabled(), identityOf = readCloneIdentity, sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)),
-  root, readHead = cloneHead, write = line => console.error(line), ...iterationDeps
+  root, pendingRebuild = () => readPendingRebuild(root, { owner: defaultOwner(process.pid) }),
+  readHead = cloneHead, write = line => console.error(line), ...iterationDeps
 } = {}) {
   try { root ??= cloneRoot(); } catch { return { exit: 'head-unknown' }; }
   const bootHead = knownHead(readHead, root);
@@ -202,11 +225,13 @@ export async function runCiHealLoop({
     const head = knownHead(readHead, root);
     if (!head) return { exit: 'head-unknown' };
     if (head !== bootHead) return { exit: 'head-moved' };
+    const pending = yieldToRebuild(pendingRebuild, write, iterationDeps.env ?? process.env);
+    if (pending) return pending;
     const { seconds, source } = resolveInterval();
     write(`ci-heal-loop: ciHeal.intervalSec=${seconds} source=${source}`);
     try {
-      const result = await iteration({ ...iterationDeps, root, write, bootHead, bootIdentity, readHead });
-      if (result?.exit === 'head-moved' || result?.exit === 'head-unknown') return result;
+      const result = await iteration({ ...iterationDeps, root, write, pendingRebuild, bootHead, bootIdentity, readHead });
+      if (result?.exit === 'head-moved' || result?.exit === 'head-unknown' || result?.exit === 'rebuild-pending') return result;
     } catch (error) {
       if (isGithubAppAuthGuardError(error)) throw error;
       write(`ci-heal-loop: iteration failed: ${String(error?.message ?? error)}`);

@@ -345,11 +345,33 @@ describe('rearm-review on an UNRESOLVED stand-down goes through the same guard w
     expect(call).toThrow(/guard|window/);
     expect(gh).toHaveBeenCalledTimes(1);
   });
-  it('refuses when a rearm-review already stands in the window', () => {
-    const done = { ...trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_done'), author: { login: 'chalbert' } };
-    const later = { ...stop, id: 'IC_later' };
-    const { call } = run([fixBegin, stop, done, fixBegin, later]);
+  const done = trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_done');
+  const later = { ...stop, id: 'IC_later' };
+  const renewed = [fixBegin, stop, done, fixBegin, later];
+  it('refuses a stale unresolved id outside the latest verdict window without writing', () => {
+    const { gh, call } = run([...renewed, trusted('🔁 review — changes requested'), fixBegin]);
     expect(call).toThrow(/guard|window/);
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('refuses answering the same rearmed stand-down twice after a later fix-begin', () => {
+    const { gh, call } = run([fixBegin, stop, done, fixBegin]);
+    expect(call).toThrow('no unresolved');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, true])('accepts the newest post-rearm stand-down (already answered: %s)', alreadyAnswered => {
+    const comments = [...renewed, fixBegin];
+    if (alreadyAnswered) comments.push(trusted(buildOperatorAnswer({ ...record, standDownId: later.id }), 'IC_non_rearm'));
+    const snapshot = { comments, labels: [{ name: 'status:answered-waiting-fixer' }],
+      headRefOid: 'b'.repeat(40), commits: [{ oid: 'b'.repeat(40), committedDate: '2026-11-14T09:00:00Z' }] };
+    snapshot.comments = comments.map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' }));
+    const gh = vi.fn(args => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
+    const posted = trusted(gh.mock.calls[1][0].at(-1), 'IC_new');
+    expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: later.id, disposition: 'rearm-review',
+      ...(alreadyAnswered ? { supersedes: 'IC_non_rearm' } : {}) });
+    expect(decideEmptyFixRound({ comments: [...comments, posted], liveHead: 'b'.repeat(40) }).empty).toBe(false);
+    snapshot.comments.push(posted, fixBegin);
+    expect(() => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toThrow('no unresolved');
   });
   it('posts for an unresolved stand-down inside the window, and the guard accepts that answer', () => {
     const { gh, call } = run([fixBegin, stop]);
