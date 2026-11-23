@@ -1,0 +1,1630 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "d0": {
+      "description": "[FLOW-DEF-001] A flow definition.",
+      "type": "object",
+      "required": [
+        "flowType",
+        "id",
+        "document",
+        "initial",
+        "keys",
+        "guards",
+        "states"
+      ],
+      "properties": {
+        "flowType": {
+          "const": "https://everstandards.dev/flow/definition/v0.1"
+        },
+        "id": {
+          "$ref": "#/$defs/d1"
+        },
+        "document": {
+          "$ref": "#/$defs/d2"
+        },
+        "supersedes": {
+          "$ref": "#/$defs/d6"
+        },
+        "initial": {
+          "$ref": "#/$defs/d9"
+        },
+        "keys": {
+          "$ref": "#/$defs/d10"
+        },
+        "retry": {
+          "$ref": "#/$defs/d14"
+        },
+        "guards": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/d9"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/d15"
+          }
+        },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/d9"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/d16"
+          }
+        },
+        "compensation": {
+          "$ref": "#/$defs/d25"
+        },
+        "policies": {
+          "description": "[FLOW-DEF-021]",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/d13"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "d1": {
+      "description": "[FLOW-DEF-001] tag URI of record type flow (CORE-ID-001 form; an org's own tag authority is allowed for its own flows).",
+      "type": "string",
+      "pattern": "^tag:[a-z0-9]([a-z0-9.-]*[a-z0-9])?,[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?:flow/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*$"
+    },
+    "d2": {
+      "description": "[FLOW-DEF-022] OWS 1.1 document form: dsl, namespace, name, version.",
+      "type": "object",
+      "required": [
+        "namespace",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "dsl": {
+          "$ref": "#/$defs/d3"
+        },
+        "namespace": {
+          "$ref": "#/$defs/d4"
+        },
+        "name": {
+          "$ref": "#/$defs/d4"
+        },
+        "version": {
+          "$ref": "#/$defs/d3"
+        },
+        "title": {
+          "$ref": "#/$defs/d5"
+        },
+        "summary": {
+          "$ref": "#/$defs/d5"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d3": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "d4": {
+      "description": "OWS 1.1 document/run.workflow namespace and name form.",
+      "type": "string",
+      "pattern": "^[a-z0-9](-?[a-z0-9])*$"
+    },
+    "d5": {
+      "description": "[FLOW-DEF-003] Prose only: never a runtime expression.",
+      "type": "string",
+      "minLength": 1,
+      "not": {
+        "pattern": "\\$\\{"
+      }
+    },
+    "d6": {
+      "description": "[FLOW-DEF-016] The version this one replaces, by id and digest.",
+      "type": "object",
+      "required": [
+        "id",
+        "digest"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/d1"
+        },
+        "digest": {
+          "$ref": "#/$defs/d7"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d7": {
+      "$ref": "#/$defs/d8"
+    },
+    "d8": {
+      "description": "[CORE-EVD-002] in-toto DigestSet. Known algorithms must have their full hex length (local rule).",
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-zA-Z0-9]*$"
+      },
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        },
+        "sha384": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{96}$"
+        },
+        "sha512": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{128}$"
+        },
+        "sha1": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{40}$"
+        },
+        "gitCommit": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"
+        },
+        "gitTree": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"
+        },
+        "gitBlob": {
+          "type": "string",
+          "pattern": "^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"
+        }
+      },
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[0-9a-fA-F]{16,}$"
+      }
+    },
+    "d9": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,62}$"
+    },
+    "d10": {
+      "description": "[FLOW-DEF-009] The step key shape this flow declares: named parts used as {part} in each step key.",
+      "type": "object",
+      "required": [
+        "parts"
+      ],
+      "properties": {
+        "parts": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/d11"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/d12"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "d11": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9]{0,31}$"
+    },
+    "d12": {
+      "description": "[FLOW-DEF-009] One part of a step key. A visit part counts re-entries; countsOn names the policy that says what counts.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "subject",
+            "version",
+            "visit",
+            "seat"
+          ]
+        },
+        "description": {
+          "$ref": "#/$defs/d5"
+        },
+        "countsOn": {
+          "$ref": "#/$defs/d13"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "not": {
+                  "const": "visit"
+                }
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "countsOn"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "d13": {
+      "description": "[FLOW-DEF-021] A check, plugin, policy or governance entry by URI and content digest; never inlined.",
+      "type": "object",
+      "required": [
+        "uri",
+        "digest"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri"
+        },
+        "digest": {
+          "$ref": "#/$defs/d7"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d14": {
+      "description": "[FLOW-DEF-022] OWS retry.limit.attempt.count, plus the state to enter when retries run out.",
+      "type": "object",
+      "required": [
+        "limit",
+        "onExhausted"
+      ],
+      "properties": {
+        "limit": {
+          "type": "object",
+          "required": [
+            "attempt"
+          ],
+          "properties": {
+            "attempt": {
+              "type": "object",
+              "required": [
+                "count"
+              ],
+              "properties": {
+                "count": {
+                  "description": "[FLOW-DEF-018] bounded",
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "onExhausted": {
+          "$ref": "#/$defs/d9"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d15": {
+      "description": "[FLOW-DEF-003] A named check (by URI and digest) with a closed outcome list that includes unknown.",
+      "type": "object",
+      "required": [
+        "check",
+        "outcomes"
+      ],
+      "properties": {
+        "check": {
+          "$ref": "#/$defs/d13"
+        },
+        "outcomes": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/d9"
+          },
+          "contains": {
+            "const": "unknown"
+          }
+        },
+        "description": {
+          "$ref": "#/$defs/d5"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d16": {
+      "description": "[FLOW-DEF-001] A state: one of the four step kinds, a final state, or a compound state holding its own states.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "description": "[FLOW-DEF-008] compute, judge, confirm, effect (the four step kinds), plus final and compound (statechart structure).",
+          "enum": [
+            "compute",
+            "judge",
+            "confirm",
+            "effect",
+            "final",
+            "compound"
+          ]
+        },
+        "title": {
+          "$ref": "#/$defs/d5"
+        },
+        "key": {
+          "$ref": "#/$defs/d17"
+        },
+        "invoke": {
+          "$ref": "#/$defs/d18"
+        },
+        "on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/d20"
+          }
+        },
+        "timeout": {
+          "$ref": "#/$defs/d22"
+        },
+        "confirm": {
+          "$ref": "#/$defs/d23"
+        },
+        "compensate": {
+          "$ref": "#/$defs/d24"
+        },
+        "emits": {
+          "type": "string",
+          "format": "uri"
+        },
+        "initial": {
+          "$ref": "#/$defs/d9"
+        },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/d9"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/d16"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "[FLOW-DEF-009] every step has a key",
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "compute",
+                  "judge",
+                  "confirm",
+                  "effect"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "key"
+            ]
+          }
+        },
+        {
+          "description": "[FLOW-DEF-008] compute, judge and effect steps say where they run",
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "compute",
+                  "judge",
+                  "effect"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "invoke"
+            ]
+          }
+        },
+        {
+          "description": "[FLOW-DEF-013] a confirm step carries its confirm block, and only a confirm step does",
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "confirm"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "confirm"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "confirm"
+              ]
+            }
+          }
+        },
+        {
+          "description": "[FLOW-DEF-017] an effect declares its compensation",
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "effect"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "compensate"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "compensate"
+              ]
+            }
+          }
+        },
+        {
+          "description": "[FLOW-DEF-014] a compound state holds initial and states; nothing else does",
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "compound"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "initial",
+              "states"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "key"
+                  ]
+                },
+                {
+                  "required": [
+                    "invoke"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "initial"
+                  ]
+                },
+                {
+                  "required": [
+                    "states"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "[FLOW-DEF-007] a final state has no outgoing transitions and is not a step",
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "final"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "on"
+                  ]
+                },
+                {
+                  "required": [
+                    "key"
+                  ]
+                },
+                {
+                  "required": [
+                    "invoke"
+                  ]
+                },
+                {
+                  "required": [
+                    "timeout"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "d17": {
+      "description": "[FLOW-DEF-009] Step key template: literal text plus at least one {part}.",
+      "type": "string",
+      "pattern": "^[^{}$]*(\\{[A-Za-z][A-Za-z0-9]*\\}[^{}$]*)+$"
+    },
+    "d18": {
+      "description": "[FLOW-DEF-008] Where a step runs: a binding, never a step kind.",
+      "type": "object",
+      "required": [
+        "where"
+      ],
+      "properties": {
+        "where": {
+          "enum": [
+            "local",
+            "a2a",
+            "mcp",
+            "subflow",
+            "agent-session"
+          ]
+        },
+        "plug": {
+          "$ref": "#/$defs/d13"
+        },
+        "flow": {
+          "$ref": "#/$defs/d19"
+        },
+        "digest": {
+          "$ref": "#/$defs/d7"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "[FLOW-DEF-015]",
+          "if": {
+            "properties": {
+              "where": {
+                "const": "subflow"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "flow",
+              "digest"
+            ]
+          }
+        },
+        {
+          "description": "[FLOW-DEF-015]",
+          "if": {
+            "required": [
+              "flow"
+            ]
+          },
+          "then": {
+            "required": [
+              "digest"
+            ]
+          }
+        }
+      ]
+    },
+    "d19": {
+      "description": "[FLOW-DEF-015][FLOW-DEF-022] OWS run.workflow id triple; the version is exact (never latest).",
+      "type": "object",
+      "required": [
+        "namespace",
+        "name",
+        "version"
+      ],
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/d4"
+        },
+        "name": {
+          "$ref": "#/$defs/d4"
+        },
+        "version": {
+          "$ref": "#/$defs/d3"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d20": {
+      "description": "[FLOW-DEF-004][FLOW-DEF-005] One routed outcome: event, optional guard + outcome, target and route.",
+      "type": "object",
+      "required": [
+        "event",
+        "target",
+        "route"
+      ],
+      "properties": {
+        "event": {
+          "type": "string",
+          "pattern": "^(done|confirm\\.[a-z][a-z0-9-]*)$"
+        },
+        "guard": {
+          "$ref": "#/$defs/d9"
+        },
+        "outcome": {
+          "$ref": "#/$defs/d9"
+        },
+        "target": {
+          "$ref": "#/$defs/d9"
+        },
+        "route": {
+          "$ref": "#/$defs/d21"
+        }
+      },
+      "dependentRequired": {
+        "guard": [
+          "outcome"
+        ],
+        "outcome": [
+          "guard"
+        ]
+      },
+      "additionalProperties": false
+    },
+    "d21": {
+      "description": "[FLOW-DEF-005] The route a transition takes; recorded on every run record.",
+      "enum": [
+        "advance",
+        "wait",
+        "retry",
+        "escalate",
+        "fail"
+      ]
+    },
+    "d22": {
+      "description": "[FLOW-DEF-011] OWS timeout.after (ISO 8601 duration), plus a named owner and a declared route.",
+      "type": "object",
+      "required": [
+        "after",
+        "owner",
+        "onTimeout"
+      ],
+      "properties": {
+        "after": {
+          "description": "[FLOW-DEF-022] OWS timeout.after duration.",
+          "type": "string",
+          "format": "duration"
+        },
+        "owner": {
+          "$ref": "#/$defs/d13"
+        },
+        "onTimeout": {
+          "description": "[FLOW-DEF-012] A timeout is unknown(not-run): its route is never advance.",
+          "type": "object",
+          "required": [
+            "target",
+            "route"
+          ],
+          "properties": {
+            "target": {
+              "$ref": "#/$defs/d9"
+            },
+            "route": {
+              "description": "[FLOW-DEF-012]",
+              "enum": [
+                "wait",
+                "retry",
+                "escalate",
+                "fail"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "d23": {
+      "description": "[FLOW-DEF-013] A person's (or delegated decider's) decision: approvers declared per org by URI and digest, author and preparers excluded, bound to the exact version, silence never approves.",
+      "type": "object",
+      "required": [
+        "approvers",
+        "outcomes",
+        "excludes",
+        "bindsSubjectVersion",
+        "onSilence",
+        "approvalCheck"
+      ],
+      "properties": {
+        "approvers": {
+          "$ref": "#/$defs/d13"
+        },
+        "outcomes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/d9"
+          }
+        },
+        "excludes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/d9"
+          },
+          "allOf": [
+            {
+              "contains": {
+                "const": "author"
+              }
+            },
+            {
+              "contains": {
+                "const": "preparers"
+              }
+            }
+          ]
+        },
+        "bindsSubjectVersion": {
+          "const": true
+        },
+        "onSilence": {
+          "const": "stay-blocked"
+        },
+        "approvalCheck": {
+          "$ref": "#/$defs/d9"
+        },
+        "deadline": {
+          "description": "[FLOW-DEF-011][FLOW-DEF-012] The v0 deadline is replaced by the state's timeout (owner plus a declared, never-advancing route).",
+          "not": {}
+        }
+      },
+      "additionalProperties": false
+    },
+    "d24": {
+      "description": "[FLOW-DEF-017] An effect names its undo step, or says none.",
+      "oneOf": [
+        {
+          "const": "none"
+        },
+        {
+          "type": "object",
+          "required": [
+            "step"
+          ],
+          "properties": {
+            "step": {
+              "$ref": "#/$defs/d9"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "d25": {
+      "description": "[FLOW-DEF-017] Undo runs in reverse completion order; a failed (or unknown) undo halts its dependents' undo by default.",
+      "type": "object",
+      "properties": {
+        "order": {
+          "const": "reverse",
+          "default": "reverse"
+        },
+        "onFailure": {
+          "enum": [
+            "halt-dependents",
+            "halt",
+            "continue"
+          ],
+          "default": "halt-dependents"
+        },
+        "steps": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/d9"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "key",
+              "invoke"
+            ],
+            "properties": {
+              "title": {
+                "$ref": "#/$defs/d5"
+              },
+              "key": {
+                "$ref": "#/$defs/d17"
+              },
+              "invoke": {
+                "$ref": "#/$defs/d18"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "d26": {
+      "title": "flow/decision-lifecycle v0: a Flow-core-shaped statechart (status: draft; namespace PROVISIONAL)",
+      "$comment": "Stand-in for the Flow core (D8 (a) default: JSON statechart, SCXML semantics, named guards with closed outcomes, no expressions, typed step kinds). Neither D8 nor D8b is ratified.",
+      "type": "object",
+      "required": [
+        "flowType",
+        "id",
+        "initial",
+        "guards",
+        "states"
+      ],
+      "properties": {
+        "flowType": {
+          "enum": [
+            "https://everstandards.dev/flow/decision-lifecycle/v0.1",
+            "https://everstandards.dev/flow/decision-lifecycle/v0"
+          ],
+          "$comment": "v0 accepted during the overlap (standards.normSunset)"
+        },
+        "id": {
+          "$ref": "#/$defs/d27"
+        },
+        "initial": {
+          "$ref": "#/$defs/d28"
+        },
+        "retry": {
+          "type": "object",
+          "required": [
+            "maxAttempts",
+            "onExhausted"
+          ],
+          "properties": {
+            "maxAttempts": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "onExhausted": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "guards": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "outcomes",
+              "classifies"
+            ],
+            "properties": {
+              "outcomes": {
+                "type": "array",
+                "minItems": 2,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z-]*$"
+                },
+                "contains": {
+                  "const": "unknown"
+                }
+              },
+              "classifies": {
+                "type": "string",
+                "minLength": 1
+              },
+              "inputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "states": {
+          "type": "object",
+          "minProperties": 2,
+          "additionalProperties": {
+            "$ref": "#/$defs/d29"
+          }
+        },
+        "compensations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/d32"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "$defs": {
+        "transition": {
+          "type": "object",
+          "required": [
+            "target"
+          ],
+          "properties": {
+            "event": {
+              "type": "string",
+              "pattern": "^(done|confirm\\.[a-z][a-z-]*)$"
+            },
+            "guard": {
+              "type": "string"
+            },
+            "outcome": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "route": {
+              "enum": [
+                "advance",
+                "wait",
+                "retry",
+                "escalate",
+                "fail"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "confirm": {
+          "type": "object",
+          "required": [
+            "role",
+            "outcomes",
+            "excludes",
+            "bindsSubjectVersion",
+            "onSilence"
+          ],
+          "properties": {
+            "role": {
+              "type": "string"
+            },
+            "outcomes": {
+              "type": "array",
+              "minItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              }
+            },
+            "excludes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "bindsSubjectVersion": {
+              "const": true
+            },
+            "onSilence": {
+              "const": "stay-blocked"
+            },
+            "deadline": {
+              "type": "object",
+              "required": [
+                "after",
+                "action"
+              ],
+              "properties": {
+                "after": {
+                  "type": "string"
+                },
+                "action": {
+                  "enum": [
+                    "notify",
+                    "reassign"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "state": {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "compute",
+                "judge",
+                "confirm",
+                "effect",
+                "invoke",
+                "final"
+              ]
+            },
+            "title": {
+              "type": "string"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "confirm": {
+              "$ref": "#/$defs/d30"
+            },
+            "emits": {
+              "type": "string"
+            },
+            "on": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/d31"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "confirm"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              "then": {
+                "required": [
+                  "confirm",
+                  "on"
+                ]
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "kind": {
+                    "const": "final"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              },
+              "then": {
+                "not": {
+                  "required": [
+                    "on"
+                  ]
+                }
+              },
+              "else": {
+                "required": [
+                  "on"
+                ]
+              }
+            }
+          ]
+        },
+        "compensation": {
+          "type": "object",
+          "required": [
+            "for",
+            "action",
+            "never"
+          ],
+          "properties": {
+            "for": {
+              "type": "string"
+            },
+            "action": {
+              "const": "mark-superseded"
+            },
+            "never": {
+              "const": "delete"
+            },
+            "effect": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "d27": {
+      "description": "[CORE-ID-001][CORE-ID-019] tag:everstandards.dev,<date>:<recordType>/<path> (RFC 4151).",
+      "type": "string",
+      "pattern": "^tag:everstandards\\.dev,[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?:(ruling|verdict|observation|finding|evidence|flow|flow-run|requirement|binding|loss-report)/[A-Za-z0-9._~-]+(/[A-Za-z0-9._~-]+)*$"
+    },
+    "d28": {
+      "description": "[CORE-ID-006] Unique inside one document.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+    },
+    "d29": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "compute",
+            "judge",
+            "confirm",
+            "effect",
+            "invoke",
+            "final"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "actor": {
+          "type": "string"
+        },
+        "confirm": {
+          "$ref": "#/$defs/d30"
+        },
+        "emits": {
+          "type": "string"
+        },
+        "on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/d31"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "confirm"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "confirm",
+              "on"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "final"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "on"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "on"
+            ]
+          }
+        }
+      ]
+    },
+    "d30": {
+      "type": "object",
+      "required": [
+        "role",
+        "outcomes",
+        "excludes",
+        "bindsSubjectVersion",
+        "onSilence"
+      ],
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "outcomes": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
+        "excludes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bindsSubjectVersion": {
+          "const": true
+        },
+        "onSilence": {
+          "const": "stay-blocked"
+        },
+        "deadline": {
+          "type": "object",
+          "required": [
+            "after",
+            "action"
+          ],
+          "properties": {
+            "after": {
+              "type": "string"
+            },
+            "action": {
+              "enum": [
+                "notify",
+                "reassign"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "d31": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "properties": {
+        "event": {
+          "type": "string",
+          "pattern": "^(done|confirm\\.[a-z][a-z-]*)$"
+        },
+        "guard": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "route": {
+          "enum": [
+            "advance",
+            "wait",
+            "retry",
+            "escalate",
+            "fail"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "d32": {
+      "type": "object",
+      "required": [
+        "for",
+        "action",
+        "never"
+      ],
+      "properties": {
+        "for": {
+          "type": "string"
+        },
+        "action": {
+          "const": "mark-superseded"
+        },
+        "never": {
+          "const": "delete"
+        },
+        "effect": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "d33": {
+      "type": "object",
+      "required": [
+        "reportType",
+        "adapter",
+        "source",
+        "target",
+        "sourceDigest",
+        "status",
+        "diagnostics",
+        "requiredPlugs",
+        "assumptions",
+        "provenance"
+      ],
+      "properties": {
+        "reportType": {
+          "const": "https://everstandards.dev/core/plug/loss-report/v0.1",
+          "description": "[CORE-PLUG-001]"
+        },
+        "id": {
+          "$ref": "#/$defs/d27"
+        },
+        "adapter": {
+          "type": "object",
+          "required": [
+            "id",
+            "version"
+          ],
+          "properties": {
+            "id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "source": {
+          "$ref": "#/$defs/d34"
+        },
+        "target": {
+          "$ref": "#/$defs/d34"
+        },
+        "sourceDigest": {
+          "$ref": "#/$defs/d8",
+          "description": "[CORE-PLUG-002]"
+        },
+        "status": {
+          "$ref": "#/$defs/d35"
+        },
+        "artifact": {
+          "type": "object",
+          "required": [
+            "digest",
+            "executable"
+          ],
+          "properties": {
+            "uri": {
+              "type": "string",
+              "format": "uri-reference"
+            },
+            "digest": {
+              "$ref": "#/$defs/d8"
+            },
+            "executable": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "lossyOptIn": {
+          "type": "boolean",
+          "description": "[CORE-PLUG-010]"
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/d36"
+          }
+        },
+        "requiredPlugs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/d39"
+          }
+        },
+        "assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "sourceNodes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "[CORE-PLUG-012]"
+        },
+        "provenance": {
+          "type": "object",
+          "required": [
+            "producedAt",
+            "producer"
+          ],
+          "properties": {
+            "producedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "producer": {
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "description": "[CORE-PLUG-011]",
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "artifact"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "d34": {
+      "type": "object",
+      "required": [
+        "format",
+        "version"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "d35": {
+      "description": "[CORE-PLUG-003]",
+      "enum": [
+        "exact",
+        "emulated",
+        "lossy",
+        "unsupported",
+        "failed"
+      ]
+    },
+    "d36": {
+      "type": "object",
+      "required": [
+        "feature",
+        "sourcePath",
+        "disposition",
+        "severity"
+      ],
+      "properties": {
+        "feature": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourcePath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "disposition": {
+          "$ref": "#/$defs/d37"
+        },
+        "severity": {
+          "$ref": "#/$defs/d38"
+        },
+        "via": {
+          "$ref": "#/$defs/d39",
+          "description": "[CORE-PLUG-006]"
+        },
+        "note": {
+          "type": "string",
+          "minLength": 1,
+          "description": "[CORE-PLUG-007]"
+        },
+        "required": {
+          "type": "boolean",
+          "description": "[CORE-PLUG-010] the source behaviour is required, not advisory"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "disposition": {
+                "const": "emulated"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "via"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "disposition": {
+                "not": {
+                  "const": "native"
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "note"
+            ]
+          }
+        }
+      ]
+    },
+    "d37": {
+      "description": "[CORE-PLUG-004]",
+      "enum": [
+        "native",
+        "emulated",
+        "preserved",
+        "lost",
+        "unknown"
+      ]
+    },
+    "d38": {
+      "description": "[CORE-PLUG-004] Camunda's four",
+      "enum": [
+        "info",
+        "review",
+        "warning",
+        "task"
+      ]
+    },
+    "d39": {
+      "description": "<plug id>@<version>",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9.-]*@[0-9A-Za-z.+-]+$"
+    }
+  },
+  "definition": {
+    "$ref": "#/$defs/d0"
+  },
+  "legacy": {
+    "$ref": "#/$defs/d26"
+  },
+  "lossReport": {
+    "$ref": "#/$defs/d33"
+  }
+}

@@ -131,7 +131,7 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/lib/dispatch-size-policy.json', 'scripts/lib/dispatch-supervision-promotions.json', 'scripts/lib/review-fix-policy-settings.json',
   'scripts/settings/delivery-metrics.json', 'scripts/settings/needs-you-feed.json', 'scripts/settings/pr-land-ready.json',
   'scripts/settings/pr-limit.json', 'scripts/settings/pr-stall-sweep.json', 'scripts/settings/review-concurrency.json',
-  'scripts/settings/review-red-team-on-skip.json',
+  'scripts/settings/review-red-team-on-skip.json', 'scripts/settings/review-flow-shadow.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
@@ -246,7 +246,7 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
-  'scripts/operations/ruled-weakened-prune.mjs',
+  'scripts/operations/ruled-weakened-prune.mjs', 'scripts/lib/flow-engine/shadow.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
   // destructured dynamic import.

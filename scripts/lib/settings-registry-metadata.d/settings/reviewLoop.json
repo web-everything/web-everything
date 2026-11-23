@@ -1,0 +1,6 @@
+{
+  "description": "Review-loop shadow observation controls and append-only log destination; never changes review or merge results.",
+  "owner": "scripts/settings/review-flow-shadow.json",
+  "changeVia": "env",
+  "instant": false
+}
