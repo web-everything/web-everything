@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,8 +8,8 @@ import { pathToFileURL } from 'node:url';
 // Execute the actual CLI/checkpoint in a child. Loader substitutes only external gate/forge ports;
 // Git effects are recorded instead of executed. No real Git, forge, card filing or operator state.
 function run({ check = true, fail = false, override = '', count = 15, exempt = false,
-  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching', soakTiming,
-  committedTiming = soakTiming, diffFailure = false, soakStatus = 'A', quotedPath = false, rawDiff } = {}) {
+  body = 'Description', earlyPr = false, labelOnGreen = false, headEvidence = 'matching',
+  realSoak = false, diffFailure = false, rawDiff, title = 'fix: admission' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pr-land-preflight-'));
   const trace = join(dir, 'effects.jsonl');
   const root = resolve('scripts');
@@ -42,12 +42,9 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
     './conveyor/infra-blocked.mjs': 'export const originSlugOf = () => "web-everything/web-everything";',
   };
   const soakTest = 'scripts/conveyor/soak/breaks/preflight.soak.test.mjs';
-  if (soakTiming !== undefined) {
-    // Use the real precheck/reader for these CLI wiring cases. Keep the source and
-    // target checkout distinct so a reader using cwd or its module root fails.
+  if (realSoak) {
+    // Exercise the real precheck without creating any timing metadata.
     delete stubs['./lib/soak-precheck-at-open.mjs'];
-    mkdirSync(join(dir, 'scripts/conveyor/soak/breaks'), { recursive: true });
-    if (soakTiming !== null) writeFileSync(join(dir, `${soakTest}.timing.json`), soakTiming);
   }
   const loader = join(dir, 'loader.mjs');
   writeFileSync(loader, `const stubs = ${JSON.stringify(stubs)}; const root = ${JSON.stringify(pathToFileURL(root + '/').href)};
@@ -70,20 +67,19 @@ function run({ check = true, fail = false, override = '', count = 15, exempt = f
       if (args[0] === 'remote') return 'https://github.com/web-everything/web-everything.git';
       if (args[0] === 'diff') {
         if (args.includes('--name-status') && ${diffFailure}) throw new Error('diff failed');
-        return args.includes('--name-status') ? ${JSON.stringify(rawDiff ?? (soakTiming !== undefined ? `${soakStatus}\t${quotedPath ? `"${soakTest.replace('preflight', '\\303\\251')}"` : soakTest}` : 'M\tblocks/example.ts'))} : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
+        return args.includes('--name-status') ? ${JSON.stringify(rawDiff ?? (realSoak ? `A\0${soakTest}\0` : 'M\0blocks/example.ts\0'))} : ${JSON.stringify(exempt ? 'scripts/conveyor/worker.mjs' : 'blocks/example.ts')};
       }
       if (args[0] === 'push') return '';
       if (args[0] === 'show') {
-        if (args[1] === ${JSON.stringify(`${sha}:${soakTest}.timing.json`)} && ${JSON.stringify(committedTiming != null)}) return ${JSON.stringify(committedTiming ?? '')};
         throw new Error('missing at ref');
       }
       return '';
     }; syncBuiltinESMExports(); register(${JSON.stringify(pathToFileURL(loader).href)});`);
   try {
     const child = spawnSync(process.execPath, ['--import', preload, join(root, 'pr-land.mjs'), `--repo=${dir}`,
-      '--ref=lane/preflight', '--title=fix: admission', `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
+      '--ref=lane/preflight', `--title=${title}`, `--body=${body}`, labelOnGreen ? '--label-on-green' : '--no-wait', '--json',
       ...(check ? ['--check'] : []), ...(override === 'forceOpen' ? ['--force-open', '--reason=operator'] : [])],
-    { cwd: soakTiming !== undefined ? root : dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', WE_PR_OPEN_SOAK_PRECHECK: '1' },
+    { cwd: realSoak ? root : dir, env: { ...process.env, TMPDIR: dir, WE_POLICY_CASCADE_LOG: '0', WE_PR_OPEN_SOAK_PRECHECK: '1' },
       encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024 });
     if (!child.stdout.trim()) throw new Error(`CLI ${child.status}: ${child.stderr}`);
     return { status: child.status, result: JSON.parse(child.stdout.trim().split('\n').at(-1)),
@@ -99,55 +95,52 @@ describe('pr-land pre-push checkpoint', () => {
     expect(result.detail).toContain('diff unavailable');
     expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
   });
-  it.each(['X', 'U', 'T'])('refuses unknown diff status %s before push/create', soakStatus => {
-    const { status, result, effects } = run({ count: 0, check: false, soakTiming: '{"seconds":1}', soakStatus });
+  it.each(['X', 'U', 'Q'])('refuses unsupported daemon diff status %s before push/create', code => {
+    const { status, result, effects } = run({ count: 0, check: false, realSoak: true,
+      rawDiff: `${code}\0scripts/conveyor/soak/breaks/preflight.soak.test.mjs\0` });
     expect(status).toBe(3);
     expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
     expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
   });
-  it.each(['missing-tab', 'A\t', 'R100\told', 'M\tREADME.md\n\nA\tnew'])('refuses malformed diff %j before push/create', rawDiff => {
+  it.each(['missing-nul', 'A\0\0', 'R100\0old\0', 'M\0README.md\0\0A\0new\0',
+    'A\0new', 'R101\0old\0new\0', 'C1000\0old\0new\0'])('refuses malformed diff %j before push/create', rawDiff => {
     const { status, result, effects } = run({ count: 0, check: false, rawDiff });
     expect(status).toBe(3);
     expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
     expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
   });
-  it.each(['R100', 'C100'])('requires committed timing for the destination of a %s record', code => {
-    const rawDiff = `${code}\told.soak.test.mjs\tscripts/conveyor/soak/breaks/preflight.soak.test.mjs`;
-    const missing = run({ count: 0, check: false, rawDiff, soakTiming: '{"seconds":1}', committedTiming: null });
-    expect(missing.status).toBe(3);
-    expect(missing.result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
-    expect(missing.effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
-    expect(run({ count: 0, rawDiff, soakTiming: '{"seconds":1}' }).status).toBe(0);
-  });
-  it('refuses a Git-quoted Unicode test path before push/create', () => {
-    const { status, result, effects } = run({ count: 0, check: false, soakTiming: null, quotedPath: true });
-    expect(status).toBe(3);
-    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
-    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
-  });
-  it.each([null, '{', '{"seconds":0}'])('refuses missing/invalid committed timing %s despite a valid working copy', committedTiming => {
-    const { status, result, effects } = run({ count: 0, check: false, soakTiming: '{"seconds":1}', committedTiming });
-    expect(status).toBe(3);
-    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
-    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
-  });
-  it('accepts valid committed timing despite a corrupt working copy', () => {
-    const { status, result, effects } = run({ count: 0, soakTiming: '{', committedTiming: '{"seconds":1}' });
+  it.each(['R100', 'C100', 'R095', 'C075', 'R5', 'C00'])('accepts an untimed destination of a %s record', code => {
+    const rawDiff = `M\0scripts/lib/daemon-rebuild.mjs\0${code}\0old.soak.test.mjs\0scripts/conveyor/soak/breaks/preflight.soak.test.mjs\0`;
+    const { status, result } = run({ count: 0, rawDiff, realSoak: true });
     expect(status).toBe(0);
     expect(result.reason).toBe('check-ok');
-    expect(effects).toContainEqual(['git', ['show', `${'a'.repeat(40)}:scripts/conveyor/soak/breaks/preflight.soak.test.mjs.timing.json`]]);
   });
-  it.each([null, '{', '{"seconds":0}'])('real soak precheck refuses missing or invalid sidecar %s before push/create', soakTiming => {
-    const { status, result, effects } = run({ count: 0, soakTiming });
-    expect(status).toBe(3);
-    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
-    expect(result.detail).toContain('preflight.soak.test.mjs.timing.json');
-    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
-  });
-  it('real soak precheck reads a valid sidecar from the ref in --repo when cwd is different', () => {
-    const { status, result } = run({ count: 0, soakTiming: '{"seconds":0.25}' });
+  it.each(['é', 'a\tb', 'a\nb', 'a\rb', 'a"b', 'a\\b', '`echo x`', '--name', 'a\u2028b', 'e\u0301', 'a\u200bb', 'trailing '])('preserves NUL-delimited filename %j through the real precheck', name => {
+    const rawDiff = `M\0scripts/lib/daemon-rebuild.mjs\0A\0scripts/conveyor/soak/breaks/${name}.soak.test.mjs\0M\0docs/${name}\0`;
+    const { status, result, effects } = run({ count: 0, rawDiff, realSoak: true });
     expect(status).toBe(0);
     expect(result.reason).toBe('check-ok');
+    expect(effects).toContainEqual(['git', ['diff', '--name-status', '-z', '-M', `origin/main...${'a'.repeat(40)}`]]);
+  });
+  it.each(['T', 'U', 'X'])('accepts unrelated %s status through the real precheck', code => {
+    expect(run({ count: 0, realSoak: true, rawDiff: `${code}\0docs/é.md\0` }).status).toBe(0);
+  });
+  it('does not mistake a rename source for break evidence', () => {
+    const rawDiff = 'M\0scripts/lib/daemon-rebuild.mjs\0R095\0scripts/conveyor/soak/breaks/old.mjs\0docs/new.md\0';
+    expect(run({ count: 0, realSoak: true, rawDiff }).status).toBe(3);
+  });
+  it('still refuses a daemon fix without a break before push/create', () => {
+    const { status, result, effects } = run({ count: 0, check: false, realSoak: true,
+      rawDiff: 'M\0scripts/lib/daemon-rebuild.mjs\0' });
+    expect(status).toBe(3);
+    expect(result.blockers).toMatchObject([{ reason: 'soak-declaration' }]);
+    expect(effects.some(([cmd, args]) => cmd === 'create' || args?.[0] === 'push')).toBe(false);
+  });
+  it.each(['test: add soak coverage', 'fix: admission'])('admits an untimed test for %s without reading timing files', title => {
+    const { status, result, effects } = run({ count: 0, realSoak: true, title });
+    expect(status).toBe(0);
+    expect(result.reason).toBe('check-ok');
+    expect(effects.some(([cmd, args]) => cmd === 'git' && args[0] === 'show' && args[1]?.endsWith('.timing.json'))).toBe(false);
   });
   it.each(['different', 'missing', 'unreadable'])('green checks with %s PR head evidence refuse before ready-to-merge is ever applied', headEvidence => {
     const { status, result, effects } = run({ check: false, count: 0, labelOnGreen: true, headEvidence });

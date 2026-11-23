@@ -6402,20 +6402,25 @@ owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks
 leave that file to the bot. Files without entries in that shared sharding map get their
 suite's median stored timing and still land in exactly one shard.
 
-Every added or renamed `.soak.test.mjs` under `scripts/conveyor/soak/` needs a committed
-sidecar named `<test>.timing.json` next to it (for example,
-`example.soak.test.mjs.timing.json`). Its entire schema is `{"seconds":0.25}`: one
-`seconds` field containing a positive finite number measured for that test. The test
-author owns the sidecar: measure the test when adding or renaming it, and refresh the
-measurement when its runtime changes. The scheduled refresh bot does not update these
-sidecars. Missing, unreadable, malformed or invalid sidecars refuse PR-open admission,
-including test-only PRs; a shared timing entry or soak waiver cannot replace them.
-Admission reads sidecars from the exact source commit (`git show <sha>:<path>`),
-so a valid working copy cannot mask missing or invalid committed evidence. Diff
-failures, unknown change types, and Git-quoted paths refuse admission; restore the
-base/source commits or supply canonical unquoted paths and retry. Sidecar reads are
-limited to 64 KiB and ten seconds; an oversized or stalled read refuses admission
-and requires correcting the sidecar or repository before retrying.
+Added and renamed soak tests need neither a shared timing entry nor a timing sidecar
+for PR admission. The scheduled refresh currently updates unit timings and preserves
+existing soak timings; new soak tests use the median fallback until measured data
+is added by a bot refresh. PR authors do not supply timing metadata.
+The named test `assigns an unknown file exactly once using its suite median` in
+`scripts/ci/__tests__/shard-assign.test.mjs` defends the fallback weight and unique assignment.
+The precheck reads `git diff --name-status -z`, preserving Unicode, quotes, tabs,
+newlines, backslashes and trailing spaces in filenames. Rename/copy scores include
+Git's padded forms such as `R095` and `C075`; only destination paths count as replay
+evidence. Type changes are modifications. Unmerged/unknown statuses refuse only for
+daemon-soak paths; unrelated files do not supply replay evidence. An unavailable or
+malformed diff still refuses admission: restore the base/source commits or resolve
+the unsupported records and retry. This fail-closed diff policy is independent of
+timing ownership.
 The PR-open soak precheck also requires break coverage for daemon-scope bug fixes as
 before. The balance diagnostic still requires measurements for every file before
 claiming measured balance; it is not a PR admission requirement.
+
+Before changing an admission gate, compare each PREP acceptance line with the net
+behavior change. Every new refusal path needs explicit authorization in the card;
+keep a deterministic test for admission without timing metadata so a separate
+measurement policy cannot silently reintroduce per-PR timing work.

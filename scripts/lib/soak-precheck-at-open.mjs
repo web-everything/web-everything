@@ -1,5 +1,5 @@
-import { execFileSync } from 'node:child_process';
 import { evaluateSoakReplayGate } from './soak-replay-gate.mjs';
+import { isDaemonSoakScopePath } from './daemon-soak-scope.mjs';
 
 export const SOAK_PRECHECK_ENV = 'WE_PR_OPEN_SOAK_PRECHECK';
 
@@ -7,50 +7,45 @@ export function soakPrecheckEnabled(env = process.env) {
   return !/^(0|false|off|no)$/i.test(String(env[SOAK_PRECHECK_ENV] ?? ''));
 }
 
-// The bot-owned shared timing map is optional; per-test sidecars supply admission evidence.
-export function soakPrecheckAtOpen({ title, body, files, env, refSha, repoRoot = process.cwd() }) {
+/** Parse raw `git diff --name-status -z` output without quoting or whitespace loss. */
+export function parseSoakNameStatus(diff) {
+  if (typeof diff !== 'string' || (diff && !diff.endsWith('\0'))) {
+    throw new Error('incomplete name-status output');
+  }
+  const fields = diff ? diff.slice(0, -1).split('\0') : [];
+  const types = { A: 'ADDED', M: 'MODIFIED', D: 'DELETED', T: 'MODIFIED', U: 'UNMERGED', X: 'UNKNOWN' };
+  const files = [];
+  for (let i = 0; i < fields.length;) {
+    const code = fields[i++];
+    // Git pads similarity scores to three digits; accept both padded and short scores.
+    const paired = /^[RC][0-9]{1,3}$/.test(code) && Number(code.slice(1)) <= 100;
+    if (!paired && !Object.hasOwn(types, code)) throw new Error('unknown name-status code');
+    const source = fields[i++];
+    const path = paired ? fields[i++] : source;
+    if (!source || !path) throw new Error('missing name-status path');
+    files.push({ path, changeType: paired ? (code[0] === 'R' ? 'RENAMED' : 'ADDED') : types[code] });
+  }
+  return files;
+}
+
+// Timing metadata is bot-owned; admission only enforces replay coverage.
+export function soakPrecheckAtOpen({ title, body, files, env }) {
   if (!soakPrecheckEnabled(env)) return { ok: true, skipped: 'disabled' };
   const gate = evaluateSoakReplayGate({ title, body, files });
   const refuseMetadata = reason => ({ ok: false, applicable: gate.applicable, reason,
-    message: `soak precheck (${SOAK_PRECHECK_ENV}): ${reason}. Fix: supply a complete diff with canonical, unquoted paths and known change types, then retry.` });
+      message: `soak precheck (${SOAK_PRECHECK_ENV}): ${reason}. Fix: supply a complete NUL-delimited diff with known daemon-soak change types, then retry.` });
   if (!Array.isArray(files)) return refuseMetadata('unavailable file list');
-  // Admission evidence belongs to the test, not the bot-owned shared sharding map.
-  // Check all added/renamed soak tests, including test-only PRs and waived fixes.
+  // Unknown metadata must not fabricate replay evidence. Unrelated files do not
+  // participate in this gate; valid Git filenames may contain quotes or whitespace.
   for (const file of files) {
     const path = typeof file === 'string' ? file : file?.path;
-    // Git's C-quoted paths must never fall through the prefix/suffix filter.
-    if (typeof path !== 'string' || path.startsWith('"') || /[\\\x00-\x1f\x7f]/.test(path) ||
-        path.split('/').some(part => !part || part === '.' || part === '..')) {
-      return refuseMetadata('invalid or Git-quoted file path');
-    }
+    if (typeof path !== 'string' || !path || path.includes('\0')) return refuseMetadata('invalid file path');
+    if (!isDaemonSoakScopePath(path)) continue;
+    if (path.split('/').some(part => !part || part === '.' || part === '..')) return refuseMetadata('non-canonical daemon-soak path');
     const changeType = typeof file === 'string' ? 'ADDED'
       : typeof file.changeType === 'string' ? file.changeType.toUpperCase() : '';
     if (!['ADDED', 'RENAMED', 'MODIFIED', 'DELETED'].includes(changeType)) {
       return refuseMetadata('unknown file change type');
-    }
-    if (!path.startsWith('scripts/conveyor/soak/') || !path.endsWith('.soak.test.mjs')) continue;
-    if (changeType === 'MODIFIED' || changeType === 'DELETED') continue;
-    const sidecar = `${path}.timing.json`;
-    try {
-      if (typeof refSha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(refSha)) {
-        throw new Error('missing or invalid ref sha');
-      }
-      // Read the immutable commit being published; uncommitted working files are not evidence.
-      const timing = JSON.parse(execFileSync('git', ['show', `${refSha}:${sidecar}`], {
-        cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-        timeout: 10_000, maxBuffer: 64 * 1024,
-      }));
-      if (!timing || typeof timing !== 'object' || Array.isArray(timing) ||
-          Object.keys(timing).length !== 1 || !Object.hasOwn(timing, 'seconds') ||
-          !Number.isFinite(timing.seconds) || timing.seconds <= 0) {
-        throw new Error('invalid timing schema');
-      }
-    } catch {
-      const reason = `missing, unreadable or invalid soak timing sidecar: ${sidecar}`;
-      return { ok: false, applicable: gate.applicable, reason,
-        message: `soak precheck (${SOAK_PRECHECK_ENV}): ${reason}. ` +
-          'Fix: measure the soak test and commit its sidecar containing only {"seconds": <positive finite number>}. ' +
-          'The test author owns this measurement and refreshes it when runtime changes.' };
     }
   }
   const { ok, applicable } = gate;

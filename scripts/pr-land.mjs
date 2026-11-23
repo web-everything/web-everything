@@ -111,8 +111,7 @@ export function buildSizeAdmissionRequest({ ref, pr, remote, base, refSha, body 
 }
 
 import { assertMayMerge, hasNonEmptyBody } from './lib/pr-merge-gate.mjs';
-import { soakPrecheckAtOpen, soakPrecheckEnabled } from './lib/soak-precheck-at-open.mjs';
-import { parseNameStatus } from './soak-replay-gate-cli.mjs';
+import { soakPrecheckAtOpen, soakPrecheckEnabled, parseSoakNameStatus } from './lib/soak-precheck-at-open.mjs';
 import { createGhLandProvider, buildCreateArgs } from './lib/forge-land-provider.mjs'; // #3585 — the forge-land port
 export { mergeMethodFlag, buildCreateArgs, buildMergeArgs, buildAddLabelArgs } from './lib/forge-land-provider.mjs'; // re-exported for backward compat — callers/tests still import these off pr-land.mjs
 import { numberPendingHashes, isPostLandTreeDirty } from './lane-drain.mjs'; // JIT numbering + dirty-probe, shared single source (#2288/#xzxc92d/#2348)
@@ -785,7 +784,10 @@ if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 
 async function runCli() {
   // Install the closure before setup so the entry-point catch can use the normal failure output.
   emit = emitResult;
-  const gitC = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const gitC = (args) => {
+    const output = execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return args.includes('-z') ? output : output.trim();
+  };
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
   // otherwise the strict-lock hook would block pr-land's own legitimate landing. Scoped to THESE calls only, so
@@ -950,20 +952,14 @@ async function runCli() {
     if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
     let files;
     try {
-      const diff = gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]);
-      // The shared parser defaults unknown statuses to MODIFIED and drops malformed rows.
-      // Admission cannot treat either as evidence that no test was added.
-      const rows = diff ? diff.split('\n') : [];
-      if (rows.some(row => !/^(?:[AMD]\t[^\t\n]+|[RC](?:100|[0-9]{1,2})\t[^\t\n]+\t[^\t\n]+)$/.test(row))) {
-        throw new Error('unknown or malformed name-status record');
-      }
-      files = parseNameStatus(diff);
+      const diff = gitC(['diff', '--name-status', '-z', '-M', `${REMOTE}/${BASE}...${refSha}`]);
+      files = parseSoakNameStatus(diff);
     } catch {
       const reason = 'diff unavailable or invalid';
       return { ok: false, reason,
         message: `soak precheck: ${reason}. Fix: make the base and source commits available, resolve unsupported diff records, and retry.` };
     }
-    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files, refSha, repoRoot: REPO });
+    return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
 
   if (DRY_RUN) {
