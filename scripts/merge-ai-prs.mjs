@@ -5930,7 +5930,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return stdout;
       },
     });
-    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    const readSnapshot = repo => {
+      try { return readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true, strictCacheOnly: true }); }
+      catch (error) {
+        if (['cold', 'stale'].includes(error.code)) throw new SnapshotColdError(error.code);
+        throw error;
+      }
+    };
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
@@ -5987,7 +5993,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const seen = new Set();
       for (let cause = error; cause && !seen.has(cause); cause = cause.cause) {
         seen.add(cause);
-        if (flags['from-catch-up'] && cause instanceof SnapshotColdError) {
+        if (flags['from-catch-up'] && cause instanceof SnapshotColdError && ['cold', 'stale'].includes(cause.code)) {
           writeStdout(JSON.stringify({ ok: true, considered: 0, enqueueOutcomes: [
             { num: Number(onlyPr), repo: localSlug, outcome: 'not-enqueued', kind: 'snapshot-cold' },
           ] }) + '\n');

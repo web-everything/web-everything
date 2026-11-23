@@ -30,10 +30,13 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     });
     for (const repo of ['fixture/web-everything', 'fixture/frontierui', 'fixture/plateau-app']) {
       if (snapshotState === 'cold') continue;
-      writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`), JSON.stringify({ v: PR_SNAPSHOT_VERSION,
+      writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`), JSON.stringify({ v: snapshotState === 'unsupported' ? -1 : PR_SNAPSHOT_VERSION,
         repo, fetchedAtMs: Date.now() - (snapshotState === 'stale' ? 100000 : snapshotState === 'dirty-after-warm' ? 20000 : 0), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
         prs: repo === 'fixture/web-everything' ? rows : [] }));
     }
+    const localSnapshot = join(snapshots, 'fixture__web-everything.json');
+    if (snapshotState === 'corrupt') writeFileSync(localSnapshot, '{');
+    if (snapshotState === 'unreadable') { rmSync(localSnapshot); mkdirSync(localSnapshot); }
     if (snapshotState === 'dirty-after-warm') {
       const env = { WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots };
       const warmed = readSharedOpenPrs({ repo: 'fixture/web-everything', fields: SNAPSHOT_FIELDS, env,
@@ -138,7 +141,7 @@ out({});
         ...(workflowEditSetting ? { WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditSetting } : {}),
         WE_PR_SNAPSHOT_STALE_OK_MS: '3600000',
         CONTEXT_MAIN_CHANGED: mainChanged ? '1' : '0', CONTEXT_LOCK_LOST: lockLost ? '1' : '0', CONTEXT_ROUND: roundPath,
-        WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
+        WE_PR_SNAPSHOT: snapshotState === 'disabled' ? '0' : '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0',
         CONTEXT_BRANCH_FILE: join(dir, 'live-branch'), CONTEXT_BRANCH_AFTER_MEMBERSHIP: branchAfterMembership ?? '',
         WE_FAST_DRAIN_SCOPE: scope, WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',

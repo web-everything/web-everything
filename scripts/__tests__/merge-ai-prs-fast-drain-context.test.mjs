@@ -1,7 +1,7 @@
 import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
@@ -510,27 +510,64 @@ for (const [name, options, message] of [
   assert.doesNotMatch(result.stdout, /snapshot-cold/);
 });
 
-test('fast-drain-context changes only the error class and the two cold-source throw types', () => {
-  const path = 'scripts/lib/fast-drain-context.mjs';
-  // Pin the original source so this guard still works after the change is committed.
-  const beforeHash = 'ed03ea706e61bedca9426e33a4b8d5c9d94f92d64c2e2019f6a5cf3417bb5739';
-  const after = readFileSync(path, 'utf8');
-  const original = after.replace('export class SnapshotColdError extends Error {}\n\n', '')
-    .replaceAll("throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty",
-      "throw new Error('snapshot unavailable/disabled/stale/dirty");
-  assert.equal(createHash('sha256').update(original).digest('hex'), beforeHash);
+test('fast-drain-context freshness logic stays unchanged outside error typing and arbitration', () => {
+  const after = readFileSync('scripts/lib/fast-drain-context.mjs', 'utf8');
+  const original = after.replace("export class SnapshotColdError extends Error {\n  constructor(reason) { super(`snapshot ${reason}`); this.code = reason; }\n}\n\n", '')
+    .replace("  const failures = results.filter(r => Object.hasOwn(r, 'error')).map(r => r.error);\n  if (failures.length) throw failures.find(error => !(error instanceof SnapshotColdError)\n    || !['cold', 'stale'].includes(error.code)) ?? failures[0];",
+      "  const failed = results.find(r => Object.hasOwn(r, 'error'));\n  if (failed) throw failed.error;");
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'ed03ea706e61bedca9426e33a4b8d5c9d94f92d64c2e2019f6a5cf3417bb5739');
 });
 
-test('only null snapshot rows are typed cold; matching error text stays a hard failure', async () => {
+// Ambiguous legacy nulls must never authorize a successful catch-up deferral.
+test('unclassified null snapshot rows and matching error text fail closed', async () => {
   for (const throws of [false, true]) {
     await assert.rejects(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7,
       failClosed: true,
       readSnapshot: () => { if (throws) throw new Error('snapshot unavailable/disabled/stale/dirty'); return null; },
     }), error => {
-      assert.equal(error.cause instanceof SnapshotColdError, !throws);
-      assert.equal(error.constructor, Error);
+      assert.equal(error.cause instanceof SnapshotColdError, false);
       assert.equal(error.cause.message, 'snapshot unavailable/disabled/stale/dirty');
       return true;
     });
   }
 });
+
+for (const snapshotState of ['disabled', 'corrupt', 'unreadable', 'unsupported']) {
+  test(`catch-up ${snapshotState} snapshot fails closed with a distinct reason`, () => {
+    const result = runFastDrainContextCli({ catchUp: true, snapshotState, rowCount: 2, dryRun: false });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, new RegExp(`snapshot ${snapshotState}`));
+    assert.doesNotMatch(result.stdout, /snapshot-cold/);
+    assert.equal(result.calls.some(a => a.some(v => /mutation|enqueuePullRequest/.test(v))
+      || a[0] === 'pr' && ['merge', 'edit', 'comment', 'close', 'review'].includes(a[1])), false);
+  });
+}
+
+for (const snapshotState of ['cold', 'stale']) {
+  test(`invalid target evidence wins over a concurrent ${snapshotState} snapshot`, () => {
+    const result = runFastDrainContextCli({ catchUp: true, snapshotState, rowCount: 2,
+      livePatches: { 7: { body: null } } });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /full PR evidence incomplete/);
+    assert.doesNotMatch(result.stdout, /snapshot-cold/);
+  });
+}
+
+for (const reason of ['disabled', 'corrupt', 'unreadable', 'unsupported']) {
+  test(`strict cache-only reader preserves the ${reason} error code`, () => {
+    const dir = mkdtempSync(join(process.env.TMPDIR, 'snapshot-reason-'));
+    try {
+      const path = snapshotPath(dir, repo);
+      if (reason === 'corrupt') writeFileSync(path, '{');
+      if (reason === 'unsupported') writeFileSync(path, JSON.stringify({ v: -1 }));
+      if (reason === 'unreadable') mkdirSync(path);
+      assert.throws(() => readSharedOpenPrs({ repo, fields: SNAPSHOT_FIELDS,
+        env: { WE_PR_SNAPSHOT: reason === 'disabled' ? '0' : '1', WE_PR_SNAPSHOT_DIR: dir },
+        cacheOnly: true, strictCacheOnly: true,
+      }), error => {
+        assert.equal(error.code, reason);
+        return true;
+      });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+}

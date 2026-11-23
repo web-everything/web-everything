@@ -14,7 +14,9 @@ import { isDegradedOpenPrListing, OPEN_PR_LIST_LIMIT } from './no-search-backed-
 import { assertInventoryComplete, buildOpenPrPageQuery, parseOpenPrPage } from './pr-list-paged.mjs';
 import { queueFileOverlap, completeListedFiles } from './queue-file-overlap.mjs';
 
-export class SnapshotColdError extends Error {}
+export class SnapshotColdError extends Error {
+  constructor(reason) { super(`snapshot ${reason}`); this.code = reason; }
+}
 
 export const LEAN_OPEN_PR_FIELDS = 'number,headRefOid,updatedAt,baseRefName,isDraft,state';
 export const fastDrainPrKey = (repo, number) => `${repo}#${number}`;
@@ -132,8 +134,9 @@ export async function readFastDrainFacts(items, concurrency, read) {
     try { return { value: await read(item, index) }; }
     catch (error) { return { error }; }
   });
-  const failed = results.find(r => Object.hasOwn(r, 'error'));
-  if (failed) throw failed.error;
+  const failures = results.filter(r => Object.hasOwn(r, 'error')).map(r => r.error);
+  if (failures.length) throw failures.find(error => !(error instanceof SnapshotColdError)
+    || !['cold', 'stale'].includes(error.code)) ?? failures[0];
   return results.map(r => r.value);
 }
 
@@ -157,7 +160,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
   const readSources = () => new Map(repos.map(repo => {
     const rows = readSnapshot(repo);
-    if (!Array.isArray(rows)) throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty — retry next pass');
+    if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
   }));
   const readHeads = async () => Object.fromEntries(await readFastDrainFacts(repos, concurrency, async repo => {
@@ -284,7 +287,7 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
       if (readInventory) return readInventory();
       const snapshots = new Map(repos.map(repo => {
         const rows = readSnapshot(repo);
-        if (!Array.isArray(rows)) throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty');
+        if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty');
         return [repo, rows];
       }));
       return { snapshots };

@@ -3329,7 +3329,7 @@ describe('catch-up snapshot warm', () => {
     expect(f.lines.some(line => line.includes('snapshot warm failed'))).toBe(failed);
     f.handle.kill();
   });
-  it('snapshot-cold releases room and retries the same head without a miss hold', async () => {
+  it('snapshot-cold consumes the attempt budget and retries next round without a miss hold', async () => {
     const f = catchUpSetup({
       readCapacity: () => ({ capacity: 1, source: 'test' }),
       readQueueDepth: async () => ({ ok: true, queued: 0 }),
@@ -3339,11 +3339,83 @@ describe('catch-up snapshot warm', () => {
         { num, outcome: 'not-enqueued', kind: 'snapshot-cold' },
       ] }),
     });
-    expect(await f.handle.catchUp()).toHaveLength(2);
+    expect(await f.handle.catchUp()).toHaveLength(1);
     expect(f.handle.missBackoff().size).toBe(0);
     f.advance(600_000);
-    expect(await f.handle.catchUp()).toHaveLength(2);
-    expect(f.calls).toHaveLength(4);
+    expect(await f.handle.catchUp()).toHaveLength(1);
+    expect(f.calls).toHaveLength(2);
     f.handle.kill();
   });
+  it.each(['kill', 'window'])('does not spawn if %s occurs during the warm', async stop => {
+    let release;
+    let allowed = true;
+    const warmSnapshot = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const f = catchUpSetup({ warmSnapshot, allowed: () => allowed });
+    const run = f.handle.catchUp();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(warmSnapshot).toHaveBeenCalledTimes(1);
+    if (stop === 'kill') f.handle.kill();
+    else allowed = false;
+    release();
+    await run;
+    expect(f.calls).toHaveLength(0);
+    f.handle.kill();
+  });
+
+  it('a hanging warm times out, backs off, and cannot spawn after late completion', async () => {
+    vi.useFakeTimers();
+    let release;
+    const warmSnapshot = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const f = catchUpSetup({ warmSnapshot, timeoutMs: 1000,
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: 'same-head' }),
+    });
+    try {
+      const run = f.handle.catchUp();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await run).toMatchObject([{ outcome: 'timeout' }]);
+      expect(f.handle.blocked().get(42)).toMatchObject({ reason: 'timeout' });
+      expect(warmSnapshot.mock.calls[0][0].signal.aborted).toBe(true);
+      release();
+      await Promise.resolve();
+      expect(f.calls).toHaveLength(0);
+      f.advance(600_000);
+      expect(await f.handle.catchUp()).toMatchObject([{ outcome: 'skipped' }]);
+      expect(warmSnapshot).toHaveBeenCalledTimes(1);
+    } finally { f.handle.kill(); vi.useRealTimers(); }
+  });
+
+  it('warm time reduces the remaining child timeout', async () => {
+    vi.useFakeTimers();
+    let release;
+    const f = catchUpSetup({ timeoutMs: 1000, manualFinish: true,
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+      warmSnapshot: () => new Promise(resolve => { release = resolve; }),
+    });
+    try {
+      const run = f.handle.catchUp();
+      await vi.advanceTimersByTimeAsync(600);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.children).toHaveLength(1);
+      f.children[0].kill = () => f.children[0].emit('close', null);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(await run).toMatchObject([{ outcome: 'timeout' }]);
+    } finally { f.handle.kill(); vi.useRealTimers(); }
+  });
+
+  it('does not spawn when a synchronous warm outlasts the deadline before timers can run', async () => {
+    vi.useFakeTimers();
+    const f = catchUpSetup({ timeoutMs: 1000,
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: 'same-head' }),
+      warmSnapshot: () => { vi.setSystemTime(Date.now() + 1001); },
+    });
+    try {
+      expect(await f.handle.catchUp()).toMatchObject([{ outcome: 'timeout' }]);
+      expect(f.calls).toHaveLength(0);
+      expect(f.handle.blocked().get(42)).toMatchObject({ reason: 'timeout' });
+    } finally { f.handle.kill(); vi.useRealTimers(); }
+  });
+
 });

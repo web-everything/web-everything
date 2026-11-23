@@ -412,7 +412,7 @@ function fastDrainUsedNoRoom(json, num) {
   const hit = (list) => Array.isArray(list) && list.some((p) => Number(p?.num) === Number(num));
   if (hit(json.merged) || hit(json.failed)) return false;
   if (Array.isArray(json.enqueueOutcomes) && json.enqueueOutcomes.some(p => Number(p?.num) === Number(num)
-    && p.outcome === 'not-enqueued' && p.kind === 'snapshot-cold')) return true;
+    && p.outcome === 'not-enqueued' && p.kind === 'snapshot-cold')) return false;
   if ([json.revalidationAborted, json.deferred, json.coupleHeld, json.parked].some(hit)) return true;
   // toMerge is the planned set, so explicit non-enqueue outcomes above take precedence.
   // toMerge also appears in skipReasons after a successful enqueue (ready-not-reached).
@@ -760,25 +760,51 @@ export function extractPassTimings(stderr) {
   return timings;
 }
 
-function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
+function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {}, beforeSpawn, signal, allowed = () => true }) {
   return new Promise((resolveRun) => {
-    let stdout = ''; let stderr = ''; let timedOut = false;
+    let stdout = ''; let stderr = ''; let timedOut = false; let done = false;
     const output = () => ({
       stdout, stderrBytes: stderr.length, errorClass: classifyChildFailure(stderr, { timedOut }),
       passTimings: extractPassTimings(stderr), timedOut,
     });
     let child;
-    try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch { resolveRun({ code: null, ...output(), errorClass: 'spawn-error' }); return; }
-    onChild(child);
-    child.stdout?.on('data', (d) => { stdout += d; });
-    // Keep the full stream: timing lines can span chunks and precede later diagnostics.
-    child.stderr?.setEncoding?.('utf8');
-    child.stderr?.on('data', (d) => { stderr += d; });
-    const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
+    const deadline = Date.now() + timeoutMs;
+    const finish = result => {
+      if (done) return;
+      done = true;
+      clearTimeout(killer);
+      signal?.removeEventListener('abort', cancel);
+      resolveRun(result);
+    };
+    const cancel = () => {
+      try { child?.kill('SIGTERM'); } catch { /* gone */ }
+      finish({ code: null, ...output(), cancelled: true });
+    };
+    const killer = setTimeout(() => {
+      timedOut = true;
+      if (child) { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+      else finish({ code: null, ...output() });
+    }, timeoutMs);
     killer.unref?.();
-    child.on('error', () => { clearTimeout(killer); resolveRun({ code: null, ...output(), errorClass: 'spawn-error' }); });
-    child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, ...output() }); });
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) { cancel(); return; }
+    const start = async () => {
+      if (beforeSpawn) await beforeSpawn();
+      if (done) return;
+      // A synchronous warm can occupy the event loop past the timer's deadline.
+      if (Date.now() >= deadline) { timedOut = true; finish({ code: null, ...output() }); return; }
+      if (signal?.aborted || !allowed()) { cancel(); return; }
+      try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+      catch { finish({ code: null, ...output(), errorClass: 'spawn-error' }); return; }
+      onChild(child);
+      child.stdout?.on('data', (d) => { stdout += d; });
+      // Keep the full stream: timing lines can span chunks and precede later diagnostics.
+      child.stderr?.setEncoding?.('utf8');
+      child.stderr?.on('data', (d) => { stderr += d; });
+      child.on('error', () => finish({ code: null, ...output(), errorClass: 'spawn-error' }));
+      child.on('close', (code) => finish({ code, ...output() }));
+    };
+    start().catch(() => finish({ code: null, ...output(), errorClass: 'spawn-error' }));
   });
 }
 
@@ -919,7 +945,7 @@ export function createEnqueueOnEvent({
   let running = null; // the serialized tick/catch-up promise
   let runningCatchUpOnly = false;
   let stopped = false;
-  const children = new Set(); // every in-flight child is stopped on daemon exit
+  const cancellations = new Set();
   const activeNums = new Set();
   let lastLine = null;
   let lastCatchUpAt = null;
@@ -1211,16 +1237,24 @@ export function createEnqueueOnEvent({
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
       log(`${prefix} ${taken.causes.join(', ')} — running the drain's single-PR fast drain ${Math.round((startedAt - taken.lastAt) / 1000)}s after the last event`);
       const finish = async () => {
-        let ownChild;
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
-        if (p.catchUp) {
+        const controller = new AbortController();
+        cancellations.add(controller);
+        const beforeSpawn = async () => {
+          if (!p.catchUp) return;
           const warmEnv = { ...env };
           delete warmEnv.WE_PR_SNAPSHOT_STALE_OK_MS;
-          try { await warmSnapshot({ localSlug, env: warmEnv }); }
+          try { await warmSnapshot({ localSlug, env: warmEnv, signal: controller.signal }); }
           catch { log(`${prefix} snapshot warm failed — spawning child anyway`); }
+        };
+        const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, beforeSpawn,
+          signal: controller.signal, allowed: () => !stopped && mayStart() });
+        controller.abort();
+        cancellations.delete(controller);
+        if (r.cancelled) {
+          if (!stopped) pending = new Map(pending).set(key, taken);
+          return;
         }
-        const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
-        children.delete(ownChild);
         const exitFailed = !r.timedOut && r.code !== 0;
         // A failed child cannot supply success or permanent-decline evidence.
         const json = exitFailed ? null : lastJsonLine(r.stdout);
@@ -1395,7 +1429,7 @@ export function createEnqueueOnEvent({
     /** Resolves when no fast drain is in flight (call before a full pass or a clone refresh). */
     idle() { return running ? running.then(() => undefined, () => undefined) : Promise.resolve(); },
     /** Stop the in-flight fast drain (the daemon calls this on its own exit, like it stops its pass child). */
-    kill() { stopped = true; if (running) running.then(clearSnapshot, clearSnapshot); else clearSnapshot(); for (const child of children) { try { child.kill('SIGTERM'); } catch { /* gone */ } } },
+    kill() { stopped = true; for (const controller of cancellations) controller.abort(); if (running) running.then(clearSnapshot, clearSnapshot); else clearSnapshot(); },
     misses: () => new Map(misses),
     blocked: () => new Map(backoff),
     missBackoff: () => new Map([...missBackoff].map(([num, entry]) => [num, { ...entry }])),

@@ -228,6 +228,7 @@ function logHit(env, caller, repo) {
  * @param {{repo:string|null, fields:string|string[], env?:NodeJS.ProcessEnv, nowMs?:number, exec?:Function,
  *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object, spawnRefresh?:Function,
  *   smokeChild?:boolean}} o
+ *   `strictCacheOnly`: classify cache misses as cold/stale or hard failures instead of returning null.
  *   `smokeChild`: defaults to the reconcile CLI or Node eval launch; with WE_SMOKE_LIVE_CLONE, fills unset smoke controls.
  *   `allowDeferred`: opt in to receiving the truthy `{outcome:'deferred-low-budget'}` object (the caller MUST
  *   check `isGhDeferred`); by default a deferral returns `null`, keeping the `Array|null` contract for every reader.
@@ -236,12 +237,16 @@ function logHit(env, caller, repo) {
 export function readSharedOpenPrs({
   repo, fields, env = process.env, now = () => Date.now(), exec,
   dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false,
-  paging = null, spawnRefresh = null, smokeChild = isSmokeDryRunChild(),
+  paging = null, spawnRefresh = null, strictCacheOnly = false, smokeChild = isSmokeDryRunChild(),
 } = {}) {
-  if (!prSnapshotEnabled(env) && !dir) return null;
-  if (!snapshotKey(repo)) return null;
+  const unavailable = code => {
+    if (strictCacheOnly) throw Object.assign(new Error(`snapshot ${code}`), { code });
+    return null;
+  };
+  if (!prSnapshotEnabled(env) && !dir) return unavailable('disabled');
+  if (!snapshotKey(repo)) return unavailable('unsupported');
   const want = normalizeFields(fields);
-  if (!want.length || !want.every((f) => SNAPSHOT_FIELDS.includes(f))) return null;
+  if (!want.length || !want.every((f) => SNAPSHOT_FIELDS.includes(f))) return unavailable('unsupported');
   env = candidateSmokeEnv(env, smokeChild);
   const root = dir || prSnapshotDir(env);
   const path = snapshotPath(root, repo);
@@ -252,7 +257,8 @@ export function readSharedOpenPrs({
   const injectedExec = exec !== undefined;
   if (exec === undefined) exec = execFileSyncThrottled;
   const servable = () => {
-    const snap = readSnapshotFile(path);
+    const snap = readSnapshotFile(path, { strict: strictCacheOnly });
+    if (strictCacheOnly && (!want.every(f => snap.fields.includes(f)) || snap.repo !== repo || snap.fetchedAtMs > now())) return unavailable('unsupported');
     if (staleOkMs && !cacheOnly && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
       if (now() - snap.fetchedAtMs >= ttl && !injectedExec
         && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
@@ -267,7 +273,7 @@ export function readSharedOpenPrs({
   const hit = servable();
   if (hit) { logHit(env, who, repo); return smokeProjection(hit, want, env); }
 
-  if (cacheOnly) return null;
+  if (cacheOnly) return unavailable('stale');
   mkdirSync(root, { recursive: true });
   let result = null;
   try {

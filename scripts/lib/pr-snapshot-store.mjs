@@ -62,14 +62,22 @@ function dirtyPath(dir, keyOrAll) {
   return join(dir, `${keyOrAll}.dirty`);
 }
 
-/** Parse a snapshot file; null when absent/corrupt/wrong version. Never throws. */
-export function readSnapshotFile(path, { readFile = readFileSync } = {}) {
+/** Parse a snapshot file; null on failure unless strict requests a classified error. */
+export function readSnapshotFile(path, { readFile = readFileSync, strict = false } = {}) {
   if (!path) return null;
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    if (s?.v !== PR_SNAPSHOT_VERSION || !Array.isArray(s.prs) || !Array.isArray(s.fields) || !Number.isFinite(s.fetchedAtMs)) return null;
+    if (s?.v !== PR_SNAPSHOT_VERSION || !Array.isArray(s.prs) || !Array.isArray(s.fields) || !Number.isFinite(s.fetchedAtMs)) {
+      if (strict) throw Object.assign(new Error('snapshot unsupported schema'), { code: 'unsupported' });
+      return null;
+    }
     return s;
-  } catch {
+  } catch (error) {
+    if (strict) {
+      const code = error.code === 'ENOENT' ? 'cold' : error.code === 'unsupported' ? 'unsupported'
+        : error instanceof SyntaxError ? 'corrupt' : 'unreadable';
+      throw Object.assign(new Error(`snapshot ${code}`, { cause: error }), { code });
+    }
     return null;
   }
 }
