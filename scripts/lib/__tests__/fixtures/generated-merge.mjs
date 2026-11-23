@@ -29,12 +29,11 @@ export function fixture({ conflict } = {}) {
   json('scripts/dispatch-settings.json', {});
   json('scripts/settings/seed.json', { sample: { base: 0 } });
   for (const path of ['delivery-platform-preferences', 'delivery-priority-settings']) json(`scripts/lib/${path}.json`, {});
-  // Optional legacy fixture input; real authoring uses metadata.d (generated artifacts are not committed).
-  json('scripts/lib/settings-registry-metadata.json', {
-    settings: {},
-    capacityLeaves: Object.fromEntries(Object.keys(CAPACITY_LEAVES).map(key => [key, { description: 'Capacity', range: '0–100' }])),
-    instantGaps: [], toSettle: [], discoveryPasses: ['B', 'C'].map(pass => ({ pass, family: 'fixture', scope: 'all', newItems: 0, newHighImpactItems: 0 })),
-  });
+  // Real authoring layout: metadata.d fragments only (no committed legacy metadata.json, generated artifacts are not committed).
+  for (const key of Object.keys(CAPACITY_LEAVES)) json(`scripts/lib/settings-registry-metadata.d/capacityLeaves/${key.replace(/[!'()*_]/g, c => `%${c.charCodeAt(0).toString(16)}`).replaceAll('%', '_')}.json`, { description: 'Capacity', range: '0–100' });
+  json('scripts/lib/settings-registry-metadata.d/lists/instantGaps.json', []);
+  json('scripts/lib/settings-registry-metadata.d/lists/toSettle.json', []);
+  json('scripts/lib/settings-registry-metadata.d/lists/discoveryPasses.json', ['B', 'C'].map(pass => ({ pass, family: 'fixture', scope: 'all', newItems: 0, newHighImpactItems: 0 })));
   json('scripts/lib/settings-registry-metadata.d/settings/sample.json', { description: 'Fixture setting', owner: 'scripts/settings/seed.json', changeVia: 'pr', instant: false });
   write('source.txt', 'base\n');
   generate('--write'); commit('base');

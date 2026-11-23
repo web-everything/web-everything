@@ -13,6 +13,8 @@ afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); for (const f of fixt
 
 it('resolveAdvisoryConflicts regenerates docs/agent/settings-registry.md when both sides add a setting', () => {
   const f = setup(), before = snapshot(f);
+  // New main layout: no committed legacy metadata.json; regeneration must not require it.
+  expect(existsSync(join(f.root, 'scripts/lib/settings-registry-metadata.json'))).toBe(false);
   const result = advisory.resolveAdvisoryConflicts(f);
   expect(result).toMatchObject({ ok: true, via: 'advisory-merge' });
   expect(snapshot(f)).toEqual(before);
@@ -207,7 +209,7 @@ it.each(['tree', 'commit', 'stage'])('cleanup failures do not override successfu
 const negatives = [
   ['N1 input JSON conflicted', { conflict: 'scripts/settings/seed.json' }],
   ['N2 closure module conflicted', { conflict: CLOSURE[1] }],
-  ['N3 bad metadata', {}, f => f.json('scripts/lib/settings-registry-metadata.json', {})],
+  ['N3 bad metadata', {}, f => f.json('scripts/lib/settings-registry-metadata.d/settings/sample.json', {})],
   ['N4 generator hangs and is killed', {}, f => f.write(CLOSURE[0], 'setInterval(() => {}, 1000);')], // keepalive-helper-ok: candidate generator text is never executed (closure mismatch refuses first)
   ['N5 source conflict', { conflict: 'source.txt' }],
   ['N6 check disagrees', {}, f => f.write(CLOSURE[0], `import {writeFileSync} from 'node:fs';
@@ -324,7 +326,7 @@ it('trusted closure drift guard follows static local imports and pins the exact 
   const seen = closureImports();
   expect([...seen].sort()).toEqual([...advisory.GENERATED_MERGE_PATHS[DOC].closure].sort());
   expect(advisory.GENERATED_MERGE_PATHS[DOC]).toEqual({ closure: CLOSURE,
-    inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/',
+    inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.d/',
       'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'], argv: ['--write'] });
   expect(Object.isFrozen(advisory.GENERATED_MERGE_PATHS)).toBe(true);
 });
