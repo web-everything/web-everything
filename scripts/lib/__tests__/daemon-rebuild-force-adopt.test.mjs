@@ -18,13 +18,14 @@ import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs'
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
 import { requestForceAdopt, readForceWatch, runForceWatchTick, readForceAdopt, recordForcedAdoption, forceBlockedReason } from '../daemon-force-adopt.mjs';
-import { readReadyCandidate, readRebuildStateStrict, alertsFilePath } from '../daemon-rebuild/state.mjs';
+import { readReadyCandidate, readRebuildStateStrict, alertsFilePath, clearReadyCandidate } from '../daemon-rebuild/state.mjs';
 import { cloneKeyOf } from '../daemon-last-good.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import * as rebuildJob from '../daemon-rebuild/rebuild-job.mjs';
 import * as rebuildPrepare from '../daemon-rebuild/prepare.mjs';
 import { pendingAdoptionPath } from '../overlay-adoption.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { createSetAsideFixture } from '../../conveyor/soak/fixtures/rebuild-set-aside-probe.mjs';
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -1220,3 +1221,28 @@ describe('R508 dispatch smoke after a force', () => {
     expect(dispatchRun).toHaveBeenCalledOnce();
   });
 });
+
+it('strictAdopt force path refuses failed smoke on a set-aside plan and keeps last-good', async () => {
+  const f = await createSetAsideFixture();
+  try {
+    const before = f.head(), adopted = f.state().adopted;
+    const env = forceEnv(f.env, dirname(f.root));
+    const job = await f.rebuild({ readyOnly: true });
+    expect(job.reason).toBe('ready-recorded');
+    expect(job.plan.decisions.some(d => d.setAside)).toBe(true);
+    // Remove the passing ready record: exercise smoke.mjs's failed-smoke force branch.
+    clearReadyCandidate(f.root, env);
+    expect(requestForceAdopt({ root: f.root, env, daemon: 'review', ruling: 'R508',
+      quote: QUOTE, sha: job.plan.finalSha, rulingsText: RULINGS }).ok).toBe(true);
+    const runSmoke = failing();
+    const result = await f.rebuild({ env, runSmoke, forceWatchProbe: async () => ({ healthy: true }) });
+    expect(runSmoke).toHaveBeenCalled();
+    expect(result.plan.finalSha).toBe(job.plan.finalSha);
+    expect(result.alerts.some(a => a.kind === 'force-adopt-over-failed-smoke')).toBe(true);
+    expect(result).toMatchObject({ moved: false, reason: 'strict-adopt-needs-fresh-smoke' });
+    expect(f.head()).toBe(before);
+    expect(f.state().adopted).toEqual(adopted);
+    expect(readReadyCandidate(f.root, env)).toBeNull();
+    expect(readForceWatch(f.root, env)).toBeNull();
+  } finally { f.cleanup(); }
+}, 60_000);

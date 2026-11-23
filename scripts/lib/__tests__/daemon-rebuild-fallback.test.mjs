@@ -29,6 +29,7 @@ import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
+import * as rebuildPlan from '../daemon-rebuild/plan.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -124,8 +125,10 @@ function makeFixture() {
   };
 }
 
+// A COMPLETE passing table (strict adoption only accepts a fresh complete smoke pass).
+const fullPass = () => ({ verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(c => ({ name: c.name, ok: true })) } });
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => fullPass());
 }
 
 // x5wbsbc — a smoke that fails ONLY the candidate carrying `file` and passes every other tree (in particular the
@@ -133,7 +136,7 @@ function passSmoke() {
 function failsWhenFile(file, result) {
   return vi.fn(async ({ root }) => (existsSync(join(root, file))
     ? result
-    : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    : fullPass()));
 }
 
 const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
@@ -204,7 +207,7 @@ describe('rebuildClone passes candidateSmokeEnv to runSmoke', () => {
     const calls = [];
     const runSmoke = vi.fn(async (args) => {
       calls.push(args);
-      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+      return fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -272,12 +275,19 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     const bad = pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'scripts/conveyor/bad.mjs', 'bad'));
     addOverlay(cloneDir, { ref: 'lane/good' }, { env });
     addOverlay(cloneDir, { ref: 'lane/bad' }, { env });
-    const runSmoke = vi.fn(async ({ root }) => failsWhenFile('scripts/conveyor/bad.mjs', {
-      verdict: 'code', attempts: 1, smoke: { results: [{
-        ok: false, name: 'x', mayBeTransient: false,
-        detail: attributable ? `exited 1: file://${root}/scripts/conveyor/bad.mjs:20` : 'boom',
-      }] },
-    })({ root }));
+    const runSmoke = vi.fn(async ({ root, reuseRows }) => {
+      if (existsSync(join(root, 'scripts/conveyor/bad.mjs'))) return {
+        verdict: 'code', attempts: 1, smoke: { results: [{
+          ok: false, name: 'x', mayBeTransient: false,
+          detail: attributable ? `exited 1: file://${root}/scripts/conveyor/bad.mjs:20` : 'boom',
+        }, ...['gh-api-repo', 'gh-pr-list'].map(name => ({ name, ok: true, completedAt: Date.now() }))] },
+      };
+      const pass = fullPass();
+      // Match runLiveSmoke's provenance when recovery asks to reuse candidate A's rows.
+      pass.smoke.results = pass.smoke.results.map(row => reuseRows.some(reused => reused.name === row.name)
+        ? { ...row, reused: true } : row);
+      return pass;
+    });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
     });
@@ -291,6 +301,28 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     expect(result.alerts.some((a) => a.kind === 'overlay-set-aside-attributed')).toBe(attributable);
     if (!attributable) expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('a fallback whose plain-main smoke reused a row from an earlier run is NOT adopted (no fresh smoke)', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'bad.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/bad' }, { env });
+    const reusedPass = () => {
+      const pass = fullPass();
+      pass.smoke.results[0] = { ...pass.smoke.results[0], reused: true };
+      return pass;
+    };
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'bad.txt'))
+      ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
+      : reusedPass()));
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(result.adopted).not.toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(readOverlays(cloneDir, { env }).map(o => o.ref)).toEqual(['lane/bad']);
   });
 
   it('a bad NON-pinned overlay: falls back to plain main, adopts it, drops the overlay, alerts both kinds', async () => {
@@ -515,6 +547,36 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
+  it('strict set-aside adoption holds when candidate and last-good share a broken harness', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1';
+    pushBranch(originDir, 'lane/harness-fix', dir => writeFile(dir, 'harness-fix.txt', 'fix\n'));
+    addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const originalPlan = rebuildPlan.planRebuild;
+    const planner = vi.spyOn(rebuildPlan, 'planRebuild').mockImplementation(async options => {
+      const plan = await originalPlan(options);
+      plan.decisions.push({ ref: 'lane/omitted', action: 'skip', setAside: { eligible: true } });
+      return plan;
+    });
+    const runSmoke = vi.fn(async () => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [{ ok: false, name: 'reconcile-dry-run', detail: 'shared cross-org auth failure' }] },
+    }));
+    try {
+      const result = await rebuildClone({
+        root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(runSmoke).toHaveBeenCalledTimes(2); // A + C: the pinned overlay prevents B.
+      expect(result.reason).not.toBe('harness-broken-adopted-not-worse');
+      expect(result.reason).toBe('smoke-harness-broken');
+      expect(result.adopted).not.toBe(true);
+      expect(result.moved).toBe(false);
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+      expect(readRebuildState(cloneDir, env).held?.reason).toBe('smoke-harness-broken');
+    } finally { planner.mockRestore(); }
+  });
+
   it('rejects a candidate failing x and y when the last-good control fails only x', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
@@ -592,7 +654,7 @@ describe('single-flight build lease across the fallback (x5wbsbc on #2731)', () 
       heldDuring.push(!!readRebuildState(cloneDir, env).building);
       return existsSync(join(root, 'lease-bad.txt'))
         ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
-        : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+        : fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -681,7 +743,7 @@ const loadFail = () => ({
     ],
   },
 });
-const PASS = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+const PASS = () => fullPass();
 
 async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
   const fx = makeFixture();
@@ -824,13 +886,13 @@ describe('rebuild smoke budget and fail-fast', () => {
   });
 
   it.each([
-    { brokenImport: false, age: 599_999, limit: undefined, reused: true },
-    { brokenImport: true, age: 0, limit: undefined, reused: true },
-    { brokenImport: false, age: 600_000, limit: undefined, reused: false },
-    { brokenImport: false, age: 0, limit: '0', reused: false },
-    { brokenImport: false, age: 100, limit: '100', reused: false },
-    { brokenImport: false, age: null, limit: undefined, reused: false },
-  ])('fallback code/import and GitHub evidence age: $brokenImport / $age / $limit', async ({ brokenImport, age, limit, reused }) => {
+    { brokenImport: false, age: 599_999, limit: undefined },
+    { brokenImport: true, age: 0, limit: undefined },
+    { brokenImport: false, age: 600_000, limit: undefined },
+    { brokenImport: false, age: 0, limit: '0' },
+    { brokenImport: false, age: 100, limit: '100' },
+    { brokenImport: false, age: null, limit: undefined },
+  ])('fallback adopts with fresh GitHub checks regardless of evidence age: $brokenImport / $age / $limit', async ({ brokenImport, age, limit }) => {
     const { originDir, cloneDir, env } = makeFixture();
     advanceMain(originDir, (dir) => {
       writeFile(dir, 'main-moved.txt', 'y\n');
@@ -885,12 +947,15 @@ describe('rebuild smoke budget and fail-fast', () => {
       return;
     }
     expect(result.reason).toBe('fallback-plain-main');
+    expect(result.adopted).toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(gitOk(cloneDir, ['rev-parse', 'origin/main']).trim());
+    expect(readOverlays(cloneDir, { env })).toEqual([]);
     expect(seen.map((s) => s.failFast)).toEqual([[], ['dispatch-dry-run']]);
     expect(seen[1].smokeEnv).toMatchObject({ WE_SMOKE_RECONCILE_MS: '3000000',
       WE_SMOKE_DISPATCH_PASS_MS: '4000000', WE_SMOKE_DISPATCH_DRY_RUN_MS: '2000000' });
-    expect(seen[1].reuseRows.map(row => row.name)).toEqual(reused ? ['gh-api-repo', 'gh-pr-list'] : []);
-    expect(children.mock.calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(reused ? 0 : 2);
-    expect(fallbackSmoke.results.filter(row => row.reused).map(row => row.name)).toEqual(reused ? ['gh-api-repo', 'gh-pr-list'] : []);
+    expect(seen[1].reuseRows).toEqual([]);
+    expect(children.mock.calls.filter(([cmd]) => cmd === 'gh')).toHaveLength(2);
+    expect(fallbackSmoke.results.filter(row => row.reused)).toEqual([]);
     for (const check of SMOKE_CHECKS.filter(check => !check.name.startsWith('gh-'))) {
       expect(fallbackSmoke.results.find(row => row.name === check.name)).toMatchObject({ ok: true });
       expect(fallbackSmoke.results.find(row => row.name === check.name).skipped).toBeUndefined();

@@ -12,6 +12,7 @@ import { spawnSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { rebuildClone, readRebuildState } from '../daemon-rebuild.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
+import { addOverlay } from '../daemon-overlays.mjs';
 import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 import { DAEMON_ENTRY_MODULES } from '../daemon-boot-smoke.mjs';
 import { collectImportClosure } from '../import-closure.mjs';
@@ -109,7 +110,8 @@ function makeFixture() {
 }
 
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+    smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }));
 }
 
 
@@ -143,6 +145,23 @@ async function next(f, skipCheck, mutate, knob = '1') {
 }
 
 describe('daemonRebuild.skipUnrelated', () => {
+  it('main-only removal of a documentation overlay runs full smoke instead of skipping unrelated changes', async () => {
+    const f = makeFixture();
+    await adoptBaseline(f);
+    pushBranch(f.originDir, 'lane/docs', dir => writeFile(dir, 'README.md', 'overlay docs\n'));
+    addOverlay(f.cloneDir, { ref: 'lane/docs' }, { env: f.env });
+    const options = { root: f.cloneDir, env: f.env, prState: async () => null, lockOpts: LOCK_OPTS };
+    expect((await rebuildClone({ ...options, runSmoke: passSmoke() })).adopted).toBe(true);
+    const skipCheck = vi.fn(() => ({ skip: true, reason: 'docs-only' }));
+    const runSmoke = passSmoke();
+    const result = await rebuildClone({ ...options, mainOnly: true, skipCheck, runSmoke,
+      env: { ...f.env, WE_DAEMON_REBUILD_SKIP_UNRELATED: '1' } });
+    expect(result.adopted).toBe(true);
+    expect(skipCheck).not.toHaveBeenCalled();
+    expect(runSmoke).toHaveBeenCalledTimes(1);
+    expect(runSmoke.mock.calls[0][0]).toMatchObject({ changedFiles: null, reuseCode: false });
+  });
+
   it('a docs/backlog-only move skips the smoke, still moves the clone, and logs the reason', async () => {
     const f = makeFixture();
     const skipCheck = await adoptBaseline(f);

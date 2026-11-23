@@ -5,7 +5,8 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { pinnedStatus, pinnedConflictSkippable, planStrictAdopt, adoptionDecisions } from './plan.mjs';
+import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
@@ -128,13 +129,17 @@ export function matchReadyCandidate({
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const revokedExact = revokedAudit(ready.adopt);
     if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
-    return { adopt: ready.adopt, dropRefs: [], match: 'exact', ...staleInfo() };
+    // Legacy records can recover decisions from the identical live plan; never
+    // interpret an absent serialized field as proof that no overlay was omitted.
+    return { adopt: { ...ready.adopt, decisions: adoptionDecisions(ready.adopt, plan) }, dropRefs: [], match: 'exact', ...staleInfo() };
   }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const adopt = {
       finalSha: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied,
+      // Retain recorded omissions that a main-only live plan did not examine.
+      decisions: adoptionDecisions(plan, ready.adopt),
     };
     const revokedSameTree = revokedAudit(adopt);
     if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
@@ -443,6 +448,8 @@ export async function finalizeRebuild(options) {
 
 async function finalizeRebuildLocked({
   root, env, log, run, stateOpts, now, plan, prevHead, lease, onAdopted, auditedTip = null, readyPassedAt,
+  strictAdopt = false, freshSmoke = null, mainOnly = false,
+  pinPlan = plan,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -464,6 +471,21 @@ async function finalizeRebuildLocked({
   // Every exit from this (locked) phase ends the build, so every exit releases its lease and persists that.
   releaseBuildLease(state, lease);
   const terminal = (result) => {
+    if (result.adopted && lease?.token !== 'force-adopt-rollback') {
+      const aside = { ...state.setAside };
+      for (const ref of Object.keys(aside)) {
+        if (!live.overlays.some(o => o.ref === ref)
+          || plan.decisions?.some(d => d.ref === ref && d.action === 'remove')) delete aside[ref];
+      }
+      for (const d of plan.decisions ?? []) {
+        if (d.setAside && live.overlays.some(o => o.ref === d.ref)) aside[d.ref] = d.setAside;
+      }
+      for (const a of state.adopted?.applied ?? []) delete aside[a.ref];
+      // Unknown history survives when overlays were not examined or an unaudited ref is still held.
+      if (state.setAside !== undefined || (!mainOnly && !plan.decisions?.some(d => d.reason === 'unaudited-tip-held'))) {
+        state.setAside = Object.keys(aside).length ? aside : null;
+      }
+    }
     writeState();
     const stale = staleAlertDetail(result, state);
     if (stale) alert('clone-held-stale', stale);
@@ -487,9 +509,58 @@ async function finalizeRebuildLocked({
   const appliedKey = (list) => JSON.stringify((list ?? []).map((a) => [a.ref, a.sha]).sort());
   // The health-watch rollback to last-good only reverts HEAD; it never touches registrations, so it is never blocked.
   const isRollback = lease?.token === 'force-adopt-rollback';
+  // THE strictAdopt gate: the one last step before the swap that every adoption path (normal, reuse/ready, fallback,
+  // force, skip-unrelated) goes through. An omission/set-aside build is adopted only on a fresh complete smoke pass of
+  // THIS candidate (`freshSmoke` is set only by smoke.mjs from a completeSmokePass of this run, never a cached/ready
+  // verdict without that mark). The only exception is the health watch's rollback to last-good.
+  // Strictness is DERIVED FROM FACTS here, not trusted from planner decisions: the candidate's applied set is missing
+  // any registered, non-retired overlay (smoke-fallback drops included), or the omission/set-aside history is unknown.
+  const live = isRollback ? { overlays: [] } : readOverlayState(root, { env });
+  const strict = strictAdopt === true || planStrictAdopt(plan, isRollback ? {} : {
+    overlays: live.corrupt ? [] : live.overlays, state,
+  });
+  if (strict && !isRollback && freshSmoke !== plan.finalSha) {
+    alert('strict-adopt-refused', { target: plan.finalSha, message: 'a build that omits or sets aside an overlay is adopted only on a fresh complete smoke pass of this candidate; keeping last-good' });
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'strict-adopt-needs-fresh-smoke', plan });
+  }
   if (dropsPending && !isRollback && appliedKey(plan.applied) !== appliedKey(state.adopted?.applied)) {
     alert('drop-pending-unsettled', { target: plan.finalSha });
     return terminal({ moved: false, reason: 'drop-pending-unsettled', plan });
+  }
+
+  // Registrations can be pinned while smoke runs unlocked. Re-read under the
+  // add guard before normal adoption (including already-adopted reconciliation).
+  // The health watch must always be able to return to last-good without changing registrations.
+  if (live.corrupt) {
+    alert('overlay-state-corrupt', { message: 'cannot re-check omitted overlay pins; repair the overlay registry' });
+    return terminal({ moved: false, reason: 'overlay-state-corrupt', plan });
+  }
+  const included = new Set((plan.applied ?? []).map(a => a.ref));
+  const pinnedOmitted = live.overlays.filter(o => {
+    if (included.has(o.ref)) return false;
+    const tip = verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`);
+    // A pin carried by an applied top is still present, even without its own applied row.
+    if (tip && gitTipInMain(git, plan.finalSha, tip)) return false;
+    if (!tip) return true;
+    const pin = pinnedStatus(git, o, plan.mainSha, tip);
+    if (!pin.pinned) return false;
+    // Preserve the planner's existing newcomer mechanism skip. Bind it to the current
+    // registration and tip, and re-prove skippability under the add guard: a new explicit
+    // pin, changed tip, missing mechanism or unreadable proof still refuses adoption.
+    const skipped = pinPlan.mainSha === plan.mainSha && pinPlan.decisions?.some(d => d.ref === o.ref
+      && (d.pr ?? null) === (o.pr ?? null) && d.sha === tip
+      && d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped')
+      && Array.isArray(pinPlan.establishedLost) && !pinPlan.establishedLost.some(d => d.ref === o.ref);
+    return !(skipped && pinnedConflictSkippable(git, plan.mainSha, tip, pin.why).skippable);
+  });
+  if (pinnedOmitted.length) {
+    const refs = pinnedOmitted.map(o => o.ref);
+    const detail = { refs, message: `omitted overlay(s) became pinned during smoke: ${refs.join(', ')}; holding on the last-good build — rebase them onto main` };
+    alert('established-overlay-hold', detail);
+    state.held = { since: state.held?.since ?? nowIso(), reason: 'established-overlay-conflict',
+      failed: detail.message, details: [], lastGood: prevHead, target: null, mainSha: plan.mainSha, updatedAt: nowIso() };
+    return terminal({ moved: false, reason: 'established-overlay-conflict', detail, plan });
   }
 
   // Defensive re-check: real (unlocked) time passed for the smoke since `prepareRebuild` read `prevHead`. Either

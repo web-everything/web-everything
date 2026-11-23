@@ -53,6 +53,7 @@ export function alertsFilePath(root, env = process.env) {
 }
 
 const EMPTY_STATE = Object.freeze({
+  setAside: undefined,
   adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null, forceUnverifiedTrees: null, smokePassed: null, pinnedNotified: null,
 });
 
@@ -88,6 +89,13 @@ const fields = (v, required, optional = {}) => object(v)
   && Object.entries(optional).every(([k, valid]) => !(k in v) || valid(v[k]));
 const boolean = v => typeof v === 'boolean';
 const nullable = valid => v => v === null || valid(v);
+const setAsideRecord = v => fields(v,
+  { eligible: v => v === true, ref: string, sha: v => typeof v === 'string' && FULL_SHA_RE.test(v),
+    mainSha: v => typeof v === 'string' && FULL_SHA_RE.test(v), reason: v => v === 'main-sync-conflict',
+    files: v => strings(v) && v.length > 0 });
+const readyDecisions = v => Array.isArray(v) && v.every(d => fields(d,
+  { ref: string, action: v => ['apply', 'remove', 'drop', 'skip'].includes(v), reason: string },
+  { setAside: v => setAsideRecord(v) && v.ref === d.ref }));
 const backoff = { retryAt: nullable(date), attempts: positive };
 // Admission requires identity/audit evidence. Legacy records omit backoff and false
 // flags; validate those fields when present, and require deadlines for scheduled retries.
@@ -131,6 +139,12 @@ function readState(root, env, strict, read = readFileSync) {
         throw new Error(`Invalid rebuild state ${key}`);
       }
     }
+    // Legacy/missing continuity remains unknown (undefined), not a known empty map.
+    // Planning must require audit evidence before any omitted content can return.
+    // Present malformed records are unknown to ordinary ticks; strict admission refuses them.
+    const validSetAside = parsed?.setAside == null || (object(parsed.setAside)
+      && Object.entries(parsed.setAside).every(([ref, v]) => setAsideRecord(v) && ref === v.ref));
+    if (strict && !validSetAside) throw new Error('Invalid rebuild state setAside');
     if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {
       adopted: parsed?.adopted ?? null,
@@ -144,6 +158,7 @@ function readState(root, env, strict, read = readFileSync) {
       forceUnverifiedTrees: parsed?.forceUnverifiedTrees ?? null,
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
+      setAside: validSetAside ? parsed?.setAside : undefined,
     };
   } catch (error) {
     if (strict && error?.code !== 'ENOENT') throw error;
@@ -188,6 +203,7 @@ export function readReadyCandidate(root, env = process.env) {
   if (rebuildReaders()) return rebuildReaders().ready(root, env);
   try {
     const r = JSON.parse(readFileSync(readyCandidatePath(root, env), 'utf8'));
+    if (r?.adopt && Object.hasOwn(r.adopt, 'decisions') && !readyDecisions(r.adopt.decisions)) return null;
     return r && typeof r === 'object' && r.adopt?.finalSha && r.prevHead ? r : null;
   } catch {
     return null;
@@ -201,7 +217,8 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
   catch (error) { if (error?.code === 'ENOENT') return null; throw error; }
   const r = JSON.parse(text);
   if (!fields(r, { prevHead: string, tree: string, passedAt: date, kind: v => ['candidate', 'fallback'].includes(v),
-    adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied }) }, {
+    adopt: v => fields(v, { finalSha: string, inputsKey: string, mainSha: string, applied: pinnedApplied },
+      { decisions: readyDecisions }) }, {
     forced: boolean, at: date, token: string, pid: positive, host: string, forInputsKey: string,
     dropRefs: v => Array.isArray(v) && v.every(r => fields(r,
       { ref: string, sha: string, pr: v => v === null || positive(v) })),
@@ -217,7 +234,14 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
     && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
   // Pre-upgrade normal candidates omitted forced; normalize only after validating
   // present values, without rewriting the persisted evidence.
-  return { forced: false, ...r };
+  // Invalid smoke metadata must retain the candidate's strict gate, never discard
+  // the record into a non-strict rebuild or preserve an untrusted smoke mark.
+  if ((Object.hasOwn(r, 'strictAdopt') && !boolean(r.strictAdopt))
+    || (Object.hasOwn(r, 'freshSmoke') && r.freshSmoke !== null
+      && (typeof r.freshSmoke !== 'string' || !FULL_SHA_RE.test(r.freshSmoke)))) {
+    return { forced: false, ...r, strictAdopt: true, freshSmoke: null };
+  }
+  return { forced: false, ...r, strictAdopt: r.strictAdopt !== false, freshSmoke: r.freshSmoke ?? null };
 }
 
 // A readable record can outlive its proof. Only adoption needs live pin proof;

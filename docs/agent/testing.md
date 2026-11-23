@@ -6376,6 +6376,65 @@ exports re-export the shared vocabulary and matcher so their callers keep the sa
 Settings-registry migration checks use the key roster in the immutable original metadata
 fixture. Compare historical declarations and rendered bytes within that roster; keep the
 live inventory and committed-document drift check responsible for subsequently added keys.
+### Main-sync overlay set-aside (daemon continuity)
+
+A validated main-sync conflict pair, confirmed by a direct Git conflict between current main
+and the same unpinned overlay tip, may build without
+that overlay, including one in the running build. Keep the registration so the ordinary planner
+retries it after a rebase. Record ref, tip, reason and conflicting files in rebuild `setAside`
+state and the overlay event trail; emit `overlay-main-sync-set-aside` once per unresolved tip/files,
+with the rebase remedy. This exception never applies to explicit pins or the self-destruct guard
+(overlays touching `REBUILD_MECHANISM_PATHS`), unaudited held tips, or unreadable conflict evidence.
+Those retain the existing refusal/last-good hold. Conflicts with other overlays retain the existing
+loss protection. The real-Git `main-sync-set-aside.test.mjs` and `rebuild-main-sync-set-aside` soak
+cover adoption of main, duplicate suppression and automatic return after branch repair.
+
+## Rebuild set-aside regression fixtures
+
+Recovery candidates that may be adopted must rerun GitHub checks, even within the
+row-reuse window: an omitted registration requires a complete fresh smoke. Keep
+the fallback tests asserting HEAD, adopted state and overlay removal, not just the
+reported reason. `rebuild-fallback-fresh-smoke` covers immediate and deferred adoption
+through real Git and `runLiveSmoke` with injected external children.
+
+`daemon-rebuild/__tests__/omission-evidence.test.mjs` runs the production smoke,
+ready matching, adoption, state readers and planner with synthetic Git responses.
+Keep main-only docs omissions strict with or without a cached smoke proof, including
+the skip-unrelated path. Ready records carry omission decisions through exact,
+same-tree, superseded and fallback adoption; only successful adoption persists them.
+The repaired tip must then reach the audit gate. The set-aside soak includes these
+omission probes alongside its real-Git conflict scenario.
+Containing overlays must remain held in both stack modes until the omitted base has
+audit evidence, including equal tips, reversed registration order, unknown history,
+unreadable ancestry and bases kept independent during retry. The synthetic probe
+drives the production planner and locked finalizer and checks the adopted ancestry;
+its positive controls release audited bases and allow unrelated new overlays.
+
+`daemon-rebuild/__tests__/main-sync-set-aside.test.mjs` drives the real Git fixture in
+`conveyor/soak/fixtures/rebuild-set-aside-probe.mjs`. Clear the sync worker's existing
+conflict wake before testing rebuild's wake producer; otherwise the worker masks a missing
+rebuild notification. Omission evidence is not adopted ancestry: inspect merge ancestry
+and retain the durable set-aside record through failed smoke, then clear it only on adoption.
+
+
+### Set-aside adoption and unknown history
+
+Rebuild fixtures that promise a successful smoke must return one passing row per
+`SMOKE_CHECKS` entry. Empty or partial tables cannot prove a fresh smoke for an omitted
+registration, including ready reuse and a skipped mechanism overlay. Keep partial tables
+in tests of incomplete evidence. Exercise newcomer mechanism skips both inline and through
+ready adoption; an explicit pin added during smoke must still refuse, while a pin carried
+by an applied top remains present in the candidate.
+
+Prepare must leave omission history unchanged until smoke and adoption succeed; finalize
+publishes the new `setAside` records and clears repaired entries on success. Missing files
+and legacy snapshots without `setAside` have unknown history, so audited mode requires
+evidence before applying a replacement and preserves that requirement across later ticks.
+An explicitly known empty history is `setAside: null`. Classify pins across every running
+SHA for the registration. Prove independence using the final combined candidate delta from
+main, including edge changes and replayed resolutions, rather than original tips pairwise.
+The omitted-pin gate exempts `force-adopt-rollback`, which must reach last-good even when
+that build lacks a registered pin. These cases live in `main-sync-set-aside.test.mjs`.
 ## Provider rotation shadow (PROV-AB S1.2)
 
 `provider-rotation.test.mjs` and `provider-rotation-shadow.test.mjs` cover the pure engine and the
