@@ -1,5 +1,15 @@
 {
   "version": 1,
-  "entries": [],
+  "entries": [
+    {
+      "test": "scripts/__tests__/codex-direct-task.test.mjs",
+      "brokenSha": "d4b20a90",
+      "owner": "orchestrator",
+      "reason": "main red 12:33 ET: codex-direct-task.test.mjs 2 failed (shard 3) after #7389 merge; fix dispatched",
+      "addedAt": 1795456858285,
+      "expiresAt": 1795471258285,
+      "job": "test-shard"
+    }
+  ],
   "mode": "quarantine"
 }

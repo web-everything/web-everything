@@ -118,3 +118,4 @@
 {"type":"quarantine-removed","at":1795399118089,"actor":"red-main-safety-net","test":"scripts/conveyor/soak/daemon-soak.soak.test.mjs","brokenSha":"70001b920c55f4423d028a2a18d3d79c8a8b2757","why":"main-green"}
 {"type":"quarantine-removed","at":1795399118089,"actor":"red-main-safety-net","test":"scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs","brokenSha":"3382d8b4912dbdb6a9a72ba6676b0f17e67b2db4","why":"main-green"}
 {"type":"quarantine-fix-prs","at":1795399118089,"actor":"red-main-safety-net","fixPrs":[]}
+{"type":"quarantine-added","at":1795456858285,"actor":"orchestrator","test":"scripts/__tests__/codex-direct-task.test.mjs","brokenSha":"d4b20a90","owner":"orchestrator","reason":"main red 12:33 ET: codex-direct-task.test.mjs 2 failed (shard 3) after #7389 merge; fix dispatched","addedAt":1795456858285,"expiresAt":1795471258285,"job":"test-shard"}
