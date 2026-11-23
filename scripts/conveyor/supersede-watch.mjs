@@ -118,7 +118,7 @@ export function runSupersedeWatch({
     const applied = apply ? holds.map((hold) => ({ ...hold, ...postHold({ repo, hold }) })) : [];
     return { repo, holds, applied, ...(bodyEditFailures ? { bodyEditFailures } : {}) };
   } catch (e) {
-    return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] };
+    return { repo, holds: [], applied: [], blocked: true, error: String(e?.message || e).split('\n')[0] };
   }
 }
 
@@ -126,7 +126,7 @@ export function runSupersedeWatch({
 export function formatSupersedeLines(result) {
   const lines = [];
   for (const r of result?.repos ?? []) {
-    if (r.error) lines.push(`supersede-watch ${r.repo} — read failed (non-fatal, retried next tick): ${r.error}`);
+    if (r.error) lines.push(`supersede-watch ${r.repo} — evidence unreadable; dispatch blocked (retried next tick): ${r.error}`);
     if (r.bodyEditFailures) lines.push(`supersede-watch ${r.repo} — ${r.bodyEditFailures} merged-PR body-edit read(s) failed; those PRs' Supersedes lines are ignored this tick (retried next tick)`);
     const applied = new Map((r.applied ?? []).map((a) => [a.pr, a]));
     for (const h of r.holds ?? []) {

@@ -73,6 +73,9 @@ export const LEGACY_ONLY_READERS = Object.freeze([
 export const LEGACY_FILE_GUARD_HINT = 'put a NEW setting in scripts/settings/<feature>.json (overlays conflict-drop on this one shared file) and read it through readSettings() from scripts/lib/settings-files.mjs — a reader that reads scripts/dispatch-settings.json directly (see LEGACY_ONLY_READERS) never sees a feature file';
 
 /** A feature file name: lower-case kebab words, `.json`. */
+/** Standalone spec documents have their own readers; they are not conveyor key namespaces. */
+export const STANDALONE_POLICY_FILES = Object.freeze(['test-timeout-policy.json']);
+
 export const FEATURE_FILE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.json$/;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -208,7 +211,7 @@ function loadSettingsLayers({ dir = SETTINGS_DIR, legacyPath = LEGACY_SETTINGS_P
   };
   if (legacyPath) load('dispatch-settings.json', legacyPath);
   let names = [];
-  try { names = readdirSync(dir).filter((f) => f.endsWith('.json')).sort(); } catch (e) {
+  try { names = readdirSync(dir).filter((f) => f.endsWith('.json') && !STANDALONE_POLICY_FILES.includes(f)).sort(); } catch (e) {
     names = [];
     recordError('settings/', e, e?.code ?? 'read error');
   }
