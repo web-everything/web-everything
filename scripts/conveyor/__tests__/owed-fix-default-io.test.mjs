@@ -3,7 +3,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os, { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import childProcess from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
 import * as underTest from '../../lib/under-test.mjs';
 import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
 import { acquireFixDispatchClaim } from '../fix-dispatch-claim.mjs';
@@ -12,26 +11,29 @@ import { lockDirFor, reserve } from '../../readiness/file-locks.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { rememberOwedFixRecoveryInput } from '../reconcile-pass.mjs';
 import { recoveryTransaction } from '../owed-fix-recovery.mjs';
+import { probeClaudeLoggedIn } from '../claude-auth-health.mjs';
 
-// Vitest can snapshot native named exports before fixture() installs its spies.
-// Forward them at call time; syncBuiltinESMExports below still covers native/preloaded consumers.
-vi.mock('node:child_process', async importOriginal => {
-  const actual = await importOriginal();
-  const methods = ['exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork'];
-  return { ...actual, ...Object.fromEntries(methods.map(method =>
-    [method, (...args) => actual.default[method](...args)])) };
+// Install one command boundary before loading the consumer graph. Replacing native exports later
+// cannot update bindings Vitest already captured, even with syncBuiltinESMExports().
+const boundary = vi.hoisted(() => {
+  vi.resetModules();
+  return { home: null, processes: Object.fromEntries(
+    ['exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork']
+      .map(method => [method, vi.fn(() => { throw new Error('external command before fixture'); })])) };
 });
+vi.mock('node:child_process', () => ({ ...boundary.processes, default: boundary.processes }));
 vi.mock('node:os', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, homedir: () => actual.default.homedir() };
+  const homedir = () => boundary.home ?? actual.default.homedir();
+  return { ...actual, homedir, default: { ...actual.default, homedir } };
 });
 
 const head = 'a'.repeat(40), start = Date.parse('2026-11-20T12:00:00Z'), minute = 60_000;
 let root;
 afterEach(() => {
   vi.restoreAllMocks();
-  syncBuiltinESMExports();
   vi.unstubAllEnvs();
+  boundary.home = null;
   if (root) rmSync(root, { recursive: true, force: true });
   root = null;
 });
@@ -44,7 +46,7 @@ function fixture(claimKind = 'fixing') {
   vi.stubEnv('WE_MAINTENANCE_MARKER', join(root, 'maintenance.json'));
   vi.stubEnv('WE_NEEDS_YOU_FEED', join(root, 'needs-you.jsonl'));
   // Isolate the default handoff path without replacing its resolver or changing HOME.
-  vi.spyOn(os, 'homedir').mockReturnValue(root);
+  boundary.home = root;
   // Exercise the consumer's omitted-option default; leave every recovery IO function at its production default.
   vi.spyOn(underTest, 'isUnderTest').mockReturnValue(false);
   const facts = { headRefOid: head, state: 'OPEN', isDraft: false, labels: [{ name: 'review:changes' }] };
@@ -61,15 +63,13 @@ function fixture(claimKind = 'fixing') {
     expect(options).toMatchObject({ timeout: 10_000, maxBuffer: 64 * 1024 });
     return JSON.stringify({ loggedIn: true });
   });
-  // Patch the native exports as well as the module object: setup can preload parts of the daemon graph.
   // Both gh's capture/spawn and direct-exec branches are intercepted; every other process call is blocked.
   const unexpected = vi.fn(() => { throw new Error('unexpected external command'); });
-  for (const method of ['exec', 'execSync', 'execFile', 'spawn', 'fork']) vi.spyOn(childProcess, method).mockImplementation(unexpected);
-  vi.spyOn(childProcess, 'execFileSync').mockImplementation((command, args, options) =>
+  for (const method of Object.values(boundary.processes)) method.mockReset().mockImplementation(unexpected);
+  childProcess.execFileSync.mockImplementation((command, args, options) =>
     command === 'gh' ? gh(command, args, options) : command === 'claude' ? auth(command, args, options) : unexpected());
-  vi.spyOn(childProcess, 'spawnSync').mockImplementation((command, args, options) => command === 'gh'
+  childProcess.spawnSync.mockImplementation((command, args, options) => command === 'gh'
     ? { status: 0, signal: null, stdout: gh(command, args, options), stderr: '' } : unexpected());
-  syncBuiltinESMExports();
   // Fix/CI-heal use their real producer. The fixing record uses the same reserve primitive and
   // fix-procedure's metadata shape; this test never invokes fix-begin or changes PR labels.
   const acquired = claimKind === 'fixing'
@@ -101,6 +101,16 @@ function fixture(claimKind = 'fixing') {
 }
 
 describe('owed-fix-default-io-smoke', () => {
+  it('shares the command boundary with named imports and the default auth probe', async () => {
+    const f = fixture();
+    const { execFileSync } = await import('node:child_process');
+    expect(execFileSync).toBe(childProcess.execFileSync);
+    expect(os.homedir()).toBe(root);
+    expect(probeClaudeLoggedIn()).toBe(true);
+    expect(f.auth).toHaveBeenCalledTimes(1);
+    expect(f.unexpected).not.toHaveBeenCalled();
+  });
+
   it.each(['fixing', 'fix', 'ci-heal'])('releases a production %s claim once and publishes the second miss once', async kind => {
     const f = fixture(kind);
     expect((await f.tick(29)).dispatched).toEqual([]);
@@ -126,9 +136,11 @@ describe('owed-fix-default-io-smoke', () => {
     expect(JSON.parse(updates[0])).toMatchObject({ pr: 7307, head, kind: 'needs-you' });
   });
 
-  it.each(['auth', 'head', 'json', 'claim', 'missing-claim'])('refuses %s failure with production recovery IO', async fault => {
+  it.each(['auth', 'auth-error', 'auth-json', 'head', 'json', 'claim', 'missing-claim'])('refuses %s failure with production recovery IO', async fault => {
     const f = fixture();
     if (fault === 'auth') f.auth.mockReturnValue('{"loggedIn":false}');
+    if (fault === 'auth-error') f.auth.mockImplementation(() => { throw new Error('auth command unavailable'); });
+    if (fault === 'auth-json') f.auth.mockReturnValue('{broken');
     if (fault === 'head') f.gh.mockReturnValue(JSON.stringify({ ...f.facts, headRefOid: 'b'.repeat(40) }));
     if (fault === 'json') f.gh.mockReturnValue('{broken');
     if (fault === 'claim' || fault === 'missing-claim') {
@@ -140,6 +152,8 @@ describe('owed-fix-default-io-smoke', () => {
     expect(refused.dispatched).toEqual([]);
     const why = {
       auth: 'auth paused or unknown; restore login before retrying',
+      'auth-error': 'auth paused or unknown; restore login before retrying',
+      'auth-json': 'auth paused or unknown; restore login before retrying',
       head: 'head moved or unreadable; refresh PR evidence',
       json: 'head moved or unreadable; refresh PR evidence',
       claim: 'invalid claim; inspect claim store',
@@ -149,7 +163,7 @@ describe('owed-fix-default-io-smoke', () => {
     expect((await f.tick(61)).dispatched).toEqual([]);
     expect(f.claim()).toEqual(f.originalClaim);
     expect(f.dispatch).not.toHaveBeenCalled();
-    expect(f.auth).toHaveBeenCalledTimes(['auth', 'head', 'json'].includes(fault) ? 2 : 0);
+    expect(f.auth).toHaveBeenCalledTimes(['auth', 'auth-error', 'auth-json', 'head', 'json'].includes(fault) ? 2 : 0);
     expect(f.gh).toHaveBeenCalledTimes(['head', 'json'].includes(fault) ? 2 : 0);
     expect(f.unexpected).not.toHaveBeenCalled();
     expect(f.state().retryAt).toBeUndefined();

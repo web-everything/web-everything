@@ -6408,12 +6408,12 @@ Acceptance evidence must distinguish automated coverage from operational proof:
 `scripts/conveyor/__tests__/owed-fix-default-io.test.mjs` implements the named
 `owed-fix-default-io-smoke` through the CI-heal consumer with omitted recovery IO.
 It uses real temporary claim/state/feed files and command-boundary fakes without
-injecting recovery IO. Hoisted native-module mocks forward named process and
-home-directory calls to the fixture's default-export spies at call time. Keep
-these alongside `syncBuiltinESMExports()` for preloaded/native consumers: syncing
-Node exports alone does not update Vitest's captured named imports, which can
-leave the auth probe or handoff path outside the fixture. Negative cases assert
-their specific refusal and command counts so an auth refusal cannot mask a head
+injecting recovery IO. Reset the module cache in `vi.hoisted` and export the same
+hoisted command fakes through both named and default imports before loading the
+consumer graph. Share the home-directory fake through both import forms too.
+Late native-export spies and `syncBuiltinESMExports()` cannot reliably update
+Vitest's captured imports; a boundary test must reach the default auth probe.
+Negative cases assert their specific refusal and command counts so an auth refusal cannot mask a head
 or claim failure. The smoke does not establish live CLI or deployment behavior.
 Its final gate result is pending
 in `xo73io1`. Negative soak fixture repairs are tracked by `xo73so1`, competing-writer
