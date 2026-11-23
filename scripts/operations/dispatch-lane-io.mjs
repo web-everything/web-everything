@@ -1634,6 +1634,7 @@ export function createDispatchSinks({
           reportEffort: (v) => { reportedEffort = v; },
           policyRoute: payload?.routing?.policyRoute ?? null,
           sessionId,
+          dispatchRoot: root,
           cwd: sessionCwd,
           // Salvaged earlier work for this card/PR (see `we:scripts/lib/salvage-index.mjs`): one pointer line.
           prompt: withSalvageHint(payload?.prompt, { cards: [payload?.num], prs: [payload?.pr] }),
@@ -1991,6 +1992,7 @@ export function defaultClaudeProvider(request, {
   const advisor = (request.advisorFor ?? advisorForLaunch)({ runId: request.sessionId, kind: request.launchKind ?? 'build' });
   const argv = buildAgentArgv({
     advisor,
+    root: request.dispatchRoot ?? REPO_ROOT,
     sessionId: request.sessionId,
     payload: {
       prompt: request.prompt, sessionSlug: request.sessionSlug, num: request.num, launchKind: request.launchKind,
@@ -2652,6 +2654,8 @@ export function ensureDispatchSessionCwd(dir, {
 
 export function buildAgentArgv({
   sessionId, payload, extraArgs = [], systemPromptFile = null, resumeSessionId = null, settingsEnv = null,
+  // Validate the grant against the same checkout that resolved it, including portable/test dispatchers.
+  root = REPO_ROOT,
   // #x9fbg1x — an OPT-IN `worktree` patch folded into the SAME `--settings` JSON `settingsEnv` already rides
   // in. `null` (every existing caller/test that never mentions it) keeps this function's argv byte-identical
   // to before this param existed — only `createDispatchSinks`' own resolver ever supplies a real value.
@@ -2705,7 +2709,7 @@ export function buildAgentArgv({
       throw notApplied(`dispatch-lane: cannot load lean repair hooks from .claude/settings.json; restore the repo settings before retrying: ${error.message}`);
     }
     // `--restricted` ignores the local settings file the lane grant is written to, so carry it here.
-    const grant = leanRepairGrant(payload, laneGrant);
+    const grant = leanRepairGrant(payload, laneGrant, { root });
     sessionSettings.permissions = {
       ...sessionSettings.permissions,
       allow: [...new Set([...(sessionSettings.permissions?.allow ?? []), ...grant.allow])],

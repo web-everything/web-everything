@@ -34,6 +34,7 @@ beforeAll(async () => {
   ({ defaultDispatchOwner } = await import('../main-ci-red-io.mjs'));
   ({ DISPATCH_EFFECT } = await import('../../operations/dispatch-lane.mjs'));
   await import('../../operations/ci-heal-pr-dispatch.mjs');
+  await import('../reconcile-fix-dispatch.mjs');
 }, 30_000);
 afterAll(() => { vi.doUnmock('../../lib/gh-app-shim.mjs'); });
 beforeEach(() => {
@@ -50,12 +51,15 @@ let sessions = 0;
 const plumbing = async ({ wrapped = false, beforeLaunch = async () => {} } = {}) => {
   const seen = { settingsFile: [], argvSettings: [], execEnv: [], wrapperEnv: [] };
   const sinkOptions = {
+    pickFreeLanes: () => [7],
     root: tmp, reserveLane: () => ({ reserved: false }), releaseLane: () => {},
     mintSessionId: () => `11111111-1111-4111-8111-${String(++sessions).padStart(12, '0')}`,
     sessionCwdFor: (id) => join(tmp, 'sessions', id), ensureSessionCwd: (c) => { mkdirSync(c, { recursive: true }); return c; },
     grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
     provider: async (request) => {
       await beforeLaunch();
+      expect(request.lane).toBe(7);
+      expect(request.dispatchRoot).toBe(tmp);
       seen.settingsFile.push(JSON.parse(readFileSync(join(request.cwd, '.claude', 'settings.local.json'), 'utf8')).env[ROLE]);
       return io.defaultClaudeProvider(request, {
         spawnAgent: (argv, opts) => io.defaultSpawnAgent(argv, opts, {
@@ -108,6 +112,45 @@ it('two overlapping owner dispatches and an unrelated observer call in between: 
 
 it('a dispatch that passes no spawnEnv keeps the dispatcher role on every channel (other kinds unchanged)', async () => {
   const { io, sinkOptions, seen } = await plumbing();
-  await io.createDispatchSinks(sinkOptions)[DISPATCH_EFFECT]({ launchKind: 'ci-heal', prompt: 'p', sessionSlug: 'ci-heal-main', scope: [], repo: 'we' });
+  await io.createDispatchSinks(sinkOptions)[DISPATCH_EFFECT]({ launchKind: 'ci-heal', prompt: 'p', sessionSlug: 'ci-heal-main', lane: 7, scope: [], repo: 'we' });
   expect(seen).toEqual({ settingsFile: ['observer'], argvSettings: ['observer'], execEnv: ['observer'], wrapperEnv: [] });
+});
+
+it('binds the owner brief and launch grant to the selected lane', async () => {
+  const { sinkOptions, seen } = await plumbing({ beforeLaunch: () => {} });
+  const provider = sinkOptions.provider;
+  sinkOptions.provider = request => {
+    expect(request.prompt).toContain('--lane=7 --session=ci-heal-main');
+    expect(request.laneGrant.additionalDirectories).toEqual([join(tmp, '../.lanes/web-everything/lane-7')]);
+    return provider(request);
+  };
+  await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, sinkOptions);
+  expect(seen.execEnv).toEqual(['worker']);
+});
+
+it.each([[], [null], [0], ['7'], [Number.MAX_SAFE_INTEGER + 1]].map(lanes => ({ lanes })))(
+  'holds without spawning when no valid named lane is available: $lanes', async ({ lanes }) => {
+    const { sinkOptions, seen } = await plumbing();
+    expect(await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, {
+      ...sinkOptions, pickFreeLanes: () => lanes,
+    })).toEqual({ held: true, reason: 'no named lane available; free a lane and retry' });
+    expect(seen).toEqual({ settingsFile: [], argvSettings: [], execEnv: [], wrapperEnv: [] });
+  },
+);
+
+it('holds without spawning when the lane availability read fails', async () => {
+  const { sinkOptions, seen } = await plumbing();
+  expect(await defaultDispatchOwner({ prompt: 'p', sessionSlug: 'ci-heal-main' }, {
+    ...sinkOptions, pickFreeLanes: () => { throw new Error('pool unreadable'); },
+  })).toEqual({ held: true, reason: 'lane availability unknown; inspect the lane pool and retry' });
+  expect(seen).toEqual({ settingsFile: [], argvSettings: [], execEnv: [], wrapperEnv: [] });
+});
+
+it.each([undefined, '', '   ', '--hostile'])('holds an invalid owner brief before adding lane instructions: %j', async prompt => {
+  const { sinkOptions, seen } = await plumbing();
+  const pickFreeLanes = vi.fn(() => [7]);
+  expect(await defaultDispatchOwner({ prompt, sessionSlug: 'ci-heal-main' }, { ...sinkOptions, pickFreeLanes }))
+    .toEqual({ held: true, reason: 'invalid owner brief; restore a nonempty, non-flag brief before retrying' });
+  expect(pickFreeLanes).not.toHaveBeenCalled();
+  expect(seen).toEqual({ settingsFile: [], argvSettings: [], execEnv: [], wrapperEnv: [] });
 });

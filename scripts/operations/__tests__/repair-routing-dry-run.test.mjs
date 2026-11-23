@@ -25,6 +25,6 @@ it('passes resolved effort to the actual Codex, Gemini and native Claude argv bu
   expect(buildAgyDirectTaskArgv(gemini)).toEqual(expect.arrayContaining(['--model', 'gemini-3.8-flash', '--effort', 'low']));
   const native = resolveOperationRoute({ operation: 'build', gateClosed: true });
   // Codex builds use medium; the native Claude fallback retains its own high effort.
-  expect(buildAgentArgv({ payload: { prompt: 'repair', launchKind: 'fix' }, table: native })).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
+  expect(buildAgentArgv({ root: '/repo', payload: { prompt: 'repair', launchKind: 'fix', lane: 7 }, table: native })).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
   expect(() => buildAgentArgv({ payload: { prompt: 'repair' }, extraArgs: ['--effort=typo'] })).toThrow(/unknown effort/);
 });

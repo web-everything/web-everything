@@ -363,7 +363,7 @@ const REAL_TEMPLATE_STUB = [
 
 describe('dispatchFix — two racing dispatchers, one PR: exactly one spawn', () => {
   const planned = { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-x', scope: ['we:x'], lane: 9, headRefOid: 'deadbeef'.repeat(5) };
-  const baseOpts = { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, claimRoot };
+  const baseOpts = { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, get claimRoot() { return claimRoot; } };
 
   it('dispatcher A spawns; dispatcher B (racing the listing lag) is refused `held`, spawning nothing', () => {
     const spawnCalls = [];

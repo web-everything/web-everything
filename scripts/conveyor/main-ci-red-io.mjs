@@ -71,17 +71,34 @@ async function defaultGates() {
 export const ownerSpawnEnv = (env = process.env) => ({ ...env, WE_GITHUB_APP_ROLE: 'worker' });
 
 /** Start the owner session through the declared dispatch-lane sink. `sinkOptions` is a test seam; production passes none. */
-export async function defaultDispatchOwner({ prompt, sessionSlug }, sinkOptions = {}) {
+export async function defaultDispatchOwner({ prompt, sessionSlug }, { pickFreeLanes = null, ...sinkOptions } = {}) {
+  // Keep the fresh-launch brief checks effective before adding the lane instructions.
+  if (!String(prompt || '').trim() || String(prompt || '').trimStart().startsWith('-')) {
+    return { held: true, reason: 'invalid owner brief; restore a nonempty, non-flag brief before retrying' };
+  }
   const io = await import('../operations/dispatch-lane-io.mjs');
   const { DISPATCH_EFFECT } = await import('../operations/dispatch-lane.mjs');
   const { dispatchModesFromEnv } = await import('../operations/dispatch-provider-registry.mjs');
   const { routeAvailableCiHeal } = await import('../operations/ci-heal-pr-dispatch.mjs');
   const route = routeAvailableCiHeal({ scope: [], reason: 'main-red' });
   if (route?.outcome === 'refused') return { held: true, reason: route.refusal ?? 'route refused' };
+  // Restricted repairs need a named lane before launch, including owners that will open a new PR.
+  const root = sinkOptions.root ?? io.REPO_ROOT;
+  let lane;
+  try {
+    const { freeLaneNumbers } = await import('./reconcile-fix-dispatch.mjs');
+    lane = (await (pickFreeLanes ?? (() => freeLaneNumbers({ root })))())?.[0];
+  } catch {
+    return { held: true, reason: 'lane availability unknown; inspect the lane pool and retry' };
+  }
+  if (!Number.isSafeInteger(lane) || lane < 1) {
+    return { held: true, reason: 'no named lane available; free a lane and retry' };
+  }
+  const assignedPrompt = `Assigned lane: ${lane}. Add \`--lane=${lane} --session=${sessionSlug}\` to the lane acquire command below. If it is unavailable, stop and report; do not switch lanes.\n\n${prompt}`;
   // A main fix has no PR: force the `claude --bg` brief path (the mechanical ci-heal wrapper needs a PR) and no probation worker.
   const sinks = io.createDispatchSinks({ root: io.REPO_ROOT, modes: { ...dispatchModesFromEnv(), 'ci-heal': 'agent' }, extraArgs: io.agentArgsFromEnv(), spawnEnv: ownerSpawnEnv(), ...sinkOptions });
   const out = await sinks[DISPATCH_EFFECT]({
-    launchKind: 'ci-heal', prompt, sessionSlug, lane: null, scope: [], pr: null, reason: 'main-red', repo: 'we',
+    launchKind: 'ci-heal', prompt: assignedPrompt, sessionSlug, lane, scope: [], pr: null, reason: 'main-red', repo: 'we',
     probationWorker: null, routing: route ? { ...route, probationWorker: null } : null,
   });
   if (out?.held) return out;

@@ -53,7 +53,7 @@ describe('lean repair security boundaries', () => {
       settings.permissions = { allow: ['Read'], deny: ['Bash(rm:*)', 'Edit(secret/**)'], ask: ['Agent', 'Bash(git push:*)'] };
       expect(load().permissions).toEqual(settings.permissions);
       for (const launchKind of ['fix', 'ci-heal']) {
-        const argv = buildAgentArgv({ payload: { launchKind, lane: 7, prompt: 'Repair this PR.' }, loadRepairSettings: load });
+        const argv = buildAgentArgv({ root: '/repo', payload: { launchKind, lane: 7, prompt: 'Repair this PR.' }, loadRepairSettings: load });
         const { permissions } = JSON.parse(argv[argv.indexOf('--settings') + 1]);
         expect(permissions.deny).toEqual(settings.permissions.deny);
         expect(permissions.ask).toEqual(settings.permissions.ask);
@@ -126,6 +126,7 @@ describe('lean repair security boundaries', () => {
 
 describe('lean repair background argv', () => {
   const options = (launchKind) => ({
+    root: '/repo',
     payload: { launchKind, lane: 7, num: '3037', sessionSlug: 'repair-3037', prompt: 'Repair this PR.' },
     settingsEnv: { PATH: '/fixture/bin' },
     worktreeSettings: { bgIsolation: 'none' },
@@ -181,7 +182,7 @@ describe('lean repair background argv', () => {
       expect(settings.env).toEqual({ PATH: '/fixture/bin', WE_CONVEYOR_WORKER: '1' });
       expect(settings.worktree).toEqual({ bgIsolation: 'none' });
       expect(settings.permissions?.allow).toEqual([...new Set([
-        ...canonical.permissions.allow, ...leanRepairGrant(options(kind).payload).allow])]);
+        ...canonical.permissions.allow, ...leanRepairGrant(options(kind).payload, null, { root: '/repo' }).allow])]);
       expect(settings.permissions?.deny).toEqual(canonical.permissions.deny);
       expect(settings.permissions?.ask).toEqual(canonical.permissions.ask);
       expect(settings.hooks).toEqual(LEAN_FIX_HOOKS_SETTINGS().hooks);
@@ -321,7 +322,7 @@ describe('lean repair background argv', () => {
   // itself — one `--add-dir` per directory plus the `--settings` permissions — or the repair cannot edit its lane.
   const settingsOf = (argv) => JSON.parse(argv[argv.indexOf('--settings') + 1]);
   const addDirsOf = (argv) => argv.flatMap((arg, i) => (arg === '--add-dir' ? [argv[i + 1]] : []));
-  const LANE_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 7 });
+  const LANE_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 7 }, null, { root: '/repo' });
 
   it('carries an explicit lane grant into --add-dir and the --settings permissions for fix and ci-heal', () => {
     for (const kind of ['fix', 'ci-heal']) {
@@ -346,6 +347,20 @@ describe('lean repair background argv', () => {
     const argv = buildAgentArgv({ ...options('fix'), payload });
     expect(addDirsOf(argv)).toEqual([expect.stringMatching(/\/\.lanes\/web(?:-)?everything\/lane-12$/)]);
     expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([expect.stringMatching(/^Edit\(.*\/lane-12\/\*\*\)$/)]));
+  });
+
+  it('validates an explicit grant against the dispatcher root, refusing another workspace', () => {
+    const payload = { ...options('fix').payload, lane: 7 };
+    const root = '/portable/workspace/we';
+    const laneGrant = leanRepairGrant(payload, null, { root, exists: () => false });
+    const argv = buildAgentArgv({ ...options('fix'), root, payload, laneGrant });
+    expect(addDirsOf(argv)).toEqual(['/portable/workspace/.lanes/web-everything/lane-7']);
+    expect(settingsOf(argv).permissions.additionalDirectories).toEqual(addDirsOf(argv));
+    expect(settingsOf(argv).permissions.allow).toContain(`Bash(node ${root}/scripts/conveyor/resolve-conflict.mjs:*)`);
+    expect(() => buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant }))
+      .toThrow(/only the assigned lane/);
+    expect(buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant, resumeSessionId: 'existing' }))
+      .toEqual(['--bg', '--resume', 'existing', payload.prompt]);
   });
 
   // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
@@ -391,7 +406,7 @@ describe('lean repair background argv', () => {
 
   it('the sink forwards its lane grant to the launch argv, not only to settings.local.json', async () => {
     const requests = [];
-    const grant = leanRepairGrant({ launchKind: 'ci-heal', lane: 40 });
+    const grant = leanRepairGrant({ launchKind: 'ci-heal', lane: 40 }, null, { root: '/repo/webeverything' });
     const sinks = createDispatchSinks({
       root: '/repo/webeverything', mintSessionId: () => 'sess-grant-1', now: () => new Date('2026-11-22T00:00:00Z'),
       sessionCwdFor: () => '/tmp/scratch-grant', ensureSessionCwd: (d) => d, resolveSettingsEnv: () => ({}),
@@ -401,6 +416,7 @@ describe('lean repair background argv', () => {
     });
     await sinks[DISPATCH_EFFECT]({ num: '4210', lane: 40, launchKind: 'ci-heal', sessionSlug: 'ci-heal-4210', prompt: '# go', scope: ['we:scripts/a.mjs'] });
     expect(requests[0].laneGrant).toEqual(grant);
+    expect(requests[0].dispatchRoot).toBe('/repo/webeverything');
     const argvs = [];
     defaultClaudeProvider({ ...requests[0], cwd: '/tmp/scratch-grant' }, {
       spawnAgent: (argv) => { argvs.push(argv); return ''; }, wrapKind: () => false,

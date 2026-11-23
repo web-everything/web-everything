@@ -48,7 +48,6 @@ vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
   const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
   return withLeanRepairSettingsFixture(await original());
 });
-const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 13 });
 
 import {
   isParkedConflictTarget, planConflictLabelChange, isStatuteTierConflict, buildConflictFindingBody,
@@ -250,6 +249,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
           mintSessionId: () => 'ffffffff-0000-0000-0000-000000000000',
           spawnAgent: (argv, opts) => defaultSpawnAgent(argv, { ...opts, env }),
         });
+        const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 13 }, null, { root });
 
         expect(result.resumed).toBe(false);
         expect(result.sessionId).toBe('ffffffff-0000-0000-0000-000000000000');

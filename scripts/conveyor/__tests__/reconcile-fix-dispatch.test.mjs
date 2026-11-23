@@ -29,7 +29,7 @@ vi.mock('../../operations/minimal-context-provider.mjs', async (original) => {
   const { withLeanRepairSettingsFixture } = await import('../../operations/__tests__/helpers/lean-repair-settings.mjs');
   return withLeanRepairSettingsFixture(await original());
 });
-const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 9 });
+const LEAN_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 9 }, null, { root: '/repo' });
 const leanFixSettings = (env) => {
   const hooks = LEAN_FIX_HOOKS_SETTINGS();
   return JSON.stringify({ env, worktree: { bgIsolation: 'none' }, ...hooks, permissions: {

@@ -1703,6 +1703,7 @@ export function dispatchFix(planned, {
     } catch { /* see above */ }
     const argv = buildAgentArgv({
       sessionId,
+      root,
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
