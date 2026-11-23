@@ -3,7 +3,10 @@ bornAs: xwtpi80
 kind: story
 size: 5
 parent: "2610"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: Phase 2 hosted tenants exist (#554); the queue is tenant-scoped feedback. Review kept it out of the app."
+dateParked: "2026-11-22"
 blockedBy: ["2774"]
 scope: ["we:contracts/feedback-review.schema.json", "we:contracts/feedback-review.examples.json", "we:scripts/__tests__/feedback-review-contract.test.mjs", "plateau:src/backlog-view/feedback-review.ts", "plateau:src/backlog-view/feedback-review.test.ts", "plateau:src/backlog-view/feedback-review-port.ts", "plateau:src/backlog-view/feedback-review-port.test.ts", "plateau:src/backlog-view/feedback-review-surface.ts", "plateau:src/backlog-view/feedback-review-surface.test.ts", "plateau:src/backlog-view/feedback-review-surface.css", "plateau:src/backlog-view/feedback-review.webcases.ts", "plateau:src/main.ts", "plateau:index.html", "plateau:vite.config.mts", "plateau:tests/e2e/feedback-review.spec.ts"]
 dateOpened: "2026-07-28"
@@ -74,3 +77,5 @@ Do not implement a capture form, hosted backend, red-team execution or routing-t
 - Specify and prove production identity/owner authorization, durable storage, retention/deletion and deployment before offering the multi-tenant channel to real users. These cannot be inferred from mock principals or fixture isolation.
 - #2777 owns accepted-suggestion routing; agree on replay/idempotency at that later transport seam without silently importing raw single-tenant evidence into this minimal channel.
 - Testing lesson: pure render tests cannot establish route mounting, receive-time scrub or tenant authorization. Keep port and real-browser evidence in this card’s implementation review; do not append shared agent documentation.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: Phase 2 hosted tenants exist (#554); the queue is tenant-scoped feedback. Review kept it out of the app.

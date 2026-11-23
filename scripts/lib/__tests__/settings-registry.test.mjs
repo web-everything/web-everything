@@ -348,8 +348,16 @@ test('generated documentation matches the merged review, shadow rotation and aud
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Includes providerRotation, both audit debounce/delta leaves and the merged review defaults:
-  // advisorySeats.antigravityReview=off and postAcceptAdvisory.sampleRate=0.1 (630 leaves).
-  assert.equal(createHash('sha256').update(original).digest('hex'), '733eb588321bc294524f41710ca7ee81dc4206b4c3eeca4d87692cb86adbec93');
+  // Includes providerRotation, ciUnitRerun, both audit debounce/delta leaves and the merged review defaults:
+  // advisorySeats.antigravityReview=off and postAcceptAdvisory.sampleRate=0.1 (632 leaves).
+  assert.equal(createHash('sha256').update(original).digest('hex'), '21cdefb5bd5a517ebe6c36e6bbeab23a4633af7ef4ffb20bfc8d65fdc3f860b3');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
+});
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });

@@ -38,3 +38,5 @@ Extend we:../plateau-app/src/wip/wip-source.test.ts:254 and we:../plateau-app/sr
 ## Scope budget and Follow-ups
 
 Predicted implementation: 5 explicit paths; two areas (WIP and relay). Even allowing this WE backlog card as one bookkeeping path/area stays below 20 paths and 4 areas. No broad directory scope. If prerequisite drift changes the touch-set, re-probe and re-slice before exceeding the gate. Record testing lessons here, never in shared agent docs. Arbitrary custom-log registration/heartbeat remains a separate producer follow-up; keep discovery coverage partial until proven.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

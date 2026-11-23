@@ -1377,6 +1377,14 @@ export function redTeamRequired(verdict) {
   return verdict === VERDICTS.ACCEPT;
 }
 
+/** Only an explicit accept/land pair ratifies; all other pairs escalate. Mirrored in the import-free workflow. */
+export function redTeamReduceFallback({ reduced } = {}) {
+  if (!reduced?.verdict) return { verdict: 'needs-human', outcome: 'escalate' };
+  const verdict = reduced.verdict;
+  const outcome = verdict === 'accept' && reduced.outcome === 'land' ? 'land' : 'escalate';
+  return { verdict, outcome };
+}
+
 /**
  * Fold a red-team's result into the FINAL (post-red-team) verdict. Pure, FAIL-CLOSED. Delegates to `deriveVerdict`
  * with `humanRequired = !ran`, so the "no signal is a FAILING signal" invariant is the SAME one `deriveVerdict`
@@ -1392,7 +1400,13 @@ export function redTeamRequired(verdict) {
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
 export function foldRedTeamVerdict({ ran = false, findings = [], findingClasses = readFindingClassPolicy() } = {}) {
-  return deriveVerdict({ findings: findings.filter(f => classAction(f, findingClasses) !== 'defer-card'), humanRequired: !ran });
+  // Deferrals require a card-id shape from backlog-stranded-sweep plus a nonempty ruling that does not demand a fix or negate deferral.
+  const nonEmpty = value => typeof value === 'string' && value.trim().length > 0;
+  const deferred = f => classAction(f, findingClasses) === 'defer-card'
+    && nonEmpty(f.cardId) && f.cardId === f.cardId.trim() && /^(?:\d{1,6}|x[0-9a-z]{6})$/.test(f.cardId)
+    && nonEmpty(f.ruling) && !/\b(must|needs?|should)\b.*\bfix\b|\bnot\b.*\bdefer/i.test(f.ruling);
+  // Exempt only the changes blocker; retain the finding so deriveVerdict still checks its prevention.
+  return deriveVerdict({ findings: findings.map(f => deferred(f) ? { ...f, outcome: 'no_change_needed' } : f), humanRequired: !ran });
 }
 
 /**

@@ -67,7 +67,7 @@ function net(o) {
   });
   return { r, calls };
 }
-const shadowLines = () => (existsSync(join(dir, SAFETY_NET_SHADOW_LOG)) ? readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+const shadowLines = () => (existsSync(join(dir, SAFETY_NET_SHADOW_LOG)) ? readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter(line => line.wouldDo) : []);
 
 describe('parseVitestFailures — a CI job log', () => {
   it('names the failing file and test from the real 2026-10-10 log, complete against the summary', () => {

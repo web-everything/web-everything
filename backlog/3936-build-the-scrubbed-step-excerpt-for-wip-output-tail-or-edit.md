@@ -22,3 +22,5 @@ The L3 detail for one step, built on the laptop: `agent-activity --excerpt=<runI
 ## Done when
 
 1. **Executable** — we:scripts/operations/__tests__/agent-excerpt.test.mjs under `npx vitest run`: from a hostile fixture transcript holding a `ghp_` token in command output, a PEM block, ANSI escapes, a thinking block, a `Read` result with file contents, an `Edit` body and the dispatch prompt, the serialized excerpts for every step contain none of those strings (substring search), and the `ghp_` step reports `withheld: true`.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

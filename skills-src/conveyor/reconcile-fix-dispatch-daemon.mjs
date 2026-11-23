@@ -1271,6 +1271,9 @@ export async function runTickAllRepos({
   // No Claude session is spawned, so the auth gate never pauses it.
   const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
     : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
+  // Unknown supersede evidence cannot authorize fresh fix or CI-heal dispatch.
+  const supersedeFailure = supersede.repos.find(r => r.error || r.blocked);
+  if (supersedeFailure) throw new Error(`supersede dispatch blocked for ${supersedeFailure.repo}; retry next tick: ${supersedeFailure.error ?? 'unreadable evidence'}`);
   const rulingStandDown = await timedAsync('ruling-stand-down', async () => {
     const setting = resolveReviewSettings().rulingResolvesStandDown;
     const settingSource = resolveReviewSettingSource('rulingResolvesStandDown');
