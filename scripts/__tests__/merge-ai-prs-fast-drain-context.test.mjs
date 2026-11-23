@@ -252,7 +252,7 @@ test('failed live default-branch resolution fails closed even with a cached hint
     assert.deepEqual(result.toMerge, []);
     assert.deepEqual(result.enqueueOutcomes ?? [], []);
     assert.ok(result.skipped.some(v => /default branch unresolved live/.test(v.reason)), live.stdout);
-    assert.match(live.stderr, /default branch unresolved live — deferring merge\/enqueue/);
+    assert.match(live.stderr, /default branch unresolved live .* — deferring merge\/enqueue/);
   }
 });
 

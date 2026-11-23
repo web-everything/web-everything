@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
+import { classifyChildFailure } from './lib/child-failure-class.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -4829,7 +4830,7 @@ export function basisTouchesEngineTier(score) {
  * @returns {boolean} always `false` until `#3493` unblocks
  */
 /**
- * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS gh's own last stderr line.
+ * The `gh-error` detail for a failed `gh pr list`: the error's first line PLUS a bounded stderr tail.
  * Also used by the per-PR merge catch to preserve the merge failure's stderr cause.
  * Enqueue errors carry `githubMessage`: preserve that diagnostic verbatim, including multiple lines.
  * `execFile`'s message is only "Command failed: gh pr list …" — the actual cause (secondary rate limit, 401,
@@ -5491,7 +5492,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, GH_REPO: repo } });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live — deferring merge/enqueue; retry on the next pass\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (class=${classifyChildFailure(e?.stderr)}) — deferring merge/enqueue; retry on the next pass\n`),
   });
   const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
