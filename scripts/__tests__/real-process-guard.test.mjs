@@ -64,9 +64,17 @@ export function scansRealProcess(source) {
  * prove one. Mocking/patching makes the entire file ineligible; no mock implementation is executed here. */
 export function startsRealProcess(source, file = 'scripts/__tests__/sample.real.test.mjs') {
   const tree = ts.createSourceFile('test.ts', source, ts.ScriptTarget.Latest, true);
-  const host = ts.createCompilerHost({ noLib: true, noResolve: true });
+  const options = { noLib: true, noResolve: true, types: [], typeRoots: [] };
+  const host = ts.createCompilerHost(options);
+  // Purely in-memory: the checker must never probe the filesystem (module or @types lookups) — hermetic tests.
   host.getSourceFile = name => name === tree.fileName ? tree : undefined;
-  const program = ts.createProgram([tree.fileName], { noLib: true, noResolve: true }, host);
+  host.fileExists = name => name === tree.fileName;
+  host.readFile = () => undefined;
+  host.directoryExists = () => false;
+  host.getDirectories = () => [];
+  host.realpath = name => name;
+  host.resolveModuleNameLiterals = literals => literals.map(() => ({ resolvedModule: undefined }));
+  const program = ts.createProgram([tree.fileName], options, host);
   const checker = program.getTypeChecker();
   const symbol = node => checker.getSymbolAtLocation(node);
   const property = node => ts.isPropertyAccessExpression(node) ? node.name.text
