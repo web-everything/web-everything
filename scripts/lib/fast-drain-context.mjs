@@ -210,11 +210,14 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     const hit = cached();
     if (hit) return revalidateMembership(hit);
     let writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
+    const triedAt = now();
     try { readSources(); } catch {
-      // Cold/stale/dirty shared cache: this single-flight child refreshes it live (slow, often > the pass TTL).
-      // The bound restarts when the refresh completes; rows are still re-hydrated against live lean membership.
+      // Cold/stale/dirty shared cache: this single-flight child refreshes it live (a refresh alone can outlast the
+      // 60s pass TTL, so counting it would make every cold catch-up expire). Rows written by a refresh are at most
+      // (refresh end - triedAt) old; they only seed base facts, and hydrateLiveInventory re-reads any PR whose live
+      // lean head/updatedAt differs, so membership authority stays live. The TTL window restarts at refresh end.
       readSources({ refresh: true });
-      writtenAt = now();
+      writtenAt = Math.max(writtenAt, now());
     }
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);

@@ -68,6 +68,26 @@ for (const refreshAvailable of [true, false]) {
   });
 }
 
+for (const slowLean of [false, true]) {
+  test(`pass inventory: a slow refresh ${slowLean ? 'still expires when the post-refresh membership read is slow' : 'does not expire the pass bound'}`, async () => {
+    let t = 1000, held = false, snapshot = null, published = null;
+    const options = {
+      path: 'unused-pass-snapshot.json', repos: [repo], targetRepo: repo, env: {}, now: () => t,
+      readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
+      listLean: async () => { if (slowLean) t += 61_000; return inventory([lean(pr(7))]); },
+      readSnapshot: (_r, o) => { if (o?.refresh) { t += 61_000; snapshot = [pr(7)]; } return snapshot; },
+      read: () => published, write: (_p, v) => { published = v; },
+      lock: async fn => { held = true; try { return { ok: true, value: await fn(() => held) }; } finally { held = false; } },
+    };
+    if (slowLean) {
+      await assert.rejects(readFastDrainPassInventory(options), /expired while reading/);
+      assert.equal(published, null);
+    } else {
+      assert.deepEqual((await readFastDrainPassInventory(options)).snapshots.get(repo), [pr(7)]);
+    }
+  });
+}
+
 async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, leanRead, snapshotRead,
   readFull, groups, setting = {}, enabled = true, repos = [repo], manifests = new Map() } = {}) {
   const calls = { fullPages: 0, contextRelists: 0, lean: [], full: [], phases: [], log: [] };
