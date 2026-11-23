@@ -19,9 +19,10 @@ export const FIX_EXECUTOR_RUNGS = Object.freeze({
 });
 const defaults = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../settings/fix-executor.json'), 'utf8')).fixExecutor;
 const normalize = value => Array.isArray(value) ? value.map(id => id === 'gemini' ? 'argon' : id) : value;
-export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(normalize(defaults.fixSeatMix));
 const valid = value => Array.isArray(value) && value.length > 0 && value.at(-1) === 'claude'
   && new Set(value).size === value.length && value.every(id => Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
+const fallbackSeatMix = Object.freeze(['codex', 'codex-alt', 'gemini', 'claude']);
+export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(normalize(valid(normalize(defaults.fixSeatMix)) ? defaults.fixSeatMix : fallbackSeatMix));
 const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
@@ -40,7 +41,7 @@ export function resolveFixExecutionMode({ env = process.env, platform = platform
 }
 export function resolveFixCriticalGlobs({ env = process.env, platform = platformPreferences(), repo = readDeclaredSettings().settings } = {}) {
   return cascadePolicy('fixExecutor.criticalGlobs', repo?.fixExecutor?.criticalGlobs, { standard:defaults.criticalGlobs, platform:platform?.fixExecutor?.criticalGlobs, env,
-    valid:value=>Array.isArray(value) && value.every(glob=>typeof glob === 'string' && !!glob.trim()) }).value;
+    valid:value=>Array.isArray(value) && value.length > 0 && value.every(glob=>typeof glob === 'string' && !!glob.trim()) }).value;
 }
 
 export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting, kind = 'fix', capacity, now = Date.now(), quota, records, record } = {}) {

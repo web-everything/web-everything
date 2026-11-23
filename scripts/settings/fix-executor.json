@@ -31,7 +31,7 @@
       "scripts/operations/land-advance**", "scripts/operations/pr-land-reasons.mjs", "scripts/lib/ai-pr-authorship.mjs", "scripts/lib/marker-authorship.mjs",
       "scripts/lib/verdict-totality.mjs", "scripts/lib/trust-chain-tier.mjs", "scripts/conveyor/hiccup-approve.mjs", "scripts/lib/agy-confined-**",
       "scripts/settings/agy-build.json", "scripts/lib/__tests__/agy-confined-**", "scripts/lib/__tests__/agy-sandbox.test.mjs", "scripts/lib/__tests__/agy-fix-admission.test.mjs",
-      "scripts/lib/__tests__/fixtures/**"
+      "scripts/lib/__tests__/fixtures/**", ".githooks/**", "**/required-status-checks*", "**/branch-protection*", "scripts/lib/__tests__/agy-**", "**/drain-**"
     ]
   }
 }

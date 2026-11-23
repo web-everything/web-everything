@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { FIX_EXECUTOR_RUNGS, FIX_EXECUTOR_CHAIN_DEFAULT, resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
 import { chooseFixExecutor, formatFixExecutorLog } from '../fix-slot-borrow.mjs';
 import { codexModelSupportsEffort } from '../codex-model-routing.mjs';
@@ -6,6 +6,16 @@ import { readFileSync } from 'node:fs';
 const chain = ['codex', 'codex-alt', 'argon', 'claude'];
 const pick = (input = {}) => pickChainRung({ chain, launcherAvailable: () => true, ...input });
 describe('fix executor chain', () => {
+  it.each([[], ['codex'], ['unknown', 'claude'], ['claude', 'claude'], null])('rejects invalid shipped seat mix %j with a frozen fallback', async fixSeatMix => {
+    vi.resetModules();
+    vi.doMock('node:fs', async original => ({ ...await original(), readFileSync: (path, ...args) => String(path).endsWith('/settings/fix-executor.json')
+      ? JSON.stringify({ fixExecutor: { fixSeatMix } }) : readFileSync(path, ...args) }));
+    try {
+      const { FIX_EXECUTOR_CHAIN_DEFAULT: value } = await import('../fix-executor-chain.mjs');
+      expect(value).toEqual(chain);
+      expect(Object.isFrozen(value)).toBe(true);
+    } finally { vi.doUnmock('node:fs'); vi.resetModules(); }
+  });
   it.each([null, 'stronger-model', 'takeover', 'ruling-not-addressed'])('combines %s with failure progress without skipping a rung', trigger => {
     for (const [codexUnproductive, expected] of [[0, trigger ? 'codex-alt' : 'codex'], [1, trigger ? 'codex-alt' : 'codex'], [2, 'codex-alt'], [3, 'argon'], [4, 'claude'], [9, 'claude']]) {
       expect(pick({ trigger, codexUnproductive }).rung).toBe(expected);
@@ -55,12 +65,15 @@ describe('chain settings cascade', () => {
     const repo = {fixExecutor:{fixSeatMix:['codex-alt','gemini','claude'],executionMode:'wrapped',executionModeByRole:{'ci-heal':'direct'}}};
     expect(resolve({repo})).toMatchObject({value:['codex-alt','argon','claude'],mode:'wrapped',modeSource:'tool'});
     expect(resolve({repo,kind:'ci-heal'}).mode).toBe('direct');
+    for (const kind of ['fix','ci-heal']) expect(resolve({repo:{fixExecutor:{executionModeByRole:{[kind]:'wrapped'}}},kind}).mode).toBe('wrapped');
     expect(resolve({repo:{fixExecutor:{executionMode:'invalid'}}}).mode).toBe('direct');
     expect(resolve({env:{WE_FIX_EXECUTOR_EXECUTION_MODE:'wrapped'}})).toMatchObject({mode:'wrapped',modeSource:'env'});
     expect(resolve({repo,env:{WE_FIX_EXECUTOR_FALLBACK_CHAIN:'codex,claude'}}).value).toEqual(['codex','claude']);
   });
   it('cascades the explicit critical path list', () => {
     expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:['scripts/security/**']}}}).criticalGlobs).toEqual(['scripts/security/**']);
+    expect(resolve({repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(resolve({}).criticalGlobs);
+    expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(['scripts/land/**']);
   });
   it.each([[],['codex'],['unknown','claude'],['claude','claude'],null,'codex,claude'])('ignores invalid layers %j', raw => {
     expect(resolve({platform:layer(['argon','claude']),repo:layer(raw),env:{WE_FIX_EXECUTOR_FALLBACK_CHAIN:'bad'}})).toEqual({...defaults,value:['argon','claude'],source:'platform'});

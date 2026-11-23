@@ -129,6 +129,7 @@ import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import picomatch from 'picomatch';
+import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
 import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1310,11 +1311,17 @@ function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readR
     strongerModel: !!planned.strongerModel || !!roundEscalationFor(planned, { fixSettings, loadLadder }) };
 }
 
+function criticalFixEntry(p, globs = resolveFixCriticalGlobs()) {
+  return ((p.risk === 'high' || p.humanRequired === true || p.tags?.includes('security'))
+    && criticalWorkVerdict({ ...p, filesTouched: p.scope }).critical)
+    || !Array.isArray(p.scope) || !p.scope.length || p.scope.some(path => typeof path !== 'string' || !path.trim()
+    || picomatch.isMatch(path.trim().replace(/^[^/:]+:/, '').replace(/^\.\//, ''), globs, { nocase: true, dot: true }));
+}
+
 /** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
 export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLadder, launcherAvailable, readRouted,
   loadFixItems = () => defaultLoadItems(REPO_ROOT),
-  criticalFor = p => !Array.isArray(p.scope) || !p.scope.length || p.scope.some(path => typeof path !== 'string' || !path.trim()
-    || picomatch.isMatch(path.trim().replace(/^(?:we|webeverything):/, '').replace(/^\.\//, ''), chain?.criticalGlobs ?? resolveFixCriticalGlobs())) }) {
+  criticalFor = p => criticalFixEntry(p, chain?.criticalGlobs) }) {
   let critical = true;
   try { critical = criticalFor(planned); } catch { /* unknown verdict fails closed */ }
   let item;
@@ -1331,7 +1338,7 @@ export function routeFixExecutor(planned, { setting, chain, fixSettings, loadLad
 export function launchTableFor(planned, roundEscalation, { fixSettings = resolveFixSettings(), capacityRoute } = {}) {
   const table = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
   if (capacityRoute?.provider === 'claude' && capacityRoute.model && !roundEscalation
-    && !planned.takeover && !planned.rulingNotAddressed && !planned.mainFix && !planned.strongerModel) {
+    && !planned.takeover && !planned.rulingNotAddressed && !planned.mainFix && !planned.strongerModel && !criticalFixEntry(planned)) {
     return { model: capacityRoute.model, effort: capacityRoute.effort ?? 'high', reason: 'configured capacity winner' };
   }
   const configured = fixSettings.claudeEscalationModel ?? 'sonnet';
@@ -1570,7 +1577,7 @@ export function dispatchFix(planned, {
   if (safety.value.resetOnRepeatedFinding) {
     try { repeat = repeatedFindingPlan(readHistoryInputs({ repo, pr: planned.pr })?.comments); } catch { /* launcher re-reads */ }
   }
-  const routed = repeat.action !== 'patch' ? { executor: 'codex', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
+  const routed = repeat.action !== 'patch' ? { executor: 'codex', mode: 'direct', source: 'repeated-finding', reason: 'mechanical scope reset or operator stand-down' } : borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
     ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
   }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
   const decision = {rung:routed.executor,provider:routed.policyRoute?.provider ?? routed.executor,...resolveFixExecutionMode(),...routed};
@@ -1612,7 +1619,7 @@ export function dispatchFix(planned, {
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
     // Card xx0055i — round N>1 carries the previous rounds; the takeover carries ALL rounds plus its own section.
     const prompt = (decision.executor === 'claude' ? 'You are the repair executor. Apply the changes yourself.\n\n'
-      : decision.mode === 'wrapped' ? `Supervise this repair using scripts/${decision.executor === 'codex' ? 'codex' : 'gemini'}-direct-task.mjs under the WE_ROOT supplied below.\n\n` : '')
+      : decision.mode === 'wrapped' ? `Supervise this repair using scripts/${decision.executor === 'codex' ? 'codex' : 'gemini'}-direct-task.mjs under the WE_ROOT supplied below. Provider=${decision.provider}, model=${decision.policyRoute?.model ?? 'default'}, effort=${decision.policyRoute?.effort ?? 'default'}.\n\n` : '')
       + briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff });
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.

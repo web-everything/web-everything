@@ -98,7 +98,7 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
   const claim = readLockEntry(lockRoot, resource);
   if (!claim || claim.owner !== owner) return false;
   return heartbeat(lockRoot, resource, owner, new Date().toISOString(), claim.pid ?? null,
-    { ...claim.meta, fixExecutor: { executor: decision.executor, rung: decision.rung, provider: decision.provider, mode: decision.mode, reason: decision.reason } });
+    { ...claim.meta, fixExecutor: { executor: decision.executor, rung: decision.rung, provider: decision.provider, mode: decision.mode, requiresReview: !!decision.requiresReview, reason: decision.reason } });
 }
 
 /**
