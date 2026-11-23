@@ -67,7 +67,7 @@ export default {
     });
     const status = (labels = [], comments = []) => derivePrStatusLabel({ humanAt: 99, requiredChecks: ['test'],
       pr: { ...draft, isDraft: false, labels: ['review:accepted', ...labels], comments,
-        statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }] } });
+        statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] } });
     check(status(['review:changes']) === 'sent-back-review', 'review changes blocks stale acceptance');
     check(status(['red-team:blocked']) === 'sent-back-red-team', 'red-team blocker blocks stale acceptance');
     for (const outcome of ['changes', 'inconclusive']) {
