@@ -19,3 +19,5 @@ PR #7336's simplicity and codex-correctness advisory findings both request a nam
 ## Proof plan
 
 Use deterministic synchronization rather than sleeps. Report the named tests and a mutation that removes the compare-and-swap check and fails the intervening-write assertion.
+
+Prevention: the review rule for any compare-and-swap or “unchanged since” guard must require a named intervening-write test. Planned fixtures `settle-retains-intervening-reservation` and `settle-retains-intervening-escalation` must preserve the second writer's exact bytes; `settle-restores-unchanged-admission` is the positive control. This captures the repeated 2026-11-23 security, simplicity and codex-correctness findings without claiming the tests exist yet.

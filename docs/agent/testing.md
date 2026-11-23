@@ -6384,6 +6384,18 @@ and vice versa. A failed release must leave its reservation durable before the
 release call; tick again at +31, +60 and +90 minutes and assert one release attempt,
 zero dispatches, one needs-you publication and one stream append.
 
+Recovery-only park gates also preserve ordinary planner output: red drafts still
+owe CI-heal. `consumer preserves ordinary planner rows under a %s recovery gate`
+covers draft, closed and referral-held inputs; `consumer preserves the real planner
+ci-heal row for a red draft on later ticks` checks the actual planner at 0, 31 and
+61 minutes. `the CI-heal consumer launches the real planner row for a red draft
+with recovery enabled` checks dispatch wiring. All are in
+`scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs`. Existing episodes
+remain parked without removing other kinds, covered by `park holds an existing
+%s episode without dropping ordinary sibling rows`. The registered
+`owed-fix-no-live-fixer-recovery` soak includes `ordinaryParkedRows` for both
+consumer kinds, preserving the dispatch array and leaving no recovery sidecar state.
+
 Acceptance evidence must distinguish automated coverage from operational proof:
 
 | PR acceptance | Named check | Observable assertion / current evidence |
@@ -6393,9 +6405,15 @@ Acceptance evidence must distinguish automated coverage from operational proof:
 | 3: babysit-label follow-up | `owed-fix-babysit-followup-record` in #xo73io1 | Pending: record the external follow-up's identifier, owner and assertion. This local card tracks the missing verification. |
 | 4: live proof after prototype load | `owed-fix-live-7307-or-7179` in that card | Pending: record exact deployed/PR heads and timed release, dispatch, suppression and escalation observations on PR #7336. Hermetic tests are not live proof. |
 
-The default-IO smoke is separately owed in that card. Negative soak fixture
-repairs are tracked by `xo73so1`, competing-writer ledger coverage by `xo73ca1`,
-and the broader temporal-test/acceptance review rule by `xo73mt1`. Do not mark a
+`scripts/conveyor/__tests__/owed-fix-default-io.test.mjs` implements the named
+`owed-fix-default-io-smoke` through the CI-heal consumer with omitted recovery IO.
+It uses real temporary claim/state/feed files and command-boundary fakes; it does
+not establish live CLI or deployment behavior. Its final gate result is pending
+in `xo73io1`. Negative soak fixture repairs are tracked by `xo73so1`, competing-writer
+ledger coverage by `xo73ca1`, and the broader temporal-test/acceptance review rule
+by `xo73mt1`. The seven historical hardening-waiver card ids remain unverified;
+`xo73hd1` now records that list and required checks. `xo73av1` tracks ordinary
+same-head re-offers after completed sessions and sidecar cleanup. Do not mark a
 numbered acceptance item complete from a suite count alone.
 ## Provider rotation shadow (PROV-AB S1.2)
 

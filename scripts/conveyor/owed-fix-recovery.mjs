@@ -192,12 +192,22 @@ export function recoverOwedFixes(input, {
     }
     if (!recoveryAuthAllowed) throw new Error('auth paused or unknown; restore login before retrying');
   };
-  // A draft can produce promote-draft rather than a repair row; operator parks hold that too.
+  // Park only an existing recovery episode. The planner intentionally emits ordinary CI-heal
+  // rows for red drafts; a recovery-only gate must not veto those or another consumer's rows.
+  // A draft can replace an already observed repair with promote-draft: retain that episode's hold.
   const operatorParked = pr => (pr.state != null && pr.state !== 'OPEN') || pr.isDraft || (pr.referralHold
     && pr.referralHold.kind !== 'same-head' && pr.referralHoldAutoResolve?.outcome !== 'send-back');
   for (const pr of input.prs.filter(operatorParked)) {
-    drop(out, row => row.prNumber !== pr.number);
-    out.refusals.push({ kind: 'owed-fix-operator-park', prNumber: pr.number, why: 'operator park; waiting for operator release' });
+    for (const row of out.dispatch.filter(row => row.prNumber === pr.number && (owned(row) || row.kind === 'promote-draft'))) {
+      try {
+        const rowKinds = owned(row) ? [row.kind] : kinds;
+        const recovering = pr.fixClaim || rowKinds.some(kind => transact(`${input.repo}:${pr.number}:${row.headRefOid}:${kind}`,
+          state => state.since !== undefined || state.retryAt !== undefined));
+        if (!recovering) continue;
+        drop(out, entry => entry !== row);
+        out.refusals.push({ kind: 'owed-fix-operator-park', prNumber: pr.number, why: 'operator park; waiting for operator release' });
+      } catch (error) { refuse(out, row, String(error.message)); }
+    }
   }
   // Re-run the SAME policy with only the claim hold removed. This does not bypass any other refusal. With no claim
   // to remove, the consumer's own plan already is that policy (and, from the pass cache, already freshness-filtered).
@@ -227,13 +237,14 @@ export function recoverOwedFixes(input, {
     ...out.refusals.filter(refusal => refusal.kind === 'fix-claimed').map(refusal => refusal.prNumber)]);
   for (const row of eligible.dispatch.filter(row => owned(row) && offered.has(row.prNumber))) {
     const pr = input.prs.find(pr => pr.number === row.prNumber);
+    // Existing episodes were held above. Leave ordinary parked rows entirely to the planner,
+    // without recording an initial recovery reservation or probing live open/non-draft facts.
+    if (pr && operatorParked(pr)) continue;
     const identity = { repo: input.repo, pr: row.prNumber };
     const head = row.headRefOid;
     let admission = null;
     try {
       if (!pr) throw new Error('PR facts absent from plan; refresh PR evidence');
-      // An operator draft/park is never undone by elapsed time, even for a block-ruling row.
-      if (operatorParked(pr)) throw new Error('operator park; waiting for operator release');
       if (!exactHead(head)) throw new Error('exact 40-hex head required; refresh PR evidence');
       const claims = readClaims(identity);
       if (!Array.isArray(claims) || claims.length > 3) throw new Error('claim inventory unknown; inspect claim store');

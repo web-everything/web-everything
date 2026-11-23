@@ -20,7 +20,7 @@ import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { resolvePrWorkUnit } from '../pr-work-unit.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
-import { recoverOwedFixes } from '../owed-fix-recovery.mjs';
+import { applyOwedFixRecovery, recoverOwedFixes } from '../owed-fix-recovery.mjs';
 import { rememberOwedFixRecoveryInput } from '../reconcile-pass.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { isClaimRunnerDead } from '../../lib/dispatch-throttle.mjs';
@@ -51,6 +51,65 @@ describe('owed fix recovery', () => {
   const staleClaim = (meta = {}) => ({ owner: 'holder', heartbeatAt: new Date(start).toISOString(),
     meta: { repo: 'we', pr: 7307, kind: 'fix', headSha: head,
       claimedAt: new Date(start).toISOString(), ...meta } });
+  it.each([
+    ['draft', { isDraft: true }],
+    ['closed', { state: 'CLOSED' }],
+    ['referral hold', { referralHold: { kind: 'operator' } }],
+  ])('consumer preserves ordinary planner rows under a %s recovery gate', (_name, parked) => {
+    const f = fixture(parked);
+    const input = { repo: 'we', prs: [f.pr], agents: [], now: start };
+    const rows = ['fix', 'ci-heal', 'promote-draft', 'review'].map(kind => ({ kind, prNumber: 7307, headRefOid: head }));
+    const plan = { dispatch: [...rows], refusals: [], notes: [] };
+    const dispatch = plan.dispatch;
+    applyOwedFixRecovery(plan, { kinds: ['ci-heal'], input, io: f.io });
+    expect(plan.dispatch).toBe(dispatch);
+    expect(plan.dispatch).toEqual(rows);
+    expect(plan.refusals).toEqual([]);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
+  it('consumer preserves the real planner ci-heal row for a red draft on later ticks', () => {
+    const f = fixture({ isDraft: true,
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] });
+    const input = { repo: 'we', prs: [f.pr], agents: [], requiredChecks: ['test'], now: start };
+    for (const elapsed of [0, 31, 61]) {
+      input.now = start + elapsed * minute;
+      const plan = planReconcile(input);
+      const expected = structuredClone(plan);
+      expect(plan.dispatch.some(row => row.kind === 'ci-heal')).toBe(true);
+      applyOwedFixRecovery(plan, { kinds: ['ci-heal'], input, io: f.io });
+      expect(plan).toEqual(expected);
+    }
+    expect(f.effects.release).not.toHaveBeenCalled();
+    expect(f.effects.attention).not.toHaveBeenCalled();
+    expect(f.effects.update).not.toHaveBeenCalled();
+  });
+  it.each(['fix', 'ci-heal'])('park holds an existing %s episode without dropping ordinary sibling rows', kind => {
+    const f = fixture();
+    const repair = { kind, prNumber: 7307, headRefOid: head };
+    f.io.kinds = [kind];
+    f.io.base = { dispatch: [repair], refusals: [], notes: [] };
+    expect(f.tick().dispatch).toEqual([repair]);
+    f.pr.isDraft = true;
+    const siblings = [{ ...repair, kind: kind === 'fix' ? 'ci-heal' : 'fix' }, { ...repair, kind: 'review' }];
+    for (const elapsed of [31, 61]) {
+      f.io.base = { dispatch: [repair, ...siblings], refusals: [], notes: [] };
+      expect(f.tick(start + elapsed * minute).dispatch).toEqual(siblings);
+    }
+    expect(f.effects.release).not.toHaveBeenCalled();
+    expect(f.effects.attention).not.toHaveBeenCalled();
+    expect(f.effects.update).not.toHaveBeenCalled();
+  });
+  it('unreadable parked recovery state refuses only the owned candidate', () => {
+    const f = fixture({ isDraft: true });
+    const rows = ['fix', 'ci-heal', 'review'].map(kind => ({ kind, prNumber: 7307, headRefOid: head }));
+    const plan = { dispatch: [...rows], refusals: [], notes: [] };
+    f.io.transact = () => { throw new Error('unreadable recovery state'); };
+    applyOwedFixRecovery(plan, { kinds: ['ci-heal'],
+      input: { repo: 'we', prs: [f.pr], agents: [], now: start }, io: f.io });
+    expect(plan.dispatch).toEqual([rows[0], rows[2]]);
+    expect(plan.refusals).toEqual([{ kind: 'owed-fix-no-fixer', prNumber: 7307, why: 'unreadable recovery state' }]);
+    expect(f.effects.release).not.toHaveBeenCalled();
+  });
   it.each(['alive', 'unknown'])('retains a %s runner without a session row', verdict => {
     const f = fixture();
     f.setClaims([staleClaim({ runnerPid: 123 })]);
@@ -3260,6 +3319,27 @@ describe('owed fix recovery through the production dispatch consumers', () => {
     return createReconcilePlanCache({ reconcile: () => w.planAt(now), now: () => now,
       readFingerprints: () => new Map([[7400, 'same']]), readClaims: () => new Set(), log: () => {} });
   };
+
+  it('the CI-heal consumer launches the real planner row for a red draft with recovery enabled', async () => {
+    const { runReconcileCiHealDispatch } = await import('../../operations/ci-heal-pr-dispatch.mjs');
+    const w = world({ kind: 'ci-heal' });
+    const input = { repo: 'we', now: start, agents: [], requiredChecks: ['test'], prs: [{ ...w.pr,
+      headRefName: w.row.headRefName, isDraft: true, comments: [],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }] };
+    const plan = { ...planReconcile(input), owedFixRecovery: rememberOwedFixRecoveryInput(input) };
+    const dispatch = vi.fn(launchResult);
+    const out = await runReconcileCiHealDispatch({ root: '/repo', checkStaleness: FRESH, reconcile: () => plan,
+      flushOwed: () => ({}), flushTimeouts: async () => [], pollAttempts: () => [], timeoutHold: () => null,
+      salvage: async () => null, pickFreeLanes: () => [3], dispatch, resolveWorkUnit: () => null,
+      fixLoop: { killed: () => false, readRows: () => [], append: async () => {}, currentBuild: async () => null },
+      owedFixRecovery: w.io });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0][0]).toMatchObject({ pr: 7400 });
+    expect(out.dispatched).toHaveLength(1);
+    expect(w.states.size).toBe(0);
+    expect(w.io.readLive).not.toHaveBeenCalled();
+    expect(w.effects.release).not.toHaveBeenCalled();
+  });
 
   it.each(['fix', 'ci-heal'])('the %s consumer launches its ordinary row despite a failed recovery probe', async kind => {
     const w = world({ kind });

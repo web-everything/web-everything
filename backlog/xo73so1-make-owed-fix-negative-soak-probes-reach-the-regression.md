@@ -19,3 +19,5 @@ PR #7336's simplicity and codex-correctness advisory findings identify the same 
 ## Proof plan
 
 Run the scoped soak wrapper through heavy-admission and record the specific behavioral failure for each mutation; do not accept only a nonzero child status.
+
+Prevention: add `negative-probe-rejects-module-error` and `negative-probe-matches-scenario-assertion` fixtures to the shared negative-probe contract. `ERR_MODULE_NOT_FOUND` cannot satisfy never-release or always-redispatch evidence. This card also captures the repeated 2026-11-23 simplicity and codex-correctness advisory suggestions; those fixtures are deliberately not repaired as part of the park regression.

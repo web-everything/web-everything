@@ -12,6 +12,7 @@ const root = fileURLToPath(new URL('../../../../', import.meta.url));
 
 describe('owed-fix no-live-fixer behavioral replay', () => {
   it.each([
+    ['ordinaryParkedRows', 'preserves ordinary planner rows across draft, closed and referral recovery gates on later ticks'],
     ['ordinaryAuthFlake', 'preserves ordinary fix and CI-heal rows when the recovery login probe fails'],
     ['kindIsolation', 'dispatches an owed fix after CI-heal escalates on the same head'],
     ['releaseFailure', 'a refused or thrown release consumes one retry and escalates once'],

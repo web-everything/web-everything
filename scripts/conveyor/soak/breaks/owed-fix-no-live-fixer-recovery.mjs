@@ -48,6 +48,29 @@ export function probe(checkout, scenario = 'all') {
         tick: () => recoverOwedFixes(input, deps) };
     }
     const cases = {
+      // PR #7336 review: recovery's draft gate must preserve ordinary planner CI-heal rows.
+      ordinaryParkedRows() {
+        for (const override of [{ isDraft: true }, { state: 'CLOSED' }, { referralHold: { kind: 'operator' } }]) {
+          for (const kind of ['fix', 'ci-heal']) {
+            const f = fixture({ fixClaim: null, ...override });
+            f.deps.readClaims = () => [];
+            const rows = [{ ...f.row, kind }, { ...f.row, kind: 'promote-draft' }, { ...f.row, kind: 'review' }];
+            for (let tick = 0; tick < 3; tick++) {
+              const plan = { dispatch: [...rows], refusals: [], notes: [] };
+              const dispatch = plan.dispatch;
+              recovery.applyOwedFixRecovery(plan, { kinds: [kind], input: f.input, io: f.deps });
+              strictEqual(plan.dispatch, dispatch);
+              deepStrictEqual(plan.dispatch, rows, 'ordinary planner rows must survive recovery-only park gates');
+              deepStrictEqual(plan.refusals, []);
+              f.input.now += 31 * minute;
+            }
+            strictEqual(f.state.size, 0, 'parked ordinary rows must not start recovery episodes');
+            deepStrictEqual(f.released, []);
+            deepStrictEqual(f.published, []);
+            deepStrictEqual(f.updates, []);
+          }
+        }
+      },
       // PR #7336 review: a flaky recovery-only login probe must preserve ordinary consumer dispatch.
       ordinaryAuthFlake() {
         for (const kind of ['fix', 'ci-heal']) {

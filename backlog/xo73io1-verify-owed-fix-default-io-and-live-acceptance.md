@@ -21,3 +21,11 @@ PR #7336's 2026-11-22 review requires a hermetic default-IO smoke and named oper
 ## Test and proof plan
 
 Keep the hermetic smoke separate from the operational record. The smoke must fail for missing/unreadable claims, changed heads, failed auth, and duplicate recovery. Include the raw bounded output and exit status in the PR evidence. A passing unit suite cannot mark the live check complete.
+
+## 2026-11-23 repair status
+
+`owed-fix-default-io-smoke` is now implemented in `we:scripts/conveyor/__tests__/owed-fix-default-io.test.mjs`: the CI-heal consumer receives no recovery IO option, production command parsing/auth/release/transactions/publication run against temporary stores, and both subprocess execution paths are intercepted. It covers `fixing`, `fix` and `ci-heal` claim records, duplicate ticks, and auth/head/JSON/missing-record/corrupt-record refusals. Fix/CI-heal claims use their real acquisition function; fixing uses the shared reserve primitive with fix-procedure-shaped metadata because the launcher forbids invoking fix-procedure here. This is command-boundary simulation, not a real executable or live-host check.
+
+The first local run had four passing refusal cases and three failing recovery cases. The fixture was then corrected to supply fixing's `who` metadata and planner hold shape, and to intercept native subprocess exports even when the daemon graph was preloaded. It has not been rerun, per the launcher's proof-only test policy. The launcher gate must establish the final result; this card stays open.
+
+`owed-fix-babysit-followup-record`, `owed-fix-live-7307-or-7179` and the rollout check remain pending: the sandbox has no network and cannot read the external configuration or deploy a prototype. No responsible person's assignment was provided; an owner still needs to be recorded by the launcher/operator. This is not a claim that operational Acceptance items 3 or 4 are complete.
