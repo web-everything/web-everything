@@ -616,6 +616,23 @@
         }
       ]
     }
+  },
+  "review": {
+    "crossVendorKeySeats": [
+      "correctness",
+      "security",
+      "red-team"
+    ]
+  },
+  "goLive": {
+    "subjectKey": "same PR (repo#pr) or card always the same provider",
+    "sharesFollow": "projected capacity",
+    "afterRunsPerKind": 30,
+    "winnerWithinPoints": 5,
+    "winnerShare": 60,
+    "otherMinShare": 10,
+    "shadowCleanHours": 24,
+    "active": false
   }
 }
 }
