@@ -14,6 +14,8 @@ import { isDegradedOpenPrListing, OPEN_PR_LIST_LIMIT } from './no-search-backed-
 import { assertInventoryComplete, buildOpenPrPageQuery, parseOpenPrPage } from './pr-list-paged.mjs';
 import { queueFileOverlap, completeListedFiles } from './queue-file-overlap.mjs';
 
+export class SnapshotColdError extends Error {}
+
 export const LEAN_OPEN_PR_FIELDS = 'number,headRefOid,updatedAt,baseRefName,isDraft,state';
 export const fastDrainPrKey = (repo, number) => `${repo}#${number}`;
 
@@ -155,7 +157,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
   const readSources = () => new Map(repos.map(repo => {
     const rows = readSnapshot(repo);
-    if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
+    if (!Array.isArray(rows)) throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
   }));
   const readHeads = async () => Object.fromEntries(await readFastDrainFacts(repos, concurrency, async repo => {
@@ -282,7 +284,7 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
       if (readInventory) return readInventory();
       const snapshots = new Map(repos.map(repo => {
         const rows = readSnapshot(repo);
-        if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty');
+        if (!Array.isArray(rows)) throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty');
         return [repo, rows];
       }));
       return { snapshots };

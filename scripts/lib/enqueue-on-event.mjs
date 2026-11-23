@@ -97,6 +97,7 @@ import { parseVerdictComment } from './review-log-claims.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { readOverlays, readOverlayState } from './daemon-overlays.mjs';
+import { readSharedOpenPrs, SNAPSHOT_FIELDS } from './pr-snapshot.mjs';
 import { readRebuildState } from './daemon-rebuild/state.mjs';
 
 export const ENQUEUE_ON_EVENT_POLICY = 'mergeQueue.enqueueOnEvent';
@@ -329,6 +330,7 @@ export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
  * Infrastructure, queue/base state and existing retry timers must not acquire a second, longer hold.
  */
 export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
+  'snapshot-cold': false,
   'batching-deferred': false,
   'merge-lock-held': false,
   prestage: false,
@@ -409,6 +411,8 @@ function fastDrainUsedNoRoom(json, num) {
   if (!isObj(json) || json.ok === false) return false;
   const hit = (list) => Array.isArray(list) && list.some((p) => Number(p?.num) === Number(num));
   if (hit(json.merged) || hit(json.failed)) return false;
+  if (Array.isArray(json.enqueueOutcomes) && json.enqueueOutcomes.some(p => Number(p?.num) === Number(num)
+    && p.outcome === 'not-enqueued' && p.kind === 'snapshot-cold')) return true;
   if ([json.revalidationAborted, json.deferred, json.coupleHeld, json.parked].some(hit)) return true;
   // toMerge is the planned set, so explicit non-enqueue outcomes above take precedence.
   // toMerge also appears in skipReasons after a successful enqueue (ready-not-reached).
@@ -833,10 +837,20 @@ export function readPendingChangePaths({ root, cwd, env = process.env, execFileS
   } catch (e) { return { ok: false, error: String(e?.message || e).split('\n')[0] }; }
 }
 
+/** Warm the same constellation context the catch-up child consumes, with strict freshness. */
+export async function warmCatchUpSnapshot({ localSlug, env, read = readSharedOpenPrs }) {
+  const { resolveContextRepos } = await import('../merge-ai-prs.mjs');
+  const repos = [...new Set(resolveContextRepos([null], localSlug).map(repo => repo || localSlug))];
+  await Promise.all(repos.map(async repo => {
+    const rows = read({ repo, fields: SNAPSHOT_FIELDS, env, caller: 'enqueue-on-event.mjs' });
+    if (!Array.isArray(rows)) throw new Error('snapshot warm unavailable');
+  }));
+}
+
 /**
  * The daemon-side handle.
  * @param {{cwd:string, localSlug:string, defaultBranch?:string, execFileSyncImpl?:Function, scriptRoot?:()=>string, allowed?:()=>boolean, refreshPending?:Function, log?:(m:string)=>void,
- *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, readRoundSnapshot?:Function, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
+ *   env?:object, now?:()=>number, spawnImpl?:Function, resolveSetting?:Function, timeoutMs?:number, warmSnapshot?:Function, readRoundSnapshot?:Function, readPr?:Function, readMembership?:Function, readCandidates?:Function, readQueueDepth?:Function, readCapacity?:Function, readPriorities?:Function}} o
  *   `cwd` the drain's data clone (the fast drain runs there, like a pass). `scriptRoot()` the pass code root (data
  *   clone, or the code clone carrying overlays). `allowed()` true only while the caller sleeps between passes.
  */
@@ -844,6 +858,7 @@ export function createEnqueueOnEvent({
   cwd, localSlug, defaultBranch, execFileSyncImpl = execFileSyncThrottled,
   scriptRoot = () => cwd, allowed = () => true, log = (m) => process.stderr.write(`${m}\n`),
   env = process.env, now = () => Date.now(), spawnImpl = spawn, resolveSetting = () => resolveEnqueueOnEventSetting({ env }),
+  warmSnapshot = warmCatchUpSnapshot,
   writeRoundSnapshot = writeFastDrainRoundDefaultBranch,
   refreshPending = () => {
     try {
@@ -1198,6 +1213,12 @@ export function createEnqueueOnEvent({
       const finish = async () => {
         let ownChild;
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
+        if (p.catchUp) {
+          const warmEnv = { ...env };
+          delete warmEnv.WE_PR_SNAPSHOT_STALE_OK_MS;
+          try { await warmSnapshot({ localSlug, env: warmEnv }); }
+          catch { log(`${prefix} snapshot warm failed — spawning child anyway`); }
+        }
         const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
         const exitFailed = !r.timedOut && r.code !== 0;

@@ -65,6 +65,7 @@ function setup(extra = {}) {
     resolveSetting: () => ({ enabled: true, debounceSeconds: 15, line: 'x' }),
     readQueueDepth: async () => ({ ok: true, queued: 0 }),
     readPr: async () => READY_PR,
+    warmSnapshot: async () => {},
     writeRoundSnapshot: () => true,
     readMembership: async () => ({ ok: true, inQueue: true, entry: { position: 1, state: 'QUEUED' }, lastEvents: [] }),
     ...extra,
@@ -2557,7 +2558,7 @@ describe('catch-up miss backoff', () => {
   // Every recordEnqueue not-enqueued kind, including its delegated producers.
   // Timers, queue/base state and unreadable evidence can recover without a head/label change.
   const holdEligibility = [
-    ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
+    ['snapshot-cold', false], ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
     ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
     ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],
     ['mq-same-head-failed', false],
@@ -3300,5 +3301,49 @@ describe('catch-up snapshot-first scheduling', () => {
       f.children.forEach(c => c.finish());
       await round;
     } finally { f.handle.kill(); f.children.forEach(c => c.emit('close', 143)); }
+  });
+});
+
+describe('catch-up snapshot warm', () => {
+  it('warms every context repo without cacheOnly using the child context resolver', async () => {
+    const read = vi.fn(() => []);
+    await enqueueModule.warmCatchUpSnapshot({ localSlug: REPO, env: {}, read });
+    expect(read.mock.calls.map(([o]) => o.repo)).toEqual([
+      REPO, 'frontier-ui/frontierui', 'plateauapp/plateau-app',
+    ]);
+    expect(read.mock.calls.every(([o]) => !Object.hasOwn(o, 'cacheOnly'))).toBe(true);
+  });
+  it.each([false, true])('warms once before each spawn with strict env; warm failure=%s still spawns', async failed => {
+    const env = { WE_PR_SNAPSHOT_STALE_OK_MS: '3600000', KEEP: 'yes' };
+    let f;
+    const warmSnapshot = vi.fn(async ({ env: warmEnv }) => {
+      expect(warmEnv).toEqual({ KEEP: 'yes' });
+      expect(f.calls).toHaveLength(warmSnapshot.mock.calls.length - 1);
+      if (failed) throw new Error('warm failed');
+    });
+    f = catchUpSetup({ env, warmSnapshot });
+    await f.handle.catchUp();
+    expect(f.calls).toHaveLength(2);
+    expect(warmSnapshot).toHaveBeenCalledTimes(2);
+    expect(env.WE_PR_SNAPSHOT_STALE_OK_MS).toBe('3600000');
+    expect(f.lines.some(line => line.includes('snapshot warm failed'))).toBe(failed);
+    f.handle.kill();
+  });
+  it('snapshot-cold releases room and retries the same head without a miss hold', async () => {
+    const f = catchUpSetup({
+      readCapacity: () => ({ capacity: 1, source: 'test' }),
+      readQueueDepth: async () => ({ ok: true, queued: 0 }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42), candidate(43)] }),
+      readPr: async () => ({ ...READY_PR, headRefOid: 'same-head' }),
+      drainResult: num => ({ ok: true, considered: 0, enqueueOutcomes: [
+        { num, outcome: 'not-enqueued', kind: 'snapshot-cold' },
+      ] }),
+    });
+    expect(await f.handle.catchUp()).toHaveLength(2);
+    expect(f.handle.missBackoff().size).toBe(0);
+    f.advance(600_000);
+    expect(await f.handle.catchUp()).toHaveLength(2);
+    expect(f.calls).toHaveLength(4);
+    f.handle.kill();
   });
 });

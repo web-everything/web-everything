@@ -1,10 +1,11 @@
 import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
-import { readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
+import { SnapshotColdError, readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
   fastDrainListingAfterBranches, validateLeanOpenPrs, listLeanOpenPrsPaged, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
 import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch, createLiveDefaultBranchReader } from '../lib/default-branch-cache.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-snapshot.mjs';
@@ -482,5 +483,54 @@ test('real fast drain with a null target base defers after both snapshot and liv
     assert.deepEqual(result.enqueueOutcomes ?? [], []);
     assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
     if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
+  }
+});
+
+for (const snapshotState of ['cold', 'stale', 'dirty-after-warm']) {
+  test(`catch-up ${snapshotState} snapshot exits 0 with snapshot-cold and no mutations`, () => {
+    const result = runFastDrainContextCli({ catchUp: true, snapshotState, rowCount: 2, dryRun: false });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { ok: true, considered: 0, enqueueOutcomes: [
+      { num: 7, repo: 'fixture/web-everything', outcome: 'not-enqueued', kind: 'snapshot-cold' },
+    ] });
+    assert.equal(result.calls.some(a => a.some(v => /mutation|enqueuePullRequest/.test(v))
+      || a[0] === 'pr' && ['merge', 'edit', 'comment', 'close', 'review'].includes(a[1])
+      || a.includes('--method') && a[a.indexOf('--method') + 1] !== 'GET'), false);
+  });
+}
+for (const [name, options, message] of [
+  ['validation failure', { livePatches: { 7: { body: null } } }, /full PR evidence incomplete/],
+  ['main changed', { mainChanged: true }, /pass main changed while reading/],
+  ['lock lost', { lockLost: true }, /lock-lost/],
+  ['lean inventory incomplete', { leanIncomplete: true }, /1 unique of 2/],
+]) test(`catch-up ${name} still exits 1`, () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 2, ...options });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, message);
+  assert.doesNotMatch(result.stdout, /snapshot-cold/);
+});
+
+test('fast-drain-context changes only the error class and the two cold-source throw types', () => {
+  const path = 'scripts/lib/fast-drain-context.mjs';
+  // Pin the original source so this guard still works after the change is committed.
+  const beforeHash = 'ed03ea706e61bedca9426e33a4b8d5c9d94f92d64c2e2019f6a5cf3417bb5739';
+  const after = readFileSync(path, 'utf8');
+  const original = after.replace('export class SnapshotColdError extends Error {}\n\n', '')
+    .replaceAll("throw new SnapshotColdError('snapshot unavailable/disabled/stale/dirty",
+      "throw new Error('snapshot unavailable/disabled/stale/dirty");
+  assert.equal(createHash('sha256').update(original).digest('hex'), beforeHash);
+});
+
+test('only null snapshot rows are typed cold; matching error text stays a hard failure', async () => {
+  for (const throws of [false, true]) {
+    await assert.rejects(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7,
+      failClosed: true,
+      readSnapshot: () => { if (throws) throw new Error('snapshot unavailable/disabled/stale/dirty'); return null; },
+    }), error => {
+      assert.equal(error.cause instanceof SnapshotColdError, !throws);
+      assert.equal(error.constructor, Error);
+      assert.equal(error.cause.message, 'snapshot unavailable/disabled/stale/dirty');
+      return true;
+    });
   }
 });

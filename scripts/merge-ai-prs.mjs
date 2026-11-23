@@ -134,7 +134,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
-import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { SnapshotColdError, listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
@@ -5940,47 +5940,62 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
     const passBranches = new Map();
     let passBranchChanged = false;
-    const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
-      concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
-      readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
-        repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
-        log: line => process.stderr.write(`${line}\n`),
-        concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
-        readMain: async repo => {
-          // Each before/after membership probe needs its own live read, not a memoized gate result.
-          const defaultBranch = await newDefaultBranchReader()(repo);
-          if (!defaultBranch) throw new Error('default branch unresolved live');
-          if (passBranches.has(repo) && passBranches.get(repo) !== defaultBranch) passBranchChanged = true;
-          passBranches.set(repo, defaultBranch);
-          const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
-            { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
-          return { sha: stdout.trim(), defaultBranch };
+    let rows;
+    try {
+      rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
+        readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
+          repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
+          log: line => process.stderr.write(`${line}\n`),
+          concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
+          readMain: async repo => {
+            // Each before/after membership probe needs its own live read, not a memoized gate result.
+            const defaultBranch = await newDefaultBranchReader()(repo);
+            if (!defaultBranch) throw new Error('default branch unresolved live');
+            if (passBranches.has(repo) && passBranches.get(repo) !== defaultBranch) passBranchChanged = true;
+            passBranches.set(repo, defaultBranch);
+            const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
+              { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+            return { sha: stdout.trim(), defaultBranch };
+          },
+        }) : undefined,
+        readSnapshot,
+        listLean,
+        readFull: (repo, num) => readFullListingPr(repo, num, true),
+        refreshPr: repo => RECONCILE && fastDrain.scope === 'full' && REPOS.some(r => (r || localSlug) === repo),
+        readManifests: async entries => {
+          // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
+          // then consumes these same reads instead of repeating the legacy-manifest fan-out.
+          const flat = entries.map(({ repo, p }) => ({ repo: CONTEXT_REPOS.find(r => (r || localSlug) === repo), p }));
+          const reads = await fetchContextReads(flat);
+          return new Map(flat.map(({ repo, p }) => {
+            const r = reads.get(prCacheKey(repo, p.number));
+            if (!r || r.degraded || r.transient || r.malformed) throw new Error('manifest evidence incomplete');
+            return [fastDrainPrKey(repo || localSlug, p.number), r.manifest];
+          }));
         },
-      }) : undefined,
-      readSnapshot,
-      listLean,
-      readFull: (repo, num) => readFullListingPr(repo, num, true),
-      refreshPr: repo => RECONCILE && fastDrain.scope === 'full' && REPOS.some(r => (r || localSlug) === repo),
-      readManifests: async entries => {
-        // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
-        // then consumes these same reads instead of repeating the legacy-manifest fan-out.
-        const flat = entries.map(({ repo, p }) => ({ repo: CONTEXT_REPOS.find(r => (r || localSlug) === repo), p }));
-        const reads = await fetchContextReads(flat);
-        return new Map(flat.map(({ repo, p }) => {
-          const r = reads.get(prCacheKey(repo, p.number));
-          if (!r || r.degraded || r.transient || r.malformed) throw new Error('manifest evidence incomplete');
-          return [fastDrainPrKey(repo || localSlug, p.number), r.manifest];
-        }));
-      },
-      readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
-      time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
-    })).catch(error => {
-      if (!passBranchChanged || !error.cause?.message?.startsWith('pass main changed while reading')) throw error;
-      // The parent round's branch evidence is no longer usable by the slow listing path either.
-      passListingSnapshot = null;
-      process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
-      return null;
-    });
+        readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
+        time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
+      })).catch(error => {
+        if (!passBranchChanged || !error.cause?.message?.startsWith('pass main changed while reading')) throw error;
+        // The parent round's branch evidence is no longer usable by the slow listing path either.
+        passListingSnapshot = null;
+        process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
+        return null;
+      });
+    } catch (error) {
+      const seen = new Set();
+      for (let cause = error; cause && !seen.has(cause); cause = cause.cause) {
+        seen.add(cause);
+        if (flags['from-catch-up'] && cause instanceof SnapshotColdError) {
+          writeStdout(JSON.stringify({ ok: true, considered: 0, enqueueOutcomes: [
+            { num: Number(onlyPr), repo: localSlug, outcome: 'not-enqueued', kind: 'snapshot-cold' },
+          ] }) + '\n');
+          return exit(0);
+        }
+      }
+      throw error;
+    }
     // Fast rows replace the whole repo listing: an incomplete PR must send its repo through
     // the existing slow path, rather than disappear from labels, rebase or classification.
     if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])]

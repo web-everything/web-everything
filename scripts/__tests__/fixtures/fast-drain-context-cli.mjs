@@ -3,14 +3,15 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { spawnSync } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SNAPSHOT_FIELDS } from '../../lib/pr-snapshot.mjs';
+import { SNAPSHOT_FIELDS, readSharedOpenPrs } from '../../lib/pr-snapshot.mjs';
 import { writeDefaultBranchCache, readDefaultBranchCache } from '../../lib/default-branch-cache.mjs';
-import { PR_SNAPSHOT_VERSION } from '../../lib/pr-snapshot-store.mjs';
+import { PR_SNAPSHOT_VERSION, markPrSnapshotDirty } from '../../lib/pr-snapshot-store.mjs';
 import { buildManifest, embedManifestInBody } from '../../readiness/lane-manifest.mjs';
 import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
+  snapshotState = 'fresh', mainChanged = false, lockLost = false, dryRun = true,
   catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
@@ -28,9 +29,17 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
         statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }] };
     });
     for (const repo of ['fixture/web-everything', 'fixture/frontierui', 'fixture/plateau-app']) {
+      if (snapshotState === 'cold') continue;
       writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`), JSON.stringify({ v: PR_SNAPSHOT_VERSION,
-        repo, fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
+        repo, fetchedAtMs: Date.now() - (snapshotState === 'stale' ? 100000 : snapshotState === 'dirty-after-warm' ? 20000 : 0), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
         prs: repo === 'fixture/web-everything' ? rows : [] }));
+    }
+    if (snapshotState === 'dirty-after-warm') {
+      const env = { WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots };
+      const warmed = readSharedOpenPrs({ repo: 'fixture/web-everything', fields: SNAPSHOT_FIELDS, env,
+        exec: () => { throw new Error('fresh warm must use the published snapshot'); } });
+      if (!Array.isArray(warmed)) throw new Error('fixture warm failed');
+      markPrSnapshotDirty({ repo: 'fixture/web-everything', env, nowMs: Date.now() + 1 });
     }
     const cacheEnv = { ...process.env, WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache') };
     if (cachedBranch) writeDefaultBranchCache('fixture/web-everything', cachedBranch, { env: cacheEnv });
@@ -57,7 +66,7 @@ if (a[0] === 'repo' && a[1] === 'view') {
   if (process.env.CONTEXT_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture default branch failure'); process.exit(1); }
   fs.writeSync(1, fs.readFileSync(process.env.CONTEXT_BRANCH_FILE, 'utf8')); process.exit(0);
 }
-if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
+if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, (process.env.CONTEXT_MAIN_CHANGED === '1' && fs.existsSync(process.env.CONTEXT_ROWS + '.membership') ? 'b' : 'a').repeat(40)); process.exit(0); }
 const endpoint = a.find(v => v.startsWith('repos/') && v.includes('/commits/'));
 if (a[0] === 'api' && endpoint) {
   if (!process.env.WE_GH_THROTTLE_OUTER_INV) {
@@ -97,6 +106,8 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));
   const pageRows = query.includes('name:"web-everything"') ? rows : [];
   if (!query.includes('statusCheckRollup')) {
+    fs.writeFileSync(process.env.CONTEXT_ROWS + '.membership', '1');
+    if (process.env.CONTEXT_LOCK_LOST === '1') fs.rmSync(process.env.CONTEXT_ROUND + '.locks', { recursive:true, force:true });
     if (pageRows.length && process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP) {
       fs.writeFileSync(process.env.CONTEXT_BRANCH_FILE, process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP);
     }
@@ -120,11 +131,13 @@ out({});
     const args = catchUp ? fastDrainArgs({ scriptRoot: root, num: 7, listingSnapshot: roundPath })
       : [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7', '--from-green-event', '--label=ready-to-merge',
         ...(outputAsJson ? ['--json'] : []), ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])];
-    const result = spawnSync(process.execPath, [...args, '--dry-run', '--no-drain-lease',
+    const result = spawnSync(process.execPath, [...args, ...(dryRun ? ['--dry-run'] : []), '--no-drain-lease',
       '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
         ...(workflowEditSetting ? { WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditSetting } : {}),
+        WE_PR_SNAPSHOT_STALE_OK_MS: '3600000',
+        CONTEXT_MAIN_CHANGED: mainChanged ? '1' : '0', CONTEXT_LOCK_LOST: lockLost ? '1' : '0', CONTEXT_ROUND: roundPath,
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_FAST_DRAIN_LISTING: 'snapshot',
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0',
         CONTEXT_BRANCH_FILE: join(dir, 'live-branch'), CONTEXT_BRANCH_AFTER_MEMBERSHIP: branchAfterMembership ?? '',
