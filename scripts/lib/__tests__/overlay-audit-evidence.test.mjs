@@ -5,11 +5,25 @@ import { auditEvidenceFor, loadAuditEvidence, describeMissing } from '../overlay
 import { QUESTION_HASH } from '../../operations/codex-audit.mjs';
 import { loadRuledWeakened } from '../../operations/prototype-load-io.mjs';
 import { readyEvidence, canonicalAuditEvidence } from '../../operations/prototype-load.mjs';
+import { fileURLToPath } from 'node:url';
 const ref = 'lane/fix';
 const covers = () => true;
 const valid = { questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z', findings: [] };
 const waiver = { ref, sha: 'a'.repeat(40), ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' };
 const sha = 'a'.repeat(40), base = 'b'.repeat(40);
+test('loads tool waivers from the running checkout in the DOM test environment, independent of the candidate cwd', () => {
+  const toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../settings/prototype-load.json');
+  const reads = [];
+  const entry = { ref, sha, ruling: 'R12', findings: ['accepted'] };
+  const fs = { readFileSync(path) {
+    reads.push(path);
+    if (path === toolPath) return JSON.stringify({ ruledWeakened: [entry] });
+    throw Object.assign(Error('missing fixture'), { code: 'ENOENT' });
+  } };
+  const result = loadAuditEvidence({ env: { HOME: '/fixture' }, cwd: '/candidate', fs });
+  assert.ok(reads.includes(toolPath), 'reads settings from the running checkout');
+  assert.deepEqual(result.waivers, [{ ...entry, layer: 'tool' }]);
+});
 test('tool and platform settings waivers survive prototype readiness and downstream admission', () => {
   const entry = { ref, sha: sha.toUpperCase(), ruling: 'R12', findings: ['accepted'] };
   const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
@@ -73,7 +87,7 @@ test('missing HOME and missing files never throw or supply evidence', () => {
 });
 
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 // Ledger-only fixtures must not inherit the checkout's real tool/platform waivers.
 const loadLedgerEvidence = ({ env }) => loadAuditEvidence({ env, fs: { readFileSync(path, encoding) {

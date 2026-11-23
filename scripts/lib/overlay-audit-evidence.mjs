@@ -1,14 +1,14 @@
 /** Canonical, exact-head evidence for standing overlay admission and inspection. */
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
 import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
 import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead } from '../operations/prototype-load.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
-const prototypeSettingsPath = fileURLToPath(new URL('../settings/prototype-load.json', import.meta.url));
+const prototypeSettingsPath = fileURLToPath(new NodeURL('../settings/prototype-load.json', import.meta.url));
 /** Name the evidence an operator must supply. */
 export function describeMissing(sha) {
   return `no NOT WEAKENED canonical audit record and no waiver in ruled-weakened.jsonl or prototypeLoad.ruledWeakened settings for ${typeof sha === 'string' ? sha : 'invalid SHA'}`;
