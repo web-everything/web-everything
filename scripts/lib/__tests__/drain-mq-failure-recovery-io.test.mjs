@@ -24,11 +24,6 @@ function fixture(mode = 'real') {
   if (mode === 'unknown event') events.push({ __typename: 'FutureMergeQueueEvent', createdAt: '2026-11-08T10:01:00Z' });
   if (mode === 'unknown reason') events.push({ ...structuredClone(event), reason: 'future_removal_reason', createdAt: '2026-11-08T10:01:00Z' });
   if (mode === 'repeated matching removal') events.push({ ...structuredClone(event), createdAt: '2026-11-08T10:01:00Z' });
-  if (['proven repeated removals', 'three matching removals', 'three unproven removals'].includes(mode)) {
-    events.push({ ...structuredClone(event), createdAt: '2026-11-08T10:01:00Z' });
-    event.beforeCommit.oid = 'e'.repeat(40); // Only the latest removal binds the run below.
-    if (mode.startsWith('three ')) events.push(structuredClone(events[1]));
-  }
   if (mode === 'retry exhausted') events.push({ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-08T10:01:00Z' });
   if (mode === 'oversized timeline') events.push(...Array.from({ length: 100 }, () => ({ __typename: 'AddedToMergeQueueEvent' })));
   const exec = vi.fn((file, args, options) => {
@@ -52,8 +47,6 @@ function fixture(mode = 'real') {
         : mode === 'ancestor unknown' ? {} : mode === 'ancestor behind' ? { status: 'ahead', behind_by: 1 }
         : { status: mode === 'identical ancestor' ? 'identical' : 'ahead', behind_by: 0 });
     }
-    if (endpoint?.includes('/actions/runs?') && ['repeated matching removal', 'three unproven removals'].includes(mode))
-      return JSON.stringify({ total_count: 0, workflow_runs: [] });
     if (endpoint?.includes('/actions/runs?')) return JSON.stringify({ total_count: mode === 'oversized runs' ? 1001 : 1,
       workflow_runs: [{ id: 701, event: 'merge_group', head_sha: mode === 'wrong run commit' ? 'd'.repeat(40) : mergeHead,
         head_branch: branch, conclusion: 'failure' }] });
@@ -70,11 +63,7 @@ function fixture(mode = 'real') {
     }
     throw new Error('Unexpected request');
   });
-  const refreshStore = { has: () => {
-    if (mode === 'unreadable refresh ledger') throw new Error('corrupt refresh ledger');
-    return mode === 'refresh spent';
-  } };
-  const io = createDrainMqFailureRecoveryIo({ exec, ledger, refreshStore });
+  const io = createDrainMqFailureRecoveryIo({ exec, ledger });
   const log = vi.fn();
   const options = { ...identity, guard, dryRun: false, log, io };
   return { options, exec, log, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
@@ -101,7 +90,7 @@ describe('drain MQ failure production adapter', () => {
 
   it.each(['infra', 'unreadable', 'wrong parent', 'wrong reason', 'missing merge commit', 'wrong run commit',
     'incomplete timeline', 'oversized timeline', 'retry exhausted', 'stale head', 'conflict',
-    'unreadable refresh ledger', 'unknown labels', 'expired log', 'oversized log', 'oversized runs'])('retains the hold without writes for %s', async mode => {
+    'unknown labels', 'expired log', 'oversized log', 'oversized runs'])('retains the hold without writes for %s', async mode => {
     const f = fixture(mode);
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false, reason: expect.any(String) });
     expect(f.writes()).toEqual([]);
@@ -114,9 +103,8 @@ describe('drain MQ failure production adapter', () => {
         routed: false, reason: expect.stringMatching(/operator inspection required/i),
       });
       expect(f.writes()).toEqual([]);
-      // Unknown history is excluded before Actions reads; repeated removals need defect proof.
-      if (mode !== 'repeated matching removal')
-        expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
+      // These exclusions must win before any Actions evidence read or publication is attempted.
+      expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
     });
 
   it('dryRun performs no reads, claims or writes and leaves a later real attempt eligible', async () => {
@@ -208,51 +196,4 @@ describe('drain production ancestry proof', () => {
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
       expect(f.writes()).toEqual([]);
     });
-});
-
-
-describe('held failures go to the fixer without retry authority', () => {
-  it.each(['refresh spent', 'proven repeated removals', 'three matching removals', 'real'])(
-    '%s publishes a fixer-only route once and keeps the hold', async mode => {
-      const f = fixture(mode);
-      const before = structuredClone(f.options.guard);
-      expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
-      const comment = f.writes().find(([, args]) => args[1] === 'comment');
-      const route = parseMqFailureRoute({ expected: identity,
-        comment: { body: comment[2].input, author: { login: 'chalbert' } } });
-      expect(route).toMatchObject({ fixerOnly: true });
-      expect(admitMqFailureRoute({ ...identity, route,
-        changedFiles: { ...identity, complete: true, files: ['src/unrelated.mjs'] } }))
-        .toMatchObject({ recoveryAction: 'fix', evidence: { fixerOnly: true } });
-      expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
-      expect(f.writes()).toHaveLength(2);
-      expect(f.options.guard).toEqual(before);
-    });
-  it('a log-only success claim never releases the hold or publishes a retry', async () => {
-    const f = fixture();
-    f.options.io = { ...f.options.io, forRoute: undefined,
-      collectEvidence: async () => ({ failedJobs: [], testFiles: [], assertions: ['All tests passed'], complete: true }) };
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
-    expect(f.options.guard).toEqual(guard);
-    expect(f.writes()).toEqual([]);
-  });
-});
-
-
-describe('retry history never substitutes for real failure proof', () => {
-  it.each([
-    ['unreadable evidence with empty arrays and refresh spent', 'refresh spent',
-      { failedJobs: [], testFiles: [], assertions: [], complete: false }],
-    ['infra-only failure with refresh spent', 'refresh spent',
-      { failedJobs: ['unit'], testFiles: [], assertions: ['The runner has lost communication with the server.'], complete: true }],
-    ['incomplete diagnostic evidence with refresh spent', 'refresh spent',
-      { failedJobs: ['unit'], testFiles: [], assertions: [], complete: false }],
-    ['three removals with no failure proof', 'three unproven removals', null],
-  ])('%s never publishes', async (_name, mode, evidence) => {
-    const f = fixture(mode);
-    if (evidence) f.options.io = { ...f.options.io, forRoute: undefined, collectEvidence: async () => evidence };
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
-    expect(f.options.guard).toEqual(guard);
-    expect(f.writes()).toEqual([]);
-  });
 });

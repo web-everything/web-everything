@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDrainMqRouteWiring } from '../drain-mq-route-wiring.mjs';
 
-const guard = { hold: true, line: 'mq-same-head-failed: failed_checks' };
+const guard = { hold: true, line: 'mq-same-head-failed: #42 head x — failed_checks' };
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40), guard, dryRun: false };
 const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
 // Execute the shipped enqueue wrapper with hermetic guard/strategy ports.
@@ -42,6 +42,8 @@ describe('drain same-head route wiring', () => {
     const wiring = createDrainMqRouteWiring({ route });
     wiring.start({ ...identity, guard: { hold: false, line: guard.line } });
     wiring.start({ ...identity, guard: { hold: true, line: 'other hold' } });
+    wiring.start({ ...identity, guard: { hold: true,
+      line: 'mq-same-head-failed: #42 head x — unreadable or mismatched live merge-queue state; inspect queue before retrying' } });
     await wiring.settle();
     expect(route).not.toHaveBeenCalled();
   });

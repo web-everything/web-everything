@@ -6,7 +6,6 @@ function path(value) {
 }
 export function classifyMqFailureIntake(input) {
   const { route, changedFiles } = input;
-  if (route?.fixerOnly === true) return 'fix';
   if (!matches(route, input) || route.stale !== false || route.complete !== true
     || !matches(changedFiles, input) || changedFiles.complete !== true
     || !Array.isArray(route.testFiles) || !route.testFiles.length || route.testFiles.length > 100
@@ -22,6 +21,5 @@ export function admitMqFailureRoute(input) {
   return { kind: 'fix', repo, pr, head, recoveryAction: classifyMqFailureIntake(input),
     evidence: structuredClone({ failedJobs: route.failedJobs, testFiles: route.testFiles,
       assertions: route.assertions, complete: route.complete,
-      ...(route.fixerOnly === true ? { fixerOnly: true } : {}),
       ...(typeof route.failureProven === 'boolean' ? { failureProven: route.failureProven } : {}) }) };
 }

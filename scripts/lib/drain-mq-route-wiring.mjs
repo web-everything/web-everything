@@ -9,7 +9,9 @@ export function createDrainMqRouteWiring({ route = routeMqFailureOnHold, log = (
   return {
     start({ repo, pr, head, guard, dryRun }) {
       if (guard?.hold !== true || dryRun || typeof guard.line !== 'string'
-        || !guard.line.startsWith('mq-same-head-failed:')) return;
+        || !guard.line.startsWith('mq-same-head-failed:')
+        // Unreadable or mismatched live queue state is never routing authority.
+        || !guard.line.includes(' — failed_checks')) return;
       pending.push({ repo, pr, head, guard, dryRun, log });
     },
     async settle() {
