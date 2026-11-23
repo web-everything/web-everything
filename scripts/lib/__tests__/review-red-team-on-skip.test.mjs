@@ -2388,6 +2388,25 @@ describe('unprovable accepted head move — fresh full review', () => {
       log: vi.fn(), settle: vi.fn(), ...over,
     });
   }
+  it('CI-recovery head move with older acceptance and a later hold stays blocked by the acceptance guard', () => {
+    const o = moved();
+    o.rawPrs[0].labels.push('mq-failure-recovery', 'ready-to-merge');
+    o.rawPrs[0].title = 'ci: recover missing PR checks';
+    o.rawPrs[0].comments.push({ body: '🔁 review — changes requested\nResolve the outstanding hold.',
+      author: { login: 'web-everything' } });
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip',
+      why: 'later verdict or hold supersedes acceptance' });
+    expect(o.dispatch).not.toHaveBeenCalled();
+    expect(o.settle).not.toHaveBeenCalled();
+  });
+  it('CI-recovery head move with older acceptance and no later hold requests a full review', () => {
+    const o = moved();
+    o.rawPrs[0].labels.push('mq-failure-recovery', 'ready-to-merge');
+    o.rawPrs[0].title = 'ci: recover missing PR checks';
+    expect(runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review',
+      why: 'unprovable head move needs a full review' });
+    expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+  });
   it.each(['old', 'absent', 'no-prior-clear'])('dispatches one full review with %s payload, then observes per-head cooldown', kind => {
     const o = moved();
     if (kind === 'no-prior-clear') o.rawPrs[0].comments.pop();

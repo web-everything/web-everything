@@ -1,3 +1,4 @@
+import { readQueuePlannerBlock } from '../red-team-queue-state.mjs';
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -1368,6 +1369,30 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     clock.t += 45 * 60_000;
     return { h, clock, notes, firstAttempt };
   };
+
+  it.each(['missing reason', 'wrong head', 'wrong repo', 'unreadable'])('fails closed for queue block with %s', kind => {
+    const readRedTeamQueueBlock = key => readQueuePlannerBlock({ ...key, readFile: () => {
+      if (kind === 'unreadable') throw new Error('unreadable');
+      return JSON.stringify([{ key: `${LOCAL}#5283`, repo: kind === 'wrong repo' ? 'other/repo' : LOCAL,
+        pr: 5283, head: kind === 'wrong head' ? 'a'.repeat(40) : HEAD, blocked: 'planner-skip',
+        ...(kind === 'missing reason' ? {} : { blockedReason: 'policy hold' }) }]);
+    } });
+    const { h } = pastDeadline({ strategyExtra: { readRedTeamQueueBlock } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(h.logs.join('')).toContain('no red-team request path');
+  });
+
+  it('surfaces a recorded planner reason immediately without waiting for a result or enqueueing', () => {
+    const reason = 'later verdict or hold supersedes acceptance';
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED,
+      strategyExtra: { readRedTeamQueueBlock: key => readQueuePlannerBlock({ ...key, readFile: () => JSON.stringify([
+        { key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, blocked: 'planner-skip', blockedReason: reason },
+      ]) }) } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, plannerBlocked: true,
+      reason: `held: red-team planner blocked: ${reason}; inspect the PR thread and resolve the hold` });
+    expect(h.logs.join('')).toContain(reason);
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+  });
 
   it('deadline passed + no result: held with a clear reason, one operator note for repo/PR/head, no enqueue', () => {
     const { h, clock, notes } = pastDeadline();

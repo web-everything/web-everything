@@ -2,7 +2,8 @@ import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-r
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { boundedReason, defaultQueueFile } from './red-team-queue-state.mjs';
+export { defaultQueueFile } from './red-team-queue-state.mjs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
@@ -172,10 +173,6 @@ export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () =
   note(log, `floor raises remainingStarts ${before} -> ${minimum}: CPU idle ${cpuIdlePct}% >= ${floor.idlePct}%`);
 }
 
-export function defaultQueueFile(env = process.env, home = homedir()) {
-  return env.WE_RED_TEAM_QUEUE_FILE || join(home, 'workspace', '.operations', 'red-team-dispatch-queue.json');
-}
-
 /** Synchronous IO matches the daemon's tick; admission never dequeues a PR. */
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
   writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr,
@@ -342,10 +339,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (!entry) continue;
         const matches = row => Number(row.prNumber) === entry.pr;
         const row = rows.find(matches);
-        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why ?? 'planner skip', skipped: true } : undefined);
+        const failure = notStarted.find(matches) ?? (row?.action === 'skip' ? { reason: row.why, skipped: true } : undefined);
         // A planner skip (e.g. later verdict supersedes acceptance) starts nothing, so it must not keep a capacity slot.
         const nonRunnable = f => !!f && f.reason !== 'no review capacity left' && (f.skipped === true || NON_RUNNABLE_REASONS.has(f.reason));
-        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; changed(`unblocked ${entry.key}`); }
+        if (entry.blocked && (dispatched.some(matches) || !nonRunnable(failure))) { delete entry.blocked; delete entry.blockedReason; changed(`unblocked ${entry.key}`); }
         if (dispatched.some(matches)) remove(entry, 'dispatch started');
         else if (row?.action === 'clear' || row?.action === 'carry') remove(entry, row.action);
         else if (failure) {
@@ -355,15 +352,22 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
             if (!entry.blocked || entry.lastProbeTurn === undefined) {
               advanceProbeTurns(entries.filter(candidate => candidate.repo === repo), [entry]);
             }
-            entry.blocked = failure.skipped ? 'planner-skip' : failure.reason;
+            const blocked = failure.skipped ? 'planner-skip' : failure.reason;
+            const reason = boundedReason(failure.reason);
+            const blockChanged = entry.blocked !== blocked || (entry.blockedReason ?? null) !== reason;
+            entry.blocked = blocked;
+            if (reason) entry.blockedReason = reason;
+            else delete entry.blockedReason;
+            if (blockChanged) changed(`blocked ${entry.key}: ${reason ?? 'reason missing; inspect planner logs'}`);
           }
+          const detail = nonRunnable(failure) ? '' : `: ${boundedReason(failure.reason) ?? 'reason missing'}`;
           entry.attempts++;
           if (entry.attempts >= limit) {
             entries.splice(entries.indexOf(entry), 1);
             entry.attempts = 0;
             entries.push(entry);
-            changed(`requeue ${entry.key}: ${failure.reason}`);
-          } else changed(`hold ${entry.key}: attempt ${entry.attempts}/${limit}: ${failure.reason}`);
+            changed(`requeue ${entry.key}${detail}`);
+          } else changed(`hold ${entry.key}: attempt ${entry.attempts}/${limit}${detail}`);
         } else if (!row) remove(entry, 'absent from rows (not owed)');
       }
       admissions.delete(repo);
