@@ -8,6 +8,9 @@ import { readPoolSource, collectResourcePool, loadPoolSettings, appendShadowRows
   RED_TEAM_HARD_LEASE_CEILING_MS, poolSourcePaths, readPoolSettingsChecked, readPoolJson, readPoolOverrides, readPoolHeavyHeld, SOURCES } from '../resource-pool-io.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 import { POOL_DEFAULTS } from '../resource-pool.mjs';
+import { resourcePoolOperation } from '../../operations/resource-pool.mjs';
+import { createRegistry } from '../../operations/registry.mjs';
+import { handleOperationRequest } from '../../operations/http-adapter.mjs';
 let coord, paths;
 const nowMs = 2000;
 const snap = () => ({ sampledAt: new Date(1000).toISOString(), freshUntil: new Date(3000).toISOString(),
@@ -28,7 +31,7 @@ beforeEach(() => {
 afterEach(() => rmSync(coord, { recursive: true, force: true }));
 const read = (source, options = {}) => readPoolSource(source, { paths, coord, nowMs,
   listCommands: () => `${process.pid} 1 node resource-pool.mjs`,
-  run: () => JSON.stringify({ lanes: [] }), heavyStatus: () => ({ held: [] }),
+  laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }),
   roundBudget: () => ({ live: 2 }), slotAlive: () => true, ...options });
 const collect = (options = {}) => collectResourcePool({ paths, coord, nowMs, settings: settings(), readSource: read, legacy, ...options });
 it('reads ONLY the named S1a sources, counts C2/C3, names paths, and never claims shrink', () => {
@@ -292,11 +295,95 @@ it('complete ps inventory is passed unchanged to the review parser and permits o
   const roundBudget = vi.fn(({ listCommands }) => ({ live: listCommands() === inventory ? 0 : undefined }));
   expect(read('rounds', { listCommands: () => inventory, roundBudget })).toMatchObject({ ok: true, holders: [] });
 });
-const lane = (path, session, purpose, leased = true) => ({ path, leased, lease: { session, purpose } });
+it('compute-only GET reads lease files without launching mutable status or changing cache/quarantine', async () => {
+  const pool = join(coord, 'pools', 'web-everything'), dir = join(pool, 'lane-1');
+  mkdirSync(dir, { recursive: true }); mkdirSync(join(pool, '.quarantine-state'));
+  writeFileSync(join(dir, '.lane-lease'), JSON.stringify({ session: 'fix-1', acquiredAt: new Date(1000).toISOString() }));
+  const sentinels = [join(pool, '.lane-status-cache.json'), join(pool, '.quarantine-state', 'lane-1.json')];
+  sentinels.forEach(file => writeFileSync(file, 'preserve'));
+  const run = vi.fn((command, args) => {
+    if (command !== 'git') throw Error('mutable lane-pool status must never run');
+    return args.includes('--show-toplevel') ? join(coord, 'web-everything') : 'https://github.com/web-everything/web-everything.git';
+  });
+  const declaration = resourcePoolOperation({ collect: () => collect({ readSource: source => read(source, {
+    env: { LANE_POOL_ROOT: join(coord, 'pools') }, run, laneStatus: undefined,
+  }) }) }), registry = createRegistry();
+  registry.register(declaration);
+  const response = await handleOperationRequest({ method: 'GET', url: '/operations/resource-pool/run' }, {
+    resolve: () => ({ declaration, registry, sinks: {} }), names: () => ['resource-pool'], newRunId: () => 'pool-read',
+  });
+  expect(response.status).toBe(200); expect(response.body.persisted).toBe(false);
+  const result = response.body.verdict.sources.find(source => source.source === 'workers');
+  expect(result).toMatchObject({ ok: true, holders: [{ jobId: 'fix-1' }] });
+  expect(run.mock.calls.every(([command]) => command === 'git')).toBe(true);
+  sentinels.forEach(file => expect(readFileSync(file, 'utf8')).toBe('preserve'));
+  expect(fs.readdirSync(pool).sort()).toEqual(['.lane-status-cache.json', '.quarantine-state', 'lane-1']);
+});
+it.each([true, false])('lane readError remains unknown even when leased=%s', leased => {
+  const lanes = [{ path: 'pool/lane-1', leased, lease: leased ? {
+    session: 'fix-1', acquiredAt: new Date(1000).toISOString(),
+  } : null, readError: 'EACCES' }];
+  const report = collect({ readSource: source => read(source, {
+    laneStatus: () => ({ lanes }),
+  }) });
+  expect(report.sources.find(s => s.source === 'workers')).toMatchObject({ ok: false });
+  expect(report.unknown).toBe(true);
+  expect(report.rows.every(row => row.poolDecision === 'hold')).toBe(true);
+});
+it.each([
+  { acquiredAt: undefined }, { acquiredAt: null }, { acquiredAt: 1000 }, { acquiredAt: 'bad' },
+  { acquiredAt: new Date(3000).toISOString() }, { renewedAt: 'bad' }, { renewedAt: null },
+  { renewedAt: new Date(3000).toISOString() }, { ttlMinutes: -1 }, { ttlMinutes: '240' },
+  { acquiredAt: '1969-02-30T00:00:00.000Z' }, { renewedAt: new Date(0).toISOString() },
+  { ttlMinutes: 0 }, { ttlMinutes: null }, { ttlMinutes: 1e308 }, { reserved: 'true' },
+])('invalid lease evidence %j stays unknown before leased/kind filtering', patch => {
+  const lanes = [{ path: 'pool/lane-1', leased: false,
+    lease: { session: 'builder-1', acquiredAt: new Date(1000).toISOString(), ...patch } }];
+  expect(read('workers', { laneStatus: () => ({ lanes }) }))
+    .toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+});
+it.each(['{', '{}', 'directory', 'symlink', 'missing-pool', 'lane-file'])('disk lane evidence %s cannot become an empty successful inventory', shape => {
+  const pool = join(coord, 'pools', 'web-everything'), dir = join(pool, 'lane-1');
+  mkdirSync(dir, { recursive: true });
+  const marker = join(dir, '.lane-lease');
+  if (shape === 'directory') mkdirSync(marker);
+  else if (shape === 'symlink') fs.symlinkSync(join(coord, 'absent'), marker);
+  else if (shape === 'missing-pool') rmSync(pool, { recursive: true });
+  else if (shape === 'lane-file') { rmSync(dir, { recursive: true }); writeFileSync(dir, ''); }
+  else writeFileSync(marker, shape);
+  const options = { env: { LANE_POOL_ROOT: join(coord, 'pools') }, laneStatus: undefined,
+    run: (command, args) => {
+      if (command !== 'git') throw Error('unexpected child command');
+      return args.includes('--show-toplevel') ? join(coord, 'web-everything') : 'https://github.com/web-everything/web-everything.git';
+    } };
+  const report = collect({ readSource: source => read(source, options) });
+  expect(report.sources.find(s => s.source === 'workers')).toMatchObject({ ok: false });
+  expect(report.rows.every(row => row.poolDecision === 'hold')).toBe(true);
+});
+it('disk inventory distinguishes absent, expired, renewed and permanent leases at the TTL boundary', () => {
+  const pool = join(coord, 'pools', 'web-everything');
+  const leases = [null,
+    { session: 'fix-expired', acquiredAt: new Date(0).toISOString(), ttlMinutes: 1 / 30 },
+    { session: 'fix-renewed', acquiredAt: new Date(0).toISOString(), renewedAt: new Date(1000).toISOString(), ttlMinutes: 1 / 30 },
+    { session: 'fix-reserved', acquiredAt: new Date(0).toISOString(), ttlMinutes: 1 / 30, reserved: true }];
+  leases.forEach((lease, i) => {
+    const dir = join(pool, `lane-${i}`); mkdirSync(dir, { recursive: true });
+    if (lease) writeFileSync(join(dir, '.lane-lease'), JSON.stringify(lease));
+  });
+  const result = read('workers', { env: { LANE_POOL_ROOT: join(coord, 'pools') }, laneStatus: undefined,
+    run: (command, args) => {
+      if (command !== 'git') throw Error('unexpected child command');
+      return args.includes('--show-toplevel') ? join(coord, '.lanes', 'web-everything', 'lane-1') : 'unused';
+    } });
+  expect(result.ok).toBe(true);
+  expect(result.holders.map(holder => holder.jobId).sort()).toEqual(['fix-renewed', 'fix-reserved']);
+});
+const lane = (path, session, purpose, leased = true) => ({ path, leased,
+  lease: { session, purpose, acquiredAt: new Date(1000).toISOString(), ttlMinutes: leased ? 240 : 0.001 } });
 it('counts both live conveyor-fix and conveyor-ci-heal leases as two C3 holders without heavy slots', () => {
   const lanes = [lane('pool/lane-1', 'fix-7343', 'conveyor-fix'),
     lane('pool/lane-2', 'ci-heal-7337', 'conveyor-ci-heal')];
-  const result = read('workers', { run: () => JSON.stringify({ lanes }) });
+  const result = read('workers', { laneStatus: () => ({ lanes }) });
   expect(result).toMatchObject({ ok: true, holders: [
     { class: 3, size: 2, jobId: 'fix-7343' },
     { class: 3, size: 2, jobId: 'ci-heal-7337' },
@@ -306,7 +393,7 @@ it('counts both live conveyor-fix and conveyor-ci-heal leases as two C3 holders 
 it('counts live fix-7343 and ci-heal-7337 leases and deduplicates heavy slots by lane', () => {
   const lanes = [lane('/pool/lane-1', 'fix-7343', 'conveyor-fix'), lane('/pool/lane-2', 'ci-heal-7337', 'conveyor-ci-heal'),
     lane('/pool/lane-3', 'fix-old', 'conveyor-fix', false), lane('/pool/lane-4', 'conveyor-fix-99', null)];
-  const result = read('workers', { run: () => JSON.stringify({ lanes }), heavyStatus: () => ({ held: [
+  const result = read('workers', { laneStatus: () => ({ lanes }), heavyStatus: () => ({ held: [
     { owner: '/pool/lane-1#123', meta: { dispatchKind: 'fix', lane: '1' } },
     { owner: '/pool/lane-2', meta: { dispatchKind: 'ci-heal', lane: '2' } },
     { owner: '/pool/lane-5#456', meta: { dispatchKind: 'ci-heal', session: 'ci-heal-1' } },
@@ -316,11 +403,11 @@ it('counts live fix-7343 and ci-heal-7337 leases and deduplicates heavy slots by
   expect(result.holders.every(h => h.class === 3 && h.size === 2)).toBe(true);
 });
 it.each(['{', '{}', '{"lanes":[{}]}', '{"lanes":[{"path":"x","leased":true,"lease":null}]}'])('malformed lane status %s holds', output => {
-  expect(read('workers', { run: () => output }).ok).toBe(false);
+  expect(read('workers', { laneStatus: () => JSON.parse(output) }).ok).toBe(false);
 });
 it('failed lane reads, oversized inventory and malformed heavy slots hold with manual fallback', () => {
-  for (const options of [{ run: () => { throw Error('lane status failed'); } },
-    { run: () => JSON.stringify({ lanes: Array(20001).fill(null) }) },
+  for (const options of [{ laneStatus: () => { throw Error('lane status failed'); } },
+    { laneStatus: () => ({ lanes: Array(20001).fill(null) }) },
     { heavyStatus: () => ({}) }, { heavyStatus: () => ({ held: [{}] }) }])
     expect(read('workers', options)).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
 });
@@ -367,8 +454,7 @@ it.each([true, false])('counts overlapping fresh claim, lane and heavy-slot evid
     heartbeatAt: new Date(1000).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } }));
   const report = collect({ readSource: source => read(source, {
     roundBudget: () => ({ live: 0 }),
-    run: () => JSON.stringify({ lanes: withLane ? [{ path: '/pool/lane-1', leased: true,
-      lease: { session: 'fix-12', purpose: 'conveyor-fix' } }] : [] }),
+    laneStatus: () => ({ lanes: withLane ? [lane('/pool/lane-1', 'fix-12', 'conveyor-fix')] : [] }),
     heavyStatus: () => ({ held: [{ owner: '/pool/lane-1#123', meta: { dispatchKind: 'fix', session: 'fix-12' } }] }),
   }) });
   expect(report.unknown).toBe(false);
@@ -382,9 +468,9 @@ it('keeps different repo/kind jobs and workers without shared job identity separ
     heartbeatAt: new Date(1000).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } }));
   const report = collect({ readSource: source => read(source, {
     roundBudget: () => ({ live: 0 }),
-    run: () => JSON.stringify({ lanes: [
-      { path: '/pool/lane-2', leased: true, lease: { session: 'fix-fui-12', purpose: 'conveyor-fix' } },
-      { path: '/pool/lane-3', leased: true, lease: { session: 'ci-heal-12', purpose: 'ci-heal' } },
+    laneStatus: () => ({ lanes: [
+      lane('/pool/lane-2', 'fix-fui-12', 'conveyor-fix'),
+      lane('/pool/lane-3', 'ci-heal-12', 'ci-heal'),
     ] }),
     heavyStatus: () => ({ held: [{ owner: '/pool/lane-4#123', meta: { dispatchKind: 'fix' } }] }),
   }) });

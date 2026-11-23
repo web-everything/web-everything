@@ -6338,6 +6338,14 @@ assertions intact; consumers without callable entries retain the fresh-import pa
 overdraw, no preemption and unknown-evidence holds. `resource-pool-io.test.mjs` covers
 missing/malformed sources, liveness failures, companion files, oversized evidence and
 settings bounds. `operations/__tests__/resource-pool.test.mjs` tests the readout and CLI sink.
+Worker collection reads `.lane-lease` files directly through the bounded JSON reader;
+it must never invoke the allocator's status command, which can update caches and quarantine.
+The IO regression guards that call boundary and preserves cache/quarantine sentinels.
+Missing pools, malformed/unreadable markers, lane `readError`, invalid acquisition/renewal
+timestamps and invalid TTLs produce unknown evidence before expiry or worker-kind filtering.
+Timestamps use the lease writer's canonical ISO form; future dates and renewals before
+acquisition are unknown. Valid expiry, renewal, absent markers and permanent reservations
+are covered separately. The collector's status diagnostic names lease files, not the CLI.
 Only sampler memory/swap/CPU, live review rounds, canonical red-team statuses and class-3
 fix claims are inventoried. Claims and workers share the canonical dispatch session name
 (`fixDispatchSessionName`); collection counts overlapping claim/lane/heavy-slot evidence

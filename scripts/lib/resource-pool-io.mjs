@@ -2,7 +2,7 @@
 import * as fs from 'node:fs';
 import { readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { readPoolLaneStatus, poolLaneLeased } from './resource-pool-lanes.mjs';
 import { admissionLockRoot, resolveCap, resolveFastSlots, slotPath } from '../readiness/heavy-admission.mjs';
 import { operatorOverridesPath, CAPACITY_LEAVES } from './operator-override-reader.mjs';
 import { hostname } from 'node:os';
@@ -147,7 +147,7 @@ export function loadPoolSettings({ env = process.env, read = readPoolSettingsChe
 }
 export const SOURCES = Object.freeze({ snapshot: 'resource-sampler snapshot (memory, swap, CPU)',
   rounds: 'liveReviewRoundBudget (bounded ps process inventory)', redTeam: 'redTeamStatusDir (canonical status files)',
-  fix: 'fixDispatchClaimRoot (class-3 fix claims)', workers: 'lane-pool leased lanes + heavy-admission held fix/ci-heal slots' });
+  fix: 'fixDispatchClaimRoot (class-3 fix claims)', workers: 'read-only lane leases + heavy-admission held fix/ci-heal slots' });
 export function poolSourcePaths({ env = process.env, coord = resolveCoordinationRoot({ env }) } = {}) {
   return { snapshot: join(coord, 'resource', 'snapshot.json'), redTeam: redTeamStatusDir(env), fix: fixDispatchClaimRoot(coord) };
 }
@@ -160,6 +160,7 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
   roundBudget = liveReviewRoundBudget, run = execFileSync,
   listCommands = () => run('ps', ['-Aww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', timeout: 10000, maxBuffer: 32 * 1024 * 1024 }),
   heavyStatus = () => readPoolHeavyHeld({ env }),
+  laneStatus = () => readPoolLaneStatus({ env, nowMs, run, readJson: json }),
   processAlive = poolPidAlive, readStart = pidStartTime, host = hostname(), namespace = pidNamespace(),
   slotAlive = (data, { statusAt }) => {
     const killAlive = pid => {
@@ -190,16 +191,15 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
       if (!Number.isSafeInteger(rounds?.live) || rounds.live < 0 || rounds.live > 20000) throw Error('live review rounds unknown or >20000; inspect processes manually');
       for (let i = 0; i < rounds.live; i++) add('review', `live-round-${i}`, 2, 1);
     } else if (source === 'workers') {
-      const status = JSON.parse(run(process.execPath, [fileURLToPath(new URL('../lane-pool.mjs', import.meta.url)), 'status', '--json', '--leased-only'],
-        { encoding: 'utf8', timeout: 60000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }));
+      const status = laneStatus();
       if (!Array.isArray(status?.lanes) || status.lanes.length > 20000) throw Error('invalid/oversized lane inventory; inspect lane-pool manually');
       const lanes = new Set();
       for (const row of status.lanes) {
-        if (!object(row) || typeof row.path !== 'string' || typeof row.leased !== 'boolean'
+        if (!object(row) || Object.hasOwn(row, 'readError') || typeof row.path !== 'string' || typeof row.leased !== 'boolean'
           || (row.lease !== null && (!object(row.lease) || typeof row.lease.session !== 'string'
             || (row.lease.purpose != null && typeof row.lease.purpose !== 'string')))
           || (row.leased && !row.lease)) throw Error('malformed lane status; inspect lane-pool manually');
-        // Some status versions retain expired metadata even with --leased-only.
+        if (row.leased !== poolLaneLeased(row.lease, nowMs)) throw Error('inconsistent lane lease status; inspect lane-pool manually');
         // Both conveyor-fix and conveyor-ci-heal consume a class-3 fixer slot.
         if (!row.leased || ![row.lease.purpose, row.lease.session].some(v => /^(?:conveyor-)?(?:fix|ci-heal)(?:-|$)/.test(v ?? ''))) continue;
         if (lanes.has(row.path)) throw Error('duplicate lane status');
@@ -262,7 +262,7 @@ export function collectResourcePool({ env = process.env, nowMs = Date.now(), coo
       || result.holders.some(h => !h || h.source !== source || ![2, 3].includes(h.class) || ![1, 2].includes(h.size))
       || (source === 'snapshot' && result.ok && (result.budget?.unknown !== false
         || !Number.isInteger(result.budget.units) || result.budget.units < 0 || result.budget.units > 30))) result = { ok: false, holders: [], error: 'invalid source result' };
-    return { ...result, source, description, path: paths[source] ?? (source === 'workers' ? 'lane-pool status / heavy-admission' : 'ps process inventory') };
+    return { ...result, source, description, path: paths[source] ?? (source === 'workers' ? 'lane lease files / heavy-admission' : 'ps process inventory') };
   });
   // Claims bridge dispatch to worker startup: both observations describe one job.
   // Missing job identity stays separately counted; never guess from a lane or display ID.

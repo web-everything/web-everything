@@ -26,15 +26,15 @@ export default {
     const violations = [];
     const check = (ok, message) => { if (!ok) violations.push(message); };
     let lanes = [
-      { path: join(coord, 'lane-1'), leased: true, lease: { session: 'fix-7343', purpose: 'conveyor-fix' } },
-      { path: join(coord, 'lane-2'), leased: false, lease: { session: 'ci-heal-7337', purpose: 'conveyor-ci-heal' } },
+      { path: join(coord, 'lane-1'), leased: true, lease: { session: 'fix-7343', purpose: 'conveyor-fix', acquiredAt: new Date(nowMs - 1000).toISOString(), ttlMinutes: 1 } },
+      { path: join(coord, 'lane-2'), leased: false, lease: { session: 'ci-heal-7337', purpose: 'conveyor-ci-heal', acquiredAt: new Date(nowMs - 120000).toISOString(), ttlMinutes: 1 } },
     ];
     let failLaneRead = false, failHeavyRead = false, heavy = [];
     const readSource = source => readPoolSource(source, {
       paths, coord, env: {}, nowMs,
       listCommands: () => `${process.pid} 1 node soak-pool-workers`,
       roundBudget: () => ({ live: 0 }),
-      run: () => { if (failLaneRead) throw Error('fixture lane inventory unreadable'); return JSON.stringify({ lanes }); },
+      laneStatus: () => { if (failLaneRead) throw Error('fixture lane inventory unreadable'); return { lanes }; },
       heavyStatus: () => { if (failHeavyRead) throw Error('fixture heavy inventory unreadable'); return { held: heavy }; },
     });
     const collect = () => collectResourcePool({ paths, coord, env: {}, nowMs, readSource,
@@ -72,7 +72,8 @@ export default {
       failLaneRead = false; failHeavyRead = true;
       observe('unreadable-heavy-slots', true);
       failHeavyRead = false; heavy = [];
-      lanes = lanes.map((lane, i) => ({ ...lane, leased: i === 1 }));
+      lanes = lanes.map((lane, i) => ({ ...lane, leased: i === 1,
+        lease: { ...lane.lease, acquiredAt: new Date(nowMs - (i === 1 ? 1000 : 120000)).toISOString() } }));
       observe('recovered-with-ci-healer', false, 'ci-heal-7337');
       const rows = readFileSync(join(coord, 'resource', 'pool-shadow.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
       check(rows.length === 15 && rows.filter(row => row.unknown).length === 6, 'persisted shadow timeline lost observations or unknown holds');
