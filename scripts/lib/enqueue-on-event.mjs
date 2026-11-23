@@ -367,7 +367,14 @@ export function summarizeFastDrain(json, num) {
   if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${Object.hasOwn(MISS_BACKOFF_HOLD_ELIGIBILITY, outcome.kind) ? outcome.kind : 'unknown'}:`;
   if (outcome?.outcome === 'enqueued') return `passed every drain gate — enqueued${outcome.already ? ' (already queued)' : ''}`;
   const deferred = hit(json.deferred);
-  if (deferred && !hit(json.merged)) return 'deferred: enqueue not attempted';
+  if (deferred && !hit(json.merged)) {
+    // Child-chosen text: keep only the fixed `overlap-yield:#<pr>` wait shape.
+    const waits = (Array.isArray(deferred.waitOn) ? deferred.waitOn : []).slice(0, 8)
+      .filter((w) => typeof w === 'string' && /^overlap-yield:#\d{1,7}$/.test(w));
+    const until = Number(deferred.overlapYield?.untilMs);
+    const when = Number.isFinite(until) && Math.abs(until) < 8.64e15 ? ` until ${new Date(until).toISOString().slice(11, 16)}Z` : '';
+    return `deferred: waits on ${waits.join(', ')}${when} — enqueue not attempted`.slice(0, 200);
+  }
   if (Array.isArray(json.enqueueOutcomes) && hit(json.toMerge)) return 'not enqueued: no enqueue outcome recorded';
   const aborted = hit(json.revalidationAborted);
   if (aborted) return 'not enqueued: revalidation-aborted';
