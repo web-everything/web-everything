@@ -2,9 +2,11 @@
 bornAs: x7jmiac
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/soak/__tests__/shard-files.test.mjs", "we:scripts/ci/shard-assign.mjs", "we:scripts/ci/test-timings.json"]
 dateOpened: "2026-10-13"
+dateResolved: "2026-11-21"
+graduatedTo: none
 tags: []
 ---
 

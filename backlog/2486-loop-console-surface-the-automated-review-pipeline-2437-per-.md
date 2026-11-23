@@ -20,3 +20,5 @@ The review console today (shipped by the resolved #2470) surfaces only the HUMAN
 ## Prerequisite
 
 #2437 is already resolved, so this is READY — no open `blockedBy`. It builds on the review-detail surface from the resolved #2470 (`we:scripts/review-detail.mjs` + the `plateau:tools/dev-panel/drain-daemon.html` review expand); this item adds the automated-panel ledger alongside the existing human-verdict controls. Impl lives in plateau-app; WE holds zero impl (this card is the tracker).
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

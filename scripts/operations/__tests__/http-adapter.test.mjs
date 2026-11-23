@@ -129,13 +129,13 @@ describe('codex-audit runner output', () => {
     { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
       stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
     { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
-      stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' },
+      stderr: 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
       stderr: 'Audit record write failed; repair the record path and retry.\n' },
     { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
-      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+      stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json] [--now] [--branch=<ref>]\n' },
     { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
-      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json]\n' },
+      stderr: 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json] [--now] [--branch=<ref>]\n' },
   ];
   for (const json of [true, false]) {
     it.each(cases)(`captures $name in ${json ? 'JSON' : 'text'} mode without leaking to process streams`, async (testCase) => {

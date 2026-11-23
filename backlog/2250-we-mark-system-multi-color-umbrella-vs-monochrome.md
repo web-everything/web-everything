@@ -146,3 +146,5 @@ is brand meta-asset authoring, off the WE↔FUI boundary.
   section with the WE gradient-span policy + the Venn ban; it binds #2251 (finalize the WE mark) and
   becomes a #2207 ground-truth label.
 - **Review surface:** any brand-asset change regenerates `plateau:branding.html` (`npm run gen:branding`).
+
+Ratified 2026-11-22 (PL-BRAND-RATIFY): ratified in one sitting with #2209, #2249 and #2250.
