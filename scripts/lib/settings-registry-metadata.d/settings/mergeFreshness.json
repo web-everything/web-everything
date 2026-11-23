@@ -1,0 +1,6 @@
+{
+  "description": "Freshness age, disjoint main moves and retest scope.",
+  "owner": "scripts/settings/merge-queue.json",
+  "changeVia": "pr",
+  "instant": false
+}

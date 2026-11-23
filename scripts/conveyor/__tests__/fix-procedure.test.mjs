@@ -973,7 +973,7 @@ it('xul2kwr synthetic #3432 soak: withdrawal survives expiry and stale plans unt
   const execute = snapshot => runReconcilePromoteDraftDispatch({
     root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
     reconcile: () => snapshot,
-    readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => pr.labels,
+    readComments: () => [], readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => pr.labels,
     provider: { ready: n => { effects.push(['ready', n]); pr.isDraft = false; } },
     clearAwaitingCi: args => { effects.push(['clear', args.pr]); applyReviewStatus({ ...args, provider: labels }); },
   });

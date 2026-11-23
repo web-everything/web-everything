@@ -1,0 +1,19 @@
+{
+ "rubricType": "https://everstandards.dev/core/rubric/v0.1",
+ "id": "https://github.com/plateauapp/plateau-settings/blob/main/review/rubrics/correctness/template",
+ "version": "template-2026-11-22.1",
+ "title": "Correctness seat template (CKLST-1 A). Source rule: the items are the PR's pinned acceptance lines, read from its backlog card's \"## Acceptance\" section at the PR's merge-base (pinned before the build, so the PR cannot rewrite them), one item per \"- [A<n>]\" line, id = the card's own A-id, text verbatim; no card: the DoR prep's \"## Acceptance\" numbered list at the merge-base, ids A1..An in order; no pinned lines: no rubric, so the seat derives unknown/missing. appliesTo = the PR head. Built by the seat tool, never by the seat.",
+ "appliesTo": {
+  "gitCommit": "0000000000000000000000000000000000000000"
+ },
+ "items": [
+  {
+   "id": "A1",
+   "text": "<pinned acceptance line A1, verbatim>"
+  },
+  {
+   "id": "A2",
+   "text": "<pinned acceptance line A2, verbatim>"
+  }
+ ]
+}

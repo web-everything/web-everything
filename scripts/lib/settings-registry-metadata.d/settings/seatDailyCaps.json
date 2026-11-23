@@ -1,0 +1,6 @@
+{
+  "description": "Daily review seat caps by provider.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

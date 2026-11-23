@@ -1,0 +1,6 @@
+{
+  "description": "Policy for falling back to personal GitHub authentication.",
+  "owner": "scripts/settings/github-auth.json",
+  "changeVia": "pr",
+  "instant": false
+}

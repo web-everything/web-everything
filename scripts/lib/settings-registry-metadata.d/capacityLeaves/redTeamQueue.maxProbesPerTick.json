@@ -1,0 +1,5 @@
+{
+  "description": "Maximum red-team probes started per tick.",
+  "range": "integer 0–50",
+  "unit": "probes/tick"
+}

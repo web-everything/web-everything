@@ -1,0 +1,19 @@
+{
+  "id": "time-track",
+  "name": "Time Track Intent",
+  "requiresCapabilities": [],
+  "status": "concept",
+  "summary": "Stacked, named time tracks sharing one scale-ruler time axis. Preserves lane order, aligns equal times across lanes, and splits each lane into past and forecast slots at a shared today marker. Up/Down moves focus between lanes; slotted content supplies the items.",
+  "dimensions": {
+    "type": {
+      "description": "Reuses the scale-ruler intent's time mapping family. All lanes share one axisRef and the same temporal domain-to-position mapping; this intent introduces no new scale mathematics.",
+      "values": [
+        "time"
+      ]
+    }
+  },
+  "events": [
+    "rescale"
+  ],
+  "description": "<h3>Shared time axis</h3><p>Several named lanes form stacked time tracks in their given order. They compose the <a href=\"/intents/scale-ruler/\">Scale Ruler Intent</a> with <code>type: time</code> and one shared <code>axisRef</code>. Two items with the same time map to the same position on every lane. Scale Ruler owns the temporal mapping and its rescale semantics; Time Track owns lane layout and applying that shared mapping.</p><h3>Today and content slots</h3><p>One shared <code>today</code> reference marker splits every lane into a <code>past</code> slot and a <code>forecast</code> slot at the same time position. Times before today belong to past; times at or after today belong to forecast. Each lane exposes both named slots for author-supplied item content. Slotted items provide their time for placement on the shared axis; their rendering is supplied by the slot content. This intent defines no chart marks or chart grammar. Forecast hatching, pulse, and other visual treatments are presentation choices outside the contract.</p><h3>Keyboard contract</h3><p>Each named lane is a focus target with its name exposed accessibly. ArrowUp moves focus to the preceding lane and ArrowDown to the following lane in the given order. Focus remains on the current lane at the first or last boundary. These keys do not reorder lanes or change item times.</p><h3>Implementation</h3><p>WE owns this intent contract. Frontier UI implements it with the <code>we-time-tracks</code> block containing <code>we-time-track</code> lanes, each exposing <code>past</code> and <code>forecast</code> content slots.</p>"
+}
