@@ -324,6 +324,40 @@ describe('lean repair background argv', () => {
   const addDirsOf = (argv) => argv.flatMap((arg, i) => (arg === '--add-dir' ? [argv[i + 1]] : []));
   const LANE_GRANT = leanRepairGrant({ launchKind: 'fix', lane: 7 }, null, { root: '/repo' });
 
+  it.each(['fix', 'ci-heal'])('%s grants the configured pool through implicit and sink-supplied argv', (kind) => {
+    const root = '/workspace/web-everything';
+    try {
+      vi.stubEnv('HOME', '/fixture/home');
+      for (const [override, pool] of [
+        ['/tmp/custom-pool', '/tmp/custom-pool'],
+        ['~/custom pool', '/fixture/home/custom pool'],
+      ]) {
+        vi.stubEnv('LANE_POOL_ROOT', override);
+        for (const [repo, directory] of [['we', 'web-everything'], ['frontierui', 'frontierui'], ['plateau-app', 'plateau-app']]) {
+          const payload = { ...options(kind).payload, repo };
+          const lane = join(pool, directory, 'lane-7');
+          const grant = dispatchLaneGrant(payload, { root, exists: () => false });
+          expect(grant.additionalDirectories).toEqual([lane]);
+          expect(leanRepairGrant(payload, null, { root, exists: () => false }).additionalDirectories).toEqual([lane]);
+          for (const laneGrant of [undefined, grant]) {
+            const argv = buildAgentArgv({ ...options(kind), root, payload, laneGrant });
+            expect(addDirsOf(argv)).toEqual([lane]);
+            expect(settingsOf(argv).permissions.additionalDirectories).toEqual([lane]);
+            expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([
+              `Edit(${lane}/**)`, `Write(${lane}/**)`,
+            ]));
+          }
+          for (const dir of [join('/workspace/.lanes', directory, 'lane-7'), join(pool, directory), join(pool, directory, 'lane-8')]) {
+            expect(() => buildAgentArgv({ ...options(kind), root, payload,
+              laneGrant: { additionalDirectories: [dir] } })).toThrow(/only the assigned lane/);
+          }
+        }
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('carries an explicit lane grant into --add-dir and the --settings permissions for fix and ci-heal', () => {
     for (const kind of ['fix', 'ci-heal']) {
       const argv = buildAgentArgv({ ...options(kind), laneGrant: LANE_GRANT });

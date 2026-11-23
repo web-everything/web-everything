@@ -30,12 +30,14 @@ const GUARDS = {
 // A fresh process both permits dynamic import in the synchronous fixPresent contract and avoids
 // caching a different tree's builder or settings. No agent is spawned by buildAgentArgv.
 const PROBE = `
-const { buildAgentArgv } = await import(process.argv[1]);
+const { buildAgentArgv, dispatchLaneGrant } = await import(process.argv[1]);
 const { LEAN_FIX_HOOKS_SETTINGS } = await import(process.argv[2]);
 const { fileURLToPath } = await import('node:url');
 const repoRoot = fileURLToPath(new URL('../../', process.argv[2]));
 const hookOptions = { repoRoot, guardRoot: repoRoot };
 const loadRepairSettings = () => LEAN_FIX_HOOKS_SETTINGS(process.argv[3], hookOptions);
+// Pin the default-pool baseline independently of the host running this probe.
+delete process.env.LANE_POOL_ROOT;
 const observations = ['fix', 'ci-heal'].map(launchKind => {
   try {
     return { launchKind, argv: buildAgentArgv({
@@ -45,6 +47,17 @@ const observations = ['fix', 'ci-heal'].map(launchKind => {
     }) };
   } catch (error) { return { launchKind, error: error.message }; }
 });
+// The actual builder and sink grant must agree with the pool CLI's configured root.
+process.env.LANE_POOL_ROOT = '/tmp/soak-custom-pool';
+const configuredPool = ['fix', 'ci-heal'].flatMap(launchKind => ['implicit', 'explicit'].map(mode => {
+  try {
+    const root = '/workspace/web-everything';
+    const payload = { launchKind, lane: 7, repo: 'we', prompt: 'Repair this PR.' };
+    const laneGrant = mode === 'explicit' ? dispatchLaneGrant(payload, { root }) : undefined;
+    return { launchKind, mode, argv: buildAgentArgv({ root, payload, laneGrant, loadRepairSettings,
+      settingsEnv: { PATH: '/fixture/bin' }, worktreeSettings: { bgIsolation: 'none' } }) };
+  } catch (error) { return { launchKind, mode, error: error.message }; }
+}));
 const { readFileSync, writeFileSync, mkdtempSync, rmSync } = await import('node:fs');
 const { join } = await import('node:path');
 const { tmpdir } = await import('node:os');
@@ -72,7 +85,7 @@ try {
     });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 } catch (error) { guardFaults = { error: error.message }; }
-process.stdout.write(JSON.stringify({ observations, guardFaults }));
+process.stdout.write(JSON.stringify({ observations, configuredPool, guardFaults }));
 `;
 
 function probe(root) {
@@ -140,6 +153,21 @@ function judge(report) {
       }
     } catch { violations.push(`${kind}: unreadable --settings JSON`); }
   }
+  for (const kind of KINDS) {
+    for (const mode of ['implicit', 'explicit']) {
+      const rows = (report.configuredPool ?? []).filter(row => row.launchKind === kind && row.mode === mode);
+      const argv = rows[0]?.argv;
+      const expected = '/tmp/soak-custom-pool/web-everything/lane-7';
+      const dirs = Array.isArray(argv) ? argv.flatMap((arg, i) => arg === '--add-dir' ? [argv[i + 1]] : []) : [];
+      let permissions;
+      try { permissions = JSON.parse(argv[argv.indexOf('--settings') + 1]).permissions; } catch {}
+      if (rows.length !== 1 || JSON.stringify(dirs) !== JSON.stringify([expected])
+          || JSON.stringify(permissions?.additionalDirectories) !== JSON.stringify([expected])
+          || !['Edit', 'Write'].every(tool => permissions?.allow?.includes(tool + '(' + expected + '/**)'))) {
+        violations.push(kind + ': ' + mode + ' grant ignores configured pool; ' + (rows[0]?.error ?? JSON.stringify(dirs)));
+      }
+    }
+  }
   const faults = report.guardFaults;
   if (!Array.isArray(faults) || faults.length !== GUARD_FAULTS.length) {
     violations.push(`guard-fault probe incomplete: ${faults?.error ?? 'no evidence'}`);
@@ -194,6 +222,11 @@ export default {
       accepted.guardFaults[0].refused = false;
       check('guard-stripped settings accepted', judge(accepted).length === 0);
       check('guard-fault probe missing', judge({ ...structuredClone(report), guardFaults: { error: 'x' } }).length === 0);
+      check('configured-pool probe missing', judge({ ...structuredClone(report), configuredPool: [] }).length === 0);
+      const wrongPool = structuredClone(report);
+      const configuredArgv = wrongPool.configuredPool[0].argv;
+      configuredArgv[configuredArgv.indexOf('--add-dir') + 1] = '/workspace/.lanes/web-everything/lane-7';
+      check('configured-pool grant points at default pool', judge(wrongPool).length === 0);
       // Exercise fixPresent against an actual other tree whose ci-heal builder lacks the fix.
       const dir = mkdtempSync(join(tmpdir(), 'soak-lean-repair-'));
       try {

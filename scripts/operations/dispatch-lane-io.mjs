@@ -88,6 +88,7 @@ import { deleteCompletion } from './completion-store.mjs';
 // guard rather than re-derived, for the SAME reason `explore-io.mjs#exploreScratchRoot` imports it: the region
 // a dispatched agent may legitimately write into and the region this file computes must be one definition.
 import { workspaceRootOf } from '../guard-lane.mjs';
+import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 // #4174 live-caught (2026-09-25) — a scratch cwd is a BRAND NEW directory `claude` has never seen, and `--bg`
 // refuses to start there ("Workspace not trusted") exactly like an interactive session would. A LANE clone
 // never hits this because `bootstrap-session.mjs`'s own `trustStatus`/`withTrustedDirs` pre-trusts the whole
@@ -2292,9 +2293,11 @@ export function dispatchSessionCwd(sessionId, opts = {}) {
 }
 
 /**
- * EVERY POOL DIRECTORY a given repo's lanes could live under — `<workspace>/.lanes/<one of that repo's own
+ * EVERY POOL DIRECTORY a given repo's lanes could live under — `<pool root>/<one of that repo's own
  * `dirs`>`, mirroring `bootstrap-session.mjs#poolRoots`'s own two-basename probe (`CONSTELLATION_REPOS.we.dirs`)
- * rather than re-deriving which basename this host actually uses. `repoKey` DEFAULTS to `'we'` — byte-identical
+ * rather than re-deriving which basename this host actually uses. The canonical pool resolver honors
+ * LANE_POOL_ROOT (including home expansion) for both sink grants and restricted argv validation.
+ * `repoKey` DEFAULTS to `'we'` — byte-identical
  * to every call site that predates xftsbsg and never passes one — but is no longer hardcoded: `we`/`frontierui`/
  * `plateau-app` each number their own lanes from 1 (all three exist simultaneously on a real host), so a caller
  * that KNOWS which repo a lane number belongs to (see {@link dispatchLaneGrant}) must say so, or this would
@@ -2305,9 +2308,9 @@ export function dispatchSessionCwd(sessionId, opts = {}) {
  * @returns {string[]}
  */
 function laneWorkspacePoolDirs(root = REPO_ROOT, repoKey = 'we') {
-  const workspace = workspaceRootOf(root);
+  const poolRoot = defaultPoolRoot(root);
   const dirs = CONSTELLATION_REPOS[repoKey]?.dirs ?? CONSTELLATION_REPOS.we.dirs;
-  return dirs.map((d) => join(workspace, '.lanes', d));
+  return dirs.map((d) => join(poolRoot, d));
 }
 
 /**
