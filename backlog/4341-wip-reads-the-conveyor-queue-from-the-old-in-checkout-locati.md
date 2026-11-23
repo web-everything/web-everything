@@ -3,7 +3,7 @@ bornAs: xykd1x3
 kind: story
 size: 2
 status: open
-scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts", "we:.conveyor/queue.json"]
+scope: ["plateau:src/wip/wip-read.ts", "plateau:src/wip/wip-read.test.ts"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-09-30"
 preparedAgainstSha: "c95b5628eb1aefc7b7e52a12cd9fb17597303dce"
@@ -105,5 +105,3 @@ against `we:scripts/conveyor/queue.mjs list --json`.
 1. **Executable** — `npx vitest run plateau:src/wip/wip-read.test.ts` passes with a case asserting the
    conveyor-queue read goes through `resolveQueuePath()` (not a hardcoded `we:.conveyor/queue.json` join),
    plus the old-shaped-`weRoot` degrade case.
-
-Will be closed when plan step PD-LIVE (delivery plan) delivers; ruled 2026-11-22 (PL-WIP-CLEANUP).
