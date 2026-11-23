@@ -56,6 +56,9 @@ describe('intake', () => {
     [{ WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_MAX_LINES: 'many' }, 'off'],
     [{ WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_ROUNDS_BEFORE_SPLIT: '0' }, 'off'],
     [{ WE_REVIEW_INTAKE_ENFORCE: 'on', WE_REVIEW_INTAKE_MAX_LINES: '-1' }, 'on'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'shadow', WE_REVIEW_INTAKE_MAX_LINES: '' }, 'shadow'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'on', WE_REVIEW_INTAKE_MAX_LINES: '1e3' }, 'on'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_ROUNDS_BEFORE_SPLIT: '0x2' }, 'off'],
     [{ WE_REVIEW_INTAKE_ENFORCE: 'bogus' }, 'on'],
   ])('invalid settings %j never throw: enforce stays %s and every PR is unknown', (env, enforce) => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});

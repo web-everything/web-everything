@@ -208,6 +208,9 @@ it.each([
 ])('invalid intake settings (%s) never abort reconciliation', async (_name, intakeEnv, loadIntake, refused) => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+  const { readIntakeSettings } = await import('../../lib/review-loop/intake.mjs');
+  // The real settings reader, isolated from this host's platform and operator-override files.
+  loadIntake ??= ({ env }) => readIntakeSettings({ env, platform: {}, operatorOverride: {} });
   const pr = { ...xxPr(), isDraft: false, rowsComplete: true, rowsHead: XX_HEAD, labels: ['review:changes'], mergeStateStatus: 'CLEAN',
     statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], comments: [
       { body: '🔁 human review — changes requested\n\nFix the defect' },
@@ -217,7 +220,7 @@ it.each([
   try {
     let plan;
     expect(() => { plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr], readRequiredChecks: () => ({ checks: ['test'] }),
-      ...(loadIntake ? { loadIntake } : {}), intakeEffects: () => {}, env: { VITEST: 'true', ...intakeEnv } }); }).not.toThrow();
+      loadIntake, intakeEffects: () => {}, env: { VITEST: 'true', ...intakeEnv } }); }).not.toThrow();
     const intakeRefusals = plan.refusals.filter(r => r.kind === 'intake-unmeasurable' || r.kind === 'split-required');
     // Unreadable enforcement fails closed (human review); a readable off/shadow mode keeps its non-blocking behaviour.
     if (refused) expect(intakeRefusals).toEqual([expect.objectContaining({ kind: 'intake-unmeasurable' })]);

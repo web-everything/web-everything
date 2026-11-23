@@ -43,14 +43,17 @@ export function readIntakeSettings({ env = process.env, tool = standard, loadSiz
   const envValues = Object.fromEntries(Object.entries(standard).map(([key, value]) => {
     const raw = env[`WE_REVIEW_INTAKE_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`];
     if (raw === undefined) return [key, undefined];
-    try { return [key, typeof value === 'number' ? Number(raw) : typeof value === 'boolean' || Array.isArray(value) ? JSON.parse(raw) : raw]; }
-    catch { unparsable.push(key); return [key, undefined]; }
+    try {
+      // Numbers are plain decimal integers only: `Number('')` is 0 and `1e3`/`0x12c` are not what an operator typed.
+      if (typeof value === 'number' && !/^(0|[1-9]\d*)$/.test(raw)) throw Error('not a decimal integer');
+      return [key, typeof value === 'number' ? Number(raw) : typeof value === 'boolean' || Array.isArray(value) ? JSON.parse(raw) : raw];
+    } catch { unparsable.push(key); return [key, undefined]; }
   }));
   let value;
   try { value = cascadePolicy('intake', tool, { standard: { ...standard, maxLines: OPEN_PR_MAX_NON_TEST_LINES }, envValues, env, ...options }).value; }
   catch { return invalidIntakeSettings(undefined, 'cascade'); }
   const invalid = [...new Set([...unparsable, ...Object.keys(VALID).filter(k => !VALID[k](value?.[k]))])];
-  if (invalid.length) return invalidIntakeSettings(unparsable.includes('enforce') ? undefined : value?.enforce, invalid.join(','));
+  if (invalid.length) return invalidIntakeSettings(value?.enforce, invalid.join(','));
   // A bad prSize layer makes each PR's intake unknown (human review), as it makes the size runner unknown.
   let sizeSettings = null;
   try { sizeSettings = sizeSettingsOf(loadSize(env)); } catch {
