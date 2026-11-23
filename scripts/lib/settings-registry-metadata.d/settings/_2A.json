@@ -1,0 +1,6 @@
+{
+  "description": "Default account mapping for unmapped daemon launch labels.",
+  "owner": "scripts/settings/claude-accounts.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Card numbering and remote numbering policy.",
+  "owner": "scripts/settings/card-numbering.json",
+  "changeVia": "pr",
+  "instant": false
+}

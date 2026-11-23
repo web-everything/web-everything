@@ -1,0 +1,6 @@
+{
+  "description": "Disposition of same-line parked PR conflicts.",
+  "owner": "scripts/settings/conflict-watch.json",
+  "changeVia": "pr",
+  "instant": false
+}

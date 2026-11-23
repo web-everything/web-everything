@@ -1,0 +1,6 @@
+{
+  "description": "Minimum number of non-Claude review seats.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

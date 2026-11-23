@@ -1,0 +1,6 @@
+{
+  "description": "Daemon task manifest format version.",
+  "owner": "scripts/settings/daemon-tasks.json",
+  "changeVia": "pr",
+  "instant": false
+}
