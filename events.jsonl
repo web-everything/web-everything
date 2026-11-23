@@ -112,3 +112,4 @@
 {"type":"quarantine-removed","at":1795232711262,"actor":"red-main-safety-net","test":"scripts/conveyor/soak/daemon-soak.soak.test.mjs::50 real daemon ticks: every invariant holds after every tick","brokenSha":"b784af27ea3e824caa8ab3ae0286b265306a20a4","why":"main-green"}
 {"type":"quarantine-added","at":1795391776243,"actor":"orchestrator","test":"scripts/conveyor/soak/daemon-soak.soak.test.mjs","brokenSha":"70001b920c55f4423d028a2a18d3d79c8a8b2757","owner":"orchestrator","reason":"daemon-soak 50-tick test hits its 1020s timeout (passed in 1017s on the parent); fix #7372 raises the limit; R1087 / rule 29","addedAt":1795391776243,"expiresAt":1795406176243,"job":"soak-shard (1)"}
 {"type":"quarantine-fix-prs","at":1795391915034,"actor":"red-main-safety-net","fixPrs":[7372]}
+{"type":"quarantine-fix-prs","at":1795393113850,"actor":"red-main-safety-net","fixPrs":[7372,7373]}
