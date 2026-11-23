@@ -61,7 +61,8 @@
  *   every other state remains a candidate. False retains the previous priority order.
  *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until the fast-drain reader accepts its round snapshot,
  *   then uses catchUp.concurrency. Missing/invalid/unreadable evidence keeps starts serial; a failed/timed-out
- *   child releases the next attempt. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
+ *   child releases the next attempt. The shared base snapshot is checked against live main SHAs
+ *   and expires after 60 s; every child revalidates lean PR membership. Unknown evidence defers to the next pass. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
  *
  *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
@@ -317,7 +318,7 @@ export function duePending(pending, { now, debounceSeconds, debounceMaxWaitMs = 
 
 /** The fast-drain argv (node script + args). The drain's own single-PR path; `--this-repo` keeps the listing local. PURE. */
 export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
-  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? [`--listing-snapshot=${listingSnapshot}`] : [])];
+  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? ['--from-catch-up', `--listing-snapshot=${listingSnapshot}`] : [])];
 }
 
 /** Explicit classification of recordEnqueue kinds, including delegated producers. PURE.
@@ -1167,6 +1168,7 @@ export function createEnqueueOnEvent({
       attempted.add(p.num);
       activeNums.add(p.num);
       const startedAt = now();
+      // Catch-up passes the round path even without a green event: the catch-up flag selects the shared lean-context path.
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num, listingSnapshot: p.catchUp ? listingSnapshot : null });
       if (greenEvent(p)) args.push('--from-green-event');
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
@@ -1176,9 +1178,15 @@ export function createEnqueueOnEvent({
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
         const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
-        const json = lastJsonLine(r.stdout);
+        const exitFailed = !r.timedOut && r.code !== 0;
+        // A failed child cannot supply success or permanent-decline evidence.
+        const json = exitFailed ? null : lastJsonLine(r.stdout);
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
+        if (!r.timedOut && (r.code !== 0 || !json)) {
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          if (stderr) what += ` (stderr: ${stderr})`;
+        }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
         const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);
@@ -1252,7 +1260,7 @@ export function createEnqueueOnEvent({
           refillCatchUp();
         }
         if (batchingRetry === p.num && !summary.startsWith('not enqueued: batching-deferred:')) batchingRetry = null;
-        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
+        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error || exitFailed });
         declines.delete(p.num); // every actual outcome replaces the previous one, including success/error
         // Allowlist: only affirmative, head-bound declines are remembered. Transient, infrastructure
         // and unknown kinds (batching-deferred, merge-lock-held, live-state-unreadable, ...) always retry.
