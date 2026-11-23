@@ -1,0 +1,6 @@
+{
+  "description": "Enable recovery of missing red-team results on reviewed heads.",
+  "owner": "scripts/settings/review-red-team-on-skip.json",
+  "changeVia": "pr",
+  "instant": false
+}

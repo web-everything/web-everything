@@ -1,0 +1,6 @@
+{
+  "description": "Mechanical carry-forward policy for human clearance.",
+  "owner": "scripts/settings/human-clearance-carry.json",
+  "changeVia": "pr",
+  "instant": false
+}

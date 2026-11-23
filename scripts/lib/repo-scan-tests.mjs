@@ -43,6 +43,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/testing-notes-advisory.test.mjs',
+    scope: 'full',
+    why: 'validates incoming testing.md anchors across top-level agent docs and the complete topic directory; guide anchor changes can break unchanged callers, so the scan must keep both sides',
+    matches: (f) => f === 'AGENTS.md' || /^docs\/agent\/[^/]+\.md$/.test(f)
+      || f.startsWith('docs/agent/testing/') || f === 'scripts/check-standards.mjs',
+    inputs: ['scripts/__tests__/testing-notes-advisory.test.mjs', 'scripts/__tests__/fixtures/testing-notes-main-links.json',
+      'scripts/lib/testing-notes-advisory.mjs', 'scripts/lib/rules-loader.cjs'],
+  },
+  {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
     scope: 'files',
     why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',

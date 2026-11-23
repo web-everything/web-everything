@@ -1,0 +1,6 @@
+{
+  "description": "Staleness thresholds, escalation rungs and recovery attempt limits.",
+  "owner": "scripts/settings/liveness-sweep.json",
+  "changeVia": "pr",
+  "instant": false
+}

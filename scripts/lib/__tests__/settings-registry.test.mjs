@@ -5,21 +5,25 @@
  */
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildRegistry, renderMarkdown } from '../settings-registry.mjs';
+import { buildRegistry, readMetadata, renderMarkdown } from '../settings-registry.mjs';
 import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
+const META_DIR = 'scripts/lib/settings-registry-metadata.d';
+const filename = key => encodeURIComponent(key).replace(/[!'()*_]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replaceAll('%', '_') + '.json';
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), 'settings-registry-'));
   t.onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   for (const dir of ['scripts/settings', 'scripts/lib']) mkdirSync(join(root, dir), { recursive: true });
-  const write = (path, value) => writeFileSync(join(root, path), JSON.stringify(value));
+  const write = (path, value) => { mkdirSync(dirname(join(root, path)), { recursive: true }); writeFileSync(join(root, path), JSON.stringify(value)); };
   write('scripts/dispatch-settings.json', { $comment: 'ignored', alpha: { count: 2 } });
   write('scripts/settings/feature.json', { beta: [1, 2], empty: {} });
   write('scripts/lib/delivery-platform-preferences.json', { alpha: { count: 5 } });
@@ -202,4 +206,149 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   const md = renderMarkdown(buildRegistry({ root: ROOT }));
   assert.ok(md.includes('H-impact discovery converged'));
   assert.ok(md.includes('M-impact tail has not converged'));
+});
+
+// Immutable compact snapshot captured before the per-key migration (not regenerated).
+const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+function split(f) {
+  for (const section of ['settings', 'capacityLeaves']) {
+    for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
+    delete f.meta[section];
+  }
+  f.write(META, f.meta);
+}
+test('per-key directory reconstructs exactly the original metadata JSON shape and registry', t => {
+  const f = fixture(t), original = structuredClone(f.meta), before = f.build();
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), original);
+  assert.deepEqual(f.build(), before);
+});
+test('migration preserves the original registry plus the intentional shadow rotation description', t => {
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  const expectedMetadata = structuredClone(originalMetadata);
+  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
+  f.write(META, expectedMetadata);
+  assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
+});
+test('a new metadata key file alone adds a row without editing the base metadata', t => {
+  const f = fixture(t); split(f);
+  const base = readFileSync(join(f.root, META), 'utf8');
+  f.write('scripts/settings/new.json', { newKey: 7 });
+  f.write(`${META_DIR}/settings/newKey.json`, { description: 'New key.', owner: 'scripts/settings/new.json', changeVia: 'pr', instant: false });
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.equal(registry.rows.find(row => row.key === 'newKey').value, 7);
+  assert.equal(readFileSync(join(f.root, META), 'utf8'), base);
+});
+test('duplicate metadata key in base and directory fails closed in either section', t => {
+  for (const section of ['settings', 'capacityLeaves']) {
+    const f = fixture(t), [key, value] = Object.entries(f.meta[section])[0];
+    f.write(`${META_DIR}/${section}/${filename(key)}`, value);
+    assert.throws(() => renderMarkdown(f.build()), /duplicate metadata key/);
+  }
+});
+test('base and per-key metadata cannot override declared key, value or owners', t => {
+  for (const perKey of [false, true]) {
+    const f = fixture(t), before = f.build().rows;
+    Object.assign(f.meta.settings.alpha, { key: 'forged', value: { forged: true }, owners: ['forged.json'] });
+    if (perKey) split(f);
+    const r = f.build();
+    for (const field of ['key', 'value', 'owners']) assert.ok(r.problems.includes(`metadata overrides declared field: alpha.${field}`));
+    assert.deepEqual(r.rows, before);
+    assert.throws(() => renderMarkdown(r), /metadata overrides declared field/);
+  }
+});
+test('base and per-key JSON reject duplicate properties at the root and inside nested objects and arrays', t => {
+  for (const section of [null, 'settings', 'capacityLeaves']) for (const raw of [
+    '{"description":"first","description":"last"}',
+    '{"leaves":{"count":{"range":"first","range":"last"}}}',
+    '{"nested":[{"key":1,"k\\u0065y":2}]}',
+  ]) {
+    const f = fixture(t); split(f);
+    const key = section === 'settings' ? 'alpha' : Object.keys(CAPACITY_LEAVES)[0];
+    const path = section === null ? META : `${META_DIR}/${section}/${filename(key)}`;
+    writeFileSync(join(f.root, path), raw);
+    const problems = [], metadata = readMetadata({ root: f.root, problems });
+    assert.ok(problems.includes(`${path}: duplicate JSON property`));
+    if (section !== null) assert.deepEqual(metadata[section][key], {});
+    assert.throws(() => readMetadata({ root: f.root }), /duplicate JSON property/);
+    assert.throws(() => renderMarkdown(buildRegistry({ root: f.root })), /duplicate JSON property/);
+  }
+});
+test('base JSON rejects symlinks and non-regular files', t => {
+  for (const symlink of [false, true]) {
+    const f = fixture(t); f.build();
+    const absolute = join(f.root, META);
+    if (symlink) {
+      const target = join(f.root, 'target.json');
+      renameSync(absolute, target);
+      symlinkSync(target, absolute);
+    } else {
+      rmSync(absolute);
+      mkdirSync(absolute);
+    }
+    const problems = [];
+    readMetadata({ root: f.root, problems });
+    assert.ok(problems.includes(`${META}: expected regular file (no symlinks)`));
+    assert.throws(() => readMetadata({ root: f.root }), /expected regular file/);
+    assert.throws(() => renderMarkdown(buildRegistry({ root: f.root })), /expected regular file/);
+  }
+});
+test('duplicate scanner allows repeated names in separate scopes and punctuation in strings', t => {
+  const f = fixture(t);
+  f.meta.extra = { left: { key: '"key":{}[],\\' }, right: [{ key: 1 }, { key: 2 }] };
+  f.write(META, f.meta);
+  assert.deepEqual(readMetadata({ root: f.root }), f.meta);
+});
+test('metadata directory rejects symlinked roots, sections and files and other non-regular entries', t => {
+  for (const section of ['settings', 'capacityLeaves']) for (const entry of ['root', 'section', 'file']) for (const symlink of [false, true]) {
+    const f = fixture(t); split(f);
+    const key = section === 'settings' ? 'alpha' : Object.keys(CAPACITY_LEAVES)[0];
+    const path = entry === 'root' ? META_DIR : entry === 'section' ? `${META_DIR}/${section}` : `${META_DIR}/${section}/${filename(key)}`;
+    const absolute = join(f.root, path);
+    if (symlink) {
+      const target = join(f.root, 'target');
+      renameSync(absolute, target);
+      symlinkSync(target, absolute);
+    } else {
+      rmSync(absolute, { recursive: true });
+      if (entry === 'file') mkdirSync(absolute);
+      else writeFileSync(absolute, '{}');
+    }
+    const problems = [];
+    readMetadata({ root: f.root, problems });
+    assert.ok(problems.some(p => p.startsWith(`${path}: expected `)), problems.join('\n'));
+    assert.throws(() => readMetadata({ root: f.root }), /expected (directory|regular file)/);
+    assert.throws(() => renderMarkdown(f.build()), /expected (directory|regular file)/);
+  }
+});
+test('filenames round-trip punctuation, percent, slash and Unicode keys in deterministic order', t => {
+  const f = fixture(t); split(f);
+  const keys = ['z', 'a.b', '$*', 'slash/\\percent%', 'café', '__proto__', 'snake_case', '$description', '*'];
+  // Every filename stays inside the audit-path grammar, so no percent sign ever reaches a tracked path.
+  for (const key of keys) assert.match(filename(key), /^[A-Za-z0-9._-]+$/);
+  for (const key of keys) f.write(`${META_DIR}/settings/${filename(key)}`, { description: key });
+  const metadata = readMetadata({ root: f.root });
+  for (const key of keys) assert.equal(metadata.settings[key].description, key);
+  assert.deepEqual(Object.keys(metadata.settings), Object.keys(metadata.settings).sort());
+});
+test('malformed names, unexpected entries and unreadable per-key JSON fail closed with repair paths', t => {
+  for (const name of ['bad%.json', '%61lpha.json', '_61lpha.json', 'a_b.json', 'notes.txt']) {
+    const f = fixture(t); f.write(`${META_DIR}/settings/${name}`, {});
+    assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d/);
+  }
+  const f = fixture(t); f.write(`${META_DIR}/settings/broken.json`, {});
+  writeFileSync(join(f.root, META_DIR, 'settings/broken.json'), '{');
+  assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
+});
+
+test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', () => {
+  const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
+  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
+  // Reconciled snapshot includes this PR's providerRotation defaults and description.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
+  execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });

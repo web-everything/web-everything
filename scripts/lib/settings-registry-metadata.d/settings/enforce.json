@@ -1,0 +1,6 @@
+{
+  "description": "Enable Claude daemon account enforcement.",
+  "owner": "scripts/settings/claude-accounts.json",
+  "changeVia": "pr",
+  "instant": false
+}

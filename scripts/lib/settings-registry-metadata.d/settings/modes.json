@@ -1,0 +1,6 @@
+{
+  "description": "Instructions defining the available delivery modes.",
+  "owner": "scripts/settings/delivery-routes.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -324,7 +324,7 @@ it('trusted closure drift guard follows static local imports and pins the exact 
   const seen = closureImports();
   expect([...seen].sort()).toEqual([...advisory.GENERATED_MERGE_PATHS[DOC].closure].sort());
   expect(advisory.GENERATED_MERGE_PATHS[DOC]).toEqual({ closure: CLOSURE,
-    inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json',
+    inputs: ['scripts/settings/', 'scripts/dispatch-settings.json', 'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/',
       'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'], argv: ['--write'] });
   expect(Object.isFrozen(advisory.GENERATED_MERGE_PATHS)).toBe(true);
 });

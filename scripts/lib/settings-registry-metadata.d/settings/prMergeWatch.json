@@ -1,0 +1,6 @@
+{
+  "description": "PR progress, stuck-state and overdue CI thresholds.",
+  "owner": "scripts/settings/pr-merge-watch.json",
+  "changeVia": "pr",
+  "instant": false
+}

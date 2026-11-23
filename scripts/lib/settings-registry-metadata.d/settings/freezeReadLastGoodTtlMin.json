@@ -1,0 +1,6 @@
+{
+  "description": "Lifetime in minutes of the last good freeze read.",
+  "owner": "scripts/settings/red-main-hold.json",
+  "changeVia": "pr",
+  "instant": false
+}

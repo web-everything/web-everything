@@ -1,0 +1,6 @@
+{
+  "description": "Permit review while the base PR remains open.",
+  "owner": "scripts/settings/stack.json",
+  "changeVia": "pr",
+  "instant": false
+}
