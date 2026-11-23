@@ -1,30 +1,30 @@
 import { routeMqFailureOnHold } from './drain-mq-failure-recovery-io.mjs';
 
 /** One drain's pending best-effort routes; the recovery adapter owns head deduplication. */
-export function createDrainMqRouteWiring({ route = routeMqFailureOnHold, log = () => {}, waitMs = 5000 } = {}) {
+export function createDrainMqRouteWiring({ route = routeMqFailureOnHold, log = () => {} } = {}) {
   const pending = [];
+  let cursor;
+  const key = ({ repo, pr, head }) => `${repo}#${pr}@${head}`;
   const note = line => { try { log(line); } catch { /* Logging cannot change a hold. */ } };
   return {
     start({ repo, pr, head, guard, dryRun }) {
       if (guard?.hold !== true || dryRun || typeof guard.line !== 'string'
         || !guard.line.startsWith('mq-same-head-failed:')) return;
-      // Defer invocation so even a synchronous adapter failure cannot change the hold.
-      pending.push(Promise.resolve().then(() => route({ repo, pr, head, guard, dryRun, log }))
-        .catch(() => { note('mq-failure-recovery: route unavailable; hold retained, operator inspection required'); }));
+      pending.push({ repo, pr, head, guard, dryRun, log });
     },
     async settle() {
-      if (!pending.length) return;
-      const batch = pending.splice(0);
-      let timer;
-      try {
-        await Promise.race([
-          Promise.allSettled(batch),
-          new Promise(resolve => { timer = setTimeout(() => {
-            note('mq-failure-recovery: route wait bound reached; hold retained, operator inspection required');
-            resolve();
-          }, waitMs); }),
-        ]);
-      } finally { clearTimeout(timer); }
+      const candidates = pending.splice(0);
+      if (!candidates.length) return;
+      // Resume after the last attempted identity, using only this sweep's live holds.
+      const offset = (candidates.findIndex(args => key(args) === cursor) + 1) % candidates.length;
+      const ordered = [...candidates.slice(offset), ...candidates.slice(0, offset)];
+      const batch = ordered.slice(0, 3);
+      cursor = key(batch.at(-1));
+      for (const _deferred of ordered.slice(3))
+        note('mq-failure-recovery: route cap reached; hold retained, deferred to next sweep');
+      // Defer invocation so even synchronous adapter failures cannot change a hold.
+      await Promise.allSettled(batch.map(args => Promise.resolve().then(() => route(args))
+        .catch(() => { note('mq-failure-recovery: route unavailable; hold retained, operator inspection required'); })));
     },
   };
 }

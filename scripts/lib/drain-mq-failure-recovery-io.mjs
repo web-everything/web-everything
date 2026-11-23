@@ -108,7 +108,7 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
     const timeline = await active.readTimeline({ repo, pr });
     if (timeline?.error || timeline?.hasPreviousPage !== false || !Array.isArray(timeline?.nodes)
       || timeline.nodes.length > 100) return finish(false, 'Incomplete timeline; operator inspection required');
-    // Reuse the guard's second-parent validation; repeated failures only authorize a fixer.
+    // Reuse the guard's second-parent validation; repeated removals still require real-defect proof.
     const decision = decideMqSameHead({ ...identity, timeline });
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && event.reason?.trim().toLowerCase() === 'failed_checks'
@@ -133,8 +133,7 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
         throw new Error('Head or merge state changed; operator inspection required');
     };
     const result = await drainMqFailureRecovery({ removal,
-      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted,
-        forceFixer: retriesExhausted || removals.length > 1 },
+      hold: { reason: 'mq-same-head-failed', historyComplete: true, mergeState: 'CLEAN', retriesExhausted },
       dryRun: false, ledger: active.ledger,
       io: {
         collectEvidence: args => active.collectEvidence(args),

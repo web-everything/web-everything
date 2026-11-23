@@ -23,10 +23,11 @@ function fixture(mode = 'real') {
   const events = [event];
   if (mode === 'unknown event') events.push({ __typename: 'FutureMergeQueueEvent', createdAt: '2026-11-08T10:01:00Z' });
   if (mode === 'unknown reason') events.push({ ...structuredClone(event), reason: 'future_removal_reason', createdAt: '2026-11-08T10:01:00Z' });
-  if (['repeated matching removal', 'three matching removals'].includes(mode)) {
+  if (mode === 'repeated matching removal') events.push({ ...structuredClone(event), createdAt: '2026-11-08T10:01:00Z' });
+  if (['proven repeated removals', 'three matching removals', 'three unproven removals'].includes(mode)) {
     events.push({ ...structuredClone(event), createdAt: '2026-11-08T10:01:00Z' });
     event.beforeCommit.oid = 'e'.repeat(40); // Only the latest removal binds the run below.
-    if (mode === 'three matching removals') events.push(structuredClone(events[1]));
+    if (mode.startsWith('three ')) events.push(structuredClone(events[1]));
   }
   if (mode === 'retry exhausted') events.push({ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-08T10:01:00Z' });
   if (mode === 'oversized timeline') events.push(...Array.from({ length: 100 }, () => ({ __typename: 'AddedToMergeQueueEvent' })));
@@ -51,6 +52,8 @@ function fixture(mode = 'real') {
         : mode === 'ancestor unknown' ? {} : mode === 'ancestor behind' ? { status: 'ahead', behind_by: 1 }
         : { status: mode === 'identical ancestor' ? 'identical' : 'ahead', behind_by: 0 });
     }
+    if (endpoint?.includes('/actions/runs?') && ['repeated matching removal', 'three unproven removals'].includes(mode))
+      return JSON.stringify({ total_count: 0, workflow_runs: [] });
     if (endpoint?.includes('/actions/runs?')) return JSON.stringify({ total_count: mode === 'oversized runs' ? 1001 : 1,
       workflow_runs: [{ id: 701, event: 'merge_group', head_sha: mode === 'wrong run commit' ? 'd'.repeat(40) : mergeHead,
         head_branch: branch, conclusion: 'failure' }] });
@@ -105,19 +108,15 @@ describe('drain MQ failure production adapter', () => {
   });
 
   it.each(['unknown event', 'unknown reason', 'repeated matching removal'])(
-    'routes repeated failures and excludes unknown timeline history: %s', async mode => {
+    'excludes ineligible timeline history without publication: %s', async mode => {
       const f = fixture(mode);
-      if (mode === 'repeated matching removal') {
-        expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
-        expect(f.writes()).toHaveLength(2);
-        return;
-      }
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({
         routed: false, reason: expect.stringMatching(/operator inspection required/i),
       });
       expect(f.writes()).toEqual([]);
-      // These exclusions must win before any Actions evidence read or publication is attempted.
-      expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
+      // Unknown history is excluded before Actions reads; repeated removals need defect proof.
+      if (mode !== 'repeated matching removal')
+        expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
     });
 
   it('dryRun performs no reads, claims or writes and leaves a later real attempt eligible', async () => {
@@ -213,7 +212,7 @@ describe('drain production ancestry proof', () => {
 
 
 describe('held failures go to the fixer without retry authority', () => {
-  it.each(['refresh spent', 'repeated matching removal', 'three matching removals', 'real'])(
+  it.each(['refresh spent', 'proven repeated removals', 'three matching removals', 'real'])(
     '%s publishes a fixer-only route once and keeps the hold', async mode => {
       const f = fixture(mode);
       const before = structuredClone(f.options.guard);
@@ -240,16 +239,20 @@ describe('held failures go to the fixer without retry authority', () => {
 });
 
 
-describe('spent refresh cannot authorize a second refresh from diagnostic logs', () => {
-  it('spent refresh routes incomplete diagnostic evidence only to the fixer', async () => {
-    const f = fixture('refresh spent');
-    f.options.io = { ...f.options.io, forRoute: undefined,
-      collectEvidence: async () => ({ failedJobs: ['unit'], testFiles: [], assertions: [], complete: false }) };
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
-    const comment = f.writes().find(([, args]) => args[1] === 'comment');
-    const route = parseMqFailureRoute({ expected: identity,
-      comment: { body: comment[2].input, author: { login: 'chalbert' } } });
-    expect(route).toMatchObject({ fixerOnly: true, complete: false });
+describe('retry history never substitutes for real failure proof', () => {
+  it.each([
+    ['unreadable evidence with empty arrays and refresh spent', 'refresh spent',
+      { failedJobs: [], testFiles: [], assertions: [], complete: false }],
+    ['infra-only failure with refresh spent', 'refresh spent',
+      { failedJobs: ['unit'], testFiles: [], assertions: ['The runner has lost communication with the server.'], complete: true }],
+    ['incomplete diagnostic evidence with refresh spent', 'refresh spent',
+      { failedJobs: ['unit'], testFiles: [], assertions: [], complete: false }],
+    ['three removals with no failure proof', 'three unproven removals', null],
+  ])('%s never publishes', async (_name, mode, evidence) => {
+    const f = fixture(mode);
+    if (evidence) f.options.io = { ...f.options.io, forRoute: undefined, collectEvidence: async () => evidence };
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
     expect(f.options.guard).toEqual(guard);
+    expect(f.writes()).toEqual([]);
   });
 });

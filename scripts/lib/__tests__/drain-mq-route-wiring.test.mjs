@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDrainMqRouteWiring } from '../drain-mq-route-wiring.mjs';
 
 const guard = { hold: true, line: 'mq-same-head-failed: failed_checks' };
@@ -16,6 +16,7 @@ function enqueue(wiring, dryRun = false) {
     { enqueue: () => { throw new Error('hold must prevent enqueue'); } });
 }
 describe('drain same-head route wiring', () => {
+  afterEach(() => vi.useRealTimers());
   it.each([false, true])('dryRun=%s keeps enqueue false and routes only live holds', async dryRun => {
     const route = vi.fn(async () => ({ routed: true }));
     const wiring = createDrainMqRouteWiring({ route });
@@ -25,9 +26,12 @@ describe('drain same-head route wiring', () => {
     expect(route).toHaveBeenCalledTimes(dryRun ? 0 : 1);
     if (!dryRun) expect(route).toHaveBeenCalledWith(expect.objectContaining(identity));
   });
-  it('a synchronous route throw retains the hold and reports operator inspection', async () => {
+  it.each(['synchronous', 'asynchronous'])('%s route failure retains the hold and reports operator inspection', async kind => {
     const log = vi.fn();
-    const wiring = createDrainMqRouteWiring({ log, route: () => { throw new Error('unavailable'); } });
+    const wiring = createDrainMqRouteWiring({ log, route: () => {
+      if (kind === 'asynchronous') return Promise.reject(new Error('unavailable'));
+      throw new Error('unavailable');
+    } });
     const result = enqueue(wiring)({ num: 42 }, identity.head, {});
     await wiring.settle();
     expect(result).toMatchObject({ enqueued: false, reason: guard.line });
@@ -41,12 +45,49 @@ describe('drain same-head route wiring', () => {
     await wiring.settle();
     expect(route).not.toHaveBeenCalled();
   });
-  it('bounds settlement and reports the held operator fallback', async () => {
-    const log = vi.fn();
-    const wiring = createDrainMqRouteWiring({ log, waitMs: 1, route: () => new Promise(() => {}) });
+  it('awaits delayed mutations so nothing publishes after settlement returns', async () => {
+    vi.useFakeTimers();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const mutate = vi.fn();
+    const wiring = createDrainMqRouteWiring({ route: async () => { await gate; mutate(); } });
     wiring.start(identity);
+    let settled = false;
+    const settlement = wiring.settle().then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(5001);
+    expect(settled).toBe(false);
+    expect(mutate).not.toHaveBeenCalled();
+    release();
+    await settlement;
+    expect(mutate).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    expect(mutate).toHaveBeenCalledTimes(1);
+  });
+  it('caps each sweep at three routes, logs deferred holds, and resets after settlement', async () => {
+    const route = vi.fn(async () => ({ routed: true })), log = vi.fn();
+    const wiring = createDrainMqRouteWiring({ route, log });
+    for (let pr = 1; pr <= 5; pr++) wiring.start({ ...identity, pr });
     await wiring.settle();
-    expect(log).toHaveBeenCalledWith(expect.stringMatching(/wait bound.*hold retained.*operator inspection/));
+    expect(route.mock.calls.map(([args]) => args.pr)).toEqual([1, 2, 3]);
+    expect(log).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/cap reached.*hold retained.*next sweep/));
+    wiring.start({ ...identity, pr: 4 });
+    await wiring.settle();
+    expect(route).toHaveBeenCalledTimes(4);
+    expect(guard).toEqual({ hold: true, line: identity.guard.line });
+  });
+  it('repeated sweeps of the same five holds give every PR a turn even without publication', async () => {
+    const route = vi.fn(async () => ({ routed: false }));
+    const wiring = createDrainMqRouteWiring({ route });
+    for (let sweep = 0; sweep < 3; sweep++) {
+      for (let pr = 1; pr <= 5; pr++) wiring.start({ ...identity, pr });
+      await wiring.settle();
+      expect(route).toHaveBeenCalledTimes((sweep + 1) * 3);
+    }
+    const attempts = route.mock.calls.map(([args]) => args.pr);
+    expect(attempts).toEqual([1, 2, 3, 4, 5, 1, 2, 3, 4]);
+    expect(new Set(attempts)).toEqual(new Set([1, 2, 3, 4, 5]));
+    expect(guard).toEqual({ hold: true, line: identity.guard.line });
   });
   it('settles pending routes in the sweep finally, including early returns', () => {
     expect(source).toMatch(/const sweepOnce = async \(\) => \{\s*try \{/);

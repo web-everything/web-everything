@@ -54,17 +54,34 @@ describe('drain mq failure recovery', () => {
     expect(options.io.postComment).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['infra', 'incomplete', 'unreadable-history', 'conflicts', 'exhausted-retries', 'dry-run', 'other-hold', 'unknown-labels'])('does not route or claim for %s', async reason => {
+  it.each(['infra', 'incomplete', 'unreadable-history', 'conflicts', 'unknown-retries', 'dry-run', 'other-hold', 'unknown-labels'])('does not route or claim for %s', async reason => {
     const options = fixture();
     if (reason === 'infra') options.io.collectEvidence.mockResolvedValue({ failedJobs: ['unit'], testFiles: [], assertions: ['The runner has lost communication with the server.'], complete: true });
     if (reason === 'incomplete') options.io.collectEvidence.mockResolvedValue({ ...evidence, complete: false });
     if (reason === 'unreadable-history') options.hold.historyComplete = false;
     if (reason === 'conflicts') options.hold.mergeState = 'CONFLICTING';
-    if (reason === 'exhausted-retries') options.hold.retriesExhausted = true;
+    if (reason === 'unknown-retries') delete options.hold.retriesExhausted;
     if (reason === 'dry-run') options.dryRun = true;
     if (reason === 'other-hold') options.hold.reason = 'review-required';
     if (reason === 'unknown-labels') options.io.readLabels.mockResolvedValue({ labels: [], complete: false });
     expect(await drainMqFailureRecovery(options)).toMatchObject({ action: 'skip', note: expect.any(String) });
+    expectNoWrites(options);
+  });
+
+  it('spent retries still route proven real failures', async () => {
+    const options = fixture();
+    options.hold.retriesExhausted = true;
+    expect(await drainMqFailureRecovery(options)).toMatchObject({ action: 'routed' });
+  });
+
+  it.each([false, true])('forceFixer cannot bypass real proof or complete labels (retriesExhausted=%s)', async retriesExhausted => {
+    const options = fixture();
+    Object.assign(options.hold, { retriesExhausted, forceFixer: true });
+    options.io.collectEvidence.mockResolvedValue({ failedJobs: [], testFiles: [], assertions: [], complete: false });
+    expect(await drainMqFailureRecovery(options)).toMatchObject({ action: 'skip' });
+    options.io.collectEvidence.mockResolvedValue(evidence);
+    options.io.readLabels.mockResolvedValue({ labels: [], complete: false });
+    expect(await drainMqFailureRecovery(options)).toMatchObject({ action: 'skip' });
     expectNoWrites(options);
   });
 
