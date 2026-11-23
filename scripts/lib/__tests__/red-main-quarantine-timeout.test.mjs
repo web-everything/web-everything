@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runSafetyNet, readJobFailures, SAFETY_NET_LEDGER, SAFETY_NET_SHADOW_LOG } from '../red-main-quarantine-io.mjs';
@@ -30,7 +30,7 @@ function harness() {
       readJobs, readLog: () => readJobFailures(1, { exec: () => text, repoSlug: 'o/r' }),
       readList: () => ({ ok: true, list }), write, log, ...extra });
   }
-  return { tick, write, log, readJobs, list: () => list, ledger: () => JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')),
+  return { dir, tick, write, log, readJobs, list: () => list, ledger: () => JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')),
     lines: () => readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse),
     clear: () => { list = { version: 1, entries: [] }; } };
 }
@@ -65,6 +65,41 @@ it('live soak timeout quarantines at once without proof reads and protects the f
   expect(testsToSkip({ list: h.list(), now: Date.parse('2026-11-22T23:30:00Z'), prNumber: 99 })).toEqual([]);
   expect(h.ledger().tests[file].softQuarantines).toHaveLength(1);
   h.tick(); expect(h.ledger().tests[file].softQuarantines).toHaveLength(1);
+});
+it.each([false, true].flatMap(shadow => ['quarantine', 'alert', 'fix-card', 'all'].map(failed => ({ shadow, failed }))))(
+  'continues timeout outputs after a logger failure at $failed (shadow=$shadow)', ({ shadow, failed }) => {
+    const h = harness();
+    h.log.mockImplementation(line => {
+      const type = line.startsWith('red-main-quarantine: ') ? JSON.parse(line.slice('red-main-quarantine: '.length)).type : null;
+      if (failed === 'all' || type === failed) throw Error('logger unavailable');
+    });
+    const out = h.tick({ shadow });
+    expect(out.applied).toBe(!shadow);
+    expect(out.error).toBe('logger unavailable');
+    expect(h.lines().filter(o => o.type).map(o => o.type)).toEqual(['quarantine', 'alert', 'fix-card']);
+    expect(h.log.mock.calls.filter(([line]) => line.startsWith('red-main-quarantine: '))
+      .map(([line]) => JSON.parse(line.slice('red-main-quarantine: '.length)).type)).toEqual(['quarantine', 'alert', 'fix-card']);
+    expect(h.ledger()).toBeDefined();
+  },
+);
+it.each([false, true])('an unwritable JSONL still attempts every timeout log (shadow=%s)', shadow => {
+  const h = harness();
+  mkdirSync(join(h.dir, SAFETY_NET_SHADOW_LOG));
+  const out = h.tick({ shadow });
+  expect(out.applied).toBe(!shadow);
+  expect(out.error).toMatch(/EISDIR/);
+  expect(h.log.mock.calls.filter(([line]) => line.startsWith('red-main-quarantine: '))
+    .map(([line]) => JSON.parse(line.slice('red-main-quarantine: '.length)).type)).toEqual(['quarantine', 'alert', 'fix-card']);
+  if (shadow) expect(h.log).toHaveBeenCalledWith(expect.stringContaining('WOULD add'));
+  expect(h.ledger()).toBeDefined();
+});
+it('retries a fallback alert after a failed sink, then deduplicates successful delivery', () => {
+  const h = harness();
+  h.log.mockImplementationOnce(() => { throw Error('logger unavailable'); });
+  expect(h.tick({ soft: limits.hardMs }).error).toBe('logger unavailable');
+  h.tick({ soft: limits.hardMs });
+  h.tick({ soft: limits.hardMs });
+  expect(h.log.mock.calls.filter(([line]) => line.includes('"type":"alert"'))).toHaveLength(2);
 });
 it('soft-timeout entry stops being skipped after ttlMin', () => {
   const h = harness(), now = Date.parse('2026-11-22T23:30:00Z');

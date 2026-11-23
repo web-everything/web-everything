@@ -583,11 +583,20 @@ export function runSafetyNet({
     return out;
   } finally {
     const rec = ledger.reds[activeKey];
+    // A broken sink must not suppress the other sink or subsequent alerts/cards after publication.
+    const deliver = (line, message) => {
+      let delivered = true;
+      try {
+        mkdirSync(dirname(shadowPath), { recursive: true });
+        appendFileSync(shadowPath, JSON.stringify(line) + '\n');
+      } catch (e) { out.error ??= String(e?.message || e).split('\n')[0]; delivered = false; }
+      try { log(message); }
+      catch (e) { out.error ??= String(e?.message || e).split('\n')[0]; delivered = false; }
+      return delivered;
+    };
     const emit = (output) => {
       const line = { at: now, shadow: !isLive, ...output };
-      mkdirSync(dirname(shadowPath), { recursive: true });
-      appendFileSync(shadowPath, JSON.stringify(line) + '\n');
-      log(`red-main-quarantine: ${JSON.stringify(line)}`);
+      return deliver(line, `red-main-quarantine: ${JSON.stringify(line)}`);
     };
     try {
       for (const entry of out.plan?.entries ?? []) if (entry.timeout && out.events?.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type))) {
@@ -602,18 +611,17 @@ export function runSafetyNet({
       const alertState = rec ?? ledger;
       const signature = createHash('sha256').update(JSON.stringify([isLive, rec?.runKey, alerts])).digest('hex');
       if (alertState.alertSignature !== signature) {
-        for (const alert of alerts) emit(alert);
-        alertState.alertSignature = signature;
+        let delivered = true;
+        for (const alert of alerts) if (!emit(alert)) delivered = false;
+        if (delivered) alertState.alertSignature = signature;
       }
     } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     if (!isLive && out.plan && (shadowChanged || (state.status === 'red' && rec && rec.shadowWhy !== out.plan.why))) {
       const plan = out.plan;
       const line = { at: new Date(now).toISOString(), mode: mode.value, modeSource: mode.source, wouldDo: plan.action, tests: plan.tests ?? [], entries: plan.entries ?? [], cards: plan.cards ?? [], names: plan.names ?? [], fixPrs: plan.fixPrs ?? null, firstRedSha: sha, why: plan.why, settingsSources: settings.sources ?? {} };
       try {
-        mkdirSync(dirname(shadowPath), { recursive: true });
-        appendFileSync(shadowPath, JSON.stringify(line) + '\n');
-        if (rec) rec.shadowWhy = plan.why;
-        log(`red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${plan.action}${plan.tests?.length ? ` ${plan.tests.join(', ')}` : ''} — ${plan.why}`);
+        const delivered = deliver(line, `red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${plan.action}${plan.tests?.length ? ` ${plan.tests.join(', ')}` : ''} — ${plan.why}`);
+        if (delivered && rec) rec.shadowWhy = plan.why;
       } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     }
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
