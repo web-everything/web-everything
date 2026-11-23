@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 168 (170 declaration rows).
-- Declared leaves: 631 (platform copies counted separately).
-- Instant top-level keys: 4; not instant: 164.
+- Top-level keys: 170 (172 declaration rows).
+- Declared leaves: 636 (platform copies counted separately).
+- Instant top-level keys: 5; not instant: 165.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -61,10 +61,11 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | advisorySeats | scripts/settings/review.json | 1 | {"antigravityReview":"probation"} | pr | no | Provider advisory review seating policy. |
 | aiRouting | scripts/settings/ai-routing.json | 0 | {} | pr | no | AI role routing overrides; empty preserves existing resolvers. |
 | alertAfterMinutes | scripts/settings/forge-share.json | 1 | 60 | pr | no | Duration before low remote execution share raises an alert. |
+| allowedFiles | scripts/settings/build-priority-scope.json | 1 | [] | pr | yes | Exact-case WE files on pinned main. Empty refuses all scopes; add files via reviewed settings PR. Guard checks and unreadable/over-64-KiB evidence still refuse. |
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
-| audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
+| audit | scripts/settings/codex-audit.json | 12 | {"debounce":{"minutes":5},"delta":{"maxFiles":0},"verdict":… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
 | auditBar | scripts/settings/hotpatch.json | 1 | "no-pr-introduced-security" | pr | yes | Hotpatch security audit bar; ruled WEAKENED evidence remains unverifiable. |
 | auditRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/audits.jsonl" | pr | no | Audit coordination record location. |
 | authority | scripts/settings/orchestrator-authority.json | 1 | {"redMainQuarantine":false} | pr | no | Repository grant for orchestrator red-main quarantine authority. |
@@ -85,6 +86,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
+| ciUnitRerun | scripts/settings/ci-unit-rerun.json | 2 | {"enabled":false,"flakeAllowlist":[]} | pr | no | Control one bounded retry of failed unit files and the allowlist permitted to recover a shard. |
 | claudeHelper | scripts/settings/claude-helper.json | 1 | {"model":"claude-sonnet-5-5"} | pr | no | Default Claude helper and juror model. |
 | cloneMaintenance | scripts/settings/clone-maintenance.json | 1 | {"intervalMs":86400000} | pr | no | Interval between idle daemon clone garbage collections. |
 | codex | scripts/settings/codex.json | 30 | {"modelByTask":{"prepare":{"model":"gpt-6-astra","effort":"… | pr | no | Per-task Codex model, effort and pre-launch retry choices. |

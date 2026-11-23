@@ -5,8 +5,8 @@ import { spawnSync as realSpawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
-import { describe, it, expect, vi } from 'vitest';
-import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS } from '../codex-audit.mjs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CANONICAL_QUESTION, EXHAUSTIVE_INSTRUCTION, QUESTION_HASH, main, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes, MAX_PRIOR_WINDOW_MS, resolveEfficiencySettings } from '../codex-audit.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 import { canonicalAuditEvidence } from '../prototype-load.mjs';
 
@@ -576,4 +576,242 @@ it('round-2: malformed appended findings cannot erase a carried WEAKENED through
     expect(canonicalAuditEvidence(records, 'd'.repeat(40), () => true, fingerprint, { priorQuestionHashes: [] }))
       .toMatchObject({ ok: false, reason: 'weakened' });
   }
+});
+
+
+describe('debounce and delta audits', () => {
+  const PREV = 'c'.repeat(40), NEXT = 'd'.repeat(40);
+  const time = Date.parse(AT);
+  // The shipped default is delta OFF (maxFiles 0); these tests enable it explicitly.
+  beforeEach(() => { settingsOverride.text = JSON.stringify({ audit: { delta: { maxFiles: 5 } } }); });
+  afterEach(() => { settingsOverride.text = null; });
+  it('the shipped default config never writes a delta record', async () => {
+    settingsOverride.text = null;
+    const f = delta();
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
+    expect(f.records[0]).not.toHaveProperty('basis');
+    expect(f.deps.diffFiles).not.toHaveBeenCalled();
+  });
+  const basis = (over = {}) => ({ base: BASE, head: PREV, questionHash: QUESTION_HASH,
+    verdict: 'NOT WEAKENED', at: AT, findings: [], ...over });
+  function delta(records = [basis()], files = ['docs/a.md', 'docs/b.md']) {
+    const f = fixture();
+    Object.assign(f.deps, { nowMs: () => time, readRecords: vi.fn(() => records),
+      isAncestor: vi.fn(() => true), diffFiles: vi.fn(() => files) });
+    return f;
+  }
+  async function full(f) {
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.runCodex).toHaveBeenCalledOnce();
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
+    expect(f.records[0]).not.toHaveProperty('basis');
+  }
+  it('a second push within the debounce window cancels the pending audit and audits only the newest head once', async () => {
+    let clock = time, tip = HEAD;
+    const a = fixture();
+    Object.assign(a.deps, { nowMs: () => clock, branchTip: vi.fn(() => tip),
+      sleep: vi.fn(ms => { clock += Math.min(ms, 60_000); tip = NEXT; }) });
+    expect(await main([...ARGS, '--branch=lane/test'], a.deps)).toBe(4);
+    expect(a.deps.runCodex).not.toHaveBeenCalled();
+    expect(a.records).toEqual([]);
+    expect([...a.output, ...a.errors].join('')).toContain(`SUPERSEDED: branch moved to ${NEXT}; audit only the newest head`);
+    const b = fixture();
+    b.deps.resolveSha = vi.fn(ref => ref === 'origin/main' ? BASE : NEXT);
+    Object.assign(b.deps, { nowMs: () => clock, branchTip: vi.fn(() => tip),
+      sleep: vi.fn(ms => { clock += ms; }) });
+    const start = clock;
+    b.deps.runCodex.mockImplementation(() => { expect(clock - start).toBeGreaterThanOrEqual(300_000); return 'NOT WEAKENED'; });
+    expect(await main(['--base=origin/main', `--head=${NEXT}`, '--branch=lane/test'], b.deps)).toBe(0);
+    expect(b.deps.runCodex).toHaveBeenCalledOnce();
+    expect(b.records).toHaveLength(1);
+    expect(b.records[0].head).toBe(NEXT);
+  });
+  it('--now runs immediately without branchTip or sleep', async () => {
+    const f = fixture();
+    Object.assign(f.deps, { branchTip: vi.fn(), sleep: vi.fn(), nowMs: () => time });
+    expect(await main([...ARGS, '--now', '--branch=lane/test'], f.deps)).toBe(0);
+    expect(f.deps.branchTip).not.toHaveBeenCalled();
+    expect(f.deps.sleep).not.toHaveBeenCalled();
+  });
+  it('an undetermined branch runs immediately', async () => {
+    const f = fixture();
+    Object.assign(f.deps, { branchTip: vi.fn(() => null), sleep: vi.fn(), nowMs: () => time });
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.deps.sleep).not.toHaveBeenCalled();
+  });
+  it.each(['scripts/guard-a.mjs', 'scripts/nested/guard-a.mjs', 'scripts/readiness/forge-deploy.mjs'])('a changed guard or merge-path file forces full audit: %s', async file => {
+    await full(delta(undefined, [file]));
+  });
+  it('a WEAKENED basis is never reused even with a later pass on a non-ancestor head', async () => {
+    const f = delta([basis(), basis({ verdict: 'WEAKENED' }), basis({ head: NEXT })]);
+    f.deps.isAncestor.mockImplementation(sha => sha === PREV);
+    await full(f);
+  });
+  it.each([{ base: NEXT }, { questionHash: 'f'.repeat(64) }, { at: '2099-01-01' }, { at: 'invalid' },
+    { findings: ['WEAKENED'] }, { head: HEAD }])('invalid basis falls back to full: %j', async over => { await full(delta([basis(over)])); });
+  it('a non-ancestor basis falls back to full', async () => {
+    const f = delta(); f.deps.isAncestor.mockReturnValue(false); await full(f);
+  });
+  it.each(['isAncestor', 'readRecords', 'diffFiles'])('throwing %s falls back to full rather than skipping', async key => {
+    const f = delta(); f.deps[key].mockImplementation(() => { throw new Error('unreadable'); }); await full(f);
+  });
+  it.each([null, [], {}])('no readable usable ledger falls back to full: %j', async records => { await full(delta(records)); });
+  it('a delta over maxFiles falls back to full', async () => { await full(delta(undefined, Array.from({ length: 6 }, (_, i) => `docs/${i}.md`))); });
+  it.each([NEXT, null, ''])('finding 1: a delta record cannot become a basis, even with basis=%j', async prior => {
+    await full(delta([basis({ basis: prior })]));
+  });
+  it.each([
+    { verdict: 'WEAKENED' },
+    { verdict: 'WEAKENED', base: NEXT, at: 'invalid', findings: ['NOT WEAKENED'] },
+    { verdict: 'WEAKENED', questionHash: 'f'.repeat(64) },
+    { verdict: 'unknown' }, { at: 'invalid' }, { findings: ['WEAKENED'] },
+  ])('finding 2: any weakened or unreadable current-head record forces FULL: %j', async over => {
+    await full(delta([basis(), basis({ head: HEAD, ...over })]));
+  });
+  it.each([{ base: NEXT }, { base: NEXT, at: 'invalid', findings: ['NOT WEAKENED'] },
+    { questionHash: 'f'.repeat(64) }])('finding 3: any weakened basis record vetoes reuse across bases and states: %j', async over => {
+    await full(delta([basis({ verdict: 'WEAKENED', ...over }), basis()]));
+  });
+  it('finding 4: an uppercase weakened basis head vetoes a lowercase pass', async () => {
+    await full(delta([basis(), basis({ head: PREV.toUpperCase(), verdict: 'WEAKENED' })]));
+  });
+  it('finding 4: an uppercase weakened current head forces FULL', async () => {
+    await full(delta([basis(), basis({ head: HEAD.toUpperCase(), base: NEXT.toUpperCase(), verdict: 'WEAKENED' })]));
+  });
+  it('finding 4: uppercase passing base and head use the normalized exact delta', async () => {
+    const f = delta([basis({ base: BASE.toUpperCase(), head: PREV.toUpperCase() })]);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0].basis).toBe(PREV);
+    expect(f.deps.diffFiles).toHaveBeenCalledWith(PREV, HEAD);
+    expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${PREV}..${HEAD}\n`);
+  });
+  it('valid basis plus two ordinary files audits the delta and preserves exact findAudit binding', async () => {
+    const f = delta();
+    expect(await main(ARGS, f.deps)).toBe(0);
+    const prompt = f.deps.runCodex.mock.calls[0][0];
+    expect(prompt).toContain(CANONICAL_QUESTION);
+    expect(prompt).toContain(`git diff ${PREV}..${HEAD}\n`);
+    expect(prompt).toContain('already audited NOT WEAKENED');
+    expect(f.records[0]).toEqual({ at: AT, base: BASE, head: HEAD, baseRef: 'origin/main',
+      questionHash: QUESTION_HASH, verdict: 'NOT WEAKENED', findings: [], basis: PREV });
+    expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, now: time })).toBe(f.records[0]);
+    expect(f.deps.diffFiles).toHaveBeenCalledWith(PREV, HEAD);
+  });
+  it('latest usable ancestor wins by ledger order, not self-reported timestamp', async () => {
+    const f = delta([basis(), basis({ head: NEXT, at: '2026-10-31' })]);
+    expect(await main(ARGS, f.deps)).toBe(0);
+    expect(f.records[0].basis).toBe(NEXT);
+  });
+  it.each([0, -1, '5', null])('invalid debounce minutes %j uses five minutes, never zero', async minutes => {
+    settingsOverride.text = JSON.stringify({ audit: { debounce: { minutes } } });
+    const f = fixture(); let clock = time;
+    Object.assign(f.deps, { branchTip: vi.fn(() => HEAD), nowMs: () => clock, sleep: vi.fn(ms => { clock += ms; }) });
+    try {
+      expect(await main([...ARGS, '--branch=lane/test'], f.deps)).toBe(0);
+      expect(clock - time).toBe(300_000);
+    } finally { settingsOverride.text = null; }
+  });
+  it.each(['bad JSON', JSON.stringify({ audit: { delta: { maxFiles: -1 } } }), JSON.stringify({ audit: { delta: { maxFiles: '5' } } })])('unreadable or invalid delta setting disables delta: %s', async text => {
+    settingsOverride.text = text;
+    try { await full(delta()); } finally { settingsOverride.text = null; }
+  });
+});
+
+
+describe('debounce and delta real adapters', () => {
+  it('reads the same JSONL ledger that appendRecord writes', () => {
+    const f = adapter();
+    f.fs.readFileSync.mockImplementation(path => String(path).endsWith('prototype-load.json')
+      ? '{"auditRecordPath":"audit.jsonl"}' : JSON.stringify({ head: HEAD }) + '\n');
+    expect(f.deps.readRecords()).toEqual([{ head: HEAD }]);
+    f.deps.appendRecord({ head: HEAD });
+    expect(f.fs.readFileSync).toHaveBeenCalledWith('/repo/audit.jsonl', 'utf8');
+    expect(f.fs.appendFileSync.mock.calls[0][0]).toBe('/repo/audit.jsonl');
+  });
+  it('gets the pushed branch tip and derives only a single matching lane branch', () => {
+    const f = adapter();
+    f.spawnSync.mockReturnValue({ status: 0, stdout: `${HEAD}\trefs/heads/lane/test\n` });
+    expect(f.deps.branchTip('lane/test')).toBe(HEAD);
+    expect(f.spawnSync.mock.calls[0][1]).toEqual(['ls-remote', '--heads', 'origin', 'refs/heads/lane/test']);
+    expect(f.deps.findBranch(HEAD)).toBe('lane/test');
+    f.spawnSync.mockReturnValue({ status: 0, stdout: `${HEAD}\trefs/heads/lane/a\n${HEAD}\trefs/heads/lane/b\n` });
+    expect(f.deps.findBranch(HEAD)).toBeNull();
+  });
+  it('uses strict ancestry and exact two-dot file differences including renamed old paths', () => {
+    const f = adapter();
+    f.spawnSync.mockReturnValue({ status: 1, stdout: '' });
+    expect(f.deps.isAncestor(BASE, HEAD)).toBe(false);
+    f.spawnSync.mockReturnValue({ status: 0, stdout: '' });
+    expect(f.deps.isAncestor(BASE, HEAD)).toBe(true);
+    expect(f.deps.isAncestor(HEAD, HEAD)).toBe(false);
+    f.spawnSync.mockReturnValue({ status: 0, stdout: 'docs/a.md\0docs/b.md\0' });
+    expect(f.deps.diffFiles(BASE, HEAD)).toEqual(['docs/a.md', 'docs/b.md']);
+    expect(f.spawnSync.mock.calls.at(-1)[1]).toEqual(['diff', '--name-only', '--no-renames', '-z', `${BASE}..${HEAD}`, '--']);
+    f.spawnSync.mockReturnValue({ status: 128, stdout: '' });
+    expect(() => f.deps.isAncestor(BASE, HEAD)).toThrow();
+  });
+});
+
+
+describe('efficiency settings and late pushes', () => {
+  it('honors configured debounce and derives a lane branch when omitted', async () => {
+    settingsOverride.text = JSON.stringify({ audit: { debounce: { minutes: 2 } } });
+    let clock = Date.parse(AT);
+    const start = clock, f = fixture();
+    Object.assign(f.deps, { findBranch: vi.fn(() => 'lane/test'), branchTip: vi.fn(() => HEAD),
+      nowMs: () => clock, sleep: vi.fn(ms => { clock += ms; }) });
+    try {
+      expect(await main(ARGS, f.deps)).toBe(0);
+      expect(clock - start).toBe(120_000);
+      expect(f.deps.findBranch).toHaveBeenCalledWith(HEAD);
+      expect(f.deps.branchTip).toHaveBeenCalledWith('lane/test');
+    } finally { settingsOverride.text = null; }
+  });
+  it('does not publish a record if the branch moves while Codex is running', async () => {
+    let clock = Date.parse(AT), tip = HEAD;
+    const f = fixture();
+    Object.assign(f.deps, { branchTip: vi.fn(() => tip), nowMs: () => clock,
+      sleep: vi.fn(ms => { clock += ms; }) });
+    f.deps.runCodex.mockImplementation(() => { tip = BASE; return 'NOT WEAKENED'; });
+    expect(await main([...ARGS, '--branch=lane/test'], f.deps)).toBe(4);
+    expect(f.records).toEqual([]);
+  });
+  it.each(['--branch=../lane', '--branch=-lane', '--branch=lane/test\n', '--now=true'])('rejects malformed new flags: %s', async flag => {
+    const f = fixture(); expect(await main([...ARGS, flag], f.deps)).toBe(2);
+    expect(f.deps.runCodex).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('efficiency settings cascade', () => {
+  const resolve = (audit, extra = {}) => resolveEfficiencySettings({ readFile: () => JSON.stringify({ audit }),
+    platform: null, env: {}, log: () => {}, ...extra });
+  it('defaults missing efficiency keys to five, using a Node file URL for real settings', () => {
+    expect(resolve({})).toEqual({ minutes: 5, maxFiles: 0 });
+    const readFile = vi.fn(path => { expect(path).toBeInstanceOf(NodeURL); return '{"audit":{}}'; });
+    expect(resolve({}, { readFile })).toEqual({ minutes: 5, maxFiles: 0 });
+  });
+  it('unreadable settings fall back to five minutes and FULL', () => {
+    expect(resolve({}, { readFile: () => { throw new Error('unreadable'); } })).toEqual({ minutes: 5, maxFiles: 0 });
+  });
+  it('cascades standard, platform, tool and tightening environment values', () => {
+    expect(resolve({ delta: { maxFiles: 4 } }, { platform: { debounce: { minutes: 2 }, delta: { maxFiles: 3 } },
+      env: { WE_AUDIT_DELTA_MAX_FILES: '1', WE_AUDIT_DEBOUNCE_MINUTES: '3' } })).toEqual({ minutes: 3, maxFiles: 1 });
+    expect(resolve({ delta: { maxFiles: 2 } }, { env: { WE_AUDIT_DELTA_MAX_FILES: '9' } }).maxFiles).toBe(2);
+  });
+  it.each([{}, null, [], 'invalid'])('malformed delta section %j disables delta', section => {
+    expect(resolve({ delta: section }).maxFiles).toBe(0);
+  });
+  it.each([{}, { nested: 1 }, [], '5', null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'finding 5: raw invalid maxFiles %j disables delta in either layer with fallback warning', maxFiles => {
+      for (const layer of ['tool', 'platform']) {
+        const log = vi.fn();
+        const audit = { delta: { maxFiles } };
+        expect(resolve(layer === 'tool' ? audit : {}, {
+          platform: layer === 'platform' ? audit : null, log,
+        }).maxFiles).toBe(0);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('delta.maxFiles=0 (fallback; 0 means FULL)'));
+      }
+    });
 });

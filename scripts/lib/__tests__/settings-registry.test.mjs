@@ -210,7 +210,10 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
-const shadowRotationDescription = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
+// Migration checks cover the historical roster. The live inventory/drift test above
+// validates every current key, including settings added after the migration.
+const originalKey = key => Object.hasOwn(originalMetadata.settings, key);
+const originalRegistry = registry => ({ ...registry, rows: registry.rows.filter(row => originalKey(row.key)) });
 function originalFixture(t) {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
@@ -219,7 +222,7 @@ function originalFixture(t) {
   for (const owner of owners) {
     const declared = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
     f.write(owner, Object.fromEntries(Object.entries(declared).filter(([key]) =>
-      key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
+      key.startsWith('$comment') || originalKey(key))));
   }
   Object.assign(f.meta, structuredClone(originalMetadata));
   return f;
@@ -245,16 +248,17 @@ test('migration preserves the registry built from the original repository metada
   assert.deepEqual(f.build(), before);
 });
 test('migration preserves the original registry plus the intentional shadow rotation description', t => {
-  const f = originalFixture(t);
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  const current = originalRegistry(buildRegistry());
+  for (const owner of new Set(current.rows.flatMap(row => row.owners))) {
+    const declarations = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
+    f.write(owner, Object.fromEntries(Object.entries(declarations).filter(([key]) => originalKey(key) || key.startsWith('$comment'))));
+  }
   const expectedMetadata = structuredClone(originalMetadata);
-  expectedMetadata.settings.providerRotation.description = shadowRotationDescription;
-  Object.assign(f.meta, expectedMetadata);
-  const before = f.build();
-  assert.deepEqual(before.problems, []);
-  split(f);
-  assert.deepEqual(readMetadata({ root: f.root }), expectedMetadata);
-  assert.deepEqual(f.build(), before);
-  assert.equal(readMetadata().settings.providerRotation.description, shadowRotationDescription);
+  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
+  f.write(META, expectedMetadata);
+  assert.deepEqual(current, buildRegistry({ root: f.root }));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -368,13 +372,19 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', t => {
-  const f = originalFixture(t);
-  f.meta.settings.providerRotation.description = shadowRotationDescription;
-  const doc = renderMarkdown(f.build());
+test('generated documentation matches the historical shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
+  const doc = renderMarkdown(originalRegistry(buildRegistry()));
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Snapshot includes the intentional shadow rotation defaults and description.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
+  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
+});
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });

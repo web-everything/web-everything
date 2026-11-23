@@ -40,3 +40,5 @@ Write the new adapter tests first (RED: adapter absent). Include missing owner/m
 ## Scope budget and Follow-ups
 
 Predicted implementation: 2 explicit paths; one WIP area. Even allowing this WE backlog card as one bookkeeping path/area stays below 20 paths and 4 areas. No broad directory scope. If prerequisite drift changes the touch-set, re-probe and re-slice before exceeding the gate. Record testing lessons here, never in shared agent docs. Arbitrary custom-log registration/heartbeat remains a separate producer follow-up; keep discovery coverage partial until proven.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

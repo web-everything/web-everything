@@ -1,0 +1,25 @@
+{
+  "policyType": "https://everstandards.dev/ship/test-timeout-policy/v0.1",
+  "id": "https://everstandards.dev/ship/fixtures/ours/test-timeout-policy/company",
+  "level": "company",
+  "all": {
+    "soft": "PT5S",
+    "hard": "PT10S",
+    "headroom": 0.1,
+    "escalation": {
+      "count": 2,
+      "window": "PT24H"
+    },
+    "release": {
+      "passes": 3
+    },
+    "runnerKillAtHard": false
+  },
+  "jobs": {},
+  "tests": {
+    "scripts/conveyor/soak/daemon-soak.soak.test.mjs": {
+      "soft": "PT17M",
+      "hard": "PT34M"
+    }
+  }
+}

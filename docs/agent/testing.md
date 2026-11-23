@@ -6362,6 +6362,26 @@ in-process sweep. Persist the retry identity in job input to dedupe the enqueue-
 The shard plan comes from `origin/main` and shards must share the selected test check's suite.
 `daemon-overlay.test.mjs` also exercises the real add lock and store: a green preflight cannot
 authorize add after CI turns red. Keep the production readers independent of lifecycle effects.
+## Build-priority named-file allowlist fixtures
+
+The shipped `scripts/settings/build-priority-scope.json` has `allowedFiles: []`.
+An empty array is valid settings evidence and refuses every scope with
+`allowlist is empty; add the file by a reviewed settings PR`. Missing or unreadable
+settings, a missing key, non-array values, non-string entries and inexact paths
+still refuse as invalid evidence. Tests needing listed files must inject
+`readScopeSettings` with an explicit allowlist; real Git reader tests commit their
+own settings blob and pin it with the card snapshot. Never depend on a shipped seed.
+
+Runtime scope protection imports the immutable vocabulary from `guard-path-floor.mjs`
+and the matcher from `audit-path.mjs`. The audit settings resolver and verdict engine
+remain inert. Keep the import-graph assertion in `build-priority-set.test.mjs` alongside
+the repository-wide inertness check in `audit-verdict.test.mjs`; protected module names
+in `guard-auditor-roots.json` are path data, not module dependencies. The existing audit
+exports re-export the shared vocabulary and matcher so their callers keep the same API.
+
+Settings-registry migration checks use the key roster in the immutable original metadata
+fixture. Compare historical declarations and rendered bytes within that roster; keep the
+live inventory and committed-document drift check responsible for subsequently added keys.
 ## Provider rotation shadow (PROV-AB S1.2)
 
 `provider-rotation.test.mjs` and `provider-rotation-shadow.test.mjs` cover the pure engine and the
@@ -6399,3 +6419,34 @@ Merge-path checklist answers (this slice observes seat selection and has no gate
 | 13 Liveness | No agent process is launched and no verdict is recorded by the observer; thrown-draw tests preserve the completed run. |
 | 14 Simplicity | One stateless append hook and one append-only sidecar; no retry machinery, markers or second scorecard rewrite. Byte comparisons and one-line-per-run assertions enforce the boundary. |
 - [Testing topic notes and authoring guidance](testing/README.md)
+
+
+## Test timing ownership
+
+The scheduled bot refresh (`.github/workflows/ci-timings-refresh.yml`, currently weekly)
+owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks should
+leave that file to the bot. Files without entries in that shared sharding map get their
+suite's median stored timing and still land in exactly one shard.
+
+Added and renamed soak tests need neither a shared timing entry nor a timing sidecar
+for PR admission. The scheduled refresh currently updates unit timings and preserves
+existing soak timings; new soak tests use the median fallback until measured data
+is added by a bot refresh. PR authors do not supply timing metadata.
+The named test `assigns an unknown file exactly once using its suite median` in
+`scripts/ci/__tests__/shard-assign.test.mjs` defends the fallback weight and unique assignment.
+The precheck reads `git diff --name-status -z`, preserving Unicode, quotes, tabs,
+newlines, backslashes and trailing spaces in filenames. Rename/copy scores include
+Git's padded forms such as `R095` and `C075`; only destination paths count as replay
+evidence. Type changes are modifications. Unmerged/unknown statuses refuse only for
+daemon-soak paths; unrelated files do not supply replay evidence. An unavailable or
+malformed diff still refuses admission: restore the base/source commits or resolve
+the unsupported records and retry. This fail-closed diff policy is independent of
+timing ownership.
+The PR-open soak precheck also requires break coverage for daemon-scope bug fixes as
+before. The balance diagnostic still requires measurements for every file before
+claiming measured balance; it is not a PR admission requirement.
+
+Before changing an admission gate, compare each PREP acceptance line with the net
+behavior change. Every new refusal path needs explicit authorization in the card;
+keep a deterministic test for admission without timing metadata so a separate
+measurement policy cannot silently reintroduce per-PR timing work.
