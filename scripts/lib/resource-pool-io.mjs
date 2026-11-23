@@ -5,7 +5,8 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { budgetFromSnapshot } from './resource-pool.mjs';
 import { readPoolLaneStatus, poolLaneLeased } from './resource-pool-lanes.mjs';
-import { admissionLockRoot, resolveCap, resolveFastSlots, slotPath } from '../readiness/heavy-admission.mjs';
+import { admissionLockRoot, loadAdmissionPolicy, resolveSlotSpan, slotPath } from '../readiness/heavy-admission.mjs';
+import { EXEMPT_DISPATCH_KINDS, PREPARE_DISPATCH_KINDS } from '../readiness/heavy-queue-projection.mjs';
 import { hostname } from 'node:os';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { fixDispatchClaimRoot, fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from '../conveyor/fix-claim-store.mjs';
@@ -41,13 +42,16 @@ const list = path => {
 };
 /** The tolerant admission status reader can hide malformed lock.json: validate each slot directly. */
 export function readPoolHeavyHeld({ env = process.env, root = admissionLockRoot(process.cwd(), env),
-  cap = resolveCap(env) + resolveFastSlots(env) } = {}) {
+  cap = resolveSlotSpan(loadAdmissionPolicy({ env }).settings) } = {}) {
   if (!Number.isSafeInteger(cap) || cap < 1 || cap > 20000) throw Error('invalid heavy capacity; inspect settings manually');
+  if (!fs.lstatSync(root).isDirectory()) throw Error('invalid heavy root; inspect admission manually');
   const held = [];
   for (let i = 0; i < cap; i++) {
     const dir = lockDirFor(root, slotPath(i));
     try { if (!fs.lstatSync(dir).isDirectory()) throw Error('invalid heavy slot directory'); }
-    catch (e) { if (e.code === 'ENOENT') continue; throw e; }
+    catch (e) { if (e.code !== 'ENOENT') throw e;
+      if (!fs.lstatSync(root).isDirectory()) throw Error('heavy root disappeared; inspect admission manually');
+      continue; }
     const raw = json(join(dir, 'lock.json'));
     if (!parseLockEntry(JSON.stringify(raw))) throw Error('malformed heavy slot; inspect admission manually');
     held.push(raw);
@@ -120,7 +124,10 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
       if (!Array.isArray(heavy?.held) || heavy.held.length > 20000) throw Error('invalid heavy held inventory; inspect heavy-admission manually');
       for (const row of heavy.held) {
         if (!object(row) || !object(row.meta)) throw Error('unknown heavy holder identity; inspect heavy-admission manually');
-        if (!['fix', 'ci-heal'].includes(row.meta.dispatchKind)) continue;
+        if (!['fix', 'ci-heal'].includes(row.meta.dispatchKind)) {
+          if (['build', ...EXEMPT_DISPATCH_KINDS, ...PREPARE_DISPATCH_KINDS].includes(row.meta.dispatchKind)) continue;
+          throw Error('unknown heavy holder identity; inspect heavy-admission manually');
+        }
         const lane = typeof row.owner === 'string' ? row.owner.replace(/#\d+$/, '') : null;
         if (!lane) throw Error('unknown heavy holder lane; inspect heavy-admission manually');
         if (lanes.has(lane)) continue;
@@ -154,6 +161,7 @@ export function readPoolSource(source, { paths, coord, env = process.env, nowMs 
         if (!['running', 'queued'].includes(row.status)) continue;
         if (row.pid == null) throw Error(`unknown red-team liveness: ${entry.name}; missing pid; inspect status manually`);
         if (!Number.isSafeInteger(row.pid) || row.pid <= 0) throw Error(`invalid red-team pid: ${entry.name}`);
+        if (typeof row.pidStart !== 'string' || !row.pidStart.trim()) throw Error(`invalid red-team pidStart: ${entry.name}`);
         const alive = slotAlive(row, { statusAt });
         if (typeof alive !== 'boolean') throw Error(`unknown red-team liveness: ${entry.name}; inspect host/process access`);
         if (alive) add('redTeam', `${row.repo}:${row.pr}:${row.head}`, 2, 1);

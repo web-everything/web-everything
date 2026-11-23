@@ -41,7 +41,7 @@ const lease = () => ({ session: 'fix-1', acquiredAt: new Date(1000).toISOString(
 const snap = () => ({ sampledAt: new Date(1000).toISOString(), freshUntil: new Date(3000).toISOString(),
   memory: { availableMb: 40000, floorMb: 4000, swapUsedPct: 10, swapGrowthMb: 0, pressureLevel: 1 }, cpu: { idlePct: 40 } });
 const head = 'a'.repeat(40), filename = `we-12-${head}.json`;
-const status = () => ({ repo: 'we', pr: 12, head, status: 'running', pid: 123 });
+const status = () => ({ repo: 'we', pr: 12, head, status: 'running', pid: 123, pidStart: 'owner-start' });
 beforeEach(() => {
   coord = fs.mkdtempSync(join(tmpdir(), 'resource-pool-'));
   paths = { snapshot: join(coord, 'resource', 'snapshot.json'), fix: join(coord, 'fix'), redTeam: join(coord, 'red-team') };
@@ -187,4 +187,62 @@ it('bounded JSON reads reject nonobjects, nonfiles and growth after fstat, and c
   const closeSync = vi.fn(), io = { openSync: () => 1, fstatSync: () => ({ isFile: () => true, size: 1 }),
     readSync: () => 2, closeSync };
   expect(() => readPoolJson('virtual', { io })).toThrow(/grew/); expect(closeSync).toHaveBeenCalledWith(1);
+});
+it('rejects future, over-age and overlong snapshot evidence with an inspect-and-rerun fallback', () => {
+  const clock = Date.parse('2026-11-23T12:00:00Z'), window = 5 * 60 * 1000;
+  for (const [sample, until] of [[clock + 1, clock + window], [clock - window - 1, clock + 1],
+    [clock, clock + window + 1], [Date.parse('2000-01-01'), Date.parse('2099-01-01')]]) {
+    fs.writeFileSync(paths.snapshot, JSON.stringify({ ...snap(), sampledAt: new Date(sample).toISOString(),
+      freshUntil: new Date(until).toISOString() }));
+    expect(read('snapshot', { nowMs: clock })).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+  }
+  fs.writeFileSync(paths.snapshot, JSON.stringify({ ...snap(), sampledAt: new Date(clock - window).toISOString(),
+    freshUntil: new Date(clock).toISOString() }));
+  expect(read('snapshot', { nowMs: clock })).toMatchObject({ ok: true, budget: { unknown: false } });
+});
+it('scans scaled heavy slots beyond cap plus fastSlots using admission settings', () => {
+  const root = join(coord, 'heavy'), dir = lockDirFor(root, 'slot-4'); fs.mkdirSync(dir, { recursive: true });
+  const preferences = join(coord, 'preferences.json');
+  fs.writeFileSync(preferences, JSON.stringify({ heavyAdmission: { cap: 2, fastSlots: 1, fastScale: { maxSlots: 3 } } }));
+  const row = { owner: 'lane#123', heartbeatAt: new Date(nowMs).toISOString(), meta: { dispatchKind: 'fix' } };
+  fs.writeFileSync(join(dir, 'lock.json'), JSON.stringify(row));
+  expect(readPoolHeavyHeld({ root, env: { ...env, WE_PLATFORM_PREFERENCES: preferences } })).toEqual({ held: [row] });
+  fs.writeFileSync(join(dir, 'lock.json'), '{}');
+  expect(read('workers', { heavyStatus: () => readPoolHeavyHeld({ root,
+    env: { ...env, WE_PLATFORM_PREFERENCES: preferences } }) })).toMatchObject({ ok: false });
+});
+it('missing heavy root is unknown while missing individual slots in an existing root are empty', () => {
+  const root = join(coord, 'missing-heavy'), heavyStatus = () => readPoolHeavyHeld({ root, cap: 2 });
+  expect(() => heavyStatus()).toThrow();
+  expect(read('workers', { heavyStatus })).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+  fs.mkdirSync(root);
+  expect(read('workers', { heavyStatus })).toMatchObject({ ok: true, holders: [] });
+});
+it.each([undefined, null, '', 'unknown', 'fix-1', 3])('unknown heavy dispatchKind %s fails closed', dispatchKind => {
+  expect(read('workers', { heavyStatus: () => ({ held: [{ owner: laneDir, meta: { dispatchKind } }] }) }))
+    .toMatchObject({ ok: false, error: expect.stringContaining('unknown heavy holder identity') });
+});
+it.each(['build', 'review', 'prepare', 'prepare-scope', 'prepare-decision', 'prepare-item', 'investigate'])(
+  'known non-fix heavy dispatchKind %s is empty', dispatchKind => {
+    expect(read('workers', { heavyStatus: () => ({ held: [{ meta: { dispatchKind } }] }) }))
+      .toMatchObject({ ok: true, holders: [] });
+  });
+it.each([undefined, null, '', ' ', 123, false, {}, []])('malformed red-team pidStart %j is unknown before probing', pidStart => {
+  fs.writeFileSync(join(paths.redTeam, filename), JSON.stringify({ ...status(), pidStart }));
+  const slotAlive = vi.fn(() => false);
+  expect(read('redTeam', { slotAlive })).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it.each([undefined, null, 0, -1, 1.5, '123', Number.MAX_SAFE_INTEGER + 1])('malformed red-team pid %s is unknown before probing', pid => {
+  fs.writeFileSync(join(paths.redTeam, filename), JSON.stringify({ ...status(), pid }));
+  const slotAlive = vi.fn(() => false);
+  expect(read('redTeam', { slotAlive })).toMatchObject({ ok: false });
+  expect(slotAlive).not.toHaveBeenCalled();
+});
+it('valid red-team identity delegates to the real probe for live, replaced and dead processes', () => {
+  fs.writeFileSync(join(paths.redTeam, filename), JSON.stringify(status()));
+  expect(read('redTeam', { slotAlive: undefined, processAlive: () => true, readStart: () => 'owner-start' }))
+    .toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
+  for (const options of [{ processAlive: () => false }, { processAlive: () => true, readStart: () => 'replacement' }])
+    expect(read('redTeam', { slotAlive: undefined, ...options })).toMatchObject({ ok: true, holders: [] });
 });
