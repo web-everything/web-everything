@@ -1,0 +1,5 @@
+{
+  "description": "Class 3 reserve policy, validated and retained for later pool slices.",
+  "range": "integer 0–64",
+  "unit": "units"
+}

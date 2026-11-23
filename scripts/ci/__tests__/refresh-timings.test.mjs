@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -52,6 +52,8 @@ function writeCi(shards) {
 }
 const tenShards = Array.from({ length: 10 }, (_, i) => i + 1);
 beforeEach(() => {
+  vi.stubEnv('GITHUB_ACTIONS', 'true');
+  vi.stubEnv('GITHUB_WORKFLOW', 'Refresh CI test timings');
   root = mkdtempSync(join(tmpdir(), 'refresh-timings-'));
   repoRoot = join(root, 'repo');
   dir = join(root, 'reports');
@@ -65,7 +67,7 @@ beforeEach(() => {
   writeFileSync(timingsFile, original);
   writeCi(tenShards);
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
 describe('refresh-timings recursive report fold', () => {
   it('finds nested unit reports, ignores soak and unrelated JSON, and uses the existing timing fold', async () => {
@@ -88,6 +90,24 @@ describe('refresh-timings recursive report fold', () => {
 });
 
 describe('refresh-timings safety rails', () => {
+  it.each([
+    ['false', 'Refresh CI test timings'],
+    ['true', 'CI'],
+    ['', ''],
+  ])('refuses non-owner environment %s/%s before writing or downloading', async (actions, workflow) => {
+    vi.stubEnv('GITHUB_ACTIONS', actions);
+    vi.stubEnv('GITHUB_WORKFLOW', workflow);
+    seed();
+    const result = await refreshFromDir({ dir, timingsFile, repoRoot });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/bot owns.*test-timings.json.*ci-timings-refresh/);
+    const exec = vi.fn();
+    await expect(main(['--runs=1'], { exec })).rejects.toThrow(/bot owns/);
+    expect(exec).not.toHaveBeenCalled();
+    expect(cli().status).toBe(2);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
   it('refuses an outside-checkout report even with complete inventory coverage, preserving existing bytes', async () => {
     seed();
     writeReport(10, withResults(files[9], { name: join(root, 'outside.test.mjs'), startTime: 0, endTime: 1000 }));

@@ -1,0 +1,5 @@
+{
+  "description": "Protected builder capacity floor in shadow allocation decisions.",
+  "range": "integer 0–64",
+  "unit": "units"
+}

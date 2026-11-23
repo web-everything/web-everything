@@ -247,16 +247,34 @@ describe('CI gate mirroring fails closed', () => {
     ]);
   });
   const real = yaml.safeLoad(workflow);
-  it.each(['Record shard start', 'Measure shard resources'])(
+  it.each(['Enforce bot-owned test timings', 'Record shard start', 'Measure shard resources'])(
     'refuses changed or missing %s commands rather than trusting workflow text', name => {
       const changed = yaml.safeLoad(workflow);
-      const steps = changed.jobs['test-shard'].steps;
+      const steps = changed.jobs[name === 'Enforce bot-owned test timings' ? 'changes' : 'test-shard'].steps;
       const index = steps.findIndex(step => step.name === name);
       expect(index).toBeGreaterThanOrEqual(0);
       steps[index].run += '\necho unmirrored-command';
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
       steps.splice(index, 1);
       expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+    });
+  it.each(['GITHUB_EVENT_NAME', 'GH_TOKEN', 'REPO', 'PR_NUMBER', 'HEAD_REF', 'HEAD_SHA', 'AUTHOR', 'HEAD_REPO'])(
+    'pins the bot-owned timings event binding %s', field => {
+      for (const value of [undefined, 'unexpected']) {
+        const changed = yaml.safeLoad(workflow);
+        const step = changed.jobs.changes.steps.find(step => step.name === 'Enforce bot-owned test timings');
+        if (value === undefined) delete step.env[field];
+        else step.env[field] = value;
+        expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('changes step execution context; update the urgent verification mirror');
+      }
+    });
+  it.each([undefined, "github.event_name == 'push'"])(
+    'refuses a changed bot-owned timings PR condition %s', condition => {
+      const changed = yaml.safeLoad(workflow);
+      const step = changed.jobs.changes.steps.find(step => step.name === 'Enforce bot-owned test timings');
+      if (condition === undefined) delete step.if;
+      else step.if = condition;
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('changes step execution context; update the urgent verification mirror');
     });
   it('pins the completed-shard timing validation script in the required test aggregator', () => {
     const changed = yaml.safeLoad(workflow);
