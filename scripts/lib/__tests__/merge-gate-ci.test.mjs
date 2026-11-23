@@ -1321,11 +1321,6 @@ describe('merge-gate-check.mjs main() (spawned CLI)', () => {
 const a = process.argv.slice(2).join(' ');
 const out = (o) => { process.stdout.write(JSON.stringify(o)); process.exit(0); };
 if (/^repo view/.test(a)) out({ defaultBranchRef: { name: 'main' } });
-if (/^pr view \\d+ .*--json headRefOid$/.test(a)) { process.stdout.write(process.env.FAKE_HEAD_JSON || 'null'); process.exit(0); }
-if (a === 'api repos/o/r/actions/runs?head_sha=' + process.env.FAKE_HEAD_SHA + '&event=pull_request&per_page=100') {
-  if (process.env.FAKE_RUNS_ERROR) process.exit(1);
-  process.stdout.write(process.env.FAKE_RUNS_JSON || 'null'); process.exit(0);
-}
 if (/^pr view \\d+ .*--json number,title/.test(a)) { if (process.env.EVALUATION_MARKER) require('node:fs').writeFileSync(process.env.EVALUATION_MARKER, 'evaluator reached'); out(JSON.parse(process.env.FAKE_PR_JSON)); }
 if (/userContentEdits/.test(a)) out({ data: { repository: { pullRequest: { userContentEdits: { totalCount: 0, nodes: [] } } } } });
 if (/mergeQueue/.test(a)) out({ data: { repository: { mergeQueue: { entries: { nodes: [] } } } } });
@@ -1367,54 +1362,37 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
     ctx.git(ctx.work, 'checkout', '--quiet', '-b', 'lane/x');
     const edited = ctx.commit('lane/x', WF, 'name: Edited gate\n');
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request', GITHUB_WORKFLOW_REF: `o/r/${WF}@refs/pull/7/merge`, GITHUB_WORKFLOW_SHA: edited,
-      GITHUB_RUN_ID: '123', FAKE_HEAD_SHA: edited, FAKE_HEAD_JSON: JSON.stringify({ headRefOid: edited }), EVALUATION_MARKER: join(ctx.clone, 'evaluation-marker') };
-    const pinnedRun = { id: 456, head_sha: edited, status: 'completed', conclusion: 'success', path: `${WF}@refs/heads/main` };
-    return { ctx, edited, env, pinnedRun };
+      EVALUATION_MARKER: join(ctx.clone, 'evaluation-marker') };
+    return { ctx, edited, env };
   };
   const wrapped = (r, mode) => runGate({ argv: ['--', script, '--pr=7'], modeInfo: { mode, source: 'repo' },
     spawn: () => r, write: () => {}, appendSummary: () => {} });
 
-  it('deferral succeeds only with a separate completed main-pinned success for the exact head, without evaluation', () => {
-    const { ctx, env, pinnedRun } = deferralSetup();
-    const r = run(ctx, ['--pr=7', '--json'], { env: { ...env, FAKE_RUNS_JSON: JSON.stringify({ workflow_runs: [pinnedRun] }) } });
-    expect(r.status, r.stderr).toBe(0);
-    expect(existsSync(env.EVALUATION_MARKER)).toBe(false);
-    const report = JSON.parse(r.stdout);
-    expect(report).toMatchObject({ deferred: true, headSha: env.FAKE_HEAD_SHA, workflowCheck: { ok: false, deferred: true },
-      pinnedRun: { id: 456, headSha: env.FAKE_HEAD_SHA, conclusion: 'success', path: pinnedRun.path } });
-    expect(report).not.toHaveProperty('ok');
-    expect(report).not.toHaveProperty('prs');
-    for (const mode of ['enforce', 'shadow']) expect(wrapped(r, mode)).toBe(0);
-  });
-
-  it.each([
-    ['no pinned run', {}],
-    ['failed run', { conclusion: 'failure' }],
-    ['in-progress run', { status: 'in_progress' }],
-    ['different head', { head_sha: HEAD }],
-    ['same run id', { id: 123 }],
-    ['PR merge-ref path', { path: `${WF}@refs/pull/7/merge` }],
-    ['API error', {}],
-    ['bad JSON', {}],
-    ['unreadable runs', {}],
-    ['unreadable head', {}],
-    ['malformed head', {}],
-    ['multiple PRs', {}],
-    ['missing self id', {}],
-  ])('deferral fails closed before evaluation: %s', (name, overrides) => {
-    const { ctx, env, pinnedRun } = deferralSetup();
-    const extra = { ...env, FAKE_RUNS_JSON: JSON.stringify({ workflow_runs: name === 'no pinned run' ? [] : [{ ...pinnedRun, ...overrides }] }) };
-    if (name === 'API error') extra.FAKE_RUNS_ERROR = '1';
-    if (name === 'bad JSON') extra.FAKE_RUNS_JSON = '{';
-    if (name === 'unreadable runs') extra.FAKE_RUNS_JSON = '{}';
-    if (name === 'unreadable head') extra.FAKE_HEAD_JSON = '{';
-    if (name === 'malformed head') extra.FAKE_HEAD_JSON = JSON.stringify({ headRefOid: 'bad' });
-    if (name === 'missing self id') extra.GITHUB_RUN_ID = '';
-    const r = run(ctx, [name === 'multiple PRs' ? '--pr=7,8' : '--pr=7', '--json'], { env: extra });
-    expect(r.status, r.stderr).toBe(1);
-    expect(existsSync(env.EVALUATION_MARKER)).toBe(false);
-    expect(JSON.parse(r.stdout)).not.toHaveProperty('pinnedRun');
-    for (const mode of ['enforce', 'shadow']) expect(wrapped(r, mode)).toBe(1);
+  it('a differing PR merge-ref workflow fails before evaluation or any runs lookup, even with successful runs available', () => {
+    const { ctx, edited, env } = deferralSetup();
+    const calls = join(ctx.clone, 'gh-calls');
+    // Successful runs would be returned if queried; the call log must prove no query occurred.
+    const successfulRuns = { workflow_runs: [{ id: 456, head_sha: edited, status: 'completed', conclusion: 'success', path: `${WF}@refs/heads/main` }] };
+    writeFileSync(join(ctx.bin, 'gh'), FAKE_GH.replace(
+      "if (/^repo view/.test(a))",
+      `require('node:fs').appendFileSync(${JSON.stringify(calls)}, a + '\\n');
+if (a.startsWith('api repos/o/r/actions/runs?')) out(${JSON.stringify(successfulRuns)});
+if (/^repo view/.test(a))`), { mode: 0o755 });
+    const reason = 'running pull_request workflow differs from main; this run cannot pass the gate. The main-pinned run decides; a PR that edits merge-gate.yml needs a human merge decision';
+    for (const json of [true, false]) {
+      const r = run(ctx, ['--pr=7', ...(json ? ['--json'] : [])], { env });
+      expect(r.status, r.stderr).toBe(1);
+      expect(r.stderr).not.toMatch(/fake gh: unexpected/);
+      expect(existsSync(env.EVALUATION_MARKER)).toBe(false);
+      if (json) {
+        expect(JSON.parse(r.stdout)).toEqual({ deferred: true, ok: false, reason,
+          workflowCheck: expect.objectContaining({ ok: false, deferred: true }) });
+        for (const mode of ['enforce', 'shadow']) expect(wrapped(r, mode)).toBe(1);
+      } else expect(r.stdout).toBe(`merge-gate: ${reason}\n`);
+    }
+    expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual([
+      'repo view o/r --json defaultBranchRef', 'repo view o/r --json defaultBranchRef',
+    ]);
   });
 
   it('main-pinned and byte-equal workflows still evaluate instead of deferring', () => {
@@ -1574,24 +1552,33 @@ describe('applyGateMode changes only the exit code', () => {
     expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
   });
 
-  it.each(['enforce', 'shadow'])('rejects unproven deferrals and missing verdicts in %s', mode => {
-    const valid = { deferred: true, workflowCheck: { deferred: true, ok: false }, headSha: HEAD,
-      pinnedRun: { id: 456, headSha: HEAD, conclusion: 'success' } };
-    for (const rep of [
-      { ...valid, pinnedRun: undefined },
-      { ...valid, pinnedRun: { ...valid.pinnedRun, headSha: 'b'.repeat(40) } },
-      { ...valid, pinnedRun: { ...valid.pinnedRun, id: '456' } },
-      { ...valid, pinnedRun: { ...valid.pinnedRun, conclusion: 'failure' } },
-      { ...valid, headSha: '', pinnedRun: { ...valid.pinnedRun, headSha: '' } },
-      { ...valid, workflowCheck: {} },
-      { ...valid, ok: true, prs: [] },
-      {}, { reason: 'no verdict' },
+  it.each(['enforce', 'shadow'])('rejects every deferral even with exit 0 and a fabricated pinnedRun in %s', mode => {
+    const fabricated = { headSha: HEAD, pinnedRun: { id: 456, headSha: HEAD, conclusion: 'success' } };
+    for (const flags of [
+      { deferred: true, workflowCheck: { deferred: true, ok: false } },
+      { deferred: true },
+      { workflowCheck: { deferred: true } },
     ]) {
+      for (const verdict of [{}, { ok: true, prs: [] }]) {
+        const rep = { ...fabricated, ...flags, ...verdict };
+        const out = applyGateMode({ mode, source: 'repo', childStatus: 0, report: rep });
+        expect(out.exitCode).toBe(1);
+        expect(out.text).toMatch(/no verdict.*deferral.*failing closed/);
+        expect(out.summary).toMatch(/no verdict.*deferral.*failing closed/);
+        expect(runGate({ argv: ['--', 'scripts/merge-gate-check.mjs'], modeInfo: { mode, source: 'repo' },
+          spawn: () => ({ status: 0, stdout: JSON.stringify(rep) }), write: () => {}, appendSummary: () => {} })).toBe(1);
+      }
+    }
+  });
+
+  it.each(['enforce', 'shadow'])('rejects reports with no ok/prs even with exit 0 in %s', mode => {
+    for (const rep of [{}, { reason: 'no verdict' }]) {
       const out = applyGateMode({ mode, source: 'repo', childStatus: 0, report: rep });
       expect(out.exitCode).toBe(1);
       expect(out.text).toMatch(/no verdict.*failing closed/);
+      expect(runGate({ argv: ['--', 'scripts/merge-gate-check.mjs'], modeInfo: { mode, source: 'repo' },
+        spawn: () => ({ status: 0, stdout: JSON.stringify(rep) }), write: () => {}, appendSummary: () => {} })).toBe(1);
     }
-    expect(applyGateMode({ mode, source: 'repo', childStatus: 1, report: valid }).exitCode).toBe(1);
   });
 
   it('no verdict (crash, usage error, unparsable or inconsistent output) is never masked, even in shadow', () => {

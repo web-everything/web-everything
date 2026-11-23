@@ -32,8 +32,8 @@
 #       run without a human having looked at that exact commit.
 #   (2) SELF-CHECK (in this repo): the evaluator refuses to pass unless the RUNNING workflow file
 #       (GITHUB_WORKFLOW_REF @ GITHUB_WORKFLOW_SHA) is byte-identical to main's — fail closed
-#       except a readable pull_request mismatch: the main-sourced check defers without evaluating.
-#       This is a courtesy for honest edits; malicious PR YAML could exit 0 anyway. Ruleset 24930207
+#       including a readable pull_request mismatch: the main-sourced check defers without evaluating and exits 1.
+#       A deferring run cannot pass in any mode; malicious PR YAML could exit 0 anyway. Ruleset 24930207
 #       pins the deciding run to refs/heads/main, independently of the PR YAML.
 #       (verifyRunningWorkflow in scripts/merge-gate-check.mjs). It cannot catch an edit that never reaches the
 #       evaluator (the job made `exit 0`, or a new workflow whose job is named `merge-gate`).

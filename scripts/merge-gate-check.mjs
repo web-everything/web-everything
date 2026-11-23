@@ -27,7 +27,7 @@
  * YAML from the merge ref and `merge_group` YAML from the group commit; the ruleset pins required workflows to main.
  * So (1) the PR-leg run holds any PR whose PINNED change list touches a workflow or action for a HUMAN (`facts.gatePaths` → `workflowEditFact`), and a PR must pass that run to enter the queue;
  * (2) the evaluation refuses to pass unless the RUNNING workflow file is byte-identical to main's
- * (`verifyRunningWorkflow`; only a differing pull_request PR-merge-ref run defers without evaluating); (3) a YAML edit that never reaches this script (`exit 0`, or a new
+ * (`verifyRunningWorkflow`; only a differing pull_request PR-merge-ref run defers without evaluating and exits 1); (3) a YAML edit that never reaches this script (`exit 0`, or a new
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
@@ -64,19 +64,6 @@ const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', s
 const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseRefName,statusCheckRollup,isCrossRepository,author';
 const BODY_HISTORY_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}';
 const SHA_RE = /^[0-9a-f]{40}$/;
-
-/** Read at most one page of runs; absent, incomplete or unreadable pinned success is not proof. */
-export function readPinnedRun({ repo, headSha, selfRunId, exec = execFileSync }) {
-  if (typeof headSha !== 'string' || !SHA_RE.test(headSha) || !/^\d+$/.test(String(selfRunId || ''))) return null;
-  try {
-    const runs = ghJson(['api', `repos/${repo}/actions/runs?head_sha=${headSha}&event=pull_request&per_page=100`], exec)?.workflow_runs;
-    if (!Array.isArray(runs)) return null;
-    return runs.find((run) => Number.isSafeInteger(run?.id) && run.id > 0
-      && String(run.id) !== String(selfRunId) && run.head_sha === headSha
-      && typeof run.path === 'string' && /\.github\/workflows\/merge-gate\.yml@refs\/heads\/main$/.test(run.path)
-      && run.status === 'completed' && run.conclusion === 'success') || null;
-  } catch { return null; }
-}
 
 /**
  * The exact commit this run judges for one PR. `expected` is the event's head sha (pull_request) or the PR's sha
@@ -536,20 +523,10 @@ async function main() {
   // Deferral is only for pull_request PR-merge-ref YAML edits, and must precede every gate evaluation.
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   if (wfCheck.deferred) {
-    let headSha = null;
-    if (!f['merge-group'] && typeof f.pr === 'string' && /^[1-9]\d*$/.test(f.pr)) {
-      try {
-        const sha = ghJson(['pr', 'view', f.pr, '--repo', repo, '--json', 'headRefOid'], execFileSync)?.headRefOid;
-        if (typeof sha === 'string' && SHA_RE.test(sha)) headSha = sha;
-      } catch { /* unreadable head cannot prove a pinned success */ }
-    }
-    const run = readPinnedRun({ repo, headSha, selfRunId: process.env.GITHUB_RUN_ID });
-    const reason = run ? 'deferred to the successful main-pinned run — no gate evaluation performed'
-      : `no successful main-pinned merge-gate run for ${headSha || 'unreadable head (exactly one --pr required)'}; re-run after it completes`;
-    const pinnedRun = run ? { id: run.id, headSha: run.head_sha, conclusion: 'success', path: run.path } : null;
-    if (f.json) writeAllSync(1, `${JSON.stringify({ deferred: true, reason, workflowCheck: wfCheck, headSha, ...(pinnedRun ? { pinnedRun } : {}) })}\n`);
+    const reason = 'running pull_request workflow differs from main; this run cannot pass the gate. The main-pinned run decides; a PR that edits merge-gate.yml needs a human merge decision';
+    if (f.json) writeAllSync(1, `${JSON.stringify({ deferred: true, ok: false, reason, workflowCheck: wfCheck })}\n`);
     else writeAllSync(1, `merge-gate: ${reason}\n`);
-    process.exit(run ? 0 : 1);
+    process.exit(1);
   }
 
   let nums;

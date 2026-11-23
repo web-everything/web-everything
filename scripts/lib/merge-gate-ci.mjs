@@ -471,25 +471,18 @@ function loadGateSetting(key, envName, { env = process.env, platformPath = PLATF
 /**
  * Apply the mode to one merge-gate-check.mjs run. `report` is its parsed `--json` output (or null), `childStatus`
  * its exit code. A verdict is trusted only when the report is well-formed AND agrees with the exit code (ok ↔ 0,
- * hold ↔ 1); deferral needs successful main-pinned evidence. Anything else fails closed in both modes. Pure.
+ * hold ↔ 1). Deferral is never a verdict and fails closed in both modes, as does any missing or inconsistent verdict. Pure.
  * @returns {{exitCode:number, text:string, summary:string, holds:string[]}}
  */
 export function applyGateMode({ mode, source, childStatus, report }) {
   const head = `merge-gate mode: ${mode} (source: ${source})`;
-  // A deferral can succeed only with proof of a separate successful main-pinned run for this exact head.
-  if (childStatus === 0 && report?.deferred === true && report.workflowCheck?.deferred === true
-      && report.pinnedRun?.conclusion === 'success' && Number.isSafeInteger(report.pinnedRun.id) && report.pinnedRun.id > 0
-      && typeof report.headSha === 'string' && /^[0-9a-f]{40}$/.test(report.headSha) && report.pinnedRun.headSha === report.headSha
-      && report.workflowCheck.ok === false && !('ok' in report) && !('prs' in report)) {
-    const line = 'merge-gate: deferred to the main-pinned run — no gate evaluation performed';
-    return { exitCode: 0, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n${line}\n` };
-  }
+  const deferred = report?.deferred === true || report?.workflowCheck?.deferred === true;
   const wellFormed = report && report.deferred !== true && report.workflowCheck?.deferred !== true
     && typeof report.ok === 'boolean' && Array.isArray(report.prs);
   const consistent = wellFormed && ((report.ok && childStatus === 0) || (!report.ok && childStatus === 1));
   if (!consistent) {
     const exitCode = 1;
-    const line = `merge-gate: no verdict (exit ${childStatus}, ${wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
+    const line = `merge-gate: no verdict (exit ${childStatus}, ${deferred ? 'workflow deferral cannot pass the gate' : wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
     return { exitCode, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
   }
   const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
