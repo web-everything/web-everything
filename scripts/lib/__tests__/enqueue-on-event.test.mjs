@@ -453,6 +453,18 @@ describe('createEnqueueOnEvent', () => {
     expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
   });
 
+  it('does not trust an enqueue-success JSON result from a nonzero-exit child', async () => {
+    const { handle, children, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const tick = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    children[0].stdout.emit('data', JSON.stringify({ considered: 1, toMerge: [{ num: 42 }], merged: [{ num: 42, enqueued: true }], failed: [], skipReasons: [] }));
+    children[0].emit('close', 1);
+    const [result] = await tick;
+    expect(result.outcome).toBe('error');
+    expect(result.verified).toBeNull();
+  });
+
   it('logs spawn errors without rejecting tick', async () => {
     const { handle, lines, advance } = setup({ spawnImpl: () => { throw new Error('fake spawn failure'); } });
     handle.notePoll({ ok: true, marked: [mark()] });
@@ -2166,8 +2178,8 @@ describe('concurrent catch-up rounds', () => {
 
 
 describe('child pass timings', () => {
-  const phases = 'listing=1ms listing.snapshot=2ms listing.target=3ms verdicts=4ms total=10ms';
-  const safePhases = 'listing=1 verdicts=4 total=10';
+  const phases = 'listing=1ms listing.snapshot=2ms listing.target=3ms mergeCall=4ms total=10ms';
+  const safePhases = 'listing=1 mergeCall=4 total=10';
   it('extracts the last pass timings from stderr with trailing skip reasons', () => {
     expect(extractPassTimings(`starting\nmerge-ai-prs · pass timings: listing=9ms total=20ms (considered 2)\nother\nmerge-ai-prs · pass timings: ${phases} (considered 1, merged 0)\n{"skipReasons":[]}\n`)).toBe(safePhases);
   });
@@ -2197,7 +2209,7 @@ describe('child pass timings', () => {
   it('rebuilds only numeric timing tokens and caps their count', () => {
     expect(extractPassTimings('merge-ai-prs · pass timings: listing=2ms ghp_secret=abc total=3.5ms bad=Infinityms nope=2msSECRET listing.snapshot=4ms password="secret"'))
       .toBe('listing=2 total=3.5');
-    expect(extractPassTimings('merge-ai-prs · pass timings: ' + Array.from({ length: 20 }, (_, i) => 'phase' + i + '=1ms').join(' ')).split(' ')).toHaveLength(12);
+    expect(extractPassTimings('merge-ai-prs · pass timings: password=123456ms ghp_topsecret=1ms listing=1ms')).toBe('listing=1');
     expect(extractPassTimings('merge-ai-prs · pass timings: total=1ms\nmerge-ai-prs · pass timings: secret')).toBeNull();
   });
 

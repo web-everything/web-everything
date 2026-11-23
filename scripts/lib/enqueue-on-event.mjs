@@ -77,6 +77,7 @@
  */
 import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
 import { classifyChildFailure } from './child-failure-class.mjs';
+import { PASS_STEP_ORDER } from './pass-timings.mjs';
 export { classifyChildFailure } from './child-failure-class.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
@@ -731,15 +732,17 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
   return plan;
 }
 
+const TIMING_NAMES = new Set([...PASS_STEP_ORDER, 'total']);
+
 /** Last pass's phase timings, without the trailing verdict counts. PURE. */
 export function extractPassTimings(stderr) {
   let timings = null;
   for (const line of String(stderr ?? '').matchAll(/^merge-ai-prs · pass timings:[ \t]*([^\r\n]*)/gm)) {
     const tokens = [];
     for (const token of line[1].split(/\s+/)) {
-      const match = /^([a-z][a-z0-9_-]{0,31})=(-?\d+(?:\.\d+)?)ms$/.exec(token);
-      if (match && Number.isFinite(Number(match[2]))) tokens.push(`${match[1]}=${Number(match[2])}`);
-      if (tokens.length === 12) break;
+      // Names come from the fixed phase list only: stderr can never choose a published name.
+      const match = /^([A-Za-z][A-Za-z0-9._-]{0,31})=(\d+(?:\.\d+)?)ms$/.exec(token);
+      if (match && TIMING_NAMES.has(match[1]) && Number.isFinite(Number(match[2]))) tokens.push(`${match[1]}=${Number(match[2])}`);
     }
     timings = tokens.join(' ') || null;
   }
