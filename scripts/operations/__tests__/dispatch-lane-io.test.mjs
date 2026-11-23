@@ -330,7 +330,7 @@ describe('lean repair background argv', () => {
       vi.stubEnv('HOME', '/fixture/home');
       for (const [override, pool] of [
         ['/tmp/custom-pool', '/tmp/custom-pool'],
-        ['~/custom pool', '/fixture/home/custom pool'],
+        ['~/example/custom pool', '/fixture/home/example/custom pool'],
       ]) {
         vi.stubEnv('LANE_POOL_ROOT', override);
         for (const [repo, directory] of [['we', 'web-everything'], ['frontierui', 'frontierui'], ['plateau-app', 'plateau-app']]) {
