@@ -91,14 +91,21 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
 }
 
 /** Inject resolveSha, runCodex, appendRecord, now, stdout and stderr for hermetic execution. */
-export async function main(argv, deps) {
+export async function main(argv, deps, { loadDeps = async () => (await import('./codex-audit-io.mjs')).createAuditDeps(), stderr } = {}) {
   const flags = parseArgs(argv);
   if (!flags) {
     (deps?.stderr ?? (text => process.stderr.write(text)))(USAGE);
     return 2;
   }
   try {
-    deps ??= (await import('./codex-audit-io.mjs')).createAuditDeps();
+    // Dependencies are checked up front: a fresh clone without node_modules fails loudly with its own reason.
+    if (!deps) {
+      try { deps = await loadDeps(); }
+      catch (error) {
+        if (error?.code === 'ERR_MODULE_NOT_FOUND') throw new Error('deps-missing: run npm ci');
+        throw error;
+      }
+    }
     let base, head;
     try {
       base = await deps.resolveSha(flags.base);
@@ -114,7 +121,7 @@ export async function main(argv, deps) {
     const lines = answer.split(/\r?\n/);
     while (lines.length && !lines[0].trim()) lines.shift();
     const verdict = lines.shift();
-    if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error('invalid first verdict line');
+    if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error(`no verdict line (first line: ${JSON.stringify(clean(String(verdict ?? '')).slice(0, 80))})`);
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
     const findings = lines.filter(line => line.trim()).map(clean);
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
@@ -130,8 +137,9 @@ export async function main(argv, deps) {
     }
     deps.stdout(flags.json ? `${JSON.stringify(result)}\n` : `${[verdict, ...findings].join('\n')}\n`);
     return verdict === 'NOT WEAKENED' ? 0 : 1;
-  } catch {
-    (deps?.stderr ?? (text => process.stderr.write(text)))('UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n');
+  } catch (error) {
+    const reason = clean(String(error?.message ?? 'unknown failure')).slice(0, 300);
+    (deps?.stderr ?? stderr ?? (text => process.stderr.write(text)))(`UNPARSEABLE audit (${reason}): incomplete or failed evidence; retry or request human review of the full diff.\n`);
     return 3;
   }
 }
