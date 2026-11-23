@@ -39,6 +39,9 @@ const CARBON_SHADOW_DEFAULT_DAILY_CAP = 100;
 export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
 
 /**
+ * @verdicts-partial Only accept and prevention-outstanding require whole-file Carbon evidence because either
+ * can lead to acceptance without another review; other verdicts retain the ordinary cited-file read checks.
+ *
  * @param {object} request - the judge request, INCLUDING its `seatProvider` directive.
  * @param {object} io
  * @param {(request: object) => Promise<object>} io.claudeJudge - the ordinary judge (returns a judge outcome).
