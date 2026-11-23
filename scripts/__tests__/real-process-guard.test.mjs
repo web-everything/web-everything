@@ -222,7 +222,8 @@ describe('real-tier manifest guard', () => {
     expect(config.test.passWithNoTests ?? false).toBe(false);
     const source = readFileSync(resolve('vitest.real.config.ts'), 'utf8');
     expect(source).not.toMatch(/\bpassWithNoTests\s*:/);
-    expect(config.test.env).toMatchObject({ WE_TEST_HERMETIC: '1', WE_TEST_SANDBOX: '0' });
+    expect(config.test.env.WE_TEST_HERMETIC).toBe('1');
+    expect(config.test.env.WE_TEST_SANDBOX).toBe('0');
   });
   it('reports install failures, suite failures and timeouts from a separate dependent job', () => {
     const workflow = yaml.safeLoad(readFileSync(resolve('.github/workflows/real-tests.yml'), 'utf8'));
