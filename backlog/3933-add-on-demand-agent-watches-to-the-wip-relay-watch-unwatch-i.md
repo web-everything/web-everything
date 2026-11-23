@@ -16,3 +16,5 @@ plateau:wip-relay.js gains `watch`/`unwatch` from pages (stored in each socket a
 ## Done when
 
 1. **Executable** — the relay unit tests in plateau-app (plateau:scripts/wip-relay.test.mjs under `npx vitest run`) cover: no page open → the laptop receives `interest {l1:false, cards:[]}`; two pages watching different cards → the union; after a simulated hibernation wake the union is rebuilt from attachments; an `agent-delta` over 16 KB is dropped; a 4th card watch from one page is refused; the `snap` table is unchanged after 100 deltas.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).
