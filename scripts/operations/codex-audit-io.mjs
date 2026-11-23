@@ -40,7 +40,7 @@ function readReport(stdout) {
   for (const match of text.matchAll(/^\{/gm)) {
     try { return JSON.parse(text.slice(match.index)); } catch { /* A streamed event is not the final report. */ }
   }
-  throw new Error('missing JSON report');
+  throw new Error(`codex report missing (no parseable JSON report in ${text.length} bytes of output)`);
 }
 
 /**
@@ -50,12 +50,47 @@ function readReport(stdout) {
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
   launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
-  const run = (command, args, timeout, env) => {
-    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout, ...(env ? { env } : {}) });
-    if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
+  const run = (command, args, timeout, env, maxBuffer = 8 * 1024 * 1024) => {
+    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer, timeout, ...(env ? { env } : {}) });
+    const name = command === process.execPath ? 'codex launcher' : command;
+    if (result.error) {
+      const code = result.error.code;
+      if (code === 'ENOBUFS') throw new Error(`${name}: output overflow (exceeded maxBuffer ${maxBuffer} bytes)`);
+      if (code === 'ETIMEDOUT') throw new Error(`${name}: timeout after ${timeout} ms`);
+      throw new Error(`${name}: spawn error ${code ?? result.error.message}`);
+    }
+    if (result.status !== 0) throw new Error(`${name}: exit code ${result.status}${result.signal ? ` (signal ${result.signal})` : ''}`);
     return result.stdout;
   };
+  const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+  const remoteHeads = pattern => run('git', ['ls-remote', '--heads', 'origin', pattern], 30_000)
+    .trim().split('\n').filter(Boolean).map(line => {
+      const match = /^([a-fA-F0-9]{40})\t(refs\/heads\/[^\s]+)$/.exec(line);
+      if (!match) throw new Error('unreadable remote heads');
+      return { sha: match[1], branch: match[2].slice('refs/heads/'.length) };
+    });
   return {
+    branchTip(branch) {
+      const name = branch.replace(/^refs\/heads\//, '');
+      const matches = remoteHeads(`refs/heads/${name}`).filter(entry => entry.branch === name);
+      return matches.length === 1 ? matches[0].sha : null;
+    },
+    findBranch(head) {
+      const matches = remoteHeads('refs/heads/lane/*').filter(entry => entry.sha === head);
+      return matches.length === 1 ? matches[0].branch : null;
+    },
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    nowMs: () => Date.now(),
+    readRecords: () => fs.readFileSync(recordPath(), 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)),
+    isAncestor(basis, head) {
+      if (basis === head) return false;
+      const result = spawnSync('git', ['merge-base', '--is-ancestor', basis, head],
+        { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 });
+      if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('ancestry unavailable');
+      return result.status === 0;
+    },
+    diffFiles: (basis, head) => run('git', ['diff', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000)
+      .split('\0').filter(Boolean),
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
@@ -72,17 +107,18 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex }));
-        if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
-          throw new Error('Codex failed or returned incomplete evidence');
-        }
+          { ...process.env, GIT_INDEX_FILE: scratchIndex }, 32 * 1024 * 1024));
+        if (!report) throw new Error('codex report missing');
+        if (report.timedOut !== false) throw new Error('codex timed out');
+        if (report.exitCode !== 0) throw new Error(`codex exit code ${report.exitCode}`);
+        if (typeof report.lastMessage !== 'string') throw new Error('codex final message missing');
         return report.lastMessage;
       } finally {
         fs.rmSync(scratch, { recursive: true, force: true });
       }
     },
     appendRecord(record) {
-      const path = resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+      const path = recordPath();
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },

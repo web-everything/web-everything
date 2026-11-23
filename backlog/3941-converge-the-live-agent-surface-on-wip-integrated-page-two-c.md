@@ -18,3 +18,5 @@ Build-UI phases 5–7 (we:docs/agent/build-ui.md) for the live agent surface: ev
 
 1. **Executable** — a webcase conformance test in plateau-app with one case per §5 state id passes under `npx vitest run`.
 2. **Recorded** — the design doc's review history lists two consecutive fresh-reviewer rounds (light + dark, 390px and ≥ 900px) with zero MUST-FIX.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).
