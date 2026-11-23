@@ -6,6 +6,12 @@ import {keyStructureFinding} from '../forge-key-structure.mjs';
 import {credentialBufferFinding} from '../forge-exec-manifest.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
 
+const yieldLoop=()=>new Promise(resolve=>setImmediate(resolve));
+const ceiling=1024*1024;
+// Each 1 MiB scan is CPU-bound; a loaded CI shard blew vitest's 5 s default (PR 7348 shard 1).
+const scanTimeoutMs=60_000;
+const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+
 // Bounded CI sweep includes prose, large structured text and compressed binary blobs.
 const ordinaryTextFixtures=[
   'reports/2026-06-18-conformance-validator-home.md',
@@ -26,35 +32,37 @@ const fixtures=[
   'design-refs/items/253b45a916c9cfe2/screenshot.webp',
 ];
 describe('Forge key structure tracked fixture sources',()=>{
-  it('admits ordinary binary and JSON fixtures at the documented 1 MiB ceiling',()=>{
-    const ceiling=1024*1024;
-    const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+  it('admits ordinary binary and JSON fixtures at the documented 1 MiB ceiling',async()=>{
     const row=JSON.stringify({title:'ordinary documentation',count:123});
     const rows='['+Array.from({length:Math.floor((ceiling-2)/(row.length+1))},()=>row).join(',')+']';
     const json=Buffer.from(rows.padEnd(ceiling,' '));
     for(const content of [binary,json]) {
       expect(content.length).toBe(ceiling);
+      await yieldLoop();
       expect(keyStructureFinding(content)).toBeNull();
+      await yieldLoop();
       expect(credentialBufferFinding(content)).toBeNull();
     }
-  });
-  it.each(['DER','JWK','UTF-16LE','UTF-16BE'])('still detects embedded %s in 1 MiB binary views',format=>{
-    const ceiling=1024*1024;
-    const binary=createHash('shake256',{outputLength:ceiling}).update('forge admission ceiling fixture').digest();
+  },scanTimeoutMs);
+  it.each(['DER','JWK','UTF-16LE','UTF-16BE'])('still detects embedded %s in 1 MiB binary views',async format=>{
     const jwk=JSON.stringify({['k'+'ty']:'oct',k:'a'});
     const payload={DER:Buffer.from([48,6,2,1,1,4,1,7]),JWK:Buffer.from(jwk),
       'UTF-16LE':Buffer.from(jwk,'utf16le'),'UTF-16BE':Buffer.from(jwk,'utf16le').swap16()}[format];
     const content=Buffer.from(binary);
     payload.copy(content,ceiling/2);
+    await yieldLoop();
     expect(keyStructureFinding(content)).toBe('private-key-structure');
+    await yieldLoop();
     expect(credentialBufferFinding(content)).toBe('private-key-structure');
-  });
-  it.each(fixtures)('adds no finding over ordinary tracked fixture source %s',file=>{
+  },scanTimeoutMs);
+  it.each(fixtures)('adds no finding over ordinary tracked fixture source %s',async file=>{
     const content=readFileSync(file);
+    await yieldLoop();
     expect(keyStructureFinding(content)).toBeNull();
     // The bundle scanner uses this shared admission hook for every added blob.
+    await yieldLoop();
     expect(credentialBufferFinding(content)).not.toBe('private-key-scan-budget-exhausted-use-local');
-  });
+  },scanTimeoutMs);
   it.each(ordinaryTextFixtures)(
     'admits the ordinary tracked blob through the bundle scanner: %s',async file=>{
       const content=readFileSync(file),commit='a'.repeat(40),blob='b'.repeat(40);

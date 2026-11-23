@@ -4,6 +4,7 @@ kind: story
 size: 2
 parent: "2676"
 status: open
+scopeRationale: "we:scripts/lib/jury-core.mjs is read-only context here; the rules in it must stay unchanged"
 scope:
   - we:skills-src/jury/subject-jury.workflow.js
   - we:skills-src/jury/SKILL.md
@@ -171,3 +172,5 @@ pure enrichment of what the already-mandatory red-team looks for, not a new mech
 One incremental, single-repo (WE) PR — prompt text + one doc line + one new test file. No schema, engine, or
 cross-repo change; does not touch #2695's or #2950's files, so it can land independently of both and in any order
 relative to them.
+
+Will be closed when carry card 8693 delivers; ruled 2026-11-22 (master plan).
