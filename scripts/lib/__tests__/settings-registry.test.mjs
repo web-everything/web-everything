@@ -362,7 +362,7 @@ test('generated documentation for the original keys matches the shadow rotation 
   });
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes main's providerRotation defaults and description.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
+  // Reconciled snapshot includes main's providerRotation and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'c925611b7ad32c041e28b23880c6598f490afaebf8aada02d502ef1f2f87cdf2');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
