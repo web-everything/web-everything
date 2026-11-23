@@ -57,12 +57,14 @@ export function createHotpatchRunner({ adapter: a, read, append }) {
       }
       let recovered = false;
       if (current === 'load') {
-        // Read the registration first: an add whose completion row was lost is already live, so it must
-        // reach live monitoring (and verified withdrawal) even if readiness has since been revoked.
+        // Read the registration first: this run's add whose completion row was lost is already live, so it
+        // must reach live monitoring (and verified withdrawal on CI/audit revocation) even after readiness
+        // is revoked. A registration with no load intent of ours is never adopted on revoked readiness.
         const loaded = await a.read(r, 'loaded');
         if (loaded.outcome === 'unknown') { await write(r, { phase: 'escalation', detail: loaded }); return; }
         const ready = await a.read(r, 'ready');
-        if (loaded.outcome === 'pass') recovered = ready.outcome !== 'pass';
+        const ownAdd = rows(r).some(v => v.phase === 'intent' && v.effect === 'load');
+        if (loaded.outcome === 'pass' && (ready.outcome === 'pass' || ownAdd)) recovered = ready.outcome !== 'pass';
         else if (ready.outcome !== 'pass') { await write(r, { phase: 'escalation', detail: ready }); return; }
         else { await intent(r, 'load'); await a.perform(r, 'load'); }
       }
@@ -73,16 +75,19 @@ export function createHotpatchRunner({ adapter: a, read, append }) {
       if (verdict.outcome === 'unknown') {
         await write(r, { phase: 'escalation', detail: verdict }); await done(r, 'unknown'); return;
       }
-      if (current === 'live' && verdict.outcome === 'fail') {
+      const listed = async () => (await a.io.list(r)).some(v => v.ref === `hotpatch/${r.sha}`);
+      // Replaying an unfinished withdrawal re-reads the registration: a remove whose completion row was
+      // lost is settled without a second remove (which would be refused once live evidence changes).
+      if (current === 'live' && verdict.outcome === 'fail' && (!unloading || await listed())) {
         await intent(r, 'unload');
         const removed = await a.perform(r, 'unload');
-        if (removed?.removed !== true || (await a.io.list(r)).some(v => v.ref === `hotpatch/${r.sha}`))
+        if (removed?.removed !== true || await listed())
           throw Error('Unload unproved; retain monitoring and retry after operator inspection');
       }
       if (current === 'load' && verdict.outcome !== 'pass') return;
       await done(r, verdict.outcome);
       if (current === 'load') await metric(r, 'liveAt');
-      // Revoked readiness on a recovered registration: run the live check now, not a tick later.
+      // Revoked readiness on a recovered registration: run the live check (CI/audit) now, not a tick later.
       if (current === 'load' && recovered && verdict.outcome === 'pass') return tick(r);
       if (current === 'pin' && verdict.outcome === 'pass' && policy.parallel) await audit(r);
     } catch {

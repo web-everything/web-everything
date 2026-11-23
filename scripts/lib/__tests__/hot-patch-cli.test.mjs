@@ -146,6 +146,23 @@ it.each(['ci', 'audit'])('interrupted add with revoked %s evidence withdraws the
   expect(f.io.list(f.runner.status(7)[0])).toEqual([]);
   expect(f.runner.status(7)[0].state).toBe('refused');
 });
+it.each(['pass', 'superseded', 'fail'])('an interrupted successful unload settles on replay without removing twice (later %s)', async outcome => {
+  const f = fixture(); await waiting(f); await f.runner.tick(); f.io.live = () => 'fail';
+  const append = row => {
+    if (row.phase === 'done' && row.transition.predicate.guard === 'live') throw Error('crash after remove');
+    f.log.push(structuredClone(row));
+  };
+  await createHotpatchRunner({ adapter: f.adapter, read: () => f.log, append }).tick();
+  expect(f.io.remove).toHaveBeenCalledTimes(1); expect(f.runner.status(7)[0].state).toBe('live');
+  f.io.live = () => outcome; await f.runner.tick();
+  expect(f.io.remove).toHaveBeenCalledTimes(1); expect(f.runner.status(7)[0].state).toBe('refused');
+});
+it('an unjournaled foreign registration is not adopted once readiness is revoked', async () => {
+  const f = fixture(); await waiting(f);
+  f.io.add(); f.io.add.mockClear(); f.data.checks.check_runs[0].conclusion = 'failure'; f.io.live = () => 'fail';
+  await f.runner.tick();
+  expect(f.io.remove).not.toHaveBeenCalled(); expect(f.runner.status(7)[0]).toMatchObject({ state: 'load', escalation: expect.anything() });
+});
 it('unknown live evidence records escalation and never unloads', async () => {
   const f = fixture(); await waiting(f); await f.runner.tick();
   f.io.live = () => { throw Error('unreadable live evidence'); }; await f.runner.tick();
