@@ -1382,16 +1382,18 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     expect(h.logs.join('')).toContain('no red-team request path');
   });
 
-  it('surfaces a recorded planner reason immediately without waiting for a result or enqueueing', () => {
+  it('annotates the hold with a recorded planner reason, still holds, and still reaches the deadline path', () => {
     const reason = 'later verdict or hold supersedes acceptance';
-    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED,
-      strategyExtra: { readRedTeamQueueBlock: key => readQueuePlannerBlock({ ...key, readFile: () => JSON.stringify([
-        { key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, blocked: 'planner-skip', blockedReason: reason },
-      ]) }) } });
-    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, plannerBlocked: true,
-      reason: `held: red-team planner blocked: ${reason}; inspect the PR thread and resolve the hold` });
-    expect(h.logs.join('')).toContain(reason);
+    const readRedTeamQueueBlock = key => readQueuePlannerBlock({ ...key, readFile: () => JSON.stringify([
+      { key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, blocked: 'planner-skip', blockedReason: reason },
+    ]) });
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, strategyExtra: { readRedTeamQueueBlock } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false });
     expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    // Past the deadline the operator is still notified exactly once; the block never suppresses escalation.
+    const late = pastDeadline({ strategyExtra: { readRedTeamQueueBlock } });
+    expect(late.h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(late.notes.length).toBe(1);
   });
 
   it('deadline passed + no result: held with a clear reason, one operator note for repo/PR/head, no enqueue', () => {

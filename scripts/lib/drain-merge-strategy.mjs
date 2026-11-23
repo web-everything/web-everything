@@ -540,9 +540,9 @@ export function createDrainMergeStrategy({
           try { plannerBlock = readRedTeamQueueBlock({ repo: slugOf(c.repo), pr: c.num, head: headSha, env, readFile }); }
           catch { /* Unknown queue state never supplies clearance. */ }
           if (typeof plannerBlock === 'string' && plannerBlock.trim()) {
-            wait.reason = `held: red-team planner blocked: ${plannerBlock}; inspect the PR thread and resolve the hold`;
+            // Annotate only: the deadline, re-request and operator-notification paths below must still run.
+            wait.reason = `${reason} (red-team planner blocked: ${plannerBlock})`;
             writeState(statePath, before);
-            return { ...pendingOutcome(c, wait), plannerBlocked: true };
           }
           const outcome = pendingOutcome(c, wait);
           // Before the deadline, and for a confirmed break (its own send-back routing), the hold is the whole answer.
