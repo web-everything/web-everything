@@ -36,7 +36,7 @@ import { readLiveFixClaim } from './fix-procedure.mjs';
 import { CONFLICT_LABEL } from './conflict-label.mjs';
 import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 import {
-  isOperatorParked, isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
+  validatePrLabels, isOperatorParked, isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
 } from './draft-promotion-rule.mjs';
 
 export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,isCrossRepository';
@@ -170,7 +170,7 @@ export function runDraftPromotionStep({
       let writeView;
       try {
         writeView = readPrView({ repoSlug: repo, prNumber: n });
-        if (!Array.isArray(writeView?.labels)) throw new Error('pr view has no label list');
+        validatePrLabels(writeView?.labels);
         if (!Array.isArray(writeView?.comments)) throw new Error('pr view has no comment list');
       } catch (e) { row('error', `pre-write pr view (retry next step): ${oneLine(e)}`); continue; }
       if (isOperatorParked(writeView.comments)) {

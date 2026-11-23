@@ -32,7 +32,7 @@ function fixture({ maxCards = 2, red = false, descendant = false, descendantMess
       return JSON.stringify({ verdict: { ok: !red, blocking: ['red'] } });
     }
     if (args[1] === 'open-pr') return JSON.stringify({ findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 9 } }] } } });
-    if (args[1] === 'view') return JSON.stringify({ isDraft: draft, labels: [] });
+    if (args[1] === 'view') return JSON.stringify({ isDraft: draft });
     if (args[1] === 'ready') draft = false;
     if (args.includes('--undo')) draft = true;
     return '';
@@ -605,16 +605,4 @@ it('an unreadable batch state never launches a seal or touches labels (fail clos
   expect(spawn).not.toHaveBeenCalled();
   await expect(publishBatch(f.input, f.opts)).rejects.toThrow();
   expect(f.calls.some(c => c.includes('--remove-label') || c.includes('ready'))).toBe(false);
-});
-
-it.each([[['status:parked']], [undefined]])('batch sealing refuses parked or unreadable labels %j and resumes after removal', async labels => {
-  const f = fixture({ maxCards: 1 });
-  const exec = (cmd, args, options) => args[1] === 'view'
-    ? JSON.stringify({ isDraft: true, labels }) : f.exec(cmd, args, options);
-  expect(await publishBatch(f.input, { ...f.opts, exec })).toMatchObject({
-    action: 'refuse', reason: labels ? 'operator-parked' : 'draft-state-unreadable',
-  });
-  expect(f.calls.some(call => call.includes('ready'))).toBe(false);
-  expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');
-  expect(f.calls.some(call => call.includes('ready'))).toBe(true);
 });

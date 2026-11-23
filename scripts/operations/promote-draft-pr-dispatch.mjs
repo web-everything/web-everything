@@ -68,7 +68,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { isParkedByLabel, isOperatorParked } from '../conveyor/draft-promotion-rule.mjs';
+import { isParkedByLabel, isOperatorParked, validatePrLabels } from '../conveyor/draft-promotion-rule.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -140,16 +140,8 @@ export function defaultReadHeadCheckState({
   return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
 }
 
-function validatePrLabels(labels) {
-  if (!Array.isArray(labels) || labels.some(label => {
-    const name = typeof label === 'string' ? label : label?.name;
-    return typeof name !== 'string' || name.trim().length === 0;
-  })) throw new Error('PR labels must be an array of label names or {name} records');
-  return labels;
-}
-
-/** Shared pre-write label guard, also used by batch sealing. Unreadable evidence refuses. */
-export function draftParkLabelRefusal(labels) {
+/** Pre-write label guard. Unreadable evidence refuses. */
+function draftParkLabelRefusal(labels) {
   try { validatePrLabels(labels); } catch {
     return { kind: 'draft-state-unreadable', why: 'could not read draft hold labels before promoting; retry next tick' };
   }
@@ -397,19 +389,7 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
-    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
-    let comments;
-    try {
-      comments = readComments(entry.prNumber, { repo: repoSlug });
-      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
-    } catch (e) {
-      refusals.push({
-        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
-      });
-      continue;
-    }
-    // Final read closes the stale-plan gap; GitHub does not offer an atomic label-check/ready write.
+    // Re-read labels before comments; GitHub does not offer an atomic label-check/ready write.
     let labels;
     try {
       labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }));
@@ -440,6 +420,18 @@ export function runReconcilePromoteDraftDispatch({
     }
     const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
     if (refusal) { refusals.push({ pr: entry.prNumber, ...refusal }); continue; }
+    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
+    let comments;
+    try {
+      comments = readComments(entry.prNumber, { repo: repoSlug });
+      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
+    } catch (e) {
+      refusals.push({
+        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
+        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
+      });
+      continue;
+    }
     if (isOperatorParked(comments)) {
       refusals.push({ pr: entry.prNumber, kind: 'operator-parked', headSha: sha,
         why: 'draft PR is operator-parked — explicit release is required before promotion' });

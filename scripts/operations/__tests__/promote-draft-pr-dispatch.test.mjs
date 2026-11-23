@@ -653,15 +653,22 @@ describe('fresh status:parked label guard', () => {
     expect(run(read, ready).dispatched).toEqual([expect.objectContaining({ kind: 'promote-draft' })]);
     expect(ready).toHaveBeenCalledOnce();
   });
-  it('observes a label applied while the complete comments are being read', () => {
+  it('refuses a park comment posted during the label read', () => {
     const ready = vi.fn();
-    let labels = [];
+    let comments = [];
+    const calls = [];
     const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
-      readComments: () => { labels = ['status:parked']; return []; }, readPrLabels: () => labels,
+      readComments: () => { calls.push('comments'); return comments; },
+      readPrLabels: () => {
+        calls.push('labels');
+        comments = [{ author: { login: 'web-everything' }, body: '<!-- operator-park -->' }];
+        return [];
+      },
       provider: { ready }, clearAwaitingCi: NOOP_STATUS,
     });
     expect(result.refusals).toEqual([expect.objectContaining({ kind: 'operator-parked' })]);
+    expect(calls).toEqual(['labels', 'comments']);
     expect(ready).not.toHaveBeenCalled();
   });
   it.each([undefined, null, {}, [null], new Error('label read failed')])('unreadable labels fail closed: %j', labels => {

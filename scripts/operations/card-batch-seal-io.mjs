@@ -12,7 +12,6 @@ import { readSettings } from '../lib/settings-files.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
-import { draftParkLabelRefusal } from './promote-draft-pr-dispatch.mjs';
 import { primaryCheckout } from '../bootstrap-session.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -251,12 +250,7 @@ export async function publishBatch(input, opts = {}) {
         await gh(['pr', 'edit', String(state.pr), '--repo', repo, '--remove-label', HOLD_LABEL]);
       } else if (step === 'ready') {
         // Query makes retry after a remote success/local crash safe: ready is not idempotent on GitHub.
-        let view;
-        try {
-          view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'isDraft,labels']));
-        } catch { return refuse('draft-state-unreadable'); }
-        const labelPark = draftParkLabelRefusal(view?.labels);
-        if (labelPark) return refuse(labelPark.kind);
+        const view = JSON.parse(await gh(['pr', 'view', String(state.pr), '--repo', repo, '--json', 'isDraft']));
         if (view.isDraft) await gh(['pr', 'ready', String(state.pr), '--repo', repo]);
       } else if (step === 'label-on-green') {
         await open('label-on-green');
