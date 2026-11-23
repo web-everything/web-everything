@@ -31,6 +31,7 @@ import { resolveOrchestratorAuthority } from './orchestrator-authority-settings.
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold.mjs';
 import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
@@ -274,7 +275,8 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
-  const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+  // gh refuses a log with terminal escape sequences unless allowed (2026-11-22: every soak-shard read threw, so the net never acted).
+  const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
   return parseVitestFailures(String(text ?? ''));
 }
 

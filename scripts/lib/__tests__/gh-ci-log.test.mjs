@@ -100,13 +100,13 @@ const deferredFindingReaders = new Map([
   ['scripts/conveyor/ci-auth-diagnosis.mjs', 1],
   ['scripts/conveyor/credential-inventory.mjs', 1],
   ['scripts/conveyor/ci-red-recovery-watch.mjs', 1],
-  ['scripts/conveyor/main-ci-red-probe.mjs', 1],
+  ['scripts/conveyor/main-ci-red-probe.mjs', 0], // Reads logs through ciJobLogApiArgs.
   ['scripts/conveyor/reconcile-pass.mjs', 1],
   ['scripts/conveyor/stale-base-refresh.mjs', 1],
   ['scripts/lib/drain-mq-failure-recovery-io.mjs', 1],
   ['scripts/lib/drain-queue-safety.mjs', 2],
   ['scripts/lib/finished-ci-cache.mjs', 0],
-  ['scripts/lib/red-main-quarantine-io.mjs', 2], // Existing API array and its documented shell command.
+  ['scripts/lib/red-main-quarantine-io.mjs', 1], // Only the documented shell command remains; readJobFailures uses the helper.
   ['scripts/lib/renamed-pr-refresh.mjs', 1],
   ['scripts/operations/operator-queue.mjs', 1],
   ['scripts/review-hold-probe.mjs', 1],
