@@ -1,0 +1,6 @@
+{
+  "description": "Commands permitted for orchestrator delegation.",
+  "owner": "scripts/settings/orchestrator-session.json",
+  "changeVia": "pr",
+  "instant": false
+}

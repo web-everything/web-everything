@@ -1,0 +1,6 @@
+{
+  "description": "Resolve ruled referral holds by resuming or sending back work.",
+  "owner": "scripts/settings/referral-hold-auto-resolve.json",
+  "changeVia": "pr",
+  "instant": false
+}

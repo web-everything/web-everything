@@ -2,9 +2,9 @@
  * @file scripts/lib/settings-registry.mjs
  * @description Declared settings inventory and documentation drift guard; never resolves host overrides.
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
- * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in the metadata JSON.
+ * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in per-key metadata files.
  */
-import { readFileSync, writeFileSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, lstatSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readSettingsChecked, settingsLeaves } from './settings-files.mjs';
@@ -12,6 +12,7 @@ import { CAPACITY_LEAVES } from './operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const META = 'scripts/lib/settings-registry-metadata.json';
+const META_DIR = 'scripts/lib/settings-registry-metadata.d';
 const DOC = 'docs/agent/settings-registry.md';
 const PLATFORM = ['scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'];
 const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
@@ -19,16 +20,79 @@ const entries = obj => Object.entries(obj).sort(([a], [b]) => compare(a, b));
 const documented = key => !key.startsWith('$comment');
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+// Keep regeneration self-contained within advisory-merge's pinned closure.
+// JSON.parse validates syntax first; strings are indivisible tokens, and each
+// object gets its own set of decoded property names (including escaped names).
+function hasDuplicateProperties(raw) {
+  const scopes = [];
+  const tokens = /"(?:\\.|[^"\\])*"|[{}\[\]:,]/g;
+  for (const token of raw.matchAll(tokens)) {
+    const value = token[0];
+    if (value === '{') scopes.push(new Set());
+    else if (value === '[') scopes.push(null);
+    else if (value === '}' || value === ']') scopes.pop();
+    else if (value.startsWith('"') && /^\s*:/.test(raw.slice(token.index + value.length))) {
+      const key = JSON.parse(value), scope = scopes.at(-1);
+      if (scope.has(key)) return true;
+      scope.add(key);
+    }
+  }
+  return false;
+}
+
+function readObject(root, path, problems) {
+  try {
+    if (!lstatSync(join(root, path)).isFile()) throw Error('expected regular file (no symlinks)');
+    const raw = readFileSync(join(root, path), 'utf8');
+    const data = JSON.parse(raw);
+    if (hasDuplicateProperties(raw)) throw Error('duplicate JSON property');
+    if (!object(data)) throw Error('expected JSON object');
+    return data;
+  } catch (error) { problems.push(`${path}: ${error.message}`); return {}; }
+}
+
+/** Optional per-key overlay; canonical URI components also escape filesystem-reserved punctuation.
+ * No directory means legacy metadata. All other read/shape errors block generation at the named path. */
+export function readMetadata({ root = ROOT, problems } = {}) {
+  const errors = problems ?? [];
+  const metadata = readObject(root, META, errors);
+  const finish = () => { if (!problems && errors.length) throw Error(errors.join('\n')); return metadata; };
+  let sections;
+  try {
+    if (!lstatSync(join(root, META_DIR)).isDirectory()) throw Error('expected directory (no symlinks)');
+    sections = readdirSync(join(root, META_DIR)).sort(compare);
+  }
+  catch (error) {
+    if (error.code !== 'ENOENT') errors.push(`${META_DIR}: ${error.message}`);
+    return finish();
+  }
+  for (const section of sections) {
+    const path = `${META_DIR}/${section}`;
+    try {
+      if (!['settings', 'capacityLeaves'].includes(section)) throw Error('unknown metadata section');
+      if (!lstatSync(join(root, path)).isDirectory()) throw Error('expected directory (no symlinks)');
+      if (!Object.hasOwn(metadata, section)) metadata[section] = {};
+      if (!object(metadata[section])) throw Error('expected JSON object');
+      for (const file of readdirSync(join(root, path)).sort(compare)) {
+        // Filenames stay within [A-Za-z0-9._-] (the audit-path grammar): `_` replaces the percent sign, so a literal `_` is escaped too.
+        const key = decodeURIComponent(file.slice(0, -5).replaceAll('_', '%'));
+        const encoded = encodeURIComponent(key).replace(/[!'()*_]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`).replaceAll('%', '_');
+        if (file !== `${encoded}.json`) throw Error(`invalid metadata filename: ${file}`);
+        if (Object.hasOwn(metadata[section], key)) { errors.push(`duplicate metadata key: ${section}.${key}`); continue; }
+        Object.defineProperty(metadata[section], key, { value: readObject(root, `${path}/${file}`, errors), enumerable: true, configurable: true });
+      }
+      metadata[section] = Object.fromEntries(entries(metadata[section]));
+    } catch (error) { errors.push(`${path}: ${error.message}`); }
+  }
+  // A migrated empty section has no tracked files. Preserve the original JSON shape.
+  for (const section of ['settings', 'capacityLeaves']) if (!Object.hasOwn(metadata, section)) metadata[section] = {};
+  return finish();
+}
+
 /** Read only repository declarations. Missing/unreadable evidence is a problem, never an empty success. */
 export function buildRegistry({ root = ROOT } = {}) {
   const problems = [];
-  const read = path => {
-    try {
-      const data = JSON.parse(readFileSync(join(root, path), 'utf8'));
-      if (!object(data)) throw Error('expected JSON object');
-      return data;
-    } catch (error) { problems.push(`${path}: ${error.message}`); return {}; }
-  };
+  const read = path => readObject(root, path, problems);
   // The shared reader intentionally tolerates ENOENT; an inventory must require both declaration homes.
   for (const path of ['scripts/dispatch-settings.json', 'scripts/settings']) {
     try {
@@ -39,7 +103,7 @@ export function buildRegistry({ root = ROOT } = {}) {
   const declared = readSettingsChecked({ dir: join(root, 'scripts/settings'), legacyPath: join(root, 'scripts/dispatch-settings.json') });
   for (const { source, reason } of declared.taint) problems.push(`scripts/${source}: ${reason}`);
   for (const { path } of declared.duplicates) problems.push(`duplicate setting leaf: ${path}`);
-  const metadata = read(META);
+  const metadata = readMetadata({ root, problems });
   for (const section of ['settings', 'capacityLeaves']) if (!object(metadata[section])) problems.push(`invalid metadata section: ${section}`);
   for (const section of ['instantGaps', 'toSettle', 'discoveryPasses']) if (!Array.isArray(metadata[section])) problems.push(`invalid metadata section: ${section}`);
   if (Array.isArray(metadata.toSettle)) {
@@ -71,6 +135,7 @@ export function buildRegistry({ root = ROOT } = {}) {
   const keys = new Set(rows.map(row => row.key));
   for (const key of keys) if (!Object.hasOwn(metadata.settings ?? {}, key)) problems.push(`missing setting metadata: ${key}`);
   for (const [key, meta] of entries(metadata.settings ?? {})) {
+    for (const field of ['key', 'value', 'owners']) if (meta != null && Object.hasOwn(meta, field)) problems.push(`metadata overrides declared field: ${key}.${field}`);
     if (!keys.has(key)) problems.push(`orphan setting metadata: ${key}`);
     if (!['capacity-leaf', 'env', 'operator-prefs', 'pr'].includes(meta?.changeVia)) problems.push(`invalid changeVia: ${key}`);
     if (typeof meta?.description !== 'string' || !meta.description.trim() || meta.description.length > 160) problems.push(`invalid description: ${key}`);
@@ -84,7 +149,7 @@ export function buildRegistry({ root = ROOT } = {}) {
     return { ...meta, key };
   });
   for (const key of Object.keys(metadata.capacityLeaves ?? {})) if (!Object.hasOwn(CAPACITY_LEAVES, key)) problems.push(`orphan capacity metadata: ${key}`);
-  return { rows: rows.map(row => ({ ...row, ...metadata.settings?.[row.key], leafCount: leafCount(row.value) }))
+  return { rows: rows.map(row => ({ ...metadata.settings?.[row.key], ...row, leafCount: leafCount(row.value) }))
     .sort((a, b) => compare(a.key, b.key) || compare(a.owners.join(), b.owners.join())),
   capacityRows, instantGaps: metadata.instantGaps ?? [], toSettle: metadata.toSettle ?? [], discoveryPasses: metadata.discoveryPasses ?? [], problems: problems.sort(compare) };
 }
@@ -118,7 +183,7 @@ export function renderMarkdown(registry) {
     'R1076: behavior belongs in product settings. The constants below are candidates to settle, not conversions or approved policy changes. Pass C records environment override availability in its instant column; that alone does not prove live reload.', '',
     '## How to change a setting', '',
     'The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.', '',
-    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
+    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
     '## Summary', '',
     `- Top-level keys: ${unique.length} (${rows.length} declaration rows).`,
     `- Declared leaves: ${rows.reduce((sum, row) => sum + row.leafCount, 0)} (platform copies counted separately).`,

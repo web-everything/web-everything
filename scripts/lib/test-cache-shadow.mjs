@@ -76,7 +76,7 @@ export function decideShadow({ row, summary, stored, quarantined, run, trace = n
   if (!row.cacheable) reason = `not-cacheable: ${row.reason ?? 'unknown'}`;
   else if (quarantined) reason = 'quarantined';
   else if (denies.length) reason = `traced-deny: ${denies[0]}`;
-  else if (row.needsTrace && !trace) reason = 'no-trace';
+  else if (!trace) reason = 'no-trace';
   else if (row.needsTrace && !trace.admitted) reason = 'not-admitted';
   else if (!stored || stored.outcome !== 'pass') reason = 'no-entry';
   else if (needsList && !stored.traced) reason = 'no-entry';
@@ -93,7 +93,8 @@ export function decideShadow({ row, summary, stored, quarantined, run, trace = n
     needsTrace: Boolean(row.needsTrace), keyMiss,
     trace: trace ? { denies, tracedInputs: Object.keys(trace.tracedMap ?? {}).length, admitted: trace.admitted, cleanRuns: trace.cleanRuns } : null,
   };
-  const canStore = run.storeAllowed && row.cacheable && !quarantined && !summary.hasOnly && isFullPass(summary) && !category && denies.length === 0;
+  // Missing runtime evidence never creates an unchecked entry or erases persisted dependencies.
+  const canStore = Boolean(trace) && run.storeAllowed && row.cacheable && !quarantined && !summary.hasOnly && isFullPass(summary) && !category && denies.length === 0;
   const store = canStore
     ? { file: row.file, outcome: 'pass', passed: summary.passed, skipped: summary.skipped, durationMs: summary.durationMs, recordedAt: now, lane: run.lane, baseSha: run.baseSha, ...(trace && needsList ? { traced: trace.tracedMap } : {}) }
     : null;

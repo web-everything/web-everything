@@ -144,7 +144,7 @@ describe('CI-heal capacity eligibility reaches the launch boundary', () => {
     }));
     const chains = resolveRepairExecutorChains({ env: {}, platform: {}, now, capacity,
       repo: { routing: { builder: 'auto' }, providerCapacity: { providers, minimumTiers: { fix: 1, 'ci-heal': 3 } } },
-      quota: () => ({ used_percent: 1 }), record: () => {} });
+      quota: () => ({ at: now, used_percent: 1 }), record: () => {} });
     expect(chains.fix.value[0]).toBe('codex');
     const launchCodex = vi.fn(() => 'pid:1');
     const launchClaude = vi.fn(() => ({ spawned: true }));

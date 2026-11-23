@@ -1,0 +1,638 @@
+{
+"providerRotation": {
+  "mode": "shadow",
+  "catalog": [
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "high"
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    {
+      "provider": "codex",
+      "model": "gpt-6-luna",
+      "effort": "medium"
+    },
+    {
+      "provider": "codex",
+      "model": "sol",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-flash",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-carbon",
+      "effort": "high"
+    },
+    {
+      "provider": "agy-gemini",
+      "model": "gemini-4-hydrogen",
+      "effort": "high"
+    },
+    {
+      "provider": "claude",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium"
+    },
+    {
+      "provider": "claude",
+      "model": "claude-haiku-5-5",
+      "effort": "medium"
+    }
+  ],
+  "exhaustedPercent": 98,
+  "reserveReleaseHours": 6,
+  "reservePercent": 10,
+  "smallArms": [
+    "hydrogen",
+    "luna",
+    "haiku",
+    "flash"
+  ],
+  "carbonPromoted": false,
+  "minPanelFamilies": 2,
+  "strongArms": [
+    "codex/gpt-6.1-sol/high",
+    "agy-gemini/gemini-4-carbon/high",
+    "claude/claude-sonnet-5-5/medium",
+    "claude/claude-opus-5-5/high"
+  ],
+  "smallTiers": [
+    "small"
+  ],
+  "keyLenses": [
+    "correctness",
+    "security",
+    "red-team"
+  ],
+  "strongShapes": [
+    "security",
+    "merge-path"
+  ],
+  "kinds": {
+    "build": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 15
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "fix": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 15
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "ci-heal": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 15
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "prepare": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "standard",
+          "share": 40
+        },
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "small",
+          "share": 20
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-hydrogen",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "small",
+          "share": 12
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 13
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-haiku-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "small",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 5
+        }
+      ]
+    },
+    "audit": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 70
+        },
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "standard",
+          "share": 30
+        }
+      ]
+    },
+    "review-correctness": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 25
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "review-security": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 25
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "review-lens": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 15
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "red-team": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 25
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "judge": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "high"
+          },
+          "family": "openai",
+          "tier": "strong",
+          "share": 60
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 15
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-carbon",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "strong",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 15
+        }
+      ]
+    },
+    "summary": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "standard",
+          "share": 40
+        },
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "small",
+          "share": 20
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-hydrogen",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "small",
+          "share": 12
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 13
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-haiku-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "small",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 5
+        }
+      ]
+    },
+    "doc-fix": {
+      "arms": [
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "standard",
+          "share": 40
+        },
+        {
+          "arm": {
+            "provider": "codex",
+            "model": "gpt-6-luna",
+            "effort": "medium"
+          },
+          "family": "openai",
+          "tier": "small",
+          "share": 20
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-hydrogen",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "small",
+          "share": 12
+        },
+        {
+          "arm": {
+            "provider": "agy-gemini",
+            "model": "gemini-4-flash",
+            "effort": "high"
+          },
+          "family": "google",
+          "tier": "standard",
+          "share": 13
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-haiku-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "small",
+          "share": 10
+        },
+        {
+          "arm": {
+            "provider": "claude",
+            "model": "claude-sonnet-5-5",
+            "effort": "medium"
+          },
+          "family": "anthropic",
+          "tier": "strong",
+          "share": 5
+        }
+      ]
+    }
+  },
+  "review": {
+    "crossVendorKeySeats": [
+      "correctness",
+      "security",
+      "red-team"
+    ]
+  },
+  "goLive": {
+    "subjectKey": "same PR (repo#pr) or card always the same provider",
+    "sharesFollow": "projected capacity",
+    "afterRunsPerKind": 30,
+    "winnerWithinPoints": 5,
+    "winnerShare": 60,
+    "otherMinShare": 10,
+    "shadowCleanHours": 24,
+    "active": false
+  }
+}
+}

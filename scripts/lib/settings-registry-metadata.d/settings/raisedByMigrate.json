@@ -1,0 +1,6 @@
+{
+  "description": "Maximum PRs attempted per raised-by migration apply run.",
+  "owner": "scripts/settings/raised-by-migrate.json",
+  "changeVia": "pr",
+  "instant": false
+}

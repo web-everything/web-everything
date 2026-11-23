@@ -71,9 +71,9 @@ describe('delivery priority settings', () => {
     expect(resolvePrioritySettings(undefined)).toMatchObject({ mode: 'off', invalid: [] });
   });
 
-  it('the declared settings file resolves with no invalid field and runs in shadow', () => {
+  it('the declared settings file resolves with no invalid field and is retired to off', () => {
     const s = resolvePrioritySettings(SETTINGS_FILE.deliveryPriority);
-    expect(s).toEqual({ mode: 'shadow', agingHours: 8, maxLiveP0: 2, unblockWeightMinutes: 60, invalid: [] });
+    expect(s).toEqual({ mode: 'off', agingHours: 8, maxLiveP0: 2, unblockWeightMinutes: 60, invalid: [] });
   });
 
   it('is pure: same input, same output, input not mutated', () => {

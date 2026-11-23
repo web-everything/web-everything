@@ -1,0 +1,6 @@
+{
+  "description": "Maximum direct confined agy build size for any kind; repair dispatch remains size 1.",
+  "owner": "scripts/settings/agy-build.json",
+  "changeVia": "env",
+  "instant": false
+}

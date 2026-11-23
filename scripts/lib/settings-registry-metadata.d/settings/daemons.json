@@ -1,0 +1,6 @@
+{
+  "description": "Daemon inventory and launch-label account mappings.",
+  "owner": "scripts/settings/claude-accounts.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -63,7 +63,9 @@ const AUDITOR_IMPORTS = Object.freeze(['scripts/lib/net-diff-fingerprint.mjs', '
   // The audit launcher's imports, and the transcript-check settings its policy reads.
   'scripts/lib/codex-transcript-policy.mjs', 'scripts/lib/codex-transcript-check.mjs', 'scripts/settings/codex-transcript-check.json',
   'scripts/lib/build-policy.mjs', 'scripts/lib/build-self-review.mjs', 'scripts/lib/lane-git-hardening.mjs',
-  'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs']);
+  'scripts/lib/codex-usage-ledger.mjs', 'scripts/lib/codex-model-routing.mjs', 'scripts/lib/codex-task-route.mjs',
+  // policy-cascade.mjs classifies a setting change's direction with it (loosening vs tightening).
+  'scripts/lib/settings-safe-direction.mjs']);
 /** Modules the review authorization family imports directly (the source-scan test pins this list complete). */
 const REVIEW_AUTH_IMPORTS = Object.freeze([
   'scripts/lib/github-app-identity.mjs', 'scripts/lib/approval-prevention-notice.mjs', 'scripts/lib/review-verdict-carried-marker.mjs',
@@ -119,6 +121,8 @@ const FLOOR_SETTINGS = Object.freeze([
   // The legacy dispatch settings file as a glob: this module never reads it, and settings-files.test.mjs counts a quoted
   // literal of its full name as a direct reader.
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
+  // The advisory-merge floor module names it as a regeneration input of the settings registry doc.
+  'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/**/*.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',
   'scripts/lib/dispatch-routing-policy.json', 'scripts/ci/test-timings.json', 'scripts/lib/model-probation.json', 'scripts/lib/swept-repos.json',

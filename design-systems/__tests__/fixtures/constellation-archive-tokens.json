@@ -1,0 +1,381 @@
+{
+  "name": "Plateau",
+  "version": 1,
+  "color": {
+    "themes": [
+      {
+        "id": "dusk",
+        "name": "Dusk"
+      },
+      {
+        "id": "day",
+        "name": "Day"
+      }
+    ],
+    "tokens": [
+      {
+        "name": "bg",
+        "value": {
+          "dusk": "#0f0b26",
+          "day": "#f7f5fc"
+        },
+        "usage": "Page ground. Dusk is the primary theme: the console lives at evening."
+      },
+      {
+        "name": "surface",
+        "value": {
+          "dusk": "#17123a",
+          "day": "#ffffff"
+        },
+        "usage": "Cards, panels, the app header."
+      },
+      {
+        "name": "surface-raised",
+        "value": {
+          "dusk": "#211a4d",
+          "day": "#efecf9"
+        },
+        "usage": "Hover rows, popovers, inputs, the selected lane."
+      },
+      {
+        "name": "line",
+        "value": {
+          "dusk": "#2e2660",
+          "day": "#dcd6f0"
+        },
+        "usage": "Hairline borders and dividers on surface and surface-raised."
+      },
+      {
+        "name": "line-strong",
+        "value": {
+          "dusk": "#6d62b3",
+          "day": "#8f87b8"
+        },
+        "usage": "Input and control borders; 3:1 on surface in both themes."
+      },
+      {
+        "name": "ink",
+        "value": {
+          "dusk": "#f3f0ff",
+          "day": "#17122f"
+        },
+        "usage": "Primary text on bg, surface and surface-raised."
+      },
+      {
+        "name": "ink-muted",
+        "value": {
+          "dusk": "#a9a2d6",
+          "day": "#5b5480"
+        },
+        "usage": "Secondary text, metadata, repo names on bg, surface and surface-raised (above 4.5:1 in both themes)."
+      },
+      {
+        "name": "accent",
+        "value": {
+          "dusk": "#9d93ff",
+          "day": "#5546e0"
+        },
+        "usage": "Links, selected nav, active tab underline; readable as text on surface in both themes."
+      },
+      {
+        "name": "sky-violet",
+        "value": "#6d5efc",
+        "usage": "Brand. Start of the sky gradient in the mark and hero. A fill or large mark only, never body text on bg."
+      },
+      {
+        "name": "sky-cyan",
+        "value": "#16d3e6",
+        "usage": "Brand. End of the sky gradient; the colour of the machine at work (AI glow, running pulses)."
+      },
+      {
+        "name": "mesa",
+        "value": "#a259b6",
+        "usage": "Brand rock colour from the mark's cliff face. Illustration, cover, charts. Not for text."
+      },
+      {
+        "name": "mesa-deep",
+        "value": "#3d2690",
+        "usage": "Shadow face of the mesa. Illustration depth, the dark band of the cover."
+      },
+      {
+        "name": "sun",
+        "value": "#ffb48f",
+        "usage": "Sunlight on the caprock: the one colour that means a person is needed. Primary button fill, the needs-you signal. Text on it is on-sun."
+      },
+      {
+        "name": "sun-glow",
+        "value": "#ffe6cf",
+        "usage": "Caprock highlight; soft halo around needs-you items. Fill only."
+      },
+      {
+        "name": "on-sun",
+        "value": "#2a1340",
+        "usage": "Text and icons on a sun or sun-glow fill (10:1)."
+      },
+      {
+        "name": "signal-running",
+        "value": {
+          "dusk": "#4fe0ef",
+          "day": "#0b7f8c"
+        },
+        "usage": "Status text and dot: an agent is working (build, review). On surface in both themes."
+      },
+      {
+        "name": "signal-needs-you",
+        "value": {
+          "dusk": "#ffb48f",
+          "day": "#b4521f"
+        },
+        "usage": "Status text and dot: waiting on a human decision. Always with the word 'Needs you'."
+      },
+      {
+        "name": "signal-landed",
+        "value": {
+          "dusk": "#6fe3c1",
+          "day": "#0f7a5c"
+        },
+        "usage": "Status text and dot: merged to main. Always with the word 'Landed' and a check."
+      },
+      {
+        "name": "signal-failed",
+        "value": {
+          "dusk": "#ff8aa0",
+          "day": "#c2264a"
+        },
+        "usage": "Status text and dot: a check or build failed. Always with the word 'Failed' and a cross; differs from landed by word and icon, not hue alone."
+      },
+      {
+        "name": "signal-queued",
+        "value": {
+          "dusk": "#a9a2d6",
+          "day": "#5b5480"
+        },
+        "usage": "Status text and dot: ready, waiting for a lane."
+      },
+      {
+        "name": "focus",
+        "value": {
+          "dusk": "#ffb48f",
+          "day": "#5546e0"
+        },
+        "usage": "Keyboard focus ring: 2px solid, 2px offset. Over 3:1 on bg and surface in both themes."
+      }
+    ]
+  },
+  "type": {
+    "fonts": [],
+    "families": {
+      "display": "\"Bricolage Grotesque\", \"Instrument Sans\", system-ui, sans-serif",
+      "body": "\"Instrument Sans\", system-ui, -apple-system, sans-serif",
+      "mono": "\"JetBrains Mono\", ui-monospace, \"SF Mono\", monospace",
+      "serif": "\"Instrument Serif\", \"Iowan Old Style\", Georgia, serif"
+    },
+    "groups": [
+      {
+        "name": "Display",
+        "family": "display",
+        "styles": [
+          {
+            "name": "display-xl",
+            "fontSize": "132px",
+            "lineHeight": "119px",
+            "fontWeight": 400,
+            "letterSpacing": "-0.018em",
+            "sample": "Elevate your apps.",
+            "usage": "Landing hero slogan only, once per page. Instrument Serif, with the last word in italic. Everything else stays in the sans faces.",
+            "family": "serif"
+          },
+          {
+            "name": "display-l",
+            "fontSize": "48px",
+            "lineHeight": "50px",
+            "fontWeight": 600,
+            "letterSpacing": "-0.024em",
+            "sample": "One view over every repo",
+            "usage": "Landing section heads."
+          },
+          {
+            "name": "title",
+            "fontSize": "28px",
+            "lineHeight": "34px",
+            "fontWeight": 650,
+            "letterSpacing": "-0.01em",
+            "sample": "Backlog",
+            "usage": "App page titles."
+          }
+        ]
+      },
+      {
+        "name": "Text",
+        "family": "body",
+        "styles": [
+          {
+            "name": "heading",
+            "fontSize": "20px",
+            "lineHeight": "26px",
+            "fontWeight": 600,
+            "sample": "Needs your call",
+            "usage": "Card and panel headings."
+          },
+          {
+            "name": "body-l",
+            "fontSize": "18px",
+            "lineHeight": "28px",
+            "fontWeight": 400,
+            "sample": "Routine delivery runs itself.",
+            "usage": "Landing paragraphs."
+          },
+          {
+            "name": "body",
+            "fontSize": "15px",
+            "lineHeight": "22px",
+            "fontWeight": 400,
+            "sample": "Review the proposed change to the merge rules.",
+            "usage": "App default text."
+          },
+          {
+            "name": "label",
+            "fontSize": "13px",
+            "lineHeight": "18px",
+            "fontWeight": 600,
+            "letterSpacing": "0.01em",
+            "sample": "Claim item",
+            "usage": "Buttons, tabs, form labels, status chips."
+          },
+          {
+            "name": "caption",
+            "fontSize": "12px",
+            "lineHeight": "16px",
+            "fontWeight": 500,
+            "letterSpacing": "0.02em",
+            "sample": "Updated 4 min ago",
+            "usage": "Timestamps, helper text."
+          }
+        ]
+      },
+      {
+        "name": "Data",
+        "family": "mono",
+        "styles": [
+          {
+            "name": "mono",
+            "fontSize": "13px",
+            "lineHeight": "20px",
+            "fontWeight": 500,
+            "sample": "#4127 · web-everything/plateau-app",
+            "usage": "Item ids, repo paths, branch names, durations."
+          }
+        ]
+      }
+    ]
+  },
+  "spacing": {
+    "tokens": [
+      {
+        "name": "space-1",
+        "value": "4px",
+        "usage": "Icon-to-text gap inside chips."
+      },
+      {
+        "name": "space-2",
+        "value": "8px",
+        "usage": "Gap between inline controls; chip padding."
+      },
+      {
+        "name": "space-3",
+        "value": "12px",
+        "usage": "Row padding in lists; button vertical padding."
+      },
+      {
+        "name": "space-4",
+        "value": "16px",
+        "usage": "Card padding; page gutter on phones."
+      },
+      {
+        "name": "space-6",
+        "value": "24px",
+        "usage": "Gap between cards; panel padding."
+      },
+      {
+        "name": "space-8",
+        "value": "32px",
+        "usage": "Gap between app sections."
+      },
+      {
+        "name": "space-12",
+        "value": "48px",
+        "usage": "Landing block padding."
+      },
+      {
+        "name": "space-16",
+        "value": "64px",
+        "usage": "Landing section gap."
+      },
+      {
+        "name": "space-24",
+        "value": "96px",
+        "usage": "Landing hero top and bottom."
+      }
+    ]
+  },
+  "radius": {
+    "tokens": [
+      {
+        "name": "radius-s",
+        "value": "6px",
+        "usage": "Chips, inputs, small buttons."
+      },
+      {
+        "name": "radius-m",
+        "value": "10px",
+        "usage": "Buttons, menus."
+      },
+      {
+        "name": "radius-l",
+        "value": "16px",
+        "usage": "Cards and panels."
+      },
+      {
+        "name": "radius-xl",
+        "value": "24px",
+        "usage": "Feature tiles; matches the mark's tile (12 on 40)."
+      },
+      {
+        "name": "radius-pill",
+        "value": "999px",
+        "usage": "Status dots, toggles."
+      }
+    ]
+  },
+  "shadow": {
+    "note": "Shadows are tinted with mesa-deep, never grey: depth reads as dusk light.",
+    "tokens": [
+      {
+        "name": "shadow-facet",
+        "value": {
+          "dusk": "inset 0 1px 0 rgba(255,255,255,0.06), 0 12px 32px -12px rgba(8,4,32,0.7)",
+          "day": "0 1px 2px rgba(40,30,90,0.08), 0 12px 32px -16px rgba(40,30,90,0.25)"
+        },
+        "usage": "Cards and panels at rest."
+      },
+      {
+        "name": "shadow-lift",
+        "value": {
+          "dusk": "inset 0 1px 0 rgba(255,255,255,0.08), 0 20px 48px -16px rgba(8,4,32,0.85)",
+          "day": "0 2px 4px rgba(40,30,90,0.1), 0 20px 48px -18px rgba(40,30,90,0.35)"
+        },
+        "usage": "Hovered or dragged card; popovers."
+      },
+      {
+        "name": "shadow-ai",
+        "value": "0 0 0 1px rgba(22,211,230,0.35), 0 0 24px rgba(22,211,230,0.22)",
+        "usage": "Glow on an element an agent is working on right now."
+      },
+      {
+        "name": "shadow-sun",
+        "value": "0 0 0 1px rgba(255,180,143,0.5), 0 0 28px rgba(255,180,143,0.28)",
+        "usage": "Glow on the one item that needs a person."
+      }
+    ]
+  }
+}

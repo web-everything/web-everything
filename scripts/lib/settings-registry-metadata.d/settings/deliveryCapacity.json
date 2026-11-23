@@ -1,0 +1,23 @@
+{
+  "description": "Delivery capacity measurement, weighted units and automatic tuning policy.",
+  "owner": "scripts/settings/delivery-capacity.json",
+  "changeVia": "pr",
+  "instant": false,
+  "leaves": {
+    "pinUnits": {
+      "range": "integer 1–200",
+      "unit": "units",
+      "note": "also instant via operator-override capacity leaf"
+    },
+    "pinUntil": {
+      "range": "positive safe integer ≤ now + 72 hours",
+      "unit": "epoch milliseconds",
+      "note": "also instant via operator-override capacity leaf"
+    },
+    "holdUntil": {
+      "range": "positive safe integer ≤ now + 72 hours",
+      "unit": "epoch milliseconds",
+      "note": "also instant via operator-override capacity leaf"
+    }
+  }
+}

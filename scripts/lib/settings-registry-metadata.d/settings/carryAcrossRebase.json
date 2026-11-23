@@ -1,0 +1,6 @@
+{
+  "description": "Carry review state across eligible rebases.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

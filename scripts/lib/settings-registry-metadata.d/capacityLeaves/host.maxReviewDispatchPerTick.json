@@ -1,0 +1,5 @@
+{
+  "description": "Maximum host review dispatches per tick.",
+  "range": "integer 1–16",
+  "unit": "dispatches/tick"
+}
