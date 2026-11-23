@@ -578,7 +578,6 @@ it('round-2: malformed appended findings cannot erase a carried WEAKENED through
   }
 });
 
-
 describe('debounce and delta audits', () => {
   const PREV = 'c'.repeat(40), NEXT = 'd'.repeat(40);
   const time = Date.parse(AT);

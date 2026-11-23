@@ -3,9 +3,9 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL, URL as NodeURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { stripVTControlCharacters } from 'node:util';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { matchesSome } from './audit-verdict.mjs';
-import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
