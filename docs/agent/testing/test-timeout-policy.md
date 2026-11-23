@@ -1,4 +1,4 @@
-# Red-main timeout policy
+## Red-main timeout policy
 
 `scripts/settings/test-timeout-policy.json` owns timeout values; the pure evaluator
 resolves `all`, job, then test file through the shared policy cascade.
