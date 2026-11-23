@@ -1,5 +1,5 @@
 {
-  "description": "Merge drain grouping, recovery and infrastructure classification policy.",
+  "description": "Merge drain grouping and asynchronous facts shadow policy.",
   "owner": "scripts/settings/drain-card-group.json",
   "changeVia": "pr",
   "instant": false

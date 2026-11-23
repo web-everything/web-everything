@@ -4,18 +4,21 @@ import { buildMqFailureRoute } from './mq-failure-route.mjs';
 export async function drainMqFailureRecovery({ removal, hold, ledger, io, dryRun = false }) {
   const skip = note => ({ action: 'skip', note });
   if (dryRun || hold?.reason !== 'mq-same-head-failed' || hold.historyComplete !== true
-    || hold.mergeState !== 'CLEAN' || hold.retriesExhausted !== false) return skip('Safety hold retained; operator inspection required');
+    || hold.mergeState !== 'CLEAN'
+    || (hold.retriesExhausted !== false && !(hold.retriesExhausted === true && hold.forceFixer === true)))
+    return skip('Safety hold retained; operator inspection required');
   let evidence, labels;
   try {
     evidence = await io.collectEvidence({ removal });
     labels = await io.readLabels({ repo: removal.repo, pr: removal.pr });
   } catch { return skip('Unreadable evidence or labels; operator inspection required'); }
-  // Proven real failures may have incomplete paths: publish those unchanged for a normal fix,
-  // while intake continues to require complete paths before authorizing a mechanical refresh.
-  if (classifyMqFailureEvidence(evidence) !== 'real' || labels?.complete !== true || !Array.isArray(labels.labels))
+  // After the single refresh is spent, incomplete logs are diagnostic data for the
+  // fixer too. They never become success evidence or a mechanical-refresh license.
+  if ((!hold.forceFixer && classifyMqFailureEvidence(evidence) !== 'real')
+    || labels?.complete !== true || !Array.isArray(labels.labels))
     return skip('Unproven or non-defect evidence; hold retained for operator inspection');
   let body;
-  try { body = buildMqFailureRoute({ ...removal, ...evidence }); }
+  try { body = buildMqFailureRoute({ ...removal, ...evidence, fixerOnly: true }); }
   catch { return skip('Invalid or oversized evidence; operator inspection required'); }
   try {
     if (!(await ledger.claim({ ...removal, kind: 'route' })).claimed) return skip('Already routed this head');

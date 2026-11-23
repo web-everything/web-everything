@@ -137,7 +137,7 @@ describe('real drain pre-stage path', () => {
     expect(end).toBeGreaterThan(start);
     const body = source.slice(start, end);
     expect(body).toMatch(/\bmqSameHeadGuard\s*\(/);
-    expect(body).toMatch(/if\s*\([^)]*\.hold\s*\)\s*(?:\{\s*)?return\s*\{/);
+    expect(body).toMatch(/if\s*\(guard\.hold\)\s*\{\s*mqFixerRoutes\.start\(\{ repo: c\.repo \?\? localSlug, pr: c\.num, head: sha, guard, dryRun: DRY_RUN \}\);\s*return\s*\{ enqueued: false, kind: 'mq-same-head-failed', reason: shown\.line \};\s*\}/);
     expect(body).toMatch(/enqueued:\s*false/);
     expect(body).toMatch(/kind:\s*['"]mq-same-head-failed['"]/);
     expect(body).toMatch(/reason:\s*\w+\.line/);

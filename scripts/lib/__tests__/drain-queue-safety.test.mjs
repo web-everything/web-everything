@@ -79,6 +79,10 @@ describe('merge-queue same-head failure admission', () => {
       }, log: vi.fn(), approvedHeadHold: vi.fn(() => false), enqueueAllowed: vi.fn(() => true) };
       f.workflowRuns = new Map();
       f.exec = vi.fn((_command, args) => {
+        if (args.includes(`repos/${repo}/actions/runs?head_sha=${head}&per_page=100`)) {
+          if (f.runs instanceof Error) throw f.runs;
+          return JSON.stringify(f.runs ?? { total_count: 1, workflow_runs: [{ created_at: '2099-01-01T00:00:00Z' }] });
+        }
         const runPath = args.find(arg => /^repos\/[^/]+\/[^/]+\/actions\/runs\/\d+$/.test(arg));
         if (runPath) {
           const result = f.workflowRuns.get(runPath.split('/').at(-1));
@@ -174,6 +178,7 @@ describe('merge-queue same-head failure admission', () => {
         const start = source.indexOf('  function enqueueWithSameHeadGuard(');
         const end = source.indexOf('  // xym8nt4 — post-approval', start);
         const wiring = { ...dependencies, assertCapability, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
+          mqFixerRoutes: { start() {}, settle: async () => {} },
           execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
           readCompletePrComments, readPinnedChangedFiles,
           readDrainQueueSafety: () => ({ value: { waitForRedTeamBeforeEnqueue: true } }),
@@ -644,13 +649,62 @@ describe('merge-queue same-head failure admission', () => {
       expect(mqSameHeadRefreshStatePath({})).toBe(join(homedir(), '.claude', 'conveyor', 'mq-same-head-refresh-state.json'));
       expect(mqSameHeadRefreshStatePath({ WE_DRAIN_MQ_REFRESH_STATE_PATH: '/fixture/state.json' })).toBe('/fixture/state.json');
     });
-    it('held CLEAN green requests exactly once across passes and a second store instance', () => fixture(f => {
+    it('executed refresh (CI run after claim) blocks a second refresh across passes and stores', () => fixture(f => {
       expect(f.run().hold).toBe(true);
       f.run();
       f.run(createMqSameHeadRefreshStore({ path: f.path }));
       expect(f.requests().map(([, args]) => args)).toEqual([['api', '-X', 'PUT', `repos/${repo}/pulls/${pr}/update-branch`, '-f', `expected_head_sha=${head}`]]);
       expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch requested`);
     }));
+    it('unexecuted legacy claim triggers exactly one timestamped retry while admission holds', () => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      writeFileSync(f.path, JSON.stringify([key]));
+      expect(f.store.claimedAt(key)).toBeNull();
+      expect(f.run()).toMatchObject({ hold: true, retriesExhausted: true });
+      expect(f.requests()).toHaveLength(1);
+      expect(f.store.claimedAt(`${key}#retry`)).toEqual(expect.any(Number));
+      expect(f.store.claimedAt(key)).toBeNull();
+      expect(JSON.parse(readFileSync(f.path, 'utf8'))).toEqual([key, `${key}#retry`]);
+      expect(f.log).toHaveBeenCalledWith(`mq-same-head-refresh: #${pr} head ${head} — update-branch retried (earlier recorded refresh never executed)`);
+    }));
+    it('unexecuted retry stays spent across passes and stores; no second retry', () => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      writeFileSync(f.path, JSON.stringify([key]));
+      f.runs = { total_count: 0, workflow_runs: [] };
+      f.run();
+      expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+      f.run(createMqSameHeadRefreshStore({ path: f.path }));
+      expect(f.requests()).toHaveLength(1);
+    }));
+    it.each([new Error('offline'), {}, { total_count: 101, workflow_runs: [] },
+      { total_count: 1, workflow_runs: [] }, { total_count: 1, workflow_runs: [{ created_at: 'invalid' }] }])(
+      'unreadable or incomplete run evidence %j fails closed without update-branch', runs => fixture(f => {
+        f.store.claim(`${repo}#${pr}@${head}`);
+        f.runs = runs;
+        expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer', retriesExhausted: true });
+        expect(f.requests()).toHaveLength(0);
+        expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/run evidence unreadable or incomplete; inspect Actions runs.*hold for fixer inspection/));
+      }));
+    it.each([-1000, 0])('CI started before or at claim (%s ms) allows one retry', offset => fixture(f => {
+      const key = `${repo}#${pr}@${head}`;
+      f.store.claim(key);
+      f.runs = { total_count: 1, workflow_runs: [{ created_at: new Date(f.store.claimedAt(key) + offset).toISOString() }] };
+      f.run(); f.run();
+      expect(f.requests()).toHaveLength(1);
+      expect(f.store.has(`${key}#retry`)).toBe(true);
+    }));
+    it.each(['not CLEAN', 'checks not green', 'authorization refused', 'blocking label'])(
+      'legacy retry preserves %s refusal without spending retry', reason => fixture(f => {
+        const key = `${repo}#${pr}@${head}`;
+        writeFileSync(f.path, JSON.stringify([key]));
+        if (reason === 'not CLEAN') f.live.mergeStateStatus = 'BEHIND';
+        if (reason === 'checks not green') f.live.statusCheckRollup = [];
+        if (reason === 'authorization refused') f.enqueueAllowed.mockReturnValue(false);
+        if (reason === 'blocking label') f.labels.push('review:changes');
+        f.run();
+        expect(f.requests()).toHaveLength(0);
+        expect(f.store.has(`${key}#retry`)).toBe(false);
+      }));
     it.each([
       ['a required check failing', f => { f.required = [{ name: 'test', bucket: 'fail' }]; }],
       ['a required check pending', f => { f.required = [{ name: 'test', bucket: 'pending' }]; }],
@@ -797,7 +851,11 @@ describe('merge-queue same-head failure admission', () => {
       const other = createMqSameHeadRefreshStore({ path: f.path });
       const key = `${repo}#${pr}@${head}`;
       expect(f.store.claim(key)).toBe(true);
+      const time = other.claimedAt(key);
+      expect(time).toEqual(expect.any(Number));
+      expect(JSON.parse(readFileSync(`${f.path}.times.json`, 'utf8'))).toEqual({ [key]: time });
       expect(other.claim(key)).toBe(false);
+      expect(other.claimedAt(key)).toBe(time);
       expect(other.claim(`${repo}#${pr}@${prior}`)).toBe(true);
       expect(f.store.claim(`${repo}#${pr + 1}@${head}`)).toBe(true);
       expect(f.store.claim(`other/repo#${pr}@${head}`)).toBe(true);
@@ -807,499 +865,6 @@ describe('merge-queue same-head failure admission', () => {
       f.run(f.store, { repo: `fixture/ledger-${kind}` }); expect(f.requests()).toHaveLength(0);
       expect(f.log).toHaveBeenCalledWith(expect.stringMatching(/state unavailable;.*inspect.*ledger/));
     }));
-  });
-
-  describe('bounded failed_checks infrastructure retry', () => {
-    const perfect = { mainGreen: true, infra: 'infra', mergeState: 'CLEAN' };
-    const retryDecision = (retryEvidence = perfect, events = [removed()]) =>
-      decideMqSameHead({ pr, head, timeline: timeline(...events), retryEvidence });
-    const holdLine = `mq-same-head-failed: #${pr} head ${head} — failed_checks`;
-    const retryLine = why => `mq-same-head-retry: #${pr} head ${head} — failed_checks infra retry 1/2 (main green, PR CLEAN, ${why}); main run 12; failed check(s): unnamed`;
-
-    it.each(['infra', 'main-red'])('releases one same-head failed_checks removal with main green, CLEAN and %s evidence', infra => {
-      expect(retryDecision({ ...perfect, infra }).hold).toBe(false);
-    });
-    it.each([false, null, undefined])('holds when latest main CI success is absent or unknown (%s)', mainGreen => {
-      expect(retryDecision({ ...perfect, mainGreen })).toEqual({ hold: true, line: holdLine });
-    });
-    it('holds real test failures when main was not red at removal time', () => {
-      expect(retryDecision({ ...perfect, infra: null })).toEqual({ hold: true, line: holdLine });
-    });
-    it.each(['BEHIND', null, undefined])('holds when the same-head live PR is not known CLEAN (%s)', mergeState => {
-      expect(retryDecision({ ...perfect, mergeState })).toEqual({ hold: true, line: holdLine });
-    });
-    it.each([3, 4, 100])('holds %i same-head failed_checks removals even with perfect evidence and names the count', count => {
-      const result = retryDecision(perfect, Array.from({ length: count }, () => removed()));
-      expectHold(result, new RegExp(`failed_checks.*\\b${count}\\b`));
-    });
-    it.each(['ci_failure', 'branch_protection_failure', 'invalid_merge_commit'])(
-      'another same-head %s removal prevents the retry in either timeline order', reason => {
-        for (const events of [[removed(), removed(reason)], [removed(reason), removed()]]) {
-          expectHold(retryDecision(perfect, events), /failed_checks|ci_failure|branch_protection_failure|invalid_merge_commit/);
-        }
-      });
-    it('counts only failures bound to the current head', () => {
-      expect(retryDecision(perfect, [removed('failed_checks', prior), removed('ci_failure', prior), removed()]).hold).toBe(false);
-    });
-    it('perfect retry evidence cannot release a truncated timeline', () => {
-      expectHold(decideMqSameHead({ pr, head, retryEvidence: perfect,
-        timeline: { nodes: [removed()], hasPreviousPage: true } }), /inspect.*history/i);
-    });
-
-    function fixture(test) {
-      const run = (id, conclusion, created_at) => ({ id, conclusion, created_at, updated_at: created_at, status: 'completed',
-        path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push' });
-      const f = { now: Date.parse('2026-11-01T14:00:00Z'), log: vi.fn(), events: [removed()], live: { headRefOid: head, mergeStateStatus: 'CLEAN' },
-        runs: [run(12, 'success', '2026-11-01T13:00:00Z'), run(11, 'success', '2026-11-01T11:00:00Z')],
-        checks: [{ id: 21, status: 'completed', conclusion: 'timed_out', output: { title: '', summary: '' } }] };
-      f.exec = vi.fn((command, args) => {
-        if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
-        if (args.some(arg => arg.includes('isInMergeQueue'))) return queueResponse();
-        if (args.some(arg => arg.includes('timelineItems'))) return response(timeline(...f.events));
-        if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify(f.live);
-        const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
-        if (endpoint?.includes('/check-runs')) {
-          f.checkReads = (f.checkReads ?? 0) + 1;
-          if (f.checkError) throw new Error('check-runs unavailable');
-          if (f.checkPages) return JSON.stringify({ total_count: f.checkTotal,
-            check_runs: f.checkPages[f.checkReads - 1] });
-          if (f.checkReads > 1) throw new Error('next check-runs page unavailable');
-          return f.checkJson ?? JSON.stringify({ total_count: f.checkTotal ?? f.checks.length, check_runs: f.checks });
-        }
-        if (/\/actions\/jobs\/[0-9]+$/.test(endpoint ?? '')) {
-          if (f.jobError) throw new Error('job metadata unavailable');
-          return JSON.stringify(f.jobData ?? { id: 9022, name: 'CI / test',
-            head_sha: removed().beforeCommit.oid, status: 'completed', conclusion: 'failure',
-            steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] });
-        }
-        if (endpoint?.includes('/actions/') || (args[0] === 'run' && args[1] === 'list')) {
-          f.mainReads = (f.mainReads ?? 0) + 1;
-          if (f.mainError) throw new Error('main runs unavailable');
-          if (f.mainPages) return JSON.stringify({ total_count: f.mainTotal,
-            workflow_runs: f.mainPages[f.mainReads - 1] });
-          const query = new URLSearchParams(endpoint?.split('?')[1] ?? '');
-          let runs = endpoint?.includes('status=completed')
-            ? f.runs.filter(run => run.status === 'completed') : f.runs;
-          const before = (query.get('created') ?? '').replace(/^</, '');
-          if (before) runs = runs.filter(run => Date.parse(run.created_at) < Date.parse(before));
-          if (query.get('per_page') === '1') runs = [...runs].sort((a, b) =>
-            Date.parse(b.created_at) - Date.parse(a.created_at) || b.id - a.id).slice(0, 1);
-          return f.mainJson ?? JSON.stringify(args[0] === 'run'
-            ? f.runs.map(r => ({ ...r, databaseId: r.id, createdAt: r.created_at, headBranch: r.head_branch,
-              workflowName: 'CI' }))
-            : { total_count: runs.length, workflow_runs: runs });
-        }
-        throw new Error(`unexpected GitHub read: ${args.join(' ')}`);
-      });
-      f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: f.now });
-      f.expectHeld = () => {
-        expect(f.guard()).toEqual({ hold: true, line: holdLine });
-        expect(f.log.mock.calls[0]).toEqual([holdLine]);
-        // Only a decline-reason line may follow the unchanged hold line.
-        for (const [line] of f.log.mock.calls.slice(1)) expect(line).toMatch(/^mq-same-head-retry-declined: #6215 head \w+ — \S/);
-      };
-      test(f);
-    }
-
-    it.each(['timed_out'])('guard logs retry 1/2 for infrastructure check conclusion %s', conclusion => fixture(f => {
-      f.checks[0].conclusion = conclusion;
-      expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
-      expect(f.checkReads).toBeGreaterThan(0);
-      expect(f.mainReads).toBeGreaterThan(0);
-      expect(f.exec.mock.calls.some(([, args]) => args.some(arg =>
-        arg.includes(`/commits/${removed().beforeCommit.oid}/check-runs`)))).toBe(true);
-      expect(f.exec.mock.calls.some(([, args]) => args.includes('mergeStateStatus,headRefOid'))).toBe(true);
-    }));
-    const regroupChecks = (conclusion = 'cancelled') => [
-      { id: 21, name: 'CI / integration', status: 'completed', conclusion,
-        details_url: `https://github.com/${repo}/actions/runs/500/job/9021`,
-        head_sha: removed().beforeCommit.oid,
-        started_at: '2026-11-01T11:00:00Z', completed_at: '2026-11-01T11:10:00Z' },
-      { id: 22, name: 'CI / test', status: 'completed', conclusion: 'failure',
-        details_url: `https://github.com/${repo}/actions/runs/500/job/9022`,
-        head_sha: removed().beforeCommit.oid,
-        started_at: '2026-11-01T11:00:00Z', completed_at: '2026-11-01T11:10:00Z' },
-      { id: 23, name: 'merge-gate', status: 'completed', conclusion: 'success' },
-      { id: 24, name: 'soak', status: 'completed', conclusion: 'success' },
-    ];
-    it.each(['cancelled', 'startup_failure'])(
-      'cancelled/regroup retries %s plus a derived aggregate without main, logs or reruns', conclusion => fixture(f => {
-        f.checks = regroupChecks(conclusion);
-        f.mainError = true;
-        const result = f.guard();
-        expect(result.hold).toBe(false);
-        expect(result.line).toContain('mq-same-head-retry:');
-        expect(result.line).toContain('failed_checks cancelled/regroup retry 1/2 (no failed required job; cancelled: CI / integration; aggregate derived: CI / test; PR CLEAN)');
-        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-          && !args.some(arg => arg.includes('/workflows/') || arg.includes('/logs')))).toBe(true);
-        expect(f.mainReads).toBeUndefined();
-      }));
-    it.each(['intrinsic step', 'missing steps', 'wrong job id', 'wrong commit', 'wrong job name',
-      'wrong status', 'wrong conclusion', 'unreadable metadata', 'missing details URL', 'foreign details URL'])(
-      'cancelled/regroup holds with %s even when main is green', kind => fixture(f => {
-        f.checks = regroupChecks();
-        f.jobData = { id: 9022, name: 'CI / test', head_sha: removed().beforeCommit.oid,
-          status: 'completed', conclusion: 'failure',
-          steps: [{ name: 'Gate on shard results', conclusion: 'failure' }] };
-        if (kind === 'intrinsic step') f.jobData.steps.push({ name: 'Install', conclusion: 'failure' });
-        if (kind === 'missing steps') delete f.jobData.steps;
-        if (kind === 'wrong job id') f.jobData.id = 22;
-        if (kind === 'wrong commit') f.jobData.head_sha = head;
-        if (kind === 'wrong job name') f.jobData.name = 'test';
-        if (kind === 'wrong status') f.jobData.status = 'in_progress';
-        if (kind === 'wrong conclusion') f.jobData.conclusion = 'success';
-        if (kind === 'unreadable metadata') f.jobError = true;
-        if (kind === 'missing details URL') delete f.checks[1].details_url;
-        if (kind === 'foreign details URL') f.checks[1].details_url = 'https://github.com/other/repo/actions/runs/500/job/9022';
-        expect(f.guard().hold).toBe(true);
-        expect(f.mainReads).toBeUndefined();
-      }));
-    it.each([
-      ['missing start', { started_at: undefined }],
-      ['missing completion', { completed_at: undefined }],
-      ['invalid start', { started_at: 'not-a-date' }],
-      ['invalid completion', { completed_at: 'not-a-date' }],
-      ['completion before start', { completed_at: '2026-11-01T10:59:00Z' }],
-      ['completion at removal', { completed_at: removed().createdAt }],
-      ['missing commit', { head_sha: undefined }],
-    ])('cancelled/regroup holds with unreadable attempt evidence: %s', (_kind, overrides) => fixture(f => {
-      f.checks = regroupChecks();
-      Object.assign(f.checks[1], overrides);
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toMatch(/attempt evidence unreadable or incomplete; operator must inspect/);
-      expect(f.mainReads).toBeUndefined();
-      expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
-    }));
-    describe.each(['cancelled', 'startup_failure'])('%s check evidence', conclusion => {
-      it.each([
-        ['missing commit', { head_sha: undefined }],
-        ['wrong commit', { head_sha: head }],
-        ['missing URL', { details_url: undefined }],
-        ['foreign repository', { details_url: 'https://github.com/other/repo/actions/runs/500/job/9021' }],
-        ['foreign origin', { details_url: `https://example.com/${repo}/actions/runs/500/job/9021` }],
-        ['missing run identity', { details_url: `https://github.com/${repo}/actions/jobs/9021` }],
-        ['invalid run identity', { details_url: `https://github.com/${repo}/actions/runs/0/job/9021` }],
-        ['invalid job identity', { details_url: `https://github.com/${repo}/actions/runs/500/job/0` }],
-        ['URL query', { details_url: `https://github.com/${repo}/actions/runs/500/job/9021?attempt=2` }],
-        ['missing name', { name: undefined }],
-        ['blank name', { name: ' ' }],
-        ['missing start', { started_at: undefined }],
-        ['invalid start', { started_at: 'not-a-date' }],
-        ['missing completion', { completed_at: undefined }],
-        ['invalid completion', { completed_at: 'not-a-date' }],
-        ['completion before start', { completed_at: '2026-11-01T10:59:00Z' }],
-        ['completion at removal', { completed_at: removed().createdAt }],
-        ['completion after removal', { completed_at: '2026-11-01T14:00:00Z' }],
-        ['pending status', { status: 'in_progress' }],
-      ])('holds with %s alongside a derived aggregate', (_kind, overrides) => fixture(f => {
-        f.checks = regroupChecks(conclusion);
-        Object.assign(f.checks[0], overrides);
-        expect(f.guard().hold).toBe(true);
-        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST')
-          && !args.some(arg => arg.includes('/logs')))).toBe(true);
-      }));
-      it.each(['repeated cancellation', 'pending rerun', 'incomplete successful rerun'])(
-        'holds with %s on the same Actions run', kind => fixture(f => {
-          f.checks = regroupChecks(conclusion);
-          f.checks.push({ ...f.checks[0], id: 25,
-            details_url: `https://github.com/${repo}/actions/runs/500/job/9025`,
-            started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z',
-            ...(kind === 'pending rerun' ? { status: 'in_progress', conclusion: null } : {}),
-            ...(kind === 'incomplete successful rerun' ? { conclusion: 'success', completed_at: undefined } : {}),
-          });
-          expect(f.guard().hold).toBe(true);
-          expect(f.mainReads).toBeUndefined();
-          expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
-        }));
-      it.each(['missing page', 'duplicate check identity', 'missing check identity'])(
-        'holds with an incomplete check-run list: %s', kind => fixture(f => {
-          f.checks = regroupChecks(conclusion);
-          if (kind === 'missing page') f.checkTotal = f.checks.length + 1;
-          if (kind === 'duplicate check identity') f.checks.push({ ...f.checks[0] });
-          if (kind === 'missing check identity') delete f.checks[0].id;
-          expect(f.guard().hold).toBe(true);
-          expect(f.mainReads).toBeUndefined();
-        }));
-    });
-    it.each([
-      [false, {}], [true, {}],
-      [false, { started_at: undefined }], [true, { completed_at: undefined }],
-    ])('cancelled/regroup holds after repeated failed attempts (later success: %s, attempt metadata: %j)', (laterSuccess, overrides) => fixture(f => {
-      f.checks = regroupChecks();
-      const original = f.checks[1];
-      f.checks.push({ ...original, id: 25,
-        details_url: `https://github.com/${repo}/actions/runs/500/job/9025`,
-        started_at: '2026-11-01T11:20:00Z', completed_at: '2026-11-01T11:30:00Z', ...overrides });
-      if (laterSuccess) f.checks.push({ ...original, id: 26, conclusion: 'success',
-        details_url: `https://github.com/${repo}/actions/runs/500/job/9026`,
-        started_at: '2026-11-01T11:40:00Z', completed_at: '2026-11-01T11:50:00Z' });
-      expect(f.guard().hold).toBe(true);
-      expect(f.mainReads).toBeUndefined();
-      expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
-    }));
-    describe.each(['cancelled', 'startup_failure'])('pure %s evidence uses the legacy main-green path', conclusion => {
-      it.each([1, 10, 11])('requires main green with %i failed jobs, including above the job cap', count => {
-        for (const main of ['green', 'red', 'unreadable']) fixture(f => {
-          f.checks = Array.from({ length: count }, (_, i) => ({
-            ...regroupChecks(conclusion)[0], id: 100 + i, name: `cancelled-${i}`,
-            details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
-          }));
-          if (main === 'red') f.runs[0].conclusion = 'failure';
-          if (main === 'unreadable') f.mainError = true;
-          const result = f.guard();
-          expect(result.hold).toBe(main !== 'green');
-          expect(result.line).not.toContain('cancelled/regroup');
-          if (main === 'green') expect(result.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
-          expect(f.mainReads).toBeGreaterThan(0);
-          expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
-        });
-      });
-      it.each(['success', 'neutral', 'skipped'])('a %s aggregate still requires main green', aggregateConclusion => fixture(f => {
-        f.checks = regroupChecks(conclusion);
-        f.checks[1].conclusion = aggregateConclusion;
-        f.mainError = true;
-        expect(f.guard().hold).toBe(true);
-        expect(f.mainReads).toBeGreaterThan(0);
-        expect(f.log.mock.calls.every(([line]) => !line.includes('cancelled/regroup'))).toBe(true);
-      }));
-    });
-    it('cancelled/regroup enforces ten failed jobs with a derived aggregate', () => {
-      for (const count of [10, 11]) fixture(f => {
-        const checks = regroupChecks();
-        f.checks = Array.from({ length: count - 1 }, (_, i) => ({
-          ...checks[0], id: 100 + i, name: `cancelled-${i}`,
-          details_url: `https://github.com/${repo}/actions/runs/500/job/${9100 + i}`,
-        }));
-        f.checks.push(checks[1]);
-        f.mainError = true;
-        const result = f.guard();
-        expect(result.hold).toBe(count > 10);
-        if (count > 10) expect(f.log.mock.calls[1][0]).toMatch(/10-job limit; operator must inspect failed jobs and enqueue manually/);
-        else expect(result.line).toContain('cancelled/regroup retry 1/2');
-        expect(f.mainReads).toBeUndefined();
-        expect(f.exec.mock.calls.every(([, args]) => !args.includes('POST'))).toBe(true);
-      });
-    });
-    it('second cancelled/regroup retry is allowed at N=2; third holds even after manual withdrawal', () => {
-      for (const spent of [1, 2]) fixture(f => {
-        f.checks = regroupChecks();
-        f.events = [removed(), added, removed()];
-        if (spent === 2) f.events.push(added, removed('manual'));
-        const result = f.guard();
-        expect(result.hold).toBe(spent === 2);
-        if (spent === 1) expect(result.line).toContain('cancelled/regroup retry 2/2');
-        else expect(result.line).toMatch(/already spent: 2\/2.*operator must inspect/);
-        expect(f.mainReads).toBeUndefined();
-      });
-    });
-    it('cancelled/regroup still holds past two failed removals even with fewer than two re-enqueues', () => {
-      const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 2,
-        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] },
-      [removed(), removed(), removed()]);
-      expect(result.hold).toBe(true);
-      expect(result.line).toMatch(/3 removals on this head/);
-    });
-    it('a configured cancellation limit of one allows the first retry and holds the second', () => {
-      for (const spent of [0, 1]) {
-        const result = retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax: 1,
-          mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] },
-        spent ? [removed(), added, removed()] : [removed()]);
-        expect(result.hold).toBe(spent === 1);
-        expect(result.line).toContain(spent ? 'already spent: 1/1' : 'cancelled/regroup retry 1/1');
-      }
-    });
-    it.each([0, 3, 4, 5, 100])('direct cancellation evidence rejects invalid bound %s', mqCancelledRetryMax => {
-      expect(retryDecision({ infra: 'cancelled-regroup', mqCancelledRetryMax,
-        mergeState: 'CLEAN', cancelledNames: ['CI / integration'], derivedNames: ['CI / test'] }).line).toMatch(/invalid cancellation retry bound; operator must inspect/);
-    });
-    it.each(['1', '3', '4', '5'])('cancelled/regroup respects the historical cap with override %s', override => {
-      const previous = process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
-      process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX = override;
-      try {
-        fixture(f => {
-          f.checks = regroupChecks();
-          f.events = [removed(), added, removed(), added, removed()];
-          const result = f.guard();
-          expect(result.hold).toBe(true);
-          expect(result.line).toContain(`already spent: 2/${override === '1' ? 1 : 2}`);
-          expect(f.mainReads).toBeUndefined();
-        });
-      } finally {
-        if (previous === undefined) delete process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX;
-        else process.env.WE_DRAIN_MQ_CANCELLED_RETRY_MAX = previous;
-      }
-    });
-    it.each(['real failure', 'timed_out', 'unconfigured aggregate', 'aggregate timed_out',
-      'incomplete', 'unreadable', 'truncated', 'not CLEAN', 'unreadable PR state'])(
-      'cancelled/regroup holds with %s evidence', kind => fixture(f => {
-        f.checks = regroupChecks();
-        if (kind === 'real failure') f.checks.push({ id: 25, name: 'test-shard (1)', status: 'completed', conclusion: 'failure' });
-        if (kind === 'timed_out') f.checks[0].conclusion = 'timed_out';
-        if (kind === 'unconfigured aggregate') f.checks[1].name = 'other';
-        if (kind === 'aggregate timed_out') f.checks[1].conclusion = 'timed_out';
-        if (kind === 'incomplete') f.checks[3].status = 'in_progress';
-        if (kind === 'unreadable') f.checkError = true;
-        if (kind === 'truncated') f.checkTotal = 1000;
-        if (kind === 'not CLEAN' || kind === 'unreadable PR state') f.events = [removed(), added, removed()];
-        if (kind === 'not CLEAN') f.live.mergeStateStatus = 'BEHIND';
-        if (kind === 'unreadable PR state') f.live = null;
-        expect(f.guard().hold).toBe(true);
-        if (kind === 'not CLEAN' || kind === 'unreadable PR state') {
-          expect(f.log.mock.calls[1][0]).toMatch(/PR is not CLEAN/);
-          expect(f.mainReads).toBeUndefined();
-        }
-      }));
-    it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
-      ['summary', 'SELF-HOSTED RUNNER went away']])('guard treats runner loss in output.%s as infrastructure (%s)', (field, text) => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { [field]: text } };
-      expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
-    }));
-    it('guard holds when any failed check is a real test failure', () => fixture(f => {
-      f.checks.push({ id: 22, status: 'completed', conclusion: 'failure', output: { title: 'Assertion failed', summary: 'expected 1 to equal 2' } });
-      f.expectHeld();
-    }));
-    it.each(['title', 'summary'])('guard holds ordinary test-runner assertion failures in output.%s', field => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
-        output: { [field]: 'Test runner reported failing assertions' } };
-      f.expectHeld();
-    }));
-    it.each(['Self-hosted runner reported failing assertions', 'Runner failed assertions',
-      'Test runner failed to execute assertions'])('guard holds real test failures mentioning runners: %s', text => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { summary: text } };
-      f.expectHeld();
-    }));
-    it.each(['failure', 'cancelled', 'timed_out'])('guard permits main-red retry when latest CI before removal was %s and main is now green', conclusion => fixture(f => {
-      f.runs[1].conclusion = conclusion;
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Assertion failed' } };
-      expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[retryLine('main-red')]]);
-    }));
-    it('an older red main run cannot override a newer green run before removal', () => fixture(f => {
-      f.runs.push({ ...f.runs[1], id: 10, conclusion: 'failure', created_at: '2026-11-01T10:00:00Z' });
-      f.checks[0].conclusion = 'failure';
-      f.expectHeld();
-    }));
-    it('a red main run created before but completed after removal is not evidence main was red at removal', () => fixture(f => {
-      f.runs[1] = { ...f.runs[1], conclusion: 'failure', created_at: '2026-11-01T11:00:00Z', updated_at: '2026-11-01T13:00:00Z' };
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Assertion failed' } };
-      f.expectHeld();
-    }));
-    it('an assertion failure that mentions a runner disconnect is a real failure, not infrastructure', () => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
-        output: { title: 'Failed', summary: 'AssertionError: Expected error "Runner disconnected" but received "assertion failed"' } };
-      f.runs[1].conclusion = 'success';
-      f.expectHeld();
-    }));
-    it('assertion text in output.text vetoes a runner-loss title', () => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure',
-        output: { title: 'Runner disconnected', summary: '', text: 'AssertionError: expected 1 to be 2' } };
-      f.runs[1].conclusion = 'success';
-      f.expectHeld();
-    }));
-    it('failing-test wording in output.text vetoes a runner-loss title', () => fixture(f => {
-      f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { title: 'Runner disconnected', summary: '', text: '1 failing test' } };
-      f.expectHeld();
-    }));
-    it('a spent retry (re-enqueued after the failed removal, then manually removed) stays held', () => fixture(f => {
-      f.events = [removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:10:00Z' },
-        removed(), { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-11-01T12:30:00Z' },
-        { __typename: 'RemovedFromMergeQueueEvent', reason: 'MANUAL', createdAt: '2026-11-01T12:40:00Z' }];
-      const result = f.guard();
-      expect(result.hold).toBe(true);
-      expect(result.line).toMatch(/already spent/);
-    }));
-    it('logs why the retry was declined: a non-infrastructure failed check and main not red at removal', () => fixture(f => {
-      f.checks = [{ id: 21, status: 'completed', conclusion: 'cancelled', name: 'test', output: {} },
-        { id: 22, status: 'completed', conclusion: 'failure', name: 'merge-gate', output: { title: '', summary: '' } }];
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — non-infrastructure failed check(s): test, merge-gate; main was not red at removal; failed check(s): test, merge-gate`);
-    }));
-    it('logs why the retry was declined: main CI not green', () => fixture(f => {
-      f.runs[0].conclusion = 'failure';
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — main CI is not green (newest completed run 12 concluded failure); failed check(s): unnamed`);
-    }));
-    it('logs why the retry was declined: PR not CLEAN', () => fixture(f => {
-      f.live.mergeStateStatus = 'BEHIND';
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — PR is not CLEAN (BEHIND); failed check(s): unnamed`);
-    }));
-    it('logs why the retry was declined: unreadable evidence', () => fixture(f => {
-      f.checkError = true;
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`);
-    }));
-    it('a main run with unreadable completion time keeps the hold', () => fixture(f => {
-      delete f.runs[0].updated_at;
-      f.runs[1].conclusion = 'failure';
-      f.checks[0].conclusion = 'failure';
-      f.expectHeld();
-    }));
-    it('a red main run created at removal time is not evidence main was red before removal', () => fixture(f => {
-      f.runs[1] = { ...f.runs[1], conclusion: 'failure', created_at: removed().createdAt };
-      f.checks[0].conclusion = 'failure';
-      f.expectHeld();
-    }));
-    it.each(['failure', null, undefined])('guard holds when latest completed main CI conclusion is %s', conclusion => fixture(f => {
-      f.runs[0].conclusion = conclusion;
-      f.expectHeld();
-    }));
-    it.each(['queued', 'in_progress'])('guard holds for a newer %s main push only when the older completed success is stale (>2h)', status => fixture(f => {
-      f.runs.push({ ...f.runs[0], id: 13, created_at: '2026-11-01T14:00:00Z', status, conclusion: null });
-      // The older completed success is stale; pending runs do not refresh it.
-      // drain-mq-retry-main-green.test.mjs covers accepting a pending push with an older fresh success.
-      f.now = Date.parse('2026-11-01T15:01:00Z');
-      f.expectHeld();
-      const mainArgs = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.includes('/actions/')))[1];
-      expect(mainArgs.join(' ')).not.toContain('status=completed');
-    }));
-    it('guard holds at the five-page check-run cap without reading main or merge state', () => fixture(f => {
-      f.checkTotal = 501;
-      f.checkPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
-        ({ ...f.checks[0], id: page * 100 + index + 1 })));
-      f.expectHeld();
-      expect(f.checkReads).toBe(5);
-      expect(f.mainReads ?? 0).toBe(0);
-      expect(f.exec).toHaveBeenCalledTimes(7); // Queue, timeline, then five REST pages.
-    }));
-    it('guard holds after five check-run pages when the bounded main-history page is incomplete', () => fixture(f => {
-      f.checkTotal = 500;
-      f.checkPages = Array.from({ length: 5 }, (_, page) => Array.from({ length: 100 }, (_, index) =>
-        ({ ...f.checks[0], id: page * 100 + index + 1 })));
-      f.mainTotal = 501;
-      f.mainPages = Array.from({ length: 1 }, (_, page) => Array.from({ length: 99 }, (_, index) =>
-        ({ ...f.runs[0], id: page * 100 + index + 1 })));
-      // With 501 reported runs, the bounded first page must contain 100; these successes are fresh.
-      f.expectHeld();
-      expect(f.log.mock.calls[1][0]).toBe(`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`);
-      expect(f.checkReads).toBe(5);
-      expect(f.mainReads).toBe(1); // The incomplete newest-run page prevents further evidence reads.
-      expect(f.exec).toHaveBeenCalledTimes(8); // Queue, timeline, five check pages, one main read.
-      const endpoints = f.exec.mock.calls.flatMap(([, args]) => args.filter(arg => arg.includes('/check-runs')));
-      expect(endpoints.map(endpoint => new URLSearchParams(endpoint.split('?')[1]).get('page')))
-        .toEqual(['1', '2', '3', '4', '5']);
-    }));
-    it.each(['check-runs throws', 'check-runs bad JSON', 'main runs throws', 'main runs bad JSON',
-      'missing check conclusion', 'no check-runs', 'no failed check-runs', 'truncated check-runs',
-      'missing main conclusion', 'no main runs', 'head moved', 'unknown merge state', 'BEHIND'])(
-      'guard fails closed with the existing hold line: %s', kind => fixture(f => {
-        if (kind === 'check-runs throws') f.checkError = true;
-        if (kind === 'check-runs bad JSON') f.checkJson = '{';
-        if (kind === 'main runs throws') f.mainError = true;
-        if (kind === 'main runs bad JSON') f.mainJson = '{';
-        if (kind === 'missing check conclusion') delete f.checks[0].conclusion;
-        if (kind === 'no check-runs') f.checks = [];
-        if (kind === 'no failed check-runs') f.checks[0].conclusion = 'success';
-        if (kind === 'truncated check-runs') f.checkTotal = 100_000;
-        if (kind === 'missing main conclusion') delete f.runs[0].conclusion;
-        if (kind === 'no main runs') f.runs = [];
-        if (kind === 'head moved') f.live.headRefOid = prior;
-        if (kind === 'unknown merge state') delete f.live.mergeStateStatus;
-        if (kind === 'BEHIND') f.live.mergeStateStatus = 'BEHIND';
-        f.expectHeld();
-      }));
   });
 
   it('#6215 pattern: removed for failed_checks at H holds at H, using the second parent', () => {
@@ -1482,7 +1047,7 @@ describe('merge-queue same-head failure admission', () => {
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
     expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read (fails closed).
-    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-retry-declined: #${pr} head ${head} — retry evidence unreadable or incomplete`]]);
+    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-refresh-decision: #${pr} head ${head} retry=false executed=unknown spent=false outcome=not-evaluated reason=refresh unavailable`], [`mq-same-head-recovery: #${pr} head ${head} — failed checks unreadable or incomplete; refresh once before fixer`]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
     const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
@@ -1503,7 +1068,8 @@ describe('merge-queue same-head failure admission', () => {
       ? queueResponse(true) : response(timeline(removed()))), log = vi.fn();
     expectHold(mqSameHeadGuard({ repo, pr, head, exec, log, allowAlreadyQueued: false }), /failed_checks/);
     expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read.
-    expect(log).toHaveBeenCalledTimes(2); // The hold line plus its decline-reason line.
+    expect(log).toHaveBeenCalledTimes(3); // The hold, refresh decision, and recovery detail.
+    expect(log).toHaveBeenCalledWith(`mq-same-head-refresh-decision: #${pr} head ${head} retry=false executed=unknown spent=false outcome=not-evaluated reason=refresh unavailable`);
   });
   it.each([true, null, undefined, 'throws'])('mutation admission fails closed for decision %s', decision => {
     const sameHeadAdmission = vi.fn(() => {
@@ -1858,34 +1424,6 @@ describe('durable head-bound red-team admission', () => {
 });
 
 describe('drain policy cascade', () => {
-  it('defaults mqCancelledRetryMax to two and logs standard provenance', () => {
-    const log = vi.fn();
-    const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log });
-    expect(r).toMatchObject({ value: { mqCancelledRetryMax: 2 }, sources: { mqCancelledRetryMax: 'standard' } });
-    expect(log.mock.calls.flat().join('')).toContain('mqCancelledRetryMax=2 (standard)');
-  });
-  it.each([
-    ['platform', {}, {}, { mqCancelledRetryMax: 1 }, 1],
-    ['env', { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: '1' }, {}, {}, 1],
-    ['tool', {}, { mqCancelledRetryMax: 2 }, { mqCancelledRetryMax: 1 }, 2],
-    ['env', { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: '1' }, { mqCancelledRetryMax: 2 }, { mqCancelledRetryMax: 1 }, 1],
-  ])('resolves mqCancelledRetryMax from %s and logs provenance', (source, env, tool, platform, value) => {
-    const log = vi.fn();
-    expect(readDrainQueueSafety({ env, tool, platform, log })).toMatchObject({
-      value: { mqCancelledRetryMax: value }, sources: { mqCancelledRetryMax: source },
-    });
-    expect(log.mock.calls.flat().join('')).toContain(`mqCancelledRetryMax=${value} (${source})`);
-  });
-  it.each([0, -1, 1.5, 3, 4, 5, 6, 100, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, 'typo', true, null])(
-    'invalid mqCancelledRetryMax %s falls back to the next valid layer', value => {
-      const r = readDrainQueueSafety({ env: {}, tool: { mqCancelledRetryMax: value }, platform: {} });
-      expect(r).toMatchObject({ value: { mqCancelledRetryMax: 2 }, sources: { mqCancelledRetryMax: 'standard' } });
-      expect(r.invalid.join('')).toContain('mqCancelledRetryMax');
-      expect(readDrainQueueSafety({ env: { WE_DRAIN_MQ_CANCELLED_RETRY_MAX: String(value) },
-        tool: { mqCancelledRetryMax: 1 }, platform: {} })).toMatchObject({
-        value: { mqCancelledRetryMax: 1 }, sources: { mqCancelledRetryMax: 'tool' },
-      });
-    });
   it('defaults queueRebuildMax to three and logs standard provenance', () => {
     const lines = [];
     const r = readDrainQueueSafety({ env: {}, tool: {}, platform: {}, log: l => lines.push(l) });
