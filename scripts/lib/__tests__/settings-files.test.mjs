@@ -454,6 +454,11 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(real.duplicates).toEqual([]);
   });
 
+  it('declares a valid empty build-priority scope allowlist in its feature file', () => {
+    expect(real.settings.allowedFiles).toEqual([]);
+    expect(real.owners.allowedFiles).toBe('settings/build-priority-scope.json');
+  });
+
   it('declares catch-up ordering and first-listing defaults in merge-queue settings', () => {
     for (const leaf of ['cleanFirst', 'snapshotFirst']) {
       expect(real.settings.mergeQueue.enqueueOnEvent.catchUp[leaf]).toBe(true);

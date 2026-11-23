@@ -362,12 +362,12 @@ test('generated documentation preserves original bytes except the intentional pe
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
   assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
 });
-test('generated documentation matches the shadow rotation, CI rerun, audit debounce and audit-owed snapshot with per-key authoring instructions', () => {
+test('generated documentation matches the shadow rotation, CI rerun, audit debounce, audit-owed and build-priority scope snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation, ciUnitRerun, the two audit debounce/delta leaves and reviewAutoAudit.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '05fe050f72649b8501b1995479d1507c9adf89de93f886f22027417db56a768b');
+  // Reconciled snapshot includes providerRotation, ciUnitRerun, the two audit debounce/delta leaves, reviewAutoAudit and allowedFiles.
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'a3670822ebec2baceab67fb8163c6529ce3073017c3ed161960d8c85bab4079d');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
 
