@@ -16,6 +16,8 @@ import { rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay } from '../daemon-overlays.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 import { matchReadyCandidate } from '../daemon-rebuild/adopt.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
+import { gitRun } from '../main-staleness.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -66,7 +68,8 @@ function fixture() {
     WE_DAEMON_CLONE_LOCK_ROOT: mktemp('we-hold-live-lock-'),
     WE_DAEMON_OVERLAY_DIR: mktemp('we-hold-live-overlay-'),
   };
-  const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
+  const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+    smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true, ms: 10 })) } }));
   // This fixture proves overlay planning/adoption, with smoke already injected. Supply
   // all dispatch-smoke hooks too, so it never loads the real dispatcher's module graph.
   const dispatchSmoke = {
@@ -74,7 +77,8 @@ function fixture() {
     run: () => { throw new Error('unexpected real dispatch smoke'); },
     match: () => [],
   };
-  const tick = () => rebuildClone({ root: clone, env, runSmoke: smoke, dispatchSmoke, prState: async () => 'OPEN', log: { error: () => {} } });
+  const tick = (options = {}) => rebuildClone({ root: clone, env, runSmoke: smoke, dispatchSmoke,
+    prState: async () => 'OPEN', log: { error: () => {} }, ...options });
   const head = () => gitOk(clone, ['rev-parse', 'HEAD']).trim();
   return { clone, env, init, push, tick, head, smoke };
 }
@@ -110,7 +114,7 @@ describe('a LIVE overlay that cannot be included holds the clone — never a can
   }, 30_000);
 
   // Runs real git repos (~4s measured); the 5s default is too tight under CI load.
-  it('a mechanism-pinned overlay that is NOT live yet is still skipped as before (xpinskip keeps the fleet moving)', async () => {
+  it.each([false, true])('a mechanism-pinned overlay that is NOT live yet is still skipped as before (readyOnly=%s)', async readyOnly => {
     const f = fixture();
     addOverlay(f.clone, { ref: 'lane/overlay-pin', pr: 5809 }, { env: f.env });
     f.push('lane/overlay-pin', f.init, { 'scripts/lib/daemon-rebuild/prepare.mjs': '// mechanism + pin\n' });
@@ -118,10 +122,51 @@ describe('a LIVE overlay that cannot be included holds the clone — never a can
     f.push('main', 'origin/main', { [REVIEW]: lines({ 3: 'main referral hold' }) });
     f.push('lane/new-top', f.init, { 'scripts/lib/daemon-rebuild/plan.mjs': '// mech\n', [REVIEW]: lines({ 3: 'new' }) });
     addOverlay(f.clone, { ref: 'lane/new-top' }, { env: f.env });
-    const r = await f.tick();
+    let r = await f.tick({ readyOnly });
+    expect(f.smoke.mock.calls.at(-1)[0]).toMatchObject({ changedFiles: null, reuseCode: false });
     expect(r.alerts.map((a) => a.kind)).toContain('pinned-overlay-conflict-skipped');
     expect(r.alerts.map((a) => a.kind)).not.toContain('established-overlay-hold');
+    if (readyOnly) {
+      expect(r).toMatchObject({ reason: 'ready-recorded' });
+      const smokes = f.smoke.mock.calls.length;
+      r = await f.tick({ adoptOnly: true });
+      expect(f.smoke).toHaveBeenCalledTimes(smokes);
+    }
     expect(r).toMatchObject({ adopted: true });
+  }, 30_000);
+
+  it.each(['explicit-pin', 'unreadable-pin'])('refuses a previously skippable mechanism overlay when evidence changes during smoke: %s', async fault => {
+    const f = fixture();
+    f.push('main', f.init, { [REVIEW]: lines({ 3: 'main' }) });
+    f.push('lane/new-top', f.init, { 'scripts/lib/daemon-rebuild/plan.mjs': '// mech\n', [REVIEW]: lines({ 3: 'new' }) });
+    addOverlay(f.clone, { ref: 'lane/new-top' }, { env: f.env });
+    const before = f.head();
+    const passing = f.smoke.getMockImplementation();
+    let smokeRan = false;
+    f.smoke.mockImplementationOnce(async (...args) => {
+      smokeRan = true;
+      if (fault === 'explicit-pin') addOverlay(f.clone, { ref: 'lane/new-top', pinned: true }, { env: f.env });
+      return passing(...args);
+    });
+    const run = (args, options) => smokeRan && fault === 'unreadable-pin' && args[0] === 'merge-base'
+      ? { status: 128, stdout: '', stderr: 'pin evidence unavailable' } : gitRun(args, options);
+    const r = await f.tick({ run });
+    expect(r.plan.decisions).toContainEqual(expect.objectContaining({ reason: 'pinned-overlay-conflict-skipped' }));
+    expect(r).toMatchObject({ moved: false, reason: 'established-overlay-conflict' });
+    expect(f.head()).toBe(before);
+  }, 30_000);
+
+  it('adopts a registered pin whose content is carried by an applied top', async () => {
+    const f = fixture();
+    const base = f.push('lane/base', f.init, { 'scripts/lib/daemon-rebuild/plan.mjs': '// mech\n' });
+    const top = f.push('lane/top', base, { [REVIEW]: lines({ 3: 'top' }) });
+    addOverlay(f.clone, { ref: 'lane/top' }, { env: f.env });
+    addOverlay(f.clone, { ref: 'lane/base', pinned: true }, { env: f.env });
+    const r = await f.tick();
+    expect(r.plan.decisions).toContainEqual(expect.objectContaining({ ref: 'lane/base', reason: 'pinned-contained-in-applied' }));
+    expect(r).toMatchObject({ adopted: true });
+    expect(isAncestor(f.clone, base, f.head())).toBe(true);
+    expect(isAncestor(f.clone, top, f.head())).toBe(true);
   }, 30_000);
 });
 

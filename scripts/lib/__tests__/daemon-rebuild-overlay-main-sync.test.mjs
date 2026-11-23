@@ -6,7 +6,7 @@ import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { retryGit, kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
+import { readMainSyncConflicts, retryGit, kickOverlayMainSync, runOverlayMainSync, selectSyncTargets, resolveOverlayMainSyncMode, VITEST_INVENTORY_MARK } from '../daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlayState, overlayFilePath, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
@@ -2130,4 +2130,10 @@ describe('R372 genuine merge conflict stops retrying', () => {
       expect(state.attemptedMain[ref]).toBe(f.mainSha);
       expect(state.conflictMain[ref]).toBe(f.mainSha);
     });
+});
+
+it('returns both validated conflict coordinates to rebuild planning', () => {
+  const f = fixture();
+  fs.writeFileSync(sidecar(f), JSON.stringify({ lastSyncedMain: {}, conflictMain: { [ref]: f.mainSha }, conflictTip: { [ref]: f.oldSha } }));
+  expect(readMainSyncConflicts(f.root, f.env)).toEqual({ conflictMain: { [ref]: f.mainSha }, conflictTip: { [ref]: f.oldSha } });
 });

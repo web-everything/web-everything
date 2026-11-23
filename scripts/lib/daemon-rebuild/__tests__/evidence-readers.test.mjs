@@ -41,7 +41,7 @@ it.each(['candidate', 'fallback'].flatMap(kind => [undefined, false, true, null,
   const readers = createRebuildReaders({ strict: true });
   if (forced === undefined || typeof forced === 'boolean') {
     expect(() => readers.validate(root, env)).not.toThrow();
-    expect(readers.ready(root, env)).toEqual({ ...ready, forced: forced ?? false });
+    expect(readers.ready(root, env)).toEqual({ ...ready, forced: forced ?? false, strictAdopt: true, freshSmoke: null });
   } else {
     expect(() => readers.ready(root, env)).toThrow(RebuildEvidenceError);
   }

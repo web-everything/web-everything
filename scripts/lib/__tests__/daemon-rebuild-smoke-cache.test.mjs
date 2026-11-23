@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { rebuildClone, readRebuildState, readyCandidatePath } from '../daemon-rebuild.mjs';
 import { SMOKE_CHECKS, runLiveSmoke } from '../daemon-live-smoke.mjs';
 import { addOverlay, readOverlays } from '../daemon-overlays.mjs';
+import * as rebuildPlan from '../daemon-rebuild/plan.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { smokePassKey, smokePassIdentity, smokePassTtlMs, resolveSmokeReuse } from '../daemon-rebuild/smoke.mjs';
 
@@ -130,6 +131,39 @@ describe('durable smoke pass cache', () => {
       expect(checked.results.filter(row => SMOKE_CHECKS.find(check => check.name === row.name)?.kind === 'env').every(row => row.ok)).toBe(true);
     }
     expect(calls.slice(1).every(({ options }) => options.changedFiles === null)).toBe(true);
+  });
+
+  it('strict set-aside adoption refuses cached code proof and incremental changed-file checks', async () => {
+    const f = makeFixture();
+    const base = head(f);
+    advanceMain(f.originDir, dir => writeFile(dir, 'a.txt', 'a'));
+    expect((await rebuild(f, async () => PASS)).adopted).toBe(true);
+    const proofs = readRebuildState(f.cloneDir, f.env).smokePassed;
+    expect(proofs).toHaveLength(1);
+    const originalPlan = rebuildPlan.planRebuild;
+    const planner = vi.spyOn(rebuildPlan, 'planRebuild').mockImplementation(async options => {
+      const plan = await originalPlan(options);
+      plan.decisions.push({ ref: 'lane/omitted', action: 'skip', setAside: { eligible: true } });
+      return plan;
+    });
+    try {
+      // A matching, live proof would normally enable code reuse.
+      const target = repeatTree(f, base);
+      expect(identity(f, target).key).toBe(proofs[0].key);
+      const cached = vi.fn(async () => PASS);
+      expect((await rebuild(f, cached)).adopted).toBe(true);
+      expect(cached).toHaveBeenCalledTimes(1);
+      expect(cached.mock.calls[0][0]).toMatchObject({ changedFiles: null, reuseCode: false });
+
+      // Without a proof, this same noninitial build would normally use a file delta.
+      repeatTree(f, head(f));
+      const state = readRebuildState(f.cloneDir, f.env);
+      writeRebuildState(f.cloneDir, { ...state, smokePassed: [] }, f.env);
+      const incremental = vi.fn(async () => PASS);
+      expect((await rebuild(f, incremental)).adopted).toBe(true);
+      expect(incremental).toHaveBeenCalledTimes(1);
+      expect(incremental.mock.calls[0][0]).toMatchObject({ changedFiles: null, reuseCode: false });
+    } finally { planner.mockRestore(); }
   });
 
   it('reuses code proof for an identical tree while materializing and re-running env checks', async () => {

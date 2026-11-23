@@ -186,6 +186,11 @@ function readSyncState(file, io = fs) {
   load(source === file ? legacyFile : file);
   return load(source) ?? validateSyncState({ lastSyncedMain: {} });
 }
+/** Rebuild consumes the sync worker's validated conflict pairs, never alert text. */
+export function readMainSyncConflicts(root, env = process.env) {
+  const state = readSyncState(sidecar(root, env));
+  return { conflictMain: state.conflictMain, conflictTip: state.conflictTip };
+}
 function validateSyncState(data) {
   if (!data || !Object.hasOwn(data, 'lastSyncedMain')) throw new Error('invalid main-sync state; operator repair required');
   for (const key of ['lastSyncedMain', 'attemptedMain', 'shadowMain', 'pushRetryMain', 'pushRetryAfter', 'errorAt', 'firstFailureAt', 'failureAlertedAt', 'failureReason', 'staleRef', 'staleRegistration', 'conflictMain', 'conflictTip', 'mainRedMain', 'mainRedTip', 'mainRedAt', ...retryKeys]) {
