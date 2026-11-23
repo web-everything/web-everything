@@ -17,3 +17,5 @@ plateau:src/wip/wip-agent.ts handles `interest`, tails the watched runs through 
 ## Done when
 
 1. **Executable** — plateau:src/wip/wip-agent.test.ts under `npx vitest run`, with a fake clock: with no interest the agent-activity reader is not called beyond the snapshot cycle; interest in card N gives a `base: true` frame then deltas with consecutive `seq`; a re-watch after a gap gives a fresh full frame; a burst of 50 steps produces at most one L1 message per 2 s.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

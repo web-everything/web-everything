@@ -2,7 +2,10 @@
 bornAs: xjms2lt
 kind: epic
 parent: "4376"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: PD-PR ships; then add the one-click split action to the PR rung."
+dateParked: "2026-11-22"
 dateOpened: "2026-10-01"
 tags: []
 ---
@@ -16,3 +19,5 @@ Operator, 2026-10-01, after PR #3311 was split by hand-built scripts: a split sh
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: PD-PR ships; then add the one-click split action to the PR rung.
