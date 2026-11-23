@@ -737,16 +737,21 @@ const stub = ({ paged = () => pagedLines(140), head = () => HEAD, total = () => 
 const REFUSE = /repair|drain|retry/i;
 
 it('a PR at the bulk file cap is paged per PR and overlap admission sees all 140 files', async () => {
-  const { gh, calls } = stub();
+  const path = 'scripts/conveyor/paged.mjs';
+  const { gh, calls } = stub({ paged: () => `${pagedLines(139)}\n${JSON.stringify({ f: path, p: null })}` });
   const prs = readPriorityPrs({ gh });
   expect(prs).toHaveLength(1);
   expect(prs[0].files).toHaveLength(140);
+  expect(prs[0].files[139]).toBe(path);
   const page = calls.find(a => a.includes('--paginate'));
   expect(page.join(' ')).toContain('repos/web-everything/web-everything/pulls/1/files');
-  const f = fixture({ readCard: () => ({ scope: ['we:f139'] }), readPrs: () => prs });
+  const readPrs = vi.fn(() => prs);
+  const f = fixture({ allowedFiles: [path], readCard: () => ({ scope: [`we:${path}`] }), readPrs });
   const result = await f.command();
   expect(result.code).not.toBe(0);
-  expect(result.lines.join('\n')).toContain('scope overlaps open PR');
+  expect(result.lines.join('\n')).toContain('scope overlaps open PR web-everything/web-everything#1');
+  expect(readPrs).toHaveBeenCalledOnce();
+  untouched(f);
 });
 
 it('an uncapped PR triggers no gh api calls', () => {
