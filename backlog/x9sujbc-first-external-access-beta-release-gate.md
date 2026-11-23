@@ -13,7 +13,7 @@ The enforcement work for PL-BETA-GUARDS: an access-grant check in the Worker or 
 
 ## Acceptance
 
-- [A1] **Executable** — an access-grant check in the Worker or auth flow refuses outside access (invites and the shared-code login) while #3130 or #3811 is not resolved, and allows it only when both are resolved. A test covers every status of each blocker: open, parked, active, preparing and closed refuse, an unreadable or missing status refuses, and only resolved allows. The same check also covers the shared-code login (the path #3811 documents, with no per-person identity): while either blocker is open, that login refuses any non-internal user, and a test drives that path directly, not only invites.
+- [A1] **Executable** — an access-grant check in the Worker or auth flow refuses outside access (invites and the shared-code login) while #3130 or #3811 is not resolved, and allows it only when both are resolved. A test covers every status of each blocker: open, parked, active, preparing and closed refuse, an unreadable or missing status refuses, and only resolved allows. The refusal applies on EVERY request path, not only new grants: cookies issued before the gate, live connections and the API all refuse outside access while a blocker is unresolved. It either invalidates pre-gate sessions on deploy or checks each request. A test asserts "a pre-existing 30-day cookie is refused while blockers are unresolved", and another covers an already-open connection and an API request. The same check also covers the shared-code login (the path #3811 documents, with no per-person identity): while either blocker is open, that login refuses any non-internal user, and a test drives that path directly, not only invites.
 
 
 
