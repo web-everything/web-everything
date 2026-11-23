@@ -233,7 +233,7 @@ describe('mergeLiveTargetIntoRows', () => {
 describe('snapshot fast drain CLI dependency context', () => {
   const repo = 'fixture/repo';
   const pr = (number, item, blockedBy = []) => ({
-    number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: `sha${number}`,
+    number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: number.toString(16).padStart(40, '0'),
     updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
@@ -273,7 +273,8 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
   const rows = process.env.GH_REPO === 'fixture/repo' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
   output({data:{repository:{pullRequests:{totalCount:rows.length,
     pageInfo:{hasNextPage:false,endCursor:null},nodes:rows.map(p => ({...p, labels:{nodes:p.labels},
-      commits:{nodes:[{commit:{statusCheckRollup:{contexts:{nodes:p.statusCheckRollup.map(c => ({...c,__typename:'CheckRun'}))}}}}]}}))}}}});
+      commits:{nodes:[{commit:{oid:p.headRefOid,statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false},
+        totalCount:p.statusCheckRollup.length,nodes:p.statusCheckRollup.map(c => ({...c,__typename:'CheckRun'}))}}}}]}}))}}}});
 }
 if (a[0] === 'pr' && a[1] === 'list') output([]);
 if (a[0] === 'pr' && a[1] === 'view') {

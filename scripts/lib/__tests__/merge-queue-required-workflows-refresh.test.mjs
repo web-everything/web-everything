@@ -10,12 +10,14 @@ import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 import { loadMergeQueueSettings } from '../merge-queue-hook.mjs';
 import { validateQueueSettings } from '../merge-queue.mjs';
 import * as settingsFiles from '../settings-files.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
 const HEAD = 'a'.repeat(40), NEXT = 'b'.repeat(40), KEY = 'owner/repo#42';
 const LIVE = `gh: Pull request Required workflows 'CI, CI, Merge gate, Merge gate, Soak replay gate, Soak replay gate' are not satisfied Required status check "merge-gate" is expected.`;
 function execFor(graphql = false) {
   return (cmd, args) => {
     if (cmd === 'git') return args[0] === 'diff' ? 'src/a.js\0' : '';
-    if (args[0] === 'api' && args.includes('--slurp')) return '[[]]';
+    // RL A0: enqueue needs head-bound red-team proof; serve a trusted policy-clear for PR 42 on HEAD.
+    if (args[0] === 'api' && args.includes('--slurp')) return JSON.stringify([[{ author: { login: 'web-everything' }, body: `${redTeamMarker(42, HEAD)}\nRed team not required on this head: card-only diff.` }]]);
     if (args[1] === 'comment') return '';
     // Pass live admission so the strategy reaches the required-workflows refusal under test.
     if (args[1] === 'view') return JSON.stringify({ id: 'PR_ID', headRefOid: HEAD, baseRefName: 'main', labels: ['ready-to-merge'] });

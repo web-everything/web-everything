@@ -145,3 +145,5 @@ meta-asset authoring, off the WE↔FUI boundary.)
   section; it becomes a ground-truth label for the #2207 design-AI reviewer and binds #2251 (WE),
   #2252 (FUI), #2253 (Plateau) mark execution + #2254 (website) direction.
 - **Review surface:** any brand-asset change regenerates `plateau:branding.html` (`npm run gen:branding`).
+
+Ratified 2026-11-22 (PL-BRAND-RATIFY): ratified in one sitting with #2209, #2249 and #2250.

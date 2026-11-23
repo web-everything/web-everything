@@ -133,7 +133,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
 import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
-import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
@@ -1138,12 +1138,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       .filter(name => name !== 'merge-gate').every(name => isRequiredCheckGreen(pr, name))
     && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
   let codeqlBlocked = false;
+  let checkEvidenceIncomplete = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
     : humanCleared
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  else if (pr?.rowsComplete === false) { decision = 'skip'; checkEvidenceIncomplete = true; reason = 'check evidence incomplete — retry with a complete live check read'; }
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
   // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
@@ -1181,6 +1183,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+    ...(checkEvidenceIncomplete ? { checkEvidenceIncomplete: true } : {}),
     ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
@@ -1479,6 +1482,23 @@ export function routeRebaseBeforeEnqueue(v, { setting, mergeStrategy, manifestFr
     return null;
   }
   return rebase;
+}
+
+/** Independent check-run/status reads for cascade revalidation. Keep the existing completeness
+ * parser and provenance; only the transport is async, bounded, and routed through the gh throttle.
+ */
+export async function readFreshGateChecks({ repo, headSha, concurrency = 2, exec = execFileP }) {
+  const endpoints = ['check-runs?per_page=100&filter=all', 'status?per_page=100'].map(endpoint =>
+    `repos/${repo}/commits/${headSha}/${endpoint}`);
+  const pages = await readFastDrainFacts(endpoints, concurrency, async endpoint => {
+    const { stdout } = await exec('gh', ['api', '--paginate', '--slurp', endpoint], { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 });
+    return [endpoint, stdout];
+  });
+  const responses = new Map(pages);
+  return readReviewChecks({ repo, headSha, run: args => {
+    if (!responses.has(args.at(-1))) throw new Error('unreadable fresh check response');
+    return responses.get(args.at(-1));
+  } });
 }
 
 /** Fresh bypass evidence: exhaust the head's rollup, bounded to 1,000 contexts.
@@ -2981,13 +3001,20 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
         waitOn: ['required-check-read'], reason: c.requiredCheckReadError, ...skipInfo });
       continue;
     }
-    if (c.decision !== 'merge') continue; // @merge-gate-exempt builds the merge-ORDERING lists (ready/deferred); a held PR is `skip` and correctly not ordered for landing — it must not join the merge cascade
     // Fast drain only: failed/truncated context cannot establish that an absent HASH blocker has landed. A numeric
     // id exists only post-land (arm (4) above), and no caller proves numerics, so those keep clearing by absence.
     // A malformed id coerces to NaN in `asItemId`; only a real positive NNN may clear by absence.
     const absentUnproven = (b) => strictAbsentHashDependencies === true && absenceUnproven && !(Number.isInteger(b) && b > 0);
     const blockWait = (Array.isArray(c.blockedBy) ? c.blockedBy : []).map(asItemId).filter((b) => (openItems.has(b) || absentUnproven(b)) && !provenLanded(b));
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
+    if (c.decision !== 'merge') {
+      // Incomplete live checks can skip a refreshed round target before ordering.
+      // Only that operative hold retains dependency waits. Other skips keep their
+      // own reason and must not turn idle watch/confirm passes into dependency waits.
+      const waitOn = [...new Set([...blockWait, ...stackWait])].filter(w => c.item == null || String(w) !== String(c.item));
+      if (c.checkEvidenceIncomplete === true && waitOn.length) deferred.push({ num: c.num, item: c.item, waitOn, ...skipInfo, headSha: c.headSha ?? null });
+      continue; // @merge-gate-exempt skipped PRs never enter the merge cascade
+    }
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier
     // when `joinImplToCouples` stamped `coupleDefer` — a carrier that is OPEN-AND-HELD, unnameable, degraded, or
     // in a truncated listing (all knowable from the label/only-blind context, NEVER from the narrowed `list`).
@@ -5092,7 +5119,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // (read-only, no gh call); the old 100 when there is no snapshot to size from (first pass, tests, cwd repo).
   const candidateListLimit = (repo) => { const n = repo ? snapshotOpenCount(repo) : null; return n == null ? 100 : Math.min(100, nextLimit(n)); };
   const isLocalRepo = (repo) => repo == null || repo === localSlug; // git-side ops only run against the local clone
-  const fastContextEnabled = REPOS.some(isLocalRepo) && useFastDrainContext({ onlyPr, fromGreenEvent: flags['from-green-event'], onlyRepo, localSlug, ...fastDrainListing });
+  const fastContextEnabled = REPOS.some(isLocalRepo) && useFastDrainContext({ onlyPr, fromGreenEvent: flags['from-green-event'], fromCatchUp: flags['from-catch-up'], listingSnapshot, onlyRepo, localSlug, ...fastDrainListing });
   const isFastDrainTarget = (repo, p) => REPOS.includes(repo) && matchesOnlyTarget({ prNumber: p.number, onlyPr, repo, onlyRepo, isLocal: isLocalRepo(repo), repoCount: REPOS.length });
   const fastDrainPrs = (repo, prs) => filterToFastDrainTarget(prs, { onlyPr, scope: fastDrain.scope, isTarget: (p) => isFastDrainTarget(repo, p) });
   const repoTag = (repo) => (repo && repo !== localSlug ? `${repo.split('/').pop()}#` : '#'); // display prefix per PR
@@ -5321,7 +5348,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const resolved = await resolveChecks(repo, data);
       // Flattened `gh pr view` rows carry no completeness or head provenance.
       // Revalidation must use the same complete, head-scoped read as pre-stage.
-      const checks = readReviewChecks({ repo: repo || localSlug, headSha: data.headRefOid });
+      const checks = await readFreshGateChecks({ repo: repo || localSlug, headSha: data.headRefOid,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads });
       const hydrated = { ...resolved, statusCheckRollup: checks,
         rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead };
       return data.mergeStateStatus === 'BEHIND' && mergeStrategy.queueOwnsFreshness(repo)
@@ -5455,7 +5483,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const defaultBranchHintsByRepo = new Map();
   const defaultBranchByRepo = new Map();
   const defaultBranchOf = repo => defaultBranchByRepo.get(repo || localSlug) ?? null;
-  const verifyDefaultBranch = createLiveDefaultBranchReader({
+  const newDefaultBranchReader = () => createLiveDefaultBranchReader({
     map: defaultBranchByRepo,
     readLive: async repo => {
       const { stdout } = await execFileP('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
@@ -5464,6 +5492,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     },
     warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${String(e.message || e).split('\n')[0]}) — deferring merge/enqueue; retry on the next pass\n`),
   });
+  const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
   // failure): the empty `[]` is a fallback, not a confirmed "no commits", so `fetchPrReadsCached` declines to cache
   // it and re-fetches next `--watch` pass rather than latching an empty read for the head-SHA lifetime. Behaviour
@@ -5515,6 +5544,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // `liveListingsByRepo` explicitly.
   const fetchContextReads = async (flat) => {
     const readsRaw = await fetchPrReadsCached(flat, {
+      concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
       cache: ctxReadCache,
       keyOf: ({ repo, p }) => prCacheKey(repo, p.number),
       shaOf: ({ p }) => prReadCacheIdentity(p),
@@ -5866,28 +5896,69 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
   fastContextRows = null;
+  let passListingSnapshot = listingSnapshot;
   // The same full target read serves both listing paths. Comments remain at the writer-contract gate.
   const readFullListingPr = async (repo, num, fullContext = false) => {
     const fields = fullContext || RECONCILE ? SWEEP_LIST_FIELDS
       : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-    const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repo || localSlug, '--json', `${fields},updatedAt,state`],
+    const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repo || localSlug, '--json', `${fields},updatedAt,state,isDraft`],
       { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     const pr = JSON.parse(stdout.trim() || 'null');
-    return pr ? (await resolveListedChecks(repo, [pr]))[0] : null;
+    if (!pr) return null;
+    const resolved = (await resolveListedChecks(repo, [pr]))[0];
+    // Flattened gh views cannot attest completeness. Read every check/status on the
+    // listed head so a capped rollup cannot hide CodeQL or another blocking context.
+    try {
+      const checks = await readFreshGateChecks({ repo: repo || localSlug, headSha: pr.headRefOid,
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads });
+      return { ...resolved, statusCheckRollup: checks,
+        rowsComplete: checks.rowsComplete === true, rowsHead: checks.rowsHead };
+    } catch {
+      // Keep the ordinary incomplete-evidence skip and its complete-live-read retry.
+      return { ...resolved, rowsComplete: false, rowsHead: null };
+    }
   };
   if (fastContextEnabled) {
     // Canonical slugs here; the rest of the drain retains its cwd/null repo sentinel.
     const slugs = [...new Set(CONTEXT_REPOS.map(repo => repo || localSlug))];
+    const listLean = repo => listLeanOpenPrsPaged({ repo,
+      readPage: async query => {
+        const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
+          { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
+        return stdout;
+      },
+    });
+    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
+    // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
+    // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
+    // and its dependency/couple/group/overlap component need full live PR/check reads in target scope.
+    // Full-scope lifecycle reconciliation also needs live CI/mergeability for every PR it can mutate:
+    // check reruns need not change the PR's head or updatedAt. Commits follow the same scope policy.
+    // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
+    const passBranches = new Map();
+    let passBranchChanged = false;
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
-      readSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true }),
-      listLean: repo => listLeanOpenPrsPaged({ repo,
-        readPage: async query => {
-          const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`],
-            { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 60_000, env: { ...process.env, GH_REPO: repo } });
-          return stdout;
+      concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
+      readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
+        repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
+        log: line => process.stderr.write(`${line}\n`),
+        concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
+        readMain: async repo => {
+          // Each before/after membership probe needs its own live read, not a memoized gate result.
+          const defaultBranch = await newDefaultBranchReader()(repo);
+          if (!defaultBranch) throw new Error('default branch unresolved live');
+          if (passBranches.has(repo) && passBranches.get(repo) !== defaultBranch) passBranchChanged = true;
+          passBranches.set(repo, defaultBranch);
+          const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
+            { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+          return { sha: stdout.trim(), defaultBranch };
         },
-      }),
+      }) : undefined,
+      readSnapshot,
+      listLean,
       readFull: (repo, num) => readFullListingPr(repo, num, true),
+      refreshPr: repo => RECONCILE && fastDrain.scope === 'full' && REPOS.some(r => (r || localSlug) === repo),
       readManifests: async entries => {
         // Reuse the normal bounded manifest/commit reader and its identity cache; collectContext
         // then consumes these same reads instead of repeating the legacy-manifest fan-out.
@@ -5901,8 +5972,18 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       },
       readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
       time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
-    }));
-    if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])].map(repo => [repo, rows.get(repo || localSlug)]));
+    })).catch(error => {
+      if (!passBranchChanged || !error.cause?.message?.startsWith('pass main changed while reading')) throw error;
+      // The parent round's branch evidence is no longer usable by the slow listing path either.
+      passListingSnapshot = null;
+      process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
+      return null;
+    });
+    // Fast rows replace the whole repo listing: an incomplete PR must send its repo through
+    // the existing slow path, rather than disappear from labels, rebase or classification.
+    if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])]
+      .map(repo => [repo, rows.get(repo || localSlug)])
+      .filter(([, prs]) => prs?.every(p => p.rowsComplete === true)));
   }
   // #2257 — collect + classify across EVERY repo in the sweep set into ONE global candidate list. PR numbers
   // are per-repo (WE #10 ≠ FUI #10), so each verdict carries its own `repo` + head ref instead of a
@@ -5951,7 +6032,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     try {
       const slug = repo || localSlug;
       let listed = {};
-      const roundPath = listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? listingSnapshot : null;
+      const roundPath = passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? passListingSnapshot : null;
       const readTarget = () => __t.timeAsync('listing.target', () => readFullListingPr(repo, onlyPr));
       const listLive = async () => {
         let snapshotSeed;
@@ -5961,7 +6042,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const fields = RECONCILE ? SWEEP_LIST_FIELDS
             : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
           try {
-            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs' }));
+            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs', cacheOnly: true }));
             if (snap == null) {
               process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
             } else {
@@ -6019,15 +6100,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   };
   const resolveDefaultBranch = (repo) => resolveCachedDefaultBranch({
     repo: repo || localSlug, key: repo, map: defaultBranchHintsByRepo,
-    readRound: () => listingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
-      ? readFastDrainRoundDefaultBranch({ path: listingSnapshot, repo: repo || localSlug }) : null,
+    readRound: () => passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr })
+      ? readFastDrainRoundDefaultBranch({ path: passListingSnapshot, repo: repo || localSlug }) : null,
   });
-  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => Promise.all(REPOS.filter(repo => fastContextEnabled || !(listingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))).map(resolveDefaultBranch)));
+  const resolveBranches = () => __t.timeAsync('listing.defaultBranch', () => mapWithConcurrency(REPOS.filter(repo => fastContextEnabled || !(passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr }))), resolvedMergePolicy.policy.concurrency.gateReads, resolveDefaultBranch));
   const listRepos = () => mapWithConcurrency(REPOS, REPOS.length, listOne);
   let [listings] = await __t.timeAsync('listing', () => fastContextEnabled
     ? fastDrainListingAfterBranches({ resolveBranches, list: async () => [await listRepos()] })
     : Promise.all([listRepos(), resolveBranches()]));
-  if (listingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
+  if (passListingSnapshot) await Promise.all(REPOS.filter(repo => isFastDrainTarget(repo, { number: onlyPr })).map(resolveDefaultBranch));
   // One repo's failed listing no longer kills the pass: it is logged as failed and the other repos proceed
   // (`partitionListings`). Only when EVERY repo failed is it the old bad-env hard-fail. The failed repo is absent
   // from the live rows, so the context re-list also fails and the couple gate fails closed for it.
@@ -6088,8 +6169,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }
   // Issue live branch reads after ALL synchronous page work, including context/eviction fallback.
   // A parent's round snapshot or host cache never populates the authoritative map.
-  await __t.timeAsync('gate.defaultBranch', () => Promise.all(REPOS
-    .filter(repo => prsByRepo.get(repo)?.length).map(repo => verifyDefaultBranch(repo || localSlug))));
+  await __t.timeAsync('gate.defaultBranch', () => mapWithConcurrency(REPOS
+    .filter(repo => prsByRepo.get(repo)?.length), resolvedMergePolicy.policy.concurrency.gateReads, repo => verifyDefaultBranch(repo || localSlug)));
   // #xc7p3q9 (R2) — the operator escape hatch symmetric to `--no-review-escalation`: `--assume-complete-context`
   // FORCES the context complete so a genuinely-stuck couple (e.g. a persistent read-noise fail-closed) can land
   // short of editing the script. Prints a LOUD one-line waiver. Off by default; the fail-closed gate stays live.
@@ -7621,13 +7702,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           // stale / refused member holds the whole couple (the stale one has been refreshed by its gate).
           const siblings = !mergeQueueHookEnabled(MERGE_QUEUE) ? [] : coupleStep.ordered.filter((x) => x !== c && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck
             && !heldThisIteration.has(candKey(x)) && !merged.some((m) => candKey(m) === candKey(x)));
-          let siblingHold = null;
-          for (const sib of siblings) {
-            const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+          // Independent sibling revalidations are read-only; keep refresh/writes ordered below.
+          // execFileP retains the shared gh throttle, while gateReads bounds this fan-out.
+          const siblingReads = await readFastDrainFacts(siblings, resolvedMergePolicy.policy.concurrency.gateReads, sib =>
+            revalidateFresh(sib.repo, sib.num, {
               queueRequiredChecks: queueRequiredChecksOf(sib.repo),
               requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
               defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
-            });
+            }));
+          let siblingHold = null;
+          for (const [index, sib] of siblings.entries()) {
+            const sibFresh = siblingReads[index];
             if (sibFresh.decision !== 'merge') { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} would not merge (${sibFresh.reason})` }; break; }
             if (!(await mergeQueueGate(sib, sibFresh.headSha, { precheck: true }))) { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} is not merge-fresh (merge-queue) — refreshed/held` }; break; }
           }
