@@ -112,3 +112,78 @@ export function assertProtectedPatterns(patterns) {
   const bad = patterns.filter(p => !validateProtectedPattern(p));
   if (bad.length) throw new Error('malformed protected pattern(s): ' + bad.map(p => JSON.stringify(p)).join(', '));
 }
+
+/**
+ * Literal globs: * matches within one segment, a run of two or more * spans directories, every other character is
+ * literal; a trailing / is a directory prefix. Matched by a bitset state walk (bit i = "pattern token i is next"),
+ * never a backtracking regex (PR #6381: nested `**` made a regex take exponential time). Cost is a few bitset
+ * operations per path character; path and pattern lengths are bounded upstream.
+ */
+function matchesPath(file, pattern) {
+  if (pattern.endsWith('/')) {
+    // A literal directory stays a plain prefix. One holding a wildcard (`custom/**/`, `custom/*/`) was a literal
+    // prefix too, so it protected nothing (PR #6381 judge): it now matches like the same glob without the trailing
+    // slashes, or anything under what that glob matches. Matching more only ever protects more.
+    if (!pattern.includes('*')) return file.startsWith(pattern);
+    const dir = pattern.replace(/\/+$/, '');
+    return globMatch(file, dir) || globMatch(file, `${dir}/**`);
+  }
+  return globMatch(file, pattern);
+}
+function globMatch(file, pattern) {
+  const lit = new Map(); let star = 0n; let globstar = 0n; let n = 0n;
+  for (let i = 0; i < pattern.length; n++) {
+    const bit = 1n << n;
+    if (pattern[i] !== '*') { lit.set(pattern[i], (lit.get(pattern[i]) ?? 0n) | bit); i++; continue; }
+    let j = i; while (pattern[j] === '*') j++;
+    if (j - i >= 2) globstar |= bit; else star |= bit;
+    i = j;
+  }
+  const wild = star | globstar;
+  // A wildcard may match nothing, so reaching it also reaches the next token. Runs of * are one token, so a
+  // wildcard is never followed by another and one shift closes the set.
+  const close = s => s | ((s & wild) << 1n);
+  let s = close(1n);
+  for (let c = 0; c < file.length; c++) {
+    const ch = file[c];
+    s = close((s & (ch === '/' ? globstar : wild)) | ((s & (lit.get(ch) ?? 0n)) << 1n));
+    if (s === 0n) return false;
+  }
+  return ((s >> n) & 1n) === 1n;
+}
+
+/**
+ * Legacy cleanup for caller-supplied patterns; configured settings are validated before this fold.
+ * Compatibility form (NFKC); invisible, control, format, line and paragraph separator
+ * characters and the blank Braille pattern dropped; the dash, slash and dot lookalikes NFKC keeps (U+2011, U+2212,
+ * U+2215, U+3002, ...) read as `-`, `/` and `.`. Written as escapes: a raw invisible in source is refused by check:standards.
+ */
+const foldPathText = s => s.normalize('NFKC')
+  .replace(/[\p{Default_Ignorable_Code_Point}\p{Cc}\p{Cf}\p{Zl}\p{Zp}\u{2800}]/gu, '')
+  .replace(/[\p{Pd}\u{2212}\u{2043}]/gu, '-')
+  .replace(/[\u{2215}\u{2044}\u{2216}\u{29f5}\u{29f8}\u{29f9}]/gu, '/')
+  .replace(/[\u{b7}\u{589}\u{6d4}\u{2027}\u{2219}\u{22c5}\u{2e31}\u{2e33}\u{3002}\u{30fb}]/gu, '.');
+// Case-insensitive: the checkout may sit on a case-insensitive file system, where `Scripts/Guard-Bash.mjs` IS the guard.
+// Folding both sides only ever protects more paths. The candidates are computed once per path, not once per glob.
+// A pattern is cleaned up the way a path candidate is (PR #6381 self-review), else `./custom/**`, `/custom/**`,
+// `custom/./**`, `custom<U+200B>/**` or a fullwidth letter matched no candidate and protected nothing: compatibility form
+// (NFKC), surrounding whitespace trimmed, invisible, control and format characters dropped, `\` read as `/`, empty and
+// `.` segments dropped, `..` resolved. A pattern that cleans up to nothing (`./`, `/`) names the repo root, and one that
+// climbs above it (`../x`) cannot be placed: both protect every path. A trailing `/` (a directory) is kept.
+const cleanPattern = p => {
+  // Trimmed AFTER the invisible characters go, so a space beside one (`custom/** <U+200B>`) is trimmed too.
+  const s = foldPathText(p).trim().replace(/\\/g, '/');
+  const segs = [];
+  for (const seg of s.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') { if (!segs.length) return '**'; segs.pop(); continue; }
+    segs.push(seg);
+  }
+  if (!segs.length) return '**';
+  return `${segs.join('/')}${s.endsWith('/') ? '/' : ''}`.toLowerCase();
+};
+export const matchesSome = (file, patterns) => {
+  const clean = patterns.map(cleanPattern);
+  const c = canonicalPaths(file, anchorsOf(clean));
+  return c === null || clean.some(p => c.some(x => matchesPath(x.toLowerCase(), p)));
+};
