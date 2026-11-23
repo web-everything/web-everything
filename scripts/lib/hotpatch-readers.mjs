@@ -10,6 +10,7 @@ import { readStore, storePath, withdrawnRevocations } from '../operations/ruled-
 import { resolveOriginRepository } from '../operations/prototype-retire.mjs';
 import { laneHistoryProofEnv, scrubGitLocationEnv } from './lane-git-hardening.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { resolveHotpatchKnobs } from './hotpatch-guards.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -73,7 +74,8 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
               if (!['Build WE docs (deploy smoke)', 'Interaction lane'].every(name => job.steps.some(s => s.name === name && s.status === 'completed' && s.conclusion === 'success'))) return false;
               continue;
             }
-            const log = origin.gh(['api', `repos/${origin.repo}/actions/jobs/${job.id}/logs`]);
+            // Shared argv: raw job logs carry ANSI escapes, which gh refuses without the helper's flag.
+            const log = origin.gh(ciJobLogApiArgs(`repos/${origin.repo}/actions/jobs/${job.id}/logs`));
             if (log.code !== 0) throw new Error('unreadable execution log');
             const decisions = log.stdout.split('\n').filter(line => line.includes('red-main-quarantine skip:'));
             if (!decisions.length || decisions.some(line => line.includes('→') || !line.includes('running everything'))) return false;

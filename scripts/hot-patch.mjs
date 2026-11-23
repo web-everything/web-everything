@@ -55,14 +55,16 @@ export function createHotpatchRunner({ adapter: a, read, append }) {
         if (policy.parallel) await audit(r);
         if ((await a.read(r, 'audit')).outcome === 'pass') await metric(r, 'auditAt');
       }
+      let recovered = false;
       if (current === 'load') {
-        const ready = await a.read(r, 'ready');
-        if (ready.outcome !== 'pass') {
-          await write(r, { phase: 'escalation', detail: ready }); return;
-        }
+        // Read the registration first: an add whose completion row was lost is already live, so it must
+        // reach live monitoring (and verified withdrawal) even if readiness has since been revoked.
         const loaded = await a.read(r, 'loaded');
         if (loaded.outcome === 'unknown') { await write(r, { phase: 'escalation', detail: loaded }); return; }
-        if (loaded.outcome !== 'pass') { await intent(r, 'load'); await a.perform(r, 'load'); }
+        const ready = await a.read(r, 'ready');
+        if (loaded.outcome === 'pass') recovered = ready.outcome !== 'pass';
+        else if (ready.outcome !== 'pass') { await write(r, { phase: 'escalation', detail: ready }); return; }
+        else { await intent(r, 'load'); await a.perform(r, 'load'); }
       }
       const guard = flow.definition.states[current].on[0].guard;
       // An unfinished withdrawal survives replay and cannot be cleared by later live evidence.
@@ -80,6 +82,8 @@ export function createHotpatchRunner({ adapter: a, read, append }) {
       if (current === 'load' && verdict.outcome !== 'pass') return;
       await done(r, verdict.outcome);
       if (current === 'load') await metric(r, 'liveAt');
+      // Revoked readiness on a recovered registration: run the live check now, not a tick later.
+      if (current === 'load' && recovered && verdict.outcome === 'pass') return tick(r);
       if (current === 'pin' && verdict.outcome === 'pass' && policy.parallel) await audit(r);
     } catch {
       await write(r, { phase: 'escalation', detail: 'Effect or evidence unavailable; operator must inspect and retry. No completion recorded.' });

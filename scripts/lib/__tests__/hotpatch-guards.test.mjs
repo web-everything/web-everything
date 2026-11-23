@@ -109,7 +109,8 @@ describe('hotpatch production readers', () => {
         if (args[1].includes('/actions/runs?')) return JSON.stringify(fixture.data.workflows);
         if (args[1] === 'repos/org/repo/actions/runs/70/jobs?filter=all&per_page=100')
           return JSON.stringify({ total_count: jobs.length, jobs });
-        const logId = /^repos\/org\/repo\/actions\/jobs\/(\d+)\/logs$/.exec(args[1])?.[1];
+        const logId = args[1] === '--allow-escape-sequences'
+          && /^repos\/org\/repo\/actions\/jobs\/(\d+)\/logs$/.exec(args[2])?.[1];
         if (logId && Object.hasOwn(logs, logId)) return logs[logId];
       }
       throw new Error('unexpected IO');
@@ -121,8 +122,8 @@ describe('hotpatch production readers', () => {
     const f = production();
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
     expect(f.calls.filter(c => c.command === 'gh')).toHaveLength(8);
-    expect(f.calls.filter(c => c.command === 'gh' && c.args[1]?.endsWith('/logs')).map(c => c.args[1]))
-      .toEqual([8, 9, 20, 21].map(id => `repos/org/repo/actions/jobs/${id}/logs`));
+    expect(f.calls.filter(c => c.command === 'gh' && c.args[2]?.endsWith('/logs')).map(c => c.args))
+      .toEqual([8, 9, 20, 21].map(id => ['api', '--allow-escape-sequences', `repos/org/repo/actions/jobs/${id}/logs`, '--hostname', 'github.com']));
     expect(f.calls.filter(c => c.command === 'git' && c.args[0] === 'fetch').map(c => c.args)).toEqual([['fetch', '--no-tags', 'origin', 'main', SHA]]);
     expect(f.calls.findIndex(c => c.args[0] === 'fetch')).toBeLessThan(f.calls.findIndex(c => c.args[0] === 'diff'));
     const next = production(); next.data.checks.check_runs[0].conclusion = 'failure';

@@ -129,6 +129,23 @@ it('an interrupted successful add re-reads the list and records completion witho
   expect(f.io.add).toHaveBeenCalledTimes(1); await f.runner.tick();
   expect(f.io.add).toHaveBeenCalledTimes(1); expect(f.runner.status(7)[0].state).toBe('live');
 });
+it.each(['ci', 'audit'])('interrupted add with revoked %s evidence withdraws the existing registration', async kind => {
+  const f = fixture(); await waiting(f);
+  const append = row => {
+    if (row.phase === 'done' && row.transition.predicate.guard === 'loaded') throw Error('crash after add');
+    f.log.push(structuredClone(row));
+  };
+  await createHotpatchRunner({ adapter: f.adapter, read: () => f.log, append }).tick();
+  expect(f.io.add).toHaveBeenCalledTimes(1); expect(f.io.list(f.runner.status(7)[0])).toHaveLength(1);
+  if (kind === 'ci') f.data.checks.check_runs[0].conclusion = 'failure';
+  else f.data.audits.push({ ...f.data.audits.at(-1), at: '2026-11-21T12:00:00Z', verdict: 'WEAKENED', findings: ['revoked'] });
+  expect((await f.adapter.read(f.runner.status(7)[0], 'ready')).outcome).not.toBe('pass');
+  f.io.live = () => 'fail';
+  await f.runner.tick();
+  expect(f.io.add).toHaveBeenCalledTimes(1); expect(f.io.remove).toHaveBeenCalledTimes(1);
+  expect(f.io.list(f.runner.status(7)[0])).toEqual([]);
+  expect(f.runner.status(7)[0].state).toBe('refused');
+});
 it('unknown live evidence records escalation and never unloads', async () => {
   const f = fixture(); await waiting(f); await f.runner.tick();
   f.io.live = () => { throw Error('unreadable live evidence'); }; await f.runner.tick();
