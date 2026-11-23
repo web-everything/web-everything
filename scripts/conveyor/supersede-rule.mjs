@@ -90,10 +90,20 @@ const withoutCodeSpans = (line) => line.replace(/(`+)[^]*?\1/g, '');
  *  while a false hold stops an unrelated PR until an operator answers. So the tracker can only hide lines, never add. */
 const require = createRequire(import.meta.url);
 let md;
+function defaultMarkdownLoader() {
+  return require('markdown-it');
+}
+let loadMarkdown = defaultMarkdownLoader;
+/** Test seam; resetting the loader also invalidates parser-dependent cached evidence. */
+export function setMarkdownLoader(loader = defaultMarkdownLoader) {
+  loadMarkdown = loader;
+  md = undefined;
+  parsedBodies.clear();
+}
 function markdown() {
   // Importing this module must work in the deps install job's snapshot, before packages exist.
   // `reference` is quadratic in markdown-it 13; REF_DEF_START_RE skips definitions instead.
-  return md ??= new (require('markdown-it'))({ html: true }).disable('reference');
+  return md ??= new (loadMarkdown())({ html: true }).disable('reference');
 }
 
 /** Raw HTML elements whose text a reader sees as code or struck out, or never sees. Counted across the whole body:

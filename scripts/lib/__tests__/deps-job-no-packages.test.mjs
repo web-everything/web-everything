@@ -8,14 +8,21 @@ import { parseSupersedes } from '../../conveyor/supersede-rule.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
-// Static imports only: deferred package loading is safe before npm ci has run.
+// Walk static imports and reject non-indented startup package loads; indented function bodies may load lazily.
 function packageImports(entry, read = (path) => readFileSync(resolve(root, path), 'utf8')) {
   const seen = new Set();
   const packages = [];
   function walk(path, chain) {
     if (seen.has(path)) return;
     seen.add(path);
-    const source = ts.createSourceFile(path, read(path), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const text = read(path);
+    for (const line of text.split('\n').filter(line => /^\S/.test(line) && !/^\/\//.test(line))) {
+      for (const match of line.matchAll(/\b(?:require|import)\s*\(\s*(['"])([^'"]+)\1/g)) {
+        const name = match[2];
+        if (!name.startsWith('.') && !name.startsWith('node:') && !isBuiltin(name)) packages.push([...chain, path, name].join(' -> '));
+      }
+    }
+    const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
     for (const statement of source.statements) {
       if (!ts.isImportDeclaration(statement) && !ts.isExportDeclaration(statement)) continue;
       const specifier = statement.moduleSpecifier;
@@ -49,6 +56,14 @@ describe('deps job without installed packages', () => {
     expect(packageImports('entry.mjs', (path) => files[path])).toEqual([
       'entry.mjs -> export.mjs -> external', 'entry.mjs -> bare.mjs -> another-package',
     ]);
+  });
+
+  it.each([
+    "const x = require('external');",
+    "const x = await import('external');",
+    "(() => { require('external'); })();",
+  ])('rejects startup package loading: %s', (source) => {
+    expect(packageImports('entry.mjs', () => source)).toEqual(['entry.mjs -> external']);
   });
 
   it('refuses an unreadable relative dependency instead of accepting an incomplete closure', () => {
