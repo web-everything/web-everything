@@ -76,6 +76,7 @@
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
 import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
+import { redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
@@ -740,7 +741,7 @@ export function extractPassTimings(stderr) {
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
-    const output = () => ({ stdout, stderrTail: stderr.slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
+    const output = () => ({ stdout, stderrTail: redactSecrets(stderr).slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
@@ -1184,7 +1185,7 @@ export function createEnqueueOnEvent({
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
         if (!r.timedOut && (r.code !== 0 || !json)) {
-          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
           if (stderr) what += ` (stderr: ${stderr})`;
         }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
@@ -1237,7 +1238,7 @@ export function createEnqueueOnEvent({
             verified = false;
             missed = true;
             const events = (membership.lastEvents || []).map(e => `${e.__typename}${e.createdAt ? ` at ${e.createdAt}` : ''}${e.reason ? `: ${e.reason}` : ''}`).join('; ') || 'no AddedToMergeQueue event';
-            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-2000);
             what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${events}; fast-drain stderr: ${stderr}) — retrying on the next catch-up`;
           }
         }
