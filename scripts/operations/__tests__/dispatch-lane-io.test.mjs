@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -376,43 +376,50 @@ describe('lean repair background argv', () => {
     expect(buildAgentArgv({ ...options('build'), laneGrant: LANE_GRANT })).not.toContain('--add-dir');
   });
 
-  it('derives the grant from the payload lane and scope when none is passed (the direct reconcile fix path)', () => {
-    const payload = { ...options('fix').payload, lane: 12, scope: ['we:scripts/a.mjs'] };
-    const argv = buildAgentArgv({ ...options('fix'), payload });
-    expect(addDirsOf(argv)).toEqual([expect.stringMatching(/\/\.lanes\/web(?:-)?everything\/lane-12$/)]);
-    expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([expect.stringMatching(/^Edit\(.*\/lane-12\/\*\*\)$/)]));
-  });
+  describe('checkout-derived pool without a configured override', () => {
+    // The configured-pool cases above keep their explicit overrides; these synthetic-root cases prove
+    // the no-override fallback independently of Vitest's private LANE_POOL_ROOT.
+    beforeEach(() => { vi.stubEnv('LANE_POOL_ROOT', ''); });
+    afterEach(() => { vi.unstubAllEnvs(); });
 
-  it('validates an explicit grant against the dispatcher root, refusing another workspace', () => {
-    const payload = { ...options('fix').payload, lane: 7 };
-    const root = '/portable/workspace/we';
-    const laneGrant = leanRepairGrant(payload, null, { root, exists: () => false });
-    const argv = buildAgentArgv({ ...options('fix'), root, payload, laneGrant });
-    expect(addDirsOf(argv)).toEqual(['/portable/workspace/.lanes/web-everything/lane-7']);
-    expect(settingsOf(argv).permissions.additionalDirectories).toEqual(addDirsOf(argv));
-    expect(settingsOf(argv).permissions.allow).toContain(`Bash(node ${root}/scripts/conveyor/resolve-conflict.mjs:*)`);
-    expect(() => buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant }))
-      .toThrow(/only the assigned lane/);
-    expect(buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant, resumeSessionId: 'existing' }))
-      .toEqual(['--bg', '--resume', 'existing', payload.prompt]);
-  });
+    it('derives the grant from the payload lane and scope when none is passed (the direct reconcile fix path)', () => {
+      const payload = { ...options('fix').payload, lane: 12, scope: ['we:scripts/a.mjs'] };
+      const argv = buildAgentArgv({ ...options('fix'), payload });
+      expect(addDirsOf(argv)).toEqual([expect.stringMatching(/\/\.lanes\/web(?:-)?everything\/lane-12$/)]);
+      expect(settingsOf(argv).permissions.allow).toEqual(expect.arrayContaining([expect.stringMatching(/^Edit\(.*\/lane-12\/\*\*\)$/)]));
+    });
 
-  // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
-  // repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
-  it('grants only the named lane in the dispatch repo, whatever the scope lists first', () => {
-    for (const repo of ['frontierui', 'frontier-ui/frontierui']) {
-      for (const scope of [undefined, [], ['we:scripts/a.mjs', 'frontierui:src/b.ts']]) {
-        const payload = { ...options('fix').payload, lane: 3, repo, scope };
-        const dirs = addDirsOf(buildAgentArgv({ ...options('fix'), payload }));
-        expect(dirs).toEqual([expect.stringMatching(/\/\.lanes\/frontierui\/lane-3$/)]);
-        expect(dispatchLaneGrant(payload, { root: '/w/webeverything', exists: () => false }).additionalDirectories)
-          .toEqual(['/w/.lanes/frontierui/lane-3']);
+    it('validates an explicit grant against the dispatcher root, refusing another workspace', () => {
+      const payload = { ...options('fix').payload, lane: 7 };
+      const root = '/portable/workspace/we';
+      const laneGrant = leanRepairGrant(payload, null, { root, exists: () => false });
+      const argv = buildAgentArgv({ ...options('fix'), root, payload, laneGrant });
+      expect(addDirsOf(argv)).toEqual(['/portable/workspace/.lanes/web-everything/lane-7']);
+      expect(settingsOf(argv).permissions.additionalDirectories).toEqual(addDirsOf(argv));
+      expect(settingsOf(argv).permissions.allow).toContain(`Bash(node ${root}/scripts/conveyor/resolve-conflict.mjs:*)`);
+      expect(() => buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant }))
+        .toThrow(/only the assigned lane/);
+      expect(buildAgentArgv({ ...options('fix'), root: '/other/workspace/we', payload, laneGrant, resumeSessionId: 'existing' }))
+        .toEqual(['--bg', '--resume', 'existing', payload.prompt]);
+    });
+
+    // Self-review (round 2): the repo comes from the dispatch's own `repo`, never only from the scope — a sibling
+    // repo's card may list a `we:` path first, and a ci-heal may carry no scope at all.
+    it('grants only the named lane in the dispatch repo, whatever the scope lists first', () => {
+      for (const repo of ['frontierui', 'frontier-ui/frontierui']) {
+        for (const scope of [undefined, [], ['we:scripts/a.mjs', 'frontierui:src/b.ts']]) {
+          const payload = { ...options('fix').payload, lane: 3, repo, scope };
+          const dirs = addDirsOf(buildAgentArgv({ ...options('fix'), payload }));
+          expect(dirs).toEqual([expect.stringMatching(/\/\.lanes\/frontierui\/lane-3$/)]);
+          expect(dispatchLaneGrant(payload, { root: '/w/webeverything', exists: () => false }).additionalDirectories)
+            .toEqual(['/w/.lanes/frontierui/lane-3']);
+        }
       }
-    }
-    expect(laneRepoKey({ repo: 'plateauapp/plateau-app' })).toBe('plateau-app');
-    expect(laneRepoKey({ repo: 'unknown/repo', scope: ['plateau-app:src/a.ts'] })).toBe('plateau-app');
-    expect(laneRepoKey({ repo: 'constructor' })).toBe('we');
-    expect(laneRepoKey({})).toBe('we');
+      expect(laneRepoKey({ repo: 'plateauapp/plateau-app' })).toBe('plateau-app');
+      expect(laneRepoKey({ repo: 'unknown/repo', scope: ['plateau-app:src/a.ts'] })).toBe('plateau-app');
+      expect(laneRepoKey({ repo: 'constructor' })).toBe('we');
+      expect(laneRepoKey({})).toBe('we');
+    });
   });
 
   it('refuses laneless launches even with an empty explicit grant', () => {
