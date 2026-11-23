@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 618 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 164.
+- Top-level keys: 165 (167 declaration rows).
+- Declared leaves: 631 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 165.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -64,7 +64,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
-| audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
+| audit | scripts/settings/codex-audit.json | 12 | {"debounce":{"minutes":5},"delta":{"maxFiles":0},"verdict":… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
 | auditRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/audits.jsonl" | pr | no | Audit coordination record location. |
 | authority | scripts/settings/orchestrator-authority.json | 1 | {"redMainQuarantine":false} | pr | no | Repository grant for orchestrator red-main quarantine authority. |
 | autoRoundGrant | scripts/settings/review.json | 3 | {"cardOnly":{"enabled":true,"maxPerPr":3,"repos":["web-ever… | pr | no | Automatic bounded extra review rounds for eligible card-only work. |
@@ -84,6 +84,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | ciGhostRerun | scripts/settings/ci-ghost-rerun.json | 5 | {"thresholdMin":15,"maxPerWindow":1,"maxPerHead":1,"windowH… | pr | no | Age, frequency and cancellation bounds for ghost CI recovery. |
 | ciHeal | scripts/settings/ci-heal.json | 2 | {"staleBaseRefreshFirst":"on","loop":"off"} | pr | no | Try a stale-base refresh before waking a CI fixer. |
 | ciHeldRecordRetryMax | scripts/settings/review-red-team-on-skip.json | 1 | 3 | pr | no | Maximum CI-held record recovery retries. |
+| ciUnitRerun | scripts/settings/ci-unit-rerun.json | 2 | {"enabled":false,"flakeAllowlist":[]} | pr | no | Control one bounded retry of failed unit files and the allowlist permitted to recover a shard. |
 | claudeHelper | scripts/settings/claude-helper.json | 1 | {"model":"claude-sonnet-5-5"} | pr | no | Default Claude helper and juror model. |
 | cloneMaintenance | scripts/settings/clone-maintenance.json | 1 | {"intervalMs":86400000} | pr | no | Interval between idle daemon clone garbage collections. |
 | codex | scripts/settings/codex.json | 30 | {"modelByTask":{"prepare":{"model":"gpt-6-astra","effort":"… | pr | no | Per-task Codex model, effort and pre-launch retry choices. |
@@ -168,7 +169,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | prepareStaleHours | scripts/settings/coroner-postmortem.json | 1 | 24 | pr | no | Age in hours at which preparation is treated as stale. |
 | prevention | scripts/settings/prevention-batch.json | 4 | {"$comment":"batchFiling enables rolling prevention PRs; fa… | pr | no | Prevention card batching and filing limits. |
 | providerCapacity | scripts/settings/provider-capacity.json | 1 | {"providers":[{"id":"codex","launcher":"codex","tier":3,"al… | pr | no | Provider/account quota windows, readers, reserves, banked resets and minimum tiers for capacity-based routing. |
-| providerRotation | scripts/settings/provider-rotation.json | 24 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Pure provider rotation input: mode, arm catalog/shares, identity families, exhaustion/reserve bounds, strong/small guards and Carbon promotion evidence. |
+| providerRotation | scripts/settings/provider-rotation.json | 33 | {"mode":"shadow","catalog":[{"provider":"codex","model":"gp… | pr | no | Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean. |
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |

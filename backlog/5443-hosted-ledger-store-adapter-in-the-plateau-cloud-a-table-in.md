@@ -4,7 +4,10 @@ kind: story
 size: 5
 parent: "2445"
 relatedTo: ["2742", "5445"]
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: Phase 2; hosted ledger store is a server we would operate."
+dateParked: "2026-11-22"
 scope: ["we:scripts/conveyor/pr-events-worker/worker.mjs", "we:scripts/conveyor/pr-events-worker/core.mjs", "we:scripts/lib/verdict-ledger-store.mjs"]
 dateOpened: "2026-10-08"
 tags: []
@@ -37,3 +40,5 @@ Ledger product review, operator 2026-10-08, D3 (option a). Free: git branch and 
 5. **Identity scoping** — events are per repo and per PR head.
 6. **State over time** — append-only; old rows are never rewritten.
 7. **Who wrote it** — every event records its writer.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: Phase 2; hosted ledger store is a server we would operate.
