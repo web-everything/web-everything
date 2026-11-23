@@ -88,7 +88,7 @@ describe('configured capacity candidates reach the fix launcher', () => {
     const planned = { scope: ['we:src/css/site.css'] };
     expect(launchTableFor(planned, null, { capacityRoute: decision.policyRoute }).model).toBe(provider.model);
     for (const entry of [{ takeover: true }, { rulingNotAddressed: true }, { mainFix: true }, { strongerModel: true },
-      { scope: ['we:scripts/lib/provider-routing.mjs'] }]) {
+      { strongerModel: true, scope: ['we:scripts/lib/provider-routing.mjs'] }]) {
       expect(launchTableFor({ ...planned, ...entry }, null, { capacityRoute: decision.policyRoute }).model).not.toBe(provider.model);
     }
     expect(chooseFixExecutor({ setting, chain, strongerModel: true, launcherAvailable: () => true }).executor).toBe('claude');
@@ -274,7 +274,7 @@ describe('fix executor decision', () => {
   it('explains fallback and formats the exact log line', () => {
     expect(chooseFixExecutor({ setting, launcherAvailable: false }).reason).toMatch(/unavailable.*fallback/);
     expect(formatFixExecutorLog({ executor: 'codex', reason: 'ordinary fix', source: 'default' }))
-      .toBe('fix executor: codex (ordinary fix, source default)');
+      .toContain('provider=codex mode=direct');
   });
   it('launches a routed fix through the existing non-Claude provider without borrowing', () => {
     const spawnBorrowed = vi.fn(() => 'pid:123');
@@ -418,7 +418,7 @@ describe('routed CI-heal and claim accounting', () => {
       expect(stampFixExecutor({ ...id, decision: chooseFixExecutor({ setting, launcherAvailable: true }) })).toBeTruthy();
       const claim = readFixDispatchClaim(id);
       expect(claim.meta.borrowed).toBeUndefined();
-      expect(claim.meta.fixExecutor).toEqual({ executor: 'codex', reason: 'codex-first ordinary repair' });
+      expect(claim.meta.fixExecutor).toEqual({ executor: 'codex', rung: 'codex', provider: 'codex', mode: 'direct', reason: 'codex-first ordinary repair' });
       const store = { read: vi.fn(() => ({})), write: vi.fn() };
       recordBorrowOutcome({ ...id, outcome: 'no-change', store });
       expect(store.read).not.toHaveBeenCalled();
@@ -782,21 +782,35 @@ describe('chain dispatch and critical scope', () => {
   const options = {setting,chain,fixSettings:{strongerModelFromRound:3},loadLadder:()=>null,readRouted:()=>({}),launcherAvailable:()=>true};
   it.each([{}, {scope:[]}, {scope:['we:scripts/lib/critical-work.mjs']}])('fails closed for critical scope %j', scope => {
     for (const trigger of [{takeover:true}, {rulingNotAddressed:true}]) {
-      expect(routeFixExecutor({pr:42,...trigger,...scope},options)).toMatchObject({executor:'claude',reason:'critical work never leaves Claude'});
+      expect(routeFixExecutor({pr:42,...trigger,...scope},options)).toMatchObject({executor:'codex',rung:'codex-alt',mode:'direct',requiresReview:true});
     }
   });
-  it('routes critical stronger-model work through the configured threshold', () => {
-    const planned = {pr:42,strongerModel:true,scope:['we:scripts/lib/critical-work.mjs']};
-    expect(routeFixExecutor(planned,options)).toMatchObject({executor:'codex',rung:'codex-alt'});
-    expect(routeFixExecutor(planned,{...options,chain:{...chain,criticalClaudeFromRung:1,criticalClaudeFromRungSource:'repo'}}))
-      .toMatchObject({executor:'claude',reason:'critical work reaches Claude from rung 1 (criticalClaudeFromRung=1, source=repo)'});
+  it.each([['scripts/build-docs.mjs','direct'],['scripts/pr-land.mjs','direct'],['scripts/build-docs.mjs','wrapped']])('%s uses the configured %s invocation', (path,mode) => {
+    const planned = {pr:42,itemNum:'42',lane:2,laneRef:'lane/42-x',scope:[`we:${path}`],strongerModel:true};
+    const decision = routeFixExecutor(planned,{...options,chain:{...chain,mode}}), launch = vi.fn(()=>'pid:1'), wrapper = vi.fn(()=>({handle:'pid:2'}));
+    expect(decision).toMatchObject({executor:'codex',mode,requiresReview:path.includes('pr-land')});
+    dispatchFix(planned,{root:'/repo',executorDecision:decision,readBrief:()=>'{{PR_NUM}} {{LANE_REF}}',readFixClaim:()=>null,
+      acquireClaim:()=>({ok:true}),stampExecutor:vi.fn(),stampRunner:vi.fn(),postNotice:vi.fn(),writeBorrowedPrompt:()=>'/unused',spawnBorrowed:launch,spawnAgent:wrapper,launchWrapped:wrapper,wrapFix:true,
+      sessionCwdFor:()=>'/unused',ensureSessionCwd:p=>p,grantConflictHelper:vi.fn(),isolateSession:()=>({}),resolveSettingsEnv:()=>null,advisorFor:()=>({enabled:false}),recordAdvisor:vi.fn()});
+    expect(launch).toHaveBeenCalledTimes(mode === 'direct' ? 1 : 0); expect(wrapper).toHaveBeenCalledTimes(mode === 'wrapped' ? 1 : 0);
+    if (mode === 'wrapped') expect(wrapper.mock.calls[0][0].bgArgv.at(-1)).toContain('codex-direct-task');
+  });
+  it('Claude executes the generated brief itself at the configured model', async () => {
+    const {readFixBriefTemplate} = await import('../reconcile-fix-dispatch.mjs');
+    const launch = vi.fn(()=>({handle:'pid:1'})), stampExecutor = vi.fn();
+    dispatchFix({pr:42,itemNum:'42',lane:2,laneRef:'lane/42-x',scope:['we:scripts/pr-land.mjs']},{root:'/repo',readBrief:()=>readFixBriefTemplate(),executorDecision:chooseFixExecutor({setting:{value:'claude'}}),
+      readFixClaim:()=>null,acquireClaim:()=>({ok:true}),stampExecutor,postNotice:vi.fn(),launchWrapped:launch,wrapFix:true,
+      sessionCwdFor:()=>'/unused',ensureSessionCwd:p=>p,grantConflictHelper:vi.fn(),isolateSession:()=>({}),resolveSettingsEnv:()=>null,advisorFor:()=>({enabled:false}),recordAdvisor:vi.fn()});
+    expect(launch.mock.calls[0][0].bgArgv.at(-1)).not.toContain('codex-direct-task');
+    expect(stampExecutor).toHaveBeenCalledWith(expect.objectContaining({decision:expect.objectContaining({provider:'claude',mode:'direct'})}));
+    expect(launchTableFor({strongerModel:true,scope:['we:scripts/pr-land.mjs']},null,{fixSettings:{claudeEscalationModel:'haiku'}}).model).toContain('haiku');
   });
   it('uses the injected critical verdict and fails closed on errors', () => {
     const planned = {pr:42,takeover:true,scope:['we:x.ts']};
     const criticalFor = vi.fn(()=>false);
     expect(routeFixExecutor(planned,{...options,criticalFor}).rung).toBe('codex-alt');
     expect(criticalFor).toHaveBeenCalledWith(planned);
-    expect(routeFixExecutor(planned,{...options,criticalFor:()=>{throw Error('unreadable');}}).executor).toBe('claude');
+    expect(routeFixExecutor(planned,{...options,criticalFor:()=>{throw Error('unreadable');}})).toMatchObject({executor:'codex',requiresReview:true});
   });
   it('stamps Argon as routed and forwards the model without a Claude ladder claim', () => {
     const spawnBorrowed = vi.fn(()=>'pid:1'), stampExecutor = vi.fn();
