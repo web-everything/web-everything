@@ -92,6 +92,7 @@ describe('mq failure reconcile intake', () => {
     };
     const io = {
       readHead: vi.fn(() => identity.head),
+      readLabels: vi.fn(() => ({ headRefOid: identity.head, labels: [] })),
       createCheckout: vi.fn(async () => ({ cwd: 'fixture/isolated', branch: 'topic' })),
       git: vi.fn(async ({ args }) => args[0] === 'merge' ? { ok: true, head: 'b'.repeat(40) } : { ok: true }),
       removeCheckout: vi.fn(async () => {}),
@@ -170,6 +171,7 @@ describe('mq failure durable fixer fallback', () => {
     const repo = 'web-everything/web-everything';
     const io = {
       readHead: vi.fn(() => identity.head),
+      readLabels: vi.fn(() => ({ headRefOid: identity.head, labels: [] })),
       createCheckout: vi.fn(() => ({ cwd: 'fixture/isolated', branch: 'topic' })),
       git: vi.fn(({ args }) => args[0] === 'merge'
         ? failure === 'conflict' ? { ok: false, conflict: true } : { ok: true, head: 'b'.repeat(40) }
@@ -233,7 +235,8 @@ describe('mq failure production changed-files intake', () => {
       const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', dryRun: false,
         reconcile: () => planReconcile({ repo: 'we', prs: [structuredClone(pr)], agents: [], durableCounts: {} }),
         checkStaleness: () => ({ fresh: true, behind: 0 }),
-        mqFailureIo: { readHead }, mqFailureLedger: { readConsumedRefresh: () => false, readFixFallback: () => false },
+        mqFailureIo: { readHead, readLabels: a => ({ headRefOid: readHead(a), labels: [] }) }, mqRefreshStore: { has: () => false },
+        mqFailureLedger: { readConsumedRefresh: () => false, readFixFallback: () => false },
         refreshMqFailure: refresh, fetchItemlessDiffPaths: fetchFiles,
         loadItems: () => [], findItemFn: () => null, pickFreeLanes: () => [5],
         tryResume: () => ({ resumed: false }), tryResumeRound: null,
@@ -313,7 +316,7 @@ describe('mq recovery dispatcher guards', () => {
   const entry = (overrides = {}) => ({ kind: 'fix', prNumber: identity.pr, headRefName: 'topic', headRefOid: identity.head,
     files: ['src/unrelated.mjs'], mqFailureRecovery: admitMqFailureRoute({ ...identity, repo: wePrRepo,
       route: { ...route, repo: wePrRepo }, changedFiles: { ...changedFiles, repo: wePrRepo } }), ...overrides });
-  function run({ entries = [entry()], ledger = { readConsumedRefresh: () => false, readFixFallback: () => false }, dryRun = false, omitDryRun = false, readHead, refresh, lanes = [5] } = {}) {
+  function run({ entries = [entry()], ledger = { readConsumedRefresh: () => false, readFixFallback: () => false }, dryRun = false, omitDryRun = false, readHead, refresh, lanes = [5], labels = [], store = { has: () => false } } = {}) {
     const dispatch = vi.fn(planned => ({ pr: planned.pr, sessionId: 'fixture-fixer' }));
     const fetchFiles = vi.fn(pr => entries.length > 1 ? [`src/unrelated-${pr}.mjs`] : ['src/unrelated.mjs']);
     const head = readHead ?? vi.fn(() => identity.head);
@@ -321,7 +324,8 @@ describe('mq recovery dispatcher guards', () => {
     const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', ...(omitDryRun ? {} : { dryRun }),
       reconcile: () => ({ dispatch: entries, refusals: [] }),
       checkStaleness: () => ({ fresh: true, behind: 0 }),
-      mqFailureIo: { readHead: head }, mqFailureLedger: ledger, refreshMqFailure,
+      mqFailureIo: { readHead: head, readLabels: a => ({ headRefOid: head(a), labels: [...labels] }) }, mqRefreshStore: store,
+      mqFailureLedger: ledger, refreshMqFailure,
       fetchItemlessDiffPaths: fetchFiles, loadItems: () => [], findItemFn: () => null, pickFreeLanes: () => lanes,
       tryResume: () => ({ resumed: false }), tryResumeRound: null,
       listFixClaims: () => [], listBuildClaims: () => [], priorityShadow: null, dispatch });
@@ -347,6 +351,44 @@ describe('mq recovery dispatcher guards', () => {
     const f = run({ entries: [{ ...base, mqFailureRecovery: incomplete }] });
     expect(f.refreshMqFailure).not.toHaveBeenCalled();
     expect(f.dispatch.mock.calls[0][0].mqFailureRecovery).toMatchObject({ recoveryAction: 'fix', evidence: { complete: false } });
+  });
+
+  const incompleteEntry = () => {
+    const base = entry();
+    return { ...base, mqFailureRecovery: { ...base.mqFailureRecovery, recoveryAction: 'refresh',
+      evidence: { ...base.mqFailureRecovery.evidence, complete: false } } };
+  };
+
+  it('incomplete evidence with a consumed refresh attempt is stopped, not handed to the fixer', () => {
+    const f = run({ entries: [incompleteEntry()], ledger: { readConsumedRefresh: () => true, readFixFallback: () => false } });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.result.refusals).toContainEqual(expect.objectContaining({ kind: 'mq-failure-refresh' }));
+  });
+
+  it('incomplete evidence with an unreadable ledger is stopped, not handed to the fixer', () => {
+    const f = run({ entries: [incompleteEntry()], ledger: { readConsumedRefresh: () => { throw new Error('bad'); }, readFixFallback: () => false } });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.result.refusals).toContainEqual(expect.objectContaining({ kind: 'mq-failure-refresh' }));
+  });
+
+  it.each([['complete', entry], ['incomplete', incompleteEntry]])('a head spent in the shared refresh store is stopped (%s evidence)', (_name, make) => {
+    const has = vi.fn(() => true);
+    const f = run({ entries: [make()], store: { has } });
+    expect(has).toHaveBeenCalledWith(`${wePrRepo}#${identity.pr}@${identity.head}`);
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.refreshMqFailure).not.toHaveBeenCalled();
+    expect(f.result.refusals).toContainEqual(expect.objectContaining({ kind: 'mq-failure-refresh' }));
+  });
+
+  it.each(['review:human', 'red-team:blocked', 'red-team:pending'])('live blocking label %s refuses fixer dispatch', label => {
+    const f = run({ labels: [{ name: label }] });
+    expect(f.dispatch).not.toHaveBeenCalled();
+    expect(f.result.refusals).toContainEqual(expect.objectContaining({ kind: 'mq-failure-refresh' }));
+  });
+
+  it('with no blocking label the same entry still reaches the fixer', () => {
+    const f = run({ labels: [{ name: 'review:changes' }] });
+    expect(f.dispatch).toHaveBeenCalledTimes(1);
   });
 
   it('dryRun cannot dispatch a recovery entry even when its hint is misbound', () => {

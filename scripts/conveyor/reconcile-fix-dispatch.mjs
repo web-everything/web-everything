@@ -4,6 +4,7 @@ import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
 import { mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
 import { createMqFailureLedger } from '../lib/mq-failure-ledger.mjs';
+import { createMqSameHeadRefreshStore, queueLabels, redTeamLabelHoldReason } from '../lib/drain-queue-safety.mjs';
 import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 /**
  * @file scripts/conveyor/reconcile-fix-dispatch.mjs
@@ -1868,6 +1869,7 @@ export function classifyEnvFaultRefusals(refusals) {
 export function runReconcileFixDispatch({
   shadowDeps,
   mqFailureLedger = null,
+  mqRefreshStore = null,
   mqFailureIo = null,
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   root = REPO_ROOT,
@@ -2100,11 +2102,6 @@ export function runReconcileFixDispatch({
     // wrong-PR data, so it is dropped from the entry and never reaches the fixer brief.
     if (recovery.repo !== ghRepoSlug(repoKey) || recovery.pr !== Number(entry.prNumber)
         || recovery.head !== entry.headRefOid) { delete entry.mqFailureRecovery; return true; }
-    // Incomplete evidence is the normal fixer's input but never authorizes a mechanical refresh.
-    if (recovery.evidence?.complete !== true) {
-      entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
-      return true;
-    }
     let result;
     try {
       const identity = { repo: recovery.repo, pr: recovery.pr, head: recovery.head };
@@ -2118,6 +2115,16 @@ export function runReconcileFixDispatch({
       const consumed = fallback ? false : ledger.readConsumedRefresh(identity);
       if (consumed?.then) { consumed.catch(() => {}); throw new Error('Unreadable MQ refresh attempt'); }
       if (consumed !== false) throw new Error('Consumed or unreadable MQ refresh attempt; operator inspection required');
+      // The drain's shared same-head store also spends a head; a spent head is never refreshed again.
+      if (!fallback) {
+        const spent = (mqRefreshStore ?? createMqSameHeadRefreshStore()).has(`${identity.repo}#${identity.pr}@${identity.head}`);
+        if (spent !== false) throw new Error('Shared MQ refresh attempt spent or unreadable; operator inspection required');
+      }
+      // Incomplete evidence is the normal fixer's input but never authorizes a mechanical refresh.
+      if (recovery.evidence?.complete !== true) {
+        entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
+        return true;
+      }
       const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
       if (!fallback && !dryRun) {
         // A list snapshot carries no completeness proof. Re-read the full diff, bracketed by live
@@ -2375,9 +2382,13 @@ export function runReconcileFixDispatch({
       if (!recovery) return true;
       try {
         const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
-        const head = io.readHead({ repo: recovery.repo, pr: recovery.pr });
-        if (head?.then) { head.catch(() => {}); throw new Error('Unreadable live head'); }
-        if (head !== recovery.head) throw new Error('Live PR head differs from route head');
+        const live = io.readLabels({ repo: recovery.repo, pr: recovery.pr });
+        if (live?.then) { live.catch(() => {}); throw new Error('Unreadable live labels'); }
+        const names = Array.isArray(live?.labels) ? queueLabels(live.labels) : null;
+        if (live?.headRefOid !== recovery.head) throw new Error('Live PR head differs from route head');
+        if (!names || names.length >= 100 || names.some(name => typeof name !== 'string' || !name.trim()))
+          throw new Error('Unreadable live labels');
+        if (names.includes('review:human') || redTeamLabelHoldReason(names)) throw new Error('Blocking live label');
       } catch {
         refusals.push({ pr: entry.pr, kind: 'mq-failure-refresh', why: 'MQ live head changed or unreadable; operator inspection required' });
         return false;

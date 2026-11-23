@@ -21,9 +21,13 @@ describe('MQ recovery only hands off to the fixer', () => {
   });
   it.each(['review:human', 'red-team:blocked', 'red-team:pending'])('blocking label %s refuses recovery before any push', label => {
     const body = buildMqFailureRoute({ ...id, failedJobs: ['unit'], testFiles: ['tests/a.mjs'], assertions: ['FAIL'], complete: true }), refresh = vi.fn(), git = vi.fn(), dispatch = vi.fn();
+    const readHead = vi.fn(() => id.head), readLabels = vi.fn(() => ({ headRefOid: id.head, labels: [{ name: label }] }));
     runReconcileFixDispatch({ root: 'fixture', repo: 'we', dryRun: false,
       reconcile: () => planReconcile({ repo: 'we', agents: [], durableCounts: {}, prs: [{ number: 42, state: 'OPEN', headRefOid: id.head, labels: [{ name: label }], comments: [{ body, author: { login: 'chalbert' } }] }] }),
-      refreshMqFailure: refresh, mqFailureIo: { git }, listFixClaims: () => [], listBuildClaims: () => [],
+      refreshMqFailure: refresh, listFixClaims: () => [], listBuildClaims: () => [],
+      // Usable head+label IO: the refusal must come from the label check, not from missing IO.
+      mqFailureIo: { git, readHead: readHead, readLabels },
+      mqRefreshStore: { has: () => false }, mqFailureLedger: { readConsumedRefresh: () => false, readFixFallback: () => false },
       loadItems: () => [], priorityShadow: null, pickFreeLanes: () => [5], dispatch });
     expect(refresh).not.toHaveBeenCalled(); expect(git).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
   });
