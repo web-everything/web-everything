@@ -6,6 +6,7 @@
 import { test } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -239,10 +240,18 @@ test('--check refuses unequal fresh renders without writing the doc', t => {
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
-// Migration checks cover the historical roster. The live inventory/drift test above
-// validates every current key, including settings added after the migration.
-const originalKey = key => Object.hasOwn(originalMetadata.settings, key);
-const originalRegistry = registry => ({ ...registry, rows: registry.rows.filter(row => originalKey(row.key)) });
+// Declarations from the same pre-migration commit (sourceCommit in the fixture).
+// Ignore top-level $comments, replace account IDs with placeholders, and excerpt
+// the privacy allowlist. Every rendered default and leaf count stays unchanged.
+// Live defaults and keys evolve independently.
+const originalDeclarations = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original-declarations.json'), 'utf8'));
+function originalFixture(t) {
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  for (const [path, value] of Object.entries(originalDeclarations.files)) f.write(path, value);
+  Object.assign(f.meta, structuredClone(originalMetadata));
+  return f;
+}
 function split(f) {
   for (const section of ['settings', 'capacityLeaves']) {
     for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
@@ -256,18 +265,12 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the original registry plus the intentional shadow rotation description', t => {
-  const f = fixture(t);
-  rmSync(join(f.root, 'scripts/settings/feature.json'));
-  const current = originalRegistry(buildRegistry());
-  for (const owner of new Set(current.rows.flatMap(row => row.owners))) {
-    const declarations = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
-    f.write(owner, Object.fromEntries(Object.entries(declarations).filter(([key]) => originalKey(key) || key.startsWith('$comment'))));
-  }
-  const expectedMetadata = structuredClone(originalMetadata);
-  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
-  f.write(META, expectedMetadata);
-  assert.deepEqual(current, buildRegistry({ root: f.root }));
+test('migration preserves the registry built from the original repository metadata JSON', t => {
+  const f = originalFixture(t), before = f.build();
+  assert.deepEqual(before.problems, []);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
+  assert.deepEqual(f.build(), before);
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -381,9 +384,20 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation retains rotation, rerun and audit debounce/delta rows and authoring instructions', () => {
+test('generated documentation preserves original bytes except the intentional per-key authoring instruction', t => {
+  const f = originalFixture(t);
+  split(f);
+  const doc = renderMarkdown(f.build());
+  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
+  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+});
+test('generated documentation retains rotation, rerun, audit debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
   const registry = buildRegistry(), doc = renderMarkdown(registry);
-  for (const key of ['providerRotation', 'ciUnitRerun', 'audit']) assert.match(doc, new RegExp(`^\\| ${key} \\|`, 'm'));
+  for (const key of ['providerRotation', 'ciUnitRerun', 'audit', 'reviewAutoAudit', 'allowedFiles']) assert.match(doc, new RegExp(`^\\| ${key} \\|`, 'm'));
+  const reviewAutoAudit = registry.rows.find(row => row.key === 'reviewAutoAudit');
+  assert.deepEqual(reviewAutoAudit.owners, ['scripts/settings/review-auto-audit.json']);
+  assert.equal(reviewAutoAudit.value.mode, 'shadow');
   const audit = registry.rows.find(row => row.key === 'audit');
   assert.deepEqual(audit.value.debounce, { minutes: 5 });
   assert.deepEqual(audit.value.delta, { maxFiles: 0 });
