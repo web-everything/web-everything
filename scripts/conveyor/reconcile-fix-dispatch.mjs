@@ -1,6 +1,9 @@
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
+import { admitMqFailureRoute } from './mq-failure-intake.mjs';
+import { mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
+import { createMqFailureLedger } from '../lib/mq-failure-ledger.mjs';
 import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 /**
  * @file scripts/conveyor/reconcile-fix-dispatch.mjs
@@ -1864,6 +1867,8 @@ export function classifyEnvFaultRefusals(refusals) {
  */
 export function runReconcileFixDispatch({
   shadowDeps,
+  mqFailureLedger = null,
+  mqFailureIo = null,
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   root = REPO_ROOT,
   repo = null,
@@ -1877,6 +1882,7 @@ export function runReconcileFixDispatch({
   // Card xrbu1bp — the round resume. Off under a test runner unless injected (it reads the live agent listing).
   tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
+  acquireClaim, releaseClaim, readFixClaim,
   reconcile = runReconcilePass,
   readPrs,
   readFreshPr = readFreshFixPr,
@@ -2081,15 +2087,75 @@ export function runReconcileFixDispatch({
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
   }
-  for (const entry of dispatchEntries) {
-    const recovery = entry.mqFailureRecovery;
-    if (entry.kind !== 'fix' || !recovery) continue;
-    // Discard misbound evidence before it can reach the fixer brief.
+  const mqRefreshRefusals = [];
+  let mqDiffReads = 0;
+  dispatchEntries = dispatchEntries.filter(entry => {
+    let recovery = entry.mqFailureRecovery;
+    if (entry.kind !== 'fix' || !recovery) return true;
+    if (dryRun) {
+      mqRefreshRefusals.push({ pr: Number(entry.prNumber), kind: 'mq-failure-refresh', why: 'Dry-run: no recovery claim or dispatch' });
+      return false;
+    }
+    // Refuse a misbound hint even if an upstream caller supplied it directly: another PR's or head's evidence is
+    // wrong-PR data, so it is dropped from the entry and never reaches the fixer brief.
     if (recovery.repo !== ghRepoSlug(repoKey) || recovery.pr !== Number(entry.prNumber)
-        || recovery.head !== entry.headRefOid) { delete entry.mqFailureRecovery; continue; }
-    // Normalize persisted refresh hints too. Only the drain may refresh a head.
-    entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
-  }
+        || recovery.head !== entry.headRefOid) { delete entry.mqFailureRecovery; return true; }
+    // Incomplete evidence is the normal fixer's input but never authorizes a mechanical refresh.
+    if (recovery.evidence?.complete !== true) {
+      entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
+      return true;
+    }
+    let result;
+    try {
+      const identity = { repo: recovery.repo, pr: recovery.pr, head: recovery.head };
+      const ledger = mqFailureLedger ?? createMqFailureLedger();
+      const fallback = dryRun ? false : ledger.readFixFallback(identity);
+      if (fallback?.then) {
+        fallback.catch(() => {});
+        throw new Error('Synchronous dispatcher requires synchronous ledger IO');
+      }
+      if (typeof fallback !== 'boolean') throw new Error('Unreadable MQ fallback decision');
+      const consumed = fallback ? false : ledger.readConsumedRefresh(identity);
+      if (consumed?.then) { consumed.catch(() => {}); throw new Error('Unreadable MQ refresh attempt'); }
+      if (consumed !== false) throw new Error('Consumed or unreadable MQ refresh attempt; operator inspection required');
+      const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
+      if (!fallback && !dryRun) {
+        // A list snapshot carries no completeness proof. Re-read the full diff, bracketed by live
+        // head reads, only for this authenticated current-head route. At most eight such reads/pass.
+        let files = null, pinned = false;
+        if (mqDiffReads++ < 8) {
+          try {
+            if (io.readHead({ repo: identity.repo, pr: identity.pr }) === identity.head) {
+              files = fetchItemlessDiffPaths(identity.pr);
+              pinned = Array.isArray(files) && files.length < MAX_PAGINATED_FILES
+                && io.readHead({ repo: identity.repo, pr: identity.pr }) === identity.head;
+            }
+          } catch { /* Missing/stale/oversized evidence preserves ordinary fixer admission. */ }
+        }
+        recovery = admitMqFailureRoute({ ...identity,
+          route: { ...identity, ...recovery.evidence, version: 1, stale: false },
+          changedFiles: { ...identity, files, complete: pinned } });
+        entry.mqFailureRecovery = recovery;
+        if (recovery.recoveryAction !== 'refresh') {
+          entry.mqFailureRecovery = { ...recovery,
+            refreshNote: 'Changed files are in-diff, unavailable, stale or over the read bound; normal fix required' };
+          return true;
+        }
+      }
+      result = fallback
+        ? { action: 'fix', note: 'Persisted MQ refresh failure; normal fix still required' }
+        : { action: 'fix', note: 'MQ recovery requires the ordinary fixer' };
+    } catch { result = { action: 'stop', note: 'MQ refresh executor failed; operator inspection required' }; }
+    if (result?.action === 'fix') {
+      // Conflict/push rejection consumes the mechanical attempt; the ordinary fixer gets the evidence.
+      entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix', refreshNote: result.note };
+      return true;
+    }
+    mqRefreshRefusals.push({ pr: Number(entry.prNumber), kind: 'mq-failure-refresh',
+      why: result?.action === 'refreshed' ? `MQ head refreshed to ${result.head}; waiting for fresh CI`
+        : result?.note ?? 'MQ refresh stopped; operator inspection required' });
+    return false; // No LLM session for a mechanical refresh or a stopped refresh.
+  });
   const { planned: plannedAll, refusals: planRefusals } = fixStep('plan-fixes', () => planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true }));
   // Refresh existing PR claims too: a prepare's old declared implementation scope must
   // not survive as ownership. Reuse the reconcile snapshot, then one read per missing PR.
@@ -2209,7 +2275,7 @@ export function runReconcileFixDispatch({
   // repo), never the WE pool for a non-WE repo (#x33jgwt).
   const lanes = [...(typeof pickFreeLanes === 'function' ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))];
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
-
+  refusals.push(...mqRefreshRefusals);
   const dispatched = [];
   let handled = 0;
   let deferred = [];
@@ -2304,6 +2370,21 @@ export function runReconcileFixDispatch({
       refusals.push({ pr: entry.pr, kind: 'executor-held', why: executorDecision.reason });
       continue;
     }
+    const recovery = entry.mqFailureRecovery;
+    const recoveryHeadCurrent = () => {
+      if (!recovery) return true;
+      try {
+        const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
+        const head = io.readHead({ repo: recovery.repo, pr: recovery.pr });
+        if (head?.then) { head.catch(() => {}); throw new Error('Unreadable live head'); }
+        if (head !== recovery.head) throw new Error('Live PR head differs from route head');
+      } catch {
+        refusals.push({ pr: entry.pr, kind: 'mq-failure-refresh', why: 'MQ live head changed or unreadable; operator inspection required' });
+        return false;
+      }
+      return true;
+    };
+    if (!recoveryHeadCurrent()) continue;
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
@@ -2346,9 +2427,10 @@ export function runReconcileFixDispatch({
       refusals.push({ pr: entry.pr, kind: 'no-lane', why: `no free lane to dispatch a fix agent for PR #${entry.pr}` });
       continue;
     }
+    if (!recoveryHeadCurrent()) continue;
     const lane = lanes.shift();
     try {
-      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
+      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, acquireClaim, releaseClaim, readFixClaim, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a

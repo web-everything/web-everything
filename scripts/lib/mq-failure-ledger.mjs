@@ -72,6 +72,11 @@ export function createMqFailureLedger({ io = mqFailureLedgerStorage() } = {}) {
         // Marks the successor as a head this ledger itself produced, so a later failure of it can reach the fixer.
         [keyFor({ ...identity, head: identity.newHead, kind: 'refresh-successor' })]: true }, result: { recorded: true } }));
     },
+    readConsumedRefresh(identity) {
+      return transaction(identity, state => ({ state,
+        result: state[keyFor({ ...identity, kind: 'refresh' })] === true
+          && state[keyFor({ ...identity, kind: 'refresh-successor' })] !== true }));
+    },
     readRefreshSuccessor(identity) {
       return transaction(identity, state => ({ state,
         result: state[keyFor({ ...identity, kind: 'refresh-successor' })] === true }));
