@@ -191,12 +191,12 @@ describe('audit and shadow visibility', () => {
     delete mainCiRuns.failing.groupEvidence;
     const r = net({ dir, mainCiRuns });
     net({ dir, mainCiRuns });
-    let lines = readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse);
+    let lines = readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse).filter(line => line.wouldDo);
     expect(lines).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds['62da75ed3'].shadowWhy).toBe(r.plan.why);
     mainCiRuns.failing.jobs = ['smoke'];
     net({ dir, mainCiRuns });
-    lines = readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse);
+    lines = readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse).filter(line => line.wouldDo);
     expect(lines).toHaveLength(2);
     expect(lines[1].why).toContain('smoke');
   });

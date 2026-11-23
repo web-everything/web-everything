@@ -27,11 +27,15 @@ describe('shard-assign — balance by measured time (card 11)', () => {
     expect(assignByTime([...files].reverse(), timings, 3)).toEqual(assignByTime(files, timings, 3));
   });
 
-  it('a file with no stored timing gets the median of the known ones', () => {
-    expect(median([1, 5, 9])).toBe(5);
-    const shards = assignByTime(['a', 'b', 'new'], { a: 10, b: 10 }, 3);
-    expect(shards.flat().sort()).toEqual(['a', 'b', 'new']);
-    expect(shards.every((s) => s.length === 1)).toBe(true);
+  it('assigns an unknown file exactly once using its suite median', () => {
+    const timings = { a: 9, b: 5, c: 1 };
+    const files = ['a', 'b', 'c', 'new'];
+    const shards = assignByTime(files, timings, 2);
+    expect(median(Object.values(timings))).toBe(5);
+    expect(shards).toEqual([['a', 'c'], ['b', 'new']]);
+    expect(shards).toEqual(assignByTime(files, { ...timings, new: 5 }, 2));
+    expect(shards.flat().filter(file => file === 'new')).toHaveLength(1);
+    expect(shards.flat().sort()).toEqual([...files].sort());
   });
 
   it('more shards than files leaves extra shards empty, not erroring', () => {
