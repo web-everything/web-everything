@@ -7,24 +7,38 @@ const FILE = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs';
 const JOB = 'soak-shard (1)';
 const rootOf = () => process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../../../../', import.meta.url));
 
-/** Reads the tree's own io + planner and plans a single red soak job whose only failure is a soft-limit timeout. */
+/** Replay the incident's failure excerpt through the tree's own shadow publisher. */
 const PROBE = (root) => `(async () => {
   const io = await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/red-main-quarantine-io.mjs')).href)});
   const q = await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/red-main-quarantine.mjs')).href)});
-  const { readFileSync } = await import('node:fs');
+  const { readFileSync, mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
   const policy = JSON.parse(readFileSync(${JSON.stringify(join(root, 'scripts/settings/test-timeout-policy.json'))}, 'utf8'));
-  const t = await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/test-timeout-policy.mjs')).href)});
-  const soft = t.resolveLimits(policy, { file: ${JSON.stringify(FILE)}, job: ${JSON.stringify(JOB)} }).softMs;
-  const text = '2026-11-22T23:25:07Z FAIL ' + ${JSON.stringify(FILE)} + ' > 50 real daemon ticks\\nError: Test timed out in ' + soft + 'ms.\\n Test Files 1 failed | 2 passed';
-  const f = io.readJobFailures(1, { exec: () => text, repoSlug: 'o/r' });
-  const plan = q.planSafetyNet({ status: 'red', firstRedSha: 'a'.repeat(40), failedJobs: [${JSON.stringify(JOB)}], jobFailures: { [${JSON.stringify(JOB)}]: f },
-    latestRunId: 1, now: Date.parse('2026-11-22T23:26:00Z'), list: { version: 1, entries: [] }, fixPrs: [99], timeoutPolicy: policy, settings: {} });
-  process.stdout.write(JSON.stringify({ action: plan.action, tests: plan.tests ?? [], why: plan.why }));
+  const text = '2026-11-22T23:25:07Z FAIL ' + ${JSON.stringify(FILE)} + ' > 50 real daemon ticks: every invariant holds after every tick\\nError: Test timed out in 1020000ms.\\n Test Files 1 failed | 2 passed';
+  const dir = mkdtempSync(join(tmpdir(), 'soft-timeout-replay-'));
+  try {
+    const now = Date.parse('2026-11-22T23:26:00Z'), run = 45080540441;
+    const printed = [];
+    const out = io.runSafetyNet({ dir, now, live: false, timeoutPolicy: policy,
+      mode: { value: 'quarantine', source: 'soak' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+      mainCiRuns: { runs: [{ databaseId: run, headSha: 'a'.repeat(40), status: 'completed', conclusion: 'failure',
+        createdAt: '2026-11-22T22:57:00Z', updatedAt: '2026-11-22T23:25:07Z', attempt: 1 }],
+        failing: { runId: run, jobs: [${JSON.stringify(JOB)}, 'daemon-soak'] }, priority: { prs: [99] } },
+      readJobs: () => ({ failed: [{ id: 1, name: ${JSON.stringify(JOB)} }] }),
+      readLog: () => io.readJobFailures(1, { exec: () => text, repoSlug: 'o/r' }),
+      readList: () => { throw Error('shadow must not read live list'); },
+      write: () => { throw Error('shadow must not publish'); },
+      log: line => { if (line.startsWith('red-main-quarantine: ')) printed.push(JSON.parse(line.slice('red-main-quarantine: '.length))); } });
+    const ledger = JSON.parse(readFileSync(join(dir, io.SAFETY_NET_LEDGER), 'utf8'));
+    process.stdout.write(JSON.stringify({ action: out.plan?.action, tests: out.plan?.tests ?? [], why: out.plan?.why,
+      error: out.error, outputs: printed, fixPrSkips: q.testsToSkip({ list: ledger.shadowList, now, prNumber: 99 }) }));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 })().catch((e) => { process.stdout.write(JSON.stringify({ error: String(e?.message ?? e) })); });`;
 
 function plan(root) {
   try {
-    const out = execFileSync(process.execPath, ['--input-type=module', '-e', PROBE(root)], { encoding: 'utf8', timeout: 60_000 });
+    const out = execFileSync(process.execPath, ['--input-type=module', '-e', PROBE(root)], { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
     return JSON.parse(out);
   } catch (error) { return { error: String(error?.message ?? error) }; }
 }
@@ -38,20 +52,31 @@ export default {
     where: 'lane/quarantine-soft-timeout',
     paths: ['scripts/lib/red-main-quarantine.mjs', 'scripts/lib/red-main-quarantine-io.mjs', 'scripts/lib/test-timeout-policy.mjs'],
   },
-  // Fix presence is decided by behaviour: a soft-limit timeout must plan an add of the timed-out file.
+  // Fix presence requires the printable entry, not just a planner decision.
   fixPresent(root) {
     try {
       const p = plan(root);
-      return p.action === 'add' && p.tests.includes(FILE);
+      return violations(p).length === 0;
     } catch { return false; }
   },
   async run() {
     const root = rootOf();
-    const violations = [];
     const p = plan(root);
-    if (p.error) violations.push(`planning a soft timeout failed: ${p.error}`);
-    else if (p.action !== 'add' || !p.tests.includes(FILE)) violations.push(`soft-limit timeout was not quarantined at once: ${p.action} (${p.why})`);
-    return { violations, plan: p };
+    return { violations: violations(p), plan: p };
   },
   judge(report) { return report.violations; },
 };
+
+function violations(p) {
+  if (p.error) return [`replaying a soft timeout failed: ${p.error}`];
+  const quarantine = p.outputs?.find(o => o.type === 'quarantine' && o.test === FILE);
+  const entry = quarantine?.entry;
+  const at = Date.parse('2026-11-22T23:26:00Z');
+  return p.action === 'add' && p.tests.includes(FILE) && quarantine?.at === at && quarantine.shadow === true
+    && entry?.expiresAt === Date.parse('2026-11-23T05:26:00Z') && entry.release?.passesUnderSoft === 3
+    && entry.timeout?.run === 45080540441 && entry.timeout.outcomes?.[0]?.runnerLimitMs === 1020000
+    && entry.timeout.outcomes[0].class === 'soft' && entry.note?.includes('file-level skip')
+    && p.outputs.some(o => o.type === 'alert') && p.outputs.some(o => o.type === 'fix-card')
+    && Array.isArray(p.fixPrSkips) && p.fixPrSkips.length === 0
+    ? [] : ['soft-limit replay did not print the complete quarantine, alert and fix-card records at 23:26Z'];
+}

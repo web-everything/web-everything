@@ -21,6 +21,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
@@ -494,7 +495,7 @@ export function runSafetyNet({
         if (new Set([...liveFiles, ...plan.tests]).size > settings.value.maxTests) return { ok: false, error: `quarantine cap ${settings.value.maxTests} reached` };
         const changes = plan.entries.map(({ test, job, proof, timeout }) => (list) => {
           const r = addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR,
-            reason: timeout ? JSON.stringify(timeout.outcomes) : `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs });
+            reason: timeout ? `${timeout.outcomes.length} soft timeout(s); measurements and policy sources in timeout.outcomes` : `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs });
           if (r.ok && timeout && r.events.length) {
             for (const e of [...r.list.entries, ...r.events]) if (e.test === test && e.job === job) Object.assign(e, { timeout, release: timeout.release, note: timeout.note });
           }
@@ -589,11 +590,21 @@ export function runSafetyNet({
       log(`red-main-quarantine: ${JSON.stringify(line)}`);
     };
     try {
-      for (const entry of out.plan?.entries ?? []) if (entry.timeout && (!isLive || out.applied && out.events.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type)))) {
-        for (const output of entry.timeout.outputs) emit({ ...output, test: entry.test, outcomes: entry.timeout.outcomes });
+      for (const entry of out.plan?.entries ?? []) if (entry.timeout && out.events?.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type))) {
+        const published = (isLive ? out.liveEntries : ledger.shadowList?.entries)?.find(e => e.test === entry.test && e.job === entry.job);
+        for (const output of entry.timeout.outputs) emit({ ...output, test: entry.test, outcomes: entry.timeout.outcomes,
+          ...(output.type === 'quarantine' ? { entry: published } : {}) });
       }
-      for (const outcome of timeoutAlerts) if (!listEmpty) emit({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome });
-      if (state.status === 'red' && listEmpty && !out.applied) emit({ type: 'alert', ref: `red-main:${sha}`, why: out.error ?? out.plan?.why ?? 'no action; quarantine list empty' });
+      const alerts = listEmpty ? [] : timeoutAlerts.map(outcome => ({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome }));
+      if (state.status === 'red' && listEmpty && !out.applied && (isLive || !activeEntries(ledger.shadowList, { now }).length)) alerts.push({ type: 'alert', ref: `red-main:${sha}`, why: out.error ?? out.plan?.why ?? 'no action; quarantine list empty' });
+      // Persist one bounded signature per red window, including the run and mode.
+      // A changed reason/run emits again; unchanged ticks (including restarts) do not.
+      const alertState = rec ?? ledger;
+      const signature = createHash('sha256').update(JSON.stringify([isLive, rec?.runKey, alerts])).digest('hex');
+      if (alertState.alertSignature !== signature) {
+        for (const alert of alerts) emit(alert);
+        alertState.alertSignature = signature;
+      }
     } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     if (!isLive && out.plan && (shadowChanged || (state.status === 'red' && rec && rec.shadowWhy !== out.plan.why))) {
       const plan = out.plan;

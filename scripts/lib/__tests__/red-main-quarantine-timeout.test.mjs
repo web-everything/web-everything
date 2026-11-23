@@ -21,12 +21,12 @@ function harness() {
   });
   const log = vi.fn();
   const readJobs = vi.fn(() => ({ failed: [{ id: 1, name: job }] }));
-  function tick({ soft = limits.softMs, mixed = false, timeoutPolicy = policy, shadow = false, incomplete = false, run = 45080540441, now = Date.parse('2026-11-22T23:30:00Z'), extra = {} } = {}) {
+  function tick({ soft = limits.softMs, mixed = false, timeoutPolicy = policy, shadow = false, incomplete = false, run = 45080540441, now = Date.parse('2026-11-22T23:30:00Z'), error, count = 1, extra = {} } = {}) {
     const head = run.toString(16).padStart(40, '0');
-    const text = `2026-11-22T23:25:07Z \x1b[31m FAIL \x1b[0m ${file} > 50 real daemon ticks: every invariant holds after every tick\nError: Test timed out in ${soft}ms.\n${mixed ? `FAIL ${file} > ordinary failure\nError: expected true\n` : ''}${incomplete ? '' : ' Test Files 1 failed | 2 passed'}`;
+    const text = Array.from({ length: count }, (_, i) => `2026-11-22T23:25:07Z \x1b[31m FAIL \x1b[0m ${file} > 50 real daemon ticks: every invariant holds after every tick ${i}\n${error ?? `Error: Test timed out in ${soft}ms.`}\n`).join('') + `${mixed ? `FAIL ${file} > ordinary failure\nError: expected true\n` : ''}${incomplete ? '' : ' Test Files 1 failed | 2 passed'}`;
     return runSafetyNet({ dir, now, mode: { value: 'quarantine', source: 'test' }, live: !shadow, timeoutPolicy,
       settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS }, sources: {} },
-      mainCiRuns: { runs: [{ databaseId: run, headSha: head, status: 'completed', conclusion: 'failure', createdAt: new Date(now).toISOString(), updatedAt: new Date(now).toISOString(), attempt: 1 }], failing: { runId: run, jobs: [job, 'daemon-soak'] }, priority: { prs: [99] } },
+      mainCiRuns: { runs: [{ databaseId: run, headSha: head, status: 'completed', conclusion: 'failure', createdAt: new Date(now).toISOString(), updatedAt: '2026-11-22T23:25:07Z', attempt: 1 }], failing: { runId: run, jobs: [job, 'daemon-soak'] }, priority: { prs: [99] } },
       readJobs, readLog: () => readJobFailures(1, { exec: () => text, repoSlug: 'o/r' }),
       readList: () => ({ ok: true, list }), write, log, ...extra });
   }
@@ -59,12 +59,53 @@ it('live soak timeout quarantines at once without proof reads and protects the f
   expect(h.list().entries[0]).toMatchObject({ test: file, job, release: { passesUnderSoft: policy.all.release.passes }, note: expect.stringContaining('file-level skip quarantines every case in the file'),
     timeout: { priority: 'high', outcomes: [{ class: 'soft', conformityLoss: 'runner-kills-at-soft (G1)', measured: { runnerLimitMs: limits.softMs } }] } });
   expect(h.list().entries[0].proof).toBeUndefined();
-  expect(JSON.parse(h.list().entries[0].reason)[0].limits.sources.soft.scope).toBe(`tests.${file}`);
+  expect(h.list().entries[0].timeout.outcomes[0].limits.sources.soft.scope).toBe(`tests.${file}`);
   expect(out.events).toContainEqual(expect.objectContaining({ type: 'card-owed', priority: 'high' }));
   expect(h.lines().map(o => o.type)).toEqual(['quarantine', 'alert', 'fix-card']);
   expect(testsToSkip({ list: h.list(), now: Date.parse('2026-11-22T23:30:00Z'), prNumber: 99 })).toEqual([]);
   expect(h.ledger().tests[file].softQuarantines).toHaveLength(1);
   h.tick(); expect(h.ledger().tests[file].softQuarantines).toHaveLength(1);
+});
+it('soft-timeout entry stops being skipped after ttlMin', () => {
+  const h = harness(), now = Date.parse('2026-11-22T23:30:00Z');
+  const ttlMin = 7;
+  h.tick({ now, extra: { settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ttlMin } } } });
+  expect(h.list().entries[0].expiresAt).toBe(now + ttlMin * 60_000);
+  expect(testsToSkip({ list: h.list(), now: now + ttlMin * 60_000 - 1 })).toEqual([file]);
+  expect(testsToSkip({ list: h.list(), now: now + ttlMin * 60_000 + 1 })).toEqual([]);
+});
+it.each([false, true])('two identical red ticks emit exactly one fallback alert (shadow=%s)', shadow => {
+  const h = harness();
+  h.tick({ soft: limits.hardMs, shadow });
+  h.tick({ soft: limits.hardMs, shadow, now: Date.parse('2026-11-22T23:31:00Z') });
+  expect(h.lines().filter(o => o.type === 'alert')).toHaveLength(1);
+  expect(h.log.mock.calls.filter(([line]) => line.includes('"type":"alert"'))).toHaveLength(1);
+});
+it('unconfigured policy alerts on an occupied list are deduplicated across ticks', () => {
+  const h = harness();
+  h.tick();
+  h.tick({ timeoutPolicy: {} });
+  h.tick({ timeoutPolicy: {}, now: Date.parse('2026-11-22T23:31:00Z') });
+  expect(h.lines().filter(o => o.why === 'unconfigured timeout policy')).toHaveLength(1);
+});
+it('a changed fallback reason emits a fresh alert', () => {
+  const h = harness();
+  h.tick({ extra: { write: () => { throw Error('first refusal'); } } });
+  h.tick({ extra: { write: () => { throw Error('second refusal'); } } });
+  expect(h.lines().filter(o => o.type === 'alert').map(o => o.why)).toEqual(['first refusal', 'second refusal']);
+});
+it('ordinary assertions quoting timeout text refuse immediate quarantine', () => {
+  const h = harness();
+  const out = h.tick({ error: `AssertionError: expected "Test timed out in ${limits.softMs}ms."\nError: Test timed out in ${limits.softMs}ms.` });
+  expect(out.applied).toBe(false);
+  expect(out.plan.action).toBe('none');
+  expect(h.write).not.toHaveBeenCalled();
+});
+it('50 timeouts in one file keep reason bounded and retain structured outcomes', () => {
+  const h = harness(), out = h.tick({ count: 50 });
+  expect(out.applied).toBe(true);
+  expect(h.list().entries[0].reason.length).toBeLessThanOrEqual(400);
+  expect(h.list().entries[0].timeout.outcomes).toHaveLength(50);
 });
 it('shadow only logs would-be soft quarantine; no live entry or count', () => {
   const h = harness(), out = h.tick({ shadow: true });

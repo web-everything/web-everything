@@ -34,6 +34,19 @@ describe('SHIP-TMO closed outcomes first', () => {
     expect(evaluate(killed(1), { all: { soft: 'bogus', hard: 'PT' } }).class).toBe('unconfigured');
     expect(durationMs('P999999999999999D')).toBeNull();
   });
+  it.each([
+    'AssertionError: expected "Test timed out in 5000ms." to equal "ok"',
+    'AssertionError: expected true to be false\nError: Test timed out in 5000ms.',
+    'AssertionError: mismatch\n\nTest timed out in 5000ms.',
+    'diagnostic: Error: Test timed out in 5000ms.',
+    'Error: ordinary failure\nError: Test timed out in 5000ms.',
+    'Error: Test timed out in 5000ms. quoted diagnostic',
+    '`Error: Test timed out in 5000ms.`',
+    'Error: Test timed out in 5000ms.\u2028assertion diagnostic',
+    'Error: ordinary failure\r\nError: Test timed out in 5000ms.',
+  ])('rejects timeout text in ordinary failure diagnostics: %s', error => {
+    expect(parseTimeouts(`FAIL a.test.mjs > case\n${error}`)).toEqual([]);
+  });
 });
 
 it('G1 at soft records a soft unknown with its conformity loss', () => {
@@ -63,6 +76,11 @@ it('soak own-limit override resolves to 1,020,000 ms and hard is twice soft', ()
 it('ANSI and timestamp parser attaches each timeout to the nearest named failure', () => {
   expect(parseTimeouts(`2026-11-22T23:25:07.6237099Z \x1b[31m FAIL \x1b[0m a.test.mjs > suite > name\n2026-11-22T23:25:07Z Error: Test timed out in ${limits.softMs}ms.`)).toEqual([{ file, name: 'suite > name', runnerLimitMs: limits.softMs, truncated: true }]);
 });
+it('accepts a complete timeout error with CRLF and blank separator lines', () => {
+  expect(parseTimeouts('FAIL a.test.mjs > case\r\n\r\nError: Test timed out in 5000ms.\r\n')).toEqual([
+    { file, name: 'case', runnerLimitMs: 5000, truncated: true },
+  ]);
+});
 it('escalation counts entries within the policy window, release carries settings or approval', () => {
   const entry = { test: file, job, timeouts: [evaluate(killed(limits.softMs))] };
   const now = Date.parse('2026-11-22T00:00:00Z');
@@ -75,4 +93,11 @@ it('escalation counts entries within the policy window, release carries settings
   expect(softRecord(entry, { now: now + durationMs(policy.all.escalation.window) + 3600000, run: 3, history: [first] }).priority).toBe('high');
   const absent = { test: file, job, timeouts: [evaluate(killed(limits.softMs), { all: { ...policy.all, escalation: undefined, release: undefined } })] };
   expect(softRecord(absent, { now, run: 1 })).toMatchObject({ priority: 'urgent', release: { approvalRequired: true } });
+});
+it('recording the same run twice keeps priority high', () => {
+  const entry = { test: file, job, timeouts: [evaluate(killed(limits.softMs))] };
+  const first = softRecord(entry, { now: 1000, run: 1 });
+  const repeated = softRecord(entry, { now: 1001, run: 1, history: [first, first] });
+  expect(repeated.priority).toBe('high');
+  expect(repeated.outputs.some(o => o.type === 'escalation')).toBe(false);
 });

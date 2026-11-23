@@ -7,13 +7,19 @@ export function parseTimeouts(logText) {
   for (const raw of String(logText ?? '').split('\n')) {
     const line = raw.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /, '');
     const fail = /^\s*FAIL\s+(\S+)(?:\s+>\s+(.+))?\s*$/.exec(line);
-    if (fail) test = /^[\w./@-]+\.test\.[cm]?[jt]sx?$/.test(fail[1]) && !fail[1].includes('..') && fail[2]
-      ? { file: fail[1], name: fail[2].trim().replace(/\s+>\s+/g, ' > ').slice(0, 200) } : null;
-    const timeout = /\bTest timed out in (\d+)ms\./.exec(line);
+    if (fail) {
+      test = /^[\w./@-]+\.test\.[cm]?[jt]sx?$/.test(fail[1]) && !fail[1].includes('..') && fail[2]
+        ? { file: fail[1], name: fail[2].trim().replace(/\s+>\s+/g, ' > ').slice(0, 200) } : null;
+      continue;
+    }
+    if (!line.trim()) continue;
+    // Only the failure's first nonblank line is its error. Later diagnostics can
+    // quote even a complete timeout error and must never supply timeout evidence.
+    const timeout = /^[ \t]*Error: Test timed out in (\d+)ms\.[ \t]*\r?$/.exec(line);
     if (timeout && test && Number.isSafeInteger(Number(timeout[1])) && Number(timeout[1]) > 0) {
       found.push({ ...test, runnerLimitMs: Number(timeout[1]), truncated: true });
-      test = null;
     }
+    test = null;
   }
   return found;
 }
@@ -72,7 +78,8 @@ export function softRecord(entry, { history = [], now, run, head }) {
   const id = `timeout:${run}:${entry.job}:${entry.test}`;
   const own = { id, at: now, run, head, outcomes };
   const window = durationMs(limits.escalation?.window);
-  const counted = [...history, own].filter(e => Number.isFinite(e.at) && e.at <= now && (window === null || now - e.at <= window));
+  const unique = [...new Map([...history, own].map(e => [e.id, e])).values()];
+  const counted = unique.filter(e => Number.isFinite(e.at) && e.at <= now && (window === null || now - e.at <= window));
   const escalated = !Number.isInteger(limits.escalation?.count) || limits.escalation.count <= 0 || window === null || counted.length >= limits.escalation.count;
   const priority = escalated ? 'urgent' : 'high';
   const outputs = ['quarantine', 'alert', 'fix-card', ...(escalated ? ['escalation'] : [])].map(type => ({ type, ref: type === 'quarantine' ? id : `${id}:${type}`, priority,
