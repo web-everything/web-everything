@@ -40,7 +40,7 @@ function readReport(stdout) {
   for (const match of text.matchAll(/^\{/gm)) {
     try { return JSON.parse(text.slice(match.index)); } catch { /* A streamed event is not the final report. */ }
   }
-  throw new Error('missing JSON report');
+  throw new Error(`codex report missing (no parseable JSON report in ${text.length} bytes of output)`);
 }
 
 /**
@@ -50,9 +50,16 @@ function readReport(stdout) {
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
   scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
   launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
-  const run = (command, args, timeout, env) => {
-    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout, ...(env ? { env } : {}) });
-    if (result.error || result.status !== 0) throw new Error('audit subprocess failed or exceeded its bound');
+  const run = (command, args, timeout, env, maxBuffer = 8 * 1024 * 1024) => {
+    const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer, timeout, ...(env ? { env } : {}) });
+    const name = command === process.execPath ? 'codex launcher' : command;
+    if (result.error) {
+      const code = result.error.code;
+      if (code === 'ENOBUFS') throw new Error(`${name}: output overflow (exceeded maxBuffer ${maxBuffer} bytes)`);
+      if (code === 'ETIMEDOUT') throw new Error(`${name}: timeout after ${timeout} ms`);
+      throw new Error(`${name}: spawn error ${code ?? result.error.message}`);
+    }
+    if (result.status !== 0) throw new Error(`${name}: exit code ${result.status}${result.signal ? ` (signal ${result.signal})` : ''}`);
     return result.stdout;
   };
   const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
@@ -100,10 +107,11 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex }));
-        if (!report || report.exitCode !== 0 || report.timedOut !== false || typeof report.lastMessage !== 'string') {
-          throw new Error('Codex failed or returned incomplete evidence');
-        }
+          { ...process.env, GIT_INDEX_FILE: scratchIndex }, 32 * 1024 * 1024));
+        if (!report) throw new Error('codex report missing');
+        if (report.timedOut !== false) throw new Error('codex timed out');
+        if (report.exitCode !== 0) throw new Error(`codex exit code ${report.exitCode}`);
+        if (typeof report.lastMessage !== 'string') throw new Error('codex final message missing');
         return report.lastMessage;
       } finally {
         fs.rmSync(scratch, { recursive: true, force: true });
