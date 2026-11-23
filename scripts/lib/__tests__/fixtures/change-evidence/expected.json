@@ -56,7 +56,7 @@
       "config": "https://everstandards.dev/fixtures/web-everything/merge-policy",
       "version": "2026-11-21",
       "digest": {
-        "sha256": "d797c1d7aebe8ce0c79ff6ceac6d171e20d7270dd7158c4e373216cd5588f133"
+        "sha256": "039ef743d2926c3ecea6fb292ca627f02fc139464bb0badd1791f098f5b6ec23"
       },
       "sources": [
         {
@@ -68,11 +68,12 @@
       ]
     },
     "verdict": {
-      "verdict": "pass",
+      "verdict": "unknown",
+      "reason": "stale",
       "policy": {
         "uri": "https://everstandards.dev/fixtures/web-everything/merge-policy#merge-policy",
         "digest": {
-          "sha256": "d797c1d7aebe8ce0c79ff6ceac6d171e20d7270dd7158c4e373216cd5588f133"
+          "sha256": "039ef743d2926c3ecea6fb292ca627f02fc139464bb0badd1791f098f5b6ec23"
         }
       },
       "evaluatedAt": "2026-11-21T16:24:00Z",
@@ -179,22 +180,6 @@
           }
         },
         {
-          "kind": "review-restamp",
-          "uri": "https://github.com/web-everything/web-everything/pull/7289#issuecomment-7061210203",
-          "digest": {
-            "gitCommit": "1076a86e7130368472ed81b69f4b653fb3717436"
-          },
-          "provenanceTier": "asserted",
-          "native": {
-            "producer": "https://github.com/apps/plateau-merger",
-            "actor": "https://github.com/apps/plateau-merger",
-            "at": "2026-11-21T10:24:16Z",
-            "commentId": 7061210203,
-            "bodySha256": "45d09b6257f82c9037384f642e8e2ef5fe53b5800c7e9cdc211b2b3e33e0e97f",
-            "reviewedDiff": "01d167c0adb2ee22afef58b5847fd9403e30ce42ba1615a1c7855c309560c55e"
-          }
-        },
-        {
           "kind": "approval-label",
           "uri": "https://github.com/web-everything/web-everything/pull/7289#event-36851211098",
           "digest": {
@@ -210,7 +195,8 @@
             "presentAtMerge": true
           }
         }
-      ]
+      ],
+      "detail": "decided by clause reviewed"
     },
     "clauses": [
       {
@@ -221,7 +207,7 @@
           "policy": {
             "uri": "https://everstandards.dev/fixtures/web-everything/merge-policy#merge-policy",
             "digest": {
-              "sha256": "d797c1d7aebe8ce0c79ff6ceac6d171e20d7270dd7158c4e373216cd5588f133"
+              "sha256": "039ef743d2926c3ecea6fb292ca627f02fc139464bb0badd1791f098f5b6ec23"
             }
           },
           "evaluatedAt": "2026-11-21T16:24:00Z",
@@ -319,17 +305,18 @@
         "clause": "reviewed",
         "required": true,
         "verdict": {
-          "verdict": "pass",
+          "verdict": "unknown",
+          "reason": "stale",
           "policy": {
             "uri": "https://everstandards.dev/fixtures/web-everything/merge-policy#merge-policy",
             "digest": {
-              "sha256": "d797c1d7aebe8ce0c79ff6ceac6d171e20d7270dd7158c4e373216cd5588f133"
+              "sha256": "039ef743d2926c3ecea6fb292ca627f02fc139464bb0badd1791f098f5b6ec23"
             }
           },
           "evaluatedAt": "2026-11-21T16:24:00Z",
           "evaluator": "https://everstandards.dev/ship/tools/change-evidence-build",
           "examined": {
-            "count": 2,
+            "count": 1,
             "unit": "review records",
             "description": "review-loop comments: accepted verdicts and re-stamps"
           },
@@ -349,24 +336,9 @@
                 "bodySha256": "03584bfe11438c87c23e6ab55e621312db5eeb42f0ad230f146012bc467a5a1f",
                 "shaSource": "approval-prevention-filed marker in comment 7060771320"
               }
-            },
-            {
-              "kind": "review-restamp",
-              "uri": "https://github.com/web-everything/web-everything/pull/7289#issuecomment-7061210203",
-              "digest": {
-                "gitCommit": "1076a86e7130368472ed81b69f4b653fb3717436"
-              },
-              "provenanceTier": "asserted",
-              "native": {
-                "producer": "https://github.com/apps/plateau-merger",
-                "actor": "https://github.com/apps/plateau-merger",
-                "at": "2026-11-21T10:24:16Z",
-                "commentId": 7061210203,
-                "bodySha256": "45d09b6257f82c9037384f642e8e2ef5fe53b5800c7e9cdc211b2b3e33e0e97f",
-                "reviewedDiff": "01d167c0adb2ee22afef58b5847fd9403e30ce42ba1615a1c7855c309560c55e"
-              }
             }
-          ]
+          ],
+          "detail": "accepted review covers e9d5d574f98e, head is 1076a86e7130"
         }
       },
       {
@@ -377,7 +349,7 @@
           "policy": {
             "uri": "https://everstandards.dev/fixtures/web-everything/merge-policy#merge-policy",
             "digest": {
-              "sha256": "d797c1d7aebe8ce0c79ff6ceac6d171e20d7270dd7158c4e373216cd5588f133"
+              "sha256": "039ef743d2926c3ecea6fb292ca627f02fc139464bb0badd1791f098f5b6ec23"
             }
           },
           "evaluatedAt": "2026-11-21T16:24:00Z",

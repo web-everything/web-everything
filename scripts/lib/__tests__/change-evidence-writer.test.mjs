@@ -20,6 +20,16 @@ const input = () => ({ pr: structuredClone(pr), events: read('events-7289.json')
   branchProtection: { protected: true, protection: { enabled: false } },
   recordedAt: '2026-11-21T15:00:00Z', recorder: 'https://everstandards.dev/ship/tools/change-evidence-build' });
 const clause = (x, id) => buildChangeEvidence(x).predicate.clauses.find(c => c.clause === id).verdict;
+// Synthetic positive carries explicitly match both fingerprints; raw #7289 does not.
+function matchingRestampInput() {
+  const x = input(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  const restamp = x.comments.find(c => c.body.includes('re-stamped'));
+  for (const key of ['reviewed-diff', 'reviewed-contribution']) {
+    const re = new RegExp(`<!-- ${key}: [a-f0-9]+ -->`);
+    restamp.body = restamp.body.replace(re, re.exec(accepted.body)[0]);
+  }
+  return x;
+}
 const dirs = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 function harness() {
@@ -72,8 +82,8 @@ it('a failed read leaves the merge pending and writes no pass record', async () 
   expect(h.pending()).toHaveLength(1); expect(fs.existsSync(h.file)).toBe(false);
   expect(h.emit).toHaveBeenCalledWith(expect.objectContaining({ kind: 'change-evidence-missing' }));
 });
-it.each(['tested', 'reviewed', 'approved'])('%s passes with complete fixture evidence', id => {
-  expect(clause(input(), id).verdict).toBe('pass');
+it.each(['tested', 'reviewed', 'approved'])('%s passes with complete evidence and a matching restamp', id => {
+  expect(clause(matchingRestampInput(), id).verdict).toBe('pass');
 });
 it.each(['tested', 'reviewed', 'approved'])('%s is unknown(missing) without its evidence', id => {
   const x = input(); x[{ tested: 'checkRuns', reviewed: 'comments', approved: 'events' }[id]] = [];
@@ -82,10 +92,11 @@ it.each(['tested', 'reviewed', 'approved'])('%s is unknown(missing) without its 
 it('tested fails on failure and is stale on another commit', () => {
   const x = input(); x.checkRuns.forEach(r => { r.head_sha = 'a'.repeat(40); });
   expect(clause(x, 'tested')).toMatchObject({ verdict: 'unknown', reason: 'stale' });
-  x.checkRuns.forEach(r => { r.conclusion = 'failure'; }); expect(clause(x, 'tested').verdict).toBe('fail');
+  x.checkRuns.forEach(r => { r.conclusion = 'failure'; });
+  expect(clause(x, 'tested')).toMatchObject({ verdict: 'unknown', reason: 'stale' });
 });
 it('reviewed is stale when accepted evidence misses head', () => {
-  const x = input(); x.pr.headRefOid = 'a'.repeat(40);
+  const x = matchingRestampInput(); x.pr.headRefOid = 'a'.repeat(40);
   expect(clause(x, 'reviewed')).toMatchObject({ verdict: 'unknown', reason: 'stale' });
 });
 it('approved fails when the authorized label was removed before merge', () => {
@@ -94,16 +105,17 @@ it('approved fails when the authorized label was removed before merge', () => {
 });
 it('ignores wrong-producer approval and review, including forged restamps', () => {
   const x = input(); x.events.forEach(e => { if (e.actor) e.actor.login = 'intruder'; });
-  x.comments.forEach(c => { c.user.login = 'intruder'; });
+  x.comments.forEach(c => { c.user.login = 'intruder'; delete c.performed_via_github_app; });
   expect(clause(x, 'approved')).toMatchObject({ verdict: 'unknown', reason: 'missing' });
   expect(clause(x, 'reviewed')).toMatchObject({ verdict: 'unknown', reason: 'unverifiable' });
 });
-it('chooses check runs by highest id, including an incomplete newer attempt', () => {
+it('chooses checks by completion time and ignores an incomplete newer attempt', () => {
   const x = input(), run = x.checkRuns.find(r => r.name === x.config.clauses.tested.requiredChecks[0]);
-  x.checkRuns.push({ ...run, id: Math.max(...x.checkRuns.map(r => r.id)) + 1, conclusion: 'failure', completed_at: '2020-01-01T00:00:00Z' });
+  x.checkRuns.push({ ...run, id: Math.max(...x.checkRuns.map(r => r.id)) + 1, conclusion: 'failure', completed_at: x.pr.mergedAt });
   expect(clause(x, 'tested').verdict).toBe('fail');
   x.checkRuns.at(-1).status = 'in_progress';
-  expect(clause(x, 'tested')).toMatchObject({ verdict: 'unknown', reason: 'missing' });
+  x.checkRuns.at(-1).completed_at = null;
+  expect(clause(x, 'tested').verdict).toBe('pass');
 });
 it('verifies the landed commit returned by the forge', () => {
   const x = input(); x.mergeCommit.sha = x.pr.headRefOid;
@@ -393,7 +405,7 @@ it('binds governance to the exact shipped policy bytes and repo blob URI', async
 });
 
 const policyInput = (mutate) => {
-  const x = input(); mutate(x.config); x.configBytes = JSON.stringify(x.config); return x;
+  const x = matchingRestampInput(); mutate(x.config); x.configBytes = JSON.stringify(x.config); return x;
 };
 const unknown = v => expect(v).toMatchObject({ verdict: 'unknown', reason: expect.stringMatching(/^(missing|stale)$/) });
 it('tested rejects unrelated and missing check app identities', () => {
@@ -419,20 +431,23 @@ it('a timestamp-only acceptance without its own reviewed SHA is inconclusive', (
 });
 it('operator authors cannot independently restamp their own PR', () => {
   const x = policyInput(p => { p.clauses.reviewed.trustedProducers = ['https://github.com/apps/plateau-reviewer', 'https://github.com/chalbert']; });
-  x.comments.find(c => c.body.includes('re-stamped')).user.login = x.pr.author.login; unknown(clause(x, 'reviewed'));
+  const restamp = x.comments.find(c => c.body.includes('re-stamped'));
+  restamp.user = { login: x.pr.author.login, type: 'User' };
+  delete restamp.performed_via_github_app;
+  unknown(clause(x, 'reviewed'));
 });
 it('configured trusted producers cannot be bypassed by the historical merger', () => {
   const x = policyInput(p => { p.clauses.reviewed.trustedProducers = []; });
   expect(clause(x, 'reviewed')).toMatchObject({ verdict: 'unknown', reason: 'unverifiable' });
 });
 it.each(['acceptance', 'diff', 'preservation'])('restamp without %s evidence is inconclusive', missing => {
-  const x = input();
+  const x = matchingRestampInput();
   if (missing === 'acceptance') x.comments = x.comments.filter(c => !c.body.startsWith('✅ review'));
   else x.comments.forEach(c => { if (c.body.includes('re-stamped')) c.body = c.body.replace(missing === 'diff' ? /<!-- reviewed-diff: [^>]+-->/g : /content-preserving rebase/g, ''); });
   unknown(clause(x, 'reviewed'));
 });
 it('a later trusted rejection revokes historical acceptance and restamps', () => {
-  const x = input(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  const x = matchingRestampInput(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
   x.comments.push({ ...accepted, id: accepted.id + 100000, created_at: '2026-11-21T11:00:00Z', updated_at: '2026-11-21T11:00:00Z', body: '🔁 review — changes requested' });
   unknown(clause(x, 'reviewed'));
 });
@@ -478,10 +493,13 @@ it('dry-run hook never invokes collection even with pending work', async () => {
   expect(collect).not.toHaveBeenCalled();
 });
 
-it('configured marker principal overrides cannot be bypassed by the historical merger', () => {
+it('configured marker principal overrides cannot be bypassed by the historical merger', async () => {
   vi.stubEnv('WE_AUTOMATION_LOGINS', 'another-bot[bot]');
   vi.stubEnv('WE_OPERATOR_LOGINS', 'another-operator');
-  unknown(clause(input(), 'reviewed'));
+  // The shared authorship policy reads its environment once, when imported.
+  vi.resetModules();
+  const { buildChangeEvidence: buildWithOverrides } = await import('../change-evidence/record.mjs');
+  unknown(buildWithOverrides(input()).predicate.clauses.find(c => c.clause === 'reviewed').verdict);
 });
 it('tested trusts the app URI and records its numeric ID only as native evidence', () => {
   const x = input(); x.checkRuns.forEach(r => { r.app.id = 999; });
@@ -508,7 +526,7 @@ it.each(['tested', 'reviewed', 'approved'])('%s requires exact producer URI case
   }
 });
 it('every evidence kind carries only native.producer in clauses and the overall evidence union', () => {
-  const record = buildChangeEvidence(input());
+  const record = buildChangeEvidence(matchingRestampInput());
   const evidence = [...record.predicate.verdict.evidence, ...record.predicate.clauses.flatMap(c => c.verdict.evidence)];
   expect(new Set(evidence.map(e => e.kind))).toEqual(new Set(['ci-check', 'review-verdict', 'review-restamp', 'approval-label']));
   for (const e of evidence) {
@@ -519,7 +537,7 @@ it('every evidence kind carries only native.producer in clauses and the overall 
 it('approval-label evidence uses the person URI for a listed human actor', () => {
   const x = policyInput(p => { p.clauses.approved.approvers = ['https://github.com/reviewer'];
     p.clauses.approved.trustedProducers = ['https://github.com/reviewer']; });
-  x.events.forEach(e => { if (e.actor) e.actor.login = 'reviewer'; });
+  x.events.forEach(e => { if (e.actor) e.actor = { login: 'reviewer', type: 'User' }; });
   expect(clause(x, 'approved')).toMatchObject({ verdict: 'pass', evidence: [expect.objectContaining({ native: expect.objectContaining({ producer: 'https://github.com/reviewer' }) })] });
 });
 it('approval falls back to URI approvers without trustedProducers and rejects an unlisted actor without evidence', () => {
@@ -527,7 +545,7 @@ it('approval falls back to URI approvers without trustedProducers and rejects an
     delete p.clauses.approved.trustedProducers;
     p.clauses.approved.approvers = ['https://github.com/reviewer'];
   });
-  x.events.forEach(e => { if (e.actor) e.actor.login = 'reviewer'; });
+  x.events.forEach(e => { if (e.actor) e.actor = { login: 'reviewer', type: 'User' }; });
   expect(clause(x, 'approved')).toMatchObject({ verdict: 'pass', evidence: [expect.objectContaining({
     native: expect.objectContaining({ producer: 'https://github.com/reviewer' }),
   })] });
@@ -539,30 +557,30 @@ it('approval requires URI approvers even when a producer is trusted', () => {
     p.clauses.approved.approvers = ['reviewer'];
     p.clauses.approved.trustedProducers = ['https://github.com/reviewer'];
   });
-  x.events.forEach(e => { if (e.actor) e.actor.login = 'reviewer'; });
+  x.events.forEach(e => { if (e.actor) e.actor = { login: 'reviewer', type: 'User' }; });
   expect(clause(x, 'approved')).toMatchObject({ verdict: 'unknown', reason: 'missing', evidence: [] });
 });
 it('an acceptance following a rejection can restore review on the same head', () => {
-  const x = input(), last = x.comments.find(c => c.body.includes('re-stamped'));
+  const x = matchingRestampInput(), last = x.comments.find(c => c.body.includes('re-stamped'));
   x.comments.unshift({ ...last, id: 1, created_at: '2026-11-21T08:00:00Z', updated_at: '2026-11-21T08:00:00Z', body: '🔁 human review — changes requested' });
   expect(clause(x, 'reviewed').verdict).toBe('pass');
 });
 it('post-merge revocation cannot undo merge-time approval or review', () => {
-  const x = input(), last = x.comments.find(c => c.body.includes('re-stamped'));
-  x.comments.push({ ...last, created_at: '2026-11-22T00:00:00Z', updated_at: '2026-11-22T00:00:00Z', body: '🔁 review — changes requested' });
+  const x = matchingRestampInput(), last = x.comments.find(c => c.body.includes('re-stamped'));
+  x.comments.push({ ...last, id: last.id + 1, created_at: '2026-11-22T00:00:00Z', updated_at: '2026-11-22T00:00:00Z', body: '🔁 review — changes requested' });
   x.events.push({ event: 'unlabeled', label: { name: 'review:accepted' }, created_at: '2026-11-22T00:00:00Z' });
   expect(buildChangeEvidence(x).predicate.verdict.verdict).toBe('pass');
 });
 it('post-merge edits cannot supply a review restamp', () => {
-  const x = input(); x.comments.find(c => c.body.includes('re-stamped')).updated_at = '2026-11-22T00:00:00Z';
+  const x = matchingRestampInput(); x.comments.find(c => c.body.includes('re-stamped')).updated_at = '2026-11-22T00:00:00Z';
   unknown(clause(x, 'reviewed'));
 });
 it('ambiguous same-SHA prevention markers cannot bind an acceptance', () => {
   const x = input(), mark = x.comments.find(c => c.body.startsWith('<!-- approval-prevention-filed:'));
   x.comments.push({ ...mark, id: mark.id + 1 }); unknown(clause(x, 'reviewed'));
 });
-it('the 7289 fixture retains its overall pass verdict', () => {
-  expect(buildChangeEvidence(input()).predicate.verdict.verdict).toBe('pass');
+it('the raw 7289 restamp has different fingerprints and remains unknown(stale)', () => {
+  expect(buildChangeEvidence(input()).predicate.verdict).toMatchObject({ verdict: 'unknown', reason: 'stale' });
 });
 it('a lock acquisition error retains the incoming merge for automatic retry', async () => {
   const h = harness(), lock = path.join(h.options.coordination, `ledger-append-${createHash('sha256').update(`change-evidence:${h.options.coordination}`).digest('hex')}.lock`);

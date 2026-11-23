@@ -3,7 +3,10 @@ bornAs: xnkllzn
 kind: story
 size: 3
 parent: "3383"
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 locus: plateau-app
 blockedBy: ["4006"]
 dateOpened: "2026-09-23"

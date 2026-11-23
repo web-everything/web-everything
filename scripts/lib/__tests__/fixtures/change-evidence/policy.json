@@ -9,7 +9,7 @@
   ],
   "clauses": {
     "tested": { "required": true, "description": "every required check succeeded on the commit that landed", "acceptKinds": ["ci-check"], "requiredChecks": ["test", "smoke", "daemon-soak", "soak-replay-gate", "merge-gate"], "minTier": "replayed" },
-    "reviewed": { "required": true, "description": "an accepted independent review covers the final head (a drain re-stamp after a content-preserving rebase counts)", "acceptKinds": ["review-verdict", "review-restamp"], "minTier": "asserted" },
+    "reviewed": { "required": true, "description": "an accepted independent review covers the final head (a drain re-stamp after a content-preserving rebase counts)", "acceptKinds": ["review-verdict", "review-restamp"], "trustedProducers": ["https://github.com/apps/plateau-reviewer", "https://github.com/apps/plateau-merger"], "minTier": "asserted" },
     "approved": { "required": true, "description": "review:accepted was applied by an approver who is not the author, and was still present at merge", "acceptKinds": ["approval-label"], "approvers": ["https://github.com/apps/plateau-reviewer"], "separationOfDuties": true, "minTier": "asserted" }
   },
   "tiers": { "ci-check": "replayed", "review-verdict": "asserted", "review-restamp": "asserted", "approval-label": "asserted" },

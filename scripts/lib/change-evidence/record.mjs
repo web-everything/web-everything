@@ -1,5 +1,5 @@
 /** Pure port of ship/change-evidence v0.1 tools/build-fixture.mjs build().
- * Comments/events retain forge thread order; required checks use the highest run id.
+ * Comments use their latest edit; checks use completion time, then run id, on the landed SHA.
  * No IO and no gate decisions: missing evidence is an explicit unknown verdict.
  */
 import { createHash } from 'node:crypto';
@@ -8,11 +8,16 @@ import { requiredChecksFromRules, requiredChecksFromBranch } from '../required-s
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const TIER = { asserted: 0, replayed: 1, probe: 2 };
 const EVALUATOR = 'https://everstandards.dev/ship/tools/change-evidence-build';
-const actorOf = login => {
+const actorOf = (actor, app) => {
+  const login = actor?.login;
   const canonical = String(login ?? '').trim().toLowerCase();
-  return canonical.startsWith('app/') || canonical.endsWith('[bot]')
-    ? { id: `https://github.com/apps/${canonical.replace(/^app\//, '').replace(/\[bot\]$/, '')}`, kind: 'bot', native: login }
-    : { id: `https://github.com/${canonical}`, kind: 'person', native: login };
+  if (!canonical) return { kind: 'unknown' };
+  const bot = actor.type === 'Bot' || actor.is_bot === true || (app?.id && app?.slug);
+  if (bot) {
+    const slug = String(app?.slug ?? canonical.replace(/^app\//, '').replace(/\[bot\]$/, '')).trim().toLowerCase();
+    return { id: `https://github.com/apps/${slug}`, kind: 'bot', native: login };
+  }
+  return { id: `https://github.com/${canonical}`, kind: 'person', native: login };
 };
 const checkProducer = run => run.app?.slug ? `https://github.com/apps/${run.app.slug}` : undefined;
 const evidenceKey = e => JSON.stringify([e.kind, e.uri ?? null, e.digest]);
@@ -55,7 +60,7 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   const cfgDigest = { sha256: sha256(configBytes) };
   const REPO = pr.url.split('/pull/')[0];
   const policy = { uri: `${config.id}#merge-policy`, digest: cfgDigest };
-  const author = actorOf(pr.author.login), head = pr.headRefOid, at = pr.mergedAt;
+  const author = actorOf(pr.author), head = pr.headRefOid, at = pr.mergedAt;
   const base = (kind, ev) => ({ policy, evaluatedAt: AT, evaluator: EVALUATOR, ...ev });
   const tierOf = (k) => config.tiers[k];
   const producerAllowed = (clause, producer, defaults = []) => (clause.trustedProducers ?? defaults).includes(producer);
@@ -65,9 +70,22 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   const beforeMerge = t => Number.isFinite(Date.parse(t)) && Date.parse(t) <= Date.parse(at);
   // Backfill must evaluate the merge-time snapshot, including comment edits.
   events = events.filter(e => beforeMerge(e.created_at));
-  const allComments = comments;
-  comments = comments.filter(c => beforeMerge(c.created_at) && (!c.updated_at || beforeMerge(c.updated_at)))
-    .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at) || a.id - b.id);
+  const commentTime = c => c.updated_at ?? c.created_at;
+  const latestComments = new Map();
+  const ambiguousComments = new Set();
+  for (const c of comments) {
+    const prior = latestComments.get(c.id);
+    // An unreadable edit time cannot safely revive a dated version.
+    if (!prior || !Number.isFinite(Date.parse(commentTime(c)))
+      || Date.parse(commentTime(c)) > Date.parse(commentTime(prior))) {
+      latestComments.set(c.id, c); ambiguousComments.delete(c.id);
+    } else if (Date.parse(commentTime(c)) === Date.parse(commentTime(prior)) && c.body !== prior.body) {
+      ambiguousComments.add(c.id);
+    }
+  }
+  const allComments = [...latestComments.values()];
+  comments = allComments.filter(c => !ambiguousComments.has(c.id) && beforeMerge(c.created_at) && beforeMerge(commentTime(c)))
+    .sort((a, b) => Date.parse(commentTime(a)) - Date.parse(commentTime(b)) || a.id - b.id);
 
 
   // tested: the ruleset's required checks, on the commit that landed (merge-queue run)
@@ -77,10 +95,12 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
     const allowed = x => producerAllowed(tc, checkProducer(x), ['https://github.com/apps/github-actions'])
       && checks.filter(c => c.context === name).every(c => c.integration_id == null || c.integration_id === x.app?.id);
     if (candidates.some(x => checkProducer(x) && !allowed(x))) unlisted.push(name);
-    const r = candidates.filter(allowed).sort((a, b) => b.id - a.id)[0];
+    const r = candidates.filter(x => allowed(x) && x.head_sha === mergeSha)
+      .sort((a, b) => Date.parse(b.completed_at) - Date.parse(a.completed_at) || b.id - a.id)[0];
+    if (!r && candidates.some(allowed)) { off.push(name); continue; }
     if (!r || r.status !== 'completed' || !eligible(tc, 'ci-check')) { missing.push(name); continue; }
     tEv.push({ kind: 'ci-check', uri: r.html_url, digest: { gitCommit: r.head_sha }, provenanceTier: tierOf('ci-check'), native: { producer: checkProducer(r), name, id: r.id, conclusion: r.conclusion, at: r.completed_at, app: r.app?.slug, appId: r.app?.id } });
-    if (r.conclusion !== 'success') bad.push(`${name}=${r.conclusion}`); if (r.head_sha !== mergeSha) off.push(name);
+    if (r.conclusion !== 'success') bad.push(`${name}=${r.conclusion}`);
   }
   const tested = bad.length ? base('tested', { verdict: 'fail', detail: bad.join(', ') }) : missing.length ? base('tested', { verdict: 'unknown', reason: !tEv.length && unlisted.length ? 'unverifiable' : 'missing', detail: `no run for ${missing}` }) : off.length ? base('tested', { verdict: 'unknown', reason: 'stale', detail: `ran on another commit: ${off}` }) : base('tested', { verdict: 'pass' });
   tested.examined = { count: tEv.length, unit: 'required checks', description: `required_status_checks of the main ruleset, latest completed run on ${mergeSha}` }; tested.evidence = tEv;
@@ -88,14 +108,17 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   // Legacy review comments bind the acceptance's own SHA to its prevention marker.
   // A nearby timestamp alone is never a binding.
   const rEv = [], rc = config.clauses.reviewed;
-  const sharedTrusted = new Set(allComments.filter(c => isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })));
-  const producers = rc.trustedProducers ?? ['https://github.com/apps/plateau-reviewer', 'https://github.com/apps/plateau-merger'];
+  const commentActor = c => actorOf(c.user, c.performed_via_github_app);
+  const sharedTrusted = new Set(allComments.filter(c => {
+    const actor = commentActor(c);
+    const login = actor.kind === 'bot' ? `${actor.id.split('/').at(-1)}[bot]` : c.user?.login;
+    if (!isTrustedMarkerAuthor({ user: { login }, viewerDidAuthor: false })) return false;
+    return true;
+  }));
+  const producers = rc.trustedProducers ?? [];
   let unlistedReview = false;
-  const independent = c => Boolean(c.user?.login) && actorOf(c.user.login).id !== author.id;
-  const trustedProducer = c => producers.includes(actorOf(c.user?.login ?? '').id)
-    && (sharedTrusted.has(c)
-      || (process.env.WE_AUTOMATION_LOGINS === undefined && process.env.WE_OPERATOR_LOGINS === undefined
-        && ['https://github.com/apps/plateau-reviewer', 'https://github.com/apps/plateau-merger'].includes(actorOf(c.user?.login).id)));
+  const independent = c => Boolean(commentActor(c).id) && commentActor(c).id !== author.id;
+  const trustedProducer = c => producers.includes(commentActor(c).id) && sharedTrusted.has(c);
   const trusted = c => independent(c) && trustedProducer(c);
   const rejection = c => /^(?:(?:🔁|❌|⛔|🚫) )?(?:human )?review — (?:rejected|changes requested|blocked)(?:\r?\n|$)/u.test(c.body);
   // An unorderable rejection cannot be superseded safely, even by a dated acceptance.
@@ -105,37 +128,38 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   const marker = (c, name, length = 40) => new RegExp(`^<!-- ${name}: ([0-9a-f]{${length}}) -->$`, 'm').exec(c.body)?.[1];
   let accepted;
   for (const c of comments) {
-    if (!producers.includes(actorOf(c.user?.login ?? '').id)
+    if (!producers.includes(commentActor(c).id)
       && (/^✅ review — accepted/u.test(c.body) || /^📌 review — acceptance re-stamped/u.test(c.body))) unlistedReview = true;
     if (!trusted(c)) continue;
     if (rejection(c)) {
       // Revocation invalidates the active acceptance and every carry derived from it.
       accepted = undefined; rEv.length = 0; continue;
     }
-    if (actorOf(c.user.login).id === 'https://github.com/apps/plateau-reviewer' && /^✅ review — accepted/.test(c.body)) {
+    if (/^✅ review — accepted/.test(c.body)) {
       accepted = undefined;
       rEv.length = 0;
       const ownSha = marker(c, 'reviewed-sha');
-      const matches = comments.filter(d => trusted(d) && actorOf(d.user.login).id === actorOf(c.user.login).id
+      const matches = comments.filter(d => trusted(d) && commentActor(d).id === commentActor(c).id
         && new RegExp(`^<!-- approval-prevention-filed:${ownSha} -->`).test(d.body)
-        && Date.parse(d.created_at) >= Date.parse(c.created_at)
-        && Date.parse(d.created_at) - Date.parse(c.created_at) < 5 * 60e3);
+        && Date.parse(commentTime(d)) >= Date.parse(commentTime(c))
+        && Date.parse(commentTime(d)) - Date.parse(commentTime(c)) < 5 * 60e3);
       const mark = ownSha && matches.length === 1 && matches[0];
       const sha = mark && ownSha;
       if (sha) {
         accepted = c;
-        rEv.push({ kind: 'review-verdict', uri: c.html_url, digest: { gitCommit: sha }, provenanceTier: tierOf('review-verdict'), native: { producer: actorOf(c.user.login).id, actor: actorOf(c.user.login).id, at: c.created_at, commentId: c.id, bodySha256: sha256(c.body), shaSource: `approval-prevention-filed marker in comment ${mark.id}` } });
+        rEv.push({ kind: 'review-verdict', uri: c.html_url, digest: { gitCommit: sha }, provenanceTier: tierOf('review-verdict'), native: { producer: commentActor(c).id, actor: commentActor(c).id, at: commentTime(c), commentId: c.id, bodySha256: sha256(c.body), shaSource: `approval-prevention-filed marker in comment ${mark.id}` } });
       }
     }
     const re = marker(c, 'reviewed-sha'), diff = marker(c, 'reviewed-diff', 64);
     // Historical restamps assert preservation; the fixture has no replayable diff proof.
     // Require the complete ceremony and an earlier active independent acceptance.
-    if (re && accepted && Date.parse(accepted.created_at) < Date.parse(c.created_at)
+    if (re && accepted && Date.parse(commentTime(accepted)) < Date.parse(commentTime(c))
       && /^📌 review — acceptance re-stamped after a rebase \(no new review\)/u.test(c.body)
       && c.body.includes(`head moved to ${re} by this drain's own content-preserving rebase`)
       && diff && marker(c, 'reviewed-contribution', 64)
-      && marker(accepted, 'reviewed-diff', 64) && marker(accepted, 'reviewed-contribution', 64)) {
-      rEv.push({ kind: 'review-restamp', uri: c.html_url, digest: { gitCommit: re }, provenanceTier: tierOf('review-restamp'), native: { producer: actorOf(c.user.login).id, actor: actorOf(c.user.login).id, at: c.created_at, commentId: c.id, bodySha256: sha256(c.body), reviewedDiff: diff } });
+      && diff === marker(accepted, 'reviewed-diff', 64)
+      && marker(c, 'reviewed-contribution', 64) === marker(accepted, 'reviewed-contribution', 64)) {
+      rEv.push({ kind: 'review-restamp', uri: c.html_url, digest: { gitCommit: re }, provenanceTier: tierOf('review-restamp'), native: { producer: commentActor(c).id, actor: commentActor(c).id, at: commentTime(c), commentId: c.id, bodySha256: sha256(c.body), reviewedDiff: diff } });
     }
   }
   const rOk = rEv.filter((e) => eligible(rc, e.kind));
@@ -149,9 +173,9 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
   // approved: review:accepted label events by a listed approver, not the author, not removed before merge
   const ac = config.clauses.approved, aEv = [];
   const headAt = (t) => commits.filter((c) => Date.parse(c.commit.committer.date) <= Date.parse(t)).map((c) => c.sha).at(-1) ?? pr.commits[0].oid;
-  for (const e of events.filter((x) => x.event === 'labeled' && x.label?.name === 'review:accepted' && ac.approvers.includes(actorOf(x.actor.login).id))) {
+  for (const e of events.filter((x) => x.event === 'labeled' && x.label?.name === 'review:accepted' && ac.approvers.includes(actorOf(x.actor).id))) {
     const removed = events.some((x) => x.event === 'unlabeled' && x.label?.name === 'review:accepted' && Date.parse(x.created_at) > Date.parse(e.created_at) && Date.parse(x.created_at) <= Date.parse(at));
-    aEv.push({ kind: 'approval-label', uri: `${pr.url}#event-${e.id}`, digest: { gitCommit: headAt(e.created_at) }, provenanceTier: tierOf('approval-label'), native: { producer: actorOf(e.actor.login).id, actor: actorOf(e.actor.login).id, label: e.label.name, at: e.created_at, eventId: e.id, presentAtMerge: !removed } });
+    aEv.push({ kind: 'approval-label', uri: `${pr.url}#event-${e.id}`, digest: { gitCommit: headAt(e.created_at) }, provenanceTier: tierOf('approval-label'), native: { producer: actorOf(e.actor).id, actor: actorOf(e.actor).id, label: e.label.name, at: e.created_at, eventId: e.id, presentAtMerge: !removed } });
   }
   const aTrusted = aEv.filter(e => producerAllowed(ac, e.native.producer, ac.approvers));
   const aOk = aTrusted.filter((e) => eligible(ac, e.kind) && e.native.presentAtMerge && ac.approvers.includes(e.native.actor) && (!ac.separationOfDuties || e.native.actor !== author.id));
@@ -180,7 +204,7 @@ export function buildChangeEvidence({ pr, events, comments, mergeCommit: mc, com
         nativeId: pr.url, number: pr.number, title: pr.title, repository: REPO, author,
         base: { ref: `refs/heads/${pr.baseRefName}`, digest: { gitCommit: mc.parents[0].sha } },
         head: { ref: `refs/heads/${pr.headRefName}`, digest: { gitCommit: head } },
-        merged: { at, by: actorOf(pr.mergedBy.login), method: events.slice(0, events.findIndex(e => e.event === 'merged' && e.commit_id === mergeSha) + 1).filter(e => ['added_to_merge_queue', 'removed_from_merge_queue'].includes(e.event)).at(-1)?.event === 'added_to_merge_queue' ? 'merge-queue' : 'merge', ref: `refs/heads/${pr.baseRefName}`, digest: { gitCommit: mergeSha } },
+        merged: { at, by: actorOf(pr.mergedBy), method: events.slice(0, events.findIndex(e => e.event === 'merged' && e.commit_id === mergeSha) + 1).filter(e => ['added_to_merge_queue', 'removed_from_merge_queue'].includes(e.event)).at(-1)?.event === 'added_to_merge_queue' ? 'merge-queue' : 'merge', ref: `refs/heads/${pr.baseRefName}`, digest: { gitCommit: mergeSha } },
       },
       governance: { org: config.org, config: config.id, version: config.version, digest: cfgDigest, ...(config.sources ? { sources: config.sources.map(({ uri, digest }) => ({ uri, digest })) } : {}) },
       verdict: overall, clauses, ...(ai.length ? { aiProvenance: ai } : {}),

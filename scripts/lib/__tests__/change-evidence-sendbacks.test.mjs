@@ -21,7 +21,7 @@ function input() {
 }
 const verdict = (x, id) => buildChangeEvidence(x).predicate.clauses.find(c => c.clause === id).verdict;
 const dirs = [];
-afterEach(() => { vi.restoreAllMocks(); dirs.splice(0).forEach(dir => fs.rmSync(dir, { recursive: true, force: true })); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); dirs.splice(0).forEach(dir => fs.rmSync(dir, { recursive: true, force: true })); });
 function harness() {
   const x = input(), coordination = fs.mkdtempSync(path.join(os.tmpdir(), 'evidence-sendbacks-'));
   dirs.push(coordination);
@@ -46,10 +46,99 @@ function harness() {
 
 it.each(['app/plateau-reviewer', 'APP/PLATEAU-REVIEWER', ' plateau-reviewer[bot] '])(
   'author alias %s cannot independently review or approve through the reviewer bot', login => {
-    const x = input(); x.pr.author.login = login;
+    const x = reviewedInput(); x.pr.author = { login, is_bot: true };
     expect(verdict(x, 'reviewed').verdict).not.toBe('pass');
     expect(verdict(x, 'approved').verdict).not.toBe('pass');
   });
+
+// Each case starts with a real acceptance covering the head, without a carry.
+function reviewedInput() {
+  const x = input();
+  x.comments = x.comments.filter(c => !c.body.includes('re-stamped'));
+  const accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  const oldSha = /<!-- reviewed-sha: ([a-f0-9]+) -->/.exec(accepted.body)[1];
+  x.comments.forEach(c => { c.body = c.body.replaceAll(oldSha, x.pr.headRefOid); });
+  return x;
+}
+it.each([false, true])('check completion time precedes id and API order (reverse=%s)', reverse => {
+  const x = input(), run = x.checkRuns.find(r => r.name === x.config.clauses.tested.requiredChecks[0]);
+  x.checkRuns.push({ ...run, id: run.id - 1, completed_at: x.pr.mergedAt, conclusion: 'failure' });
+  if (reverse) x.checkRuns.reverse();
+  expect(verdict(x, 'tested').verdict).toBe('fail');
+});
+it('equal completion times choose the highest check id rather than the first response', () => {
+  const x = input(), run = x.checkRuns.find(r => r.name === x.config.clauses.tested.requiredChecks[0]);
+  x.checkRuns.push({ ...run, id: run.id + 1, conclusion: 'failure' });
+  expect(verdict(x, 'tested').verdict).toBe('fail');
+});
+it('a newer successful check on another SHA cannot hide a failed landed check', () => {
+  const x = input(), run = x.checkRuns.find(r => r.name === x.config.clauses.tested.requiredChecks[0]);
+  run.conclusion = 'failure';
+  x.checkRuns.unshift({ ...run, id: run.id + 1, head_sha: x.pr.headRefOid,
+    completed_at: x.pr.mergedAt, conclusion: 'success' });
+  expect(verdict(x, 'tested').verdict).toBe('fail');
+});
+it('an edited rejection is ordered at its edit time and revokes a later-created acceptance', () => {
+  const x = reviewedInput(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  x.comments.unshift({ ...accepted, id: 1, created_at: '2026-11-21T08:00:00Z',
+    updated_at: '2026-11-21T11:00:00Z', body: '🔁 review — changes requested' });
+  expect(verdict(x, 'reviewed').verdict).not.toBe('pass');
+});
+it.each([false, true])('the latest edited version of a comment wins (reverse=%s)', reverse => {
+  const x = reviewedInput(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  x.comments.push({ ...accepted, updated_at: '2026-11-21T11:00:00Z', body: '🔁 review — changes requested' });
+  if (reverse) x.comments.reverse();
+  const result = verdict(x, 'reviewed');
+  expect(result.verdict).not.toBe('pass');
+  expect(result.evidence).toHaveLength(0);
+});
+it('a post-merge edited version cannot resurrect an older acceptance copy', () => {
+  const x = reviewedInput(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  x.comments.push({ ...accepted, updated_at: '2026-11-22T00:00:00Z', body: '🔁 review — changes requested' });
+  expect(verdict(x, 'reviewed').verdict).not.toBe('pass');
+});
+it.each([false, true])('conflicting versions with equal edit times cannot assert a pass (reverse=%s)', reverse => {
+  const x = reviewedInput(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  x.comments.push({ ...accepted, body: '🔁 review — changes requested' });
+  if (reverse) x.comments.reverse();
+  expect(verdict(x, 'reviewed').verdict).toBe('unknown');
+});
+it.each([undefined, { login: 'plateau-reviewer[bot]', type: 'User' }])(
+  'missing or human reviewer identity cannot borrow a bot identity: %j', user => {
+    const x = reviewedInput(); x.comments.forEach(c => { c.user = user; delete c.performed_via_github_app; });
+    expect(verdict(x, 'reviewed').verdict).toBe('unknown');
+  });
+it('a bot actor with an app identity needs no bot suffix or author comparison', () => {
+  const x = reviewedInput();
+  x.comments.forEach(c => { c.user = { login: 'review-service', type: 'Bot' }; });
+  expect(verdict(x, 'reviewed').verdict).toBe('pass');
+});
+it('a missing producer policy does not fall back to a hardcoded reviewer', () => {
+  const x = reviewedInput(); delete x.config.clauses.reviewed.trustedProducers;
+  x.configBytes = JSON.stringify(x.config);
+  expect(verdict(x, 'reviewed').verdict).toBe('unknown');
+});
+it.each(['reviewed-diff', 'reviewed-contribution'])('a restamp with a different %s cannot carry acceptance', name => {
+  const x = input(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  const restamp = x.comments.find(c => c.body.includes('re-stamped'));
+  // First align both fingerprints, then change only the fingerprint under test.
+  for (const key of ['reviewed-diff', 'reviewed-contribution']) {
+    const re = new RegExp(`<!-- ${key}: [a-f0-9]+ -->`);
+    restamp.body = restamp.body.replace(re, re.exec(accepted.body)[0]);
+  }
+  restamp.body = restamp.body.replace(new RegExp(`<!-- ${name}: [a-f0-9]+ -->`), `<!-- ${name}: ${'a'.repeat(64)} -->`);
+  expect(verdict(x, 'reviewed')).toMatchObject({ verdict: 'unknown', reason: 'stale' });
+  expect(verdict(x, 'reviewed').evidence.some(e => e.kind === 'review-restamp')).toBe(false);
+});
+it('a restamp with both matching fingerprints can carry an independent acceptance', () => {
+  const x = input(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
+  const restamp = x.comments.find(c => c.body.includes('re-stamped'));
+  for (const key of ['reviewed-diff', 'reviewed-contribution']) {
+    const re = new RegExp(`<!-- ${key}: [a-f0-9]+ -->`);
+    restamp.body = restamp.body.replace(re, re.exec(accepted.body)[0]);
+  }
+  expect(verdict(x, 'reviewed').verdict).toBe('pass');
+});
 it.each([undefined, null, '', 'invalid'])(
   'an undated trusted rejection (%s) beats an otherwise passing review', created_at => {
     const x = input(), accepted = x.comments.find(c => c.body.startsWith('✅ review'));
