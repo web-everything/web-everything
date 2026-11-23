@@ -1138,13 +1138,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       .filter(name => name !== 'merge-gate').every(name => isRequiredCheckGreen(pr, name))
     && decideWorkflowHoldRepark({ labels: pr.labels, checkRows: pr.statusCheckRollup }).admit;
   let codeqlBlocked = false;
+  let checkEvidenceIncomplete = false;
   let reason = certifyLabel
     ? `producer-certified (label "${trustLabel}"), required check green, cleanly mergeable`
     : humanCleared
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
-  else if (pr?.rowsComplete === false) { decision = 'skip'; reason = 'check evidence incomplete — retry with a complete live check read'; }
+  else if (pr?.rowsComplete === false) { decision = 'skip'; checkEvidenceIncomplete = true; reason = 'check evidence incomplete — retry with a complete live check read'; }
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
   // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
@@ -1182,6 +1183,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, ...(prestagePendingCi ? { prestagePendingCi: true } : {}), state, mergeable, offDefaultBase,
+    ...(checkEvidenceIncomplete ? { checkEvidenceIncomplete: true } : {}),
     ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
@@ -3007,9 +3009,10 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     const stackWait = (Array.isArray(c.stackParents) ? c.stackParents : []).map(asItemId).filter((sp) => !stackProven(sp));
     if (c.decision !== 'merge') {
       // Incomplete live checks can skip a refreshed round target before ordering.
-      // Retain its dependency waits from the live context without admitting it to ready.
+      // Only that operative hold retains dependency waits. Other skips keep their
+      // own reason and must not turn idle watch/confirm passes into dependency waits.
       const waitOn = [...new Set([...blockWait, ...stackWait])].filter(w => c.item == null || String(w) !== String(c.item));
-      if (waitOn.length) deferred.push({ num: c.num, item: c.item, waitOn, ...skipInfo, headSha: c.headSha ?? null });
+      if (c.checkEvidenceIncomplete === true && waitOn.length) deferred.push({ num: c.num, item: c.item, waitOn, ...skipInfo, headSha: c.headSha ?? null });
       continue; // @merge-gate-exempt skipped PRs never enter the merge cascade
     }
     // #xc7p3q9 — the COUPLE gate: a manifest-less impl PR joined to a WE couple defers with its carrier

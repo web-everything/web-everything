@@ -43,6 +43,8 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     writeFileSync(join(dir, 'calls.jsonl'), '');
     writeFileSync(join(dir, 'live-branch'), liveDefaultBranch);
     writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/web-everything.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
+    // The async test transport resolves gh via PATH; both that path and the binary
+    // hook must reach gh-throttle before the fake serves check/status evidence.
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
 const a = process.argv.slice(2);
@@ -58,6 +60,10 @@ if (a[0] === 'repo' && a[1] === 'view') {
 if (a[0] === 'api' && a[1]?.includes('/git/ref/heads/')) { fs.writeSync(1, 'a'.repeat(40)); process.exit(0); }
 const endpoint = a.find(v => v.startsWith('repos/') && v.includes('/commits/'));
 if (a[0] === 'api' && endpoint) {
+  if (!process.env.WE_GH_THROTTLE_OUTER_INV) {
+    fs.appendFileSync(process.env.CONTEXT_CALLS + '.bare-checks', JSON.stringify(a) + '\\n');
+    fs.writeSync(2, 'check/status read bypassed gh-throttle'); process.exit(1);
+  }
   const p = selected.find(p => endpoint.includes(p.headRefOid));
   if (p && endpoint.includes('/check-runs?')) {
     if (endpoint.includes('filter=all') && Object.hasOwn(p, 'liveCheckRunPages')) out(p.liveCheckRunPages);
@@ -123,13 +129,16 @@ out({});
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache'), CONTEXT_FAIL_BRANCH: failDefaultBranch ? '1' : '0',
         CONTEXT_BRANCH_FILE: join(dir, 'live-branch'), CONTEXT_BRANCH_AFTER_MEMBERSHIP: branchAfterMembership ?? '',
         WE_FAST_DRAIN_SCOPE: scope, WE_FAST_DRAIN_CONTEXT: killSwitch ? 'live' : 'snapshot', WE_PR_SNAPSHOT_TTL_MS: '75000',
-        WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
+        WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_OUTER_INV: '',
+        WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
         CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
         CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
         CONTEXT_CALLS: join(dir, 'calls.jsonl'), CONTEXT_ROWS: join(dir, 'rows.json') },
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
+      bareCheckReads: existsSync(join(dir, 'calls.jsonl.bare-checks'))
+        ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))
         ? readFileSync(join(dir, 'calls.jsonl.views'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       passSnapshotPublished: existsSync(roundPath),

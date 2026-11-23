@@ -9,7 +9,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { withResolutionBasis, buildDrainReasonComment, hasDrainReasonComment, buildDrainVerdicts, classifyPr, isRebaseDropCandidate, isBehindButClean, headTreeLacksManifestFile, routeRebaseBeforeEnqueue, retainCheckedQueueHead, retainBypassedQueueHead, readFreshQueueRollup, revalidateWithUnknownRetry, resolveRebaseBeforeEnqueue, buildLiveListingsByRepo, unlandableStateReason } from '../merge-ai-prs.mjs';
-import { planLabelDrain } from '../merge-ai-prs.mjs';
+import { planLabelDrain, isPassIdle, isConfirmSweepSettled } from '../merge-ai-prs.mjs';
+import { buildSkipReasons } from '../lib/drain-skip-reasons.mjs';
 import { readFastDrainRoundListing, withFastDrainRoundLock } from '../lib/fast-drain-scope.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,6 +32,56 @@ describe('incomplete round targets retain live dependency ordering', () => {
     expect(plan.ready).toEqual([]);
     expect(plan.deferred).toEqual(open ? [expect.objectContaining({ num: 42, waitOn: [43] })] : []);
     expect(verdict.decision).toBe('skip');
+  });
+});
+
+describe('skipped candidates preserve their operative hold with open dependencies', () => {
+  const green = { number: 42, rowsComplete: true, baseRefName: 'main', body: 'A real summary',
+    mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', labels: [{ name: 'ready-to-merge' }],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+  const cases = [
+    ['review:changes', { labels: [...green.labels, { name: 'review:changes' }] }, /review hold/, false],
+    ['review:human', { labels: [...green.labels, { name: 'review:human' }] }, /review hold/, false],
+    ['review:held-mechanical', { labels: [...green.labels, { name: 'review:held-mechanical' }] }, /review hold/, false],
+    ['review:pending', { labels: [...green.labels, { name: 'review:pending' }] }, /review hold/, false],
+    ['red CI', { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] }, /not green/, false],
+    ['fix claim', { fixClaim: { who: 'fixture-fixer' } }, /fix claim held/, false],
+    ['uncertified', { labels: [] }, /not AI-generated/, false],
+    ['off-default base', { baseRefName: 'develop' }, /base is not main/, false],
+    ['conflict', { mergeable: 'CONFLICTING' }, /not mergeable/, false],
+    ['behind', { mergeStateStatus: 'BEHIND' }, /BEHIND/, false],
+    ['empty body', { body: '' }, /description/, false],
+    ['incomplete checks', { rowsComplete: false }, /check evidence incomplete/, true],
+    // Pin a caller-supplied draft skip; classifyPr's draft gate is outside this repair.
+    ['draft', {}, /draft/, false, { num: 42, decision: 'skip', reason: 'draft' }],
+  ];
+  it.each(cases)('%s: only incomplete checks retain dependency deferrals', (_name, patch, reason, incomplete, supplied) => {
+    const verdict = supplied ?? classifyPr({ ...green, ...patch }, { defaultBranch: 'main' });
+    expect(verdict.decision).toBe('skip');
+    expect(verdict.reason).toMatch(reason);
+    for (const edge of ['blockedBy', 'stackParents']) {
+      const plan = planLabelDrain([{ ...verdict, item: 42, [edge]: [43] }], { extraOpenItems: [43] });
+      expect(plan.ready).toEqual([]);
+      expect(plan.deferred).toEqual(incomplete ? [expect.objectContaining({ num: 42, waitOn: [43] })] : []);
+      expect(isPassIdle(plan)).toBe(!incomplete);
+      expect(isConfirmSweepSettled(plan)).toBe(!incomplete);
+      if (!incomplete) expect(buildSkipReasons({ verdicts: [verdict], deferred: plan.deferred })[0].reason).toBe(verdict.reason);
+      expect(verdict.reason).toMatch(reason);
+    }
+  });
+
+  it.each([true, false, undefined])('pins the legacy classifyPr rowsComplete=%s contract', rowsComplete => {
+    const verdict = classifyPr({ ...green, rowsComplete }, { defaultBranch: 'main' });
+    expect(verdict.decision).toBe(rowsComplete === false ? 'skip' : 'merge');
+    expect(verdict.checkEvidenceIncomplete === true).toBe(rowsComplete === false);
+  });
+
+  it('keeps required-check read errors on their existing dedicated deferral', () => {
+    const verdict = classifyPr({ ...green, rowsComplete: false, requiredCheckReadError: 'roster unavailable' }, { defaultBranch: 'main' });
+    expect(verdict.checkEvidenceIncomplete).toBeUndefined();
+    const plan = planLabelDrain([{ ...verdict, item: 42, blockedBy: [43] }], { extraOpenItems: [43] });
+    expect(plan.ready).toEqual([]);
+    expect(plan.deferred).toEqual([expect.objectContaining({ num: 42, waitOn: ['required-check-read'], reason: 'roster unavailable' })]);
   });
 });
 

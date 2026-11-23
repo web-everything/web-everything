@@ -29,6 +29,24 @@ it('tier 1: catch-up without --from-green-event makes zero full-PR pagination ca
     && a[a.indexOf('--json') + 1].includes('body')).map(a => a[2])).toEqual(['7']);
 });
 
+it('CLI catch-up check/status reads use the default gh-throttle transport within a bounded call budget', () => {
+  const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, workflowEditSetting: 'off' });
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.bareCheckReads).toEqual([]);
+  expect(JSON.parse(result.stdout).toMerge.map(p => p.num), result.stdout).toEqual([7]);
+  const endpoints = result.calls.filter(a => a[0] === 'api')
+    .flatMap(a => a.filter(v => /\/commits\/.*\/(check-runs|status)\?/.test(v)));
+  const target = 'repos/fixture/web-everything/commits/' + '7'.padStart(40, '0');
+  expect(endpoints).toEqual(expect.arrayContaining([
+    `${target}/check-runs?per_page=100&filter=all`, `${target}/status?per_page=100`,
+  ]));
+  expect(endpoints).toHaveLength(2);
+  expect(result.fullListings + result.heavyListings).toBe(0);
+  // Includes the lean cross-repo membership and default-branch probes (27 calls
+  // in the fixture); a small fixed ceiling catches repeated hydration/listing.
+  expect(result.calls.length, JSON.stringify(result.calls)).toBeLessThanOrEqual(30);
+});
+
 it('catch-up excludes incomplete check evidence from the fast snapshot and reaches slow classification', () => {
   const result = runFastDrainContextCli({ catchUp: true, rowCount: 18,
     livePatches: { 7: { liveCheckRunPages: [] } } });
