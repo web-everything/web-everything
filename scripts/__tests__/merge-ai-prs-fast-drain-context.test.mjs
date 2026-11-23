@@ -68,22 +68,37 @@ for (const refreshAvailable of [true, false]) {
   });
 }
 
-for (const slowLean of [false, true]) {
-  test(`pass inventory: a slow refresh ${slowLean ? 'still expires when the post-refresh membership read is slow' : 'does not expire the pass bound'}`, async () => {
-    let t = 1000, held = false, snapshot = null, published = null;
+// Freshness after a refresh is anchored to the rows' fetch time; validation errors are never swallowed.
+for (const mode of ['fresh-fetch', 'old-fetch', 'validation-error']) {
+  test(`pass inventory refresh anchors to row fetch time (${mode})`, async () => {
+    const T = 1_000_000;
+    let t = T, held = false, snapshot = null, published = null;
+    const refreshCalls = [];
     const options = {
       path: 'unused-pass-snapshot.json', repos: [repo], targetRepo: repo, env: {}, now: () => t,
       readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
-      listLean: async () => { if (slowLean) t += 61_000; return inventory([lean(pr(7))]); },
-      readSnapshot: (_r, o) => { if (o?.refresh) { t += 61_000; snapshot = [pr(7)]; } return snapshot; },
+      listLean: async () => inventory([lean(pr(7))]),
+      readSnapshot: (_r, o) => {
+        if (mode === 'validation-error' && !o?.refresh) throw new Error('source validation failed');
+        if (o?.refresh) {
+          refreshCalls.push(o);
+          t += 30_000; // slow lock/refresh: must not itself expire fresh rows
+          snapshot = [pr(7)];
+          Object.defineProperty(snapshot, 'fetchedAtMs', { value: mode === 'old-fetch' ? T - 61_000 : T + 1 });
+        }
+        return snapshot;
+      },
       read: () => published, write: (_p, v) => { published = v; },
       lock: async fn => { held = true; try { return { ok: true, value: await fn(() => held) }; } finally { held = false; } },
     };
-    if (slowLean) {
+    if (mode === 'fresh-fetch') {
+      assert.deepEqual((await readFastDrainPassInventory(options)).snapshots.get(repo), [pr(7)]);
+    } else if (mode === 'old-fetch') {
       await assert.rejects(readFastDrainPassInventory(options), /expired while reading/);
       assert.equal(published, null);
     } else {
-      assert.deepEqual((await readFastDrainPassInventory(options)).snapshots.get(repo), [pr(7)]);
+      await assert.rejects(readFastDrainPassInventory(options), /source validation failed/);
+      assert.equal(refreshCalls.length, 0);
     }
   });
 }

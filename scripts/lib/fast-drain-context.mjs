@@ -23,6 +23,8 @@ export function useFastDrainContext({ onlyPr, fromGreenEvent, fromCatchUp, listi
 }
 
 /** Reject incomplete inventories, including partial pages and repeated identities. */
+const SNAPSHOT_UNAVAILABLE = 'SNAPSHOT_UNAVAILABLE';
+
 export function validateLeanOpenPrs(inventory, maxRows = OPEN_PR_LIST_LIMIT, repo = '') {
   const { rows, totalCount, hasNextPage, truncated } = inventory ?? {};
   if (!Array.isArray(rows) || !Number.isInteger(totalCount) || totalCount < 0
@@ -155,7 +157,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
   const readSources = options => new Map(repos.map(repo => {
     const rows = readSnapshot(repo, options);
-    if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
+    if (!Array.isArray(rows)) throw Object.assign(new Error('snapshot unavailable/disabled/stale/dirty — retry next pass'), { code: SNAPSHOT_UNAVAILABLE });
     return [repo, rows];
   }));
   const readHeads = async () => Object.fromEntries(await readFastDrainFacts(repos, concurrency, async repo => {
@@ -210,14 +212,15 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     const hit = cached();
     if (hit) return revalidateMembership(hit);
     let writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    const triedAt = now();
-    try { readSources(); } catch {
-      // Cold/stale/dirty shared cache: this single-flight child refreshes it live (a refresh alone can outlast the
-      // 60s pass TTL, so counting it would make every cold catch-up expire). Rows written by a refresh are at most
-      // (refresh end - triedAt) old; they only seed base facts, and hydrateLiveInventory re-reads any PR whose live
-      // lean head/updatedAt differs, so membership authority stays live. The TTL window restarts at refresh end.
-      readSources({ refresh: true });
-      writtenAt = Math.max(writtenAt, now());
+    try { readSources(); } catch (e) {
+      if (e?.code !== SNAPSHOT_UNAVAILABLE) throw e; // only an unavailable/stale cache may be refreshed; anything else stays fatal
+      // Cold/stale/dirty shared cache: this single-flight child refreshes it live. Freshness is anchored to when
+      // the refreshed rows were READ FROM GITHUB (their fetch time), never to the end of the lock or refresh: a slow
+      // lock wait no longer counts, and rows fetched longer ago than the TTL still expire. Rows with no fetch time
+      // keep the stricter pre-lock anchor.
+      const refreshed = readSources({ refresh: true });
+      const fetched = [...refreshed.values()].map(rows => rows.fetchedAtMs);
+      if (fetched.length && fetched.every(Number.isFinite)) writtenAt = Math.min(...fetched);
     }
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);

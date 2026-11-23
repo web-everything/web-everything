@@ -113,6 +113,8 @@ function smokeProjection(snap, fields, env) {
   const rows = smokeProjectionRows(snap, fields, env);
   if (!Array.isArray(rows)) return rows;
   const declared = sampleDeclared(env);
+  // When these rows were read from GitHub (non-enumerable): lets a caller bound evidence age by the fetch, not the read.
+  if (Number.isFinite(snap?.fetchedAtMs)) Object.defineProperty(rows, 'fetchedAtMs', { value: snap.fetchedAtMs });
   if (declared && rows.length < (snap?.prs?.length ?? 0)) Object.defineProperty(rows, 'sampled', { value: true });
   if (snap?.truncated === true || (!declared && Array.isArray(snap?.prs) && rows.length < snap.prs.length)) {
     Object.defineProperty(rows, 'discoveryIncomplete', { value: true });
