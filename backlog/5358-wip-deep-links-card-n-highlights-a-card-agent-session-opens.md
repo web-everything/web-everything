@@ -2,7 +2,10 @@
 bornAs: xadunn9
 kind: story
 size: 1
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 dateOpened: "2026-10-08"
 tags: []
 ---

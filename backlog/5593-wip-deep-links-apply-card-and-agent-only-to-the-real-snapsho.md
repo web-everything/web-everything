@@ -2,7 +2,10 @@
 bornAs: x5wdhhz
 kind: story
 size: 2
-status: open
+status: closed
+closedReason: duplicate
+closedInto: "6202"
+dateClosed: "2026-11-22"
 scope: ["plateau:src/wip/glance/glance-mount.ts", "plateau:src/wip/glance/glance-view.ts", "plateau:src/wip/glance/glance-deeplink.test.ts"]
 dateOpened: "2026-10-09"
 tags: []
