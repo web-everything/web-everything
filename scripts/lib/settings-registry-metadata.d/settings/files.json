@@ -1,0 +1,6 @@
+{
+  "description": "Warn-only migration baseline of unit test files that start node, git or gh subprocesses.",
+  "owner": "scripts/settings/real-process-test-baseline.json",
+  "changeVia": "pr",
+  "instant": false
+}

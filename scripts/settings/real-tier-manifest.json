@@ -1,0 +1,7 @@
+{
+  "$comment": "R1063a real-tier manifest: every tracked *.real.test.mjs must be listed here and contain a reachable real subprocess call in an active test. Exact module and export identities are checked; mocks and unknown callback consumers are not proof. Empty inventories and empty test collections fail.",
+  "realTierFiles": [
+    "scripts/__tests__/merge-ai-prs-listing-dedupe.real.test.mjs",
+    "scripts/__tests__/merge-ai-prs-prestage.real.test.mjs"
+  ]
+}

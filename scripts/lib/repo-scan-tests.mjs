@@ -43,6 +43,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/real-process-guard.test.mjs',
+    scope: 'full',
+    why: 'lists every tracked *.real.test.mjs and checks each is in the real-tier manifest and starts a real process; a rename or manifest edit anywhere must re-run it',
+    matches: (f) => /\.real\.test\.mjs$/.test(f) || f === 'scripts/settings/real-tier-manifest.json' || f === 'vitest.config.ts' || f === 'vitest.real.config.ts' || f === '.github/workflows/real-tests.yml',
+    inputs: ['scripts/__tests__/real-process-guard.test.mjs', 'scripts/settings/real-tier-manifest.json', 'scripts/settings/real-process-test-baseline.json', 'vitest.real.config.ts', '.github/workflows/real-tests.yml'],
+  },
+  {
     test: 'scripts/__tests__/testing-notes-advisory.test.mjs',
     scope: 'full',
     why: 'validates incoming testing.md anchors across top-level agent docs and the complete topic directory; guide anchor changes can break unchanged callers, so the scan must keep both sides',
