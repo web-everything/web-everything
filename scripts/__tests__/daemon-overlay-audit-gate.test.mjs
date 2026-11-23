@@ -106,32 +106,36 @@ test('gate mode table: platform prefs file sets refuse/warn/off, env only tighte
   // proofs). Pinned on purpose: a prefs file CAN set warn/off; the environment variable alone cannot.
   const home = mkdtempSync(join(tmpdir(), 'overlay-gate-table-'));
   const root = join(home, 'clone');
-  const { WE_OVERLAY_AUDIT_EVIDENCE: _inherited, ...baseEnv } = process.env;
-  void _inherited;
+  // Drop inherited audit env and prefs redirect; every row names its own prefs file (an empty one for "no
+  // platform value"), so the operator's real platform preferences never reach the gate.
+  const { WE_OVERLAY_AUDIT_EVIDENCE: _audit, WE_PLATFORM_PREFERENCES_FILE: _prefs, ...baseEnv } = process.env;
+  void _audit; void _prefs;
   const prefsFor = (mode) => {
-    const file = join(home, `prefs-${mode}.json`);
-    writeFileSync(file, JSON.stringify({ overlaySafety: { auditEvidence: mode } }));
+    const file = join(home, `prefs-${mode ?? 'empty'}.json`);
+    writeFileSync(file, JSON.stringify(mode ? { overlaySafety: { auditEvidence: mode } } : {}));
     return file;
   };
-  const gate = env => registrationAuditGate({ root, ref: 'lane/fix', sha, by: 'operator', readOnly: true,
-    env: { ...baseEnv, HOME: home, WE_DAEMON_OVERLAY_DIR: join(home, 'state'), ...env } });
+  const envFor = row => ({ ...baseEnv, HOME: home, WE_DAEMON_OVERLAY_DIR: join(home, 'state'),
+    WE_PLATFORM_PREFERENCES_FILE: prefsFor(row.prefs), ...(row.env ? { WE_OVERLAY_AUDIT_EVIDENCE: row.env } : {}) });
   try {
     const rows = [
-      { prefs: 'refuse', expected: false },
-      { prefs: 'warn', expected: true },
-      { prefs: 'off', expected: true },
-      { prefs: 'warn', env: 'refuse', expected: false },
-      { prefs: 'off', env: 'refuse', expected: false },
-      { prefs: 'off', env: 'warn', expected: true },
-      { env: 'off', expected: false },
-      { env: 'warn', expected: false },
+      { prefs: 'refuse', mode: 'refuse', expected: false },
+      { prefs: 'warn', mode: 'warn', expected: true },
+      { prefs: 'off', mode: 'off', expected: true },
+      { prefs: 'warn', env: 'refuse', mode: 'refuse', expected: false },
+      { prefs: 'off', env: 'refuse', mode: 'refuse', expected: false },
+      { prefs: 'off', env: 'warn', mode: 'warn', expected: true },
+      { env: 'off', mode: 'refuse', expected: false },
+      { env: 'warn', mode: 'refuse', expected: false },
     ];
     for (const row of rows) {
-      const env = {};
-      if (row.prefs) env.WE_PLATFORM_PREFERENCES_FILE = prefsFor(row.prefs);
-      if (row.env) env.WE_OVERLAY_AUDIT_EVIDENCE = row.env;
-      assert.equal(gate(env), row.expected, JSON.stringify(row));
+      const env = envFor(row);
+      assert.equal(overlaySafetySettings(env).auditEvidence, row.mode, JSON.stringify(row));
+      assert.equal(registrationAuditGate({ root, ref: 'lane/fix', sha, by: 'operator', readOnly: true, env }), row.expected, JSON.stringify(row));
     }
+    // readOnly (--check) with an override admits but records no unaudited-override event.
+    assert.equal(registrationAuditGate({ root, ref: 'lane/fix', sha, by: 'operator', readOnly: true,
+      unauditedReason: 'emergency approved', env: envFor({ prefs: 'refuse' }) }), true);
     assert.equal(readdirSync(home).includes('state'), false, 'readOnly gate writes nothing');
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

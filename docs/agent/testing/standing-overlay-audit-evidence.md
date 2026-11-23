@@ -13,7 +13,8 @@ written, and a refusal exits 3.
 event. The prototype loader's `--audit-checked-by` marker is provenance, never evidence.
 The read-only `scripts/daemon-overlay-audit-check.mjs` inventory checks the current local
 `origin/<ref>` tip of each registration; it never fetches. The stored registration SHA is only
-reported as `moved-from` when the tip differs. A gone ref reports `sha=unresolved` and fails.
+reported as `moved-from` when the tip differs or cannot be resolved. A gone ref reports
+`sha=unresolved` and fails.
 A corrupt state file or any unaudited entry exits nonzero.
 The `daemon-overlay-audit-check` and `overlay-audit-evidence` suites run under both node:test and
 Vitest; the `daemon-overlay-audit-gate` suite is Vitest-only (it uses `vi` spies and env stubs).
