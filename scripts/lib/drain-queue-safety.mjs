@@ -6,6 +6,7 @@ import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { stripVTControlCharacters } from 'node:util';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
@@ -137,11 +138,9 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
-  const unreadableRetry = retryEvidence?.infra === 'unreadable-log' && retryEvidence.mainGreen === true
-    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !unreadableRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -159,7 +158,6 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
-      : unreadableRetry ? 'failed_checks unreadable-log retry 1/1 (failed job log unreadable, main green, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -901,18 +899,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
-          if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
-          const tail = Buffer.from(text).subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
+          if (typeof text !== 'string' || !stripVTControlCharacters(text).trim()) throw new Error('unreadable log');
+          // Bound the scan as well as subprocess output. Injected readers may return oversized text.
+          const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
           if (tail.split('\n').some(line => line.length > MQ_INFRA_LINE_CHARS))
             logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
           // Readability alone never proves infrastructure.
-        } catch (error) {
+        } catch {
           unreadable.add(check.id);
-          if (['merge-gate', 'review-gate'].includes(localJob(check.name))
-            || error?.code != null && !Number.isInteger(error.code)
-            || /maxBuffer|timed out/i.test(String(error?.message))
-            || ![check.output?.title, check.output?.summary].every(value => typeof value === 'string' && !value.trim()))
-            logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
         }
       }
     }
@@ -928,11 +922,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     if (!intrinsic.length && !noLogInfra)
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
-    const unreadableOnly = !blocked && !logReason && unreadable.size > 0
-      && !hasAggregateCandidates && derived.size === 0 && !attempts.reason
-      && attempts.candidates.length === intrinsic.length
-      && intrinsic.every(c => unreadable.has(c.id));
-    if (unreadable.size > 0 && !unreadableOnly)
+    if (unreadable.size > 0)
       logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
     let infra = !logReason && (noLogInfra || intrinsic.every(check => !hasAggregateCandidates && summaryInfra(check)));
     const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
@@ -1086,7 +1076,6 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
-        && (!unreadableOnly || deciding === newest[0] && stale === false)
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
@@ -1094,7 +1083,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : unreadableOnly ? 'unreadable-log' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
@@ -1115,7 +1104,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (['quarantined', 'cancelled-regroup'].includes(evidence.infra))
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red', 'flaky-test', 'exact-test', 'unreadable-log'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
