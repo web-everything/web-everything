@@ -6349,6 +6349,57 @@ Normalization `ok:false` never supplies success or real-failure proof; recovery 
 Keep negative tests for real failures (zero refreshes), unreadable/normalization-failed logs (one refresh),
 repeat failures and persisted ledger entries (no second refresh), new author heads (one new refresh), and
 the merge gate refusing non-green group members. The unreadable-log soak probes the refresh path itself.
+
+Refresh refusal is terminal for the guard's automatic refresh path: missing options/store, failed eligibility,
+or refused/unreadable approval selects fixer inspection without spending a refresh claim. Dry-run stays
+read-only. Both immediate and recovered successor binding require a verified GitHub `web-flow` commit
+in addition to the parent relationship; an author's local merge of main retains its own attempt.
+Infrastructure prose (`fail-closed`, `Failed to download action`, runner loss) is not assertion evidence;
+`FAIL` needs a file-path or suite-result shape. Preserve timestamp, ANSI and CRLF fixture variants.
+
+### MQ ANSI incident acceptance manifest (PR #7343)
+
+Record a result and evidence location for every row at handoff; a synthetic fixture is not live proof.
+
+| Guarantee | Named check | Result in this offline repair |
+| --- | --- | --- |
+| ANSI job logs are normalized and classified | `drain-mq-failure-recovery-io.test.mjs`: `job log with ANSI escapes is read and classified, not unreadable`; soak `drain-mq-log-reader-escape-sequences` | Await launcher verify |
+| Infrastructure/gate prose gets at most one refresh | `drain-queue-safety-same-head-retry.test.mjs`: `infrastructure or gate output %s spends exactly one refresh` | Four new cases reproduced red before repair; await launcher verify |
+| Refused refresh exits to fixer | Same-head suite: `skipped refresh (%s) routes to fixer without spending a claim`; recovery IO suite: `a guard with %s routes unreadable evidence to the fixer without a refresh` | Five guard cases reproduced red; integration awaits launcher verify |
+| Local author merges retain their attempt | Same-head suite: `author merge receives its own refresh (races post-write read: %s)` | Both races reproduced red; await launcher verify |
+| Incident #7310 recovered | `mq-ansi-incident-7310` below | BLOCKED: no network or incident observations supplied |
+| Incident #7315 recovered | `mq-ansi-incident-7315` below | BLOCKED: no network or incident observations supplied |
+| Incident #7321 recovered | `mq-ansi-incident-7321` below | BLOCKED: no network or incident observations supplied |
+
+The named live checks are read-only acceptance procedures, one per incident PR in
+`web-everything/web-everything`. The launcher/operator records the following evidence for each:
+
+1. Read the PR and complete removal history. Record the observed UTC time, current head, incident PR head,
+   merge-group SHA and failed job/run URLs. Bind the incident head to the removal's second parent; if the
+   current head advanced, keep both identities. Missing/expired history is `UNVERIFIED`, never pass.
+2. Read each failed job via `ciJobLogApiArgs` and `readNormalizedJobLog`; record successful transport,
+   whether SGR was present, normalization status and classification using `createDrainMqFailureRecoveryIo`
+   evidence collection. Preserve a bounded diagnostic excerpt and evidence location. Empty, truncated,
+   unsupported-escape or expired logs do not demonstrate successful ANSI classification.
+3. Inspect the shared refresh ledger and drain request/skip diagnostics for that authored head and its
+   generated successor. Record the claim count separately from the observed update-branch request count
+   and outcome (requested, refused, skipped, or fixer). A claim alone cannot prove a successful refresh;
+   more than one request for the authored head fails acceptance. Record successor committer and verification
+   metadata as well, to validate the production binding against the fixture assumption.
+4. Read subsequent PR and merge-group CI. Record head SHA, run URL, conclusion and whether admission stayed
+   held until the merge group was green. A newer head's green run cannot stand in for the incident outcome.
+   Report `PASS` only with successful ANSI classification, policy-consistent refresh/fixer outcome and a
+   recorded subsequent CI result; record unresolved recovery as `FAIL` or `UNVERIFIED` with its reason.
+
+Receipt fields: `check`, `observedAt`, `currentHead`, `incidentHead`, `mergeGroupHead`, `failedJobUrls`,
+`ansiPresent`, `normalization`, `classification`, `refreshClaims`, `refreshRequests`, `refreshOutcome`,
+`successorHead`, `successorCommitter`, `successorVerified`, `subsequentCiHead`, `subsequentCiUrl`,
+`subsequentCiConclusion`, `admissionHeldUntilGreen`, `result`, `evidenceLocation`. No live receipt was
+available in the offline repair; these three acceptance rows remain open until recorded by the launcher/operator.
+The offline caller sweep also found that `scripts/merge-ai-prs.mjs` returns the same-head hold without
+invoking `routeMqFailureOnHold`. This existing caller is outside the repair's listed file scope; guard/adapter
+fixtures do not prove production fixer dispatch. Resolve that wiring gap before claiming incident recovery.
+
 ## Orphan exclusions precede stand-down answers
 
 The fix-dispatch orphan guard must reach `runReconcilePass` before R123 enrichment,

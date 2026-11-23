@@ -26,7 +26,7 @@ function fixture(test) {
       timelineItems: { nodes: f.events, pageInfo: { hasPreviousPage: false } } } } } });
     if (args.includes('PUT')) { f.writes.push(args); if (f.afterHead) f.head = f.afterHead; return '{}'; }
     if (args.includes('headRefOid') && f.postReadFails) throw new Error('post-write read unavailable');
-    if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, mergeStateStatus: 'CLEAN',
+    if (args[0] === 'pr') return JSON.stringify({ headRefOid: f.head, mergeStateStatus: f.mergeState ?? 'CLEAN',
       statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }], labels: ['ready-to-merge'] });
     const endpoint = args.find(a => a.startsWith('repos/'));
     if (endpoint?.includes('/check-runs') && f.checksOverride) return JSON.stringify(f.checksOverride);
@@ -34,7 +34,9 @@ function fixture(test) {
       id: 12, name: 'test-shard (1)', head_sha: merge, status: 'completed', conclusion: 'failure',
       details_url: `https://github.com/${repo}/actions/runs/800/job/901` }] });
     if (endpoint?.includes('/commits/')) return JSON.stringify({ sha: f.head,
-      parents: f.afterHead === f.head ? [{ sha: head }, { sha: 'c'.repeat(40) }] : [{ sha: 'c'.repeat(40) }] });
+      committer: { login: f.authorMerge ? 'contributor' : 'web-flow' },
+      commit: { verification: { verified: !f.unverified } },
+      parents: f.authorMerge || f.afterHead === f.head ? [{ sha: head }, { sha: 'c'.repeat(40) }] : [{ sha: 'c'.repeat(40) }] });
     if (endpoint?.endsWith('/logs')) {
       f.logs.push({ args, options });
       expect(args).toContain('--allow-escape-sequences');
@@ -78,6 +80,7 @@ describe('same-head failures never authorize re-enqueue from logs', () => {
         retryEvidence: { infra, mainGreen: true, mergeState: 'CLEAN' } }).hold).toBe(true);
     });
   it.each(['AssertionError: expected true', ' FAIL tests/widget.test.mjs > keeps state',
+    'FAIL widget.test.mjs', 'FAILED suite > keeps state', 'FAIL tests\\widget.test.mjs',
     'Unhandled Rejection: broken', 'Errors 1 error', 'Error: assertion failed',
     '2026-11-21T12:00:00Z ##[error]AssertionError: expected true',
     '2026-11-21T12:00:00Z  FAIL tests/widget.test.mjs > keeps state',
@@ -100,6 +103,31 @@ describe('same-head failures never authorize re-enqueue from logs', () => {
     expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
     expect(f.writes).toHaveLength(1);
   }));
+  it.each(['2026-11-16T02:19:19Z   fail-closed   red-main-freeze   red-main freeze unreadable',
+    'Failed to download action', 'failed to connect', 'FAILED to download action',
+    '\x1b[31m2026-11-16T02:19:19Z ##[error]Failed to download action\x1b[0m\r\n',
+    'The runner has lost communication with the server.'])(
+    'infrastructure or gate output %s spends exactly one refresh', text => fixture(f => {
+      f.text = text;
+      expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'refresh-first' });
+      expect(f.writes).toHaveLength(1);
+      expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
+      expect(f.writes).toHaveLength(1);
+    }));
+  it.each(['allow false', 'allow throws', 'no store', 'no refresh', 'ineligible'])(
+    'skipped refresh (%s) routes to fixer without spending a claim', condition => fixture(f => {
+      const store = createMqSameHeadRefreshStore({ path: f.path });
+      const refresh = { store, allow: () => true };
+      if (condition === 'allow false') refresh.allow = () => false;
+      if (condition === 'allow throws') refresh.allow = () => { throw new Error('unreadable approval'); };
+      if (condition === 'no store') delete refresh.store;
+      if (condition === 'ineligible') f.mergeState = 'BLOCKED';
+      const options = { refresh: condition === 'no refresh' ? undefined : refresh };
+      expect(f.run(options)).toMatchObject({ hold: true, recoveryAction: 'fixer', reason: expect.stringMatching(/refresh unavailable/) });
+      expect(f.run(options)).toMatchObject({ hold: true, recoveryAction: 'fixer' });
+      expect(f.writes).toHaveLength(0);
+      expect(store.has(`${repo}#${pr}@${head}`)).toBe(false);
+    }));
   it.each(['Run node --test tests/assert.test.mjs', 'Run npm test -- --testNamePattern="expected state"'])(
     'infrastructure log with command header %s does not prove an assertion failure', header => fixture(f => {
       f.text = `${header}\nThe runner has lost communication with the server.\n`;
@@ -145,6 +173,22 @@ describe('same-head failures never authorize re-enqueue from logs', () => {
     f.events.push(removed(f.head));
     expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
     expect(f.writes).toHaveLength(1);
+  }));
+  it.each([false, true])('author merge receives its own refresh (races post-write read: %s)', racesRead => fixture(f => {
+    if (racesRead) { f.afterHead = 'e'.repeat(40); f.authorMerge = true; }
+    f.run();
+    f.head = 'e'.repeat(40); f.authorMerge = true;
+    f.events.push(removed(f.head));
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'refresh-first' });
+    expect(f.writes).toHaveLength(2);
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'fixer' });
+  }));
+  it('unverified merge attributed to web-flow does not inherit a spent refresh', () => fixture(f => {
+    f.afterHead = 'e'.repeat(40); f.unverified = true;
+    f.run();
+    f.events.push(removed(f.head));
+    expect(f.run()).toMatchObject({ hold: true, recoveryAction: 'refresh-first' });
+    expect(f.writes).toHaveLength(2);
   }));
   it('recovers spent successor binding after an unreadable post-write head read', () => fixture(f => {
     f.afterHead = 'e'.repeat(40); f.postReadFails = true;

@@ -4,6 +4,7 @@ import { classifyMqFailureEvidence } from '../mq-failure-evidence.mjs';
 import { createMqFailureLedger } from '../mq-failure-ledger.mjs';
 import { parseMqFailureRoute } from '../mq-failure-route.mjs';
 import { admitMqFailureRoute } from '../../conveyor/mq-failure-intake.mjs';
+import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
 
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40) };
 const mergeHead = 'b'.repeat(40);
@@ -31,12 +32,17 @@ function fixture(mode = 'real') {
     expect(file).toBe('gh');
     if (mode === 'unreadable') throw new Error('unreadable remote');
     if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: {
+      headRefOid: identity.head, isInMergeQueue: false,
       timelineItems: { nodes: events, pageInfo: { hasPreviousPage: mode === 'incomplete timeline' } },
     } } } });
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: mode === 'stale head' ? 'd'.repeat(40) : identity.head,
       mergeStateStatus: mode === 'conflict' ? 'DIRTY' : 'CLEAN', baseRefName: 'main',
+      statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
       labels: mode === 'unknown labels' ? null : [] });
     const endpoint = args.find(arg => arg.startsWith(`repos/${identity.repo}/`));
+    if (endpoint?.includes('/check-runs')) return JSON.stringify({ total_count: 1, check_runs: [{
+      id: 901, name: 'unit', head_sha: mergeHead, status: 'completed', conclusion: 'failure',
+      details_url: `https://github.com/${identity.repo}/actions/runs/701/job/901` }] });
     if (args[0] === 'pr' && args[1] === 'comment') { expect(typeof options.input).toBe('string'); return ''; }
     if (args.includes('POST')) {
       const payload = JSON.parse(options.input);
@@ -130,6 +136,26 @@ describe('drain MQ failure production adapter', () => {
     expect(await routeMqFailureOnHold({ ...f.options, guard: { ...guard, recoveryAction: 'refresh-first' } })).toMatchObject({ routed: false });
     expect(f.exec).not.toHaveBeenCalled();
   });
+  it.each(['approval refused', 'no refresh store', 'no refresh options'])(
+    'a guard with %s routes unreadable evidence to the fixer without a refresh', async mode => {
+      const f = fixture('404 log');
+      const allow = vi.fn(() => false);
+      const refresh = mode === 'no refresh options' ? undefined
+        : { store: mode === 'no refresh store' ? undefined : f.refreshStore, allow };
+      const held = mqSameHeadGuard({ ...identity, exec: f.exec, refresh });
+      expect(held).toMatchObject({ hold: true, recoveryAction: 'fixer' });
+      if (mode === 'approval refused') expect(allow).toHaveBeenCalledOnce();
+      expect(f.options.io.readRefreshCount(identity)).toBe(0);
+      expect(await routeMqFailureOnHold({ ...f.options, guard: held })).toMatchObject({ routed: true });
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('PUT'))).toBe(false);
+      const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+      const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+      expect(route).toMatchObject({ complete: false, fixerOnly: true });
+      expect(admitMqFailureRoute({ ...identity, route,
+        changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+      expect(await routeMqFailureOnHold({ ...f.options, guard: held })).toMatchObject({ routed: false });
+      expect(f.writes()).toHaveLength(2);
+    });
   it('404 job log retains the hold without publication', async () => {
     const f = fixture('404 log');
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });

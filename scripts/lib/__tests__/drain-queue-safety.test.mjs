@@ -989,7 +989,8 @@ describe('merge-queue same-head failure admission', () => {
     const result = mqSameHeadGuard({ repo, pr, head, exec, log });
     expect(result).toEqual(decide(timeline(removed())));
     expect(exec).toHaveBeenCalledTimes(3); // Queue, timeline, then the unreadable infra-retry evidence read (fails closed).
-    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-recovery: #${pr} head ${head} — failed checks unreadable or incomplete; refresh once before fixer`]]);
+    expect(result.recoveryAction).toBe('fixer');
+    expect(log.mock.calls).toEqual([[result.line], [`mq-same-head-recovery: #${pr} head ${head} — single refresh unavailable or refused by preconditions; hold for fixer inspection`]]);
   });
   it('mqSameHeadGuard releases manual removal without logging a hold', () => {
     const exec = withQueue(() => response(timeline(removed('manual')))), log = vi.fn();
