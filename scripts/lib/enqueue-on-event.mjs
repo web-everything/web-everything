@@ -1178,9 +1178,15 @@ export function createEnqueueOnEvent({
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
         const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
-        const json = lastJsonLine(r.stdout);
+        const exitFailed = !r.timedOut && r.code !== 0;
+        // A failed child cannot supply success or permanent-decline evidence.
+        const json = exitFailed ? null : lastJsonLine(r.stdout);
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
         const summary = what;
+        if (!r.timedOut && (r.code !== 0 || !json)) {
+          const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
+          if (stderr) what += ` (stderr: ${stderr})`;
+        }
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
         const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);
@@ -1254,7 +1260,7 @@ export function createEnqueueOnEvent({
           refillCatchUp();
         }
         if (batchingRetry === p.num && !summary.startsWith('not enqueued: batching-deferred:')) batchingRetry = null;
-        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
+        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error || exitFailed });
         declines.delete(p.num); // every actual outcome replaces the previous one, including success/error
         // Allowlist: only affirmative, head-bound declines are remembered. Transient, infrastructure
         // and unknown kinds (batching-deferred, merge-lock-held, live-state-unreadable, ...) always retry.

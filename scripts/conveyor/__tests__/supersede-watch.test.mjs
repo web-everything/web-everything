@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setMarkdownLoader } from '../supersede-rule.mjs';
 import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadBodyEdit } from '../supersede-watch.mjs';
 import { runTickAllRepos, runSupersedeAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
@@ -139,6 +140,26 @@ describe('supersede daemon wiring', () => {
     expect(order).toEqual([`supersede:${repo}`, `fix:${repo}`]);
     expect(supersedeTick).toHaveBeenCalledWith({ repo });
     expect(result.supersede.repos[0].holds).toEqual([hold]);
+  });
+  it.each(['load', 'parse'])('blocks dispatch when markdown-it cannot %s; retries after repair', async (failure) => {
+    const fixTick = vi.fn(noopDispatch);
+    const ciHealTick = vi.fn(async () => noopDispatch());
+    setMarkdownLoader(() => {
+      if (failure === 'load') throw new Error('markdown-it unavailable');
+      return class { disable() { return this; } parse() { throw new Error('markdown-it unavailable'); } };
+    });
+    const options = { ...tickFakes(), fixTick, ciHealTick, supersedeTick: () => runSupersedeWatch(fakes()) };
+    try {
+      const result = runSupersedeWatch(fakes());
+      expect(result).toMatchObject({ blocked: true, error: 'markdown-it unavailable' });
+      expect(formatSupersedeLines({ repos: [result] }).join('')).toContain('dispatch blocked');
+      await expect(runTickAllRepos(options)).rejects.toThrow('markdown-it unavailable');
+      expect(fixTick).not.toHaveBeenCalled();
+      expect(ciHealTick).not.toHaveBeenCalled();
+    } finally { setMarkdownLoader(); }
+    await runTickAllRepos(options);
+    expect(fixTick).toHaveBeenCalledTimes(1);
+    expect(ciHealTick).toHaveBeenCalledTimes(1);
   });
   it('never invokes the real supersede watcher in an injected test tick', async () => {
     expect((await runTickAllRepos(tickFakes())).supersede).toEqual({ repos: [] });

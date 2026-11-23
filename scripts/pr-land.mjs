@@ -111,8 +111,7 @@ export function buildSizeAdmissionRequest({ ref, pr, remote, base, refSha, body 
 }
 
 import { assertMayMerge, hasNonEmptyBody } from './lib/pr-merge-gate.mjs';
-import { soakPrecheckAtOpen, soakPrecheckEnabled } from './lib/soak-precheck-at-open.mjs';
-import { parseNameStatus } from './soak-replay-gate-cli.mjs';
+import { soakPrecheckAtOpen, soakPrecheckEnabled, parseSoakNameStatus } from './lib/soak-precheck-at-open.mjs';
 import { createGhLandProvider, buildCreateArgs } from './lib/forge-land-provider.mjs'; // #3585 — the forge-land port
 export { mergeMethodFlag, buildCreateArgs, buildMergeArgs, buildAddLabelArgs } from './lib/forge-land-provider.mjs'; // re-exported for backward compat — callers/tests still import these off pr-land.mjs
 import { numberPendingHashes, isPostLandTreeDirty } from './lane-drain.mjs'; // JIT numbering + dirty-probe, shared single source (#2288/#xzxc92d/#2348)
@@ -785,7 +784,10 @@ if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 
 async function runCli() {
   // Install the closure before setup so the entry-point catch can use the normal failure output.
   emit = emitResult;
-  const gitC = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const gitC = (args) => {
+    const output = execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return args.includes('-z') ? output : output.trim();
+  };
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
   // otherwise the strict-lock hook would block pr-land's own legitimate landing. Scoped to THESE calls only, so
@@ -950,10 +952,12 @@ async function runCli() {
     if (!soakPrecheckEnabled()) return { ok: true, skipped: 'disabled' };
     let files;
     try {
-      files = parseNameStatus(gitC(['diff', '--name-status', '-M', `${REMOTE}/${BASE}...${refSha}`]));
-    } catch (e) {
-      process.stderr.write(`pr-land [${REPO}] · soak precheck: diff unavailable (${String(e.message || e).split('\n')[0]}); CI still enforces it\n`);
-      return { ok: true, skipped: 'diff unavailable; CI still enforces it' };
+      const diff = gitC(['diff', '--name-status', '-z', '-M', `${REMOTE}/${BASE}...${refSha}`]);
+      files = parseSoakNameStatus(diff);
+    } catch {
+      const reason = 'diff unavailable or invalid';
+      return { ok: false, reason,
+        message: `soak precheck: ${reason}. Fix: make the base and source commits available, resolve unsupported diff records, and retry.` };
     }
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
@@ -1094,7 +1098,7 @@ async function runCli() {
     if (!bodyGuard.ok) collect('body', bodyGuard.code, bodyGuard.reason);
     const soak = soakCreatePrecheck();
     if (!soak.ok) collect('soak-declaration', 'soak-declaration', soak.message);
-    if (!AS_JSON && !soak.skipped?.startsWith('diff unavailable')) {
+    if (!AS_JSON) {
       process.stderr.write(`pr-land [${REPO}] · soak precheck: ${soak.skipped || soak.reason}\n`);
     }
   }
