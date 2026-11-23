@@ -203,6 +203,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/mirror-sync.mjs',
   // Landed on main since: the red-main quarantine rerun marker (an exclusive `wx` create).
   'scripts/lib/red-main-quarantine-io.mjs',
+  // Unit retries consume their once-only allowance with an exclusive `wx` marker.
+  'scripts/ci/rerun-failed-once.mjs',
   // Landed on main since: the force-adopt watch transition (a lock directory made without `recursive`).
   'scripts/lib/daemon-force-adopt.mjs',
   // Landed on main since (PR #6381 judge sweep, CI run 42533429518): the review-run archiver and the abandoned-run

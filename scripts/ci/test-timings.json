@@ -405,6 +405,7 @@
   "scripts/ci/__tests__/quarantine-job-wiring.test.mjs": 0.06,
   "scripts/ci/__tests__/quarantine-skip.test.mjs": 0.77,
   "scripts/ci/__tests__/refresh-timings.test.mjs": 3.68,
+  "scripts/ci/__tests__/rerun-failed-once.test.mjs": 0.05,
   "scripts/ci/__tests__/review-fast-checks.test.mjs": 0.01,
   "scripts/ci/__tests__/shard-assign.test.mjs": 1.15,
   "scripts/ci/__tests__/shard-runner-compare.test.mjs": 0.05,

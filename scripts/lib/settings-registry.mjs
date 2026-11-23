@@ -23,7 +23,7 @@ const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 // Keep regeneration self-contained within advisory-merge's pinned closure.
 // JSON.parse validates syntax first; strings are indivisible tokens, and each
 // object gets its own set of decoded property names (including escaped names).
-function hasDuplicateProperties(raw) {
+export function hasDuplicateProperties(raw) {
   const scopes = [];
   const tokens = /"(?:\\.|[^"\\])*"|[{}\[\]:,]/g;
   for (const token of raw.matchAll(tokens)) {
