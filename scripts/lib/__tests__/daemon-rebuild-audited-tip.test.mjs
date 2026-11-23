@@ -805,6 +805,16 @@ describe('unaudited-tip: a pending ready candidate never outlives its audit evid
 
 describe('unaudited-tip wiring', () => {
   const sourceOf = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  it('audited-tip loads the hotpatch guard modules lazily, never through a static import cycle', () => {
+    // A static import closes daemon-overlays -> audited-tip -> hotpatch-guards -> prototype-load ->
+    // prototype-load-io -> daemon-overlays, which deadlocked vite-node and hung CI test-shard 9 (PR #7362).
+    const source = sourceOf('../daemon-rebuild/audited-tip.mjs');
+    const target = String.raw`['"]\.\.\/hotpatch-(guards|readers)\.mjs['"]`;
+    expect(source).not.toMatch(new RegExp(String.raw`^\s*(import|export)\b[^;]*?\bfrom\s+${target}`, 'm'));
+    expect(source).not.toMatch(new RegExp(String.raw`^\s*import\s+${target}`, 'm'));
+    expect(source).toContain("await import('../hotpatch-guards.mjs')");
+    expect(source).toContain("await import('../hotpatch-readers.mjs')");
+  });
   /** Text of every `planRebuild({ … })` call (brace-balanced), definitions excluded. */
   const planCalls = (src) => {
     const out = [];
@@ -1197,13 +1207,4 @@ describe('hotpatch canonical evidence at finalization', () => {
       } finally { factory.mockRestore(); }
     },
   );
-});
-
-it('audited-tip loads the hotpatch guard modules lazily, never through a static import cycle', () => {
-  // A static import closes daemon-overlays -> audited-tip -> hotpatch-guards -> prototype-load ->
-  // prototype-load-io -> daemon-overlays, which deadlocked vite-node and hung CI test-shard 9 (PR #7362).
-  const source = readFileSync(new URL('../daemon-rebuild/audited-tip.mjs', import.meta.url), 'utf8');
-  expect(source).not.toMatch(/^\s*import\s[^;]*from\s+['"]\.\.\/hotpatch-(guards|readers)\.mjs['"]/m);
-  expect(source).toContain("await import('../hotpatch-guards.mjs')");
-  expect(source).toContain("await import('../hotpatch-readers.mjs')");
 });
