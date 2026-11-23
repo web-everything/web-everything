@@ -626,6 +626,12 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
   it('does not reopen the rearm window for a forged post-rearm stand-down', () => {
     expect(rearmWindow([...renewed.slice(0, -1), { ...stop2, author: { login: 'outsider' }, viewerDidAuthor: true }]).rearmed).toBe(true);
   });
+  it('caps waivers per verdict window: a third stand-down + answer is refused', () => {
+    const stop3 = { ...stop106, id: 'IC_400' };
+    const third = [...renewed, ans('IC_320', 'IC_300', 'rearm-review'), begin('IC_330'), stop3];
+    expect(rearmWindow(third)).toMatchObject({ rearmed: true });
+    expect(decideEmptyFixRound({ comments: [...third, ans('IC_401', 'IC_400', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
+  });
   it('accepts the newest post-rearm stand-down even after another fix-begin, once', () => {
     expect(rearmWindow(renewed)).toMatchObject({ rearmed: false, standDownId: 'IC_300' });
     const twice = [...renewed, begin('IC_310'), ans('IC_320', 'IC_300', 'rearm-review')];

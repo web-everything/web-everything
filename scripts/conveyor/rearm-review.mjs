@@ -202,11 +202,13 @@ function normaliseComment(c) {
  * (`decideEmptyFixRound`) and the answer CLI (`stand-down-answer.mjs`) read it, so the CLI refuses exactly what the
  * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
  */
+const REARM_WAIVER_CAP = 2;
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
   let standDownIds = [];
   let rearmed = false;
+  let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -220,6 +222,7 @@ export function rearmWindow(comments) {
       reviewedHead = null;
       standDownIds = [];
       rearmed = true;
+      waivers += 1;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
@@ -230,6 +233,7 @@ export function rearmWindow(comments) {
       reviewedHead = verdictReviewedHead(c);
       standDownIds = [];
       rearmed = false;
+      waivers = 0;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
@@ -240,7 +244,7 @@ export function rearmWindow(comments) {
       if (c.id != null) {
         standDownIds.push(String(c.id));
         // A fresh stop after a later claim needs its own answer; the cleared old id stays unanswerable.
-        rearmed = false;
+        if (waivers < REARM_WAIVER_CAP) rearmed = false;
       }
     }
   }
