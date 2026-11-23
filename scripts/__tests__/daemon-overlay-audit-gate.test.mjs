@@ -68,6 +68,16 @@ test('gate requires readable main coverage and a canonical audit or matching wai
     assert.equal(run({ sha: tip }), false);
     git(['update-ref', 'refs/remotes/origin/main', base]);
     writeFileSync(join(dir, 'audits.jsonl'), JSON.stringify({ head: tip, base, verdict: 'WEAKENED', questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z', findings: ['accepted'] }) + '\n');
+    // The read-only registration surface must accept a supported settings waiver without a store entry.
+    const prefs = join(home, 'waiver-prefs.json');
+    const settingsEntry = { ref: 'lane/fix', sha: tip, ruling: 'R12', findings: ['accepted'] };
+    const writePrefs = entry => writeFileSync(prefs, JSON.stringify({ prototypeLoad: { ruledWeakened: [entry] } }));
+    const settingsEnv = { ...env, WE_PLATFORM_PREFERENCES_FILE: prefs };
+    writePrefs(settingsEntry);
+    assert.equal(run({ sha: tip, env: settingsEnv, readOnly: true }), true);
+    writePrefs({ ...settingsEntry, findings: ['unrelated'] });
+    assert.equal(run({ sha: tip, env: settingsEnv, readOnly: true }), false);
+    writePrefs(settingsEntry);
     writeFileSync(join(dir, 'ruled-weakened.jsonl'), JSON.stringify({ ref: 'lane/fix', sha: tip, ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' }) + '\n');
     assert.equal(run({ sha: tip }), true);
     const handoff = join(home, 'workspace/.operations/handoff');
@@ -75,6 +85,7 @@ test('gate requires readable main coverage and a canonical audit or matching wai
     const withdrawal = JSON.stringify({ ref: 'lane/fix', sha: tip, ruling: 'WITHDRAWN', at: '2026-11-11T00:00:00Z', reason: 'withdrawn\nby operator' });
     writeFileSync(join(handoff, 'waiver-requests.jsonl'), withdrawal + '\n');
     assert.equal(run({ sha: tip }), false);
+    assert.equal(run({ sha: tip, env: settingsEnv, readOnly: true }), false, 'withdrawal also revokes settings evidence');
     writeFileSync(join(handoff, 'waiver-requests.jsonl'), withdrawal.replace('\\n', '\n') + '\n');
     assert.equal(run({ sha: tip }), false, 'damaged withdrawal must not reinstate the older waiver');
   } finally { rmSync(home, { recursive: true, force: true }); }

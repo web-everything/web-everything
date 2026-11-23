@@ -11,6 +11,12 @@ setting `WE_OVERLAY_AUDIT_EVIDENCE=off` alone does nothing.
 written, and a refusal exits 3.
 `--unaudited-reason` requires at least ten trimmed characters and leaves an `unaudited-override`
 event. The prototype loader's `--audit-checked-by` marker is provenance, never evidence.
+Waivers come from `prototypeLoad.ruledWeakened` platform preferences, the `ruledWeakened`
+list in `scripts/settings/prototype-load.json`, and the shared `ruled-weakened.jsonl` store.
+The gate preserves the prototype loader's tool → platform → store precedence for a matching
+ref/SHA/ruling. Settings entries use the loader's ruling/findings schema; store entries also
+require actor, quote and timestamp. Every waiver still needs an exact ref/SHA match and a
+matching canonical audit, and withdrawals apply to every source.
 The read-only `scripts/daemon-overlay-audit-check.mjs` inventory checks the current local
 `origin/<ref>` tip of each registration; it never fetches. The stored registration SHA is only
 reported as `moved-from` when the tip differs or cannot be resolved. A gone ref reports
