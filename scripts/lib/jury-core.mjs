@@ -1377,6 +1377,14 @@ export function redTeamRequired(verdict) {
   return verdict === VERDICTS.ACCEPT;
 }
 
+/** Lost reducer evidence always escalates, even with no findings. Mirrored inline in the import-free workflow. */
+export function redTeamReduceFallback({ reduced } = {}) {
+  if (!reduced?.verdict) return { verdict: 'needs-human', outcome: 'escalate' };
+  const verdict = reduced.verdict;
+  const outcome = typeof reduced.outcome === 'string' ? reduced.outcome : null;
+  return { verdict, outcome: outcome || (verdict === 'accept' ? 'land' : 'escalate') };
+}
+
 /**
  * Fold a red-team's result into the FINAL (post-red-team) verdict. Pure, FAIL-CLOSED. Delegates to `deriveVerdict`
  * with `humanRequired = !ran`, so the "no signal is a FAILING signal" invariant is the SAME one `deriveVerdict`
@@ -1392,7 +1400,10 @@ export function redTeamRequired(verdict) {
  * @returns {'accept'|'changes'|'needs-human'|'prevention-outstanding'}
  */
 export function foldRedTeamVerdict({ ran = false, findings = [], findingClasses = readFindingClassPolicy() } = {}) {
-  return deriveVerdict({ findings: findings.filter(f => classAction(f, findingClasses) !== 'defer-card'), humanRequired: !ran });
+  // A policy preference to defer is not a recorded disposition: require both the card and its ruling.
+  const nonEmpty = value => typeof value === 'string' && value.trim().length > 0;
+  return deriveVerdict({ findings: findings.filter(f => !(classAction(f, findingClasses) === 'defer-card'
+    && nonEmpty(f.cardId) && nonEmpty(f.ruling))), humanRequired: !ran });
 }
 
 /**

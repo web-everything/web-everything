@@ -888,11 +888,10 @@ async function redTeamGate(roster, material, materialFile, round, roundCap) {
     { label: `redteam-reduce:${subject}:r${round}`, phase: 'Red-team', schema: VERDICT_SCHEMA },
   ).catch(() => null);
 
-  // Fail-closed on a lost fold too: findings present but no verdict back ⇒ do NOT silently ratify. Match
-  // foldRedTeamVerdict — outstanding findings ⇒ changes, a clean red-team ⇒ accept; a missing outcome falls to the
-  // safe terminal step (land only on a clean accept, else escalate — never a silent `continue` on lost signal).
-  let verdict = (r && r.verdict) || (findings.length ? 'changes' : 'accept');
-  let outcome = (r && typeof r.outcome === 'string') ? r.outcome : null;
+  // Mirror redTeamReduceFallback inline (this workflow has no imports). A lost verdict is missing evidence,
+  // even with empty findings; ignore any orphan outcome and escalate for a human.
+  const verdict = (r && r.verdict) || 'needs-human';
+  let outcome = (r && r.verdict && typeof r.outcome === 'string') ? r.outcome : null;
   if (!outcome) outcome = verdict === 'accept' ? 'land' : 'escalate';
 
   const taggedFindings = findings.map((f) => ({ ...f, category: f.category || RED_TEAM_LENS }));

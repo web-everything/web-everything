@@ -64,10 +64,18 @@ describe('finding class policy', () => {
       readFile: () => JSON.stringify({ findingClasses: { 'theoretical-race': 'fix-now' } }) });
     expect(policy).toEqual({ 'theoretical-race': 'fix-now' });
   });
-  it('excludes deferred findings from changes but keeps unclassified findings blocking', () => {
+  it('keeps deferred findings outstanding without a recorded card and ruling', () => {
     const f = { summary: 'race', findingClass: 'theoretical-race', classBasis: 'requires concurrency' };
-    expect(foldRedTeamVerdict({ ran: true, findings: [f], findingClasses: {} })).toBe('accept');
+    expect(foldRedTeamVerdict({ ran: true, findings: [f], findingClasses: {} })).toBe('changes');
+    for (const evidence of [{ cardId: '123' }, { ruling: 'defer' },
+      { cardId: ' ', ruling: 'defer' }, { cardId: '123', ruling: ' ' },
+      { cardId: 123, ruling: 'defer' }, { cardId: '123', ruling: true }]) {
+      expect(foldRedTeamVerdict({ ran: true, findings: [{ ...f, ...evidence }], findingClasses: {} })).toBe('changes');
+    }
+    const recorded = { ...f, cardId: '123', ruling: 'defer to recorded card' };
+    expect(foldRedTeamVerdict({ ran: true, findings: [recorded], findingClasses: {} })).toBe('accept');
     expect(foldRedTeamVerdict({ ran: true, findings: [f, { summary: 'unknown' }], findingClasses: {} })).toBe('changes');
+    expect(foldRedTeamVerdict({ ran: true, findings: [recorded, { summary: 'unknown' }], findingClasses: {} })).toBe('changes');
     expect(foldRedTeamVerdict({ ran: false, findings: [f], findingClasses: {} })).toBe('needs-human');
   });
 });
