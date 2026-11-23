@@ -6,13 +6,12 @@
 import { test } from 'vitest';
 import { spawnSync, execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import MarkdownIt from 'markdown-it';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildRegistry, readMetadata, renderMarkdown } from '../settings-registry.mjs';
+import { buildRegistry, readMetadata, renderMarkdown, ensureRegistryDoc } from '../settings-registry.mjs';
 import { fixture as mergeFixture, snapshot, DOC, CLOSURE } from './fixtures/generated-merge.mjs';
 import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
@@ -121,12 +120,14 @@ test('render round-trips backslashes and pipes in one table cell', t => {
     assert.deepEqual(actual, original.map(cell => cell === 'Fixture beta.' ? value : cell));
   });
 });
-test('real repository metadata is complete and fresh renders are byte-equal', () => {
+test('real repository metadata is complete and generated documentation matches the render', () => {
   const registry = buildRegistry({ root: ROOT }); assert.deepEqual(registry.problems, []);
   assert.ok([0, 10].includes(registry.toSettle.filter(row => row.top === true).length));
   const identities = registry.toSettle.map(row => `${row.identifier}:${row.where.replace(/:\d+$/, '')}`);
   assert.equal(new Set(identities).size, identities.length, 'identifier+file pairs must be unique');
   assert.equal(registry.capacityRows.length, Object.keys(CAPACITY_LEAVES).length);
+  assert.equal(execFileSync('git', ['ls-files', 'docs/agent/settings-registry.md'], { cwd: ROOT, encoding: 'utf8' }), '', 'generated doc must not be tracked');
+  assert.equal(ensureRegistryDoc({ root: ROOT }), renderMarkdown(registry));
   assert.equal(renderMarkdown(buildRegistry({ root: ROOT })), renderMarkdown(registry));
 });
 test('top proposals allow zero or ten and refuse incomplete, oversized or non-boolean selections', t => {
@@ -222,8 +223,8 @@ test('--check succeeds without a tracked or local doc and writes nothing', t => 
   assert.deepEqual(snapshot(f), before);
   f.generate('--write'); assert.ok(existsSync(join(f.root, DOC)));
   assert.equal(f.ok(['status', '--porcelain']), '');
-  f.json(META, {});
-  assert.throws(() => f.generate('--check'), /invalid metadata section/);
+  f.json(`${META_DIR}/settings/sample.json`, {});
+  assert.throws(() => f.generate('--check'), /invalid description: sample/);
 });
 
 test('--check refuses unequal fresh renders without writing the doc', t => {
@@ -380,16 +381,17 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('fresh render matches the historical shadow rotation and audit debounce snapshot with per-key, gitignored-doc authoring instructions', () => {
-  // The doc is generated locally and never committed, so pin a fresh render instead of a tracked file.
-  const doc = renderMarkdown(originalRegistry(buildRegistry({ root: ROOT })));
+test('generated documentation retains rotation, rerun and audit debounce/delta rows and authoring instructions', () => {
+  const registry = buildRegistry(), doc = renderMarkdown(registry);
+  for (const key of ['providerRotation', 'ciUnitRerun', 'audit']) assert.match(doc, new RegExp(`^\\| ${key} \\|`, 'm'));
+  const audit = registry.rows.find(row => row.key === 'audit');
+  assert.deepEqual(audit.value.debounce, { minutes: 5 });
+  assert.deepEqual(audit.value.delta, { maxFiles: 0 });
+  const auditRow = doc.split('\n').find(line => line.startsWith('| audit |'));
+  assert.ok(auditRow.includes('"debounce":{"minutes":5}'));
+  assert.ok(auditRow.includes('"delta":{"maxFiles":0}'));
   assert.ok(doc.includes('scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json'));
-  assert.ok(doc.includes('`npm run docs:settings-registry` to generate the local, gitignored doc; never commit it'));
-  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
-  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation, ciUnitRerun, the two audit debounce/delta leaves
-  // and the fixExecutor fixSeatMix row (PR 7384).
-  assert.equal(createHash('sha256').update(original).digest('hex'), '84b5dbdc91d7cfb37ee64398febdfbe39dd5cfa4a52aa78f65c02ea6dec2c442');
+  assert.ok(doc.includes('generated by `npm run settings:registry`, not committed'));
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
 
@@ -399,4 +401,63 @@ test('standalone timeout policy does not claim conveyor setting metadata', t => 
   const r = f.build();
   assert.deepEqual(r.problems, []);
   assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
+});
+
+function authoredFixture(t) {
+  const f = fixture(t); split(f);
+  for (const key of ['instantGaps', 'toSettle', 'discoveryPasses']) f.write(`${META_DIR}/lists/${key}.json`, f.meta[key]);
+  rmSync(join(f.root, META));
+  return f;
+}
+function checkFixture(f) {
+  for (const name of ['settings-registry', 'settings-files', 'operator-override-reader']) {
+    const path = `scripts/lib/${name}.mjs`;
+    writeFileSync(join(f.root, path), readFileSync(join(ROOT, path)));
+  }
+  return spawnSync(process.execPath, [join(f.root, 'scripts/lib/settings-registry.mjs'), '--check'], {
+    cwd: f.root, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+  });
+}
+test('clean build creates a missing doc, repairs stale output and checks inputs without output', t => {
+  const f = authoredFixture(t);
+  assert.equal(existsSync(join(f.root, DOC)), false);
+  assert.equal(checkFixture(f).status, 0);
+  assert.equal(existsSync(join(f.root, DOC)), false, '--check only validates inputs');
+  const content = ensureRegistryDoc({ root: f.root });
+  assert.equal(readFileSync(join(f.root, DOC), 'utf8'), content);
+  writeFileSync(join(f.root, DOC), 'stale');
+  assert.match(checkFixture(f).stderr, /is stale/);
+  ensureRegistryDoc({ root: f.root });
+  assert.equal(checkFixture(f).status, 0);
+  assert.equal(readFileSync(join(f.root, DOC), 'utf8'), content);
+  f.write(`${META_DIR}/settings/beta.json`, {});
+  const invalid = checkFixture(f);
+  assert.notEqual(invalid.status, 0);
+  assert.match(invalid.stderr, /invalid description: beta/);
+  assert.throws(() => ensureRegistryDoc({ root: f.root }), /invalid description: beta/);
+});
+test('both generated registry paths are ignored by git', () => {
+  assert.deepEqual(execFileSync('git', ['check-ignore', '--', DOC, META], {
+    cwd: ROOT, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
+  }).trim().split('\n'), [DOC, META]);
+});
+test('adding a setting needs only its owner and metadata fragment, leaving lists and generated files untouched', t => {
+  const f = authoredFixture(t);
+  const paths = readdirSync(join(f.root, META_DIR, 'lists')).map(name => `${META_DIR}/lists/${name}`);
+  const before = paths.map(path => readFileSync(join(f.root, path), 'utf8'));
+  f.write('scripts/settings/new.json', { newKey: 7 });
+  f.write(`${META_DIR}/settings/newKey.json`, { description: 'New key.', owner: 'scripts/settings/new.json', changeVia: 'pr', instant: false });
+  assert.match(renderMarkdown(buildRegistry({ root: f.root })), /\| newKey \| scripts\/settings\/new.json \|/);
+  assert.deepEqual(paths.map(path => readFileSync(join(f.root, path), 'utf8')), before);
+  for (const path of [DOC, META]) assert.equal(existsSync(join(f.root, path)), false);
+});
+test('list metadata rejects non-arrays, unreadable evidence and duplicate legacy keys', t => {
+  for (const raw of ['{}', '[', '[{"x":1,"x":2}]']) {
+    const f = authoredFixture(t), path = `${META_DIR}/lists/instantGaps.json`;
+    writeFileSync(join(f.root, path), raw);
+    assert.throws(() => renderMarkdown(buildRegistry({ root: f.root })), /lists\/instantGaps.json/);
+  }
+  const f = authoredFixture(t);
+  f.write(META, { instantGaps: [] });
+  assert.throws(() => readMetadata({ root: f.root }), /duplicate metadata key: instantGaps/);
 });
