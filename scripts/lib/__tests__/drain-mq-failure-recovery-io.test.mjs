@@ -9,7 +9,7 @@ const mergeHead = 'b'.repeat(40);
 const branch = `gh-readonly-queue/main/pr-${identity.pr}-${'c'.repeat(40)}`;
 const guard = { hold: true, line: `mq-same-head-failed: #42 head ${identity.head} — failed_checks` };
 const failureLog = 'FAIL tests/widget.test.mjs > keeps state\nAssertionError: expected true';
-function fixture(mode = 'real', logText) {
+function fixture(mode = 'real') {
   let state = {};
   const ledger = createMqFailureLedger({ io: { atomicUpdate(update) {
     const next = update(structuredClone(state)); state = structuredClone(next.state); return next.result;
@@ -56,10 +56,10 @@ function fixture(mode = 'real', logText) {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
-      if (logText !== undefined) return logText;
-      if (mode === 'coloured log') {
-        if (!args.includes('--allow-escape-sequences')) throw new Error('unreadable');
-        return '\x1b[31mFA\x1b[1mIL tests/widget.test.mjs > keeps state\x1b[0m\nAssertionError: expected true';
+      if (mode === 'escaped diagnostic') {
+        if (!args.includes('--allow-escape-sequences')) throw new Error('unreadable log');
+        return '\x1b]0;FAIL tests/x.test.mjs > t\x07\x1bPFAIL tests/x.test.mjs > t\x1b\\\n'
+          + '\x1b[31m' + 'x'.repeat(2000) + ' Runner disconnected; The runner has received a shutdown signal\x1b[0m';
       }
       if (mode === 'expired log') throw new Error('410 expired');
       return mode === 'infra' ? 'The runner has lost communication with the server.'
@@ -75,29 +75,6 @@ function fixture(mode = 'real', logText) {
 }
 
 describe('drain MQ failure production adapter', () => {
-  it('requests escape-containing logs and strips colours before parsing failure evidence', async () => {
-    const f = fixture('coloured log');
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
-    const read = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.endsWith('/logs')));
-    expect(read[1]).toContain('--allow-escape-sequences');
-    const comment = f.writes().find(([, args]) => args[0] === 'pr' && args[1] === 'comment');
-    const route = parseMqFailureRoute({ comment: { body: comment[2].input, author: { login: 'chalbert' } }, expected: identity });
-    expect(route).toMatchObject({ testFiles: ['tests/widget.test.mjs'], complete: true });
-    expect(comment[2].input).not.toContain('\x1b');
-  });
-
-  it.each([']', 'P', '_', '^', 'X'])('does not route incomplete ESC %s control strings as failure evidence', async kind => {
-    const f = fixture('real', `\x1b${kind}hidden\n${failureLog}\x1b\\`);
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
-    expect(f.writes()).toEqual([]);
-  });
-
-  it.each(['P', '_', '^', 'X'])('does not route forged failure payload in ESC %s strings', async kind => {
-    const f = fixture('real', `\x1b${kind}FAIL tests/forged.test.mjs > t\x1b\\\n`);
-    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
-    expect(f.writes()).toEqual([]);
-  });
-
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {
     const f = fixture();
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true, reason: expect.any(String) });
@@ -224,4 +201,22 @@ describe('drain production ancestry proof', () => {
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
       expect(f.writes()).toEqual([]);
     });
+});
+
+
+it('escaped diagnostic text cannot prove failure, complete evidence, or a recovery route', async () => {
+  const f = fixture('escaped diagnostic');
+  const evidence = await f.options.io.collectEvidence({ removal: { ...identity, mergeGroupHead: mergeHead } });
+  expect(evidence.complete).toBe(false);
+  expect(evidence.failureProven).not.toBe(true);
+  expect(evidence.testFiles).toEqual([]);
+  const result = await routeMqFailureOnHold(f.options);
+  expect(result.routed).toBe(false);
+  expect(result.reason).toContain('Runner disconnected');
+  const excerpt = result.reason.split('job log diagnostic: ')[1];
+  expect(excerpt.length).toBeLessThanOrEqual(600);
+  expect(excerpt).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  expect(excerpt).not.toContain('tests/x.test.mjs');
+  expect(f.log.mock.calls.flat().join(' ')).toContain('Runner disconnected');
+  expect(f.writes()).toEqual([]);
 });

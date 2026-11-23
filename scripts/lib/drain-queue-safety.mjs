@@ -1,3 +1,4 @@
+import { readMqDiagnosticLog } from './drain-mq-log-diagnostic.mjs';
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
 import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
@@ -14,33 +15,6 @@ import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
-
-/** Remove terminal controls; incomplete control strings are unreadable evidence. */
-export function stripTerminalEscapes(text) {
-  const parts = [];
-  let start = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] !== '\x1b' || !']P_^X'.includes(text[i + 1] ?? '\0')) continue;
-    const osc = text[i + 1] === ']';
-    parts.push(text.slice(start, i));
-    let end = i + 2;
-    while (end < text.length && !/[\r\n\u2028\u2029]/.test(text[end])) {
-      if (osc && text[end] === '\x07') break;
-      if (text[end] === '\x1b' && text[end + 1] === '\\') break;
-      end++;
-    }
-    if (end === text.length || /[\r\n\u2028\u2029]/.test(text[end])) {
-      const error = new Error('unterminated terminal control string; log evidence incomplete; operator must inspect');
-      error.code = 'MQ_LOG_INCOMPLETE';
-      throw error;
-    }
-    i = text[end] === '\x07' ? end : end + 1;
-    start = i + 1;
-  }
-  parts.push(text.slice(start));
-  return parts.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-    .replace(/\x1b[ -/]*[@-Z\\-_]|\x1b/g, '');
-}
 
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
@@ -131,14 +105,17 @@ const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reaso
  * Strip the smoke memo from BOTH gh-throttle's environment and the child environment.
  * Preserve caller options and non-GitHub IO without mutating shared process state.
  */
-export function createMqLiveReader(exec = execFileSyncThrottled) {
+export function createMqLiveReader(exec = execFileSyncThrottled, { onLogDiagnostic } = {}) {
   return (file, args, opts = {}) => {
     if (file !== 'gh') return exec(file, args, opts);
     const env = { ...(opts.env ?? process.env) };
     const throttleEnv = { ...(opts.throttle?.env ?? process.env) };
     delete env.WE_GH_READ_MEMO_DIR;
     delete throttleEnv.WE_GH_READ_MEMO_DIR;
-    return exec(file, args, { ...opts, env, throttle: { ...opts.throttle, env: throttleEnv } });
+    const options = { ...opts, env, throttle: { ...opts.throttle, env: throttleEnv } };
+    if (args[0] === 'api' && args.some(arg => /^repos\/[^/]+\/[^/]+\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg)))
+      return readMqDiagnosticLog(exec, file, args, options, onLogDiagnostic);
+    return exec(file, args, options);
   };
 }
 
@@ -477,8 +454,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
     }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
-    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint,
-      ...(endpoint.endsWith('/logs') ? ['--allow-escape-sequences'] : [])], { encoding: 'utf8', timeout: 60_000,
+    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
       maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
@@ -494,9 +470,9 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
-      const text = stripTerminalEscapes(read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024));
+      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
       const failures = parseVitestFailures(text);
-      const plain = text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+      const plain = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
       const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
       const names = new Set(failures.tests.map(t => `${t.file}::${t.name}`));
       // Unhandled errors/rejections fail a run without being a listed test failure: never covered by a quarantine.
@@ -558,8 +534,7 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
     const read = (endpoint, binary = false) => {
       // The staged executor owns the shared allowance, including base-reader IO and cached requests.
-      return exec('gh', ['api', `repos/${repo}/${endpoint}`,
-        ...(endpoint.endsWith('/logs') ? ['--allow-escape-sequences'] : [])], { encoding: binary ? 'buffer' : 'utf8',
+      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
     };
@@ -664,8 +639,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
     // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
     const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
-    const tail = stripTerminalEscapes(Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8'))
-      .replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+    const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
+      .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
     const tailLines = tail.split(/\r?\n/);
     const starts = tailLines.map((line, i) => /^\s*Test Files\s/.test(line) ? i : -1).filter(i => i >= 0);
     if (starts.length !== 1) return null;
@@ -886,11 +861,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const rawLog = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`, '--allow-escape-sequences'], {
+          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
-          if (Buffer.byteLength(rawLog, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
-          const log = stripTerminalEscapes(rawLog);
+          if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
           // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
@@ -974,7 +948,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
           budget--;
-          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`, '--allow-escape-sequences'], {
+          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
@@ -986,7 +960,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             error.code = 'MQ_LOG_INCOMPLETE';
             throw error;
           }
-          const lines = stripTerminalEscapes(text).split('\n');
+          const lines = text.split('\n');
           const truncatedLine = lines.some(line => line.length > MQ_INFRA_LINE_CHARS);
           // Captured test output has no trustworthy end delimiter. If present, none of this
           // job's signature matches can establish runner-origin evidence.
@@ -1179,14 +1153,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       } catch { flaky = false; }
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
-    return { mainGreen: !!deciding && deciding === newest[0] && newest[0].status === 'completed'
-        && !stale && deciding.conclusion === 'success'
+    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
         && (!unreadableOnly || deciding === newest[0] && stale === false)
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
-        : deciding !== newest[0] ? `newest main run ${newest[0].id} ${newest[0].status} (${newest[0].conclusion ?? 'verdict pending'}); operator must inspect main CI before retrying`
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
@@ -1225,7 +1197,8 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
   // This only skips historical admission for bookkeeping. Fresh mutations use allowAlreadyQueued:false
   // at enqueuePr's mutation boundary, even if another reader still reports the PR as queued.
   const rerunScope = exec;
-  exec = createMqLiveReader(exec);
+  let diagnosticExcerpt = '';
+  exec = createMqLiveReader(exec, { onLogDiagnostic: excerpt => { diagnosticExcerpt = excerpt; } });
   const queue = readMergeQueueState({ repo, pr, readJson: args => JSON.parse(exec('gh', args,
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
@@ -1238,11 +1211,13 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
+  // Display-only side channel: the decision above has already consumed unreadable-log evidence.
+  const diagnostic = decision.hold && diagnosticExcerpt ? `; job log diagnostic: ${diagnosticExcerpt}` : '';
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);
     if (timelineHasFailedChecks(timeline, currentHead))
-      log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.derivedNames?.length && retryEvidence.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`);
+      log(`mq-same-head-retry-declined: #${String(pr).replace(/\D/g, '')} head ${currentHead} — ${mqRetryDeclineReason(retryEvidence, decision.line)}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}${retryEvidence?.derivedNames?.length && retryEvidence.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${diagnostic}`);
     // Unknown/incomplete history cannot authorize recovery. Require a failed removal bound to H.
     const confirmed = !timeline?.error && timeline?.hasPreviousPage === false
       && Array.isArray(timeline.nodes) && timeline.nodes.every(event =>
@@ -1263,7 +1238,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     ? `${decision.line}; ${mqRetryDeclineReason(retryEvidence, decision.line)}${mqDerivedDetails(retryEvidence)}${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}`
     : decision.line;
   Object.defineProperties(decision, {
-    reason: { value: reason }, mainRunId: { value: retryEvidence?.mainRunId ?? null },
+    reason: { value: reason == null ? reason : `${reason}${diagnostic}` }, mainRunId: { value: retryEvidence?.mainRunId ?? null },
   });
   return decision;
 }

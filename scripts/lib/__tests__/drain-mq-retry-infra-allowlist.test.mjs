@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mqSameHeadGuard, readDrainQueueSafety } from '../drain-queue-safety.mjs';
-import * as queueSafety from '../drain-queue-safety.mjs';
 
 // Exercise the production readSettings().drain path without reading developer settings.
 const settings = vi.hoisted(() => ({ drain: {} }));
@@ -32,8 +31,8 @@ const job = (id, conclusion = 'failure') => ({
 // As in drain-mq-retry-main-green.test.mjs, model the API's filters and limits.
 // No summary hints or quarantine coverage can mask the log-based classification.
 function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
-  runs = [run(102)],
-  events = [removal()], mergeState = 'CLEAN', requireEscapes = false } = {}) {
+  runs = [{ ...run(103, null, '2026-11-01T13:50:00Z'), status: 'in_progress' }, run(102)],
+  events = [removal()], mergeState = 'CLEAN' } = {}) {
   const log = vi.fn(), logReads = [];
   const exec = vi.fn((command, args, opts) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -58,11 +57,10 @@ function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
     if (match) {
       const id = Number(match[1]);
       logReads.push({ id, opts });
-      if (requireEscapes && !args.includes('--allow-escape-sequences')) throw new Error('unreadable');
       if (!logs.has(id)) throw new Error(`unreadable job ${id}`);
       const value = logs.get(id);
       if (value instanceof Error) throw value;
-      return value;
+      return typeof value === 'function' ? value(args) : value;
     }
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
       const query = new URLSearchParams(endpoint.split('?')[1]);
@@ -97,54 +95,27 @@ function expectVisibleDecision(decision, reason, mainRunId = 102) {
 }
 
 describe('same-head MQ retry job-log infrastructure allowlist', () => {
-  it('allows terminal escapes in gh output and strips colours before matching the infra allowlist', () => {
-    const f = fixture({ requireEscapes: true, logs: new Map([[21,
-      '\x1b[31mfatal: could not \x1b[1mfetch\x1b[22m deadbeef from promisor remote\x1b[0m\n']]) });
-    expectInfraRetry(f.guard());
-    const reads = f.exec.mock.calls.filter(([, args]) => args.some(arg => arg.endsWith('/logs')));
-    expect(reads).toHaveLength(1);
-    expect(reads[0][1]).toContain('--allow-escape-sequences');
-  });
-
-  it('strips CSI, OSC with BEL or ST, ESC controls and bare ESC while preserving log text', () => {
-    expect(queueSafety.stripTerminalEscapes(
-      '\x1b[?25l\x1b[31mFAIL\x1b[0m \x1b[1 qtest\n'
-      + '\x1b]0;hidden title\x07line\x1b]8;;https://example.test\x1b\\ link\x1b]8;;\x1b\\'
-      + '\x1bM\x1b',
-    )).toBe('FAIL test\nline link');
-  });
-
-  it.each([']', 'P', '_', '^', 'X'])('rejects unterminated ESC %s without swallowing later failure lines', kind => {
-    expect(() => queueSafety.stripTerminalEscapes(`\x1b${kind}hidden\n${testLog}\x1b\\`))
-      .toThrow(/incomplete|unterminated/i);
-    const f = fixture({ logs: new Map([[21, `\x1b${kind}hidden\n${testLog}${infraLog}`]]) });
-    expect(f.guard()).toMatchObject({ hold: true, reason: expect.stringMatching(/operator must inspect/) });
-  });
-
-  it.each(['P', '_', '^', 'X'])('removes the entire terminated ESC %s payload', kind => {
-    expect(queueSafety.stripTerminalEscapes(`\x1b${kind}FAIL tests/forged.test.mjs > t\x1b\\visible\n`))
-      .toBe('visible\n');
-  });
 
   it.each(['FAIL tests/real.test.mjs > t', 'AssertionError: expected true', 'Tests  1 failed | 2 passed'])
     ('vetoes infrastructure when the same log contains %s', failure => {
-      expect(fixture({ logs: new Map([[21, infraLog + failure + '\n']]) }).guard().hold).toBe(true);
+      const f = fixture({ logs: new Map([[21, infraLog + failure + '\n']]) });
+      expect(f.guard().hold).toBe(true);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
     });
 
   it.each(['stdout', 'stderr'])('never trusts infrastructure inside captured %s (even without a closing block)', stream => {
     for (const suffix of ['', '\n ✓ tests/fixture.test.mjs > passes\n']) {
-      expect(fixture({ logs: new Map([[21, `${stream} | tests/fixture.test.mjs > prints\n${infraLog}${suffix}`]]) }).guard().hold).toBe(true);
+      const f = fixture({ logs: new Map([[21, `${stream} | tests/fixture.test.mjs > prints\n${infraLog}${suffix}`]]) });
+      expect(f.guard().hold).toBe(true);
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
     }
   });
 
-  it('holds if failure evidence could be outside the bounded whole-log scan', () => {
-    expect(fixture({ logs: new Map([[21, testLog + 'padding\n'.repeat(10000) + infraLog]]) }).guard().hold).toBe(true);
-  });
-
-  it.each(['queued', 'in_progress'])('holds with a newer %s main run despite older success', status => {
-    expect(fixture({ runs: [{ ...run(103, null, '2026-11-01T13:50:00Z'), status }, run(102)] }).guard().hold).toBe(true);
-  });
-
+  it.each(['stdout | tests/fixture.test.mjs > prints', 'AssertionError: expected true'])
+    ('retains the veto when %s precedes the infrastructure tail scan', prefix => {
+      const f = fixture({ logs: new Map([[21, prefix + '\n' + 'padding\n'.repeat(10000) + infraLog]]) });
+      expect(f.guard()).toMatchObject({ hold: true, reason: expect.stringMatching(/operator must inspect/) });
+    });
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
@@ -295,6 +266,7 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
   it('holds oversized returned text even with a signature at the end, requiring operator inspection', () => {
     const f = fixture({ logs: new Map([[21, 'x'.repeat(MAX_LOG_BYTES * 2) + '\n' + infraLog]]) });
     expect(f.guard()).toMatchObject({ hold: true, reason: expect.stringMatching(/operator must inspect/) });
+    expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
   it('holds on exec output overflow and returns an operator-visible incomplete-log fallback', () => {
@@ -316,5 +288,29 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     const decision = fixture({ logs: new Map([[21, testLog]]) }).guard();
     expect(decision.hold).toBe(true);
     expectVisibleDecision(decision, /non-infrastructure.*test-shard-21/);
+  });
+});
+
+
+describe('diagnostic-only escaped job logs', () => {
+  it('holds and displays bounded diagnostics without allowing infrastructure signatures to authorize retry', () => {
+    const raw = '\x1b[31m' + 'x'.repeat(2000) + ' Runner disconnected; The runner has received a shutdown signal; '
+      + 'fatal: could not fetch deadbeef from promisor remote\x1b[0m\n'
+      + '\x1b]0;FAIL tests/x.test.mjs > t\x07\x1bPFAIL tests/x.test.mjs > t\x1b\\';
+    const f = fixture({ logs: new Map([[21, args => {
+      if (!args.includes('--allow-escape-sequences')) throw new Error('unreadable log');
+      return raw;
+    }]]) });
+    const result = f.guard();
+    expect(result.hold).toBe(true);
+    expect(result.reason).toContain('Runner disconnected');
+    const decline = f.log.mock.calls.flat().find(line => line.startsWith('mq-same-head-retry-declined:'));
+    expect(decline).toContain('Runner disconnected');
+    const excerpt = result.reason.split('job log diagnostic: ')[1];
+    expect(excerpt).toBeDefined();
+    expect(excerpt.length).toBeLessThanOrEqual(600);
+    expect(excerpt).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    expect(excerpt).not.toContain('tests/x.test.mjs');
+    expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
   });
 });

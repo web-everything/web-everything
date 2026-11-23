@@ -1,6 +1,6 @@
 /** Production adapter for a drain's held same-head MQ failure. No work runs at import time. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { createMqLiveReader, readMqTimeline, decideMqSameHead, stripTerminalEscapes } from './drain-queue-safety.mjs';
+import { createMqLiveReader, readMqTimeline, decideMqSameHead } from './drain-queue-safety.mjs';
 import { collectMqFailureEvidence } from './mq-failure-evidence.mjs';
 import { createMqFailureLedger } from './mq-failure-ledger.mjs';
 import { drainMqFailureRecovery } from './drain-mq-failure-recovery.mjs';
@@ -16,7 +16,8 @@ const safe = text => String(text).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, '
 export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
   ledger = createMqFailureLedger(), maxCalls = 128 } = {}) {
   const limit = Number.isSafeInteger(maxCalls) && maxCalls > 0 ? Math.min(maxCalls, 128) : 128;
-  const liveExec = createMqLiveReader(exec);
+  let diagnosticExcerpt = '';
+  const liveExec = createMqLiveReader(exec, { onLogDiagnostic: excerpt => { diagnosticExcerpt = excerpt; } });
   let calls = 0;
   const request = (file, args, options = {}) => {
     if (++calls > limit) throw new Error('MQ evidence call bound reached; operator inspection required');
@@ -45,6 +46,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
     { input: JSON.stringify(body) }));
   return {
     ledger,
+    diagnosticExcerpt: () => diagnosticExcerpt,
     forRoute: () => createDrainMqFailureRecoveryIo({ exec, ledger, maxCalls: limit }),
     readTimeline: ({ repo, pr }) => readMqTimeline({ repo, pr, exec: request }),
     readPr: ({ repo, pr }) => json(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,mergeStateStatus,baseRefName']),
@@ -77,11 +79,8 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
             && ['success', 'skipped', 'neutral', 'cancelled', 'failure'].includes(job.conclusion)) };
         },
         readJobLog({ repo, jobId }) {
-          const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`, '--allow-escape-sequences'], { maxBuffer: 256 * 1024 });
-          // Do not sanitize a partial read: its control strings and failure evidence may be incomplete.
-          if (typeof text !== 'string' || Buffer.byteLength(text) >= 256 * 1024)
-            return { text: '', complete: false };
-          return { text: stripTerminalEscapes(text), complete: true };
+          const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], { maxBuffer: 256 * 1024 });
+          return { text, complete: typeof text === 'string' && Buffer.byteLength(text) <= 256 * 1024 };
         },
       } });
     },
@@ -97,7 +96,10 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
   // Same default as the reconcile dispatcher: an omitted argument inherits DRY_RUN, so no caller can write by omission.
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   log = () => {}, io = productionIo } = {}) {
+  let active;
   const finish = (routed, reason) => {
+    const diagnostic = !routed ? active?.diagnosticExcerpt?.() : '';
+    if (diagnostic) reason += `; job log diagnostic: ${diagnostic}`;
     try { log(safe(`mq-failure-recovery: #${pr} ${reason}`)); } catch { /* Logging cannot interrupt the drain. */ }
     return { routed, reason };
   };
@@ -106,7 +108,7 @@ export async function routeMqFailureOnHold({ repo, pr, head, guard,
     const identity = { repo, pr, head };
     if (!validIdentity(identity) || guard?.hold !== true || typeof guard.line !== 'string'
       || !guard.line.startsWith('mq-same-head-failed:')) return finish(false, 'No eligible same-head MQ hold');
-    const active = io.forRoute ? io.forRoute() : io;
+    active = io.forRoute ? io.forRoute() : io;
     const timeline = await active.readTimeline({ repo, pr });
     if (timeline?.error || timeline?.hasPreviousPage !== false || !Array.isArray(timeline?.nodes)
       || timeline.nodes.length > 100) return finish(false, 'Incomplete timeline; operator inspection required');

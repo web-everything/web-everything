@@ -71,11 +71,12 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
   });
   afterEach(() => vi.useRealTimers());
 
-  it('holds a recent completed green run while the newest main push is in progress', () => {
+  it('accepts a recent completed green run while the newest main push is in progress', () => {
     const f = fixture([pending(), run(102)]);
-    expect(f.guard().hold).toBe(true);
-    expect(f.declineLog()).toContain('main CI is not green');
-    expect(f.declineLog()).toContain('103 in_progress');
+    expect(f.guard().hold).toBe(false);
+    expect(f.retryLog()).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN');
+    expect(f.retryLog()).toContain('102');
+    expect(f.retryLog()).toContain(failedName);
   });
 
   it('declines a newest completed failure even when an older completed run is green, naming the run and failed check', () => {
@@ -88,12 +89,13 @@ describe('same-head retry uses fresh completed main CI evidence', () => {
   });
 
   it.each(['cancelled', 'startup_failure', 'stale', 'action_required'])(
-    'holds a completed %s run even if the previous completed run was green', conclusion => {
+    'skips a completed %s run and accepts the next completed green run, logging its deciding id', conclusion => {
       const f = fixture([run(102, conclusion), run(101, 'success', '2026-11-01T13:00:00Z', '2026-11-01T13:10:00Z')]);
-      expect(f.guard().hold).toBe(true);
-      expect(f.retryLog()).toBeUndefined();
-      expect(f.declineLog()).toContain('main CI is not green');
-      expect(f.declineLog()).toContain('102');
+      expect(f.guard().hold).toBe(false);
+      expect(f.retryLog()).toContain('mq-same-head-retry:');
+      expect(f.retryLog()).toContain('101');
+      expect(f.retryLog()).not.toContain('102');
+      expect(f.retryLog()).toContain(failedName);
     },
   );
 
