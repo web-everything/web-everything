@@ -42,6 +42,25 @@ describe('fix executor chain', () => {
     expect(pick({critical:true,codexUnproductive:3})).toMatchObject({rung:'argon'});
     expect(pick({critical:true,codexUnproductive:4})).toMatchObject({executor:'claude',rung:'claude'});
   });
+  it('preserves Claude-only paths outside the chain', () => {
+    for (const entry of [{takeover:true},{rulingNotAddressed:true},{mainFix:true},{strongerModel:true},{codexUnproductive:2}]) {
+      expect(chooseFixExecutor({...entry,critical:true,launcherAvailable:true}).executor).toBe('claude');
+    }
+    expect(chooseFixExecutor({chain:{value:chain},mainFix:true,critical:true,launcherAvailable:true}).executor).toBe('claude');
+  });
+  it('critical work still skips unavailable launchers and keeps requiresReview', () => {
+    expect(pick({chain:['argon','codex-alt','claude'],critical:true,launcherAvailable:executor=>executor==='codex'}))
+      .toMatchObject({executor:'codex',rung:'codex-alt',requiresReview:true,reason:expect.stringContaining('argon launcher unavailable, fallback')});
+  });
+  it('critical work reaches Claude with requiresReview when every other launcher is unavailable', () => {
+    expect(pick({critical:true,launcherAvailable:executor=>executor==='claude'}))
+      .toMatchObject({executor:'claude',rung:'claude',requiresReview:true,reason:expect.stringContaining('falls back to Claude (chain exhausted)')});
+  });
+  it('ordinary work never requires review', () => {
+    expect(pick({})).not.toHaveProperty('requiresReview');
+    expect(chooseFixExecutor({chain:{value:chain},launcherAvailable:true}).requiresReview).toBe(false);
+    expect(formatFixExecutorLog(chooseFixExecutor({chain:{value:chain},launcherAvailable:true}))).toContain('requiresReview=false');
+  });
   it('records skipped Gemini before exhausted-chain Claude', () => {
     expect(pick({codexUnproductive:3,launcherAvailable:e=>e!=='antigravity'})).toMatchObject({executor:'claude',reason:expect.stringContaining('gemini skipped: no admitted fix path')});
   });
@@ -80,6 +99,17 @@ describe('chain settings cascade', () => {
     expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:['scripts/security/**']}}}).criticalGlobs).toEqual(['scripts/security/**']);
     expect(resolve({repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(resolve({}).criticalGlobs);
     expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(['scripts/land/**']);
+  });
+  it('ignores the retired criticalClaudeFromRung setting in every layer', () => {
+    const resolved = resolve({platform:{fixExecutor:{criticalClaudeFromRung:3}},repo:{fixExecutor:{criticalClaudeFromRung:1}},env:{WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG:'1'}});
+    expect(resolved).toEqual(resolve({}));
+    expect(resolved).not.toHaveProperty('criticalClaudeFromRung');
+  });
+  it('falls back to the default critical path list for invalid entries', () => {
+    const fallback = resolve({}).criticalGlobs;
+    for (const criticalGlobs of [['scripts/land/**', '  '], ['scripts/land/**', 7], 'scripts/land/**', null]) {
+      expect(resolve({repo:{fixExecutor:{criticalGlobs}}}).criticalGlobs).toEqual(fallback);
+    }
   });
   it.each([[],['codex'],['unknown','claude'],['claude','claude'],null,'codex,claude'])('ignores invalid layers %j', raw => {
     expect(resolve({platform:layer(['argon','claude']),repo:layer(raw),env:{WE_FIX_EXECUTOR_FALLBACK_CHAIN:'bad'}})).toEqual({...defaults,value:['argon','claude'],source:'platform'});
