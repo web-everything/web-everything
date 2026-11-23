@@ -114,3 +114,4 @@
 {"type":"quarantine-fix-prs","at":1795391915034,"actor":"red-main-safety-net","fixPrs":[7372]}
 {"type":"quarantine-fix-prs","at":1795393113850,"actor":"red-main-safety-net","fixPrs":[7372,7373]}
 {"type":"quarantine-fix-prs","at":1795394312756,"actor":"red-main-safety-net","fixPrs":[7373]}
+{"type":"quarantine-added","at":1795395354720,"actor":"orchestrator","test":"scripts/conveyor/soak/breaks/large-reap-backlog-starves-dispatch.soak.test.mjs","brokenSha":"3382d8b4912dbdb6a9a72ba6676b0f17e67b2db4","owner":"orchestrator","reason":"soak break large-reap-backlog-starves-dispatch fails (expected [] got 1 item) on main 3382d8b4; rule 29, named failing test quarantined at once; worker diagnosing","addedAt":1795395354720,"expiresAt":1795409754720,"job":"soak-shard (7)"}
