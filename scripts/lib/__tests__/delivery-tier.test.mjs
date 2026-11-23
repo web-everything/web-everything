@@ -5,8 +5,12 @@ import { TRUST_CHAIN } from '../gate-config.mjs';
 
 
 // Concrete witnesses, including directory-marker entries from the protected floors.
-const sample = (glob) => glob.replace(/\*\*\//g, 'nested/').replace(/\*\*/g, 'sample.mjs')
-  .replace(/\*/g, 'sample').replace(/\?/g, 'x');
+const sample = (glob) => (glob.endsWith('/') ? `${glob}sample.mjs` : glob).replace(/\*\*\//g, 'nested/')
+  .replace(/\*\*/g, 'sample.mjs').replace(/\*/g, 'sample').replace(/\?/g, 'x');
+const matchedHigh = (path) => {
+  const r = classifyTier([path], builtins).perFile[0];
+  return r.tier === 'HIGH' && !['unmatched', 'invalid-path', 'settings-unavailable'].includes(r.rule);
+};
 const builtins = { settings: { extraHigh: [] } };
 const highExamples = [
   'scripts/merge-ai-prs.mjs', 'scripts/lib/review-core.mjs', 'scripts/drain-queue.mjs',
@@ -70,14 +74,14 @@ describe('delivery tiers (observe-only)', () => {
     expect(result.perFile.map(f => f.path).sort()).toEqual([oldPath, path].sort());
   });
   it.each(HIGH_MUST_STAY)('every must-stay glob has a HIGH witness: %s', (glob) => {
-    expect(classifyTier([sample(glob)], builtins).tier).toBe('HIGH');
+    expect(matchedHigh(sample(glob))).toBe(true);
     expect(HIGH_MUST_STAY).toContain(glob);
     expect(TIER_RULES.HIGH).toContain(glob);
   });
   for (const [name, floor] of Object.entries({ GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR })) {
     it.each(floor)(`${name} parity: %s`, (glob) => {
       expect(HIGH_MUST_STAY).toContain(glob);
-      expect(classifyTier([sample(glob)], builtins).tier).toBe('HIGH');
+      expect(matchedHigh(sample(glob))).toBe(true);
     });
   }
   it.each(TRUST_CHAIN.flatMap(member => member.homes))('TRUST_CHAIN home is explicitly HIGH: %s', (path) => {
@@ -89,8 +93,13 @@ describe('delivery tiers (observe-only)', () => {
     expect(Object.isFrozen(TIER_RULES)).toBe(true);
     for (const rules of Object.values(TIER_RULES)) expect(Object.isFrozen(rules)).toBe(true);
   });
-  it.each([null, { extraHigh: 'docs/**' }, { extraHigh: [null] }])('invalid settings fail closed: %j', (settings) => {
+  it.each([null, { extraHigh: null }, { extraHigh: 'docs/**' }, { extraHigh: [null] }])('invalid settings fail closed: %j', (settings) => {
     expect(classifyTier(['docs/x.md'], { settings }).tier).toBe('HIGH');
+    expect(classifyTier(['docs/x.md'], { readSettings: () => JSON.stringify(settings) }).tier).toBe('HIGH');
+  });
+  it('sparse arrays never classify LOW', () => {
+    expect(classifyTier(Array(1), builtins).tier).toBe('HIGH');
+    expect(classifyTier(Array(1), { readSettings: () => { throw new Error('x'); } }).tier).toBe('HIGH');
   });
   it('unreadable settings fail closed', () => {
     const readSettings = () => { throw new Error('unreadable'); };

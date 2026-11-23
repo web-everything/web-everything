@@ -69,7 +69,7 @@ function settingsHigh(opts) {
     const settings = Object.hasOwn(opts, 'settings')
       ? opts.settings : JSON.parse((opts.readSettings ?? readFileSync)(SETTINGS_PATH, 'utf8'));
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return null;
-    const extraHigh = settings.extraHigh ?? [];
+    const extraHigh = Object.hasOwn(settings, 'extraHigh') ? settings.extraHigh : [];
     if (!Array.isArray(extraHigh) || extraHigh.some(g => typeof g !== 'string' || !g.length)) return null;
     // Only this additive key is read. Removal and lower-tier keys have no effect.
     return extraHigh;
@@ -103,7 +103,8 @@ export function fileTier(path, opts = {}) {
 export function classifyTier(paths, opts = {}) {
   const extraHigh = settingsHigh(opts);
   if (!Array.isArray(paths) || paths.length === 0) return { tier: 'HIGH', perFile: [] };
-  const perFile = paths.flatMap(item => {
+  // Array.from turns sparse holes into undefined entries, which classify as invalid-path HIGH.
+  const perFile = Array.from(paths).flatMap(item => {
     if (item && typeof item === 'object') {
       return [item.path, ...(Object.hasOwn(item, 'oldPath') ? [item.oldPath] : [])]
         .map(path => classifyFile(path, extraHigh));
