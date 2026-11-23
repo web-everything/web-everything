@@ -36,7 +36,7 @@ import {
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
-import { cloneKey } from '../daemon-overlays.mjs';
+import { cloneKeyOf as cloneKey } from '../daemon-last-good.mjs';
 import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
 
