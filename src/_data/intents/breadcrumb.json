@@ -1,0 +1,29 @@
+{
+  "id": "breadcrumb",
+  "name": "Breadcrumb Intent",
+  "status": "draft",
+  "summary": "UX vocabulary for a location trail: an ordered path from a root section to the current page, where earlier items are links back up and the last item is the current page. Refines the hierarchical structure of the Navigation intent; the current-item marker is derived from it.",
+  "dimensions": {
+    "current": {
+      "description": "How the last item is presented. It is always the current page: marked aria-current=\"page\" (derived from Navigation hierarchical structure) and never a link",
+      "values": [
+        "text"
+      ]
+    },
+    "separator": {
+      "description": "How items are divided. A visual divider only; hidden from assistive technology so the trail reads as an ordered list",
+      "values": [
+        "glyph",
+        "none"
+      ]
+    },
+    "overflow": {
+      "description": "What happens when the trail is wider than its container",
+      "values": [
+        "truncate",
+        "wrap"
+      ]
+    }
+  },
+  "description": "<p class=\"text-sm text-gray-600\">The Breadcrumb Intent describes where the user is within a hierarchy. It composes the <a href=\"/intents/navigation/\">Navigation intent</a> (<code>structure: hierarchical</code>) and adds only the trail presentation.</p><h3>Landmark</h3><p class=\"text-sm text-gray-600\">The trail sits in a <code>nav</code> landmark with an accessible name, and the items form an ordered list.</p><h3>Current Item</h3><p class=\"text-sm text-gray-600\">The last item is the current page: <code>aria-current=\"page\"</code>, not a link. Every earlier item is a link.</p><h3>Separator</h3><ul class=\"text-sm text-gray-600 list-disc pl-5\"><li><code>glyph</code>: a divider character, hidden from assistive technology.</li><li><code>none</code>: no divider.</li></ul><h3>Overflow</h3><ul class=\"text-sm text-gray-600 list-disc pl-5\"><li><code>truncate</code>: long labels are cut with an ellipsis; the trail stays on one line.</li><li><code>wrap</code>: the trail wraps onto further lines.</li></ul>"
+}
