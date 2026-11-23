@@ -6356,6 +6356,12 @@ Gate ceilings get one capped retry tied to lane, head and killed job. Detached j
 `verify-gate-job.mjs`, so recovery must cover that consumer as well as `verify-dispatch.mjs`'s
 in-process sweep. Persist the retry identity in job input to dedupe the enqueue-before-marker crash window.
 
+## Hotpatch admission fixtures
+
+`hotpatch-guards.test.mjs` exercises the shared receipt/audit guards and bounded production readers.
+The shard plan comes from `origin/main` and shards must share the selected test check's suite.
+`daemon-overlay.test.mjs` also exercises the real add lock and store: a green preflight cannot
+authorize add after CI turns red. Keep the production readers independent of lifecycle effects.
 ## Provider rotation shadow (PROV-AB S1.2)
 
 `provider-rotation.test.mjs` and `provider-rotation-shadow.test.mjs` cover the pure engine and the

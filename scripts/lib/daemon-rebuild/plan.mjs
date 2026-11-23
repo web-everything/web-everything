@@ -341,6 +341,14 @@ export async function planRebuild({
   const alerts = [];
   const decisions = [];
   const applied = [];
+  // Reject before stack analysis, so a mutable hotpatch cannot be used as a containing top either.
+  overlays = overlays.filter(o => {
+    if (!o?.ref?.startsWith('hotpatch/')) return true;
+    if (/^hotpatch\/[a-f0-9]{40}$/.test(o.ref)
+      && verifyRev(git, `refs/remotes/origin/${o.ref}^{commit}`) === o.ref.slice(9)) return true;
+    decisions.push({ ref: o.ref, pr: o.pr ?? null, action: 'skip', reason: 'hotpatch-ref-sha-mismatch', sha: null });
+    return false;
+  });
   let cur = mainSha;
   let holdFailure = null;
   const holdRefusal = () => ({
@@ -636,7 +644,11 @@ export async function planRebuild({
     }
     // unaudited-tip — noPin only controls conflict pins; it must never bypass audit evidence.
     let unauditedFrom = null;
-    const heldAt = holdUnauditedTip(ref, pr, ovSha);
+    if (ref.startsWith('hotpatch/') && ovSha !== ref.slice(9)) {
+      decisions.push({ ref, pr, action: 'skip', reason: 'hotpatch-ref-sha-mismatch', sha: null });
+      continue;
+    }
+    const heldAt = ref.startsWith('hotpatch/') ? null : holdUnauditedTip(ref, pr, ovSha);
     if (heldAt) {
       unauditedFrom = ovSha;
       ovSha = heldAt;
@@ -714,7 +726,7 @@ export async function planRebuild({
         // content is exactly what already passed smoke here, and the build it lands in is still smoked as usual.
         // A ref with no adopted head (a brand-new registration) falls through to the plain drop below, as before.
         const adoptedTip = adoptedTips.get(ref);
-        if (adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
+        if (!ref.startsWith('hotpatch/') && adoptedTip && adoptedTip !== ovSha && !establishedRefs.has(ref) && !noPin.has(ref)) {
           const pmt = git(['merge-tree', '--write-tree', '--no-messages', cur, adoptedTip]);
           const ptree = String(pmt.stdout ?? '').split('\n')[0].trim();
           // Adopted content already carried by another overlay (merge changes nothing): no pin — a pin that applies

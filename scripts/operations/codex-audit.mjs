@@ -3,9 +3,9 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL, URL as NodeURL } from 'node:url';
 import { readFileSync } from 'node:fs';
 import { stripVTControlCharacters } from 'node:util';
+import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { matchesSome } from './audit-verdict.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
@@ -49,15 +49,19 @@ const validHashList = v => Array.isArray(v) && v.every(e => e && typeof e === 'o
 
 /** audit.priorQuestionHashes ([{hash, acceptUntil}]), resolved via the policy cascade. Lands empty; any unreadable
  * or invalid value resolves to [] (accept nothing extra, the strictest reading). Local resolver: it moves to
- * scripts/lib/audit-settings.mjs once that lands. */
-export function resolvePriorQuestionHashes({ env = process.env, readFile = readFileSync } = {}) {
+ * scripts/lib/audit-settings.mjs once that lands. `strict` throws instead: hotpatch evidence cannot lose prior negatives. */
+export function resolvePriorQuestionHashes({ env = process.env, readFile = readFileSync, strict = false } = {}) {
   try {
     let tool;
-    try { tool = JSON.parse(readFile(SETTINGS_FILE, 'utf8'))?.audit; } catch { tool = undefined; }
-    const { value } = cascadePolicy('audit', tool, { standard: { priorQuestionHashes: [] }, platform: null, env, valid: { priorQuestionHashes: validHashList } });
+    try { tool = JSON.parse(readFile(SETTINGS_FILE, 'utf8'))?.audit; } catch (e) { if (strict) throw e; tool = undefined; }
+    const explicitPlatform = strict && env.WE_PLATFORM_PREFERENCES_FILE ? readFile(env.WE_PLATFORM_PREFERENCES_FILE, 'utf8') : null;
+    const platform = strict ? readPlatformPreferences({ env, readFile: (p, e) => p === env.WE_PLATFORM_PREFERENCES_FILE ? explicitPlatform : readFile(p, e) }) : null;
+    if (strict && (platform.errors.length || !tool || typeof tool !== 'object')) throw new Error('unreadable audit policy');
+    const { value, invalid } = cascadePolicy('audit', tool, { standard: { priorQuestionHashes: [] }, platform: strict ? platform.prefs.audit ?? {} : null, env, valid: { priorQuestionHashes: validHashList } });
+    if (strict && invalid.length) throw new Error('invalid prior-question policy');
     const list = value?.priorQuestionHashes;
     return validHashList(list) ? list : [];
-  } catch { return []; }
+  } catch (e) { if (strict) throw e; return []; }
 }
 
 /** True for the current question hash, or a prior hash still inside its acceptUntil window. Unknown/expired: false. */
@@ -81,6 +85,10 @@ export function findAudit(records, { head, base, questionHash, priorQuestionHash
     if (isCurrent) sawCurrent = true;
     if (!isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now, at: record.at }) || !Number.isFinite(Date.parse(record.at))
       || (record.verdict !== 'NOT WEAKENED' && record.verdict !== 'WEAKENED')) continue;
+    if (record.findings !== undefined && (!Array.isArray(record.findings) || record.findings.some(f => typeof f !== 'string'))) {
+      // Unusable findings cannot supersede an existing negative (including carried evidence).
+      continue;
+    }
     if (Array.isArray(record.findings) && hasConflictingVerdict(record.verdict, record.findings)) continue;
     // A self-reported time more than FUTURE_SKEW_MS ahead of now is untrustworthy: unusable (and, for a current-question
     // record, still blocks the prior fallback above). Among usable records the LATER-WRITTEN (ledger order) one wins, never

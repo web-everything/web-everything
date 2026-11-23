@@ -101,6 +101,20 @@ const swaps = f => finishPendingSwaps({ root: f.root, env: f.env, run,
   removeOverlay: (...args) => { f.calls.push('remove'); return removeOverlay(...args); },
   appendOverlayEvent: (...args) => { f.calls.push(args[1].kind); return appendOverlayEvent(...args); } });
 
+describe('auto-rebase hotpatch refs', () => {
+  it('never re-registers a hotpatch ref; escalates instead', async () => {
+    const f = fixture(); f.moveMain();
+    const hp = `hotpatch/${'a'.repeat(40)}`;
+    addOverlay(f.root, { ref: hp }, { env: f.env });
+    await expect(runAutoRebase({ root: f.root, ref: hp, env: f.env, deps: f.deps })).rejects.toThrow(/hotpatch/);
+    expect(f.calls).not.toContain('add');
+    expect(f.scratched).toEqual([]);
+    const alert = needsYouAlert(f);
+    expect(alert.detail.ref).toBe(hp);
+    expect(alert.detail.reason).toMatch(/hotpatch/);
+  });
+});
+
 describe('auto-rebase executed-test inventory', () => {
   it.each(['empty', 'nested-empty', 'mixed', 'skipped-empty'])(
     'refuses ambiguous TAP execution evidence from %s suites', async mode => {

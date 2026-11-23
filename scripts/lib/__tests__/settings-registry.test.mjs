@@ -210,6 +210,29 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+function originalFixture(t) {
+  const f = fixture(t);
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  // Keep later declarations out of the historical migration and byte-preservation checks.
+  const owners = new Set(buildRegistry().rows.flatMap(row => row.owners));
+  for (const owner of owners) {
+    const declared = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
+    // Pin the historical provider shape before main added shadow rollout guards.
+    if (declared.providerRotation) {
+      delete declared.providerRotation.review;
+      delete declared.providerRotation.goLive;
+    }
+    // Pin the historical audit shape before main added debounce and delta settings.
+    if (declared.audit) {
+      delete declared.audit.debounce;
+      delete declared.audit.delta;
+    }
+    f.write(owner, Object.fromEntries(Object.entries(declared).filter(([key]) =>
+      key.startsWith('$comment') || Object.hasOwn(originalMetadata.settings, key))));
+  }
+  Object.assign(f.meta, structuredClone(originalMetadata));
+  return f;
+}
 function split(f) {
   for (const section of ['settings', 'capacityLeaves']) {
     for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
@@ -223,14 +246,24 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the original registry plus the intentional shadow rotation description', t => {
+test('migration preserves the registry built from the original repository metadata JSON', t => {
+  const f = originalFixture(t), before = f.build();
+  assert.deepEqual(before.problems, []);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
+  assert.deepEqual(f.build(), before);
+});
+test('migration preserves the current registry including shadow rotation and hotpatch settings', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
-  for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  const expectedMetadata = structuredClone(originalMetadata);
-  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
-  f.write(META, expectedMetadata);
-  assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
+  const current = buildRegistry({ root: ROOT });
+  for (const owner of new Set(current.rows.flatMap(row => row.owners))) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  const metadata = readMetadata({ root: ROOT });
+  Object.assign(f.meta, structuredClone(metadata));
+  assert.deepEqual(f.build(), current);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), metadata);
+  assert.deepEqual(f.build(), current);
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -344,12 +377,19 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
+test('generated documentation preserves original bytes except the intentional per-key authoring instruction', t => {
+  const doc = renderMarkdown(originalFixture(t).build());
+  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
+  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
+  assert.equal(createHash('sha256').update(original).digest('hex'), '76cf30afed6cf657e1f4f5939437e3b469b4247662d1aee0f4fa26970bd77564');
+});
+
+test('generated documentation matches the hotpatch, shadow rotation and audit debounce snapshot with per-key authoring instructions', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
+  // Reconciled snapshot includes hotpatch settings, providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), 'faaa3a6c0f9daee96b16e94f058d7332eef990a3bcb953181406a6eb45eebb05');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
 
