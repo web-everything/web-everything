@@ -1,6 +1,7 @@
 // Allowlisted files are exempt per path+rule, reviewed by a human via the base-branch allowlist.
 // Text rules match line by line (raw and decoded): credentials split across multiple lines may escape
-// text matching. The shared Forge structural detector also scans each file's concatenated added lines.
+// text matching. The shared Forge structural detector also scans each file's concatenated added lines,
+// including member fragments whose unchanged JWK type/enclosing object is absent from the diff.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -50,8 +51,49 @@ function decodedLine(text) {
 
 function safePath(path) {
   if (secretText.some(([pattern]) => { pattern.lastIndex = 0; return pattern.test(path) || pattern.test(decodedLine(path)); })
-    || keyStructureFinding(Buffer.from(path))) return '[redacted-path]';
+    || addedStructureFinding(Buffer.from(path))) return '[redacted-path]';
   return /[\x00-\x1f\x7f-\x9f]/.test(path) ? JSON.stringify(path) : path;
+}
+
+function addedStructureFinding(bytes) {
+  // Keep the original byte view first: DER must not make a UTF-8 round trip.
+  const finding = keyStructureFinding(bytes);
+  if (finding) return finding;
+  // A zero-context diff may contain only new private members of an existing public
+  // JWK. Supply a conservative type witness to the SAME detector, both around the
+  // fragment and in any added objects. Its duplicate-member handling preserves the
+  // witness even when an added kty follows. `oct` covers asymmetric and symmetric
+  // private members; this intentionally also rejects ambiguous member fragments.
+  // Skip literals/comments so braces inside them cannot corrupt the member view.
+  const witness = '"kty":"oct",';
+  const text = bytes.toString('utf8');
+  let size = Buffer.byteLength(text) + witness.length + 4, depth = 1;
+  if (size > LIMIT) throw incomplete();
+  const trivia = /(?:\s+|\/\*[\s\S]*?\*\/|\/\/[^\r\n\u2028\u2029]*)*/y;
+  const fragments = text.replace(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]]/g, (token, offset) => {
+    let extra = '';
+    if (token === '{' || token === '[') {
+      depth++;
+      trivia.lastIndex = offset + 1;
+      trivia.exec(text);
+      // A type witness must not turn empty `oth: {}` into private material.
+      if (token === '{' && text[trivia.lastIndex] !== '}') extra = witness;
+    } else if (token === '}' || token === ']') {
+      if (--depth === 0) {
+        // An addition can first close an unchanged container, then add members
+        // in its parent. Start another witness instead of losing that suffix.
+        depth = 1;
+        extra = `\n{${witness}\n`;
+      }
+    }
+    size += extra.length;
+    if (size > LIMIT) throw incomplete();
+    return token + extra;
+  });
+  // The unchanged remainder may close added containers. Complete the synthetic
+  // view so an unclosed last container cannot hide earlier private members.
+  if (size + depth - 1 > LIMIT) throw incomplete();
+  return keyStructureFinding(Buffer.from(`{${witness}\n${fragments}\n${'}'.repeat(depth)}`));
 }
 
 export function scanDiff(diff, allowlist = []) {
@@ -68,7 +110,7 @@ export function scanDiff(diff, allowlist = []) {
   };
   const finishFile = () => {
     if (added.length) {
-      const rule = keyStructureFinding(Buffer.concat(added));
+      const rule = addedStructureFinding(Buffer.concat(added));
       if (rule) report(rule, firstAdded);
     }
     added = [];

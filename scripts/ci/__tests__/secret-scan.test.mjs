@@ -106,6 +106,76 @@ describe('secret-scan', () => {
     expect(result.status).toBe(1);
     expect(result.output).toBe('key.json:1 private-key-structure\n');
   });
+  it.each([false, true])('rejects private members inserted into an existing public RSA JWK (context=%s)', context => {
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const jwk = privateKey.export({ format: 'jwk' });
+    const publicJwk = publicKey.export({ format: 'jwk' });
+    const members = ['d', 'p', 'q', 'dp', 'dq', 'qi'].map(name => `  ${JSON.stringify(name)}: ${JSON.stringify(jwk[name])},`);
+    const publicLines = JSON.stringify(publicJwk, null, 2).split('\n');
+    const resulting = [publicLines[0], ...members, ...publicLines.slice(1)].join('\n');
+    expect(createPrivateKey({ key: JSON.parse(resulting), format: 'jwk' }).asymmetricKeyType).toBe('rsa');
+    expect(keyStructureFinding(Buffer.from(resulting))).toBe('private-key-structure');
+    const input = '--- a/key.json\n+++ b/key.json\n'
+      + (context ? `@@ -1,${publicLines.length} +1,${publicLines.length + members.length} @@\n ${publicLines[0]}\n` : '@@ -1,0 +2,6 @@\n')
+      + members.map(text => `+${text}\n`).join('')
+      + (context ? publicLines.slice(1).map(text => ` ${text}\n`).join('') : '');
+    const result = scan(input);
+    expect(result.status).toBe(1);
+    expect(result.output).toBe('key.json:2 private-key-structure\n');
+  });
+  it.each(['d', 'p', 'q', 'dp', 'dq', 'qi', 'k', 'oth'])('scans an inserted %s member without its unchanged JWK enclosure or type', name => {
+    const value = name === 'oth' ? [Object.fromEntries(['r', 'd', 't'].map(member => [member, 'abc']))] : 'abc';
+    const body = `${JSON.stringify(name)}: ${JSON.stringify(value)},`;
+    expect(scan(diff(body)).output).toBe('fixture.txt:7 private-key-structure\n');
+    expect(scan(diff(body), [{ path: 'fixture.txt', rule: 'private-key-structure', reason: 'Synthetic member fixture' }]).status).toBe(0);
+  });
+  it.each([
+    '"\\u0064": "abc",',
+    "\\u0064 /* member */ : 'abc',",
+    '"d":\n"abc",',
+    '"metadata": {"description":"brace { in a literal"},\n"d":"abc",',
+    '{\n"d":"abc",',
+    '// brace { in a comment\r\n"d":"abc",',
+    '/* brace { in a comment */\n"d":"abc",',
+    '// comment\u2028"d":"abc",',
+    '"description":"new metadata"\n},\n"d":"abc",\n"more":{',
+    '],\n"d":"abc",\n"more":[',
+  ])('scans partial JWK members across hunks with escaping, trivia and added containers %#', fragment => {
+    const input = '--- a/key.json\n+++ b/key.json\n'
+      + fragment.split('\n').map((text, i) => `@@ -${i + 1},0 +${2 * i + 2} @@\n+${text}\n`).join('');
+    expect(scan(input).output).toBe('key.json:2 private-key-structure\n');
+  });
+  it('ignores unchanged/removed private members and keeps public or empty fragments clean', () => {
+    for (const text of ['"n":"abc", "e":"AQAB",', '"d":"", "k":"", "oth":[],', '"oth":{},', '"oth":{ /* empty */ },', '"d":0, "p":null,', 'a brace { and ordinary prose', '"description":"literal { and d: text",']) {
+      expect(scan(diff(text)).status).toBe(0);
+    }
+    expect(scan('--- a/key.json\n+++ b/key.json\n@@ -1,2 +1,2 @@\n "d":"abc",\n-"p":"abc",\n+"description":"clean",\n').status).toBe(0);
+  });
+  it('finds partial JWK members in the real Git diff path with unchanged public key material', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'secret-scan-partial-jwk-'));
+    dirs.push(dir);
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
+      encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const jwk = privateKey.export({ format: 'jwk' });
+    const publicText = JSON.stringify(publicKey.export({ format: 'jwk' }), null, 2);
+    git('init', '-q');
+    writeFileSync(join(dir, 'key.json'), publicText);
+    git('add', 'key.json');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'public');
+    const base = git('rev-parse', 'HEAD').trim();
+    const members = ['d', 'p', 'q', 'dp', 'dq', 'qi'].map(name => `  ${JSON.stringify(name)}: ${JSON.stringify(jwk[name])},\n`).join('');
+    writeFileSync(join(dir, 'key.json'), publicText.replace('{\n', '{\n' + members));
+    git('add', 'key.json');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'private');
+    const result = spawnSync(process.execPath, [cli.pathname, '--repo', dir, '--base', base, '--head', 'HEAD'], {
+      cwd: tmpdir(), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('key.json:2 private-key-structure\n');
+    expect(result.stderr).toBe('');
+  });
   it.each(['pkcs8', 'pkcs1'])('scans raw %s DER bytes in a real Git patch through stdin', type => {
     const { privateKey } = generateKeyPairSync('rsa', {
       modulusLength: 2048, privateKeyEncoding: { type, format: 'der' },
@@ -141,6 +211,8 @@ describe('secret-scan', () => {
     const path = JSON.stringify({ [keyType]: 'RSA', ['d']: 'a' + 'bc' });
     const input = `--- a/x\n+++ ${JSON.stringify('b/' + path)}\n@@ -0,0 +7 @@\n+${aws}\n`;
     expect(scan(input).output).toBe('[redacted-path]:7 aws-access-key\n');
+    const fragmentPath = '"d":"abc",';
+    expect(scan(`--- a/x\n+++ ${JSON.stringify('b/' + fragmentPath)}\n@@ -0,0 +7 @@\n+${aws}\n`).output).toBe('[redacted-path]:7 aws-access-key\n');
   });
   it('fails closed on a residual binary notice and redacts its path', () => {
     for (const path of ['image.bin', token + '.bin']) {
