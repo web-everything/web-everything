@@ -111,7 +111,7 @@ export async function shadowReviewStep({ repo, pr, classified, session, completi
     const flow = engine.load(definition);
     const outcome = completion.outcome === 'auto-cleared' && completion.verdict === 'converged' ? 'accept' : completion.outcome === 'bounced' ? 'continue' : 'unknown';
     const attempt = Number.isSafeInteger(classified?.attempt) && classified.attempt >= 1 ? classified.attempt : 1;
-    const projection = { flowDigest: flow.digest, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: `${seq}.${attempt}` }, attempt };
+    const projection = { flowDigest: flow.digest, head, netDiff, seq: records.length, records, event: 'done', outcome, parts: { Subject: `${repo}#${pr}`, Visit: `${seq}.${attempt}` }, attempt };
     const ctx = { repo, pr, head, netDiff, round: classified?.round ?? 'unknown', runId: classified?.runId ?? 'unknown', seq, at: stamp, executorCommit: executorCommit(), inputs: [input] };
     const steps = engine.plan(flow, projection);
     const actualOutcome = classified?.outcome === 'auto-cleared' && classified.loopOutcome === 'converged' ? 'accept' : classified?.outcome === 'bounced' ? 'continue' : null;
