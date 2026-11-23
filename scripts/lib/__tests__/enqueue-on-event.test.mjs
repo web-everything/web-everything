@@ -16,6 +16,8 @@ import {
 } from '../enqueue-on-event.mjs';
 import { readFastDrainRoundSnapshot, readFastDrainRoundListing, readFastDrainRoundDefaultBranch } from '../fast-drain-scope.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import { readSharedOpenPrs } from '../pr-snapshot.mjs';
+import { snapshotPath } from '../pr-snapshot-store.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -3311,10 +3313,12 @@ describe('catch-up snapshot warm', () => {
     expect(read.mock.calls.map(([o]) => o.repo)).toEqual([
       REPO, 'frontier-ui/frontierui', 'plateauapp/plateau-app',
     ]);
-    expect(read.mock.calls.every(([o]) => !Object.hasOwn(o, 'cacheOnly'))).toBe(true);
+    expect(read.mock.calls.every(([o]) => !Object.hasOwn(o, 'cacheOnly') && o.forceRefresh === true)).toBe(true);
   });
   it.each([false, true])('warms once before each spawn with strict env; warm failure=%s still spawns', async failed => {
-    const env = { WE_PR_SNAPSHOT_STALE_OK_MS: '3600000', KEEP: 'yes' };
+    const env = { WE_PR_SNAPSHOT_STALE_OK_MS: '3600000', WE_GH_READ_MEMO_DIR: '/memo',
+      WE_GH_ETAG_DIR: '/etag', WE_GH_ETAG_CACHE: '1', WE_FINISHED_CI_CACHE_DIR: '/ci',
+      WE_FINISHED_CI_CACHE_RUN_JOBS_REVALIDATE_MS: '0', KEEP: 'yes' };
     let f;
     const warmSnapshot = vi.fn(async ({ env: warmEnv }) => {
       expect(warmEnv).toEqual({ KEEP: 'yes' });
@@ -3329,6 +3333,67 @@ describe('catch-up snapshot warm', () => {
     expect(f.lines.some(line => line.includes('snapshot warm failed'))).toBe(failed);
     f.handle.kill();
   });
+  it('never publishes a memoized transport response with a fresh snapshot timestamp', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'warm-transport-'));
+    const env = { WE_PR_SNAPSHOT_DIR: dir, WE_PR_SNAPSHOT: '1', WE_GH_READ_MEMO_DIR: join(dir, 'memo') };
+    const memoized = JSON.stringify({ data: { repository: { pullRequests: {
+      nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null },
+    } } } });
+    let transportReads = 0;
+    const at = Date.now();
+    const f = catchUpSetup({ env, warmSnapshot: options => enqueueModule.warmCatchUpSnapshot({ ...options,
+      read: options => readSharedOpenPrs({ ...options, now: () => at, exec: (_file, _args, execOptions) => {
+        // Model the gh runner's read memo: its throttle env controls whether transport runs.
+        if (execOptions.throttle.env.WE_GH_READ_MEMO_DIR) return memoized;
+        transportReads++;
+        return JSON.stringify({ data: { repository: { pullRequests: {
+          nodes: [], totalCount: 0, pageInfo: { hasNextPage: false, endCursor: null },
+        } } } });
+      } }),
+    }) });
+    try {
+      await f.handle.catchUp();
+      expect(transportReads).toBe(3);
+      expect(f.lines.some(line => line.includes('snapshot warm failed'))).toBe(false);
+      const published = JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8'));
+      expect(published).toMatchObject({ fetchedAtMs: at, count: 0, prs: [] });
+      expect(env.WE_GH_READ_MEMO_DIR).toBe(join(dir, 'memo'));
+    } finally { f.handle.kill(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each(['close', 'error'])('kill keeps idle pending until the spawned child emits %s', async event => {
+    const f = catchUpSetup({ manualFinish: true,
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }),
+    });
+    const run = f.handle.catchUp();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(f.children).toHaveLength(1);
+    const child = f.children[0];
+    child.kill = vi.fn(() => true);
+    f.handle.kill();
+    let idle = false;
+    const waiting = f.handle.idle().then(() => { idle = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(idle).toBe(false);
+    child.emit(event, event === 'error' ? new Error('child failed') : 143);
+    await waiting;
+    await run;
+    expect(idle).toBe(true);
+  });
+
+  it('kill resolves idle immediately while the warm has no child', async () => {
+    let release;
+    const f = catchUpSetup({ warmSnapshot: () => new Promise(resolve => { release = resolve; }) });
+    const run = f.handle.catchUp();
+    await new Promise(resolve => setImmediate(resolve));
+    f.handle.kill();
+    await f.handle.idle();
+    expect(f.children).toHaveLength(0);
+    release();
+    await run;
+  });
+
   it('snapshot-cold consumes the attempt budget and retries next round without a miss hold', async () => {
     const f = catchUpSetup({
       readCapacity: () => ({ capacity: 1, source: 'test' }),

@@ -163,13 +163,13 @@ export function nextLimit(prevCount) {
 }
 
 /** Is `snap` servable for `fields` at `nowMs`? PURE. */
-export function isServable(snap, { fields, nowMs, ttlMs, dirtyMs = 0 }) {
+export function isServable(snap, { fields, nowMs, ttlMs, dirtyMs = 0, forceRefresh = false }) {
   if (!snap) return false;
   const have = new Set(snap.fields);
   if (!fields.every((f) => have.has(f))) return false;
   const age = nowMs - snap.fetchedAtMs;
   if (age < 0 || age >= ttlMs) return false;
-  if (dirtyMs > snap.fetchedAtMs && age >= DIRTY_REFRESH_FLOOR_MS) return false;
+  if (dirtyMs > snap.fetchedAtMs && (forceRefresh || age >= DIRTY_REFRESH_FLOOR_MS)) return false;
   return true;
 }
 
@@ -194,7 +194,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
   // in the snapshot already protected by readSharedOpenPrs' lock and atomic publication.
   const checkAppState = { ...(prev?.repo === repo ? prev.checkAppState : {}) };
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize, pageRetries: paging.pageRetries,
-    maxRows: MAX_LIMIT, checkAppState, execOpts: { throttle: { op: 'pr list (snapshot page)', deferrable } } });
+    maxRows: MAX_LIMIT, checkAppState, execOpts: { env, throttle: { env, op: 'pr list (snapshot page)', deferrable } } });
   if (light.deferred) return light.deferred;
   assertInventoryComplete({ repo, rows: light.rows, totalCount: light.totalCount, truncated: light.truncated });
   const cache = {};
@@ -204,7 +204,7 @@ export function fetchSnapshot({ repo, prevCount, prev = null, exec = execFileSyn
     }
   }
   const heavy = hydrateHeavyFields({ repo, rows: light.rows, exec, cache, nowMs,
-    maxAgeMs: paging.heavyMaxAgeSeconds * 1000, execOpts: { throttle: { op: 'pr view (snapshot hydrate)' } } });
+    maxAgeMs: paging.heavyMaxAgeSeconds * 1000, execOpts: { env, throttle: { env, op: 'pr view (snapshot hydrate)' } } });
   const heavyMeta = Object.fromEntries(Object.entries(heavy.cache).map(([n, { updatedAt, headRefOid, fetchedAtMs }]) =>
     [n, { updatedAt, headRefOid, fetchedAtMs }]));
   return { v: PR_SNAPSHOT_VERSION, repo, fetchedAtMs: nowMs, fields: [...SNAPSHOT_FIELDS], limit: MAX_LIMIT,
@@ -227,7 +227,8 @@ function logHit(env, caller, repo) {
  * The shared open-PR read. Returns the projected PR array, or `null` when not applicable (see the file header).
  * @param {{repo:string|null, fields:string|string[], env?:NodeJS.ProcessEnv, nowMs?:number, exec?:Function,
  *   dir?:string, ttlMs?:number, caller?:string, lockWaitMs?:number, allowDeferred?:boolean, paging?:object, spawnRefresh?:Function,
- *   smokeChild?:boolean}} o
+ *   smokeChild?:boolean, forceRefresh?:boolean}} o
+ *   `forceRefresh`: warm-only override of the dirty-refresh floor and stale-ok allowance.
  *   `strictCacheOnly`: classify cache misses as cold/stale or hard failures instead of returning null.
  *   `smokeChild`: defaults to the reconcile CLI or Node eval launch; with WE_SMOKE_LIVE_CLONE, fills unset smoke controls.
  *   `allowDeferred`: opt in to receiving the truthy `{outcome:'deferred-low-budget'}` object (the caller MUST
@@ -237,7 +238,7 @@ function logHit(env, caller, repo) {
 export function readSharedOpenPrs({
   repo, fields, env = process.env, now = () => Date.now(), exec,
   dir = null, ttlMs = null, caller = null, lockWaitMs = LOCK_WAIT_MS, allowDeferred = false, cacheOnly = false,
-  paging = null, spawnRefresh = null, strictCacheOnly = false, smokeChild = isSmokeDryRunChild(),
+  paging = null, spawnRefresh = null, forceRefresh = false, strictCacheOnly = false, smokeChild = isSmokeDryRunChild(),
 } = {}) {
   const unavailable = code => {
     if (strictCacheOnly) throw Object.assign(new Error(`snapshot ${code}`), { code });
@@ -259,7 +260,7 @@ export function readSharedOpenPrs({
   const servable = () => {
     const snap = readSnapshotFile(path, { strict: strictCacheOnly });
     if (strictCacheOnly && (!want.every(f => snap.fields.includes(f)) || snap.repo !== repo || snap.fetchedAtMs > now())) return unavailable('unsupported');
-    if (staleOkMs && !cacheOnly && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
+    if (staleOkMs && !cacheOnly && !forceRefresh && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
       if (now() - snap.fetchedAtMs >= ttl && !injectedExec
         && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
         refreshStarted.add(snapshotKey(repo));
@@ -267,7 +268,7 @@ export function readSharedOpenPrs({
       }
       return snap;
     }
-    return isServable(snap, { fields: want, nowMs: now(), ttlMs: ttl, dirtyMs: latestDirtyMs(root, repo) }) ? snap : null;
+    return isServable(snap, { fields: want, nowMs: now(), ttlMs: ttl, dirtyMs: latestDirtyMs(root, repo), forceRefresh }) ? snap : null;
   };
 
   const hit = servable();

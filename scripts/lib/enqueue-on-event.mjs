@@ -768,6 +768,7 @@ function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {}, be
       passTimings: extractPassTimings(stderr), timedOut,
     });
     let child;
+    let cancelled = false;
     const deadline = Date.now() + timeoutMs;
     const finish = result => {
       if (done) return;
@@ -777,8 +778,9 @@ function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {}, be
       resolveRun(result);
     };
     const cancel = () => {
-      try { child?.kill('SIGTERM'); } catch { /* gone */ }
-      finish({ code: null, ...output(), cancelled: true });
+      cancelled = true;
+      if (child) { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+      else finish({ code: null, ...output(), cancelled: true });
     };
     const killer = setTimeout(() => {
       timedOut = true;
@@ -801,8 +803,8 @@ function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {}, be
       // Keep the full stream: timing lines can span chunks and precede later diagnostics.
       child.stderr?.setEncoding?.('utf8');
       child.stderr?.on('data', (d) => { stderr += d; });
-      child.on('error', () => finish({ code: null, ...output(), errorClass: 'spawn-error' }));
-      child.on('close', (code) => finish({ code, ...output() }));
+      child.on('error', () => finish({ code: null, ...output(), errorClass: 'spawn-error', ...(cancelled ? { cancelled: true } : {}) }));
+      child.on('close', (code) => finish({ code, ...output(), ...(cancelled ? { cancelled: true } : {}) }));
     };
     start().catch(() => finish({ code: null, ...output(), errorClass: 'spawn-error' }));
   });
@@ -868,7 +870,7 @@ export async function warmCatchUpSnapshot({ localSlug, env, read = readSharedOpe
   const { resolveContextRepos } = await import('../merge-ai-prs.mjs');
   const repos = [...new Set(resolveContextRepos([null], localSlug).map(repo => repo || localSlug))];
   await Promise.all(repos.map(async repo => {
-    const rows = read({ repo, fields: SNAPSHOT_FIELDS, env, caller: 'enqueue-on-event.mjs' });
+    const rows = read({ repo, fields: SNAPSHOT_FIELDS, env, forceRefresh: true, caller: 'enqueue-on-event.mjs' });
     if (!Array.isArray(rows)) throw new Error('snapshot warm unavailable');
   }));
 }
@@ -1244,6 +1246,9 @@ export function createEnqueueOnEvent({
           if (!p.catchUp) return;
           const warmEnv = { ...env };
           delete warmEnv.WE_PR_SNAPSHOT_STALE_OK_MS;
+          for (const key of Object.keys(warmEnv)) {
+            if (/^(?:WE_GH_.*(?:MEMO|CACHE)|WE_GH_ETAG_|WE_FINISHED_CI_CACHE)/.test(key)) delete warmEnv[key];
+          }
           try { await warmSnapshot({ localSlug, env: warmEnv, signal: controller.signal }); }
           catch { log(`${prefix} snapshot warm failed — spawning child anyway`); }
         };

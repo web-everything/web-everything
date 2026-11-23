@@ -16,6 +16,7 @@ import {
   readSharedOpenPrs, nextLimit, isServable, projectPrs, SNAPSHOT_FIELDS, MIN_LIMIT, DIRTY_REFRESH_FLOOR_MS,
   readShaCache, writeShaCache, snapshotOpenCount,
 } from '../pr-snapshot.mjs';
+import { warmCatchUpSnapshot } from '../enqueue-on-event.mjs';
 import { PrListUnreadableError } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
 import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
@@ -434,4 +435,25 @@ it('snapshot v2 projects check evidence metadata without losing completeness', (
   expect(SNAPSHOT_FIELDS).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
   const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
   expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
+});
+
+it('warm refreshes a dirty snapshot inside ten seconds while ordinary readers obey the floor', async () => {
+  const { exec, calls } = fakeExec();
+  const options = opts({ fields: SNAPSHOT_FIELDS, exec });
+  readSharedOpenPrs(options);
+  const initialCalls = calls.length;
+  clock += 1000;
+  const dirty = join(dir, 'web-everything__web-everything.dirty');
+  writeFileSync(dirty, '');
+  const t = new Date(clock); utimesSync(dirty, t, t);
+  readSharedOpenPrs(options);
+  expect(calls).toHaveLength(initialCalls);
+  await warmCatchUpSnapshot({ localSlug: REPO, env: options.env,
+    read: warmOptions => warmOptions.repo === REPO
+      ? readSharedOpenPrs({ ...options, ...warmOptions }) : [],
+  });
+  expect(pageCalls(calls)).toHaveLength(2);
+  expect(JSON.parse(readFileSync(snapshotPath(dir, REPO), 'utf8')).fetchedAtMs).toBe(clock);
+  readSharedOpenPrs(options);
+  expect(pageCalls(calls)).toHaveLength(2);
 });

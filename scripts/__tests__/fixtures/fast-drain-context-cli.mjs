@@ -154,14 +154,7 @@ out({});
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
-      // Fail closed on every command outside the fixture's known read-only transports.
-      mutationCalls: calls.filter(a => !(
-        a[0] === 'repo' && a[1] === 'view'
-        || a[0] === 'pr' && ['view', 'list'].includes(a[1])
-        || a[0] === 'api' && (!a.includes('--method') || a[a.indexOf('--method') + 1] === 'GET')
-          && (a[1] === 'graphql' ? a.some(v => v.startsWith('query=') && /^query=\s*(query\b|\{)/.test(v)) && !a.some(v => /\bmutation\b/.test(v))
-            : !a.some(v => ['-f', '-F', '--field', '--raw-field', '--input'].includes(v)))
-      )),
+      mutationCalls: calls.filter(isMutationCall),
       bareCheckReads: existsSync(join(dir, 'calls.jsonl.bare-checks'))
         ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))
@@ -173,3 +166,13 @@ out({});
       heavyListings: calls.filter(a => a[0] === 'pr' && a[1] === 'list' && a.some(v => v.includes('statusCheckRollup'))).length };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
+
+/** Fail closed on every command outside the fixture's known read-only transports. */
+export const isMutationCall = a => !(
+  a[0] === 'repo' && a[1] === 'view'
+  || a[0] === 'pr' && ['view', 'list'].includes(a[1])
+  || a[0] === 'api' && !a.some((v, i) => v === '-X' || v === '--method'
+    ? a[i + 1] !== 'GET' : /^(?:-X|--method=)/.test(v) && !['-XGET', '--method=GET'].includes(v))
+    && (a[1] === 'graphql' ? a.some(v => v.startsWith('query=') && /^query=\s*(query\b|\{)/.test(v)) && !a.some(v => /\bmutation\b/.test(v))
+      : !a.some(v => ['-f', '-F', '--field', '--raw-field', '--input'].includes(v)))
+);

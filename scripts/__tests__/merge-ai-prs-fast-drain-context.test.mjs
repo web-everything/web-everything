@@ -12,7 +12,7 @@ import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-sn
 import { snapshotPath, PR_SNAPSHOT_VERSION, markPrSnapshotDirty } from '../lib/pr-snapshot-store.mjs';
 import { resolveFastDrainListingSetting } from '../lib/fast-drain-scope.mjs';
 import { OPEN_PR_LIST_LIMIT } from '../lib/no-search-backed-pr-list.mjs';
-import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
+import { runFastDrainContextCli, isMutationCall } from './fixtures/fast-drain-context-cli.mjs';
 
 process.env.WE_UNDER_TEST = '1';
 const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass } = await import('../merge-ai-prs.mjs');
@@ -613,3 +613,22 @@ for (const reason of ['disabled', 'corrupt', 'unreadable', 'unsupported']) {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 }
+
+for (const verb of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+  for (const flags of [['-X', verb], [`-X${verb}`], ['--method', verb], [`--method=${verb}`]]) {
+    test(`CLI mutation detector flags ${flags.join(' ')}`, () => {
+      assert.equal(isMutationCall(['api', 'repos/fixture/repo/issues', ...flags]), true);
+      assert.equal(isMutationCall(['api', 'graphql', '-f', 'query={viewer{login}}', ...flags]), true);
+    });
+  }
+}
+for (const flags of [[], ['-X', 'GET'], ['-XGET'], ['--method', 'GET'], ['--method=GET']]) {
+  test(`CLI mutation detector accepts GET ${flags.join(' ')}`, () => {
+    assert.equal(isMutationCall(['api', 'repos/fixture/repo/issues', ...flags]), false);
+  });
+}
+test('CLI mutation detector refuses missing and unknown methods', () => {
+  for (const flags of [['-X'], ['--method'], ['-XUNKNOWN'], ['--method=UNKNOWN']]) {
+    assert.equal(isMutationCall(['api', 'repos/fixture/repo/issues', ...flags]), true);
+  }
+});
