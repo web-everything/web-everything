@@ -214,13 +214,9 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     let writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
     try { readSources(); } catch (e) {
       if (e?.code !== SNAPSHOT_UNAVAILABLE) throw e; // only an unavailable/stale cache may be refreshed; anything else stays fatal
-      // Cold/stale/dirty shared cache: this single-flight child refreshes it live. Freshness is anchored to when
-      // the refreshed rows were READ FROM GITHUB (their fetch time), never to the end of the lock or refresh: a slow
-      // lock wait no longer counts, and rows fetched longer ago than the TTL still expire. Rows with no fetch time
-      // keep the stricter pre-lock anchor.
-      const refreshed = readSources({ refresh: true });
-      const fetched = [...refreshed.values()].map(rows => rows.fetchedAtMs);
-      if (fetched.length && fetched.every(Number.isFinite)) writtenAt = Math.min(...fetched);
+      // Refresh outside the whole-read deadline; all subsequent reads share this one anchor.
+      readSources({ refresh: true });
+      writtenAt = now();
     }
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);
@@ -300,10 +296,8 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
     };
     // Pass reuse is cache-only and must retain the source snapshot's freshness checks.
     const readTarget = () => time('listing.target', async () => requireFullPr(await readFull(targetRepo, Number(onlyPr)), Number(onlyPr)));
-    let base, target;
-    if (readInventory) [base, target] = await readFastDrainFacts(
-      [() => time('listing.inventory', loadInventory), readTarget], 2, read => read());
-    else { base = loadInventory(); target = await readTarget(); }
+    const base = await (readInventory ? time('listing.inventory', loadInventory) : loadInventory());
+    const target = await readTarget();
     const { snapshots, inventories } = base;
     const liveReads = new Set([fastDrainPrKey(targetRepo, onlyPr)]);
     const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency, refreshPr }));

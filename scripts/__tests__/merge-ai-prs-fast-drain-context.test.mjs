@@ -68,40 +68,79 @@ for (const refreshAvailable of [true, false]) {
   });
 }
 
-// Freshness after a refresh is anchored to the rows' fetch time; validation errors are never swallowed.
-for (const mode of ['fresh-fetch', 'old-fetch', 'validation-error']) {
-  test(`pass inventory refresh anchors to row fetch time (${mode})`, async () => {
+for (const [mode, name] of [
+  ['fresh', 'accepts a slow refresh with the deadline starting after refresh'],
+  ['expired', 'refuses reads exceeding the post-refresh TTL without publishing'],
+  ['validation-error', 'rethrows initial validation errors without refreshing'],
+]) {
+  test(`pass inventory ${name}`, async () => {
     const T = 1_000_000;
     let t = T, held = false, snapshot = null, published = null;
     const refreshCalls = [];
     const options = {
       path: 'unused-pass-snapshot.json', repos: [repo], targetRepo: repo, env: {}, now: () => t,
       readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
-      listLean: async () => inventory([lean(pr(7))]),
+      listLean: async () => {
+        t += mode === 'expired' ? 61_000 : 45_000;
+        return inventory([lean(pr(7))]);
+      },
       readSnapshot: (_r, o) => {
         if (mode === 'validation-error' && !o?.refresh) throw new Error('source validation failed');
         if (o?.refresh) {
           refreshCalls.push(o);
-          t += 30_000; // slow lock/refresh: must not itself expire fresh rows
+          t += 30_000;
           snapshot = [pr(7)];
-          Object.defineProperty(snapshot, 'fetchedAtMs', { value: mode === 'old-fetch' ? T - 61_000 : T + 1 });
         }
         return snapshot;
       },
       read: () => published, write: (_p, v) => { published = v; },
       lock: async fn => { held = true; try { return { ok: true, value: await fn(() => held) }; } finally { held = false; } },
     };
-    if (mode === 'fresh-fetch') {
+    if (mode === 'fresh') {
       assert.deepEqual((await readFastDrainPassInventory(options)).snapshots.get(repo), [pr(7)]);
-    } else if (mode === 'old-fetch') {
+      assert.equal(published.writtenAt, T + 30_000);
+      assert.equal(refreshCalls.length, 1);
+    } else if (mode === 'expired') {
       await assert.rejects(readFastDrainPassInventory(options), /expired while reading/);
       assert.equal(published, null);
+      assert.equal(refreshCalls.length, 1);
     } else {
       await assert.rejects(readFastDrainPassInventory(options), /source validation failed/);
       assert.equal(refreshCalls.length, 0);
+      assert.equal(published, null);
     }
   });
 }
+
+test('target read waits for inventory resolution after a refresh longer than the TTL', async () => {
+  const order = [];
+  let t = 1_000_000, snapshot = null, published, targetReadAt;
+  const rows = await readFastDrainContext({
+    repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true,
+    readInventory: async () => {
+      order.push('inventory started');
+      const base = await readFastDrainPassInventory({
+        path: 'unused-pass-snapshot.json', repos: [repo], targetRepo: repo, env: {}, now: () => t,
+        readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
+        listLean: async () => inventory([lean(pr(7))]),
+        readSnapshot: (_r, o) => {
+          if (o?.refresh) { t += 90_000; snapshot = [pr(7)]; }
+          return snapshot;
+        },
+        read: () => null, write: (_p, value) => { published = value; },
+        lock: async fn => ({ ok: true, value: await fn(() => true) }),
+      });
+      order.push('inventory resolved');
+      return base;
+    },
+    readFull: async () => { order.push('target'); targetReadAt = t; return pr(7); },
+    readManifest: async () => null,
+  });
+  assert.deepEqual(order, ['inventory started', 'inventory resolved', 'target']);
+  assert.equal(targetReadAt, 1_090_000);
+  assert.ok(targetReadAt >= published.writtenAt);
+  assert.deepEqual(rows.get(repo), [pr(7)]);
+});
 
 async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, leanRead, snapshotRead,
   readFull, groups, setting = {}, enabled = true, repos = [repo], manifests = new Map() } = {}) {
