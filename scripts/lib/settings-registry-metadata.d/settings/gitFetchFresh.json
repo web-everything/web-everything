@@ -1,0 +1,6 @@
+{
+  "description": "Maximum age of a reusable Git fetch.",
+  "owner": "scripts/settings/git-fetch-fresh.json",
+  "changeVia": "pr",
+  "instant": false
+}

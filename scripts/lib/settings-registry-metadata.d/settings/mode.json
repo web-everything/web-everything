@@ -1,0 +1,6 @@
+{
+  "description": "Expectation babysitter mode: off or observe. WE_EXPECTATIONS_MODE overrides the repository default.",
+  "owner": "scripts/settings/expectations.json",
+  "changeVia": "env",
+  "instant": false
+}

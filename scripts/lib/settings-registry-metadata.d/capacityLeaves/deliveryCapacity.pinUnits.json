@@ -1,0 +1,5 @@
+{
+  "description": "Pinned delivery capacity.",
+  "range": "integer 1–200",
+  "unit": "units"
+}

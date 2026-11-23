@@ -1,0 +1,6 @@
+{
+  "description": "Host load targets, pause priorities and resumption thresholds.",
+  "owner": "scripts/settings/load-governor.json",
+  "changeVia": "pr",
+  "instant": false
+}

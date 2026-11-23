@@ -1,0 +1,6 @@
+{
+  "description": "Retry policy for exhausted fixes after main advances.",
+  "owner": "scripts/settings/exhausted-retry.json",
+  "changeVia": "pr",
+  "instant": false
+}

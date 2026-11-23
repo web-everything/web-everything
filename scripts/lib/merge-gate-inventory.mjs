@@ -35,7 +35,7 @@ export const DRAIN_GATES = Object.freeze([
     note: 'the drain only considers --label=ready-to-merge PRs; merge-gate requires the label too' },
   { id: 'producer-certified', where: 'merge-gate', input: 'github', signals: ['classifyPr'], skipKinds: ['not-certified'] },
   { id: 'default-base', where: 'merge-gate', input: 'github', signals: [], skipKinds: ['off-base'] },
-  { id: 'required-check-green', where: 'queue', input: 'github', signals: ['isRequiredCheckGreen'], skipKinds: ['checks-pending'],
+  { id: 'required-check-green', where: 'queue', input: 'github', signals: ['isRequiredCheckGreen'], skipKinds: ['checks-pending', 'checks-failed'],
     note: 'ruleset required checks (test, smoke, daemon-soak, soak-replay-gate, merge-gate) on the group commit' },
   { id: 'codeql', where: 'merge-gate', input: 'github', signals: ['isCodeQLFailed'], skipKinds: ['codeql-failed'] },
   { id: 'mergeable', where: 'queue', input: 'github', signals: [], skipKinds: ['unknown-mergeability', 'conflicting'] },

@@ -1,0 +1,6 @@
+{
+  "description": "Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.",
+  "owner": "scripts/settings/provider-rotation.json",
+  "changeVia": "pr",
+  "instant": false
+}

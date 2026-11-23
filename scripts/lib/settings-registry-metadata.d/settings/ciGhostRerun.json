@@ -1,0 +1,6 @@
+{
+  "description": "Age, frequency and cancellation bounds for ghost CI recovery.",
+  "owner": "scripts/settings/ci-ghost-rerun.json",
+  "changeVia": "pr",
+  "instant": false
+}

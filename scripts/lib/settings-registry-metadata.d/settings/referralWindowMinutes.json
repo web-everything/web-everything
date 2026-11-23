@@ -1,0 +1,6 @@
+{
+  "description": "Time window in minutes for referral judgment.",
+  "owner": "scripts/settings/referral-judge-window.json",
+  "changeVia": "pr",
+  "instant": false
+}

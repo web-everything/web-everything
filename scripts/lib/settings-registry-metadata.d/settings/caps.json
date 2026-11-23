@@ -1,0 +1,6 @@
+{
+  "description": "V8 old-space caps by review child and daemon role.",
+  "owner": "scripts/settings/node-heap-cap.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -1,0 +1,6 @@
+{
+  "description": "Direction-aware human review classification mode.",
+  "owner": "scripts/settings/direction-aware-human.json",
+  "changeVia": "pr",
+  "instant": false
+}

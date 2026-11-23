@@ -1,0 +1,6 @@
+{
+  "description": "Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed.",
+  "owner": "scripts/settings/expectations.json",
+  "changeVia": "pr",
+  "instant": false
+}

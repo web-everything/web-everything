@@ -1,0 +1,6 @@
+{
+  "description": "Required-check exceptions for draft promotion.",
+  "owner": "scripts/settings/draft-promotion.json",
+  "changeVia": "pr",
+  "instant": false
+}

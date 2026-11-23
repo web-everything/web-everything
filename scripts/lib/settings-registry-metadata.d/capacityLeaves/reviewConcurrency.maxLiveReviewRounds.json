@@ -1,0 +1,5 @@
+{
+  "description": "Maximum live host review rounds.",
+  "range": "integer 1–16",
+  "unit": "rounds"
+}

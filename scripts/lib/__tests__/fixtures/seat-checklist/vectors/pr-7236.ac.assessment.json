@@ -1,0 +1,66 @@
+{
+ "_type": "https://in-toto.io/Statement/v1",
+ "subject": [
+  {
+   "name": "web-everything/web-everything#7236",
+   "uri": "https://github.com/web-everything/web-everything/pull/7236",
+   "digest": {
+    "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+   }
+  }
+ ],
+ "predicateType": "https://everstandards.dev/core/assessment/v0.1",
+ "predicate": {
+  "seat": {
+   "lens": "correctness",
+   "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus"
+  },
+  "rubric": {
+   "uri": "https://everstandards.dev/core/fixtures/rubrics/pr-7236-ac",
+   "digest": {
+    "sha256": "cf284ba37cc10d051e853bd819c123aa1d524d8b3147464d9d109528c13484a4"
+   }
+  },
+  "policy": {
+   "uri": "https://everstandards.dev/core/fixtures/policies/company",
+   "digest": {
+    "sha256": "37d73e81ebe761aebce5ffcae23e645c484aab5744aa9c37bc8b61b1e0097bf7"
+   }
+  },
+  "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d",
+  "repositoryUri": "https://github.com/web-everything/web-everything",
+  "evaluatedAt": "2026-11-21T22:30:00-05:00",
+  "items": [
+   {
+    "itemId": "AC1",
+    "outcome": "pass",
+    "evidence": [
+     {
+      "kind": "quoted-citation",
+      "location": {
+       "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+       "startLine": 21,
+       "snippet": "a clear check on this head swaps pending to clear"
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+     }
+    ]
+   },
+   {
+    "itemId": "AC2",
+    "outcome": "pass",
+    "evidence": [
+     {
+      "kind": "quoted-citation",
+      "location": {
+       "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+       "startLine": 39,
+       "snippet": "foreign app"
+      },
+      "revisionId": "6a28dc635352f022f9be6e6686d35074599cad8d"
+     }
+    ]
+   }
+  ]
+ }
+}

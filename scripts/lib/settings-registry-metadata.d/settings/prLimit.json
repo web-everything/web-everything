@@ -1,0 +1,6 @@
+{
+  "description": "PR limit exclusions and explicit focus references.",
+  "owner": "scripts/settings/pr-limit.json",
+  "changeVia": "pr",
+  "instant": false
+}

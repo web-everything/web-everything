@@ -1,0 +1,6 @@
+{
+  "description": "First-output timeout and cooldown for external review jurors.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

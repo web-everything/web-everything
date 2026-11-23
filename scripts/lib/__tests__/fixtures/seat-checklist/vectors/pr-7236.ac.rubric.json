@@ -1,0 +1,18 @@
+{
+ "rubricType": "https://everstandards.dev/core/rubric/v0.1",
+ "id": "https://everstandards.dev/core/fixtures/rubrics/pr-7236-ac",
+ "version": "prep-1",
+ "appliesTo": {
+  "gitCommit": "6a28dc635352f022f9be6e6686d35074599cad8d"
+ },
+ "items": [
+  {
+   "id": "AC1",
+   "text": "Tier 1 test \"red-team label settles from the head's check\" (fails on main)."
+  },
+  {
+   "id": "AC2",
+   "text": "Negatives: older head, failure/in-progress/foreign app, unreadable check, open hold, recorded break."
+  }
+ ]
+}

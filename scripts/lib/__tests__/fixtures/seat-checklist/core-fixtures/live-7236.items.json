@@ -1,0 +1,348 @@
+{
+ "repo": "web-everything/web-everything",
+ "repositoryUri": "https://github.com/web-everything/web-everything",
+ "pr": 7236,
+ "head": "6a28dc635352f022f9be6e6686d35074599cad8d",
+ "base": "a6ce3c7fc347bfb8a5e46b29329c2b54fe59bd68",
+ "mergeCommit": "4e90997ff4832b54605a160392b76a8d7996c3b3",
+ "evaluator": "https://everstandards.dev/core/fixtures/security-seat-opus",
+ "evaluatedAt": "2026-11-21T22:30:00-05:00",
+ "note": "Security seat answers to the merge-path checklist for merged PR #7236 (fix(red-team): settle the red-team label from the head's clear check), authored by the Standards design committee from the head tree. Every location is checked live against git by tools/verify-live.mjs.",
+ "items": [
+  {
+   "itemId": "MP1",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-check-run.mjs",
+      "startLine": 167,
+      "snippet": "Number(run.app?.id) === Number(appId)"
+     },
+     "note": "only check runs from the configured App id count"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 110,
+      "snippet": "if (app.ok !== true) return false;"
+     },
+     "note": "no App id resolved: no proof"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 39,
+      "snippet": "foreign app"
+     },
+     "note": "negative test"
+    }
+   ]
+  },
+  {
+   "itemId": "MP2",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 116,
+      "snippet": "} catch { return false; }"
+     },
+     "note": "a missing or unreadable check is not clear"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 24,
+      "snippet": "without a clear check fact pending stays (unknown means pending)"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP3",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-check-run.mjs",
+      "startLine": 175,
+      "snippet": "runs.sort((a, b) => Number(b.id) - Number(a.id));"
+     },
+     "note": "ordered by run id, not timestamps"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-check-run.mjs",
+      "startLine": 172,
+      "endLine": 173,
+      "snippet": "ordering unreadable"
+     },
+     "note": "invalid or shared ids refuse"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 45,
+      "snippet": "a newer failing run beats an older success (ordered by id)"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP4",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 185,
+      "snippet": "Compare-and-swap: clear is written only while pending is still on the fresh labels"
+     }
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 187,
+      "snippet": "skipped: 'pending-gone'"
+     }
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 192,
+      "snippet": "vanished-clear race"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP5",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-check-run.mjs",
+      "startLine": 167,
+      "snippet": "run.head_sha.toLowerCase() === headSha.toLowerCase()"
+     },
+     "note": "the check is bound to the exact head"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 167,
+      "snippet": "if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+     },
+     "note": "re-verified before the write"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 180,
+      "snippet": "if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };"
+     },
+     "note": "last guard right before the write"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 36,
+      "snippet": "a check on an older head does not settle the current head"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP6",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-check-run.mjs",
+      "startLine": 168,
+      "snippet": "run.external_id === identity"
+     },
+     "note": "a run counts only for this PR identity; another PR's success cannot clear it"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 39,
+      "snippet": "other PR"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP7",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 116,
+      "snippet": "} catch { return false; }"
+     }
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 182,
+      "snippet": "skipped: 'labels-unreadable'"
+     }
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 172,
+      "snippet": "skipped: 'thread-unreadable'"
+     }
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 48,
+      "snippet": "unreadable check runs, unset app id or a throw refuse"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP8",
+   "outcome": "n/a",
+   "reason": "The change persists no dedupe or state marker: its only write is the label set call itself, so there is nothing to order after the effect.",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 195,
+      "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP9",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 194,
+      "endLine": 195,
+      "snippet": "provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });"
+     },
+     "note": "a crash before the single set call leaves pending (closed); the swap is one call"
+    }
+   ]
+  },
+  {
+   "itemId": "MP10",
+   "outcome": "n/a",
+   "reason": "The diff adds no token choice: reads go through the existing gh runner with only the read-memo variable removed, and the write goes through the existing label provider.",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 103,
+      "snippet": "createFreshGh(runGhSync, env)"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP11",
+   "outcome": "n/a",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 95,
+      "snippet": "delete env[WE_GH_READ_MEMO_DIR];"
+     }
+    }
+   ],
+   "reason": "The diff adds no git subprocess, fetch or credential helper; its only environment change removes the read-memo variable from the settle reads."
+  },
+  {
+   "itemId": "MP12",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 184,
+      "snippet": "skipped: 'blocked-label'"
+     },
+     "note": "the only label the new path trusts is one that refuses (blocked); no label or policy string lets it skip a check"
+    },
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/__tests__/red-team-label-settle.test.mjs",
+      "startLine": 204,
+      "snippet": "a blocked label on the fresh state vetoes the settle to clear"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP13",
+   "outcome": "n/a",
+   "reason": "The change starts no child or uid process; the settle runs synchronously in the caller and writes nothing after it returns.",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 160,
+      "snippet": "const planWith = (threadNow, clear) =>"
+     }
+    }
+   ]
+  },
+  {
+   "itemId": "MP14",
+   "outcome": "pass",
+   "evidence": [
+    {
+     "kind": "quoted-citation",
+     "location": {
+      "uri": "scripts/lib/red-team-status-labels.mjs",
+      "startLine": 115,
+      "snippet": "readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact"
+     },
+     "note": "reuses the merge gate's own evaluators; no new marker or retry machinery"
+    }
+   ]
+  }
+ ]
+}

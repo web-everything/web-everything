@@ -35,7 +35,7 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
     const { result, ready, clearAwaiting, readHeadCheckState, readPrView } = run({ state: 'red', reviewHoldOnly: true });
     expect(readHeadCheckState).toHaveBeenCalledTimes(1);
     expect(readHeadCheckState).toHaveBeenCalledWith({ repoSlug: fixture.repo, sha: draft.headRefOid, prNumber: draft.number });
-    expect(readPrView).toHaveBeenCalledTimes(1);
+    expect(readPrView).toHaveBeenCalledTimes(2);
     expect(readPrView).toHaveBeenCalledWith({ repoSlug: fixture.repo, prNumber: draft.number });
     expect(result.rows).toEqual([expect.objectContaining({ repo: fixture.repo, pr: draft.number, action: 'promoted' })]);
     expect(ready).toHaveBeenCalledTimes(1);
@@ -108,4 +108,51 @@ describe('runDraftPromotionStep — forwards reviewHoldOnly from the fresh head 
     expect(readPrView).toHaveBeenCalledTimes(state === 'unchecked' ? 1 : 0);
     expect(ready).not.toHaveBeenCalled();
   });
+});
+
+describe('last-read operator park guard', () => {
+  const park = { author: { login: 'web-everything' }, body: '<!-- operator-park -->' };
+  const run = (readDuring, finalComments) => {
+    const ready = vi.fn();
+    const clearAwaiting = vi.fn();
+    let comments = [];
+    const view = () => ({ ...draft, state: 'OPEN', isDraft: true, baseRefName: 'main',
+      comments, labels: [], isCrossRepository: false, body: '', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: [check('test')], mergeable: 'MERGEABLE' });
+    const readPrView = vi.fn(() => {
+      if (readPrView.mock.calls.length === 2 && finalComments instanceof Error) throw finalComments;
+      return view();
+    });
+    const during = name => { if (name === readDuring) comments = finalComments; };
+    const result = runDraftPromotionStep({
+      repos: [fixture.repo], listDrafts: () => [draft], absentNotApplicable: [],
+      readHeadCheckState: () => ({ state: 'green' }), readPrView,
+      readAgents: () => { during('agents'); return []; },
+      readRequiredChecks: () => { during('required'); return { checks: ['test'] }; },
+      readClaim: () => { during('claim'); return null; },
+      ready, clearAwaiting,
+    });
+    return { result, ready, clearAwaiting, readPrView };
+  };
+
+  it.each(['agents', 'required', 'claim'])(
+    'a park posted during %s reads stops the loop write', readDuring => {
+      const { result, ready, clearAwaiting, readPrView } = run(readDuring, [park]);
+      expect(readPrView).toHaveBeenCalledTimes(2);
+      expect(result.rows).toEqual([expect.objectContaining({ action: 'skip', reason: 'operator-parked' })]);
+      expect(ready).not.toHaveBeenCalled();
+      expect(clearAwaiting).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([undefined, null, {}, 'comments', new Error('unreadable')])(
+    'fails closed when the final comment refresh returns %j', comments => {
+      const { result, ready, readPrView } = run('claim', comments);
+      expect(readPrView).toHaveBeenCalledTimes(2);
+      expect(result.rows).toEqual([expect.objectContaining({
+        action: 'error', why: expect.stringContaining('retry next step'),
+      })]);
+      expect(ready).not.toHaveBeenCalled();
+    },
+  );
 });

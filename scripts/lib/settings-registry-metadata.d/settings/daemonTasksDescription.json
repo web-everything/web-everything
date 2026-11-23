@@ -1,0 +1,6 @@
+{
+  "description": "Documentation of the daemon task manifest and host token substitution.",
+  "owner": "scripts/settings/daemon-tasks.json",
+  "changeVia": "pr",
+  "instant": false
+}

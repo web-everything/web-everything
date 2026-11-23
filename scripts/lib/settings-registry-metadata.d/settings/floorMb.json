@@ -1,0 +1,6 @@
+{
+  "description": "Minimum child-process V8 old-space cap in megabytes.",
+  "owner": "scripts/settings/node-heap-cap.json",
+  "changeVia": "pr",
+  "instant": false
+}
