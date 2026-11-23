@@ -1,11 +1,26 @@
 import { describe, expect, it, vi } from 'vitest';
 import { classifyMqFailureIntake, admitMqFailureRoute } from '../mq-failure-intake.mjs';
-import { refreshMqFailureHead } from '../../lib/mq-failure-refresh.mjs';
+import { refreshMqFailureHead as executeRefresh } from '../../lib/mq-failure-refresh.mjs';
 import { collectMqFailureEvidence } from '../../lib/mq-failure-evidence.mjs';
 import { buildMqFailureRoute, parseMqFailureRoute } from '../../lib/mq-failure-route.mjs';
 import { planReconcile, BOOKKEEPING_MARKERS } from '../reconcile-core.mjs';
-import { runReconcileFixDispatch, fetchPrDiffPaths } from '../reconcile-fix-dispatch.mjs';
+import { runReconcileFixDispatch as executeDispatch, fetchPrDiffPaths } from '../reconcile-fix-dispatch.mjs';
 import { createMqFailureLedger } from '../../lib/mq-failure-ledger.mjs';
+
+const stores = new WeakMap();
+function refreshMqFailureHead(options) {
+  if (!stores.has(options.ledger)) { const spent = new Set(); stores.set(options.ledger, { claim: key => !spent.has(key) && !!spent.add(key) }); }
+  return executeRefresh({ ...options, store: stores.get(options.ledger), allow: () => true,
+    io: { ...options.io, readLabels: () => ({ headRefOid: options.head, labels: ['ready-to-merge'] }) } });
+}
+function runReconcileFixDispatch(options) {
+  const spent = new Set();
+  return executeDispatch({ approvedHeadHold: () => false, enqueueAllowed: () => true,
+    mqRefreshStore: { claim: key => !spent.has(key) && !!spent.add(key) },
+    acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, readFixClaim: () => null,
+    ...options, mqFailureIo: options.mqFailureIo && { ...options.mqFailureIo,
+      readLabels: () => ({ headRefOid: identity.head, labels: ['ready-to-merge'] }) } });
+}
 
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40) };
 const route = { ...identity, version: 1, failedJobs: ['unit (node 22)'],
@@ -311,7 +326,7 @@ describe('mq recovery dispatcher guards', () => {
       route: { ...route, repo: wePrRepo }, changedFiles: { ...changedFiles, repo: wePrRepo } }), ...overrides });
   function run({ entries = [entry()], ledger = { readFixFallback: () => false }, dryRun = false, omitDryRun = false, readHead, refresh, lanes = [5] } = {}) {
     const dispatch = vi.fn(planned => ({ pr: planned.pr, sessionId: 'fixture-fixer' }));
-    const fetchFiles = vi.fn(() => ['src/unrelated.mjs']);
+    const fetchFiles = vi.fn(pr => entries.length > 1 ? [`src/unrelated-${pr}.mjs`] : ['src/unrelated.mjs']);
     const head = readHead ?? vi.fn(() => identity.head);
     const refreshMqFailure = refresh ?? vi.fn(() => ({ action: 'refreshed', head: 'b'.repeat(40) }));
     const result = runReconcileFixDispatch({ root: 'fixture/dispatch', repo: 'we', ...(omitDryRun ? {} : { dryRun }),
@@ -379,7 +394,7 @@ describe('mq recovery dispatcher guards', () => {
   it('one pass reads at most eight MQ diffs; entries past the bound keep fixer admission', () => {
     const entries = Array.from({ length: 9 }, (_, i) => {
       const pr = 100 + i;
-      return { kind: 'fix', prNumber: pr, headRefName: `topic-${i}`, headRefOid: identity.head, files: ['src/unrelated.mjs'],
+      return { kind: 'fix', prNumber: pr, headRefName: `topic-${i}`, headRefOid: identity.head, files: [`src/unrelated-${pr}.mjs`],
         mqFailureRecovery: admitMqFailureRoute({ ...identity, pr, repo: wePrRepo,
           route: { ...route, pr, repo: wePrRepo }, changedFiles: { ...changedFiles, pr, repo: wePrRepo } }) };
     });

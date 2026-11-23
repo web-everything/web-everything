@@ -1,3 +1,4 @@
+import { createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, queueLabels, sendBackReason, redTeamLabelHoldReason } from './drain-queue-safety.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,6 +11,7 @@ export function mqFailureRefreshIo(root, { exec = execFileSync, throttled = exec
   const pr = (repo, number, fields) => JSON.parse(throttled('gh', ['pr', 'view', String(number), '--repo', repo, '--json', fields],
     { cwd: root, encoding: 'utf8', timeout: 30000, maxBuffer: 128 * 1024 }));
   return {
+    readLabels: ({ repo, pr: number }) => pr(repo, number, 'headRefOid,labels'),
     readHead: ({ repo, pr: number }) => pr(repo, number, 'headRefOid').headRefOid,
     createCheckout({ repo, pr: number, head }) {
       const data = pr(repo, number, 'headRefOid,headRefName,isCrossRepository');
@@ -38,7 +40,8 @@ export function mqFailureRefreshIo(root, { exec = execFileSync, throttled = exec
 }
 
 // One state machine, driven asynchronously by hermetic callers and synchronously by the existing dispatcher.
-function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
+function* refresh({ repo, pr, head, ledger, io, store = createMqSameHeadRefreshStore(), approvedHeadHold, enqueueAllowed,
+  allow = createMqSameHeadRefreshOptions({ repo, pr, head, approvedHeadHold, enqueueAllowed }).allow, dryRun = false }) {
   const stop = note => ({ action: 'stop', note });
   if (dryRun) return stop('Dry-run: no refresh claim or writes');
   if (!/^[a-f0-9]{40}$/.test(head ?? '')) return stop('Unknown head; operator inspection required');
@@ -49,8 +52,13 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
   // "head changed after merge" (a newer head owns the next route). Nothing else may leave the PR with no owner.
   const fallback = function* (note) { yield () => ledger.recordFixFallback(identity); return { action: 'fix', note }; };
   try {
+    if ((yield () => allow?.()) !== true) return stop('Refresh authorization refused or unreadable; operator inspection required');
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed; stale route retained for operator inspection');
-    const claim = yield () => ledger.claim({ ...identity, kind: 'refresh' });
+    const sharedClaim = yield () => store.claim(`${repo}#${pr}@${head}`);
+    // Retain legacy consumed-attempt evidence; the shared store is authoritative across both paths.
+    const claim = sharedClaim === true
+      ? yield () => ledger.claim({ ...identity, kind: 'refresh' })
+      : { claimed: false, note: 'Already refreshed once; operator inspection required' };
     if (!claim.claimed) {
       // A head this ledger produced by a refresh that failed again is main-caused or real: the fixer gets it. Any other
       // denied claim (a concurrent executor, an earlier attempt) stays a loop-guard stop.
@@ -67,8 +75,17 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
     if (!/^[a-f0-9]{40}$/.test(merged.head ?? '')) return yield* fallback('Unknown merged head; normal fix required');
     if (merged.head === head) return yield* fallback('Merge left head unchanged (main already included); normal fix required');
     // Reserve the successor BEFORE publication: a crash after push cannot grant it another refresh.
+    yield () => store.claim(`${repo}#${pr}@${merged.head}`);
     yield () => ledger.recordRefresh({ ...identity, newHead: merged.head });
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed after merge; refusing stale push');
+    let labeled;
+    try { labeled = yield () => io.readLabels({ repo, pr }); }
+    catch { return stop('Live labels unreadable; operator inspection required'); }
+    const names = Array.isArray(labeled?.labels) ? queueLabels(labeled.labels) : null;
+    if (labeled?.headRefOid !== head || !names || names.length >= 100
+      || names.some(name => typeof name !== 'string' || !name.trim())
+      || sendBackReason(names) || redTeamLabelHoldReason(names))
+      return stop('Live labels blocked or unreadable; operator inspection required');
     const pushed = yield () => io.git({ cwd: checkout.cwd, args: ['push', 'origin', `HEAD:refs/heads/${checkout.branch}`] });
     if (!pushed?.ok) return yield* fallback('Ordinary push rejected; normal fix required (no retry)');
     return { action: 'refreshed', head: merged.head };

@@ -17,13 +17,16 @@ function fixture() {
     tail = operation.catch(() => {});
     return operation;
   }) };
+  const spent = new Set();
+  const store = { claim: key => !spent.has(key) && !!spent.add(key) };
   const io = {
+    readLabels: () => ({ headRefOid: identity.head, labels: ['ready-to-merge'] }),
     readHead: vi.fn(async () => identity.head),
     createCheckout: vi.fn(async () => checkout),
     git: vi.fn(async ({ args }) => args[0] === 'merge' ? { ok: true, head: newHead } : { ok: true }),
     removeCheckout: vi.fn(async () => {}),
   };
-  return { ...identity, ledger: createMqFailureLedger({ io: storage }), io, dryRun: false };
+  return { ...identity, store, allow: () => true, ledger: createMqFailureLedger({ io: storage }), io, dryRun: false };
 }
 const pushes = options => options.io.git.mock.calls.filter(([call]) => call.args[0] === 'push');
 

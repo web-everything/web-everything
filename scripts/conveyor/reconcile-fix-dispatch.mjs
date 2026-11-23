@@ -1,3 +1,5 @@
+import { createMqRefreshAuthorization } from '../lib/mq-refresh-authorization.mjs';
+import { createMqSameHeadRefreshOptions } from '../lib/drain-queue-safety.mjs';
 import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
@@ -1871,6 +1873,9 @@ export function runReconcileFixDispatch({
   refreshMqFailure = refreshMqFailureHeadSync,
   mqFailureLedger = null,
   mqFailureIo = null,
+  approvedHeadHold, enqueueAllowed, mqRefreshStore, mqRefreshExec,
+  acquireClaim = acquireFixDispatchClaim, releaseClaim = releaseFixDispatchClaim,
+  readFixClaim = readLiveFixClaim, claimOwner = fixDispatchClaimOwner(), claimRoot,
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   root = REPO_ROOT,
   repo = null,
@@ -2090,7 +2095,7 @@ export function runReconcileFixDispatch({
   }
   const mqRefreshRefusals = [];
   let mqDiffReads = 0;
-  dispatchEntries = dispatchEntries.filter(entry => {
+  const prepareMqRefresh = entry => {
     let recovery = entry.mqFailureRecovery;
     if (entry.kind !== 'fix' || !recovery) return true;
     // Refuse a misbound hint even if an upstream caller supplied it directly: another PR's or head's evidence is
@@ -2138,7 +2143,10 @@ export function runReconcileFixDispatch({
       }
       result = fallback
         ? { action: 'fix', note: 'Persisted MQ refresh failure; normal fix still required' }
-        : refreshMqFailure({ ...identity, dryRun, ledger, io });
+        : refreshMqFailure({ ...identity, dryRun, ledger, io,
+          ...createMqSameHeadRefreshOptions({ ...identity, store: mqRefreshStore,
+            ...createMqRefreshAuthorization({ ...identity, root: repoKey === 'we' ? root : profile.lanePoolRepo,
+              exec: mqRefreshExec, approvedHeadHold, enqueueAllowed }) }) });
     } catch { result = { action: 'stop', note: 'MQ refresh executor failed; operator inspection required' }; }
     if (result?.action === 'fix') {
       // Conflict/push rejection consumes the mechanical attempt; the ordinary fixer gets the evidence.
@@ -2149,7 +2157,7 @@ export function runReconcileFixDispatch({
       why: result?.action === 'refreshed' ? `MQ head refreshed to ${result.head}; waiting for fresh CI`
         : result?.note ?? 'MQ refresh stopped; operator inspection required' });
     return false; // No LLM session for a mechanical refresh or a stopped refresh.
-  });
+  };
   const { planned: plannedAll, refusals: planRefusals } = fixStep('plan-fixes', () => planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef, { includeLabels: true }));
   // Refresh existing PR claims too: a prepare's old declared implementation scope must
   // not survive as ownership. Reuse the reconcile snapshot, then one read per missing PR.
@@ -2269,7 +2277,7 @@ export function runReconcileFixDispatch({
   // repo), never the WE pool for a non-WE repo (#x33jgwt).
   const lanes = [...(typeof pickFreeLanes === 'function' ? pickFreeLanes() : freeLaneNumbers({ root, lanePoolRepo: profile.lanePoolRepo }))];
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
-  refusals.push(...mqRefreshRefusals);
+
   const dispatched = [];
   let handled = 0;
   let deferred = [];
@@ -2347,6 +2355,24 @@ export function runReconcileFixDispatch({
         deferredForCapacity: capResult.deferredForCapacity, cap: queueCapRefusalCap, capExhausted: false,
       });
       continue;
+    }
+    // Mechanical writes obey the same admission and exclusive ownership as a fixer.
+    if (entry.mqFailureRecovery) {
+      const claimArgs = { repo: repoKey, pr: entry.pr, kind: 'fix', headSha: entry.headRefOid,
+        scope: entry.overlapScope ?? entry.scope, owner: claimOwner, lockRoot: claimRoot };
+      try {
+        if (readFixClaim(claimArgs)) { refusals.push({ pr: entry.pr, kind: 'held', why: 'PR claimed by fixer' }); continue; }
+        const claim = acquireClaim(claimArgs);
+        if (!claim.ok) { refusals.push({ pr: entry.pr, kind: 'held', why: 'Fix dispatch claim refused' }); continue; }
+        let proceed;
+        try {
+          if (readFixClaim(claimArgs)) { refusals.push({ pr: entry.pr, kind: 'held', why: 'PR claimed by fixer' }); continue; }
+          const row = { ...entry, kind: 'fix', prNumber: entry.pr };
+          proceed = prepareMqRefresh(row);
+          entry.mqFailureRecovery = row.mqFailureRecovery;
+        } finally { releaseClaim(claimArgs); }
+        if (!proceed) continue;
+      } catch { refusals.push({ pr: entry.pr, kind: 'held', why: 'MQ claim unreadable; operator inspection required' }); continue; }
     }
     // #xazl9u3 — ask "would a resume work?" BEFORE ever touching the lane pool. Only a conflict-caused entry
     // is even eligible (tryResumeFix itself returns `resumed: false, resumeAttempt: null` immediately for any
@@ -2436,6 +2462,7 @@ export function runReconcileFixDispatch({
     }
   }
 
+  refusals.push(...mqRefreshRefusals);
   if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
   return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }

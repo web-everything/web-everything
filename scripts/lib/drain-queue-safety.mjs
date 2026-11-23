@@ -159,6 +159,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
       else return hold(reason || 'unknown removal reason');
     }
   }
+  if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
+    return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   const cancelledRegroup = retryEvidence?.infra === 'cancelled-regroup';
   const cancelledMax = retryEvidence?.mqCancelledRetryMax ?? 2;
   const cancelledRetry = cancelledRegroup && retryEvidence.mergeState === 'CLEAN'
@@ -189,8 +191,6 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
       : reenqueuedAfterFailure > 0
       ? 'failed_checks (re-queued after the failed removal without retry evidence); operator must inspect history and enqueue manually'
       : 'failed_checks');
-  if (mergeConflictRemovals >= MQ_MERGE_CONFLICT_RETRY_CAP)
-    return hold(`repeated merge_conflict ejection (${mergeConflictRemovals} times); operator must inspect history and enqueue manually`);
   if (mergeConflictRemovals > 0 && mergeState !== 'CLEAN')
     return hold(`merge_conflict removal and the PR is not CLEAN (${String(mergeState ?? 'unknown')}); not re-enqueuing`);
   const retryDetails = `${retryEvidence?.mainRunId != null ? `; main run ${retryEvidence.mainRunId}` : ''}${retryEvidence?.failedNames?.length ? `; failed check(s): ${retryEvidence.failedNames.join(', ')}` : ''}${mqDerivedDetails(retryEvidence)}`;
@@ -264,7 +264,7 @@ export function createMqSameHeadRefreshStore({ path = mqSameHeadRefreshStatePath
 }
 
 export function createMqSameHeadRefreshOptions({ store, approvedHeadHold, enqueueAllowed, repo, pr, head }) {
-  return { store, allow: () => enqueueAllowed?.() === true
+  return { store, approvedHeadHold, enqueueAllowed, allow: () => enqueueAllowed?.() === true
     && approvedHeadHold({ repo, num: pr }, head, { strict: true }) === false };
 }
 
@@ -1266,7 +1266,7 @@ export function redTeamLabelHoldReason(labels) {
 
 export function sendBackReason(labels) {
   const names = queueLabels(labels);
-  const hold = ['review:changes', 'review:human', 'review:pending', 'red-team:blocked'].find(l => names.includes(l));
+  const hold = ['human-only', 'review:changes', 'review:human', 'review:pending', 'red-team:blocked'].find(l => names.includes(l));
   return hold ? `state is ${hold}` : !names.includes('ready-to-merge') ? 'ready-to-merge was removed' : null;
 }
 
