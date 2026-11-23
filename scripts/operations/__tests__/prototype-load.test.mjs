@@ -6,6 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import nodeFs, { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { registrationAuditGate } from '../../daemon-overlay.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -21,6 +22,7 @@ import { urgentSignature } from '../urgent-verify-marker.mjs';
 const urgentKey = Buffer.alloc(32, 7);
 import * as prototypeLoad from '../prototype-load.mjs';
 import { QUESTION_HASH, main as auditMain } from '../codex-audit.mjs';
+import { AUDIT_SETTINGS_PATH } from '../codex-audit-io.mjs';
 import { resolveOperation } from '../run.mjs';
 import { createRegistry } from '../registry.mjs';
 import { startRun, advance } from '../engine.mjs';
@@ -57,9 +59,11 @@ function fixture(options = {}) {
   const admitted = [];
   const env = { HOME: '/home/test', USER: 'tester', PATH: '/bin', GH_TOKEN: 'secret', NODE_OPTIONS: 'unsafe', WE_ALLOW_NO_PR: '1', ...options.env };
   const ready = { ref: BASE.branch, sha: candidateSha, tests: 'green', audit: 'NOT WEAKENED' };
+  let auditBody = options.audits ?? auditLines([auditRecord({ head: candidateSha, base: 'e'.repeat(40) })]);
   const fs = {
     readFileSync(p) {
       reads.push(p);
+      if (p === AUDIT_SETTINGS_PATH) return JSON.stringify({ auditRecordPath: '~/canonical-audits.jsonl', ...options.settings });
       if (options.waiverRequests && p.endsWith('/handoff/waiver-requests.jsonl')) return nodeFs.readFileSync(options.waiverRequests, 'utf8');
       if (options.waiverStore && p.endsWith('/coordination/ruled-weakened.jsonl')) return nodeFs.readFileSync(options.waiverStore, 'utf8');
       if (p.endsWith('/urgent-full-green.jsonl')) {
@@ -73,7 +77,7 @@ function fixture(options = {}) {
       if (p === '/home/test/ready') return options.ready ?? `bad line\n${JSON.stringify(ready)}\n`;
       if (p === '/home/test/canonical-audits.jsonl') {
         if (options.auditReadError) throw Object.assign(new Error('audit file unreadable'), { code: options.auditReadError });
-        return options.audits ?? auditLines([auditRecord({ head: candidateSha, base: 'e'.repeat(40) })]);
+        return auditBody;
       }
       if (options.alertsReadError && p.endsWith('.alerts.jsonl')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
       if (p.endsWith('.alerts.jsonl')) return options.alerts || '';
@@ -103,6 +107,8 @@ function fixture(options = {}) {
     if (cmd === 'plutil') return JSON.stringify({ WorkingDirectory: '/home/test/workspace/review' });
     if (cmd === 'node') {
       const action = args[1], ref = args.find((a) => a.startsWith('--ref='))?.slice(6);
+      if (['add', 'replace'].includes(action) && options.registrationGate && !options.registrationGate({ ref, sha: remoteTip }))
+        return fail(3, JSON.stringify({ check: { ok: true, clean: true, candSha: remoteTip }, wouldRegister: false, refused: 'no-canonical-audit' }));
       if (action === 'list') return options.listRaw ?? JSON.stringify({ list: [...registrations.values()] });
       if (action === 'recover-drops') return options.recoverRaw ?? JSON.stringify({ settled: [{ ref: 'lane/x', outcome: 'restored' }], pending: [] });
       if (action === 'retire') {
@@ -271,14 +277,24 @@ function fixture(options = {}) {
   }
   // Retirement has its own real-git suite (prototype-retire.test.mjs); here it is injected like combinedTest.
   const retirePlanner = vi.fn((input) => options.retirePlan ? options.retirePlan(input) : []);
+  const audit = vi.fn(async input => {
+    if (options.generatedAudit === 'throws') throw new Error('auditor unavailable');
+    const record = auditRecord({ head: options.generatedAudit === 'wrong-head' ? SHA : input.head,
+      base: options.generatedAuditBase ?? 'e'.repeat(40), ...(options.generatedAudit === 'weakened' ? { verdict: 'WEAKENED', findings: ['new merge finding'] } : {}) });
+    if (options.generatedAudit !== 'missing') auditBody += auditLines([record]);
+    if (options.generatedAudit === 'corrupt') auditBody += '{broken\n';
+    options.onAudit?.(input, record, calls);
+    return options.generatedAudit === 'failed' ? 3 : options.generatedAudit === 'weakened' ? 1 : 0;
+  });
   const load = createPrototypeLoader({ exec, fs, env, retirePlanner, readUrgentKey: () => { if (options.missingUrgentKey) throw new Error('missing'); return urgentKey; },
+    audit: options.generatedAudit === 'unavailable' ? undefined : audit,
     readState: options.readState ?? (() => ({ corrupt: false, overlays: [...registrations.values(), ...admitted] })),
     // defaultTestCheck leaves the seam unset so the production check-run reader (gh api + workflow binding) runs.
     testCheck: options.defaultTestCheck ? undefined : options.testCheck ?? (async ({ sha }) => ({ sha, name: 'test', status: 'completed', conclusion: 'success', appId: 15368 })),
     dispatchSmoke: options.dispatchSmoke, removeRegistration: options.removeRegistration, ...(options.fingerprint ? { fingerprint: options.fingerprint } : {}), ...(options.defaultCombined ? {} : { combinedTest }), settings: structuredClone({ ...settings, auditRecordPath: '~/canonical-audits.jsonl', ...options.settings }), now: () => clock,
     cloneKey: (root) => { cloneRoots.push(root); return 'test-clone-key'; },
     sleep: async (ms) => { sleeps.push(ms); clock += ms; await options.onSleep?.(); } });
-  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
+  return { calls, records, readyWrites, sleeps, admitted, reads, cloneRoots, lateChanges, registrations, combinedTest, retirePlanner, audit, run: (input = {}) => load({ ...BASE, sha: candidateSha, ...input }) };
 }
 const mutations = (f, action) => f.calls.filter((c) => c.cmd === 'node' && c.args[1] === action && !c.args.includes('--check'));
 describe('urgent prototype admission', () => {
@@ -519,6 +535,20 @@ function auditedFixture(mode, options = {}) {
 }
 
 describe('codex-audit runner registration', () => {
+  it('binds the generated-merge auditor and keeps its output off operation stdout', async () => {
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(auditMain).mockImplementationOnce(async (argv, deps) => {
+      expect(argv).toEqual([`--base=origin/main`, `--head=${MERGE}`]);
+      deps.stdout('NOT WEAKENED\n');
+      return 0;
+    });
+    try {
+      expect(await defaultDeps().audit({ base: 'origin/main', head: MERGE, cwd: '/fixture', home: '/fixture-home' })).toBe(0);
+      expect(stdout).not.toHaveBeenCalled();
+      expect(stderr).toHaveBeenCalledWith('NOT WEAKENED\n');
+    } finally { stdout.mockRestore(); stderr.mockRestore(); }
+  });
   it('declares base and head inputs and binds execution to codex-audit main', async () => {
     vi.mocked(auditMain).mockClear();
     const { declaration, registry, sinks } = resolveOperation('codex-audit');
@@ -639,6 +669,13 @@ describe('prototype-load ruled-WEAKENED admission', () => {
       const make = () => auditedFixture('refuse', { ready: auditLines([ready]), waiverStore, waiverRequests });
       expect(await make().run()).toMatchObject({ ok: true, registered: true });
       nodeFs.appendFileSync(waiverRequests, JSON.stringify({ ref: BASE.branch, sha: SHA, ruling: 'WITHDRAWN', at: '2026-11-18T12:00:00Z' }) + '\n');
+      expect(await make().run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready' });
+      const withdrawal = JSON.stringify({ ref: BASE.branch, sha: SHA, ruling: 'WITHDRAWN', reason: 'withdrawn\nby operator' });
+      for (const damaged of [withdrawal.replace('\\n', '\n'), withdrawal.replace('\\n', '\r'), '{broken']) {
+        nodeFs.writeFileSync(waiverRequests, damaged + '\n');
+        expect(await make().run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready' });
+      }
+      nodeFs.writeFileSync(waiverRequests, withdrawal + '\n');
       expect(await make().run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-ready' });
     } finally { warning.mockRestore(); nodeFs.rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1175,6 +1212,36 @@ describe('prototype-load', () => {
   it.each([[null, 'lane/new-m1'], [`${SHA}\trefs/heads/lane/new-m1\n`, 'lane/new-m2']])('clean behind-main merge publishes next suffix', async (remote, ref) => {
     const f = fixture({ behind: true, remote }); const r = await f.run(); expect(r.ok).toBe(true); expect(r.effectiveRef).toBe(ref); expect(r.effectiveSha).toBe(MERGE);
     expect(f.calls.find((c) => c.args[0] === 'push').args).toEqual(['push', 'origin', `${MERGE}:refs/heads/${ref}`]);
+  });
+  it.each([[false, false], [true, false], [false, true], [true, true]])('audits the generated SHA before real admission (replace: %s, waived: %s)', async (replace, waived) => {
+    await withBareOrigin(async ({ tmp: home, clone, git }) => {
+      const base = git(['rev-parse', 'origin/main']).trim();
+      const dir = join(home, 'workspace/.operations/coordination');
+      nodeFs.mkdirSync(dir, { recursive: true });
+      const ledger = join(dir, 'audits.jsonl');
+      writeFileSync(ledger, auditLines([auditRecord({ base: 'e'.repeat(40) })]));
+      const waiverStore = join(dir, 'ruled-weakened.jsonl');
+      if (waived) writeFileSync(waiverStore, auditLines([{ ref: 'lane/new-m1', sha: MERGE, ruling: 'R12', findings: ['new merge finding'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' }]));
+      const f = fixture({ behind: true, generatedAuditBase: base, auditBaseInMain: base,
+        ...(waived ? { generatedAudit: 'weakened', waiverStore } : {}),
+        ...(replace ? { list: ['lane/old'], contained: ['lane/old'] } : {}),
+        registrationGate: ({ ref, sha }) => registrationAuditGate({ root: clone, ref, sha, env: { HOME: home }, readOnly: true }),
+        onAudit: (input, record, calls) => {
+          expect(input).toMatchObject({ base: 'origin/main', head: MERGE, cwd: expect.any(String) });
+          expect(calls.some(c => c.args[0] === 'push')).toBe(false);
+          nodeFs.appendFileSync(ledger, auditLines([record]));
+        } });
+      expect(await f.run(replace ? { replace: 'lane/old' } : {})).toMatchObject({ ok: true, registered: true, effectiveSha: MERGE });
+      expect(f.audit).toHaveBeenCalledTimes(1);
+      expect(mutations(f, replace ? 'replace' : 'add')).toHaveLength(1);
+    });
+  });
+  it.each(['missing', 'wrong-head', 'weakened', 'failed', 'throws', 'corrupt', 'unavailable'])('does not publish or register a generated merge with %s audit evidence', async generatedAudit => {
+    const f = fixture({ behind: true, generatedAudit });
+    expect(await f.run()).toMatchObject({ ok: false, registered: false, stopReason: 'no-canonical-audit',
+      generatedAudit: { sha: MERGE }, fallback: expect.stringContaining('A retry may create a different SHA') });
+    expect(f.calls.some(c => c.args[0] === 'push')).toBe(false);
+    expect(mutations(f, 'add')).toHaveLength(0);
   });
   it('behind-main-conflict names paths and never registers', async () => {
     const f = fixture({ behind: true, mergeConflict: true }); const r = await f.run(); expect(r.stopReason).toBe('behind-main-conflict'); expect(r.mainCheck.files).toEqual(['x']); expect(mutations(f, 'add')).toHaveLength(0);
@@ -2281,6 +2348,7 @@ describe('prototype-load', () => {
   });
   it('dry-run checks original ref and records without push/add/remove or adoption', async () => {
     const f = fixture({ behind: true, list: ['lane/old'], contained: ['lane/old'] }); const r = await f.run({ dryRun: true }); expect(r.ok).toBe(true); expect(r.wouldMerge.ref).toBe('lane/new-m1'); expect(r.wouldRegister).toBe(true); expect(r.effectiveRef).toBe(BASE.branch); expect(r.wouldRemove).toEqual([]); expect(r.wouldRetain).toEqual(['lane/old']); expect(r.wouldStopReason).toBe('swap-remove-failed');
+    expect(f.audit).not.toHaveBeenCalled();
     expect(f.calls.some((c) => ['push', 'commit-tree', '-C'].includes(c.args[0]))).toBe(false); expect(mutations(f, 'add')).toHaveLength(0); expect(mutations(f, 'remove')).toHaveLength(0); expect(f.records[0].dryRun).toBe(true);
   });
   it('resolves plist WorkingDirectory with logged source', async () => { const f = fixture(); const r = await f.run({ daemon: 'review' }); expect(r.cloneSource).toBe('plist:com.we.review-daemon'); expect(r.clone).toBe('/home/test/workspace/review'); expect(f.calls[0].cmd).toBe('plutil'); });

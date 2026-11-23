@@ -8,6 +8,9 @@
  * Real deps bind only in defaultDeps.
  */
 import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
+import { main as auditMain } from './codex-audit.mjs';
+import { createAuditDeps } from './codex-audit-io.mjs';
+import { auditEvidenceFor, loadAuditEvidence } from '../lib/overlay-audit-evidence.mjs';
 import { requestForceAdopt } from '../lib/daemon-force-adopt.mjs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -220,11 +223,21 @@ export function diagnoseWaiverMismatch(records, input, ruledWeakened) {
 export function defaultDeps() {
   return { exec: execFileSync, fs: nodeFs, now: () => Date.now(), sleep: (ms) => new Promise((done) => setTimeout(done, ms)),
     env: { ...process.env, HOME: homedir() }, settings: undefined, cloneKey, combinedTest: defaultCombinedTest,
+    audit: ({ base, head, cwd, home }) => auditMain([`--base=${base}`, `--head=${head}`], {
+      ...createAuditDeps({ cwd, home }),
+      // The outer operation owns stdout (including its JSON envelope).
+      stdout: text => process.stderr.write(text),
+    }),
     retirePlanner: defaultRetirePlanner };
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
 export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn }) {
-  const isRevoked = withdrawnRevocations({ fs, env, warn });
+  let damaged = false;
+  const isRevoked = withdrawnRevocations({ fs, env, warn: message => {
+    damaged = true;
+    warn(`${message}; no waivers loaded until the request log is repaired.`);
+  } });
+  if (damaged) return [];
   const merged = mergeRuledWeakened(platform, tool, warn).filter(e => !isRevoked(e));
   const store = readStore({ path: storePath(env), fs, warn });
   if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);
@@ -236,7 +249,7 @@ export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn
   }
   return merged;
 }
-export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, cloneKey: keyForClone = cloneKey,
+export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, combinedTest, audit, cloneKey: keyForClone = cloneKey,
   readState = readOverlayState,
   retirePlanner = defaultRetirePlanner, fingerprint = null, testCheck = null, readUrgentKey = () => fs.readFileSync(urgentKeyPath(env.HOME)), dispatchSmoke = null, realDispatchSmoke = runRealDispatchSmoke, removeRegistration = null,
   resolveOperatorIdentity: operatorIdentity = resolveOperatorIdentity }) {
@@ -717,6 +730,22 @@ export function createPrototypeLoader({ exec, fs, now, sleep, env, settings, com
       if (out.wouldMerge && !input.dryRun) {
         const commit = requireGit('commit-tree', comparison, '-p', 'origin/main', '-p', input.sha, '-m', `Merge origin/main into ${input.branch}`);
         if (!validSha(commit)) throw new Error('invalid merge commit');
+        // Admission binds to the exact SHA. The original head's audit (including fingerprint
+        // carry or a waiver) cannot authorize this newly constructed merge commit.
+        stage = 'no-canonical-audit';
+        const fallback = `Resolve the generated merge audit findings or repair the auditor/ledger, then retry prototype-load for a fresh merge audit. A retry may create a different SHA. No generated ref was published.`;
+        out.generatedAudit = { sha: commit, ref: out.wouldMerge.ref, ok: false };
+        if (typeof audit !== 'function') return stop(stage, { detail: 'generated-auditor-unavailable', fallback });
+        let code;
+        try { code = await audit({ base: 'origin/main', head: commit, cwd: gitRepo, home: env.HOME }); }
+        catch (error) { return stop(stage, { detail: 'generated-auditor-failed', error: String(error.message || error), fallback }); }
+        // A successful subprocess alone supplies no evidence: re-read the persisted ledger,
+        // reject partial/corrupt JSONL, and evaluate this head without original-head carry.
+        out.generatedAudit = { sha: commit, ref: out.wouldMerge.ref, code,
+          ...auditEvidenceFor(commit, { ...loadAuditEvidence({ env: childEnv, fs, cwd: gitRepo }), ref: out.wouldMerge.ref, covers }) };
+        if (![0, 1].includes(code) || !out.generatedAudit.ok)
+          return stop(stage, { detail: 'generated-merge-audit-refused', fallback });
+        stage = 'check-unverifiable';
         requireGit('push', 'origin', `${commit}:refs/heads/${out.wouldMerge.ref}`);
         out.effectiveRef = out.wouldMerge.ref; out.effectiveSha = commit;
       }

@@ -39,19 +39,22 @@ export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, co
 }
 
 /** Read the shared ledgers using their existing readers/resolvers. Unreadable evidence grants nothing. */
-export function loadAuditEvidence({ env = process.env } = {}) {
+export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cwd = process.cwd() } = {}) {
   let auditRecords = [], waivers = [];
   if (typeof env.HOME !== 'string' || !env.HOME.trim()) return { auditRecords, waivers };
   try {
-    const path = resolveAuditRecordPath(readAuditSettings(), { home: env.HOME, cwd: process.cwd() });
-    const body = readFileSync(path, 'utf8');
+    const path = resolveAuditRecordPath(readAuditSettings((path, encoding) => fs.readFileSync(path, encoding)), { home: env.HOME, cwd });
+    const body = fs.readFileSync(path, 'utf8');
     const records = jsonLines(body);
     if (records.length === body.split(/\r?\n/).filter(line => line.trim()).length) auditRecords = records;
   } catch { /* Missing, corrupt or unreadable audit ledger: no audit evidence. */ }
   try {
     let damaged = false;
-    const store = readStore({ path: storePath(env), warn: () => { damaged = true; } });
-    const revoked = withdrawnRevocations({ env });
+    const store = readStore({ path: storePath(env), fs, warn: () => { damaged = true; } });
+    const revoked = withdrawnRevocations({ env, fs, warn: message => {
+      damaged = true;
+      console.warn(`${message}; no waiver evidence admitted until the request log is repaired.`);
+    } });
     if (!store.error && !damaged) waivers = store.entries.filter(entry => !revoked(entry));
   } catch { /* Missing or unreadable waiver ledger: no waiver evidence. */ }
   return { auditRecords, waivers };

@@ -78,6 +78,17 @@ test('withdrawals and unreadable revocation ledgers revoke stored waivers', () =
     const ledger = join(dir, 'handoff/waiver-requests.jsonl');
     writeFileSync(ledger, JSON.stringify({ ref, sha, ruling: 'WITHDRAWN' }) + '\n');
     assert.deepEqual(loadAuditEvidence({ env }).waivers, []);
+    const withdrawal = JSON.stringify({ ref, sha, ruling: 'WITHDRAWN', reason: 'withdrawn\nby operator' });
+    for (const damaged of [withdrawal.replace('\\n', '\n'), withdrawal.replace('\\n', '\r'), '{broken']) {
+      writeFileSync(ledger, damaged + '\n');
+      assert.deepEqual(loadAuditEvidence({ env }).waivers, [], 'damaged revocations cannot restore a waiver');
+    }
+    writeFileSync(join(dir, 'coordination/audits.jsonl'), JSON.stringify({ ...valid, head: sha, base, verdict: 'NOT WEAKENED' }) + '\n');
+    assert.equal(auditEvidenceFor(sha, { ...loadAuditEvidence({ env }), ref, covers }).kind, 'audit', 'withdrawal damage blocks waivers, while independent passing audits still qualify');
+    for (const reason of ['line\rreturn', 'line\u2028separator', '`quoted` "text"', '--withdraw ../path', '\u200bhidden', 'safe' + ' parts']) {
+      writeFileSync(ledger, JSON.stringify({ ref, sha, ruling: 'WITHDRAWN', reason }) + '\n');
+      assert.deepEqual(loadAuditEvidence({ env }).waivers, []);
+    }
     rmSync(ledger); mkdirSync(ledger);
     assert.deepEqual(loadAuditEvidence({ env }).waivers, []);
   } finally { rmSync(home, { recursive: true, force: true }); }

@@ -70,6 +70,13 @@ test('gate requires readable main coverage and a canonical audit or matching wai
     writeFileSync(join(dir, 'audits.jsonl'), JSON.stringify({ head: tip, base, verdict: 'WEAKENED', questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z', findings: ['accepted'] }) + '\n');
     writeFileSync(join(dir, 'ruled-weakened.jsonl'), JSON.stringify({ ref: 'lane/fix', sha: tip, ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' }) + '\n');
     assert.equal(run({ sha: tip }), true);
+    const handoff = join(home, 'workspace/.operations/handoff');
+    mkdirSync(handoff);
+    const withdrawal = JSON.stringify({ ref: 'lane/fix', sha: tip, ruling: 'WITHDRAWN', at: '2026-11-11T00:00:00Z', reason: 'withdrawn\nby operator' });
+    writeFileSync(join(handoff, 'waiver-requests.jsonl'), withdrawal + '\n');
+    assert.equal(run({ sha: tip }), false);
+    writeFileSync(join(handoff, 'waiver-requests.jsonl'), withdrawal.replace('\\n', '\n') + '\n');
+    assert.equal(run({ sha: tip }), false, 'damaged withdrawal must not reinstate the older waiver');
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
