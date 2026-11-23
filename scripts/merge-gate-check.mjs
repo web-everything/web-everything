@@ -27,7 +27,8 @@
  * YAML from the merge ref and `merge_group` YAML from the group commit; the ruleset pins required workflows to main.
  * So (1) the PR-leg run holds any PR whose PINNED change list touches a workflow or action for a HUMAN (`facts.gatePaths` → `workflowEditFact`), and a PR must pass that run to enter the queue;
  * (2) the evaluation refuses to pass unless the RUNNING workflow file is byte-identical to main's
- * (`verifyRunningWorkflow`; only a differing pull_request PR-merge-ref run defers without evaluating and exits 1); (3) a YAML edit that never reaches this script (`exit 0`, or a new
+ * (`verifyRunningWorkflow`; only a differing pull_request PR-merge-ref run defers without evaluating and exits 1
+ * under the separate `merge-gate (unpinned workflow)` check name); (3) a YAML edit that never reaches this script (`exit 0`, or a new
  * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
  * Actions integration-id restriction (`--print-ruleset`).
  */
@@ -523,7 +524,7 @@ async function main() {
   // Deferral is only for pull_request PR-merge-ref YAML edits, and must precede every gate evaluation.
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   if (wfCheck.deferred) {
-    const reason = 'running pull_request workflow differs from main; this run cannot pass the gate. The main-pinned run decides; a PR that edits merge-gate.yml needs a human merge decision';
+    const reason = 'running pull_request workflow differs from main; this diagnostic run cannot pass the gate. The main-pinned merge-gate check decides, including exact-head human clearance for workflow edits';
     if (f.json) writeAllSync(1, `${JSON.stringify({ deferred: true, ok: false, reason, workflowCheck: wfCheck })}\n`);
     else writeAllSync(1, `merge-gate: ${reason}\n`);
     process.exit(1);

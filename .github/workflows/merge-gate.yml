@@ -35,6 +35,8 @@
 #       including a readable pull_request mismatch: the main-sourced check defers without evaluating and exits 1.
 #       A deferring run cannot pass in any mode; malicious PR YAML could exit 0 anyway. Ruleset 24930207
 #       pins the deciding run to refs/heads/main, independently of the PR YAML.
+#       Unpinned runs use `merge-gate (unpinned workflow)` so their diagnostic failures cannot supersede a
+#       human-cleared head's main-pinned `merge-gate` success. Without that pinned success the required check holds.
 #       (verifyRunningWorkflow in scripts/merge-gate-check.mjs). It cannot catch an edit that never reaches the
 #       evaluator (the job made `exit 0`, or a new workflow whose job is named `merge-gate`).
 #   (3) THE ENQUEUE REFUSAL, which no PR can edit because it does not run in a workflow: enqueuePr
@@ -106,7 +108,7 @@ concurrency:
 
 jobs:
   merge-gate:
-    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:') && 'merge-gate (unwatched label, skipped)' || github.workflow_ref != format('{0}/.github/workflows/merge-gate.yml@refs/heads/main', github.repository) && 'merge-gate (unpinned workflow)' || 'merge-gate' }}
     if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && github.event.label.name != 'gate:refresh' && !startsWith(github.event.label.name, 'review:') && !startsWith(github.event.label.name, 'red-team:')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15

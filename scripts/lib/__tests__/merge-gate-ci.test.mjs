@@ -17,6 +17,7 @@ import { readRedTeamCheckFact, redTeamPublicationContext } from '../red-team-che
 // The gatherer's PR is #7: its hold lives on that PR's own context.
 const RED_TEAM_PUBLICATION_CONTEXT = redTeamPublicationContext(7);
 import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { reviewCiGate } from '../review-ci-gate.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -848,6 +849,18 @@ describe('merge group membership completeness', () => {
 const workflowOf = (name) => yaml.load(readFileSync(new URL(`../../../.github/workflows/${name}`, import.meta.url), 'utf8'));
 // js-yaml 3 parses the bare key `on` as boolean true.
 const triggersOf = (wf) => wf.on ?? wf[true];
+// Execute the checked-in job-name expression with the Actions functions it uses. This keeps the
+// review prerequisite regression wired to the producer's actual name rather than a copied label.
+const mergeGateJobName = (github) => {
+  const expression = workflowOf('merge-gate.yml').jobs['merge-gate'].name.slice(3, -2);
+  return Function('github', 'startsWith', 'format', `return (${expression});`)(github,
+    (value, prefix) => String(value ?? '').startsWith(prefix),
+    (template, value) => template.replace('{0}', value));
+};
+const gateContext = (ref, eventName = 'pull_request', action = 'labeled', label = 'gate:refresh') => ({
+  repository: 'o/r', workflow_ref: `o/r/.github/workflows/merge-gate.yml@${ref}`,
+  event_name: eventName, event: { action, label: { name: label } },
+});
 
 describe('merge-gate workflow structure', () => {
   const wf = workflowOf('merge-gate.yml');
@@ -922,6 +935,19 @@ describe('merge-gate workflow structure', () => {
       .not.toBe(render('o/r/.github/workflows/merge-gate.yml@refs/pull/7/merge'));
     expect(wf.concurrency['cancel-in-progress']).toBe(true);
   });
+
+  it.each(['opened', 'synchronize', 'reopened', 'labeled', 'unlabeled'])(
+    'reserves the required check name for the pinned PR workflow on %s', action => {
+      expect(mergeGateJobName(gateContext('refs/heads/main', 'pull_request', action))).toBe('merge-gate');
+      expect(mergeGateJobName(gateContext('refs/pull/7/merge', 'pull_request', action))).toBe('merge-gate (unpinned workflow)');
+    });
+
+  it.each(['merge_group', 'workflow_dispatch'])(
+    'reserves the required name for main-pinned %s runs', event => {
+      expect(mergeGateJobName(gateContext('refs/heads/main', event, ''))).toBe('merge-gate');
+      const unpinned = event === 'merge_group' ? 'refs/heads/gh-readonly-queue/main/pr-7' : 'refs/heads/lane/x';
+      expect(mergeGateJobName(gateContext(unpinned, event, ''))).toBe('merge-gate (unpinned workflow)');
+    });
 
   it('checks out main, never the PR ref, before running the scripts', () => {
     const checkoutStep = job.steps.find((s) => /actions\/checkout/.test(s.uses || ''));
@@ -1342,10 +1368,11 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
     return { status: proc.status, stdout: proc.stdout, stderr: proc.stderr };
   };
   // A merge group on top of main: one queue merge commit for PR #7 (+ optionally a commit that maps to no PR).
-  const group = (ctx, { stray = false } = {}) => {
+  const group = (ctx, { stray = false, workflowEdit = false } = {}) => {
     const { git, work, clone, commit } = ctx;
     const base = git(work, 'rev-parse', 'HEAD');
     git(work, 'checkout', '--quiet', '-b', 'lane/x');
+    if (workflowEdit) commit('lane/x', WF, 'name: Merge gate\n# harmless human-approved comment\n');
     const prHead = commit('lane/x', 'docs/a.md', 'pr\n');
     git(work, 'checkout', '--quiet', '-B', 'grp', base);
     git(work, 'merge', '--quiet', '--no-ff', '-m', 'Merge pull request #7 from o/lane/x', prHead);
@@ -1378,7 +1405,7 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
       `require('node:fs').appendFileSync(${JSON.stringify(calls)}, a + '\\n');
 if (a.startsWith('api repos/o/r/actions/runs?')) out(${JSON.stringify(successfulRuns)});
 if (/^repo view/.test(a))`), { mode: 0o755 });
-    const reason = 'running pull_request workflow differs from main; this run cannot pass the gate. The main-pinned run decides; a PR that edits merge-gate.yml needs a human merge decision';
+    const reason = 'running pull_request workflow differs from main; this diagnostic run cannot pass the gate. The main-pinned merge-gate check decides, including exact-head human clearance for workflow edits';
     for (const json of [true, false]) {
       const r = run(ctx, ['--pr=7', ...(json ? ['--json'] : [])], { env });
       expect(r.status, r.stderr).toBe(1);
@@ -1393,6 +1420,44 @@ if (/^repo view/.test(a))`), { mode: 0o755 });
     expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual([
       'repo view o/r --json defaultBranchRef', 'repo view o/r --json defaultBranchRef',
     ]);
+  });
+
+  it.each(['pull_request', 'merge_group'])('a comment-only %s workflow result cannot poison a pinned success or replace missing/failing pinned evidence', event => {
+    const ctx = setup();
+    ctx.commit('main', WF, 'name: Merge gate\n');
+    let head, prHead, ref, args;
+    if (event === 'merge_group') {
+      const grouped = group(ctx, { workflowEdit: true });
+      head = grouped.head; prHead = grouped.prHead;
+      ref = 'refs/heads/gh-readonly-queue/main/pr-7';
+      args = ['--merge-group', `--head-sha=${head}`, `--base-sha=${grouped.base}`, `--head-ref=${ref}`, `--group-tree=${ctx.work}`];
+    } else {
+      ctx.git(ctx.work, 'checkout', '--quiet', '-b', 'lane/x');
+      head = prHead = ctx.commit('lane/x', WF, 'name: Merge gate\n# harmless human-approved comment\n');
+      ref = 'refs/pull/7/merge'; args = ['--pr=7'];
+    }
+    const r = run(ctx, [...args, '--json'], { pr: { headRefOid: prHead }, env: {
+      GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: event, GITHUB_WORKFLOW_SHA: head,
+      GITHUB_WORKFLOW_REF: `o/r/${WF}@${ref}`,
+    } });
+    expect(r.status, r.stderr).toBe(1);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: false, workflowCheck: { ok: false } });
+    expect(wrapped(r, 'enforce')).toBe(1);
+    for (const mode of ['enforce', 'shadow']) {
+      const diagnostic = { id: 200, head_sha: head, status: 'completed',
+        name: mergeGateJobName(gateContext(ref, event, '')),
+        conclusion: wrapped(r, mode) === 0 ? 'success' : 'failure' };
+      const pinned = { id: 100, head_sha: head, status: 'completed',
+        name: mergeGateJobName(gateContext('refs/heads/main', event, '')), conclusion: 'success' };
+      const review = checks => reviewCiGate({ headSha: head, requiredChecks: ['merge-gate'],
+        checks, rowsHead: head, rowsComplete: true });
+      for (const checks of [[pinned, diagnostic], [diagnostic, pinned]]) {
+        expect(review(checks), mode).toMatchObject({ allowed: true });
+      }
+      expect(review([diagnostic])).toMatchObject({ allowed: false });
+      expect(review([{ ...pinned, conclusion: 'failure' }, { ...diagnostic, conclusion: 'success' }]))
+        .toMatchObject({ allowed: false });
+    }
   });
 
   it('main-pinned and byte-equal workflows still evaluate instead of deferring', () => {
@@ -1659,7 +1724,11 @@ describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
   it('skips unwatched label events under a DIFFERENT check name, so a skipped run never stands in for merge-gate', () => {
     // A skipped job reports as passing for a required check: the skipped run must not be named `merge-gate`.
     expect(job.if).toBe(`\${{ !(${UNWATCHED}) }}`);
-    expect(job.name).toBe(`\${{ ${UNWATCHED} && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}`);
+    expect(job.name).toBe(`\${{ ${UNWATCHED} && 'merge-gate (unwatched label, skipped)' || github.workflow_ref != format('{0}/.github/workflows/merge-gate.yml@refs/heads/main', github.repository) && 'merge-gate (unpinned workflow)' || 'merge-gate' }}`);
+    for (const ref of ['refs/heads/main', 'refs/pull/7/merge']) {
+      expect(mergeGateJobName(gateContext(ref, 'pull_request', 'labeled', 'docs')))
+        .toBe('merge-gate (unwatched label, skipped)');
+    }
   });
 
   it('one live run per PR, superseded runs cancelled, and an unwatched-label run can never cancel a real one', () => {
