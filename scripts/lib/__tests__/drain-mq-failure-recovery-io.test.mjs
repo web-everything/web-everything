@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createDrainMqFailureRecoveryIo, routeMqFailureOnHold } from '../drain-mq-failure-recovery-io.mjs';
+import { classifyMqFailureEvidence } from '../mq-failure-evidence.mjs';
 import { createMqFailureLedger } from '../mq-failure-ledger.mjs';
 import { parseMqFailureRoute } from '../mq-failure-route.mjs';
 import { admitMqFailureRoute } from '../../conveyor/mq-failure-intake.mjs';
+import { mqSameHeadGuard } from '../drain-queue-safety.mjs';
 
 const identity = { repo: 'acme/web', pr: 42, head: 'a'.repeat(40) };
 const mergeHead = 'b'.repeat(40);
@@ -30,12 +32,17 @@ function fixture(mode = 'real') {
     expect(file).toBe('gh');
     if (mode === 'unreadable') throw new Error('unreadable remote');
     if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: {
+      headRefOid: identity.head, isInMergeQueue: false,
       timelineItems: { nodes: events, pageInfo: { hasPreviousPage: mode === 'incomplete timeline' } },
     } } } });
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: mode === 'stale head' ? 'd'.repeat(40) : identity.head,
       mergeStateStatus: mode === 'conflict' ? 'DIRTY' : 'CLEAN', baseRefName: 'main',
+      statusCheckRollup: [{ status: 'COMPLETED', conclusion: 'SUCCESS' }],
       labels: mode === 'unknown labels' ? null : [] });
     const endpoint = args.find(arg => arg.startsWith(`repos/${identity.repo}/`));
+    if (endpoint?.includes('/check-runs')) return JSON.stringify({ total_count: 1, check_runs: [{
+      id: 901, name: 'unit', head_sha: mergeHead, status: 'completed', conclusion: 'failure',
+      details_url: `https://github.com/${identity.repo}/actions/runs/701/job/901` }] });
     if (args[0] === 'pr' && args[1] === 'comment') { expect(typeof options.input).toBe('string'); return ''; }
     if (args.includes('POST')) {
       const payload = JSON.parse(options.input);
@@ -56,20 +63,127 @@ function fixture(mode = 'real') {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
+      if (!args.includes('--allow-escape-sequences')) throw new Error('gh: log contains ANSI escape sequences');
+      if (mode === '404 log') throw new Error('HTTP 404: Not Found');
       if (mode === 'expired log') throw new Error('410 expired');
+      if (mode === 'OSC') return `${failureLog}\n\x1b]0;Errors 1 error\x07`;
+      if (mode === 'ESC[Errors') return `${failureLog}\n\x1b[Errors 1 error`;
+      if (mode === 'C1') return `${failureLog}\n\x9bErrors 1 error`;
+      if (mode === 'ANSI') return `\x1b[31m${failureLog}\x1b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
         : mode === 'oversized log' ? failureLog + 'x'.repeat(300000) : failureLog;
     }
     throw new Error('Unexpected request');
   });
-  const io = createDrainMqFailureRecoveryIo({ exec, ledger });
+  const refreshed = new Set();
+  const refreshStore = { has: key => refreshed.has(key), claim: key => refreshed.add(key) };
+  const io = createDrainMqFailureRecoveryIo({ exec, ledger, refreshStore });
   const log = vi.fn();
   const options = { ...identity, guard, dryRun: false, log, io };
-  return { options, exec, log, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
+  return { options, exec, log, refreshStore, writes: () => exec.mock.calls.filter(([, args]) => args.includes('POST') || (args[0] === 'pr' && args[1] === 'comment')) };
 }
 
 describe('drain MQ failure production adapter', () => {
+  it('reads the exact-head refresh count and routes an exhausted infrastructure failure only to the fixer', async () => {
+    const f = fixture('infra');
+    expect(f.options.io.readRefreshCount(identity)).toBe(0);
+    f.refreshStore.claim(`${identity.repo}#${identity.pr}@${identity.head}`);
+    expect(f.options.io.forRoute().readRefreshCount(identity)).toBe(1);
+    expect(f.options.io.readRefreshCount({ ...identity, head: 'd'.repeat(40) })).toBe(0);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    expect(guard.hold).toBe(true);
+    const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+    const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+    expect(admitMqFailureRoute({ ...identity, route,
+      changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toHaveLength(2);
+  });
+  it('an unreadable refresh ledger retains the hold with operator escalation and no writes', async () => {
+    const f = fixture();
+    f.refreshStore.has = () => { throw new Error('unreadable ledger'); };
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false,
+      reason: expect.stringMatching(/operator inspection required/) });
+    expect(f.writes()).toEqual([]);
+    expect(f.exec.mock.calls.some(([, args]) => args.some(arg => arg.includes('/actions/')))).toBe(false);
+  });
+  it('real failure routes to the fixer even when every failing test is outside the PR diff', async () => {
+    const f = fixture();
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+    const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+    const admitted = admitMqFailureRoute({ ...identity, route,
+      changedFiles: { ...identity, complete: true, files: ['src/unrelated.mjs'] } });
+    expect(admitted).toMatchObject({ recoveryAction: 'fix', evidence: { fixerOnly: true } });
+    // The dispatcher reconstructs a route from persisted evidence before choosing its action.
+    expect(admitMqFailureRoute({ ...identity, route: { ...identity, ...admitted.evidence, stale: false },
+      changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+  });
+  it.each(['404 log', 'OSC', 'infra', 'repeated matching removal', 'retry exhausted'])(
+    'spent refresh with %s evidence holds and routes only to the fixer', async mode => {
+      const f = fixture(mode);
+      f.options.guard = { ...guard, recoveryAction: 'fixer' };
+      expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+      const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+      const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+      expect(admitMqFailureRoute({ ...identity, route,
+        changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+      if (['404 log', 'OSC'].includes(mode)) expect(route.complete).toBe(false);
+    });
+  it('refresh-first defers fixer routing and performs no evidence reads or writes', async () => {
+    const f = fixture();
+    expect(await routeMqFailureOnHold({ ...f.options, guard: { ...guard, recoveryAction: 'refresh-first' } })).toMatchObject({ routed: false });
+    expect(f.exec).not.toHaveBeenCalled();
+  });
+  it.each(['approval refused', 'no refresh store', 'no refresh options'])(
+    'a guard with %s routes unreadable evidence to the fixer without a refresh', async mode => {
+      const f = fixture('404 log');
+      const allow = vi.fn(() => false);
+      const refresh = mode === 'no refresh options' ? undefined
+        : { store: mode === 'no refresh store' ? undefined : f.refreshStore, allow };
+      const held = mqSameHeadGuard({ ...identity, exec: f.exec, refresh });
+      expect(held).toMatchObject({ hold: true, recoveryAction: 'fixer' });
+      if (mode === 'approval refused') expect(allow).toHaveBeenCalledOnce();
+      expect(f.options.io.readRefreshCount(identity)).toBe(0);
+      expect(await routeMqFailureOnHold({ ...f.options, guard: held })).toMatchObject({ routed: true });
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('PUT'))).toBe(false);
+      const body = f.writes().find(([, args]) => args[1] === 'comment')[2].input;
+      const route = parseMqFailureRoute({ expected: identity, comment: { body, author: { login: 'chalbert' } } });
+      expect(route).toMatchObject({ complete: false, fixerOnly: true });
+      expect(admitMqFailureRoute({ ...identity, route,
+        changedFiles: { ...identity, complete: true, files: [] } })).toMatchObject({ recoveryAction: 'fix' });
+      expect(await routeMqFailureOnHold({ ...f.options, guard: held })).toMatchObject({ routed: false });
+      expect(f.writes()).toHaveLength(2);
+    });
+  it('404 job log retains the hold without publication', async () => {
+    const f = fixture('404 log');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
+    expect(f.exec.mock.calls.find(([, args]) => args.at(-1)?.endsWith('/901/logs'))[1])
+      .toContain('--allow-escape-sequences');
+  });
+
+  it.each(['ANSI'])('job log with %s escapes is read and classified, not unreadable', async mode => {
+    const f = fixture(mode);
+    const evidence = await f.options.io.collectEvidence({ removal: {
+      ...identity, mergeGroupHead: mergeHead, branch,
+    } });
+    expect(evidence.complete).toBe(true);
+    expect(classifyMqFailureEvidence(evidence)).toBe('real');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+  });
+
+  it.each(['OSC', 'ESC[Errors', 'C1'])('readJobLog with %s error evidence stays incomplete and retains the hold', async mode => {
+    const f = fixture(mode);
+    const evidence = await f.options.io.collectEvidence({ removal: {
+      ...identity, mergeGroupHead: mergeHead, branch,
+    } });
+    expect(evidence.complete).toBe(false);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
+  });
+
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {
     const f = fixture();
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true, reason: expect.any(String) });
@@ -89,14 +203,14 @@ describe('drain MQ failure production adapter', () => {
   });
 
   it.each(['infra', 'unreadable', 'wrong parent', 'wrong reason', 'missing merge commit', 'wrong run commit',
-    'incomplete timeline', 'oversized timeline', 'retry exhausted', 'stale head', 'conflict',
+    'incomplete timeline', 'oversized timeline', 'stale head', 'conflict',
     'unknown labels', 'expired log', 'oversized log', 'oversized runs'])('retains the hold without writes for %s', async mode => {
     const f = fixture(mode);
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false, reason: expect.any(String) });
     expect(f.writes()).toEqual([]);
   });
 
-  it.each(['unknown event', 'unknown reason', 'repeated matching removal'])(
+  it.each(['unknown event', 'unknown reason'])(
     'excludes ineligible timeline history without publication: %s', async mode => {
       const f = fixture(mode);
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({

@@ -313,9 +313,7 @@ export function watchDuplicatePrs({
   return results;
 }
 
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
-if (IS_CLI) {
-  const argv = process.argv.slice(2);
+export function runDuplicateWatchCli(argv = process.argv.slice(2)) {
   const flag = (name) => (argv.find((a) => a.startsWith(`--${name}=`)) || '').slice(name.length + 3) || undefined;
   const verb = argv.find((a) => !a.startsWith('--')) || 'sweep';
   const repo = flag('repo') || null;
@@ -340,3 +338,6 @@ if (IS_CLI) {
     }
   }
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (IS_CLI) runDuplicateWatchCli();
