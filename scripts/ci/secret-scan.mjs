@@ -55,9 +55,10 @@ function safePath(path) {
 }
 
 export function scanDiff(diff, allowlist = []) {
-  if (Buffer.byteLength(diff) > LIMIT) throw incomplete();
+  if (!Buffer.isBuffer(diff)) diff = Buffer.from(diff, 'utf8');
+  if (diff.length > LIMIT) throw incomplete();
   const hits = [];
-  let path = null, line = 0, oldLeft = 0, newLeft = 0, added = [], firstAdded = 0, displayPath;
+  let path = null, line = 0, oldLeft = 0, newLeft = 0, added = [], firstAdded = 0, displayPath, previousPrefix;
   const report = (rule, at) => {
     if (!path) throw incomplete();
     if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
@@ -67,16 +68,27 @@ export function scanDiff(diff, allowlist = []) {
   };
   const finishFile = () => {
     if (added.length) {
-      const rule = keyStructureFinding(Buffer.from(added.join('\n')));
+      const rule = keyStructureFinding(Buffer.concat(added));
       if (rule) report(rule, firstAdded);
     }
     added = [];
     firstAdded = 0;
     displayPath = undefined;
   };
-  for (const text of diff.split('\n')) {
+  // Split only on LF bytes. Decode metadata/text rules separately; DER must never
+  // pass through a UTF-8 round trip (including CR bytes and the final LF).
+  for (let offset = 0; offset < diff.length;) {
+    const newline = diff.indexOf(10, offset);
+    const bytes = diff.subarray(offset, newline === -1 ? diff.length : newline);
+    offset = newline === -1 ? diff.length : newline + 1;
+    const text = bytes.toString('utf8');
+    if (text === '\\ No newline at end of file') {
+      if (previousPrefix === '+') added[added.length - 1] = added.at(-1).subarray(0, -1);
+      previousPrefix = undefined;
+      continue;
+    }
+    previousPrefix = undefined;
     if (oldLeft || newLeft) {
-      if (text === '\\ No newline at end of file') continue;
       const prefix = text[0];
       if (!['+', '-', ' '].includes(prefix)) throw incomplete();
       if (prefix !== '+') oldLeft--;
@@ -86,12 +98,13 @@ export function scanDiff(diff, allowlist = []) {
         if (!path) throw incomplete();
         if (!added.length) firstAdded = line;
         const raw = text.slice(1), decoded = decodedLine(raw);
-        added.push(raw);
+        added.push(Buffer.concat([bytes.subarray(1), Buffer.from('\n')]));
         for (const [pattern, rule] of secretText) {
           pattern.lastIndex = 0;
           if (pattern.test(raw) || pattern.test(decoded)) report(rule, line);
         }
       }
+      previousPrefix = prefix;
       if (prefix !== '-') line++;
     } else if (text.startsWith('diff --git ')) {
       finishFile();
@@ -141,11 +154,11 @@ export async function main(args = process.argv.slice(2)) {
         if (size > LIMIT) throw incomplete();
         chunks.push(chunk);
       }
-      diff = Buffer.concat(chunks).toString('utf8');
+      diff = Buffer.concat(chunks);
     } else {
       try {
         diff = execFileSync('git', ['-C', options.repo, '-c', 'core.quotePath=true', 'diff', '--text', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', `${options.base}...${options.head}`, '--'], {
-          encoding: 'utf8', maxBuffer: LIMIT, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+          maxBuffer: LIMIT, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
         });
       } catch { throw incomplete(); }
     }

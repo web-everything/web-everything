@@ -1,11 +1,13 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createPrivateKey, generateKeyPairSync } from 'node:crypto';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
 import { secretText } from '../../readiness/forge-exec-manifest.mjs';
+import { keyStructureFinding } from '../../readiness/forge-key-structure.mjs';
 
 const cli = new URL('../secret-scan.mjs', import.meta.url);
 const token = 'ghp' + '_' + 'a'.repeat(36);
@@ -104,6 +106,35 @@ describe('secret-scan', () => {
     expect(result.status).toBe(1);
     expect(result.output).toBe('key.json:1 private-key-structure\n');
   });
+  it.each(['pkcs8', 'pkcs1'])('scans raw %s DER bytes in a real Git patch through stdin', type => {
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048, privateKeyEncoding: { type, format: 'der' },
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+    });
+    expect(createPrivateKey({ key: privateKey, type, format: 'der' }).asymmetricKeyType).toBe('rsa');
+    expect(keyStructureFinding(privateKey)).toBe('private-key-structure');
+    const patch = spawnSync('git', ['diff', '--no-index', '--text', '--unified=0', '/dev/null', '-'], {
+      input: privateKey, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(patch.status).toBe(1);
+    const result = scan(patch.stdout);
+    expect(result.status).toBe(1);
+    expect(result.output).toBe('-:1 private-key-structure\n');
+  });
+  it.each([0x0a, 0x0d, 0xff])('preserves DER line endings and non-UTF-8 bytes (last byte=%i)', last => {
+    // Minimal PKCS#1 structure with CR, LF, NUL and invalid UTF-8 inside INTEGERs.
+    // A terminal LF belongs to DER, whereas Git's no-newline marker is patch syntax.
+    const fields = [0, 0x80, 0x0d, 0x0a, 0, 1, 2, 3, last];
+    const bytes = Buffer.from([0x30, fields.length * 3, ...fields.flatMap(value => [2, 1, value])]);
+    expect(keyStructureFinding(bytes)).toBe('private-key-structure');
+    const patch = spawnSync('git', ['diff', '--no-index', '--text', '--unified=0', '/dev/null', '-'], {
+      input: bytes, timeout: 10_000, maxBuffer: 1024 * 1024,
+    });
+    expect(patch.status).toBe(1);
+    const result = scan(patch.stdout);
+    expect(result.status).toBe(1);
+    expect(result.output).toBe('-:1 private-key-structure\n');
+  });
   it('redacts credential-bearing paths without suppressing location or rule', () => {
     expect(scan(diff(aws, token + '.txt')).output).toBe('[redacted-path]:7 aws-access-key\n');
     const keyType = 'k' + 'ty';
@@ -128,6 +159,12 @@ describe('secret-scan', () => {
     writeFileSync(join(dir, '.gitattributes'), '*.dat -diff\n');
     writeFileSync(join(dir, 'binary.bin'), '\0' + token);
     writeFileSync(join(dir, 'hidden.dat'), aws);
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048, privateKeyEncoding: { type: 'pkcs8', format: 'der' },
+      publicKeyEncoding: { type: 'spki', format: 'der' },
+    });
+    expect(keyStructureFinding(privateKey)).toBe('private-key-structure');
+    writeFileSync(join(dir, 'private.der'), privateKey);
     mkdirSync(join(dir, 'scripts/ci'), { recursive: true });
     writeFileSync(join(dir, 'scripts/ci/secret-scan.mjs'), 'process.exit(0);');
     writeFileSync(join(dir, 'scripts/ci/secret-scan-allowlist.json'), JSON.stringify([
@@ -141,6 +178,7 @@ describe('secret-scan', () => {
     expect(result.status).toBe(1);
     expect(result.stdout).toContain('binary.bin:1 github-token');
     expect(result.stdout).toContain('hidden.dat:1 aws-access-key');
+    expect(result.stdout).toContain('private.der:1 private-key-structure');
     expect(result.stdout + result.stderr).not.toContain(token);
     expect(result.stdout + result.stderr).not.toContain(aws);
   });
