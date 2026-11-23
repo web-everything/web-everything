@@ -182,7 +182,7 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * round is empty only when the live head still equals the head of EVERY one of those claims. A claim recorded at a
  * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
  * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
- * An exact trusted `rearm-review` answer to the latest stand-down since fix-begin clears the window and
+ * An exact trusted `rearm-review` answer to the latest stand-down after a fix-begin clears the window and
  * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
  * @returns {{empty:boolean, since?:string}}
@@ -234,8 +234,14 @@ export function rearmWindow(comments) {
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
       claims.push(sha);
-    } else if (claims.length && standDownComments([c]).length) {
-      if (c.id != null) standDownIds.push(String(c.id));
+    } else if (claims.length && standDownComments([c]).length
+      // Reopening permits another waiver: require the actual trusted poster, never viewerDidAuthor alone.
+      && isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })) {
+      if (c.id != null) {
+        standDownIds.push(String(c.id));
+        // A fresh stop after a later claim needs its own answer; the cleared old id stays unanswerable.
+        rearmed = false;
+      }
     }
   }
   return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
