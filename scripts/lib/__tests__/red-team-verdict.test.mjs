@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { deriveRedTeamVerdict, deriveRedTeamVerdictDetail, redTeamVerdictHoldReason } from '../red-team-verdict.mjs';
-import { redTeamEnqueueHold } from '../drain-queue-safety.mjs';
+import { redTeamClearHoldReason, redTeamEnqueueHold } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { redTeamGateMarker } from '../red-team-gate.mjs';
 import { buildVerdictCarriedMarker } from '../review-verdict-carried-marker.mjs';
@@ -135,7 +135,13 @@ describe('the drain hold is unchanged when mapped from the verdict', () => {
   it.each(cases)('old redTeamEnqueueHold === new: %s', (_n, comments) => {
     for (const scheduled of [true, false]) {
       const old = redTeamEnqueueHold({ scheduled, loopPayload: { verdict: payload.verdict }, comments, pr: 5283, head, env: {} });
-      expect(holdVia({ comments, owed: scheduled })).toBe(old);
+      const mapped = holdVia({ comments, owed: scheduled });
+      // RL A0 (deliberate divergence): a not-owed head with no head-bound result or policy-clear no longer enqueues;
+      // the enqueue hold says so, while the pure verdict fold still reads it as 'not-owed'. Every other case is identical.
+      const a0 = !scheduled && mapped === null && old !== null;
+      if (a0) expect(old).toBe(redTeamClearHoldReason(head));
+      else expect(mapped).toBe(old);
+      expect(a0).toBe(!scheduled && ['none', 'older head', 'untrusted carry'].includes(_n));
     }
   });
   it('evidence unknown maps to the drain reason', () => {

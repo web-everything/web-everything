@@ -1,4 +1,4 @@
-/** Replay label-only red-team holds with injected IO and a clear-label enqueue control. */
+/** Replay label-only red-team holds with injected IO and a clear-label enqueue control (with head-bound proof, RL A0). */
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -37,6 +37,11 @@ export default {
       const { CONSTELLATION_REPOS: { we: { slug: REPO } } } = await load('scripts/lib/constellation-repos.mjs');
       const { createDrainMergeStrategy } = await load('scripts/lib/drain-merge-strategy.mjs');
       const { resolveMergeDeliveryPolicy } = await load('scripts/lib/merge-delivery-policy.mjs');
+      const { renderRedTeamComment } = await load('scripts/operations/review-extra-seats.mjs');
+      // A completed clean review from the real renderer: the only head-bound proof the A0 hold accepts. A clear label
+      // alone, or a bare "no break found" heading, is no proof of a result on this head.
+      const cleanResult = { user: { login: 'web-everything[bot]' }, body: renderRedTeamComment({ pr: PR, rev: HEAD,
+        findings: [], provider: 'codex', model: 'm', recheckStatus: 'ok', foldedVerdict: 'accept' }) };
       const cases = [undefined, 'true', 'false'].flatMap(wait => [
         ['red-team:blocked', false], ['red-team:pending', false], ['red-team:clear', false],
         ...(wait === 'false' ? [] : [['red-team:pending', true]]),
@@ -45,11 +50,13 @@ export default {
         { wait: 'true', status: 'red-team:pending', overdue: true, override: true },
         { wait: 'true', status: 'red-team:blocked', overdue: true, override: true },
         { wait: 'true', status: 'red-team:pending', overdue: true, resultArrived: true },
+        // RL A0: a clear label with no head-bound result is held whenever the drain waits for the red team.
+        { wait: undefined, status: 'red-team:clear', overdue: false, noProof: true },
+        { wait: 'true', status: 'red-team:clear', overdue: false, noProof: true },
       );
-      for (const { wait, status, overdue, override, resultArrived } of cases) {
+      for (const { wait, status, overdue, override, resultArrived, noProof } of cases) {
         let labels = ['review:accepted', 'ready-to-merge', status];
-        const comments = resultArrived ? [{ user: { login: 'web-everything[bot]' },
-          body: `<!-- we:red-team-advisory pr=${PR} rev=${HEAD} -->\n### Post-accept red team — no break found` }] : [];
+        const comments = resultArrived || (status === 'red-team:clear' && !noProof) ? [cleanResult] : [];
         let clock = 45 * 60_000;
         let queued = false, requests = 0, notes = 0;
         let stored = { pending: [], followedUp: [], ...(overdue ? { redTeamPending: { [`cwd#${PR}`]: {
@@ -65,7 +72,8 @@ export default {
           if (cmd === 'git') {
             if (args[0] === 'rev-parse') return `${BASE}\n`;
             if (args[0] === 'diff') return 'scripts/x.mjs\0';
-            if (['fetch', 'cat-file'].includes(args[0])) return '';
+            // `commit-graph verify` runs only when the checkout holds a commit-graph file (a local lane, not CI).
+            if (['fetch', 'cat-file', 'commit-graph'].includes(args[0])) return '';
           }
           if (cmd === 'gh') {
             if (args.includes('--slurp')) return JSON.stringify([comments]);
@@ -126,8 +134,11 @@ export default {
             `wait=${wait ?? 'default'}: pending label bypassed the operator notification`);
         }
         const sent = calls.some(c => c.some(isMutation));
-        const allowed = status === 'red-team:clear' || resultArrived || (override && status === 'red-team:pending');
-        if (allowed) {
+        const allowed = (status === 'red-team:clear' && !noProof) || resultArrived || (override && status === 'red-team:pending');
+        if (noProof) {
+          check(!sent && result.enqueued !== true && /unknown\(missing\)/.test(result.reason ?? ''),
+            `wait=${wait ?? 'default'} / ${status} / no proof: enqueued (or held for another reason) without head-bound red-team proof`);
+        } else if (allowed) {
           check(sent && result.enqueued === true,
             `wait=${wait ?? 'default'} / ${status} / override=${!!override} / result=${!!resultArrived}: did not enqueue`);
           check(!stored.redTeamPending?.[`cwd#${PR}`], 'successful admission retained the pending backoff');
