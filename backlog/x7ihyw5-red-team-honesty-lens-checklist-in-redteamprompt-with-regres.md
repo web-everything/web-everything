@@ -14,6 +14,8 @@ Carried from closed #2697: add a named honesty-lens checklist (internal contradi
 ## Acceptance
 
 - [A1] **Executable** — running the jury red-team test suite: a test asserts redTeamPrompt names all five honesty checks and fails on main (the prompt names none today), and the existing panel-fanout suite stays green.
+- [A3] The five checks are added in addition to the existing generic adversarial hunt, not instead of it: the existing generic adversarial hunt stays in redTeamPrompt, and a test asserts it is present. The test slices redTeamPrompt's own function source (not the whole file) and asserts both the five lens names and the generic hunt text appear in it. A finding may self-tag its free-text `category` with a lens name; no schema edit.
+- [A4] we:skills-src/jury/SKILL.md's #2707 red-team section names the five-lens checklist and cites #2697 and #2695 (data-model truth is a by-eye check here; #2695 is the automated deeper version). The scoped jury suites (skills-src/jury and the jury-core tests) are green and npm run check:standards reports 0 errors.
 - [A2] RED_TEAM_SCHEMA, redTeamRequired, foldRedTeamVerdict and DISPOSITIONS stay unchanged (fail-closed invariants), pinned by tests that fail if any of them changes.
 
 

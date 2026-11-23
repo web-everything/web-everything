@@ -13,6 +13,7 @@ Carried from closed #3767 (done-when 6): a test scans the tracked we:.claude/com
 
 ## Acceptance
 
+- [A2] The scan fails on a hard-coded pull request number used as a state claim (# followed by digits, for example "Prototype PR = #1853" and "PR #2334 has merged") and on a lane number (lane- followed by digits), in both tracked files. The choice on a warning before a deploy overwrites a hand-edited command is made and recorded (built, or declined with the reason).
 - [A1] **Executable** — a test scanning we:.claude/commands/continue.md and we:.claude/commands/handoff.md fails on main (they name PR 1853 and lane-54) and passes once the hard-coded state is removed.
 
 
