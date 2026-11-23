@@ -1,7 +1,5 @@
 /** unaudited-tip — fail closed to the adopted head when audit evidence is unavailable. */
 import fs, { readFileSync } from 'node:fs';
-import { admitHotpatch } from '../hotpatch-guards.mjs';
-import { createHotpatchReaders } from '../hotpatch-readers.mjs';
 import { homedir } from 'node:os';
 import { resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { verifyRev } from './shared.mjs';
@@ -97,8 +95,13 @@ export async function revokedHotpatchTips({ applied = [], git, root, env, reader
   const revoked = [];
   let admissionReaders = readers;
   git = pathBEvidenceGit(git);
+  let guards;
   for (const { ref, sha } of applied) {
     if (!ref?.startsWith('hotpatch/')) continue;
+    // Loaded lazily: a static import closes a cycle (daemon-overlays -> audited-tip -> hotpatch-guards ->
+    // prototype-load -> prototype-load-io -> daemon-overlays) that deadlocks vite-node module loading in CI.
+    guards ??= { ...(await import('../hotpatch-guards.mjs')), ...(await import('../hotpatch-readers.mjs')) };
+    const { admitHotpatch, createHotpatchReaders } = guards;
     if (!/^hotpatch\/[0-9a-f]{40}$/.test(ref) || ref !== `hotpatch/${sha}`
       || git(['fetch', '--quiet', '--', 'origin', `+refs/heads/${ref}:refs/remotes/origin/${ref}`]).status !== 0
       || verifyRev(git, `refs/remotes/origin/${ref}^{commit}`) !== sha

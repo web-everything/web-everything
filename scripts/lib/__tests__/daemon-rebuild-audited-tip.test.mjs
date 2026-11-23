@@ -1198,3 +1198,12 @@ describe('hotpatch canonical evidence at finalization', () => {
     },
   );
 });
+
+it('audited-tip loads the hotpatch guard modules lazily, never through a static import cycle', () => {
+  // A static import closes daemon-overlays -> audited-tip -> hotpatch-guards -> prototype-load ->
+  // prototype-load-io -> daemon-overlays, which deadlocked vite-node and hung CI test-shard 9 (PR #7362).
+  const source = readFileSync(new URL('../daemon-rebuild/audited-tip.mjs', import.meta.url), 'utf8');
+  expect(source).not.toMatch(/^\s*import\s[^;]*from\s+['"]\.\.\/hotpatch-(guards|readers)\.mjs['"]/m);
+  expect(source).toContain("await import('../hotpatch-guards.mjs')");
+  expect(source).toContain("await import('../hotpatch-readers.mjs')");
+});
