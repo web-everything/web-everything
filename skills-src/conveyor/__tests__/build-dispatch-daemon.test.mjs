@@ -1761,35 +1761,6 @@ describe('cliPlanTick — exempts this daemon\'s own tick-core read from the sha
 
 describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the class of bug a vitest import cannot catch', () => {
   const ENTRY = resolve(fileURLToPath(import.meta.url), '..', '..', 'build-dispatch-daemon.mjs');
-  const expectedStartupLine = l => l.startsWith('policy-cascade ·')
-    || /^\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\. Please use a userland alternative instead\.$/.test(l)
-    || l === '(Use `node --trace-deprecation ...` to show where the warning was created)';
-  const assertStartup = stderr => {
-    const rawLines = stderr.split('\n');
-    const jsonWarning = l => /^\(node:\d+\) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time$/.test(l);
-    // Remove only the exact JSON-module warning and its own immediately adjacent Node hint.
-    // A standalone hint, a different warning, or extra text still reaches the original strict assertion.
-    const lines = rawLines.filter((l, i) => !jsonWarning(l)
-      && !(l === '(Use `node --trace-warnings ...` to show where the warning was created)' && i > 0 && jsonWarning(rawLines[i - 1])));
-    const usageAt = lines.findIndex(l => /^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/.test(l));
-    expect(usageAt).toBeGreaterThanOrEqual(0);
-    expect(lines.slice(0, usageAt).every(expectedStartupLine)).toBe(true);
-  };
-
-  it.each([
-    '(Use `node --trace-warnings ...` to show where the warning was created)',
-    '(node:123) ExperimentalWarning: another experimental feature',
-    'prefix (node:123) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time',
-    '(node:123) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time suffix',
-    'operator-override: operator-db-unreadable store (permission denied); using code value',
-  ])('rejects unexpected startup output: %s', diagnostic => {
-    expect(() => assertStartup(`${diagnostic}\nusage: build-dispatch-daemon.mjs\n`)).toThrow();
-  });
-
-  it('accepts exactly the JSON-module warning pair before the original startup assertion', () => {
-    assertStartup('(node:123) ExperimentalWarning: Importing JSON modules is an experimental feature and might change at any time\n'
-      + '(Use `node --trace-warnings ...` to show where the warning was created)\nusage: build-dispatch-daemon.mjs\n');
-  });
 
   it('a fresh `node <entry>` process (no flags) evaluates its ENTIRE static import graph and reaches its own '
     + 'usage text (exit 2) — never a ReferenceError/TDZ from a circular import reached only at real process '
@@ -1807,9 +1778,15 @@ describe('build-dispatch-daemon.mjs boots as a fresh `node` process — the clas
     }
     expect(stderr).not.toMatch(/ReferenceError|before initialization/);
     // 68b: main() stamps its output. Host policy-cascade log lines may print first, and ONLY those may precede the usage line.
-    assertStartup(stderr);
+    const lines = stderr.split('\n');
+    const usageAt = lines.findIndex(l => /^(?:\d{4}-\d\d-\d\dT\S+Z )?usage: build-dispatch-daemon\.mjs/.test(l));
+    expect(usageAt).toBeGreaterThanOrEqual(0);
     // Only policy provenance and the observed Node warning may precede usage. Every operator-override
     // diagnostic means degraded policy/store reads and must fail, even when the daemon reaches usage.
+    const expectedStartupLine = l => l.startsWith('policy-cascade ·')
+      || /^\(node:\d+\) \[DEP0040\] DeprecationWarning: The `punycode` module is deprecated\. Please use a userland alternative instead\.$/.test(l)
+      || l === '(Use `node --trace-deprecation ...` to show where the warning was created)';
+    expect(lines.slice(0, usageAt).every(expectedStartupLine)).toBe(true);
     expect([
       'operator-override: operator-db-invalid host.maxReviewDispatchPerTick (invalid type or outside hard range); repair the store before using this policy',
       'operator-override: operator-db-unreadable store (permission denied); using code value',
