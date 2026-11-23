@@ -469,10 +469,14 @@ test.each(['policy', 'overlay'])('unpromoted Carbon from %s falls back before re
     provider: 'agy-gemini', model: 'probation-model', effort: 'high',
     fallback: [{ provider: 'codex', model: 'sol', effort: 'high' }],
   };
+  // Exercise the configured Carbon route before the Claude builder's Codex preference can bypass it.
   const actual = await seat(source === 'overlay' ? providerOnly('red-team', 'agy-gemini') : empty,
-    { readRoutingPolicy: () => policy }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
+    { readRoutingPolicy: () => policy,
+      readSeatSettings: () => ({ tool: { redTeam: { routeByBuilder: false } }, platform: {} }),
+    }, { WE_REVIEW_SEAT_CAP_AGY_GEMINI: '20', WE_REVIEW_SHADOW_AGY_PROMOTED: 'false' });
   assert.equal(actual.result.status, 'speculated', actual.result.reason);
   assert.deepEqual(actual.reservations, ['codex']);
+  assert.equal(actual.calls.length, 1);
   assert.equal(actual.calls[0].provider, 'codex');
   assert.ok(actual.logs.some(line => /Carbon not promoted.*fallback/.test(line)));
 });
