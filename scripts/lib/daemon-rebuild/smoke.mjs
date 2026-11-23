@@ -476,6 +476,10 @@ export async function smokeAndAdopt({
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
     // Recovery uses only evidence collected in this run, never historical passing trees.
     const freshComparison = label != null;
+    // Recovery targets can omit registered overlays even when their plans have no drop decisions.
+    // Collect every row afresh for adoption (including a deferred ready record). Only last-good's
+    // diagnostic comparison may reuse external probes, and never for an already-strict build.
+    const freshAdoption = planStrictAdopt(plan) || (freshComparison && label !== 'last-good');
     if (freshComparison || planStrictAdopt(plan)) changedFiles = null; // strictAdopt: full fresh smoke, no incremental checks
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
@@ -496,7 +500,7 @@ export async function smokeAndAdopt({
     try {
       const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
       let reuseRows = [];
-      if (freshComparison && firstSmoke) {
+      if (freshComparison && !freshAdoption && firstSmoke) {
         // Only external reachability probes are independent of the candidate tree. Every check
         // executing candidate code must run again, regardless of its kind or import closure.
         reuseRows = (firstSmoke.smoke?.results || []).filter(row => {
