@@ -1,4 +1,8 @@
 import { it, expect, vi } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { roundEndRefusal, applyIntakeEffects, applyIntakeEffectsSync } from '../round-end-gates.mjs';
 const readIntake = () => ({ verdict: 'fail', reason: 'split-required', lines: 585 });
 const sizeSettings = { dataExtensions: ['.json'], dataDirs: [], dataPaths: [] };
@@ -30,11 +34,33 @@ it('moved head refuses effects before card and after card without appending even
   expect(event).not.toHaveBeenCalled();
 });
 
-it('synchronous shell awaits bounded effects and performs no subprocess for an empty plan', () => {
+it('synchronous shell bounds its child and performs no subprocess for an empty plan', () => {
   const exec = vi.fn();
   applyIntakeEffectsSync({ notes: [] }, exec); expect(exec).not.toHaveBeenCalled();
   applyIntakeEffectsSync({ notes: [{ kind: 'intake-effect', intake: { shadow: true } }] }, exec);
   expect(exec.mock.calls[0][2]).toMatchObject({ timeout: 120000, maxBuffer: 1024 * 1024 });
+});
+
+it('reconciliation resumes only after a real child has awaited every async effect to completion', () => {
+  // A real `node` child running the production effect path (runEffectsChild → applyIntakeEffects → appendDaemonEvent);
+  // only the GitHub head read is replaced, by one that resolves after a delay so a non-waiting shell would return first.
+  const dir = mkdtempSync(join(tmpdir(), 'intake-child-')), events = join(dir, 'events.jsonl'), entry = join(dir, 'child.mjs');
+  const gates = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'round-end-gates.mjs')).href;
+  writeFileSync(entry, `import { runEffectsChild } from ${JSON.stringify(gates)};\n`
+    + 'await runEffectsChild({ readHead: async () => { await new Promise(r => setTimeout(r, 300)); return process.env.INTAKE_TEST_HEAD; } });\n');
+  const head = 'a'.repeat(40);
+  const note = { kind: 'intake-effect', pr: { number: 7, headRefOid: head }, intake: { kind: 'intake-override', overrideUsed: 'R1', lines: 585 } };
+  vi.stubEnv('WE_DAEMON_EVENTS', events); vi.stubEnv('INTAKE_TEST_HEAD', head);
+  const lines = () => existsSync(events) ? readFileSync(events, 'utf8').trim().split('\n').map(l => JSON.parse(l)) : [];
+  try {
+    applyIntakeEffectsSync({ notes: [note] }, undefined, { entry });
+    // Read synchronously, with no await or delay: the event is on disk the moment the shell returns.
+    expect(lines()).toEqual([expect.objectContaining({ kind: 'intake-override', pr: 7, detail: expect.objectContaining({ head, ruling: 'R1' }) })]);
+    // A child whose awaited effect rejects (the head moved) fails the shell, and appends nothing.
+    vi.stubEnv('INTAKE_TEST_HEAD', 'b'.repeat(40));
+    expect(() => applyIntakeEffectsSync({ notes: [note] }, undefined, { entry })).toThrow();
+    expect(lines()).toHaveLength(1);
+  } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
 });
 it('used override emits its ruling and never files a split card', async () => {
   const runSize = vi.fn(), appendEvent = vi.fn();

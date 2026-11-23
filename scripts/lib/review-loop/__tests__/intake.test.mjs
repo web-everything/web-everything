@@ -50,6 +50,23 @@ describe('intake', () => {
     expect(readIntakeSettings({ env: { WE_POLICY_CASCADE_LOG: '1', WE_REVIEW_INTAKE_MAX_LINES: '600', WE_REVIEW_INTAKE_ENFORCE: 'on' }, platform: {}, operatorOverride: {}, log: s => logs.push(s) })).toMatchObject({ maxLines: 600, enforce: 'on' });
     expect(logs.join(' ')).toContain('env');
   });
+  it.each([
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'shadow', WE_REVIEW_INTAKE_EXEMPT_PATHS: 'not json' }, 'shadow'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'shadow', WE_REVIEW_INTAKE_URGENT_EXEMPT: '{' }, 'shadow'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_MAX_LINES: 'many' }, 'off'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_ROUNDS_BEFORE_SPLIT: '0' }, 'off'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'on', WE_REVIEW_INTAKE_MAX_LINES: '-1' }, 'on'],
+    [{ WE_REVIEW_INTAKE_ENFORCE: 'bogus' }, 'on'],
+  ])('invalid settings %j never throw: enforce stays %s and every PR is unknown', (env, enforce) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const params = readIntakeSettings({ env, platform: {}, operatorOverride: {} });
+      expect(params).toMatchObject({ enforce, invalid: expect.any(String) });
+      expect(check(subject(), params)).toMatchObject({ verdict: 'unknown', reason: 'unverifiable' });
+      expect(readIntake({ number: 7181, headRefOid: head }, { params, git: () => { throw Error('must not read git'); } }).verdict).toBe('unknown');
+      expect(errors).toHaveBeenCalledWith(expect.stringContaining(`enforce=${enforce}`));
+    } finally { errors.mockRestore(); }
+  });
 });
 
 describe('intake and the size runner share one resolved PR-size setting', async () => {

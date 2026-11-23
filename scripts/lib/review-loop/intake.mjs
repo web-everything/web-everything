@@ -17,19 +17,40 @@ function sizeSettingsOf(value) {
     || !SIZE_KEYS.every(k => Array.isArray(value[k]) && value[k].every(v => typeof v === 'string'))) throw Error('invalid size settings');
   return Object.freeze(Object.fromEntries(SIZE_KEYS.map(k => [k, Object.freeze([...value[k]])])));
 }
+const strings = v => Array.isArray(v) && v.every(s => typeof s === 'string');
+const VALID = Object.freeze({
+  enforce: v => ['off', 'shadow', 'on'].includes(v),
+  maxLines: v => Number.isSafeInteger(v) && v >= 0,
+  roundsBeforeSplit: v => Number.isSafeInteger(v) && v >= 1,
+  countRule: v => v === 'non-test-non-data',
+  overCapAction: v => v === 'split-after-rounds',
+  exemptPaths: strings, generatedPaths: strings, atomicExempt: strings,
+  urgentExempt: v => typeof v === 'boolean', trackOverrides: v => typeof v === 'boolean',
+});
+/**
+ * Invalid settings never throw: the pass that reads them must keep reconciling every other PR. A readable
+ * enforce mode is kept (off stays off, shadow stays shadow); an unreadable one fails closed to `on`. Either
+ * way every PR's intake is unknown (human review of the full diff) until the operator repairs the policy.
+ */
+export function invalidIntakeSettings(enforce, invalid) {
+  const mode = VALID.enforce(enforce) ? enforce : 'on';
+  try { console.error(`intake settings invalid (${invalid}); intake unknown for every PR; enforce=${mode}; operator must repair intake policy`); } catch { /* best-effort */ }
+  return Object.freeze({ enforce: mode, invalid: String(invalid), sizeSettings: null });
+}
 /** Resolve once, with the caller's environment, and carry the result into every later stage. */
 export function readIntakeSettings({ env = process.env, tool = standard, loadSize = e => loadPrSizeSettingsFile(undefined, { env: e }), ...options } = {}) {
+  const unparsable = [];
   const envValues = Object.fromEntries(Object.entries(standard).map(([key, value]) => {
     const raw = env[`WE_REVIEW_INTAKE_${key.replace(/[A-Z]/g, c => `_${c}`).toUpperCase()}`];
-    return [key, raw === undefined ? undefined : typeof value === 'number' ? Number(raw)
-      : typeof value === 'boolean' ? JSON.parse(raw) : Array.isArray(value) ? JSON.parse(raw) : raw];
+    if (raw === undefined) return [key, undefined];
+    try { return [key, typeof value === 'number' ? Number(raw) : typeof value === 'boolean' || Array.isArray(value) ? JSON.parse(raw) : raw]; }
+    catch { unparsable.push(key); return [key, undefined]; }
   }));
-  const value = cascadePolicy('intake', tool, { standard: { ...standard, maxLines: OPEN_PR_MAX_NON_TEST_LINES }, envValues, env, ...options }).value;
-  if (!['off', 'shadow', 'on'].includes(value.enforce) || !Number.isSafeInteger(value.maxLines) || value.maxLines < 0
-    || !Number.isSafeInteger(value.roundsBeforeSplit) || value.roundsBeforeSplit < 1
-    || value.countRule !== 'non-test-non-data' || value.overCapAction !== 'split-after-rounds'
-    || !['exemptPaths', 'generatedPaths', 'atomicExempt'].every(k => Array.isArray(value[k]) && value[k].every(v => typeof v === 'string'))
-    || typeof value.urgentExempt !== 'boolean' || typeof value.trackOverrides !== 'boolean') throw Error('invalid intake settings; operator must repair policy');
+  let value;
+  try { value = cascadePolicy('intake', tool, { standard: { ...standard, maxLines: OPEN_PR_MAX_NON_TEST_LINES }, envValues, env, ...options }).value; }
+  catch { return invalidIntakeSettings(undefined, 'cascade'); }
+  const invalid = [...new Set([...unparsable, ...Object.keys(VALID).filter(k => !VALID[k](value?.[k]))])];
+  if (invalid.length) return invalidIntakeSettings(unparsable.includes('enforce') ? undefined : value?.enforce, invalid.join(','));
   // A bad prSize layer makes each PR's intake unknown (human review), as it makes the size runner unknown.
   let sizeSettings = null;
   try { sizeSettings = sizeSettingsOf(loadSize(env)); } catch {
@@ -40,7 +61,7 @@ export function readIntakeSettings({ env = process.env, tool = standard, loadSiz
 export function check(subject, params = {}) {
   try {
     const p = { ...standard, ...params }, { entries, head, baseSha, round, markers = [] } = subject;
-    if (!Array.isArray(entries) || !sha.test(head) || !sha.test(baseSha) || !Number.isSafeInteger(round) || round < 0
+    if (p.invalid || !Array.isArray(entries) || !sha.test(head) || !sha.test(baseSha) || !Number.isSafeInteger(round) || round < 0
       || !Number.isSafeInteger(p.maxLines) || p.maxLines < 0 || !Number.isSafeInteger(p.roundsBeforeSplit) || p.roundsBeforeSplit < 1) throw Error('missing evidence');
     const exempt = path => matchesAny(path, p.exemptPaths);
     const generated = path => p.atomicExempt.includes('generated') && matchesAny(path, p.generatedPaths);
@@ -71,6 +92,7 @@ export function check(subject, params = {}) {
 }
 export function readIntake(pr, { git = createGitReader(process.cwd()), diffStat, params = {} } = {}) {
   try {
+    if (params.invalid) throw Error('invalid intake settings');
     const head = pr.headRefOid ?? pr.head;
     if (!sha.test(head)) throw Error('unpinned head');
     let evidence;

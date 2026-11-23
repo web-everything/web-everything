@@ -32,13 +32,17 @@ export async function applyIntakeEffects(plan, { runSize = createSizeAdmissionRu
   }
 }
 
-/** Preserve the synchronous planner shell; the bounded child awaits every async effect. */
-export function applyIntakeEffectsSync(plan, exec = execFileSync) {
+/** The child's whole job: apply every effect and settle before it exits, so the parent's synchronous exec returns only after completion. */
+export async function runEffectsChild({ input = readFileSync(0, 'utf8'), readHead } = {}) {
+  await applyIntakeEffects(JSON.parse(input), { readHead });
+}
+/** Preserve the synchronous planner shell; the bounded child awaits every async effect. `entry` is the child script (tests only). */
+export function applyIntakeEffectsSync(plan, exec = execFileSync, { entry = fileURLToPath(import.meta.url) } = {}) {
   const notes = plan.notes.filter(n => n.kind === 'intake-effect');
   if (!notes.length) return;
   const run = notes => {
     if (notes.length > 32) throw Error('intake effects exceed tick budget; operator must triage open splits');
-    exec(process.execPath, [fileURLToPath(import.meta.url), '--effects'], {
+    exec(process.execPath, [entry, '--effects'], {
       input: JSON.stringify({ notes }), encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -58,7 +62,7 @@ export function applyIntakeEffectsSync(plan, exec = execFileSync) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href && process.argv[2] === '--effects') {
   const { runGhSync } = await import('../gh-throttle.mjs');
   const { ghRepoSlug } = await import('../constellation-repos.mjs');
-  await applyIntakeEffects(JSON.parse(readFileSync(0, 'utf8')), { readHead: async (pr, repo) => JSON.parse(runGhSync(
+  await runEffectsChild({ readHead: async (pr, repo) => JSON.parse(runGhSync(
     ['pr', 'view', String(pr.number), ...(repo ? ['--repo', ghRepoSlug(repo)] : []), '--json', 'headRefOid'],
     { encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 })).headRefOid });
 }

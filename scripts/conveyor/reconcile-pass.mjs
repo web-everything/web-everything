@@ -1,4 +1,4 @@
-import { readIntake, readIntakeSettings } from '../lib/review-loop/intake.mjs';
+import { readIntake, readIntakeSettings, invalidIntakeSettings } from '../lib/review-loop/intake.mjs';
 import { applyIntakeEffectsSync } from '../lib/review-loop/round-end-gates.mjs';
 import { greenLedgerDir, hasGreenLedger } from '../lib/lane-verify.mjs';
 import { unread } from './dispatch-eligibility.mjs';
@@ -1931,7 +1931,14 @@ export function runReconcilePass({
     mainRedPriority: readPriority(),
     ...(readOnly ? { shadowDeps: { mode: 'off', appendLine: () => {}, readLocals: () => undefined } } : {}),
   };
-  const intakeParams = loadIntake({ env });
+  // Invalid intake settings never abort the pass: a readable off/shadow mode is kept, anything else fails closed
+  // to `on` with every PR's intake unknown (human review) until the operator repairs the policy.
+  let intakeParams;
+  try {
+    intakeParams = loadIntake({ env });
+    if (!intakeParams || typeof intakeParams !== 'object') throw Error('intake settings missing');
+  } catch { intakeParams = invalidIntakeSettings(undefined, 'unreadable'); }
+  console.error(`intake.enforce=${intakeParams.enforce}${intakeParams.invalid ? ` (invalid: ${intakeParams.invalid})` : ''}`);
   Object.assign(plannerInput, { intakeEnforce: intakeParams.enforce,
     readIntake: (pr, round) => intakeReader({ ...pr, round }, { params: intakeParams }) });
   const plan = step('plan', () => planReconcile(plannerInput));
