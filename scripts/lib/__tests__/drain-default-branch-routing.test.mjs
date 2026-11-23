@@ -44,6 +44,7 @@ it('refuses an unreadable sibling branch and logs its stderr cause for the next-
   const f = fixture(repos[1]);
   expect(await f.create()(repos[1])).toBeNull();
   expect(f.map.get(repos[1])).toBeNull();
-  expect(f.warnings.join('')).toContain('gh: for frontier-ui/frontierui');
+  expect(f.warnings.join('')).toContain('frontier-ui/frontierui: default branch unresolved live');
+  expect(f.warnings.join('')).not.toContain('Could not resolve');
   expect(f.warnings.join('')).toContain('retry on the next pass');
 });

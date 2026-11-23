@@ -5491,7 +5491,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, GH_REPO: repo } });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${ghListErrText(e)}) — deferring merge/enqueue; retry on the next pass\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live — deferring merge/enqueue; retry on the next pass\n`),
   });
   const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
