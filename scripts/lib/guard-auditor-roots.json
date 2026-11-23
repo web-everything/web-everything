@@ -1,0 +1,11 @@
+[
+  "scripts/operations/audit-verdict.mjs",
+  "scripts/operations/codex-audit*",
+  "scripts/lib/audit-settings.mjs",
+  "scripts/lib/audit-path.mjs",
+  "scripts/lib/policy-cascade.mjs",
+  "scripts/settings/codex-audit.json",
+  "scripts/codex-direct-task.mjs",
+  "scripts/lib/audit-finding-key.mjs",
+  "scripts/operations/audit-base-repro.mjs"
+]
