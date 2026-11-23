@@ -10,12 +10,13 @@ import { resolveRecovery } from './recovery.mjs';
 import { checkPendingAdoptions } from '../overlay-adoption.mjs';
 import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
-import { basename, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
+import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { withWriteLock, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
@@ -24,7 +25,7 @@ import {
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS, processStartMs,
 } from './lease.mjs';
-import { readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
+import { alertsFilePath, readReadyCandidate, readRebuildState, writeRebuildState, clearReadyCandidate } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
 import { makeSkipCheck } from './skip-unrelated.mjs';
 import { rollbackUnverified } from './local-state.mjs';
@@ -32,6 +33,8 @@ import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
 import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
+
+const lastBlockedAlert = new Map();
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -391,19 +394,41 @@ async function rebuildCloneInternal({
   const readerWaitMs = Math.max(0, (prepareEnteredMs ?? now()) - startedMs);
 
   if (prep.ok) {
+    lastBlockedAlert.delete(root);
     // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
     if (launchedBy !== 'early' && launchedBy !== 'recovery' && starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
       writeRebuildStarvation(root, 0, stEnv);
     }
   } else if (launchedBy !== 'early' && launchedBy !== 'recovery' && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
+    const alerts = [];
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);
+      const raw = env?.WE_DAEMON_REBUILD_GIVEUP_ALERT_AFTER;
+      const parsed = Number(raw);
+      const threshold = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 5;
+      const claim = inspectCloneLock(root, finalLockOpts).writerClaim;
+      const count = claim?.count ?? 0;
+      if (count >= threshold) {
+        const alert = `rebuild blocked: ${count} consecutive give-ups, reader ${prep.heldBy ?? '?'} still ticking (needs a restart of that reader)`;
+        const kind = 'rebuild-reader-blocked';
+        alerts.push({ kind, detail: alert });
+        const key = JSON.stringify([finalLockOpts.lockRoot, claim.owner, claim.since, count]);
+        if (lastBlockedAlert.get(root) !== key) {
+          lastBlockedAlert.set(root, key);
+          log.error?.(alert);
+          try {
+            const file = alertsFilePath(root, stEnv);
+            mkdirSync(dirname(file), { recursive: true });
+            appendFileSync(file, `${JSON.stringify({ at: new Date(now()).toISOString(), kind, detail: alert })}\n`, 'utf8');
+          } catch { /* best-effort audit trail only, as with prepare alerts */ }
+        }
+      }
     } else if (prep.reason === 'reader-priority') {
       // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.
       log.error?.(`daemon-rebuild: backed off — reader ${prep.heldBy ?? '?'} was refused ${prep.starved ?? '?'} consecutive time(s) and has priority; nothing was moved, the next tick retries (#4044 reader fairness)`);
     }
-    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
+    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, alerts, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }
   if (prep.value.terminal) {
     return { ...prep.value.result, alerts: prep.value.alerts, waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0 };

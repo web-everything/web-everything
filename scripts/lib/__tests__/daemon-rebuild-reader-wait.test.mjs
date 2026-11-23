@@ -488,3 +488,29 @@ it('ready-only writer excludes its recorded target session even after the launch
   expect(cloneBytes(f.root)).toEqual(before);
   expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, owner)).not.toBeNull();
 });
+
+
+it.each([undefined, '2', 'invalid', '0'])('logs and persists each changed count at or above the writer give-up threshold %s', async setting => {
+  const f = prepareFixture();
+  f.read('Mac:222', 222);
+  const threshold = setting === '2' ? 2 : 5;
+  const env = { ...f.env, WE_DAEMON_REBUILD_GIVEUP_ALERT_AFTER: setting };
+  const log = { error: vi.fn() };
+  for (let count = 1; count <= threshold + 1; count++) {
+    const result = await rebuildClone({ ...f.args, env, log, asJob: false, versions: null,
+      lockOpts: { ...f.opts, owner: 'Mac:12154', writerPriorityAfter: 1 } });
+    expect(result.reason).toBe('tick-in-progress');
+    expect(result.alerts ?? []).toEqual(count >= threshold
+      ? [{ kind: 'rebuild-reader-blocked', detail: `rebuild blocked: ${count} consecutive give-ups, reader Mac:222 still ticking (needs a restart of that reader)` }] : []);
+  }
+  // A different writer cannot bump the live claim. Re-observing that count must not log/persist twice.
+  const repeated = await rebuildClone({ ...f.args, env, log, asJob: false, versions: null,
+    lockOpts: { ...f.opts, owner: 'Mac:12155', writerPriorityAfter: 1 } });
+  expect(repeated.alerts).toHaveLength(1);
+  const details = [threshold, threshold + 1].map(count =>
+    `rebuild blocked: ${count} consecutive give-ups, reader Mac:222 still ticking (needs a restart of that reader)`);
+  expect(log.error.mock.calls.filter(([line]) => line.startsWith('rebuild blocked:')))
+    .toEqual(details.map(detail => [detail]));
+  const persisted = fs.readFileSync(alertsFilePath(f.root, env), 'utf8').trim().split('\n').map(JSON.parse);
+  expect(persisted).toEqual(details.map(detail => ({ at: expect.any(String), kind: 'rebuild-reader-blocked', detail })));
+});

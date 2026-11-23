@@ -29,8 +29,10 @@ describe('fast drain deferred summary', () => {
       .toBe('passed every drain gate — enqueued');
   });
   it('joins waits without an overlap deadline and caps the summary at 200 characters', () => {
-    expect(summarizeFastDrain({ deferred: [{ num, waitOn: ['first', 'second'] }] }, num))
-      .toBe('deferred: waits on first, second — enqueue not attempted');
-    expect(summarizeFastDrain({ deferred: [{ num, waitOn: ['x'.repeat(250)] }] }, num)).toHaveLength(200);
+    expect(summarizeFastDrain({ deferred: [{ num, waitOn: ['overlap-yield:#1', 'overlap-yield:#2'] }] }, num))
+      .toBe('deferred: waits on overlap-yield:#1, overlap-yield:#2 — enqueue not attempted');
+    expect(summarizeFastDrain({ deferred: [{ num, waitOn: ['x'.repeat(250)] }] }, num)).toBe('deferred: waits on  — enqueue not attempted');
+    const hostile = summarizeFastDrain({ deferred: [{ num, waitOn: ['ghp_abcdefghijklmnopqrstuvwxyz0123', 'password=hunter2', 'overlap-yield:#5309'] }] }, num);
+    expect(hostile).toBe('deferred: waits on overlap-yield:#5309 — enqueue not attempted');
   });
 });

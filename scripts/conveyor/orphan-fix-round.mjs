@@ -81,19 +81,20 @@ export function verdictReviewedHead(body) {
  * Decide what one PR is owed. PURE.
  * @param {{pr:{number:number, labels?:Array, headRefOid?:string, isDraft?:boolean, comments?:Array}, owned?:boolean,
  *   nowMs:number, graceMs?:number, cap?:number, repo?:string, cardReadable?:Function}} o
- * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, verdictAt?:string, roundAt?:string, rulingAt?:string}}
+ * Stable none decisions may suppress budget holds for the same head until expiry or a fix dispatch.
+ * @returns {{decision:'none'|'rearm'|'redispatch'|'escalate', reason:string, stable?:boolean, verdictAt?:string, roundAt?:string, rulingAt?:string}}
  */
 export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT_ORPHAN_GRACE_MS, cap = ORPHAN_REDISPATCH_CAP,
   repo = CONSTELLATION_REPOS.we.slug, cardReadable = () => false }) {
-  const none = (reason) => ({ decision: 'none', reason });
+  const none = (reason, stable = false) => ({ decision: 'none', reason, ...(stable ? { stable: true } : {}) });
   const labels = labelNames(pr?.labels);
-  if (!labels.includes('review:changes')) return none('not bounced (no review:changes)');
-  if (headEverHumanCleared(pr?.comments, pr?.headRefOid)) return none('human-cleared head — final');
+  if (!labels.includes('review:changes')) return none('not bounced (no review:changes)', true);
+  if (headEverHumanCleared(pr?.comments, pr?.headRefOid)) return none('human-cleared head — final', true);
   if (pr?.isDraft) return none('draft — the draft-promotion path owns it');
   if (owned) return none('owned — a live fix or dispatch claim holds it');
   const trusted = (Array.isArray(pr?.comments) ? pr.comments : []).filter((c) => isTrustedMarkerAuthor(c) && atMs(c) != null);
   const verdict = latestChangesVerdict(trusted);
-  if (!verdict) return none('no trusted changes verdict on the thread');
+  if (!verdict) return none('no trusted changes verdict on the thread', true);
   const vAt = atMs(verdict);
   // GitHub timestamps have second precision; the thread also orders comments within that second.
   const vIndex = trusted.indexOf(verdict);
@@ -130,7 +131,7 @@ export function planOrphanFixRound({ pr, owned = false, nowMs, graceMs = DEFAULT
     }
   }
   const roundEvents = after.filter((c) => lead(c).startsWith(FIX_END_MARKER) || lead(c).startsWith(FIX_BEGIN_MARKER));
-  if (!roundEvents.length) return none('no fix round since the latest verdict — the ordinary fix dispatch owns it');
+  if (!roundEvents.length) return none('no fix round since the latest verdict — the ordinary fix dispatch owns it', true);
   const lastRoundMs = Math.max(...roundEvents.map(atMs));
   const ctx = { verdictAt: new Date(vAt).toISOString(), roundAt: new Date(lastRoundMs).toISOString() };
   if (nowMs - lastRoundMs < graceMs) return { ...none(`last fix-round event ${ctx.roundAt} is inside the ${Math.round(graceMs / 60000)}-min grace`), ...ctx };
@@ -261,8 +262,9 @@ export function defaultPostComment({ slug, pr, body, exec = execFileSync }) {
 
 /**
  * ONE guard pass over every constellation repo. Never throws; one PR's failure never stops the rest.
+ * Optional `settled` retains stable none verdicts between passes, keyed by `${slug}#${pr}` → {head, at}.
  * `cursor` is the per-repo map a previous pass returned as `repoCursors` (or a legacy single `{repo, pr}`).
- * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
+ * @returns {Promise<{enabled:boolean, rows:Array<object>, handled:number, deferred:Array<object>, deferredSettled:Array<object>, newlySettled:Array<object>, nextCursor:object|null, repoCursors:object|null}>}
  */
 export async function runOrphanFixRoundPass({
   env = process.env,
@@ -271,6 +273,8 @@ export async function runOrphanFixRoundPass({
   shouldYield,
   now = Date.now,
   cursor = null,
+  settled,
+  settledTtlMs = 6 * 60 * 60 * 1000,
   reconcile,
   repos = Object.entries(CONSTELLATION_REPOS).map(([key, r]) => ({ key, slug: r.slug })),
   listBounced = (slug) => defaultListBounced(slug),
@@ -285,7 +289,7 @@ export async function runOrphanFixRoundPass({
   cardReadable = (ref) => referralCardReadable(ref, ROOT),
 } = {}) {
   const enabled = orphanGuardEnabled(env);
-  const rows = [], deferred = [];
+  const rows = [], deferred = [], deferredSettled = [], newlySettled = [];
   let handled = 0, redispatched = false, deferring = false;
   // Each repo keeps its OWN resume point (PR #7330): a pass that reaches only some repos must not overwrite the
   // deferred progress of a repo it never listed. A legacy single `{repo, pr}` cursor migrates to one entry.
@@ -302,20 +306,44 @@ export async function runOrphanFixRoundPass({
     const own = [...(prs ?? [])].sort((a, b) => a.number - b.number);
     for (const p of own) (at != null && p.number < at ? wrapped : head).push({ key, slug, p });
   }
-  const ordered = [...head, ...wrapped];
-  for (const { key, slug, p } of ordered) {
+  const uncached = [], cachedPrs = [];
+  for (const entry of [...head, ...wrapped]) {
+    const { slug, p } = entry;
+    const cacheKey = `${slug}#${p.number}`;
+    const cached = settled?.get(cacheKey);
+    const age = nowMs - cached?.at;
+    if (typeof p.headRefOid === 'string' && p.headRefOid.length > 0
+      && cached?.head === p.headRefOid && age >= 0 && age < settledTtlMs) {
+      cachedPrs.push({ ...entry, cachedAt: cached.at });
+    } else {
+      settled?.delete(cacheKey);
+      uncached.push(entry);
+    }
+  }
+  // Settlement changes scheduling and budget holds only: comments can change without a head move.
+  // Refresh the oldest cached evidence first, after all uncached work (including wrapped PRs).
+  const ordered = [...uncached, ...cachedPrs.sort((a, b) => a.cachedAt - b.cachedAt)];
+  for (const { key, slug, p, cachedAt } of ordered) {
+    const cacheKey = `${slug}#${p.number}`;
     if (deferring || (handled > 0 && (now() >= deadlineAt || shouldYield?.()))) {
       deferring = true;
-      deferred.push({ repo: slug, pr: p.number });
+      (cachedAt === undefined ? deferred : deferredSettled).push({ repo: slug, pr: p.number });
       continue;
     }
+    settled?.delete(cacheKey);
     handled += 1;
     const row = { repo: slug, pr: p.number };
     try {
       const owned = await isOwned(key, p.number);
       const comments = owned ? [] : await readComments(p.number, slug);
       const plan = planOrphanFixRound({ pr: { ...p, comments }, owned, nowMs, graceMs, repo: slug, cardReadable });
-      if (plan.decision === 'none') continue;
+      if (plan.decision === 'none') {
+        if (settled && plan.stable && typeof p.headRefOid === 'string' && p.headRefOid.length > 0) {
+          settled.set(cacheKey, { head: p.headRefOid, at: nowMs });
+          newlySettled.push({ repo: slug, pr: p.number });
+        }
+        continue;
+      }
       if (plan.decision === 'redispatch' && redispatched) {
         deferring = true;
         deferred.push({ repo: slug, pr: p.number });
@@ -347,7 +375,7 @@ export async function runOrphanFixRoundPass({
   const nextRepoCursors = { ...repoCursors };
   for (const { key, slug } of listed) { delete nextRepoCursors[key]; delete nextRepoCursors[slug]; }
   for (const d of deferred) nextRepoCursors[d.repo] ??= d.pr;
-  return { enabled, rows, handled, deferred, nextCursor: deferred[0] ?? null,
+  return { enabled, rows, handled, deferred, deferredSettled, newlySettled, nextCursor: deferred[0] ?? null,
     repoCursors: Object.keys(nextRepoCursors).length ? nextRepoCursors : null };
 }
 
