@@ -7,13 +7,13 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { assertProtectedPatterns } from './audit-path.mjs';
+import { GUARD_FLOOR } from './protected-path-floor.mjs';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { cascadePolicy, LEGACY_PLATFORM_PREFERENCES_PATHS, operatorPreferencesPath, PLATFORM_PREFERENCES_ENV, PLATFORM_PREFERENCES_PATH,
   readPlatformPreferences } from './policy-cascade.mjs';
-import { GUARD_FLOOR } from './guard-path-floor.mjs';
-export { AUDITOR_FLOOR, GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from './guard-path-floor.mjs';
 
 export const AUDIT_SETTINGS_PATH = fileURLToPath(new NodeURL('../settings/codex-audit.json', import.meta.url));
+export { AUDITOR_FLOOR, GUARD_FLOOR, LOCK_API, LOCK_HOLDERS, LOCK_PRIMITIVES, LOCK_USERS, REVIEW_AUTH_FLOOR } from './protected-path-floor.mjs';
 
 /** What an invalid or unreadable path list resolves to: the floor plus every path (`**` matches any path). */
 const STRICTEST_PATHS = Object.freeze([...GUARD_FLOOR, '**']);

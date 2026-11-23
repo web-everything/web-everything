@@ -1338,6 +1338,14 @@ describe('card outcomes, proof binding and the default card reader (PR #6381 jud
 describe('AU1 PR-A is inert', () => {
   // One helper, shared by the scan and its own pin below, so the pin tests the rule the scan applies.
   const commentOnly = text => /^\s*(\/\/|\/\*|\*)/.test(text);
+  const grepMatch = line => {
+    const match = /^(.*?):(\d+):(.*)$/.exec(line);
+    return match && { file: match[1], text: match[3] };
+  };
+  // The shared floor names the protected modules as array data. Only bare string-list rows qualify:
+  // an import, re-export, dynamic import or CLI call in this module must still fail the runtime scan.
+  const floorDataOnly = m => m?.file === 'scripts/lib/protected-path-floor.mjs'
+    && /^\s*(?:'[^'\r\n]*'\s*,\s*)*'[^'\r\n]*'\s*(?:,\s*|\]\);\s*)$/.test(m.text);
   it('no runtime file imports the rubric core or its settings', async () => {
     const { spawnSync } = await import('node:child_process');
     const root = fileURLToPath(new NodeURL('../../../', import.meta.url));
@@ -1346,15 +1354,22 @@ describe('AU1 PR-A is inert', () => {
     // A failed grep prints nothing, which would read as "no importers": require a clean run that saw this file.
     expect(grep.error).toBeUndefined();
     expect(grep.status, grep.stderr).toBe(0);
-    const matches = grep.stdout.split('\n').filter(Boolean).map(l => { const m = /^(.*?):(\d+):(.*)$/.exec(l); return m && { file: m[1], text: m[3] }; });
+    const matches = grep.stdout.split('\n').filter(Boolean).map(grepMatch);
     expect(matches.map(m => m?.file)).toContain('scripts/operations/__tests__/audit-verdict.test.mjs');
     // Any CODE line naming either module counts (an import, a dynamic import, a CLI spawn). A line that is only a
     // comment does not: main's codex-audit.mjs notes its resolver "moves to scripts/lib/audit-settings.mjs once that
     // lands" (PR #6381 merge with AU1 PR-B). A comment marker after code on the same line still counts as code.
     const hits = [...new Set(matches.filter(m => !m || (/\.(mjs|js|cjs|ts)$/.test(m.file) && !/__tests__\/|\.test\./.test(m.file)
-      && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text))).map(m => m?.file ?? 'unparsed grep line'))];
+      && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text) && !floorDataOnly(m))).map(m => m?.file ?? 'unparsed grep line'))];
     // R1053 S1a: these pure modules may import the vocabulary, but must have no runtime callers.
-    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);
+    // PR #7334: codex-audit.mjs is the one deliberate runtime caller. Its delta re-audit (off by default) vetoes a
+    // change touching protected paths, via resolveAuditSettings and matchesSome only (pinned just below).
+    expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/codex-audit.mjs']);
+    const auditCode = matches.filter(m => m?.file === 'scripts/operations/codex-audit.mjs' && !commentOnly(m.text)).map(m => m.text.trim());
+    expect(auditCode).toEqual([
+      "import { resolveAuditSettings } from '../lib/audit-settings.mjs';",
+      "import { matchesSome } from './audit-verdict.mjs';",
+    ]);
     const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],
       { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
     expect(callers.error).toBeUndefined();
@@ -1365,7 +1380,8 @@ describe('AU1 PR-A is inert', () => {
     expect(JSON.parse(readFileSync(join(root, 'scripts/lib/guard-auditor-roots.json'), 'utf8'))).toEqual(AUDITOR_FLOOR);
     expect(callers.stdout.split('\n').filter(l => l && !/__tests__\//.test(l)
       && !l.startsWith('scripts/lib/guard-auditor-roots.json:')
-      && !/^scripts\/(lib\/audit-(settings|finding-key)|operations\/audit-base-repro)\.mjs:/.test(l))).toEqual([]);
+      && !/^scripts\/(lib\/audit-(settings|finding-key)|operations\/audit-base-repro)\.mjs:/.test(l)
+      && !floorDataOnly(grepMatch(l)))).toEqual([]);
   });
   it('the inertness check ignores a comment-only mention but catches code that names the module (PR #6381 merge)', () => {
     expect(commentOnly(' * scripts/lib/audit-settings.mjs once that lands. */')).toBe(true);
@@ -1373,5 +1389,28 @@ describe('AU1 PR-A is inert', () => {
     expect(commentOnly("import { computeVerdict } from './audit-verdict.mjs';")).toBe(false);
     expect(commentOnly("const v = await import('../lib/audit-settings.mjs'); // lazy")).toBe(false);
     expect(commentOnly("spawnSync('node', ['scripts/operations/audit-verdict.mjs'])")).toBe(false);
+  });
+  it('the shared floor may name protected paths as data but cannot load the audit engine', () => {
+    const row = text => ({ file: 'scripts/lib/protected-path-floor.mjs', text });
+    expect(floorDataOnly(row("  'scripts/operations/audit-verdict.mjs', 'scripts/lib/audit-settings.mjs',"))).toBe(true);
+    expect(floorDataOnly({ file: 'scripts/runtime.mjs', text: "  'scripts/lib/audit-settings.mjs'," })).toBe(false);
+    for (const code of ["import { resolveAuditSettings } from './audit-settings.mjs';",
+      "export { resolveAuditSettings } from './audit-settings.mjs';", "await import('./audit-settings.mjs');",
+      "require('./audit-settings.mjs');", "spawnSync('node', ['scripts/operations/audit-verdict.mjs']);",
+      "  'scripts/lib/audit-settings.mjs', import('./audit-settings.mjs');"]) {
+      expect(floorDataOnly(row(code)), code).toBe(false);
+    }
+  });
+  it('the caller scan accepts the closing floor data row but refuses executable references', () => {
+    const row = text => grepMatch(`scripts/lib/protected-path-floor.mjs:48:${text}`);
+    expect(floorDataOnly(row("  'scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs']);"))).toBe(true);
+    expect(floorDataOnly(grepMatch("scripts/runtime.mjs:1:  'scripts/lib/audit-finding-key.mjs',"))).toBe(false);
+    expect(floorDataOnly(grepMatch('unparsed grep line'))).toBe(false);
+    for (const code of ["import './audit-finding-key.mjs';", "export { findingKey } from './audit-finding-key.mjs';",
+      "await import('./audit-base-repro.mjs');", "require('./audit-finding-key.mjs');",
+      "spawnSync('node', ['scripts/operations/audit-base-repro.mjs']);",
+      "  'scripts/lib/audit-finding-key.mjs']); import('./audit-base-repro.mjs');"]) {
+      expect(floorDataOnly(row(code)), code).toBe(false);
+    }
   });
 });
