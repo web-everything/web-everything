@@ -88,10 +88,10 @@ export default {
   async run({ log } = {}) {
     // Deterministic proof of the per-tick budget, independent of runner speed: how many seeded backlog
     // sessions were actually `claude stop`ped by the first tick (read at the start of round 1).
-    const reapStats = { stoppedAfterFirstTick: null };
+    const reapStats = { stoppedBeforeTick: {} };
     const report = await runSoak({
       name: 'break:large-reap-backlog-starves-dispatch',
-      rounds: 2,
+      rounds: 3,
       daemons: ['review'],
       mainEvery: 0,
       scorecards: false,
@@ -99,10 +99,9 @@ export default {
       bounds: { tickBoundMs: TICK_BOUND_MS, owedGraceTicks: 0 },
       log,
       perRound(w, round) {
-        if (round === 1) {
-          reapStats.stoppedAfterFirstTick = w.claude.sessions()
-            .filter((s) => String(s.id).startsWith('oldsess') && s.state === 'stopped').length;
-        }
+        // Cumulative count of ALL sessions in the fake store that `claude stop` has ended, observed at the start
+        // of every round (= after the previous round's tick); the judge turns it into a per-tick stop count.
+        reapStats.stoppedBeforeTick[round] = w.claude.sessions().filter((s) => s.state === 'stopped').length;
       },
       setup(w) {
         // Seeded BEFORE the review daemon's very first tick — the live incident's own shape: the whole
@@ -121,21 +120,28 @@ export default {
     return { ...report, reapStats };
   },
   judge(report) {
-    // 'bounded' is the direct proof: an unbounded reap blows the per-tick bound (pre-fix) vs a budgeted one
-    // comfortably finishing (post-fix). 'owed' is the FUNCTIONAL consequence when a tick isn't outright
-    // aborted by the harness's own IPC timeout — either signal alone means the break reproduced.
-    const found = report.violations
-      .filter((v) => ['bounded', 'owed', 'crash', 'isolation'].includes(v.invariant))
-      .map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
-    // The wall-clock bound is deliberately generous (runner variance); the cap itself is asserted by COUNT so
-    // the scenario can never pass by skipping the reap or by exceeding the budget.
+    // Every violation the harness recorded counts (bounded, owed, crash, no-throw, no-onTick-crash, isolation, ...):
+    // nothing is filtered out, so a daemon failure after the first dispatch cannot hide behind this scenario.
+    const found = report.violations.map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
+    // The wall-clock bound ('bounded') is deliberately generous (runner variance, see TICK_BOUND_MS); the cap
+    // itself is asserted by COUNT, every tick, so the scenario can never pass by skipping the reap or by
+    // exceeding the per-tick budget.
     if (report.fatal) found.push(`[fatal] ${report.fatal}`);
-    if (!report.ticks || report.ticks.length < 1) found.push('[ticks] no review tick completed');
-    const stopped = report.reapStats?.stoppedAfterFirstTick;
+    if (!report.ticks || report.ticks.length < 3) found.push(`[ticks] only ${report.ticks?.length ?? 0} of 3 review ticks completed`);
     const cap = Number(MAX_STOPS_OVERRIDE);
-    if (stopped == null) found.push('[reap] first-tick reap count was never observed');
-    else if (stopped < 1) found.push('[reap] the first tick reaped none of the backlog — the budgeted reap did not run');
-    else if (stopped > cap) found.push(`[reap] the first tick stopped ${stopped} backlog sessions, over the per-tick cap of ${cap}`);
+    const at = report.reapStats?.stoppedBeforeTick ?? {};
+    // Per-round stop counts: round r's delta is (stopped before round r+1) - (stopped before round r); the
+    // baseline before tick 0 is the count the store held at round 0, and the last tick's end state is read at
+    // the next round index (so `rounds` is one more than the ticks asserted here).
+    const stops = [];
+    for (let r = 1; r <= 2; r += 1) {
+      if (at[r] == null) { found.push(`[reap] stop count before round ${r} was never observed`); continue; }
+      stops.push(at[r] - (r === 1 ? 0 : at[r - 1] ?? 0));
+    }
+    stops.forEach((n, k) => {
+      if (k === 0 && n < 1) found.push('[reap] the first tick reaped none of the backlog — the budgeted reap did not run');
+      if (n > cap) found.push(`[reap] tick ${k} stopped ${n} sessions, over the per-tick cap of ${cap}`);
+    });
     return found;
   },
 };
