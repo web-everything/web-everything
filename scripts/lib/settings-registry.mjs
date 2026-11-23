@@ -1,10 +1,10 @@
 /**
  * @file scripts/lib/settings-registry.mjs
- * @description Declared settings inventory and documentation drift guard; never resolves host overrides.
+ * @description Declared settings inventory and documentation generator; never resolves host overrides.
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
- * API: buildRegistry({ root }), renderMarkdown(registry). Descriptions belong in per-key metadata files.
+ * API: buildRegistry({ root }), renderMarkdown(registry), ensureRegistryDoc({ root }). Descriptions belong in per-key metadata files.
  */
-import { readFileSync, writeFileSync, statSync, lstatSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, lstatSync, readdirSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readSettingsChecked, settingsLeaves, STANDALONE_POLICY_FILES } from './settings-files.mjs';
@@ -40,22 +40,22 @@ export function hasDuplicateProperties(raw) {
   return false;
 }
 
-function readObject(root, path, problems) {
+function readObject(root, path, problems, { optional = false, array = false } = {}) {
   try {
     if (!lstatSync(join(root, path)).isFile()) throw Error('expected regular file (no symlinks)');
     const raw = readFileSync(join(root, path), 'utf8');
     const data = JSON.parse(raw);
     if (hasDuplicateProperties(raw)) throw Error('duplicate JSON property');
-    if (!object(data)) throw Error('expected JSON object');
+    if (array ? !Array.isArray(data) : !object(data)) throw Error(array ? 'expected JSON array' : 'expected JSON object');
     return data;
-  } catch (error) { problems.push(`${path}: ${error.message}`); return {}; }
+  } catch (error) { if (!optional || error.code !== 'ENOENT') problems.push(`${path}: ${error.message}`); return {}; }
 }
 
-/** Optional per-key overlay; canonical URI components also escape filesystem-reserved punctuation.
+/** Optional legacy metadata plus per-key and list authoring files; canonical URI components also escape filesystem-reserved punctuation.
  * No directory means legacy metadata. All other read/shape errors block generation at the named path. */
 export function readMetadata({ root = ROOT, problems } = {}) {
   const errors = problems ?? [];
-  const metadata = readObject(root, META, errors);
+  const metadata = readObject(root, META, errors, { optional: true });
   const finish = () => { if (!problems && errors.length) throw Error(errors.join('\n')); return metadata; };
   let sections;
   try {
@@ -69,8 +69,17 @@ export function readMetadata({ root = ROOT, problems } = {}) {
   for (const section of sections) {
     const path = `${META_DIR}/${section}`;
     try {
-      if (!['settings', 'capacityLeaves'].includes(section)) throw Error('unknown metadata section');
+      if (!['settings', 'capacityLeaves', 'lists'].includes(section)) throw Error('unknown metadata section');
       if (!lstatSync(join(root, path)).isDirectory()) throw Error('expected directory (no symlinks)');
+      if (section === 'lists') {
+        for (const file of readdirSync(join(root, path)).sort(compare)) {
+          if (!/^[A-Za-z][A-Za-z0-9]*\.json$/.test(file)) throw Error(`invalid metadata filename: ${file}`);
+          const key = file.slice(0, -5);
+          if (Object.hasOwn(metadata, key)) { errors.push(`duplicate metadata key: ${key}`); continue; }
+          metadata[key] = readObject(root, `${path}/${file}`, errors, { array: true });
+        }
+        continue;
+      }
       if (!Object.hasOwn(metadata, section)) metadata[section] = {};
       if (!object(metadata[section])) throw Error('expected JSON object');
       for (const file of readdirSync(join(root, path)).sort(compare)) {
@@ -183,7 +192,7 @@ export function renderMarkdown(registry) {
     'R1076: behavior belongs in product settings. The constants below are candidates to settle, not conversions or approved policy changes. Pass C records environment override availability in its instant column; that alone does not prove live reload.', '',
     '## How to change a setting', '',
     'The policy layers are standard → platform → tool/repo → env → operator-db; see [policy-cascade.mjs](../../scripts/lib/policy-cascade.mjs). Readers opt into the cascade; this inventory does not assert every declaration uses every layer. Environment overrides require reader support and process environment propagation.', '',
-    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. Then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
+    'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update `scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json` (`capacityLeaves/<encoded-key>.json` for capacity metadata); encode keys with encodeURIComponent, additionally percent-escape !, apostrophe, (, ), * and _, then write every percent sign as an underscore. List authoring files live in `scripts/lib/settings-registry-metadata.d/lists/<list>.json`. The registry doc and legacy `scripts/lib/settings-registry-metadata.json` are generated by `npm run settings:registry`, not committed. Then run `npm run settings:registry`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.', '',
     '## Summary', '',
     `- Top-level keys: ${unique.length} (${rows.length} declaration rows).`,
     `- Declared leaves: ${rows.reduce((sum, row) => sum + row.leafCount, 0)} (platform copies counted separately).`,
@@ -213,12 +222,23 @@ export function renderMarkdown(registry) {
   return out.join('\n');
 }
 
+export function ensureRegistryDoc({ root = ROOT } = {}) {
+  const content = renderMarkdown(buildRegistry({ root }));
+  let existing;
+  try { existing = readFileSync(join(root, DOC), 'utf8'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (existing !== content) {
+    mkdirSync(dirname(join(root, DOC)), { recursive: true });
+    writeFileSync(join(root, DOC), content);
+  }
+  return content;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
     const mode = process.argv.slice(2);
     if (mode.length !== 1 || !['--write', '--check'].includes(mode[0])) throw Error('usage: node scripts/lib/settings-registry.mjs --write | --check');
-    const content = renderMarkdown(buildRegistry({ root: ROOT }));
-    if (mode[0] === '--write') writeFileSync(join(ROOT, DOC), content);
-    else if (readFileSync(join(ROOT, DOC), 'utf8') !== content) throw Error(`${DOC} is stale; run node scripts/lib/settings-registry.mjs --write`);
+    if (mode[0] === '--write') ensureRegistryDoc({ root: ROOT });
+    else renderMarkdown(buildRegistry({ root: ROOT }));
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

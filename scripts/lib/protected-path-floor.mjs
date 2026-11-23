@@ -115,6 +115,7 @@ const FLOOR_SETTINGS = Object.freeze([
   // literal of its full name as a direct reader.
   'scripts/settings/stand-down.json', 'scripts/settings/fix.json', 'scripts/review-settings.json', 'scripts/dispatch-settings.*',
   // The advisory-merge floor module names it as a regeneration input of the settings registry doc.
+  // Legacy generated metadata is not committed (npm run settings:registry); authoring fragments remain protected.
   'scripts/lib/settings-registry-metadata.json', 'scripts/lib/settings-registry-metadata.d/**/*.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json', 'scripts/lib/poc-branches.json',
   'scripts/exec-output-baseline.json', 'scripts/pr-comment-read-baseline.json', 'scripts/check-standards.contract.json',

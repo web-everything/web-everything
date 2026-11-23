@@ -5,6 +5,7 @@
   "description": "Web Everything - Grouping standards for better web library standardization",
   "customElements": "custom-elements.json",
   "scripts": {
+    "settings:registry": "node scripts/lib/settings-registry.mjs --write",
     "prepare": "git config core.hooksPath .githooks || true",
     "bootstrap": "node scripts/bootstrap-session.mjs",
     "bootstrap:install": "node scripts/bootstrap-session.mjs install",
