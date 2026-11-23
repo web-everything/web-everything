@@ -435,33 +435,34 @@ describe('createEnqueueOnEvent', () => {
   });
 
   it.each([
-    [1, null, true],
-    [1, { enqueueOutcomes: [{ num: 42, outcome: 'enqueued' }] }, true],
-    [0, null, true],
-    [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, true],
-    [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, false],
-  ])('reports bounded stderr for exit %s with JSON %j (diagnostic=%s)', async (code, json, diagnostic) => {
-    const stderr = `${'old noise '.repeat(100)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
-    const tail = stderr.replace(/\s+/g, ' ').trim().slice(-300);
+    [1, null], [0, null],
+    [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }],
+    [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }],
+  ])('publishes only allowlisted diagnostics for exit %s with JSON %j', async (code, json) => {
+    const stderr = 'opaque diagnostic text';
     const { handle, children, lines, advance } = setup({ manualFinish: true });
-    handle.notePoll({ ok: true, marked: [mark()] });
-    advance(15_000);
-    const run = handle.tick();
-    await new Promise((resolve) => setImmediate(resolve));
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const tick = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
     if (json) children[0].stdout.emit('data', JSON.stringify(json));
     children[0].stderr.emit('data', stderr);
     children[0].emit('close', code);
-    const [result] = await run;
-    expect(result.what.includes(` (stderr: ${tail})`)).toBe(diagnostic);
-    if (!json) {
-      expect(result.what).toBe(`no JSON result (stderr: ${tail})`);
-      expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
-    }
-    if (code !== 0) {
-      expect(result.outcome).toBe('error');
-      expect(result.verified).toBeNull();
-    }
-    expect(lines.some((line) => line.includes(result.what))).toBe(true);
+    const [result] = await tick;
+    expect(JSON.stringify({ result, lines })).not.toContain(stderr);
+    expect(lines.find(line => line.includes('fast drain exit'))).toContain('exit ' + code + ', ' + stderr.length + 'B stderr, class=unknown');
+    expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
+  });
+
+  it('does not trust an enqueue-success JSON result from a nonzero-exit child', async () => {
+    const { handle, children, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const tick = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    children[0].stdout.emit('data', JSON.stringify({ considered: 1, toMerge: [{ num: 42 }], merged: [{ num: 42, enqueued: true }], failed: [], skipReasons: [] }));
+    children[0].emit('close', 1);
+    const [result] = await tick;
+    expect(result.outcome).toBe('error');
+    expect(result.verified).toBeNull();
   });
 
   it('logs spawn errors without rejecting tick', async () => {
@@ -469,7 +470,7 @@ describe('createEnqueueOnEvent', () => {
     handle.notePoll({ ok: true, marked: [mark()] });
     advance(15_000);
     await expect(handle.tick()).resolves.toEqual([{
-      num: 42, code: null, what: 'could not run (fake spawn failure)', verified: null, outcome: 'error',
+      num: 42, code: null, what: 'could not run (exit none, 0B stderr, class=spawn-error)', verified: null, outcome: 'error',
     }]);
     expect(lines.some((line) => line.includes('#42') && line.includes('could not run'))).toBe(true);
     expect(handle.pending()).toEqual([]);
@@ -526,7 +527,7 @@ describe('summarizeFastDrain — queue-mode accounting (live 2026-10-13, #5202)'
   });
   it('reports a revalidation abort as not enqueued', () => {
     const json = { considered: 1, toMerge: [{ num: 7 }], revalidationAborted: [{ num: 7, reason: 'numbered card(s) on branch before enqueue' }], skipReasons: [] };
-    expect(summarizeFastDrain(json, 7)).toMatch(/^not enqueued: numbered/);
+    expect(summarizeFastDrain(json, 7)).toMatch(/^not enqueued: revalidation-aborted$/);
   });
 });
 
@@ -1480,7 +1481,7 @@ describe('catch-up handle', () => {
 
 it('reports top-level fast-drain refusal honestly', () => {
   expect(summarizeFastDrain({ ok: false, reason: 'gh-error', detail: 'gh pr list failed [network]: HTTP 504' }, 1))
-    .toBe('refused: gh-error: gh pr list failed [network]: HTTP 504');
+    .toBe('refused: unknown');
 });
 
 describe('catch-up fill and stable acceptance ordering', () => {
@@ -1601,7 +1602,7 @@ describe('actual enqueue outcomes and membership', () => {
   const membershipSetup = (extra = {}) => catchUpSetup({ readCandidates: async () => ({ ok: true, prs: [candidate(42)], queued: 0 }), ...extra });
   it('reports the live batching deferral instead of the pre-enqueue toMerge verdict', () => {
     expect(summarizeFastDrain({ toMerge: [{ num: 5025 }], enqueueOutcomes: [{ num: 5025, outcome: 'not-enqueued', kind: 'batching-deferred', reason: 'queue holds 2 group(s) (max 2)' }] }, 5025))
-      .toBe('not enqueued: batching-deferred: queue holds 2 group(s) (max 2)');
+      .toBe('not enqueued: batching-deferred:');
   });
 
   it('uses recorded success, already queued, missing outcomes and legacy results', () => {
@@ -1641,19 +1642,31 @@ describe('actual enqueue outcomes and membership', () => {
     expect(handle.misses().has(42)).toBe(false);
   });
 
-  it('includes queue timeline evidence and the collapsed last 300 stderr characters in a miss', async () => {
-    const { handle } = membershipSetup({ drainStderr: 'x'.repeat(400) + '\n batching   blocked',
+  it('publishes only fixed diagnostics in a membership miss', async () => {
+    const { handle } = membershipSetup({ drainStderr: 'x'.repeat(2400) + '\n batching   blocked',
       readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-10-14', reason: 'checks failed' }] }),
     });
     const [ran] = await handle.catchUp();
-    expect(ran.what).toContain('RemovedFromMergeQueueEvent at 2026-10-14: checks failed');
-    expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(400) + ' batching blocked').slice(-300));
+    expect(ran.what).not.toContain('checks failed');
+    expect(ran.what).toContain('exit 0, 2420B stderr, class=unknown');
+  });
+
+  it('omits child stderr credentials in membership-miss reports', async () => {
+    const secret = 'ghs_' + 'B'.repeat(2100);
+    const { handle, lines } = membershipSetup({
+      drainStderr: `Authorization: Bearer ${secret}\nhttps://user:password@example.test\nGraphQL: denied`,
+      readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [] }),
+    });
+    const [ran] = await handle.catchUp();
+    expect(ran.what).toContain('class=unknown');
+    expect(ran.what).not.toContain('GraphQL: denied');
+    expect([ran.what, ...lines].join('\n')).not.toMatch(/B{20}|user:password/);
   });
 
   it('does not count failed membership reads as misses', async () => {
     const { handle } = membershipSetup({ readMembership: async () => ({ ok: false, error: 'HTTP 504' }) });
     const ran = await handle.catchUp();
-    expect(ran[0]).toMatchObject({ verified: null, what: 'passed every drain gate — enqueued (unverified: HTTP 504)' });
+    expect(ran[0]).toMatchObject({ verified: null, what: 'passed every drain gate — enqueued (unverified: membership unreadable)' });
     expect(handle.misses().size).toBe(0);
   });
 
@@ -1676,7 +1689,7 @@ describe('actual enqueue outcomes and membership', () => {
     await handle.tick();
     expect(drains).toEqual([42, 99]);
     expect(handle.pending()).toEqual([]);
-    expect(lines).toContain('enqueue-on-event: catch-up stopping this round — batching deferred #42 (queue holds 2 group(s) (max 2)); 2 PR(s) retried at the next catch-up');
+    expect(lines).toContain('enqueue-on-event: catch-up stopping this round — batching deferred #42; 2 PR(s) retried at the next catch-up');
     expect(handle.misses().get(42)).toBe(1);
     advance(600_000);
     await handle.tick();
@@ -2165,13 +2178,87 @@ describe('concurrent catch-up rounds', () => {
 
 
 describe('child pass timings', () => {
-  const phases = 'listing=1ms listing.snapshot=2ms listing.target=3ms verdicts=4ms total=10ms';
+  const phases = 'listing=1ms listing.snapshot=2ms listing.target=3ms mergeCall=4ms total=10ms';
+  const safePhases = 'listing=1 mergeCall=4 total=10';
   it('extracts the last pass timings from stderr with trailing skip reasons', () => {
-    expect(extractPassTimings(`starting\nmerge-ai-prs · pass timings: listing=9ms total=20ms (considered 2)\nother\nmerge-ai-prs · pass timings: ${phases} (considered 1, merged 0)\n{"skipReasons":[]}\n`)).toBe(phases);
+    expect(extractPassTimings(`starting\nmerge-ai-prs · pass timings: listing=9ms total=20ms (considered 2)\nother\nmerge-ai-prs · pass timings: ${phases} (considered 1, merged 0)\n{"skipReasons":[]}\n`)).toBe(safePhases);
   });
   it('returns null when stderr contains no pass timings', () => {
     expect(extractPassTimings('starting\n{"skipReasons":[]}\n')).toBeNull();
   });
+  it.each([
+    'ghp_superSecret123456', 'Authorization: Bearer x', 'Authorization: Negotiate X',
+    'password="a"b', 'password="' + ('multilineSecret\n'.repeat(1400)) + '"',
+    'configured-env-secret',
+  ])('publishes no stderr text (%#)', async secret => {
+    const source = readFileSync(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
+    const runChild = new Function('classifyChildFailure', 'extractPassTimings',
+      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(enqueueModule.classifyChildFailure, extractPassTimings);
+    const child = new EventEmitter(); child.stderr = new EventEmitter();
+    const pending = runChild({ env: { SERVICE_SECRET: secret }, args: [], timeoutMs: 1000, spawnImpl: () => child });
+    child.stderr.emit('data', secret); child.emit('close', 1);
+    const result = await pending;
+    expect(result).toEqual({ code: 1, stdout: '', stderrBytes: secret.length, errorClass: 'unknown', passTimings: null, timedOut: false });
+    const { handle, lines, advance } = setup({ env: { SERVICE_SECRET: secret }, drainStderr: secret });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const ran = await handle.tick();
+    expect(JSON.stringify({ result, ran, lines })).not.toContain(secret.split('\n')[0].replaceAll('"', '\\"'));
+    if (secret.includes('multilineSecret')) expect(JSON.stringify({ ran, lines })).not.toContain('multilineSecret');
+  });
+
+  it('rebuilds only numeric timing tokens and caps their count', () => {
+    expect(extractPassTimings('merge-ai-prs · pass timings: listing=2ms ghp_secret=abc total=3.5ms bad=Infinityms nope=2msSECRET listing.snapshot=4ms password="secret"'))
+      .toBe('listing=2 total=3.5');
+    expect(extractPassTimings('merge-ai-prs · pass timings: password=123456ms ghp_topsecret=1ms listing=1ms')).toBe('listing=1');
+    expect(extractPassTimings('merge-ai-prs · pass timings: total=1ms\nmerge-ai-prs · pass timings: secret')).toBeNull();
+  });
+
+  it.each(['throw', 'error'])('never publishes spawn error messages (%s)', async mode => {
+    const secret = 'spawn-message-secret';
+    const { handle, children, lines, advance } = setup({ manualFinish: true,
+      ...(mode === 'throw' ? { spawnImpl: () => { throw new Error(secret); } } : {}),
+    });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const tick = handle.tick();
+    if (mode === 'error') {
+      await new Promise(resolve => setImmediate(resolve));
+      children[0].emit('error', new Error(secret));
+    }
+    const ran = await tick;
+    expect(JSON.stringify({ ran, lines })).not.toContain(secret);
+    expect(ran[0].what).toContain('class=spawn-error');
+  });
+
+  it.each([
+    { ok: false, reason: 'secret', detail: 'secret' },
+    { failed: [{ num: 42, detail: 'secret' }] },
+    { enqueueOutcomes: [{ num: 42, outcome: 'not-enqueued', kind: 'secret', reason: 'secret' }] },
+    { deferred: [{ num: 42, waitOn: ['secret'], overlapYield: { untilMs: 'secret' } }] },
+    { revalidationAborted: [{ num: 42, reason: 'secret' }] },
+    { skipReasons: [{ num: 42, reason: 'secret' }] },
+    { skipped: 'drain-in-progress', detail: 'secret' },
+  ])('does not publish child JSON free text (%j)', async drainJson => {
+    const { handle, lines, advance } = setup({ drainJson });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const ran = await handle.tick();
+    expect(JSON.stringify({ ran, lines })).not.toContain('secret');
+  });
+
+  it.each([
+    ['bad credentials', 'gh-auth'], ['HTTP 401', 'gh-auth'], ['not logged in', 'gh-auth'],
+    ['HTTP 404', 'gh-not-found'], ['Could not resolve to a Repository', 'gh-not-found'],
+    ['HTTP 403 secondary rate limit', 'gh-rate-limit'], ['HTTP 429', 'gh-rate-limit'],
+    ['ECONNRESET', 'network'], ['EAI_AGAIN', 'network'], ['socket hang up', 'network'],
+    ['SyntaxError', 'parse'], ['unexpected token', 'parse'], ['JSON', 'parse'], ['unrecognised', 'unknown'],
+  ])('classifies %s as %s', (stderr, expected) => {
+    expect(enqueueModule.classifyChildFailure(stderr, {})).toBe(expected);
+  });
+  it('prioritizes timeout and spawn failure and bounds classification to the last 8000 characters', () => {
+    expect(enqueueModule.classifyChildFailure('HTTP 401', { timedOut: true })).toBe('timeout');
+    expect(enqueueModule.classifyChildFailure('HTTP 401', { error: new Error('secret') })).toBe('spawn-error');
+    expect(enqueueModule.classifyChildFailure('HTTP 401' + 'x'.repeat(8000), {})).toBe('unknown');
+  });
+
   it.each(['close', 'error'])('logs split timings after they leave the stderr tail on child %s', async (event) => {
     const { handle, lines, advance, children } = setup({ manualFinish: true });
     handle.notePoll({ ok: true, marked: [mark()] });
@@ -2184,7 +2271,7 @@ describe('child pass timings', () => {
     child.stdout.emit('data', JSON.stringify({ considered: 1, toMerge: [{ num: 42 }], failed: [], skipReasons: [] }));
     child.emit(event, event === 'close' ? 0 : new Error('fake child error'));
     await tick;
-    expect(lines.find((line) => line.includes('fast drain exit'))).toContain(` · phases: ${phases}`);
+    expect(lines.find((line) => line.includes('fast drain exit'))).toContain(` · phases: ${safePhases}`);
   });
 });
 
@@ -2611,14 +2698,15 @@ describe('catch-up miss backoff', () => {
     expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toHaveLength(2);
   });
 
-  it('sanitises hostile control characters in the logged miss reason', async () => {
+  it('omits hostile free text from the logged miss reason', async () => {
     const reason = 'x\nSMELL enqueue-not-entering\r\x1b[31m\x00\x7f\x85';
     const f = fixture({ drainResult: num => persistentMiss(num, reason) });
     await f.handle.catchUp();
     f.advance(600_000); await f.handle.catchUp();
     const lines = f.lines.filter(l => l.includes('miss-backoff: skipped'));
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain('reason red-team-pending: x SMELL enqueue-not-entering  [31m');
+    expect(lines[0]).toContain('reason red-team-pending:)');
+    expect(lines[0]).not.toContain('SMELL');
     expect(lines[0]).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
   });
 
@@ -2653,12 +2741,12 @@ describe('catch-up miss backoff', () => {
     const f = fixture();
     await f.handle.catchUp();
     expect(attempts(f)).toEqual(['--only=42']);
-    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head', labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending: awaiting clearance', at: expect.any(Number) });
+    expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head', labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending:', at: expect.any(Number) });
     f.advance(600_000); await f.handle.catchUp();
     f.advance(600_000); await f.handle.catchUp();
     expect(attempts(f)).toEqual(['--only=42']);
     expect(f.lines.filter(l => l.includes('miss-backoff: skipped'))).toEqual([
-      'enqueue-on-event: catch-up #42 — miss-backoff: skipped (reason red-team-pending: awaiting clearance) until head/labels change or TTL',
+      'enqueue-on-event: catch-up #42 — miss-backoff: skipped (reason red-team-pending:) until head/labels change or TTL',
     ]);
     expect(f.lines.at(-1)).toContain('nothing runnable');
   });
@@ -2670,17 +2758,17 @@ describe('catch-up miss backoff', () => {
     f.handle.notePoll({ ok: true, marked: [mark(42)] });
     f.advance(15_000);
     const eventRan = await f.handle.tick();
-    expect(eventRan).toMatchObject([{ num: 42, what: 'not enqueued: red-team-pending: awaiting clearance' }]);
+    expect(eventRan).toMatchObject([{ num: 42, what: 'not enqueued: red-team-pending:' }]);
     expect(eventRan[0].catchUp).toBeUndefined();
     expect(attempts(f)).toEqual(['--only=42']);
     expect(f.handle.missBackoff().get(42)).toMatchObject({ pr: 42, headSha: 'miss-head',
-      labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending: awaiting clearance', at: expect.any(Number), logged: false });
+      labelsDigest: expect.stringMatching(/^[a-f0-9]{64}$/), reason: 'red-team-pending:', at: expect.any(Number), logged: false });
 
     catchUpEnabled = true;
     f.advance(600_000);
     const catchUpRan = await f.handle.catchUp();
     expect(catchUpRan).toMatchObject([{ num: 42, catchUp: true, outcome: 'skipped',
-      what: 'miss-backoff: skipped (reason red-team-pending: awaiting clearance) until head/labels change or TTL' }]);
+      what: 'miss-backoff: skipped (reason red-team-pending:) until head/labels change or TTL' }]);
     expect(attempts(f)).toEqual(['--only=42']);
   });
 
@@ -2774,7 +2862,7 @@ describe('catch-up miss backoff', () => {
     expect(f.handle.missBackoff().size).toBe(0);
   });
 
-  it('events bypass the hold and a new reason replaces the record on re-pick', async () => {
+  it('events bypass the hold and retain only the fixed kind when free text changes', async () => {
     let reason = 'red-team-pending';
     const f = fixture({ drainResult: num => persistentMiss(num, reason) });
     await f.handle.catchUp();
@@ -2782,10 +2870,10 @@ describe('catch-up miss backoff', () => {
     f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000); await f.handle.tick();
     expect(attempts(f)).toHaveLength(2);
     f.advance(1_800_000); await f.handle.catchUp();
-    expect(f.handle.missBackoff().get(42).reason).toBe('red-team-pending: other-gate');
+    expect(f.handle.missBackoff().get(42).reason).toBe('red-team-pending:');
     f.advance(600_000); await f.handle.catchUp();
     expect(attempts(f)).toHaveLength(3);
-    expect(f.lines.some(l => l.includes('miss-backoff: skipped (reason red-team-pending: other-gate)'))).toBe(true);
+    expect(f.lines.some(l => l.includes('miss-backoff: skipped (reason red-team-pending:)'))).toBe(true);
   });
 
   it('an unclassified event-origin abort clears an earlier hold and retries next catch-up', async () => {
