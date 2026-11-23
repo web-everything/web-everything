@@ -180,3 +180,51 @@ it.each([{}, { rowsComplete: false, rowsHead: XX_HEAD }, { rowsComplete: true, r
     expect(log.mock.calls.map(([l]) => l)).toContain('check-evidence-coverage: 0/1 PRs rowsComplete===true && rowsHead===headRefOid');
   } finally { log.mockRestore(); }
 });
+
+it('intake IO passes the pinned head and durable round, records refusal before effects and keeps read-only passes read-only', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+  const pr = { ...xxPr(), isDraft: false, rowsComplete: true, rowsHead: XX_HEAD, labels: ['review:changes'], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], comments: [
+      { body: '🔁 human review — changes requested\n\nFix the defect' },
+      { body: REARM_COMMENT_MARKER, author: { login: 'web-everything' } },
+    ] };
+  const intakeReader = vi.fn(() => ({ verdict: 'fail', reason: 'split-required', lines: 585 }));
+  const intakeEffects = vi.fn(plan => { expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'split-required' })); expect(plan.dispatch).toEqual([]); });
+  const options = { ...xxOptions(), readPrs: () => [pr], readRequiredChecks: () => ({ checks: ['test'] }),
+    loadIntake: () => ({ enforce: 'on' }), intakeReader, intakeEffects, env: { VITEST: 'true' } };
+  runReconcilePass(options);
+  expect(intakeReader).toHaveBeenCalledWith(expect.objectContaining({ headRefOid: XX_HEAD, round: 1 }), { params: { enforce: 'on' } });
+  expect(intakeEffects).toHaveBeenCalledTimes(1);
+  runReconcilePass({ ...options, readOnly: true });
+  expect(intakeEffects).toHaveBeenCalledTimes(1);
+});
+
+it.each([
+  ['shadow with malformed exempt paths', { WE_REVIEW_INTAKE_ENFORCE: 'shadow', WE_REVIEW_INTAKE_EXEMPT_PATHS: 'not json' }, undefined, false],
+  ['off with a non-numeric cap', { WE_REVIEW_INTAKE_ENFORCE: 'off', WE_REVIEW_INTAKE_MAX_LINES: 'many' }, undefined, false],
+  ['an unreadable enforce mode', { WE_REVIEW_INTAKE_ENFORCE: 'bogus' }, undefined, true],
+  ['a throwing settings loader', {}, () => { throw Error('invalid intake settings; operator must repair policy'); }, true],
+])('invalid intake settings (%s) never abort reconciliation', async (_name, intakeEnv, loadIntake, refused) => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { REARM_COMMENT_MARKER } = await import('../rearm-review.mjs');
+  const { readIntakeSettings } = await import('../../lib/review-loop/intake.mjs');
+  // The real settings reader, isolated from this host's platform and operator-override files.
+  loadIntake ??= ({ env }) => readIntakeSettings({ env, platform: {}, operatorOverride: {} });
+  const pr = { ...xxPr(), isDraft: false, rowsComplete: true, rowsHead: XX_HEAD, labels: ['review:changes'], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ name: 'test', status: 'completed', conclusion: 'success' }], comments: [
+      { body: '🔁 human review — changes requested\n\nFix the defect' },
+      { body: REARM_COMMENT_MARKER, author: { login: 'web-everything' } },
+    ] };
+  const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    let plan;
+    expect(() => { plan = runReconcilePass({ ...xxOptions(), readPrs: () => [pr], readRequiredChecks: () => ({ checks: ['test'] }),
+      loadIntake, intakeEffects: () => {}, env: { VITEST: 'true', ...intakeEnv } }); }).not.toThrow();
+    const intakeRefusals = plan.refusals.filter(r => r.kind === 'intake-unmeasurable' || r.kind === 'split-required');
+    // Unreadable enforcement fails closed (human review); a readable off/shadow mode keeps its non-blocking behaviour.
+    if (refused) expect(intakeRefusals).toEqual([expect.objectContaining({ kind: 'intake-unmeasurable' })]);
+    else { expect(intakeRefusals).toEqual([]); expect(plan.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix' })); }
+    expect(errors.mock.calls.map(([l]) => String(l)).join('\n')).toContain('operator must repair intake policy');
+  } finally { errors.mockRestore(); }
+});

@@ -62,6 +62,7 @@ describe('an automatic (standing-ruling) grant frees a round NOW (live #5690)', 
       enrichEscalationBase: id, enrichFixClaims: id, enrichTimeouts: id, enrichReferralHolds: id, enrichLedgerHolds: id,
       enrichRulings: id, enrichScopeBloat: id, enrichCodeQL: id, enrichOwedMainRule: () => {},
       loadMechanicalRoundsSetting: () => ({ value: true, source: 'env' }),
+      intakeReader: (pr) => ({ verdict: 'pass', reason: 'under-cap', lines: 0, round: pr.round, head: H }),
       env: { WE_REVIEW_ROUND_CAP: '10', WE_REVIEW_START_AFTER: 'ci-green' }, now: Date.parse('2026-10-15T12:00:00Z') });
     const reads = { readRuling: () => verified, cardOnly: ({ head }) => head === H, unedited: () => ['IC_auto'] };
     const enrichWith = (deps, seen = []) => (prs, o) => { seen.push(o); return enrichPrsWithStandingRulingGrants(prs,

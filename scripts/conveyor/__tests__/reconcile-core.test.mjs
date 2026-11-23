@@ -4995,6 +4995,18 @@ it.each([
   expect(reviewHoldCiWaivable({ pr: { ...pr, ...evidence }, requiredChecks })).toBe(false);
 });
 
+it('refuses a fix for an over-cap PR after one review round', () => {
+  const pr = pr1563();
+  const readIntake = (_pr, attempts) => ({ verdict: attempts >= 1 ? 'fail' : 'pass', reason: 'split-required', lines: 585 });
+  const options = { prs: [pr], agents: [], now: NOW, durableCounts: { 1563: 1 }, readIntake, intakeEnforce: 'on' };
+  const plan = planReconcile(options);
+  expect(plan.dispatch).toEqual([]);
+  expect(plan.refusals).toMatchObject([{ kind: 'split-required' }]);
+  expect(plan.notes).toContainEqual(expect.objectContaining({ kind: 'intake-effect' }));
+  expect(planReconcile({ ...options, intakeEnforce: 'shadow' }).dispatch).toMatchObject([{ kind: 'fix' }]);
+  expect(planReconcile({ ...options, readIntake: () => { throw Error('unreadable'); } }).refusals).toMatchObject([{ kind: 'intake-unmeasurable' }]);
+});
+
 import { extractFindings } from '../fix-context-pack.mjs';
 import redTeamSendBack from './fixtures/pr7312-red-team-send-back.json';
 it('red-team gate send-back counts as a finding', () => {
