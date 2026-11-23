@@ -488,3 +488,21 @@ it('ready-only writer excludes its recorded target session even after the launch
   expect(cloneBytes(f.root)).toEqual(before);
   expect(readLockEntry(cloneLockDirs(f.root, f.lockRoot).readersRoot, owner)).not.toBeNull();
 });
+
+
+it.each([undefined, '2', 'invalid', '0'])('alerts once at the consecutive writer give-up threshold %s', async setting => {
+  const f = prepareFixture();
+  f.read('Mac:222', 222);
+  const threshold = setting === '2' ? 2 : 5;
+  const env = { ...f.env, WE_DAEMON_REBUILD_GIVEUP_ALERT_AFTER: setting };
+  const log = { error: vi.fn() };
+  for (let count = 1; count <= threshold + 1; count++) {
+    const result = await rebuildClone({ ...f.args, env, log, asJob: false, versions: null,
+      lockOpts: { ...f.opts, owner: 'Mac:12154', writerPriorityAfter: 1 } });
+    expect(result.reason).toBe('tick-in-progress');
+    expect(result.alerts ?? []).toEqual(count >= threshold
+      ? [`rebuild blocked: ${count} consecutive give-ups, reader Mac:222 still ticking (needs a restart of that reader)`] : []);
+  }
+  expect(log.error.mock.calls.filter(([line]) => line.startsWith('rebuild blocked:')))
+    .toEqual([[`rebuild blocked: ${threshold} consecutive give-ups, reader Mac:222 still ticking (needs a restart of that reader)`]]);
+});

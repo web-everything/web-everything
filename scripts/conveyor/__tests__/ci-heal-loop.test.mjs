@@ -16,7 +16,7 @@ function fixture() {
     heartbeat: vi.fn(),
   };
   return {
-    root: '/clone', lock,
+    root: '/clone', lock, pendingRebuild: () => null,
     locks: { acquireRead: vi.fn(() => ({ ok: true })), releaseRead: vi.fn(), heartbeatRead: vi.fn() },
     tick: vi.fn(async () => ({ healed: true })), ensureAuth: vi.fn(),
     now: vi.fn().mockReturnValueOnce(10).mockReturnValue(25), write: vi.fn(),
@@ -336,5 +336,52 @@ describe('CI heal interval', () => {
       resolveInterval: () => ({ seconds: 300, source: 'standard' }), sleep: vi.fn(async () => {}) });
     expect(iteration).toHaveBeenCalledOnce();
     expect(result).toEqual({ exit: 'disabled' });
+  });
+});
+
+
+describe('pending rebuild tick boundaries', () => {
+  it('exits before acquiring a read slot or cycle lock', async () => {
+    const deps = fixture();
+    deps.pendingRebuild = () => ({ owner: 'foreign-writer', count: 1 });
+    expect(await runCiHealLoopIteration(deps)).toEqual({ exit: 'rebuild-pending' });
+    expect(deps.locks.acquireRead).not.toHaveBeenCalled();
+    expect(deps.lock.reserve).not.toHaveBeenCalled();
+    expect(deps.tick).not.toHaveBeenCalled();
+    expect(deps.write).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails open when the pending rebuild check throws', async () => {
+    const deps = fixture();
+    deps.pendingRebuild = () => { throw new Error('unreadable'); };
+    expect(await runCiHealLoopIteration(deps)).toEqual({ healed: true });
+    expect(deps.locks.acquireRead).toHaveBeenCalledOnce();
+    expect(deps.locks.releaseRead).toHaveBeenCalledOnce();
+  });
+
+  it('checks every loop boundary and exits cleanly before the next iteration', async () => {
+    const deps = fixture();
+    const iteration = vi.fn(async () => ({}));
+    deps.enabled = () => iteration.mock.calls.length < 2;
+    deps.pendingRebuild = vi.fn().mockReturnValueOnce(null).mockReturnValue({ owner: 'writer', count: 1 });
+    expect(await main([], { ...deps, iteration })).toEqual({ exit: 'rebuild-pending' });
+    expect(iteration).toHaveBeenCalledOnce();
+    expect(deps.sleep).toHaveBeenCalledOnce();
+    expect(process.exitCode ?? 0).toBe(0);
+  });
+
+  it('propagates a claim arriving between the loop and iteration checks', async () => {
+    const deps = fixture();
+    deps.pendingRebuild = vi.fn().mockReturnValueOnce(null).mockReturnValue({ owner: 'writer', count: 1 });
+    expect(await runCiHealLoop({ ...deps, once: true })).toEqual({ exit: 'rebuild-pending' });
+    expect(deps.locks.acquireRead).not.toHaveBeenCalled();
+    expect(deps.write.mock.calls.filter(([line]) => line.includes('rebuild pending'))).toHaveLength(1);
+  });
+
+  it('fails open at the outer boundary too', async () => {
+    const deps = fixture();
+    deps.pendingRebuild = () => { throw new Error('unreadable'); };
+    await runCiHealLoop({ ...deps, once: true });
+    expect(deps.tick).toHaveBeenCalledOnce();
   });
 });

@@ -15,7 +15,7 @@ import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
-import { withWriteLock } from '../daemon-clone-lock.mjs';
+import { withWriteLock, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
@@ -397,13 +397,23 @@ async function rebuildCloneInternal({
     }
   } else if (launchedBy !== 'early' && launchedBy !== 'recovery' && prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
+    const alerts = [];
     if (prep.reason === 'tick-in-progress') {
       log.error?.(`daemon-rebuild: gave up after ${Math.round((now() - startedMs) / 1000)}s — reader ${prep.heldBy ?? '?'} still ticking; this tick runs on the current tree and the next one retries (#4044)`);
+      const raw = env?.WE_DAEMON_REBUILD_GIVEUP_ALERT_AFTER;
+      const parsed = Number(raw);
+      const threshold = Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 5;
+      const count = inspectCloneLock(root, finalLockOpts).writerClaim?.count ?? 0;
+      if (count >= threshold) {
+        const alert = `rebuild blocked: ${count} consecutive give-ups, reader ${prep.heldBy ?? '?'} still ticking (needs a restart of that reader)`;
+        alerts.push(alert);
+        if (count === threshold) log.error?.(alert);
+      }
     } else if (prep.reason === 'reader-priority') {
       // Not counted as rebuild starvation: escalating to the long starved wait would re-block the very reader.
       log.error?.(`daemon-rebuild: backed off — reader ${prep.heldBy ?? '?'} was refused ${prep.starved ?? '?'} consecutive time(s) and has priority; nothing was moved, the next tick retries (#4044 reader fairness)`);
     }
-    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
+    return { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0, moved: false, alerts, reason: prep.reason, ...(prep.heldBy ? { heldBy: prep.heldBy } : {}) };
   }
   if (prep.value.terminal) {
     return { ...prep.value.result, alerts: prep.value.alerts, waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs: 0 };
