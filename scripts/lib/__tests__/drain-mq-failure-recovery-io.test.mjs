@@ -56,6 +56,10 @@ function fixture(mode = 'real') {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
+      if (mode === 'coloured log') {
+        if (!args.includes('--allow-escape-sequences')) throw new Error('unreadable');
+        return '\x1b[31mFA\x1b[1mIL tests/widget.test.mjs > keeps state\x1b[0m\nAssertionError: expected true';
+      }
       if (mode === 'expired log') throw new Error('410 expired');
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
@@ -70,6 +74,17 @@ function fixture(mode = 'real') {
 }
 
 describe('drain MQ failure production adapter', () => {
+  it('requests escape-containing logs and strips colours before parsing failure evidence', async () => {
+    const f = fixture('coloured log');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+    const read = f.exec.mock.calls.find(([, args]) => args.some(arg => arg.endsWith('/logs')));
+    expect(read[1]).toContain('--allow-escape-sequences');
+    const comment = f.writes().find(([, args]) => args[0] === 'pr' && args[1] === 'comment');
+    const route = parseMqFailureRoute({ comment: { body: comment[2].input, author: { login: 'chalbert' } }, expected: identity });
+    expect(route).toMatchObject({ testFiles: ['tests/widget.test.mjs'], complete: true });
+    expect(comment[2].input).not.toContain('\x1b');
+  });
+
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {
     const f = fixture();
     expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true, reason: expect.any(String) });

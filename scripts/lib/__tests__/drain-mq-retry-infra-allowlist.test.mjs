@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mqSameHeadGuard, readDrainQueueSafety } from '../drain-queue-safety.mjs';
+import * as queueSafety from '../drain-queue-safety.mjs';
 
 // Exercise the production readSettings().drain path without reading developer settings.
 const settings = vi.hoisted(() => ({ drain: {} }));
@@ -32,7 +33,7 @@ const job = (id, conclusion = 'failure') => ({
 // No summary hints or quarantine coverage can mask the log-based classification.
 function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
   runs = [{ ...run(103, null, '2026-11-01T13:50:00Z'), status: 'in_progress' }, run(102)],
-  events = [removal()], mergeState = 'CLEAN' } = {}) {
+  events = [removal()], mergeState = 'CLEAN', requireEscapes = false } = {}) {
   const log = vi.fn(), logReads = [];
   const exec = vi.fn((command, args, opts) => {
     if (command !== 'gh') throw new Error('unexpected non-GitHub IO');
@@ -57,6 +58,7 @@ function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
     if (match) {
       const id = Number(match[1]);
       logReads.push({ id, opts });
+      if (requireEscapes && !args.includes('--allow-escape-sequences')) throw new Error('unreadable');
       if (!logs.has(id)) throw new Error(`unreadable job ${id}`);
       const value = logs.get(id);
       if (value instanceof Error) throw value;
@@ -95,6 +97,23 @@ function expectVisibleDecision(decision, reason, mainRunId = 102) {
 }
 
 describe('same-head MQ retry job-log infrastructure allowlist', () => {
+  it('allows terminal escapes in gh output and strips colours before matching the infra allowlist', () => {
+    const f = fixture({ requireEscapes: true, logs: new Map([[21,
+      '\x1b[31mfatal: could not \x1b[1mfetch\x1b[22m deadbeef from promisor remote\x1b[0m\n']]) });
+    expectInfraRetry(f.guard());
+    const reads = f.exec.mock.calls.filter(([, args]) => args.some(arg => arg.endsWith('/logs')));
+    expect(reads).toHaveLength(1);
+    expect(reads[0][1]).toContain('--allow-escape-sequences');
+  });
+
+  it('strips CSI, OSC with BEL or ST, ESC controls and bare ESC while preserving log text', () => {
+    expect(queueSafety.stripTerminalEscapes(
+      '\x1b[?25l\x1b[31mFAIL\x1b[0m \x1b[1 qtest\n'
+      + '\x1b]0;hidden title\x07line\x1b]8;;https://example.test\x1b\\ link\x1b]8;;\x1b\\'
+      + '\x1bM\x1b',
+    )).toBe('FAIL test\nline link');
+  });
+
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(now);

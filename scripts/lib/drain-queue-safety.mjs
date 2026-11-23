@@ -15,6 +15,13 @@ import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, rea
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
+/** Remove terminal controls before interpreting GitHub Actions log text. */
+export function stripTerminalEscapes(text) {
+  return text.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[ -/]*[@-Z\\-_]|\x1b/g, '');
+}
+
 const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value) ? value.toLowerCase() : null;
 // Explicit failure reasons only; future enum values require operator inspection.
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
@@ -450,7 +457,8 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
     }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
-    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint,
+      ...(endpoint.endsWith('/logs') ? ['--allow-escape-sequences'] : [])], { encoding: 'utf8', timeout: 60_000,
       maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
@@ -466,9 +474,9 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
       }
       const job = JSON.parse(read1(`repos/${repo}/actions/jobs/${check.id}`, 1024 * 1024));
       if (job?.name !== check.name || mqOid(job?.head_sha) !== commit) return null;
-      const text = read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024);
+      const text = stripTerminalEscapes(read1(`repos/${repo}/actions/jobs/${check.id}/logs`, 64 * 1024 * 1024));
       const failures = parseVitestFailures(text);
-      const plain = text.replace(/\x1b\[[0-9;]*m/g, '').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+      const plain = text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
       const summary = /^\s*Tests\s+(\d+) failed\b/m.exec(plain);
       const names = new Set(failures.tests.map(t => `${t.file}::${t.name}`));
       // Unhandled errors/rejections fail a run without being a listed test failure: never covered by a quarantine.
@@ -530,7 +538,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
     const read = (endpoint, binary = false) => {
       // The staged executor owns the shared allowance, including base-reader IO and cached requests.
-      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
+      return exec('gh', ['api', `repos/${repo}/${endpoint}`,
+        ...(endpoint.endsWith('/logs') ? ['--allow-escape-sequences'] : [])], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
     };
@@ -635,8 +644,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     // Additional source: vitest's own final summary block, read from a bounded tail of the failed shard log
     // only (never classified as a whole; aggregators' logs are never read). `Errors  N error(s)` marks unhandled errors.
     const rawLog = read(`actions/jobs/${shards[0].id}/logs`, true);
-    const tail = Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8')
-      .replace(/\x1b\[[0-9;]*m/g, '').replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+    const tail = stripTerminalEscapes(Buffer.from(rawLog).subarray(-MQ_SUMMARY_TAIL_BYTES).toString('utf8'))
+      .replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
     const tailLines = tail.split(/\r?\n/);
     const starts = tailLines.map((line, i) => /^\s*Test Files\s/.test(line) ? i : -1).filter(i => i >= 0);
     if (starts.length !== 1) return null;
@@ -857,10 +866,11 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
+          const rawLog = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`, '--allow-escape-sequences'], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
-          if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          if (Buffer.byteLength(rawLog, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
+          const log = stripTerminalEscapes(rawLog);
           // `fail-closed` rows count too: a red-main freeze read that raced a main CI re-run fails closed
           // ("red-main freeze unreadable: … verdict pending") — main-caused and transient, not this PR's defect.
           const holds = log.split('\n').filter(line => /^\S+\s+(?:hold|fail-closed)\s{2,}\S+/.test(line));
@@ -944,13 +954,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
           budget--;
-          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
+          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`, '--allow-escape-sequences'], {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
           // Bound the scan as well as subprocess output. Injected readers may return oversized text.
-          const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
+          const tail = stripTerminalEscapes(Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8')
+            .subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8'));
           let truncatedLine = false;
           const matched = tail.split('\n').some(line => {
             if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
