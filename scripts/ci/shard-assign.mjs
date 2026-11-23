@@ -177,7 +177,14 @@ export function timingsFromReports(reports, repoRoot = REPO_ROOT) {
 export function formatUpdatedTimings(all, suite, timings) {
   const sorted = Object.fromEntries(Object.entries(timings).sort(([a], [b]) => (a < b ? -1 : 1)));
   assertTimingKeys({ ...all, [suite]: sorted });
-  return `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. Refresh with --update.', unit: {}, soak: {}, integration: {}, ...all, [suite]: sorted }, null, 1)}\n`;
+  return `${JSON.stringify({ _doc: 'Measured seconds per test file, used by scripts/ci/shard-assign.mjs to balance CI shards. The weekly ci-timings-refresh bot owns this file; PRs never edit it.', unit: {}, soak: {}, integration: {}, ...all, [suite]: sorted }, null, 1)}\n`;
+}
+
+/** Only the weekly bot workflow owns the persisted sharding measurements. */
+export function assertTimingsWriter(env = process.env) {
+  if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_WORKFLOW !== 'Refresh CI test timings') {
+    throw new Error('The weekly bot owns scripts/ci/test-timings.json; PRs never edit it. Only .github/workflows/ci-timings-refresh.yml may write it.');
+  }
 }
 
 async function main(argv) {
@@ -189,6 +196,7 @@ async function main(argv) {
     throw new Error('shard-assign: --suite=integration requires --update=<json> and forbids --shard/--group');
   }
   if (update) {
+    assertTimingsWriter();
     if (!update.slice('--update='.length)) throw new Error('shard-assign: --update requires a JSON report path');
     const reports = update.slice('--update='.length).split(',').filter(Boolean).map((p) => JSON.parse(readFileSync(p, 'utf8')));
     const all = loadTimings();
