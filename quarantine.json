@@ -11,5 +11,8 @@
       "job": "soak-shard (1)"
     }
   ],
-  "mode": "quarantine"
+  "mode": "quarantine",
+  "fixPrs": [
+    7372
+  ]
 }
