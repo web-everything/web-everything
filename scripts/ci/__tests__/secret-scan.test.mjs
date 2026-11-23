@@ -40,6 +40,70 @@ describe('secret-scan', () => {
     expect(scan(diff('ordinary text')).status).toBe(0);
     expect(scan('').status).toBe(0);
   });
+  it.each([
+    '{"p":"Paragraph"}',
+    'const event = { k: "click" };',
+    '{"nested":{"d":"description","p":"Paragraph","k":"kind"}}',
+    '{"\\u0070":"Paragraph"}',
+    'const event = { /* trivia */ k: "click", nested: [{p:"Paragraph"}] };',
+    '{"p":"Paragraph"}\n{"k":"kind"}',
+  ])('does not invent key evidence in complete ordinary objects %#', text => {
+    const lines = text.split('\n');
+    const input = '--- /dev/null\n+++ b/locale.json\n'
+      + `@@ -0,0 +1,${lines.length} @@\n` + lines.map(line => `+${line}\n`).join('');
+    expect(keyStructureFinding(Buffer.from(text))).toBeNull();
+    const result = scan(input);
+    expect(result.status).toBe(0);
+    expect(result.output).toBe('');
+  });
+  it.each([false, true])('does not carry an added comment across omitted closing syntax (context=%s)', context => {
+    const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = privateKey.export({ format: 'jwk' });
+    const publicMembers = Object.entries(publicKey.export({ format: 'jwk' }))
+      .map(([name, value]) => `${JSON.stringify(name)}:${JSON.stringify(value)},`);
+    const member = `d:${JSON.stringify(jwk.d)},`;
+    const resulting = ['({', ...publicMembers, '/* updated comment', 'unchanged', '*/', member, '})'].join('\n');
+    // Only locally generated fixture source is evaluated, never scanner input.
+    expect(createPrivateKey({ key: Function(`return ${resulting}`)(), format: 'jwk' }).asymmetricKeyType).toBe('ec');
+    expect(keyStructureFinding(Buffer.from(resulting))).toBe('private-key-structure');
+    const input = '--- a/key.js\n+++ b/key.js\n'
+      + (context
+        ? '@@ -6,3 +6,4 @@\n-/* existing comment\n+/* updated comment\n unchanged\n */\n'
+        : '@@ -6 +6 @@\n-/* existing comment\n+/* updated comment\n@@ -8,0 +9 @@\n')
+      + `+${member}\n`;
+    const result = scan(input);
+    expect(result.status).toBe(1);
+    expect(result.output).toMatch(/^key\.js:\d+ private-key-structure\n$/);
+    expect(result.output).not.toContain(jwk.d);
+  });
+  it.each(['/* changed comment', '"changed string', "'changed string"])(
+    'resets incomplete lexical state across a diff gap %#', opener => {
+      const input = '--- a/key.js\n+++ b/key.js\n'
+        + `@@ -1 +1 @@\n-old\n+${opener}\n@@ -8,0 +9 @@\n+"d":"abc",\n`;
+      expect(scan(input).output).toMatch(/^key\.js:\d+ private-key-structure\n$/);
+    },
+  );
+  it('keeps private members visible when both their syntax and an earlier comment span gaps', () => {
+    const input = '--- a/key.js\n+++ b/key.js\n'
+      + '@@ -1 +1 @@\n-old\n+/* updated comment\n'
+      + '@@ -4,0 +5 @@\n+{\n'
+      + '@@ -7,0 +9 @@\n+"d":\n'
+      + '@@ -10,0 +13,2 @@\n+"abc",\n+}\n';
+    expect(scan(input).output).toBe('key.js:1 private-key-structure\n');
+  });
+  it('preserves comments and literals within consecutive added lines and separate complete objects across gaps', () => {
+    const lines = ['const metadata = {', '/* comment', 'd:"abc",', '*/', 'p:"Paragraph",', 'k:"kind",', '};'];
+    const input = '--- a/locale.js\n+++ b/locale.js\n'
+      + `@@ -0,0 +1,${lines.length} @@\n` + lines.map(line => `+${line}\n`).join('')
+      + '@@ -10,0 +18 @@\n+const event = {k:"click"};\n';
+    expect(scan(input).status).toBe(0);
+  });
+  it('treats adjacent postimage lines as contiguous even in separate hunks', () => {
+    const input = '--- a/locale.json\n+++ b/locale.json\n'
+      + ['{', '"p":"Paragraph"', '}'].map((text, index) =>
+        `@@ -${index},0 +${index + 1} @@\n+${text}\n`).join('');
+    expect(scan(input).status).toBe(0);
+  });
   it('ignores removed lines and context, keeping new-file line numbers', () => {
     const result = scan(`--- a/x\n+++ b/x\n@@ -3,2 +3,2 @@\n-${token}\n ${token}\n+${aws}\n`);
     expect(result.status).toBe(1);
@@ -213,6 +277,9 @@ describe('secret-scan', () => {
     expect(scan(input).output).toBe('[redacted-path]:7 aws-access-key\n');
     const fragmentPath = '"d":"abc",';
     expect(scan(`--- a/x\n+++ ${JSON.stringify('b/' + fragmentPath)}\n@@ -0,0 +7 @@\n+${aws}\n`).output).toBe('[redacted-path]:7 aws-access-key\n');
+    const ordinaryPath = '{"p":"Paragraph"}';
+    expect(scan(`--- a/x\n+++ ${JSON.stringify('b/' + ordinaryPath)}\n@@ -0,0 +7 @@\n+${aws}\n`).output)
+      .toBe(`${ordinaryPath}:7 aws-access-key\n`);
   });
   it('fails closed on a residual binary notice and redacts its path', () => {
     for (const path of ['image.bin', token + '.bin']) {

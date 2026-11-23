@@ -2,6 +2,7 @@
 // Text rules match line by line (raw and decoded): credentials split across multiple lines may escape
 // text matching. The shared Forge structural detector also scans each file's concatenated added lines,
 // including member fragments whose unchanged JWK type/enclosing object is absent from the diff.
+// Gaps also get a separate lexical view: unchanged syntax cannot be inferred from added lines.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -55,29 +56,44 @@ function safePath(path) {
   return /[\x00-\x1f\x7f-\x9f]/.test(path) ? JSON.stringify(path) : path;
 }
 
-function addedStructureFinding(bytes) {
+function addedStructureFinding(bytes, gaps = []) {
   // Keep the original byte view first: DER must not make a UTF-8 round trip.
   const finding = keyStructureFinding(bytes);
   if (finding) return finding;
   // A zero-context diff may contain only new private members of an existing public
-  // JWK. Supply a conservative type witness to the SAME detector, both around the
-  // fragment and in any added objects. Its duplicate-member handling preserves the
-  // witness even when an added kty follows. `oct` covers asymmetric and symmetric
-  // private members; this intentionally also rejects ambiguous member fragments.
+  // JWK. Supply a conservative type witness to the SAME detector around fragments
+  // and unclosed objects only. Complete added objects must supply their own key
+  // evidence: injecting a type into {p:"Paragraph"} would invent a private key.
+  // `oct` covers asymmetric and symmetric private members; missing-context member
+  // fragments remain ambiguous and are intentionally rejected conservatively.
   // Skip literals/comments so braces inside them cannot corrupt the member view.
   const witness = '"kty":"oct",';
   const text = bytes.toString('utf8');
+  const pieces = /"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]]/g;
+  const stack = [], closed = new Set();
+  let gapIndex = 0, lastGap = -1;
+  for (const match of text.matchAll(pieces)) {
+    while (gapIndex < gaps.length && gaps[gapIndex] <= match.index) lastGap = gaps[gapIndex++];
+    const token = match[0];
+    if (token === '{' || token === '[') stack.push({ token, at: match.index });
+    else if (token === '}' || token === ']') {
+      const open = stack.pop();
+      // A matching brace across omitted lines is not evidence of a complete object:
+      // those lines may contain the real key type. Only contiguous objects are known.
+      if (open?.token === (token === '}' ? '{' : '[') && lastGap <= open.at) closed.add(open.at);
+    }
+  }
   let size = Buffer.byteLength(text) + witness.length + 4, depth = 1;
   if (size > LIMIT) throw incomplete();
   const trivia = /(?:\s+|\/\*[\s\S]*?\*\/|\/\/[^\r\n\u2028\u2029]*)*/y;
-  const fragments = text.replace(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]]/g, (token, offset) => {
+  const fragments = text.replace(pieces, (token, offset) => {
     let extra = '';
     if (token === '{' || token === '[') {
       depth++;
       trivia.lastIndex = offset + 1;
       trivia.exec(text);
       // A type witness must not turn empty `oth: {}` into private material.
-      if (token === '{' && text[trivia.lastIndex] !== '}') extra = witness;
+      if (token === '{' && !closed.has(offset) && text[trivia.lastIndex] !== '}') extra = witness;
     } else if (token === '}' || token === ']') {
       if (--depth === 0) {
         // An addition can first close an unchanged container, then add members
@@ -96,11 +112,35 @@ function addedStructureFinding(bytes) {
   return keyStructureFinding(Buffer.from(`{${witness}\n${fragments}\n${'}'.repeat(depth)}`));
 }
 
+function fileStructureFinding(added, starts) {
+  if (starts.length === 1) return addedStructureFinding(Buffer.concat(added));
+  const runs = starts.map((start, index) => Buffer.concat(added.slice(start, starts[index + 1])));
+  const scanRuns = chunks => {
+    let offset = 0;
+    const gaps = chunks.slice(0, -1).map(chunk => (offset += chunk.toString('utf8').length));
+    return addedStructureFinding(Buffer.concat(chunks), gaps);
+  };
+  const finding = scanRuns(runs);
+  if (finding) return finding;
+  // Each run contains consecutive added postimage lines. An unfinished literal or
+  // block comment at a gap may close on omitted lines. Drop only that unfinished
+  // token in this alternate view; retain the original byte view above for DER and
+  // structures genuinely spanning runs. Do not reset between consecutive additions.
+  // Match unfinished tokens in the same pass as closed tokens, so repeated openers
+  // without a terminator cannot cause repeated searches through the remaining run.
+  const pieces = /"(?:\\[\s\S]|[^"\\])*("|\\?$)|'(?:\\[\s\S]|[^'\\])*('|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(\*\/|$)/g;
+  return scanRuns(runs.map(run => Buffer.from(run.toString('utf8')
+    .replace(pieces, (token, doubleEnd, singleEnd, commentEnd) =>
+      (doubleEnd !== undefined && doubleEnd !== '"')
+      || (singleEnd !== undefined && singleEnd !== "'") || commentEnd === '' ? '\n' : token))));
+}
+
 export function scanDiff(diff, allowlist = []) {
   if (!Buffer.isBuffer(diff)) diff = Buffer.from(diff, 'utf8');
   if (diff.length > LIMIT) throw incomplete();
   const hits = [];
   let path = null, line = 0, oldLeft = 0, newLeft = 0, added = [], firstAdded = 0, displayPath, previousPrefix;
+  let starts = [], lastAdded = 0;
   const report = (rule, at) => {
     if (!path) throw incomplete();
     if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
@@ -110,10 +150,12 @@ export function scanDiff(diff, allowlist = []) {
   };
   const finishFile = () => {
     if (added.length) {
-      const rule = addedStructureFinding(Buffer.concat(added));
+      const rule = fileStructureFinding(added, starts);
       if (rule) report(rule, firstAdded);
     }
     added = [];
+    starts = [];
+    lastAdded = 0;
     firstAdded = 0;
     displayPath = undefined;
   };
@@ -139,6 +181,8 @@ export function scanDiff(diff, allowlist = []) {
       if (prefix === '+') {
         if (!path) throw incomplete();
         if (!added.length) firstAdded = line;
+        if (!added.length || line !== lastAdded + 1) starts.push(added.length);
+        lastAdded = line;
         const raw = text.slice(1), decoded = decodedLine(raw);
         added.push(Buffer.concat([bytes.subarray(1), Buffer.from('\n')]));
         for (const [pattern, rule] of secretText) {
