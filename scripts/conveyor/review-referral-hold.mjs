@@ -54,9 +54,10 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 
 /** Safe, bounded diagnostic persisted beside a parked run and carried into operator alerts. */
 export function sanitizeAcceptHoldReason(value) {
-  return typeof value === 'string' ? value
-    .replace(/[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, '')
-    .replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|Bearer\s+[^\s]+|x-access-token:[^\s/@]+/gi, '[REDACTED]')
+  // Redact on the raw text first (Bearer\tTOKEN), then strip controls, then redact again (controls hidden inside a token).
+  const redact = text => text.replace(/(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+|Bearer\s+[^\s]+|x-access-token:[^\s/@]+/gi, '[REDACTED]');
+  return typeof value === 'string' ? redact(redact(value)
+    .replace(/[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, ''))
     .slice(0, 300) : '';
 }
 

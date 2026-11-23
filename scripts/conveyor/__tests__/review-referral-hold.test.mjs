@@ -1021,6 +1021,13 @@ describe('same-head hold never silences a review whose verdict never landed (liv
     expect(reason).toContain('[REDACTED]');
     expect(reason).not.toContain('secret');
   });
+  it.each(['Bearer\tsecretJWT', 'Bearer\nsecretJWT', 'Bear​er secretJWT'])('redacts a credential split by control characters: %j', credential => {
+    const raw = run();
+    raw.acceptHoldReason = `parked: ${credential}`;
+    const reason = reviewRunEvidence(raw).acceptHoldReason;
+    expect(reason).toContain('[REDACTED]');
+    expect(reason).not.toContain('secretJWT');
+  });
   it('alerts once per exhausted head and run-count with the latest sanitized park reason', () => {
     const raw = run();
     raw.acceptHoldReason = 'Unattended accept parked: live referrals unavailable: ghp_secret Bearer secret x-access-token:secret\n detail: ' + 'x'.repeat(500);

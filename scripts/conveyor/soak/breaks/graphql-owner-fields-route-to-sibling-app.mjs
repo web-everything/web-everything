@@ -3,7 +3,6 @@
  * comment read used the web-everything App token ("Could not resolve to a Repository"). Every accepted review then
  * parked at the confirm step with no verdict label. The owner must be read from the graphql fields.
  */
-import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -12,13 +11,8 @@ export default {
   title: 'gh shim: graphql owner=/name= fields must select the sibling repo owner App installation, not the checkout owner',
   card: 'plateau-app review accepts park: graphql owner routing (PA-REVIEW-WRITEBACK)',
   fixedBy: { sha: 'pending', where: 'lane/pa-writeback-owner-routing', paths: ['scripts/lib/github-app-installations.mjs'] },
-  // Behavioural: a child process imports the tree's resolver and asks it to route a graphql call.
-  fixPresent(root) {
-    const code = `const m = await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/github-app-installations.mjs')).href)});`
-      + `process.stdout.write(String(m.ownerFromGhArgv(['api','graphql','-f','owner=plateauapp','-f','name=plateau-app'])));`;
-    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8' });
-    return r.status === 0 && r.stdout === 'plateauapp';
-  },
+  // The fix ships with this break, so it is always required: a regression fails CI instead of flipping to expected-fail.
+  fixPresent() { return true; },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const { ownerFromGhArgv } = await import(pathToFileURL(join(root, 'scripts/lib/github-app-installations.mjs')).href);
