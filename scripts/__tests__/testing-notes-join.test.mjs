@@ -1,8 +1,10 @@
 // @repo-scanning-test scope=full — verifies the numbered guide against its pinned source.
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { resolve } from 'node:path';
+import MarkdownIt from 'markdown-it';
+import { extractAnchors } from '../lib/rules-loader.cjs';
+import { dirname, relative, resolve } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { joinTestingNotes, readTestingNotes } from '../lib/testing-notes-join.mjs';
@@ -10,6 +12,39 @@ import { joinTestingNotes, readTestingNotes } from '../lib/testing-notes-join.mj
 const root = resolve(import.meta.dirname, '../..');
 const baseline = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/testing-notes-split-baseline.json'), 'utf8'));
 const fragment = (name, text) => ({ name, text });
+
+const markdown = new MarkdownIt();
+const sha256 = (text) => createHash('sha256').update(text).digest('hex');
+
+// Parse the entire body, including reference links, images and nested inline tokens.
+function brokenLinks(file, text, repo = root) {
+  const failures = [];
+  function visit(tokens) {
+    for (const token of tokens) {
+      const href = token.attrGet('href') ?? token.attrGet('src');
+      if (href && !/^(?:[a-z][a-z0-9+.-]*:|#|\/\/)/i.test(href)) {
+        const [path, anchor] = href.split('#');
+        const target = resolve(repo, dirname(file), decodeURIComponent(path));
+        if (relative(repo, target).startsWith('..') || !existsSync(target)) failures.push(`${file}: missing ${href}`);
+        else if (anchor && path.endsWith('.md') && (!statSync(target).isFile()
+          || !extractAnchors(readFileSync(target, 'utf8')).anchors.has(decodeURIComponent(anchor)))) {
+          failures.push(`${file}: missing anchor ${href}`);
+        }
+      }
+      if (token.children) visit(token.children);
+    }
+  }
+  visit(markdown.parse(text, {}));
+  return failures;
+}
+
+function requireBaseline(git, skip = process.env.TESTING_SPLIT_BASELINE_SKIP) {
+  try { git(); return true; }
+  catch (error) {
+    if (skip === '1') return false;
+    throw new Error(`Pinned commit ${baseline.sha} is unreachable; restore local history or set TESTING_SPLIT_BASELINE_SKIP=1.`, { cause: error });
+  }
+}
 
 describe('testing notes join', () => {
   it('sorts by code units across locales with exactly one blank line', () => {
@@ -31,6 +66,25 @@ describe('testing notes join', () => {
     const result = joinTestingNotes([fragment('a.md', '## One\n### Same\n'), fragment('b.md', '## Two\n### Same\n')]);
     expect(result.warnings).toEqual([expect.stringMatching(/duplicate.*same.*a.md.*b.md/i)]);
     expect(result.text).toContain('## Two');
+  });
+
+  it('reports repeated subheadings within one fragment', () => {
+    expect(joinTestingNotes([fragment('a.md', '## One\n### Same\n### Same\n')]).warnings)
+      .toEqual([expect.stringMatching(/duplicate.*same.*a.md.*a.md/i)]);
+  });
+
+  it('checks relative links and markdown anchors throughout every fragment body', () => {
+    const directory = 'docs/agent/testing.d';
+    const failures = readdirSync(resolve(root, directory)).filter((name) => name.endsWith('.md'))
+      .flatMap((name) => brokenLinks(`${directory}/${name}`, readFileSync(resolve(root, directory, name), 'utf8')));
+    expect(failures).toEqual([]);
+  });
+
+  it('reports a synthetic broken body link, reference link and missing anchor', () => {
+    const text = '## Synthetic\n\n[broken](missing.md)\n\n[reference][bad]\n\n[bad]: absent.md\n\n[anchor](../testing.md#absent-anchor)';
+    expect(brokenLinks('docs/agent/testing.d/synthetic.md', text)).toEqual([
+      expect.stringContaining('missing.md'), expect.stringContaining('absent.md'), expect.stringContaining('absent-anchor'),
+    ]);
   });
 
   it('accepts a new fragment at a stable position and ignores README, non-md and nested files', () => {
@@ -64,25 +118,30 @@ describe('testing notes join', () => {
     for (const warning of joined.warnings) expect(result.stderr).toContain(warning);
   });
 
-  it('losslessly preserves every original section against the pinned commit', (context) => {
-    try { execFileSync('git', ['cat-file', '-e', baseline.sha + '^{commit}'], { cwd: root, stdio: 'pipe' }); }
-    catch (error) {
-      const shallow = execFileSync('git', ['rev-parse', '--is-shallow-repository'], { cwd: root, encoding: 'utf8' }).trim() === 'true';
-      if (!shallow || !/Not a valid object name|Not a valid object|bad object/i.test(String(error.stderr))) throw error;
-      context.skip(`Pinned commit ${baseline.sha} is unreachable (shallow clone); fetch history to verify losslessness.`);
-      return;
-    }
-    const original = execFileSync('git', ['show', baseline.sha + ':docs/agent/testing.md'], { cwd: root, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
-    expect(createHash('sha256').update(original).digest('hex')).toBe(baseline.sha256);
-    expect(original.split('\n').length - Number(original.endsWith('\n'))).toBe(baseline.lineCount);
-    const body = original.replace(/^# [^\n]*\n+/, '').replace(/^> Authors:[^\n]*\n\n/gm, '');
-    const sections = body.split(/(?=^## )/m).filter(Boolean);
+  it('fails closed for an unreachable baseline unless the explicit override is 1', () => {
+    const missing = () => { throw new Error('missing commit'); };
+    expect(() => requireBaseline(missing, '')).toThrow(/TESTING_SPLIT_BASELINE_SKIP=1/);
+    expect(() => requireBaseline(missing, 'true')).toThrow(/unreachable/);
+    expect(requireBaseline(missing, '1')).toBe(false);
+    expect(requireBaseline(() => {}, '')).toBe(true);
+  });
+
+  it('losslessly preserves every original section from fragment bytes without git', () => {
     const directory = resolve(root, 'docs/agent/testing.d');
-    const files = readdirSync(resolve(root, 'docs/agent/testing.d')).filter((name) => /^\d{3}-/.test(name)).sort();
-    expect(files).toHaveLength(sections.length);
-    files.forEach((name, i) => expect(readFileSync(resolve(directory, name), 'utf8')).toBe(sections[i]));
-    expect(joinTestingNotes(files.map((name) => fragment(name, readFileSync(resolve(directory, name), 'utf8')))).text)
-      .toBe(sections.map((text) => text.replace(/\n+$/g, '')).join('\n\n') + '\n');
+    const files = readdirSync(directory).filter((name) => /^\d{3}-/.test(name)).sort();
+    expect(files).toEqual(baseline.sections.map(({ file }) => file));
+    const restored = baseline.sections.map(({ file, sha256: expected, links }) => {
+      let text = readFileSync(resolve(directory, file), 'utf8');
+      // Only URL relocation is allowed; all other original bytes remain pinned.
+      for (const { original, relocated } of links) text = text.replaceAll(`](${relocated})`, `](${original})`);
+      expect(sha256(text), file).toBe(expected);
+      return fragment(file, text);
+    });
+    expect(sha256(joinTestingNotes(restored).text)).toBe(baseline.bodySha256);
     expect(readTestingNotes(root).text).toContain('## Red-main timeout policy');
+  });
+
+  it('requires the pinned commit unless the explicit baseline override is set', () => {
+    requireBaseline(() => execFileSync('git', ['cat-file', '-e', baseline.sha + '^{commit}'], { cwd: root, stdio: 'pipe' }));
   });
 });

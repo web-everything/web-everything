@@ -34,6 +34,6 @@ Merge-path checklist answers (this slice observes seat selection and has no gate
 | 12 Exemptions | Unknown lenses, case variants and kind/lens mismatches refuse; required cross-vendor seats cannot be disabled by policy. On-mode logging refuses. Named tests cover these paths. |
 | 13 Liveness | No agent process is launched and no verdict is recorded by the observer; thrown-draw tests preserve the completed run. |
 | 14 Simplicity | One stateless append hook and one append-only sidecar; no retry machinery, markers or second scorecard rewrite. Byte comparisons and one-line-per-run assertions enforce the boundary. |
-- [Testing topic notes and authoring guidance](testing/README.md)
+- [Testing topic notes and authoring guidance](README.md)
 
 

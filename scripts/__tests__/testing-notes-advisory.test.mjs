@@ -4,13 +4,19 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readTestingNotes } from '../lib/testing-notes-join.mjs';
 import { testingNotesAdvisory, scanTestingNotesAdvisory, TESTING_GUIDE } from '../lib/testing-notes-advisory.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const { extractAnchors } = createRequire(import.meta.url)('../lib/rules-loader.cjs');
 const base = 'a'.repeat(40);
 const added = '@@ -1,0 +2 @@\n+new note\n';
+
+function legacyAnchorResolves(anchor, redirects, guide = readFileSync(resolve(root, TESTING_GUIDE), 'utf8')) {
+  if (extractAnchors(guide).anchors.has(anchor)) return true;
+  const target = redirects[anchor];
+  return typeof target === 'string' && target.startsWith('docs/agent/testing.d/')
+    && extractAnchors(readFileSync(resolve(root, target), 'utf8')).anchors.has(anchor);
+}
 
 describe('testing notes advisory', () => {
   it('warns for added lines in the legacy guide, with the per-topic destination', () => {
@@ -61,7 +67,8 @@ describe('testing documentation links', () => {
     const baseline = JSON.parse(readFileSync(resolve(root, 'scripts/__tests__/fixtures/testing-notes-main-links.json'), 'utf8'));
     expect(baseline.commit).toMatch(/^[a-f0-9]{40}$/);
     expect(baseline.references.length).toBeGreaterThan(0);
-    const currentAnchors = extractAnchors(readTestingNotes(root).text).anchors;
+    const redirects = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/legacy-anchor-map.json'), 'utf8'));
+    for (const anchor of Object.keys(redirects)) expect(legacyAnchorResolves(anchor, redirects), anchor).toBe(true);
     const files = ['AGENTS.md', ...readdirSync(resolve(root, 'docs/agent'))
       .filter((name) => name.endsWith('.md')).map((name) => `docs/agent/${name}`)];
     const sources = files.map((file) => [file, readFileSync(resolve(root, file), 'utf8')]);
@@ -82,11 +89,18 @@ describe('testing documentation links', () => {
       for (const match of text.matchAll(/\]\(([^\s)]*testing\.md)#([^\s)]+)\)/g)) {
         if (resolve(root, dirname(file), match[1]) !== resolve(root, TESTING_GUIDE)) continue;
         const anchor = decodeURIComponent(match[2]);
-        expect(currentAnchors.has(anchor), `${file}: ${match[0]}`).toBe(true);
+        expect(legacyAnchorResolves(anchor, redirects), `${file}: ${match[0]}`).toBe(true);
         checked++;
       }
     }
     expect(checked).toBeGreaterThan(0);
+  });
+
+  it('rejects unmapped legacy anchors and redirects whose target lacks the anchor', () => {
+    expect(legacyAnchorResolves('unmapped-anchor', {})).toBe(false);
+    expect(legacyAnchorResolves('unmapped-anchor', { 'unmapped-anchor': TESTING_GUIDE })).toBe(false);
+    expect(legacyAnchorResolves('unmapped-anchor', { 'unmapped-anchor': 'docs/agent/testing.d/README.md' })).toBe(false);
+    expect(legacyAnchorResolves('retained', {}, '# Guide\n## Retained\n')).toBe(true);
   });
 
   it('keeps the static directory link valid and each topic headed and named consistently', () => {

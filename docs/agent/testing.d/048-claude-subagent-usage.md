@@ -121,7 +121,7 @@ in `scripts/__tests__/verify-lane.test.mjs` exercises that worker lifetime bound
 
 ### Daemon worker risk routing
 
-For the [daemon model rule](platform-decisions.md#daemon-claude-worker-risk), exercise
+For the [daemon model rule](../platform-decisions.md#daemon-claude-worker-risk), exercise
 card loading through `readTick` and spawn argv: a pure router test cannot catch
 `findItem` dropping frontmatter risk. Review daemon fixtures must inject both
 `readPrs` and `readAgents` to exercise its shared PR snapshot; that snapshot carries

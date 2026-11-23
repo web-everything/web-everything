@@ -201,10 +201,10 @@ Establish an ordinary child CLI baseline before attributing failure to isolation
 at `sandbox_apply`; neither result tested doctrine exclusion. Parent-shell edits do not prove child
 agent tools work. Deleting a tracked doctrine file also leaves it recoverable via `git show HEAD:AGENTS.md`,
 which the same probe observed: distinguish automatic context exclusion from enforced read denial.
-See [the commands and output](../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-10--tool-bearing-doctrine-isolation-attempted-2026-09-10).
+See [the commands and output](../../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-10--tool-bearing-doctrine-isolation-attempted-2026-09-10).
 
 The dispatching session subsequently supplied successful unsandboxed baseline/deletion/tool-bearing
-runs ([Probe 11](../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-11--dispatching-sessions-unsandboxed-deletion-proof-2026-09-10)).
+runs ([Probe 11](../../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-11--dispatching-sessions-unsandboxed-deletion-proof-2026-09-10)).
 Attribute that evidence to its actual observer; do not repeat nested probes already blocked by Seatbelt
 or describe supplied observations as locally reproduced. Root AGENTS.md deletion before child startup
 prevents its automatic loading in that setup; it does not erase Git history or other instruction sources.

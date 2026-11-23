@@ -81,7 +81,7 @@ Cleanup attempts both the private report and the scratch clone before rejecting 
 It emits one cleanup needs-you event and alert, including both reasons if both removals fail,
 and retains the original registration and pending swap. The report/scratch/both cleanup cases
 in `daemon-rebuild-auto-rebase.test.mjs` pin those guarantees.
-The existing [test-selection fallback and durable evidence](../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
+The existing [test-selection fallback and durable evidence](../../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs) cases cover overlay tests, reverse imports, skipped empty runners and exact audit refusal.
 Report and scratch cleanup are both attempted. A cleanup pass emits one needs-you incident containing
 each removal failure; scratch cleanup failure still rejects the worker, while report-only failure remains
 best-effort. The cleanup regression covers report-only, scratch-only and simultaneous failures.

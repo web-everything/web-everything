@@ -12,7 +12,10 @@ export function joinTestingNotes(fragments) {
     if (typeof text !== 'string' || !/^## .+\n/.test(text)) {
       throw new Error(`${name}: expected leading ## heading; repair the fragment before joining.`);
     }
-    for (const anchor of extractAnchors(text).anchors) {
+    const { anchors: exposed, headings } = extractAnchors(text);
+    const headingAnchors = headings.map(({ anchor }) => anchor);
+    // Keep repeated headings; the exposed-anchor Set also covers non-heading IDs.
+    for (const anchor of [...headingAnchors, ...[...exposed].filter((id) => !headingAnchors.includes(id))]) {
       if (anchors.has(anchor)) warnings.push(`Duplicate anchor ${anchor}: ${anchors.get(anchor)} and ${name}; give headings distinct anchors.`);
       anchors.set(anchor, name);
     }
