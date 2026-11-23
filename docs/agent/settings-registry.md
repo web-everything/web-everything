@@ -17,7 +17,7 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 ## Summary
 
 - Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 624 (platform copies counted separately).
+- Declared leaves: 626 (platform copies counted separately).
 - Instant top-level keys: 0; not instant: 164.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
@@ -64,7 +64,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | allowedKinds | scripts/settings/agy-build.json | 1 | ["doc-fix"] | env | no | Doc-fix only; test-fix refused until #8606 regardless of settings. Production confinement unavailable; repair size 1. |
 | allowedSigners | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Trusted card-ledger signers. |
 | archive | scripts/settings/archive-retention.json | 1 | {"runsBatchCap":5000} | pr | no | Archive retention and bounded archive batch policy. |
-| audit | scripts/settings/codex-audit.json | 10 | {"verdict":{"mode":"model"},"preExisting":{"mode":"block","… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
+| audit | scripts/settings/codex-audit.json | 12 | {"debounce":{"minutes":5},"delta":{"maxFiles":0},"verdict":… | pr | no | Audit verdict, pre-existing finding and protected path policy. |
 | auditRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/audits.jsonl" | pr | no | Audit coordination record location. |
 | authority | scripts/settings/orchestrator-authority.json | 1 | {"redMainQuarantine":false} | pr | no | Repository grant for orchestrator red-main quarantine authority. |
 | autoRoundGrant | scripts/settings/review.json | 3 | {"cardOnly":{"enabled":true,"maxPerPr":3,"repos":["web-ever… | pr | no | Automatic bounded extra review rounds for eligible card-only work. |
