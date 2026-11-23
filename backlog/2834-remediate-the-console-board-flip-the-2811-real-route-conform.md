@@ -5,8 +5,9 @@ size: 8
 parent: "2804"
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
-blockedBy: []
+maturityTrigger: "adoptionSignal: #2811 is unparked; remediation depends on the final route and tokens."
+dateParked: "2026-11-22"
+blockedBy: ["2811"]
 scope:
   - "plateau-app:src/backlog-view/lane-board.ts"
   - "plateau-app:src/backlog-view/lane-board.css"
@@ -55,3 +56,5 @@ board is actually fixed. WE validates; plateau-app renders (MEMORY #6 preserved)
   (`plateau-app:tests/visual/real-route-fidelity.spec.ts`) goes GREEN.
 - Full plateau-app `npm test` stays green; `we:` `check:standards` passes.
 - Delivered via a plateau-app PR left OPEN for the orchestrator's independent review of the red→green proof.
+
+Ruled PARK in the master plan (2026-11-22); blockedBy #2811 added so it re-enters readiness when #2811 resolves. Left parked rather than reopened: no declared operation moves a parked card to open, and #2811 is itself parked. Unpark when: #2811 is unparked.

@@ -5,7 +5,8 @@ size: 8
 parent: "2445"
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
+maturityTrigger: "adoptionSignal: the #3119 split is done and plan step DZ-SETTINGS exists."
+dateParked: "2026-11-22"
 priority: low
 dateOpened: "2026-07-12"
 tags: []
@@ -69,3 +70,5 @@ surface at all (model). A single "make it all platform config" story would eithe
 gating self-gating question or skip it and under-deliver — exactly the buried-fork failure mode item 4
 exists to prevent. This needs to be split before it can be prepared to build-ready; see the follow-up item
 filed for the recommended slice breakdown.
+
+Parked 2026-11-22 (plateau ruling, master plan; premise stale per its own prep note). Unpark when: the #3119 split is done and plan step DZ-SETTINGS exists. Parked, not blockedBy, because the trigger is partly a plan step.

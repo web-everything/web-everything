@@ -37,3 +37,5 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — n/a: this follow-up opens no new case of this class.
 6. **State over time** — scroll and open happen once per page load, not per snapshot refresh.
 7. **Who wrote it** — n/a: this follow-up opens no new case of this class.
+
+Superseded by plan step PD1 (PL-WIP-CLEANUP, 2026-11-22). Unfinished acceptance carried to PD1: deep links apply only to the real snapshot, never to the fallback sample, as one PD1 acceptance case.

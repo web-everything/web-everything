@@ -289,3 +289,5 @@ merit, not prioritization.
 - **Review surface:** any brand-asset change regenerates `plateau:branding.html`
   (`npm run gen:branding`) — the standing before/after visual-check surface for branding edits.
 - **Ratify step:** the ratification of these forks lives here in #2209. The rollout work after ratification stays on #2255, which is kept open.
+
+Ratified 2026-11-22 (PL-BRAND-RATIFY): ratified in one sitting with #2249 and #2250; plan step DZ-BRAND-OK carries the sign-off.
