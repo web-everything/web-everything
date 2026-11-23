@@ -138,6 +138,17 @@ describe('defaultRearm child diagnostics', () => {
 });
 
 describe('planOrphanFixRound — the #4715 shapes', () => {
+  it.each([
+    ['not bounced', pr4715([], { labels: [] })],
+    ['human-cleared head', pr4715([
+      c('2026-10-10T15:22:00Z', buildVerdictComment({ to: 'clear-human', actor: 'operator', headSha: HEAD }), { login: 'chalbert' }),
+    ])],
+    ['no trusted changes verdict', pr4715([])],
+    ['no fix round since the latest verdict', pr4715([VERDICT])],
+  ])('marks %s as a stable none verdict', (_reason, pr) => {
+    expect(planOrphanFixRound({ pr, nowMs: NOW })).toMatchObject({ decision: 'none', stable: true });
+  });
+
   it('re-arms the live #4715 thread: findings addressed (evidence, head moved), round ended, never re-armed', () => {
     const p = planOrphanFixRound({ pr: pr4715([VERDICT, EVIDENCE, BEGIN, RESTACK, END]), nowMs: NOW });
     expect(p.decision).toBe('rearm');
@@ -164,7 +175,7 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
       c('2026-10-10T15:23:00Z', buildVerdictComment({ to: 'accepted', actor: 'reviewer', headSha: HEAD })),
     ]);
     expect(parseLatestHumanClearedSha(pr.comments)).toBeNull();
-    expect(planOrphanFixRound({ pr, nowMs: NOW })).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
+    expect(planOrphanFixRound({ pr, nowMs: NOW })).toEqual({ decision: 'none', reason: 'human-cleared head — final', stable: true });
   });
 
   it.each([
@@ -178,7 +189,7 @@ describe('planOrphanFixRound — the #4715 shapes', () => {
     ], { headRefOid: HEAD.toUpperCase() });
     const plan = planOrphanFixRound({ pr, nowMs: NOW });
     expect(plan.decision).toBe(decision);
-    if (decision === 'none') expect(plan).toEqual({ decision: 'none', reason: 'human-cleared head — final' });
+    if (decision === 'none') expect(plan).toEqual({ decision: 'none', reason: 'human-cleared head — final', stable: true });
   });
 
   it('re-dispatches a restack-only round that never addressed the review', () => {
@@ -429,6 +440,71 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     escalate: vi.fn(async () => ({ ok: true })),
     postComment: vi.fn(),
     ...over,
+  });
+
+  it('settles stable no-fix verdicts instead of deferring wrapped PRs forever', async () => {
+    const settled = new Map();
+    const readComments = vi.fn(async () => [VERDICT]);
+    const s = seams([], { settled, readComments, deadlineAt: 0, now: () => 0,
+      listBounced: () => [1, 2, 3, 4, 5].map(number => pr4715([], { number })) });
+    let cursor = null;
+    const deferred = [];
+    for (let pass = 0; pass < 6; pass++) {
+      const result = await runOrphanFixRoundPass({ ...s, cursor });
+      cursor = result.repoCursors;
+      deferred.push(result.deferred.length);
+      expect(result.newlySettled).toHaveLength(pass < 5 ? 1 : 0);
+      expect(result.settledSkipped).toHaveLength(Math.min(pass, 5));
+    }
+    expect(deferred).toEqual([4, 3, 2, 1, 0, 0]);
+    expect(readComments).toHaveBeenCalledTimes(5);
+  });
+
+  it.each(['head moved', 'TTL expired', 'missing head', 'future timestamp'])('re-reads settled evidence when %s', async reason => {
+    const settled = new Map([[`${repos[0].slug}#4715`, {
+      head: reason === 'head moved' ? 'other' : reason === 'missing head' ? undefined : HEAD,
+      at: reason === 'TTL expired' ? NOW - 6 * 60 * 60 * 1000 : reason === 'future timestamp' ? NOW + 1 : NOW,
+    }]]);
+    const readComments = vi.fn(async () => [VERDICT]);
+    const result = await runOrphanFixRoundPass(seams([], { settled, readComments }));
+    expect(readComments).toHaveBeenCalledOnce();
+    expect(result.settledSkipped).toEqual([]);
+    expect(result.newlySettled).toEqual([{ repo: repos[0].slug, pr: 4715 }]);
+    expect(settled.get(`${repos[0].slug}#4715`)).toEqual({ head: HEAD, at: NOW });
+  });
+
+  it('skips a cached same-head PR before budget deferral and all per-PR reads', async () => {
+    const settled = new Map([[`${repos[0].slug}#4715`, { head: HEAD, at: NOW - 9 }]]);
+    const s = seams([], { settled, settledTtlMs: 10, deadlineAt: 0, now: () => 0,
+      readComments: vi.fn(), isOwned: vi.fn() });
+    const result = await runOrphanFixRoundPass(s);
+    expect(result).toMatchObject({ handled: 0, deferred: [], newlySettled: [],
+      settledSkipped: [{ repo: repos[0].slug, pr: 4715 }] });
+    expect(s.isOwned).not.toHaveBeenCalled();
+    expect(s.readComments).not.toHaveBeenCalled();
+  });
+
+  it.each(['grace', 'owned', 'draft'])('never caches a non-stable %s none', async reason => {
+    const settled = new Map();
+    const s = seams([VERDICT, BEGIN, END], { settled,
+      nowMs: Date.parse(END.createdAt) + 1,
+      isOwned: async () => reason === 'owned',
+      listBounced: () => [pr4715([], { isDraft: reason === 'draft' })] });
+    const result = await runOrphanFixRoundPass(s);
+    expect(result.rows).toEqual([]);
+    expect(result.newlySettled).toEqual([]);
+    expect(settled.size).toBe(0);
+  });
+
+  it('never caches real orphans and keeps deferred orphans behind the redispatch cap', async () => {
+    const settled = new Map();
+    const s = seams([VERDICT, BEGIN, END], { settled,
+      listBounced: () => [1, 2].map(number => pr4715([], { number })) });
+    const result = await runOrphanFixRoundPass(s);
+    expect(result.deferred).toEqual([{ repo: repos[0].slug, pr: 2 }]);
+    expect(result.newlySettled).toEqual([]);
+    expect(settled.size).toBe(0);
+    expect(s.redispatch).toHaveBeenCalledOnce();
   });
 
   it('re-dispatches at most one orphan per pass and defers the rest with a cursor', async () => {

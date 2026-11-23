@@ -2155,7 +2155,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
         { kind: 'promote-draft', prNumber: 8, headRefOid: 'def', baseRefName: 'main' }] });
     });
     return { planner, dispatch, promote, checkStaleness, timeoutHold, readHeadCheckState, live,
-      options: { repos: ['we'], fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
+      options: { repos: ['we'], orphanSettled: new Map(), fixSettings: { skipEmptySteps: false, standDownAutoProceed: false },
         listBouncedPrs: () => [],
         authGateOverride: () => ({ paused: false, reason: null }), notesDryRun: true,
         now: () => elapsed,
@@ -2180,6 +2180,67 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
       } });
     expect(reconcile({ repo, allowStandDownAutoProceed: false }).dispatch).not.toContainEqual(expect.objectContaining({ prNumber: 7 }));
     expect(reconcile({ repo: otherRepo, allowStandDownAutoProceed: false }).dispatch).toContainEqual(expect.objectContaining({ prNumber: 7 }));
+  });
+
+  it('retains settled verdicts across daemon passes while deferred holds drain', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockReturnValue({ dispatched: [], refusals: [] });
+    const orphanSettled = new Map();
+    const options = { ...f.options, orphanSettled, now: () => 0, budgetRotation: {}, prCursors: {},
+      passBudgets: resolveFixPassBudgets({ env: {}, file: { fixPassBudget: { orphanGuardMs: 1000 } } }),
+      orphanGuardTick: options => orphanFixRound.runOrphanFixRoundPass({ ...options, deadlineAt: 0,
+        listBounced: () => [1, 2, 3, 4, 5].map(number => ({ number, labels: ['review:changes'], headRefOid: 'abc' })),
+        readComments: async () => [], isOwned: async () => false }),
+    };
+    const counts = [];
+    for (let pass = 0; pass < 5; pass++) {
+      const result = await realRunTickAllRepos(options);
+      counts.push(result.refusals.filter(row => row.kind === 'orphan-guard-deferred').length);
+    }
+    expect(counts).toEqual([4, 3, 2, 1, 0]);
+    expect(orphanSettled.size).toBe(5);
+  });
+
+  it.each(['we', CONSTELLATION_REPOS.we.slug])('invalidates settled cache on ordinary fix dispatch with repo %s', async repo => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    const key = `${CONSTELLATION_REPOS.we.slug}#7`;
+    const otherKey = `${CONSTELLATION_REPOS.frontierui.slug}#7`;
+    const orphanSettled = new Map([[key, { head: 'abc', at: 0 }], [otherKey, { head: 'abc', at: 0 }]]);
+    vi.spyOn(fixDispatch, 'runReconcileFixDispatch').mockReturnValue({ dispatched: [{ pr: 7 }], refusals: [] });
+    const tick = vi.fn(async options => {
+      expect(options.settled).toBe(orphanSettled);
+      [...options.repos];
+      return { rows: [], newlySettled: [], settledSkipped: [{ repo: CONSTELLATION_REPOS.we.slug, pr: 7 }] };
+    });
+    await realRunTickAllRepos({ ...f.options, repos: [repo], orphanSettled,
+      budgetRotation: {}, prCursors: {}, orphanGuardTick: tick });
+    expect(tick).toHaveBeenCalledOnce();
+    expect(orphanSettled.has(key)).toBe(false);
+    expect(orphanSettled.has(otherKey)).toBe(true);
+  });
+
+  it('invalidates a settled entry for a non-none guard row even when the action failed', async () => {
+    const f = productionFixture();
+    vi.spyOn(rulingStandDown, 'runRulingResolvesStandDownPass').mockResolvedValue({ rows: [] });
+    const repo = CONSTELLATION_REPOS.we.slug;
+    const orphanSettled = new Map([[`${repo}#7`, { head: 'abc', at: 0 }]]);
+    await realRunTickAllRepos({ ...f.options, orphanSettled, budgetRotation: {}, prCursors: {},
+      orphanGuardTick: async options => {
+        [...options.repos];
+        return { rows: [{ repo, pr: 7, decision: 'error', result: 'error: unreadable' }] };
+      } });
+    expect(orphanSettled.size).toBe(0);
+  });
+
+  it('logs new and cached settled counts once per pass', () => {
+    const log = { error: vi.fn() };
+    buildCliDaemonEffects({ owner: 'fixture', log }).onTick({
+      stuckFixers: { rows: [], orphanRounds: { newlySettled: [{ pr: 1 }], settledSkipped: [{ pr: 2 }, { pr: 3 }] } },
+    });
+    expect(log.error.mock.calls.filter(([line]) => line.startsWith('orphan-guard:')))
+      .toEqual([['orphan-guard: settled 1 PR(s) (skipped 2 cached)']]);
   });
 
   it('orphan-guard stops between PRs at its deadline and resumes from its PR cursor next pass', async () => {

@@ -1062,6 +1062,8 @@ export async function saveFixPassCursors({ path, rotation, prCursors, write = wr
 
 // Load once for the daemon defaults; injected state stays independent.
 const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
+// Process-local settled verdicts survive ticks; restarts deliberately re-read live evidence.
+const orphanSettled = new Map();
 
 const gitCommandWords = new Set('fetch push rebase merge status rev-parse log diff worktree checkout reset ls-remote show-ref merge-base branch cherry-pick'.split(' '));
 
@@ -1165,6 +1167,7 @@ export async function runTickAllRepos({
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
+  orphanSettled: settled = orphanSettled,
   // Optional path/write IO for hermetic persistence probes; state ownership stays with the defaults.
   cursorPersistence = {},
   adoptYieldProbe,
@@ -1422,7 +1425,7 @@ export async function runTickAllRepos({
       const result = await orphanGuardTick({ env: process.env, nowMs: now(),
       deadlineAt: phaseStarts['orphan-guard'] + budgets['orphan-guard'].budgetMs,
       ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}),
-      now, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
+      now, settled, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
@@ -1438,6 +1441,9 @@ export async function runTickAllRepos({
       else for (const row of result.rows) {
         const key = row?.repo && repoKeyForSlug(row.repo);
         if (!key) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; break; }
+        if (row.decision !== 'none' && Number.isInteger(row.pr)) {
+          settled.delete(`${CONSTELLATION_REPOS[key].slug}#${row.pr}`);
+        }
         const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
         if (!Object.hasOwn(success, row.decision)
           || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
@@ -1513,6 +1519,10 @@ export async function runTickAllRepos({
         why: 'orphan-cap guard did not settle this PR; fix deferred until next pass',
       });
     }
+  }
+  for (const row of fix.dispatched ?? []) {
+    const key = repoKeyForSlug(row.repo);
+    if (key) settled.delete(`${CONSTELLATION_REPOS[key].slug}#${row.pr ?? row.prNumber}`);
   }
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
@@ -1875,6 +1885,8 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         log.error(`ruling-resolves-stand-down: setting=${setting} (source: ${settingSource})`);
         for (const row of rows) log.error(`ruling-resolves-stand-down: ${row.repo}#${row.pr} ${row.action} stand-down=${row.standDownId ?? '?'}${row.why ? ` — ${row.why}` : ''}`);
       }
+      const orphan = stuckFixers?.orphanRounds;
+      log.error(`orphan-guard: settled ${orphan?.newlySettled?.length ?? 0} PR(s) (skipped ${orphan?.settledSkipped?.length ?? 0} cached)`);
       // card xiqtf7w — one line per supersede hold planned or posted.
       for (const line of formatSupersedeLines(supersede)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.
