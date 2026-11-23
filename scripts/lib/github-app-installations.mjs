@@ -86,31 +86,78 @@ export function ownerFromRemoteUrl(url) {
 }
 
 /**
- * The repo owner a `gh` invocation targets, from its argv: `--repo X/Y`, `--repo=X/Y`, `-R X/Y`, `-RX/Y`, or an
- * `api repos/X/Y/...` path. `null` when the call names no repo (then the caller consults the checkout remote).
+ * Resolve explicit argv targets. null means no target; false means GraphQL target fields
+ * were supplied but cannot safely identify an owner (callers must refuse ambient auth).
+ * Self-contained because the gh shim embeds this function via toString().
  * @param {string[]} argv
  */
 export function ownerFromGhArgv(argv) {
   const args = Array.isArray(argv) ? argv.map(String) : [];
-  for (let i = 0; i < args.length; i += 1) {
+  // Preserve the existing non-api repo selector behavior.
+  if (args[0] !== 'api') {
+    for (let i = 0; i < args.length; i += 1) {
+      const a = args[i];
+      const v = a === '--repo' || a === '-R' ? args[i + 1]
+        : a.startsWith('--repo=') ? a.slice(7)
+          : a.startsWith('-R') ? a.slice(2) : null;
+      if (v) return ownerOfSlug(v.split('/').slice(-2).join('/'));
+    }
+    return null;
+  }
+  const takesValue = new Set(['header', 'method', 'raw-field', 'field', 'input', 'jq', 'template', 'cache', 'hostname', 'repo', 'preview']);
+  const shorts = { H: 'header', X: 'method', f: 'raw-field', F: 'field', q: 'jq', t: 'template', R: 'repo', p: 'preview' };
+  let endpoint;
+  let repoSelector;
+  let owner;
+  let name;
+  let repo;
+  let hasTarget = false;
+  let invalid = false;
+  const consume = (option, value) => {
+    if (option === 'repo' && repoSelector === undefined) repoSelector = value;
+    if (option !== 'field' && option !== 'raw-field') return;
+    // Only actual field keys count, never substrings inside queries or other values.
+    const match = /^(owner|name|repo)(?:=([\s\S]*))?$/.exec(value || '');
+    if (!match) return;
+    hasTarget = true;
+    const key = match[1];
+    const v = match[2];
+    const valid = key === 'owner' ? /^[A-Za-z0-9][A-Za-z0-9-]*(?![\s\S])/ : /^[A-Za-z0-9._-]+(?![\s\S])/;
+    if (v === undefined || !valid.test(v)) { invalid = true; return; }
+    const previous = key === 'owner' ? owner : key === 'name' ? name : repo;
+    if (previous !== undefined && previous !== v) invalid = true;
+    if (key === 'owner') owner = v;
+    else if (key === 'name') name = v;
+    else repo = v;
+  };
+  let positionalOnly = false;
+  for (let i = 1; i < args.length; i += 1) {
     const a = args[i];
-    let v = null;
-    if (a === '--repo' || a === '-R') v = args[i + 1];
-    else if (a.startsWith('--repo=')) v = a.slice(7);
-    else if (a.startsWith('-R') && a.length > 2) v = a.slice(2);
-    if (v) {
-      // `HOST/OWNER/REPO` form: take the last two segments.
-      const parts = v.split('/');
-      return ownerOfSlug(parts.slice(-2).join('/'));
+    if (!positionalOnly && a === '--') { positionalOnly = true; continue; }
+    if (!positionalOnly && a.startsWith('--')) {
+      const equals = a.indexOf('=');
+      const option = a.slice(2, equals < 0 ? undefined : equals);
+      if (takesValue.has(option)) consume(option, equals < 0 ? args[++i] : a.slice(equals + 1));
+      continue;
     }
-  }
-  if (args[0] === 'api') {
-    for (const a of args.slice(1)) {
-      const m = /^\/?repos\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/.exec(a);
-      if (m) return canonicalOwner(m[1], m[2]);
+    if (!positionalOnly && a.startsWith('-') && a.length > 1) {
+      for (let j = 1; j < a.length; j += 1) {
+        const option = shorts[a[j]];
+        if (!option) continue; // Boolean switches may precede a value-taking short option.
+        consume(option, j + 1 < a.length ? a.slice(j + 1) : args[++i]);
+        break;
+      }
+      continue;
     }
+    if (endpoint === undefined) endpoint = a;
   }
-  return null;
+  if (endpoint === 'graphql' && hasTarget) {
+    if (invalid || !owner || (!name && !repo) || (name && repo && name !== repo)) return false;
+    return canonicalOwner(owner, name || repo);
+  }
+  if (repoSelector) return ownerOfSlug(repoSelector.split('/').slice(-2).join('/'));
+  const m = /^\/?repos\/([A-Za-z0-9][A-Za-z0-9-]*)\/([A-Za-z0-9._-]+)/.exec(endpoint || '');
+  return m ? canonicalOwner(m[1], m[2]) : null;
 }
 
 /** Per-installation token cache path, derived from the legacy single-cache path: `x.json` -> `x.<id>.json`. */
