@@ -1,0 +1,6 @@
+{
+  "description": "Retention and log compaction bounds for reviewed heads.",
+  "owner": "scripts/settings/review-head-index.json",
+  "changeVia": "pr",
+  "instant": false
+}

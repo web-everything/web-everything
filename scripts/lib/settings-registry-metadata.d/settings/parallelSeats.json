@@ -1,0 +1,6 @@
+{
+  "description": "Enable parallel review seats.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

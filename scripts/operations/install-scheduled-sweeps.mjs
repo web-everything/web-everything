@@ -2,6 +2,7 @@
 /**
  * Card 106 — install command for the scheduled sweeps. DEFAULT OFF: with no flag it only prints the plan.
  *   --apply  writes the selected plists (--pass=<name> selects one) into ~/Library/LaunchAgents (never overwrites an existing file).
+ *   --pass=agy-usage-reader selects the half-hour agy usage reader.
  * It NEVER runs launchctl; it prints the `launchctl bootstrap` lines for the operator to run (or not).
  * The write loop lives in `applyInstallPlan` (scheduled-sweep.mjs) so those guarantees are unit-tested.
  */

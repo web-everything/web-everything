@@ -129,7 +129,7 @@ describe('codex-audit runner output', () => {
     { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
       stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
     { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
-      stderr: 'UNPARSEABLE audit: incomplete or failed evidence; retry or request human review of the full diff.\n' },
+      stderr: 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
       stderr: 'Audit record write failed; repair the record path and retry.\n' },
     { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
@@ -620,6 +620,8 @@ describe('#3036 read-only is a property of the DECLARING MODULE — the part tha
     'operator-override-set': 'operator-override.mjs',
     'operator-override-clear': 'operator-override.mjs',
     'ruled-weakened-add': 'ruled-weakened-add.mjs',
+    // Writes: resolves a generated-file merge conflict in a worktree by regenerating it; listed for module-map coverage only.
+    'resolve-generated': 'resolve-generated.mjs',
     'delivery-capacity-hold': 'delivery-capacity-override.mjs',
     'delivery-capacity-pin': 'delivery-capacity-override.mjs',
     'delivery-capacity-clear': 'delivery-capacity-override.mjs',

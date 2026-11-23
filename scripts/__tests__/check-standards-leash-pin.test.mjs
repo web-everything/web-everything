@@ -29,6 +29,10 @@ describe('checkLeashPin — the live tree', () => {
   it('pins the review-policy contract — the file that owns #2838\'s landMode flip', () => {
     expect(LEASH_PIN_SNAPSHOT).toContain('review-policy.contract.json');
   });
+  it('pins both checklist conformance contracts so dropping either from the human gate is caught', () => {
+    expect(LEASH_PIN_SNAPSHOT).toContain('seat-assessment.test.mjs');
+    expect(LEASH_PIN_SNAPSHOT).toContain('seat-ac-rubric.test.mjs');
+  });
 });
 
 describe('checkLeashPin — every way to DROP a leash file from the human gate goes red', () => {

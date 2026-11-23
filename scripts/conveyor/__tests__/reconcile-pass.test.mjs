@@ -70,6 +70,48 @@ it('R123 wires the automatic answer before main-red enrichment and terminal refu
   expect(plan.refusals.some(r => r.kind === 'stood-down')).toBe(false);
 });
 
+it('orphan exclusions retain an unanswered stand-down without reading or writing it while another PR auto-proceeds', async () => {
+  const { runReconcilePass } = await import('../reconcile-pass.mjs');
+  const { enrichPrsWithStandDownAutoProceed } = await import('../stand-down-auto-proceed-io.mjs');
+  const { buildStandDownComment } = await import('../stand-down.mjs');
+  const head = 'a'.repeat(40), author = { login: 'web-everything' };
+  const snapshots = [5195, 5196].map(number => ({ number, headRefOid: head,
+    headRefName: `lane/${number}`, baseRefName: 'main', labels: [], files: [], body: '',
+    statusCheckRollup: [{ name: 'test', conclusion: 'CANCELLED', status: 'COMPLETED' }],
+    comments: [{ id: `SD${number}`, author, createdAt: '2026-10-13T22:55:00Z',
+      body: buildStandDownComment({ reason: 'gate-red', head }) }] }));
+  const readComments = vi.fn(number => snapshots.find(pr => pr.number === number).comments);
+  const reserve = vi.fn(() => true);
+  const post = vi.fn(({ body }) => ({ author, body }));
+  let observed;
+  const plan = runReconcilePass({ ...xxOptions(), readPrs: () => snapshots,
+    allowStandDownAutoProceed: true, skipStandDownPrs: pr => pr.number === 5195,
+    readRequiredChecks: () => ({ checks: ['test'] }),
+    enrichStandDownAutoProceed: (prs, opts) => enrichPrsWithStandDownAutoProceed(prs, { ...opts,
+      selectCandidates: candidates => candidates, readBindings: () => [{ context: 'test', integration_id: 15368 }],
+      readComments, readHead: () => head, readContext: () => null, readScopedChecks: () => [],
+      readChecks: () => ({ head, complete: true, runs: [{ id: 1, name: 'test',
+        app: { id: 15368 }, check_suite: { id: 901 }, head_sha: head, status: 'completed',
+        conclusion: 'cancelled', completed_at: '2026-10-13T23:40:00Z' }] }),
+      reserve, post, log: () => {},
+    }),
+    enrichMainRed: prs => { observed = prs; return { prs, mainRedWindows: [] }; },
+    enrichEscalationBase: p => p, enrichReferralHolds: p => p, enrichLedgerHolds: p => p,
+    enrichReferralAutoResolve: p => p, enrichRulings: p => p, enrichScopeBloat: p => p,
+    enrichCodeQL: p => p, enrichOwedMainRule: () => {}, enrichStandingRulingGrants: p => p, env: {},
+  });
+  expect(readComments.mock.calls.map(([number]) => number)).toEqual([5196, 5196]);
+  expect(reserve).toHaveBeenCalledTimes(1);
+  expect(reserve).toHaveBeenCalledWith(expect.objectContaining({ number: 5196 }));
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(post).toHaveBeenCalledWith(expect.objectContaining({ number: 5196 }));
+  expect(observed.map(pr => pr.number)).toEqual([5195, 5196]);
+  expect(observed[0].comments).toBe(snapshots[0].comments);
+  expect(observed[1].comments).toHaveLength(2);
+  expect(plan.refusals).toContainEqual(expect.objectContaining({ kind: 'stood-down', prNumber: 5195 }));
+  expect(plan.refusals).not.toContainEqual(expect.objectContaining({ kind: 'stood-down', prNumber: 5196 }));
+});
+
 it.each([undefined, false, 'true', 1])('read-only reconcile and dry-run claim planning never invoke the R123 writer (%s)', async enabled => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const writer = vi.fn(prs => prs);

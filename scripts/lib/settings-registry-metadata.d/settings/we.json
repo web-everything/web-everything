@@ -1,0 +1,6 @@
+{
+  "description": "Known legacy duplicate card identities and their canonical numbers.",
+  "owner": "scripts/settings/card-ledger-legacy-identities.json",
+  "changeVia": "pr",
+  "instant": false
+}
