@@ -1,4 +1,4 @@
-# Historical change-evidence principals
+## Historical change-evidence principals
 
 The #7289 cases in `scripts/lib/__tests__/change-evidence-writer.test.mjs` and
 `scripts/lib/__tests__/change-evidence-sendbacks.test.mjs` pin automation and operator
