@@ -16,9 +16,9 @@ For repo defaults, edit the owner file through a PR and rebuild the consuming da
 
 ## Summary
 
-- Top-level keys: 164 (166 declaration rows).
-- Declared leaves: 627 (platform copies counted separately).
-- Instant top-level keys: 0; not instant: 164.
+- Top-level keys: 166 (168 declaration rows).
+- Declared leaves: 629 (platform copies counted separately).
+- Instant top-level keys: 0; not instant: 166.
 - Instant capacity leaves: 15.
 - Constants to settle: 312.
 - Instant gaps: 28.
@@ -110,6 +110,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | expectations | scripts/settings/expectations.json | 1 | [{"id":"ready-no-gate","after":["clear-human","ready-to-mer… | pr | no | Observe-only PR expectation triggers, deadlines and proposed responses; responses are recorded but never executed. |
 | expectedLocalReasons | scripts/settings/forge-share.json | 1 | ["command-not-allowed","needs-git"] | pr | no | Local execution reasons excluded from remote-share warnings. |
 | externalJurors | scripts/settings/review.json | 2 | {"firstOutputMs":120000,"cooldownMs":1800000} | pr | no | First-output timeout and cooldown for external review jurors. |
+| files | scripts/settings/real-process-test-baseline.json | 1 | ["bun-trial/scripts/__tests__/capability-search.test.mjs","… | pr | no | Warn-only migration baseline of unit test files that start node, git or gh subprocesses. |
 | fix | scripts/settings/fix-context-pack.json, scripts/settings/fix-safety.json, scripts/settings/fix.json | 18 | {"contextPack":true,"contextLines":30,"contextMaxBytes":800… | pr | no | Fix context, local verification, round limits and exception policy. |
 | fixDispatch | scripts/dispatch-settings.json, scripts/settings/fix-empty-steps.json | 8 | {"borrowBuildSlots":"on","borrowAfterMinutes":15,"borrowExe… | pr | no | Fix slot borrowing, parked-run accounting and completion release policy. |
 | fixDispatchMaxConcurrent | scripts/dispatch-settings.json | 1 | 2 | pr | no | Maximum concurrent fix dispatches. |
@@ -172,6 +173,7 @@ Operator-prefs layer: ~/.plateau/platform-preferences.json is the requested oper
 | quarantine | scripts/settings/card-ledger-trust.json | 1 | [] | pr | no | Quarantined card-ledger identities. |
 | raisedByMigrate | scripts/settings/raised-by-migrate.json | 1 | {"maxPrsPerRun":10} | pr | no | Maximum PRs attempted per raised-by migration apply run. |
 | readyRecordPath | scripts/settings/prototype-load.json | 1 | "~/workspace/.operations/coordination/fix-ready.jsonl" | pr | no | Fix readiness coordination record location. |
+| realTierFiles | scripts/settings/real-tier-manifest.json | 1 | ["scripts/__tests__/merge-ai-prs-listing-dedupe.real.test.m… | pr | no | Required non-empty inventory of real-process test files; each file must contain an unmocked subprocess call reachable from an active test. |
 | rebuildSmoke | scripts/settings/rebuild-smoke.json | 5 | {"reuseEnabled":true,"reuseHours":12,"bootSignalRetries":1,… | pr | no | Reuse of passing rebuild proofs and boot retry/concurrency bounds. |
 | rebuildSmokeDryRun | scripts/settings/rebuild-smoke.json | 3 | {"prSample":12,"snapshotStaleOkMs":900000,"lanePoolListCach… | pr | no | PR sample, snapshot age and lane list cache for dry-run smoke. |
 | rebuildSmokeReadMemo | scripts/settings/rebuild-smoke.json | 1 | {"enabled":true} | pr | no | Share identical read-only GitHub calls within a rebuild smoke. |

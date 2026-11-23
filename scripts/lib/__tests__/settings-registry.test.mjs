@@ -208,8 +208,16 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   assert.ok(md.includes('M-impact tail has not converged'));
 });
 
-// Immutable compact snapshot captured before the per-key migration (not regenerated).
-const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+// Reconstruct the monolithic layout from today's per-key metadata and declarations.
+function liveRepositoryFixture(t) {
+  const f = { ...fixture(t), meta: readMetadata({ root: ROOT }) };
+  rmSync(join(f.root, 'scripts/settings/feature.json'));
+  for (const row of buildRegistry().rows) for (const owner of row.owners) {
+    f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  }
+  f.write(META, f.meta);
+  return f;
+}
 function split(f) {
   for (const section of ['settings', 'capacityLeaves']) {
     for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
@@ -223,14 +231,21 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(readMetadata({ root: f.root }), original);
   assert.deepEqual(f.build(), before);
 });
-test('migration preserves the original registry plus the intentional shadow rotation description', t => {
-  const f = fixture(t);
-  rmSync(join(f.root, 'scripts/settings/feature.json'));
-  for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
-  const expectedMetadata = structuredClone(originalMetadata);
-  expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
-  f.write(META, expectedMetadata);
-  assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
+test('migration preserves the LIVE registry with all current per-key metadata', t => {
+  const f = liveRepositoryFixture(t), live = buildRegistry({ root: ROOT });
+  assert.deepEqual(live.problems, []);
+  assert.deepEqual(buildRegistry({ root: f.root }), live);
+  split(f);
+  assert.deepEqual(readMetadata({ root: f.root }), readMetadata({ root: ROOT }));
+  assert.deepEqual(buildRegistry({ root: f.root }), live);
+});
+test('live comparison detects drift in a per-key description', t => {
+  const f = liveRepositoryFixture(t);
+  split(f);
+  const path = `${META_DIR}/settings/providerRotation.json`;
+  const metadata = JSON.parse(readFileSync(join(f.root, path), 'utf8'));
+  f.write(path, { ...metadata, description: 'Stale provider rotation description.' });
+  assert.throws(() => assert.deepEqual(buildRegistry({ root: f.root }), buildRegistry({ root: ROOT })));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -344,11 +359,11 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('generated documentation matches the shadow rotation snapshot with per-key authoring instructions', () => {
+test('generated documentation hash matches the current LIVE registry', () => {
   const doc = readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8');
-  const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
-  const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes this PR's providerRotation defaults and description.
-  assert.equal(createHash('sha256').update(original).digest('hex'), '01518f0f4a3415bad06bd8e1bc3b78f4139ebcff384c4157c6c6bd551bc41e82');
+  const generated = renderMarkdown(buildRegistry({ root: ROOT }));
+  const hash = text => createHash('sha256').update(text).digest('hex');
+  assert.equal(hash(doc), hash(generated));
+  assert.notEqual(hash(doc + '\nStale inventory\n'), hash(generated));
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
