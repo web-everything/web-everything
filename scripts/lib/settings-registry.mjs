@@ -225,8 +225,10 @@ export function renderMarkdown(registry) {
 export function ensureRegistryDoc({ root = ROOT } = {}) {
   const content = renderMarkdown(buildRegistry({ root }));
   let existing;
-  try { existing = readFileSync(join(root, DOC), 'utf8'); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try {
+    if (!lstatSync(join(root, DOC)).isFile()) throw Error(`${DOC}: expected regular file (no symlinks)`);
+    existing = readFileSync(join(root, DOC), 'utf8');
+  } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (existing !== content) {
     mkdirSync(dirname(join(root, DOC)), { recursive: true });
     writeFileSync(join(root, DOC), content);
@@ -239,6 +241,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     const mode = process.argv.slice(2);
     if (mode.length !== 1 || !['--write', '--check'].includes(mode[0])) throw Error('usage: node scripts/lib/settings-registry.mjs --write | --check');
     if (mode[0] === '--write') ensureRegistryDoc({ root: ROOT });
-    else renderMarkdown(buildRegistry({ root: ROOT }));
+    else {
+      const content = renderMarkdown(buildRegistry({ root: ROOT }));
+      let existing;
+      try { existing = readFileSync(join(ROOT, DOC), 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (existing !== undefined && existing !== content) throw Error(`${DOC} is stale; run npm run settings:registry`);
+    }
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }

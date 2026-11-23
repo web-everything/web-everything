@@ -125,8 +125,8 @@ test('real repository metadata is complete and generated documentation matches t
   const identities = registry.toSettle.map(row => `${row.identifier}:${row.where.replace(/:\d+$/, '')}`);
   assert.equal(new Set(identities).size, identities.length, 'identifier+file pairs must be unique');
   assert.equal(registry.capacityRows.length, Object.keys(CAPACITY_LEAVES).length);
-  ensureRegistryDoc({ root: ROOT });
-  assert.equal(readFileSync(join(ROOT, 'docs/agent/settings-registry.md'), 'utf8'), renderMarkdown(registry));
+  assert.equal(execFileSync('git', ['ls-files', 'docs/agent/settings-registry.md'], { cwd: ROOT, encoding: 'utf8' }), '', 'generated doc must not be tracked');
+  assert.equal(ensureRegistryDoc({ root: ROOT }), renderMarkdown(registry));
 });
 test('top proposals allow zero or ten and refuse incomplete, oversized or non-boolean selections', t => {
   const f = fixture(t);
@@ -398,8 +398,9 @@ test('clean build creates a missing doc, repairs stale output and checks inputs 
   const content = ensureRegistryDoc({ root: f.root });
   assert.equal(readFileSync(join(f.root, DOC), 'utf8'), content);
   writeFileSync(join(f.root, DOC), 'stale');
-  assert.equal(checkFixture(f).status, 0);
+  assert.match(checkFixture(f).stderr, /is stale/);
   ensureRegistryDoc({ root: f.root });
+  assert.equal(checkFixture(f).status, 0);
   assert.equal(readFileSync(join(f.root, DOC), 'utf8'), content);
   f.write(`${META_DIR}/settings/beta.json`, {});
   const invalid = checkFixture(f);
