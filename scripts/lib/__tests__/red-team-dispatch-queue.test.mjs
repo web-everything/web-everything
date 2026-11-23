@@ -729,7 +729,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const why = 'later verdict or hold supersedes acceptance';
     skip(why); skip(why);
     expect(f.open().entries()[0]).toMatchObject({ blocked: 'planner-skip', blockedReason: why });
-    expect(f.logs.filter(line => line.includes(why))).toHaveLength(1);
+    expect(f.logs.filter(line => line.includes('blocked ') && line.includes(why))).toHaveLength(1);
     skip('PR reviews unreadable');
     expect(f.open().entries()[0].blockedReason).toBe('PR reviews unreadable');
     f.queue.admit(repo, 1);
@@ -766,7 +766,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     }
     expect(dispatchedPrs).toEqual([2]); // PR2 really dispatched on tick 2 despite capacity 1
     expect(numbers(f.queue.entries())).toEqual([1]);
-    expect(f.logs.some(line => line.includes('blocked') && line.includes(reason))).toBe(true);
+    expect(f.logs.some(line => line.includes('requeue') && line.includes(reason))).toBe(true);
   });
 
   it('stuck head skip-and-requeue after K attempts logs reason and lets the rest dispatch', async () => {

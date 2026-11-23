@@ -366,7 +366,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
             entries.splice(entries.indexOf(entry), 1);
             entry.attempts = 0;
             entries.push(entry);
-            changed(`requeue ${entry.key}${detail}`);
+            changed(`requeue ${entry.key}: ${failure.reason}`);
           } else changed(`hold ${entry.key}: attempt ${entry.attempts}/${limit}${detail}`);
         } else if (!row) remove(entry, 'absent from rows (not owed)');
       }
