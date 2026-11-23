@@ -936,6 +936,40 @@ describe('promotion verdict authorization audit', () => {
     disposition: 'carve-out', impactIfUnfixed: 'broken', introduced: false, worseThanBase: false, parallelizable: true,
     prevention: 'add regression coverage', preventionCaptured: false,
   }] } };
+  it.each([
+    ['accept', carbonClean, true],
+    ['changes', good, false],
+    ['prevention-outstanding', preventionCarbon, true],
+    // The judge schema does not authorize a juror to set the panel's human-required flag.
+    ['needs-human', { ...carbonClean, value: { ...carbonClean.value, humanRequired: true } }, true],
+  ])('ranged reads of every changed file enforce Carbon evidence admission for %s', async (verdict, carbon, fallback) => {
+    expect(deriveVerdict(carbon.value)).toBe(verdict);
+    const result = await attempt(carbon, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(true),
+    });
+    if (fallback) {
+      fellBack(result);
+      expect(result.rows[0]).toMatchObject({ fallback: true, agyVerdict: null });
+      if (verdict !== 'needs-human') expect(result.answer.seatProvider.fellBackFrom.reasons.join(' ')).toMatch(/read_file evidence/);
+    } else {
+      expect(result.calls).toEqual(['carbon']);
+      expect(deriveVerdict(result.answer)).toBe(verdict);
+    }
+  });
+  it('prevention-outstanding requires reads of every changed file, including uncited files', async () => {
+    fellBack(await attempt(preventionCarbon, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: readTrace(finding.file),
+    }));
+  });
+  it('prevention-outstanding counts with whole-file reads of every changed file at the reviewed head', async () => {
+    const result = await attempt(preventionCarbon, {
+      scope: [finding.file, 'scripts/second.mjs'], transcript: twoFileReads(),
+      claude: new Error('fallback must not run'),
+    });
+    expect(result.calls).toEqual(['carbon']);
+    expect(deriveVerdict(result.answer)).toBe('prevention-outstanding');
+    expect(result.rows[0]).toMatchObject({ fallback: false, agyVerdict: 'prevention-outstanding' });
+  });
   it.each([carbonClean, good, preventionCarbon, guardedCarbon])('valid Carbon verdict decides without invoking the fallback: %j', async carbon => {
     const result = await attempt(carbon, { claude: new Error('fallback must not run') });
     expect(result.calls).toEqual(['carbon']);

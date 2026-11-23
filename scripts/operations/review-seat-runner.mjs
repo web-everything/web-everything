@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { scopeFindingsToCitedFiles, deriveVerdict } from '../lib/jury-core.mjs';
+import { scopeFindingsToCitedFiles, deriveVerdict, VERDICTS } from '../lib/jury-core.mjs';
 import { isIndependentReviewSeat } from '../lib/review-seat-independence.mjs';
 import { resolveShadowPromoted, resolveShadowPromotionReplaces, resolveReviewSeatSafeguards, carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 /**
@@ -194,7 +194,8 @@ export async function runSeatWithProvider(request, {
         try { inspected = Boolean(agyRun.transcriptFile) && hasSuccessfulDiffRead(readTranscript(agyRun.transcriptFile), directive.citationScope, {
           checkoutRoot: agyRun.checkoutRoot ?? cwd,
           requiredFiles: directive.citationScope,
-          wholeFiles: deriveVerdict(agyRun.value) === 'accept',
+          // The loop can accept prevention-outstanding after filing guards, without another review.
+          wholeFiles: [VERDICTS.ACCEPT, VERDICTS.PREVENTION_OUTSTANDING].includes(deriveVerdict(agyRun.value)),
         }); } catch { /* unreadable evidence refuses */ }
         if (!inspected) reasons.push('Carbon lacks successful diff read_file evidence for its cited files');
       }
