@@ -9,7 +9,7 @@ const mergeHead = 'b'.repeat(40);
 const branch = `gh-readonly-queue/main/pr-${identity.pr}-${'c'.repeat(40)}`;
 const guard = { hold: true, line: `mq-same-head-failed: #42 head ${identity.head} — failed_checks` };
 const failureLog = 'FAIL tests/widget.test.mjs > keeps state\nAssertionError: expected true';
-function fixture(mode = 'real') {
+function fixture(mode = 'real', logText) {
   let state = {};
   const ledger = createMqFailureLedger({ io: { atomicUpdate(update) {
     const next = update(structuredClone(state)); state = structuredClone(next.state); return next.result;
@@ -56,6 +56,7 @@ function fixture(mode = 'real') {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
+      if (logText !== undefined) return logText;
       if (mode === 'coloured log') {
         if (!args.includes('--allow-escape-sequences')) throw new Error('unreadable');
         return '\x1b[31mFA\x1b[1mIL tests/widget.test.mjs > keeps state\x1b[0m\nAssertionError: expected true';
@@ -83,6 +84,18 @@ describe('drain MQ failure production adapter', () => {
     const route = parseMqFailureRoute({ comment: { body: comment[2].input, author: { login: 'chalbert' } }, expected: identity });
     expect(route).toMatchObject({ testFiles: ['tests/widget.test.mjs'], complete: true });
     expect(comment[2].input).not.toContain('\x1b');
+  });
+
+  it.each([']', 'P', '_', '^', 'X'])('does not route incomplete ESC %s control strings as failure evidence', async kind => {
+    const f = fixture('real', `\x1b${kind}hidden\n${failureLog}\x1b\\`);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
+  });
+
+  it.each(['P', '_', '^', 'X'])('does not route forged failure payload in ESC %s strings', async kind => {
+    const f = fixture('real', `\x1b${kind}FAIL tests/forged.test.mjs > t\x1b\\\n`);
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
+    expect(f.writes()).toEqual([]);
   });
 
   it('real failure derives the timeline removal and emits comment plus label once per head', async () => {

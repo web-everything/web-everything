@@ -1057,6 +1057,7 @@
   "scripts/lib/__tests__/drain-mq-failure-recovery.test.mjs": 0.03,
   "scripts/lib/__tests__/drain-mq-flake-reenqueue.test.mjs": 0.14,
   "scripts/lib/__tests__/drain-mq-flake-rerun.test.mjs": 0.05,
+  "scripts/lib/__tests__/drain-mq-log-escape-soak-guard.test.mjs": 0.1,
   "scripts/lib/__tests__/drain-mq-retry-aggregate-evidence.test.mjs": 0.07,
   "scripts/lib/__tests__/drain-mq-retry-aggregate-jobs.test.mjs": 0.21,
   "scripts/lib/__tests__/drain-mq-retry-freeze-ejection.test.mjs": 0.26,

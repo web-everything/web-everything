@@ -119,16 +119,17 @@ describe('MQ log authorization guard regressions', () => {
     expect(decision.reason).toMatch(/log evidence unreadable.*operator must inspect/);
   });
 
-  it('bounds the tail scan by UTF-8 bytes rather than JS character count', () => {
+  it('holds oversized UTF-8 logs regardless of signature position', () => {
     // More than 4 MiB in fewer than 4 Mi JS characters: a character-only bound
     // would incorrectly preserve the signature before the multibyte suffix.
     const suffix = 'é'.repeat(bytes / 2);
     const held = probe({ text: signature + suffix });
     expect(held.reads).toHaveLength(1);
     expect(held.decision.hold).toBe(true);
-    const accepted = probe({ text: suffix + '\n' + signature });
-    expect(accepted.decision.hold).toBe(false);
-    expect(accepted.reads[0].options.maxBuffer).toBe(bytes);
+    const oversized = probe({ text: suffix + '\n' + signature });
+    expect(oversized.decision.hold).toBe(true);
+    expect(oversized.decision.reason).toMatch(/unreadable or incomplete.*operator must inspect/);
+    expect(oversized.reads[0].options.maxBuffer).toBe(bytes);
   });
 
   it.each(['BEHIND', 'DIRTY', 'UNKNOWN', null])('matching infra logs cannot retry a PR whose merge state is %j', clean => {
@@ -172,14 +173,15 @@ describe('MQ signature cost and specificity bounds', () => {
   });
 
   it.each(['x'.repeat(64 * 1024), 'é'.repeat(32 * 1024)])(
-    'limits pattern scans to the last 64 KiB (suffix case %#)', suffix => {
+    'holds logs above the 64 KiB whole-log scan bound (suffix case %#)', suffix => {
       const held = probe({ text: signature + suffix });
       expect(held.reads).toHaveLength(1);
       expect(held.decision.hold).toBe(true);
-      expect(held.decision.reason).toContain('non-infrastructure');
-      const accepted = probe({ text: suffix + '\n' + signature });
-      expect(accepted.decision.hold).toBe(false);
-      expect(accepted.reads[0].options.maxBuffer).toBe(bytes);
+      expect(held.decision.reason).toMatch(/unreadable or incomplete.*operator must inspect/);
+      const oversized = probe({ text: suffix + '\n' + signature });
+      expect(oversized.decision.hold).toBe(true);
+      expect(oversized.decision.reason).toMatch(/unreadable or incomplete.*operator must inspect/);
+      expect(oversized.reads[0].options.maxBuffer).toBe(bytes);
     });
 });
 
@@ -264,12 +266,12 @@ describe('MQ signature audit bounds', () => {
     expect(probe({ text: 'unrelated failure\n' + signature }).decision.hold).toBe(false);
   });
 
-  it('truncates every line to its last 512 characters and holds for operator inspection without a match', () => {
+  it('holds oversized lines for operator inspection even when a signature matches their suffix', () => {
     const held = probe({ text: signature.trimEnd() + 'x'.repeat(512) + '\nunrelated failure\n' });
     expect(held.decision.hold).toBe(true);
     expect(held.decision.reason).toMatch(/non-infrastructure.*operator must inspect/);
-    expect(probe({ text: 'x'.repeat(4096) + signature }).decision.hold).toBe(false);
+    expect(probe({ text: 'x'.repeat(4096) + signature }).decision.hold).toBe(true);
     expect(probe({ text: 'x'.repeat(4096) + '\n' + signature.trimEnd()
-      + 'x'.repeat(512 - signature.trimEnd().length) }).decision.hold).toBe(false);
+      + 'x'.repeat(512 - signature.trimEnd().length) }).decision.hold).toBe(true);
   });
 });

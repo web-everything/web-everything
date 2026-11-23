@@ -78,8 +78,10 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
         },
         readJobLog({ repo, jobId }) {
           const text = request('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`, '--allow-escape-sequences'], { maxBuffer: 256 * 1024 });
-          return { text: typeof text === 'string' ? stripTerminalEscapes(text) : text,
-            complete: typeof text === 'string' && Buffer.byteLength(text) <= 256 * 1024 };
+          // Do not sanitize a partial read: its control strings and failure evidence may be incomplete.
+          if (typeof text !== 'string' || Buffer.byteLength(text) >= 256 * 1024)
+            return { text: '', complete: false };
+          return { text: stripTerminalEscapes(text), complete: true };
         },
       } });
     },

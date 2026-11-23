@@ -15,10 +15,30 @@ import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, rea
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
-/** Remove terminal controls before interpreting GitHub Actions log text. */
+/** Remove terminal controls; incomplete control strings are unreadable evidence. */
 export function stripTerminalEscapes(text) {
-  return text.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, '')
-    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  const parts = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '\x1b' || !']P_^X'.includes(text[i + 1] ?? '\0')) continue;
+    const osc = text[i + 1] === ']';
+    parts.push(text.slice(start, i));
+    let end = i + 2;
+    while (end < text.length && !/[\r\n\u2028\u2029]/.test(text[end])) {
+      if (osc && text[end] === '\x07') break;
+      if (text[end] === '\x1b' && text[end + 1] === '\\') break;
+      end++;
+    }
+    if (end === text.length || /[\r\n\u2028\u2029]/.test(text[end])) {
+      const error = new Error('unterminated terminal control string; log evidence incomplete; operator must inspect');
+      error.code = 'MQ_LOG_INCOMPLETE';
+      throw error;
+    }
+    i = text[end] === '\x07' ? end : end + 1;
+    start = i + 1;
+  }
+  parts.push(text.slice(start));
+  return parts.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
     .replace(/\x1b[ -/]*[@-Z\\-_]|\x1b/g, '');
 }
 
@@ -959,18 +979,26 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
           if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
-          // Bound the scan as well as subprocess output. Injected readers may return oversized text.
-          const tail = stripTerminalEscapes(Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8')
-            .subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8'));
-          let truncatedLine = false;
-          const matched = tail.split('\n').some(line => {
-            if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
-            const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
-            return patterns.some(pattern => pattern.test(boundedLine));
-          });
+          // A tail cannot exclude earlier assertion failures or captured-output headers.
+          // Scan only complete bounded logs; missing evidence requires operator inspection.
+          if (Buffer.byteLength(text, 'utf8') > MQ_INFRA_SCAN_BYTES) {
+            const error = new Error('whole job log exceeds infrastructure scan limit');
+            error.code = 'MQ_LOG_INCOMPLETE';
+            throw error;
+          }
+          const lines = stripTerminalEscapes(text).split('\n');
+          const truncatedLine = lines.some(line => line.length > MQ_INFRA_LINE_CHARS);
+          // Captured test output has no trustworthy end delimiter. If present, none of this
+          // job's signature matches can establish runner-origin evidence.
+          const captured = lines.some(line => /\b(?:stdout|stderr)\s*(?:\||:|>)/i.test(line));
+          const assertionFailure = lines.some(line => /\b(?:FAIL|FAILED|AssertionError)\b|Error: expect\b|\bexpect\(|\bExpected:|\bReceived:|[✗×❯]/i.test(line));
+          const matched = !truncatedLine && !captured && !assertionFailure
+            && lines.some(line => patterns.some(pattern => pattern.test(line)));
           logVerdicts.set(check.id, matched);
-          if (!matched && truncatedLine)
-            logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
+          if (truncatedLine || captured || assertionFailure
+            && lines.some(line => patterns.some(pattern => pattern.test(line))))
+            logReason = `non-infrastructure or incomplete job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit (assertion failure, captured output or oversized line); operator must inspect failed jobs and enqueue manually`;
+
         } catch (error) {
           unreadable.add(check.id);
           if (['merge-gate', 'review-gate'].includes(localJob(check.name))
@@ -1151,12 +1179,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       } catch { flaky = false; }
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
-    return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
+    return { mainGreen: !!deciding && deciding === newest[0] && newest[0].status === 'completed'
+        && !stale && deciding.conclusion === 'success'
         && (!unreadableOnly || deciding === newest[0] && stale === false)
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
       mainGreenReason: !deciding ? 'no completed run in latest 100 runs; operator must inspect main CI before retrying'
+        : deciding !== newest[0] ? `newest main run ${newest[0].id} ${newest[0].status} (${newest[0].conclusion ?? 'verdict pending'}); operator must inspect main CI before retrying`
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,

@@ -32,7 +32,7 @@ const job = (id, conclusion = 'failure') => ({
 // As in drain-mq-retry-main-green.test.mjs, model the API's filters and limits.
 // No summary hints or quarantine coverage can mask the log-based classification.
 function fixture({ checks = [job(21)], logs = new Map([[21, infraLog]]),
-  runs = [{ ...run(103, null, '2026-11-01T13:50:00Z'), status: 'in_progress' }, run(102)],
+  runs = [run(102)],
   events = [removal()], mergeState = 'CLEAN', requireEscapes = false } = {}) {
   const log = vi.fn(), logReads = [];
   const exec = vi.fn((command, args, opts) => {
@@ -112,6 +112,37 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
       + '\x1b]0;hidden title\x07line\x1b]8;;https://example.test\x1b\\ link\x1b]8;;\x1b\\'
       + '\x1bM\x1b',
     )).toBe('FAIL test\nline link');
+  });
+
+  it.each([']', 'P', '_', '^', 'X'])('rejects unterminated ESC %s without swallowing later failure lines', kind => {
+    expect(() => queueSafety.stripTerminalEscapes(`\x1b${kind}hidden\n${testLog}\x1b\\`))
+      .toThrow(/incomplete|unterminated/i);
+    const f = fixture({ logs: new Map([[21, `\x1b${kind}hidden\n${testLog}${infraLog}`]]) });
+    expect(f.guard()).toMatchObject({ hold: true, reason: expect.stringMatching(/operator must inspect/) });
+  });
+
+  it.each(['P', '_', '^', 'X'])('removes the entire terminated ESC %s payload', kind => {
+    expect(queueSafety.stripTerminalEscapes(`\x1b${kind}FAIL tests/forged.test.mjs > t\x1b\\visible\n`))
+      .toBe('visible\n');
+  });
+
+  it.each(['FAIL tests/real.test.mjs > t', 'AssertionError: expected true', 'Tests  1 failed | 2 passed'])
+    ('vetoes infrastructure when the same log contains %s', failure => {
+      expect(fixture({ logs: new Map([[21, infraLog + failure + '\n']]) }).guard().hold).toBe(true);
+    });
+
+  it.each(['stdout', 'stderr'])('never trusts infrastructure inside captured %s (even without a closing block)', stream => {
+    for (const suffix of ['', '\n ✓ tests/fixture.test.mjs > passes\n']) {
+      expect(fixture({ logs: new Map([[21, `${stream} | tests/fixture.test.mjs > prints\n${infraLog}${suffix}`]]) }).guard().hold).toBe(true);
+    }
+  });
+
+  it('holds if failure evidence could be outside the bounded whole-log scan', () => {
+    expect(fixture({ logs: new Map([[21, testLog + 'padding\n'.repeat(10000) + infraLog]]) }).guard().hold).toBe(true);
+  });
+
+  it.each(['queued', 'in_progress'])('holds with a newer %s main run despite older success', status => {
+    expect(fixture({ runs: [{ ...run(103, null, '2026-11-01T13:50:00Z'), status }, run(102)] }).guard().hold).toBe(true);
   });
 
   beforeEach(() => {
@@ -255,17 +286,15 @@ describe('same-head MQ retry job-log infrastructure allowlist', () => {
     expect(decision.reason ?? decision.line).toMatch(/(?:bound|cap|limit|too many).*operator.*inspect/i);
   });
 
-  it('tail-scans oversized returned text: an old prefix signature cannot authorize a retry', () => {
+  it('holds oversized returned text: an old prefix signature cannot authorize a retry', () => {
     const f = fixture({ logs: new Map([[21, infraLog + 'x'.repeat(MAX_LOG_BYTES * 2) + '\n' + testLog]]) });
     expect(f.guard().hold).toBe(true);
     expect(f.logReads.map(read => read.id)).toEqual([21]);
   });
 
-  it('tail-scans oversized returned text and recognizes a signature at the end', () => {
-    // Injected IO may return more than maxBuffer; the classifier must bound its scan too.
+  it('holds oversized returned text even with a signature at the end, requiring operator inspection', () => {
     const f = fixture({ logs: new Map([[21, 'x'.repeat(MAX_LOG_BYTES * 2) + '\n' + infraLog]]) });
-    expectInfraRetry(f.guard());
-    expect(f.logReads.map(read => read.id)).toEqual([21]);
+    expect(f.guard()).toMatchObject({ hold: true, reason: expect.stringMatching(/operator must inspect/) });
   });
 
   it('holds on exec output overflow and returns an operator-visible incomplete-log fallback', () => {
