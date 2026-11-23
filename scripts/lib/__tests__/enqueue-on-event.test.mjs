@@ -240,6 +240,12 @@ describe('overlayRefreshPending', () => {
 });
 
 describe('fast drain helpers', () => {
+  it('catch-up children explicitly select the shared pass context without claiming a green event', () => {
+    expect(fastDrainArgs({ scriptRoot: '/code', num: 42, listingSnapshot: '/scratch/round.json' })).toEqual([
+      join('/code', 'scripts', 'merge-ai-prs.mjs'), '--only=42', '--label=ready-to-merge', '--this-repo', '--json',
+      '--from-catch-up', '--listing-snapshot=/scratch/round.json',
+    ]);
+  });
   it('builds the exact single-PR fast drain arguments', () => {
     expect(fastDrainArgs({ scriptRoot: '/code', num: 42 })).toEqual([
       join('/code', 'scripts', 'merge-ai-prs.mjs'), '--only=42', '--label=ready-to-merge', '--this-repo', '--json',
@@ -426,6 +432,36 @@ describe('createEnqueueOnEvent', () => {
     advance(15_000);
     await handle.tick();
     expect(calls).toEqual([]);
+  });
+
+  it.each([
+    [1, null, true],
+    [1, { enqueueOutcomes: [{ num: 42, outcome: 'enqueued' }] }, true],
+    [0, null, true],
+    [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, true],
+    [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }, false],
+  ])('reports bounded stderr for exit %s with JSON %j (diagnostic=%s)', async (code, json, diagnostic) => {
+    const stderr = `${'old noise '.repeat(100)}\n ERR_MODULE_NOT_FOUND\t markdown-it\n`;
+    const tail = stderr.replace(/\s+/g, ' ').trim().slice(-300);
+    const { handle, children, lines, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    const run = handle.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    if (json) children[0].stdout.emit('data', JSON.stringify(json));
+    children[0].stderr.emit('data', stderr);
+    children[0].emit('close', code);
+    const [result] = await run;
+    expect(result.what.includes(` (stderr: ${tail})`)).toBe(diagnostic);
+    if (!json) {
+      expect(result.what).toBe(`no JSON result (stderr: ${tail})`);
+      expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
+    }
+    if (code !== 0) {
+      expect(result.outcome).toBe('error');
+      expect(result.verified).toBeNull();
+    }
+    expect(lines.some((line) => line.includes(result.what))).toBe(true);
   });
 
   it('logs spawn errors without rejecting tick', async () => {
@@ -2648,7 +2684,7 @@ describe('catch-up miss backoff', () => {
     expect(attempts(f)).toEqual(['--only=42']);
   });
 
-  it.each(['skipped', 'timeout', 'error', 'refused'])('an event-origin %s clears an earlier miss so only existing backoff rules govern catch-up', async outcome => {
+  it.each(['skipped', 'timeout', 'error', 'exit-error', 'refused'])('an event-origin %s clears an earlier miss so only existing backoff rules govern catch-up', async outcome => {
     vi.useFakeTimers();
     try {
       let result = persistentMiss(42);
@@ -2662,6 +2698,9 @@ describe('catch-up miss backoff', () => {
         if (end === 'timeout') {
           child.kill = () => child.emit('close', null);
           await vi.advanceTimersByTimeAsync(1000);
+        } else if (end === 'exit-error') {
+          child.stdout.emit('data', JSON.stringify(persistentMiss(42)));
+          child.emit('close', 1);
         } else if (end === 'error') child.emit('error', new Error('spawn failed'));
         else child.finish();
         return run;
@@ -2673,13 +2712,13 @@ describe('catch-up miss backoff', () => {
         : { considered: 1, skipReasons: [{ num: 42, reason: 'merge state BLOCKED' }] };
       f.handle.notePoll({ ok: true, marked: [mark(42)] }); f.advance(15_000);
       const eventRan = await finish(f.handle.tick(), outcome);
-      expect(eventRan).toMatchObject([{ num: 42, outcome }]);
+      expect(eventRan).toMatchObject([{ num: 42, outcome: outcome === 'exit-error' ? 'error' : outcome }]);
       expect(eventRan[0].catchUp).toBeUndefined();
       expect(f.handle.missBackoff().size).toBe(0);
       expect(f.handle.blocked().size).toBe(0); // Events do not arm blocked/timeout backoff.
 
       f.advance(600_000);
-      expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome }]);
+      expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome: outcome === 'exit-error' ? 'error' : outcome }]);
       expect(attempts(f)).toHaveLength(3);
       expect(f.handle.missBackoff().size).toBe(0);
       if (outcome === 'skipped' || outcome === 'timeout') {

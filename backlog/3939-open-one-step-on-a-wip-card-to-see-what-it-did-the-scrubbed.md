@@ -17,3 +17,5 @@ Tapping a step sends one `agent-step` ask; the answer (tool, exit, times, output
 ## Done when
 
 1. **Executable** — `npx vitest run src/wip`: a tap sends exactly one `agent-step` ask; a running step re-asks every 5 s and stops when closed; `withheld: true` renders "Output hidden — it looked like it contained a secret."; a stale connection renders "details need your laptop" and sends no ask.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22).

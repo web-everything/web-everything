@@ -59,7 +59,7 @@ export default {
         if (mainResult?.measure.quarantine?.action !== 'add') violations.push(`${label}: main smell lost the add decision`);
         const cardResults = first.evaluations.find((e) => e.smell.id === cards.id)?.results;
         if (cardResults?.length !== (live ? 1 : 0)) violations.push(`${label}: wrong repair-card results`);
-        if (!live && readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').length !== 1) violations.push(`${label}: duplicate shadow decision in add tick`);
+        if (!live && readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse).filter(line => line.wouldDo).length !== 1) violations.push(`${label}: duplicate shadow decision in add tick`);
         runHealthTick(first.state, probes, smells, now);
         if (calls !== 2) violations.push(`${label}: two ticks called runSafetyNet ${calls} times`);
       } finally { rmSync(dir, { recursive: true, force: true }); }

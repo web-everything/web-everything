@@ -155,3 +155,5 @@ volume — so it couldn't be sliced as a build alongside #398's A–D. Settling 
 **Build sequence once ratified:** the tiering build is a plateau-app slice `blockedBy` #427, itself
 `blockedBy` the #424 generator + #425 primitives — so resolving this decision produces an unblocked
 build, not code.
+
+Ruled PARK in the master plan (2026-11-22); kept open with blockedBy #554 instead, so it re-enters readiness when #554 resolves.

@@ -2,7 +2,10 @@
 bornAs: xcciuwx
 kind: epic
 parent: "2527"
-status: open
+status: parked
+parkedReason: maturityGated
+maturityTrigger: "adoptionSignal: Phase 2 hosted tenants exist (#554)."
+dateParked: "2026-11-22"
 dateOpened: "2026-07-22"
 tags: [plateau-loop, product, feedback, privacy]
 ---
@@ -39,3 +42,5 @@ slices read):
 3. **Routing accepted suggestions** — route an accepted suggestion into the learnings intake (red-team →
    lane → PR), the multi-tenant generalization of the single-tenant close-session sweep. `blockedBy`
    owner-review (it acts on reviewed/accepted items).
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: Phase 2 hosted tenants exist (#554).

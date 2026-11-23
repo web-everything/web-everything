@@ -367,3 +367,11 @@ test('generated documentation hash matches the current LIVE registry', () => {
   assert.notEqual(hash(doc + '\nStale inventory\n'), hash(generated));
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
 });
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
+});
