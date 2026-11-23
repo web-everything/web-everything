@@ -412,17 +412,20 @@ describe('aiRouting resolver inputs: audit regressions', () => {
       .toMatchObject({ value: ['codex-alt', 'claude'], source: 'env' });
   });
 
-  it('role_overlays_preserve_fix_chain_safety: builder strip and critical escalation follow role inputs', () => {
+  it('role_overlays_preserve_fix_chain_safety: builder strip and critical ladder follow role inputs with review required', () => {
     const aiRouting = ['codex', 'codex-alt', 'argon', 'claude'];
     expect(chain({ aiRouting, repo: { routing: { builder: 'claude' } } }))
       .toMatchObject({ value: ['argon', 'claude'], source: 'aiRouting+routing.builder' });
     const resolved = chain({ aiRouting });
-    const pick = options => pickChainRung({ chain: resolved.value, critical: true,
-      criticalClaudeFromRung: resolved.criticalClaudeFromRung, criticalSource: resolved.criticalClaudeFromRungSource, ...options });
-    expect(pick({})).toMatchObject({ executor: 'codex', rung: 'codex' });
-    for (const trigger of ['takeover', 'ruling-not-addressed']) expect(pick({ trigger }))
-      .toMatchObject({ executor: 'claude', reason: 'critical work never leaves Claude' });
-    expect(pick({ codexUnproductive: 3 })).toMatchObject({ executor: 'claude', rung: 'claude' });
+    const pick = options => pickChainRung({ chain: resolved.value, critical: true, ...options });
+    expect(pick({})).toMatchObject({ executor: 'codex', rung: 'codex', requiresReview: true });
+    for (const trigger of ['takeover', 'ruling-not-addressed', 'stronger-model']) expect(pick({ trigger }))
+      .toMatchObject({ executor: 'codex', rung: 'codex-alt', requiresReview: true });
+    expect(pick({ codexUnproductive: 3 })).toMatchObject({ executor: 'antigravity', rung: 'argon', requiresReview: true });
+    expect(pick({ codexUnproductive: 3, launcherAvailable: executor => executor !== 'antigravity' }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', requiresReview: true,
+        reason: expect.stringContaining('gemini skipped: no admitted fix path') });
+    expect(pick({ codexUnproductive: 4 })).toMatchObject({ executor: 'claude', rung: 'claude', requiresReview: true });
     for (const invalid of [[], ['codex'], ['unknown', 'claude'], ['codex', 'codex', 'claude']]) {
       expect(chain({ aiRouting: invalid })).toEqual(chain({}));
     }

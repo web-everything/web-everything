@@ -37,7 +37,12 @@ it.each([
   expect(pickChainRung({ chain: chain.value, launcherAvailable: () => true }).executor).toBe('codex');
   if (provider === 'claude') {
     expect(pickChainRung({ chain: chain.value, codexUnproductive: 3, launcherAvailable: () => true }).executor).toBeNull();
-    expect(pickChainRung({ chain: chain.value, critical: true, trigger: 'takeover', launcherAvailable: () => true }).executor).toBeNull();
+    for (const trigger of ['takeover', 'ruling-not-addressed', 'stronger-model']) {
+      expect(pickChainRung({ chain: chain.value, critical: true, trigger, launcherAvailable: () => true }))
+        .toMatchObject({ executor: 'codex', rung: 'codex-alt', requiresReview: true });
+      expect(pickChainRung({ chain: chain.value, critical: true, trigger, codexUnproductive: 3,
+        launcherAvailable: () => true }).executor).toBeNull();
+    }
   }
 });
 

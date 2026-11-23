@@ -63,11 +63,11 @@ describe('fixer-ladder site: optional aiRouting input', () => {
 
 describe('critical decision and builder strip at the routing site', () => {
   const planned = { kind: 'fix', takeover: true, scope: [] };
-  it('a critical takeover stays on Claude whatever the aiRouting chain says', () => {
+  it('a critical takeover uses the next aiRouting rung directly and requires review', () => {
     const picked = routeFixExecutor(planned, { setting: { value: 'codex-first', source: 'default' },
-      chain: chain({ aiRouting: ['codex', 'claude'] }), fixSettings: { strongerModelFromRound: 3 },
+      chain: chain({ aiRouting: ['codex', 'codex-alt', 'argon', 'claude'] }), fixSettings: { strongerModelFromRound: 3 },
       launcherAvailable: () => true, readRouted: () => [], criticalFor: () => true });
-    expect(picked).toMatchObject({ executor: 'claude' });
+    expect(picked).toMatchObject({ executor: 'codex', rung: 'codex-alt', mode: 'direct', requiresReview: true });
   });
   it('the builder strip survives an aiRouting chain', () => {
     const stripped = chain({ aiRouting: ['codex', 'claude'], repo: { routing: { builder: 'claude' } } });

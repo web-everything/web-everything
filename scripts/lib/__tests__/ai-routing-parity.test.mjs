@@ -72,8 +72,7 @@ describe('aiRouting inheritance parity', () => {
       const inherited = resolveFixExecutorChain({ ...chainOptions, aiRouting: inputs.executors });
       expect(inherited, context).toEqual(absent);
       const pickOptions = { critical: row.critical, trigger: row.takeover ? 'takeover' : null,
-        launcherAvailable: provider => provider !== 'codex' || !row.codexHeld,
-        criticalClaudeFromRung: absent.criticalClaudeFromRung, criticalSource: absent.criticalClaudeFromRungSource };
+        launcherAvailable: provider => provider !== 'codex' || !row.codexHeld };
       expect(pickChainRung({ ...pickOptions, chain: inherited.value }), context)
         .toEqual(pickChainRung({ ...pickOptions, chain: absent.value }));
       const chooseOptions = { critical: row.critical, takeover: row.takeover,

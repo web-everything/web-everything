@@ -43,6 +43,18 @@ describe('fix executor chain', () => {
     for (const codexUnproductive of [0,1,2,3,9]) expect(pick({chain:['codex','claude'],trigger,codexUnproductive}).executor).toBe(trigger || codexUnproductive >= 2 ? 'claude' : 'codex');
   });
   it('skips an unavailable Argon launcher', () => expect(pick({codexUnproductive:3, launcherAvailable:e=>e!=='antigravity'})).toMatchObject({executor:'claude',reason:expect.stringContaining('argon launcher unavailable')}));
+  it.each([false, true])('refuses an unavailable terminal launcher with critical=%s', critical => {
+    for (const trigger of [null, 'stronger-model', 'takeover', 'ruling-not-addressed']) {
+      for (const codexUnproductive of [0, 2, 3, 4, 20]) {
+        for (const value of [chain, ['codex', 'claude'], ['claude']]) {
+          expect(pick({ chain: value, trigger, codexUnproductive, critical, launcherAvailable: () => false }))
+            .toMatchObject({ executor: null, rung: null, source: 'capacity', reason: 'no available executor' });
+        }
+      }
+    }
+    expect(pick({ chain: ['codex', 'claude'], trigger: 'takeover', critical,
+      launcherAvailable: executor => executor !== 'claude' })).toMatchObject({ executor: null, rung: null });
+  });
   it('uses a supported alternate model and effort', () => {
     const {model,effort} = FIX_EXECUTOR_RUNGS['codex-alt'].policyRoute;
     expect(codexModelSupportsEffort(model,effort)).toBe(true);

@@ -119,7 +119,7 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, rungs = {}, 
       : trigger === 'stronger-model' ? 'stronger-model rung' : 'codex-first ordinary repair';
   const definition = id => Object.hasOwn(rungs, id) ? rungs[id] : FIX_EXECUTOR_RUNGS[id];
   const skips = chain.slice(0,index).filter(id=>definition(id).executor === 'antigravity' && !launcherAvailable('antigravity')).map(()=> 'gemini skipped: no admitted fix path');
-  while (index < chain.length && chain[index] !== 'claude' && !launcherAvailable(definition(chain[index]).executor)) {
+  while (index < chain.length && !launcherAvailable(definition(chain[index]).executor)) {
     skips.push(`${chain[index]} launcher unavailable, fallback${chain[index] === 'argon' ? '; gemini skipped: no admitted fix path' : ''}`);
     index++;
   }

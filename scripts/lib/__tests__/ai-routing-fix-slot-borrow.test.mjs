@@ -18,10 +18,15 @@ describe('aiRouting fix executor chain at the borrow router', () => {
     const picked = choose(chainOf({ aiRouting: ['codex-alt', 'claude'] }));
     expect(picked).toMatchObject({ executor: 'codex', rung: 'codex-alt', source: 'aiRouting' });
   });
-  it('aiRouting cannot override the critical decision', () => {
-    const chain = chainOf({ aiRouting: ['codex', 'claude'] });
-    expect(choose(chain, { takeover: true, critical: true })).toMatchObject({ executor: 'claude' });
-    expect(choose(chain, { codexUnproductive: 3, critical: true })).toMatchObject({ executor: 'claude' });
+  it('aiRouting preserves the critical ladder and its review requirement', () => {
+    const chain = chainOf({ aiRouting: ['codex', 'codex-alt', 'argon', 'claude'] });
+    expect(choose(chain, { critical: true })).toMatchObject({ executor: 'codex', rung: 'codex', mode: 'direct', requiresReview: true });
+    expect(choose(chain, { takeover: true, critical: true }))
+      .toMatchObject({ executor: 'codex', rung: 'codex-alt', mode: 'direct', requiresReview: true });
+    expect(choose(chain, { codexUnproductive: 3, critical: true }))
+      .toMatchObject({ executor: 'antigravity', rung: 'argon', mode: 'direct', requiresReview: true });
+    expect(choose(chain, { codexUnproductive: 4, critical: true }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', mode: 'direct', requiresReview: true });
   });
   it('aiRouting cannot override the builder strip', () => {
     const chain = chainOf({ aiRouting: ['codex', 'claude'], repo: { routing: { builder: 'claude' } } });

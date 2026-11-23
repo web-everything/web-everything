@@ -11,7 +11,8 @@ const pick = (entry) => slot.chooseFixExecutor({ chain, launcherAvailable: () =>
 const out = {
   critical: pick({ critical: true, strongerModel: true }),
   takeover: pick({ critical: true, takeover: true }),
-  exhausted: pick({ critical: false, codexUnproductive: 9, launcherAvailable: (id) => id === 'codex' }),
+  exhausted: pick({ critical: false, codexUnproductive: 9, launcherAvailable: (id) => id === 'codex' || id === 'claude' }),
+  unavailable: pick({ critical: false, codexUnproductive: 9, launcherAvailable: () => false }),
   mode: chainMod.resolveFixExecutionMode({ env: {}, platform: {}, repo: {}, kind: 'fix' }).mode,
 };
 console.log(JSON.stringify(out));`;
@@ -29,6 +30,7 @@ const violations = (out) => {
   if (out.critical.executor === 'claude') found.push('critical stronger-model repair launched Claude');
   if (out.takeover.executor === 'claude') found.push('critical takeover launched Claude');
   if (out.exhausted.executor !== 'claude') found.push(`exhausted chain did not reach Claude last: ${out.exhausted.executor}`);
+  if (out.unavailable.executor !== null) found.push(`unavailable terminal launcher selected: ${out.unavailable.executor}`);
   if (out.mode !== 'direct') found.push(`default invocation mode is ${out.mode}, expected direct`);
   return found;
 };
