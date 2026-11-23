@@ -2,7 +2,8 @@
 kind: story
 size: 1
 status: open
-scope: ["we:scripts/lib/settings-registry-metadata.d/settings/forgeSlots.json"]
+scope: ["we:scripts/lib/settings-registry-metadata.d/settings/forgeSlots.json", "we:scripts/lib/__tests__/settings-registry.test.mjs"]
+scopeRationale: "The registry checker at we:scripts/lib/settings-registry.mjs is run for validation only; its implementation does not change."
 dateOpened: "2026-11-23"
 tags: []
 ---
