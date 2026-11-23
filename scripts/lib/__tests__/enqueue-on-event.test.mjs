@@ -434,6 +434,22 @@ describe('createEnqueueOnEvent', () => {
     expect(calls).toEqual([]);
   });
 
+  it('redacts child stderr credentials across chunks before the 2000-character cutoff', async () => {
+    const secret = 'ghs_' + 'A'.repeat(2100);
+    const { handle, children, lines, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] });
+    advance(15_000);
+    const run = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    children[0].stderr.emit('data', 'Authorization: Bearer ' + secret.slice(0, 1200));
+    children[0].stderr.emit('data', secret.slice(1200) + '\nhttps://user:password@example.test\nGraphQL: denied');
+    children[0].emit('close', 1);
+    const [result] = await run;
+    expect(result.what).toContain('GraphQL: denied');
+    expect(result.what).toContain('[redacted]');
+    expect([result.what, ...lines].join('\n')).not.toMatch(/A{20}|user:password/);
+  });
+
   it.each([
     [1, null, true],
     [1, { enqueueOutcomes: [{ num: 42, outcome: 'enqueued' }] }, true],
@@ -1648,6 +1664,18 @@ describe('actual enqueue outcomes and membership', () => {
     const [ran] = await handle.catchUp();
     expect(ran.what).toContain('RemovedFromMergeQueueEvent at 2026-10-14: checks failed');
     expect(ran.what).toContain('fast-drain stderr: ' + ('x'.repeat(2400) + '\n batching   blocked').slice(-2000).replace(/\s+/g, ' ').trim());
+  });
+
+  it('redacts child stderr credentials in membership-miss reports', async () => {
+    const secret = 'ghs_' + 'B'.repeat(2100);
+    const { handle, lines } = membershipSetup({
+      drainStderr: `Authorization: Bearer ${secret}\nhttps://user:password@example.test\nGraphQL: denied`,
+      readMembership: async () => ({ ok: true, inQueue: false, lastEvents: [] }),
+    });
+    const [ran] = await handle.catchUp();
+    expect(ran.what).toContain('GraphQL: denied');
+    expect(ran.what).toContain('[redacted]');
+    expect([ran.what, ...lines].join('\n')).not.toMatch(/B{20}|user:password/);
   });
 
   it('does not count failed membership reads as misses', async () => {

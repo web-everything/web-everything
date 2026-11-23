@@ -76,6 +76,7 @@
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
 import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
+import { redactSecrets } from '../conveyor/ci-heal-mark.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
@@ -740,7 +741,7 @@ export function extractPassTimings(stderr) {
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
-    const output = () => ({ stdout, stderrTail: stderr.slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
+    const output = () => ({ stdout, stderrTail: redactSecrets(stderr).slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }

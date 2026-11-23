@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
+import { ghStderrTail } from './lib/gh-stderr-tail.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
@@ -4839,7 +4840,8 @@ export function basisTouchesEngineTier(score) {
 export function ghListErrText(e) {
   if (e?.githubMessage != null) return e.githubMessage;
   const head = String((e && e.message) || e).split('\n')[0];
-  const cause = String(e?.stderr || '').replace(/\s+/g, ' ').trim().slice(-2000);
+  const lines = String((e && e.stderr) || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const cause = lines.length ? lines[lines.length - 1].slice(0, 300) : '';
   return cause && !head.includes(cause) ? `${head} — gh: ${cause}` : head;
 }
 
@@ -5490,7 +5492,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, GH_REPO: repo } });
       return stdout;
     },
-    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${ghListErrText(e)}) — deferring merge/enqueue; retry on the next pass\n`),
+    warn: (e, repo) => process.stderr.write(`  ⚠ ${repo}: default branch unresolved live (${ghStderrTail({ stderr: e?.stderr || e?.message || e }, 2000).replace(/\s+/g, ' ')}) — deferring merge/enqueue; retry on the next pass\n`),
   });
   const verifyDefaultBranch = newDefaultBranchReader();
   // #2417 review — returns `{ commits, degraded }`. `degraded:true` means the gh read THREW (a swallowed transient
