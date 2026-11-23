@@ -10,7 +10,7 @@ tags: [security, prevention]
 
 # Centralize redaction before publishing gh stderr diagnostics
 
-PR #7381 review identified raw `gh` stderr reaching logs and failed-merge reports. The immediate repair restores the shared error formatter's historical bound, uses the existing redacted tail helper for the new default-branch warning, and redacts catch-up child stderr before cutting its diagnostic tail. Route all remaining gh stderr surfaced to logs or reports through a shared redaction helper, and add a standards rule rejecting raw stderr interpolation.
+PR #7381 review identified raw `gh` stderr reaching logs and failed-merge reports. The final repair restores the shared error formatter's historical bound, publishes a fixed failure class in the default-branch warning, and withholds catch-up child stderr from logs. Route any remaining gh stderr surfaced to logs or reports through a shared redaction helper, and add a standards rule rejecting raw stderr interpolation.
 
 ## Acceptance
 
@@ -18,6 +18,15 @@ PR #7381 review identified raw `gh` stderr reaching logs and failed-merge report
 - [A2] Redact before truncation and whitespace collapse. A token spanning the output boundary must leave no credential suffix; preserve useful nonsecret failure text and existing output bounds.
 - [A3] Executable standards fixtures reject raw stderr interpolation into logs/reports and accept calls through the approved helper, including aliases and concatenation.
 - [A4] An unreadable or oversized diagnostic yields a bounded withheld-diagnostic placeholder; missing redaction evidence must never permit raw fallback output.
+
+## Planned tests
+
+These cases are planned, not implemented by PR #7381.
+
+- [A1] `we:scripts/lib/__tests__/child-diagnostic-redaction.test.mjs` — `redacts credentials across merge, listing and catch-up diagnostics`: exercise each publishing path with Authorization headers, GitHub tokens, URL credentials and configured secret values; assert no credential reaches the published output.
+- [A2] `we:scripts/lib/__tests__/child-diagnostic-redaction.test.mjs` — `redacts before truncation and whitespace collapse`: place credentials across the output boundary and assert no suffix survives, useful nonsecret text remains and each output keeps its historical bound.
+- [A3] `we:scripts/lib/__tests__/child-diagnostic-redaction.test.mjs` — `standards rejects raw stderr publication and accepts the shared helper`: run the standards rule on fixtures using direct interpolation, aliases and concatenation; assert raw publication fails and the approved helper passes.
+- [A4] `we:scripts/lib/__tests__/child-diagnostic-redaction.test.mjs` — `withholds unreadable and oversized diagnostics without raw fallback`: inject read failures, overflow and helper failures; assert the fixed placeholder and its byte bound for string and Buffer inputs.
 
 ## Non-goals
 

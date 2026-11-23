@@ -18,6 +18,14 @@ PR #7381 review found that changing `we:scripts/merge-ai-prs.mjs#ghListErrText` 
 - [A2] Cover async functions, re-exports, aliases, deleted exports, and unrelated same-name symbols. Unreadable source or an incomplete bounded search produces an explicit selection-required result.
 - [A3] Exceeding a source/search bound names the affected-test override as the operator fallback; never silently treat an incomplete search as no dependents.
 
+## Planned tests
+
+These cases are planned additions to `we:scripts/lib/__tests__/related-test-selection.test.mjs`, not implemented by PR #7381.
+
+- [A1] `selects every test referencing a changed exported function body`: edit one export with two referencing test files, editing only one test; assert both are selected and an explicit run set omitting either is refused.
+- [A2] `resolves changed exports by module identity and refuses incomplete searches`: table-test async functions, re-exports, aliases and deleted exports; assert all referencing tests are selected, unrelated same-name symbols are excluded, and unreadable source or an incomplete bounded search returns selection-required.
+- [A3] `names the affected-test override when a selection bound is exceeded`: exceed source-byte and referencing-file bounds separately; assert selection-required includes the explicit affected-test override and never returns an empty successful selection.
+
 ## Non-goals
 
 - Replace the import graph or run the full unit suite for every repair.
