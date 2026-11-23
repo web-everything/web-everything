@@ -43,13 +43,22 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/testing-notes-join.test.mjs',
+    scope: 'full',
+    why: 'proves lossless migration against the pinned original and validates the joined fragment inventory',
+    matches: (f) => f.startsWith('docs/agent/testing.d/'),
+    inputs: ['scripts/__tests__/testing-notes-join.test.mjs', 'scripts/__tests__/fixtures/testing-notes-split-baseline.json',
+      'scripts/lib/testing-notes-join.mjs', 'scripts/testing-notes.mjs', 'scripts/lib/rules-loader.cjs'],
+  },
+  {
     test: 'scripts/__tests__/testing-notes-advisory.test.mjs',
     scope: 'full',
     why: 'validates incoming testing.md anchors across top-level agent docs and the complete topic directory; guide anchor changes can break unchanged callers, so the scan must keep both sides',
     matches: (f) => f === 'AGENTS.md' || /^docs\/agent\/[^/]+\.md$/.test(f)
-      || f.startsWith('docs/agent/testing/') || f === 'scripts/check-standards.mjs',
+      || f.startsWith('docs/agent/testing.d/') || /^skills-src\/[^/]+\/SKILL\.md$/.test(f)
+      || f === 'scripts/check-standards.mjs',
     inputs: ['scripts/__tests__/testing-notes-advisory.test.mjs', 'scripts/__tests__/fixtures/testing-notes-main-links.json',
-      'scripts/lib/testing-notes-advisory.mjs', 'scripts/lib/rules-loader.cjs'],
+      'scripts/lib/testing-notes-advisory.mjs', 'scripts/lib/testing-notes-join.mjs', 'scripts/lib/rules-loader.cjs'],
   },
   {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',

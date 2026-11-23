@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { readTestingNotes } from '../lib/testing-notes-join.mjs';
 import { testingNotesAdvisory, scanTestingNotesAdvisory, TESTING_GUIDE } from '../lib/testing-notes-advisory.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -14,12 +15,12 @@ const added = '@@ -1,0 +2 @@\n+new note\n';
 describe('testing notes advisory', () => {
   it('warns for added lines in the legacy guide, with the per-topic destination', () => {
     expect(testingNotesAdvisory([TESTING_GUIDE])).toEqual([
-      expect.stringContaining('docs/agent/testing/ as separate topic files'),
+      expect.stringContaining('docs/agent/testing.d/ as separate topic files'),
     ]);
   });
 
-  it('is silent for a new per-topic file and unrelated additions', () => {
-    expect(testingNotesAdvisory(['docs/agent/testing/new-topic.md', 'AGENTS.md'])).toEqual([]);
+  it('is silent for new or changed per-topic files and unrelated additions', () => {
+    expect(testingNotesAdvisory(['docs/agent/testing.d/new-topic.md', 'AGENTS.md'])).toEqual([]);
     expect(testingNotesAdvisory([])).toEqual([]);
   });
 
@@ -60,10 +61,21 @@ describe('testing documentation links', () => {
     const baseline = JSON.parse(readFileSync(resolve(root, 'scripts/__tests__/fixtures/testing-notes-main-links.json'), 'utf8'));
     expect(baseline.commit).toMatch(/^[a-f0-9]{40}$/);
     expect(baseline.references.length).toBeGreaterThan(0);
-    const currentAnchors = extractAnchors(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).anchors;
+    const currentAnchors = extractAnchors(readTestingNotes(root).text).anchors;
     const files = ['AGENTS.md', ...readdirSync(resolve(root, 'docs/agent'))
       .filter((name) => name.endsWith('.md')).map((name) => `docs/agent/${name}`)];
     const sources = files.map((file) => [file, readFileSync(resolve(root, file), 'utf8')]);
+    for (const skill of readdirSync(resolve(root, 'skills-src'), { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+      const path = `skills-src/${skill.name}/SKILL.md`;
+      try { sources.push([path, readFileSync(resolve(root, path), 'utf8')]); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    for (const [file, text] of sources) {
+      for (const match of text.matchAll(/\]\(([^\s)]*testing\.d\/[^\s)#]+\.md)#([^\s)]+)\)/g)) {
+        const target = readFileSync(resolve(root, dirname(file), match[1]), 'utf8');
+        expect(extractAnchors(target).anchors.has(decodeURIComponent(match[2])), `${file}: ${match[0]}`).toBe(true);
+      }
+    }
     sources.push(...baseline.references);
     let checked = 0;
     for (const [file, text] of sources) {
@@ -78,9 +90,9 @@ describe('testing documentation links', () => {
   });
 
   it('keeps the static directory link valid and each topic headed and named consistently', () => {
-    expect(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).toContain('(testing/README.md)');
-    const directory = resolve(root, 'docs/agent/testing');
-    expect(readFileSync(resolve(directory, 'README.md'), 'utf8')).toContain('not appended');
+    expect(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).toContain('(testing.d/README.md)');
+    const directory = resolve(root, 'docs/agent/testing.d');
+    expect(readFileSync(resolve(directory, 'README.md'), 'utf8')).toContain('never edit testing.md');
     const topics = readdirSync(directory).filter((name) => name !== 'README.md');
     expect(topics.length).toBeGreaterThanOrEqual(4);
     for (const topic of topics) {

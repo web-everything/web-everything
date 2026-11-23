@@ -166,7 +166,7 @@ To show the same element as HTML and JSX on a block/adapter page (`source-toggle
 
 ## 5. Testing (mandatory — details in [testing.md](testing.md) and the coverage plan)
 
-Add new testing notes as per-topic files in [testing/](testing/README.md).
+Add new testing notes as per-topic files in [testing.d/](testing.d/README.md).
 
 - **Logic** → unit tests over the **shared fixtures** (`*.test.ts`, Vitest). Adding a mapping/behavior
   case = adding one fixture, which covers the demo and the tests at once.
