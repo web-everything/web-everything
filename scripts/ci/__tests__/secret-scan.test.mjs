@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
@@ -87,6 +87,63 @@ describe('secret-scan', () => {
   it('reports every matching shared rule on a line', () => {
     expect(scan(diff(token + ' ' + aws)).output).toBe('fixture.txt:7 github-token\nfixture.txt:7 aws-access-key\n');
   });
+  it.each(['unicode', 'hex', 'percent'])('scans %s escaped ASCII without echoing it', encoding => {
+    const encoded = [...token].map(char => encoding === 'unicode'
+      ? '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0')
+      : (encoding === 'hex' ? '\\x' : '%') + char.charCodeAt(0).toString(16)).join('');
+    const result = scan(diff(encoded));
+    expect(result.status).toBe(1);
+    expect(result.output).toBe('fixture.txt:7 github-token\n');
+    expect(result.output).not.toContain(encoded);
+  });
+  it('scans private JWK structure across added lines and hunks', () => {
+    const keyType = 'k' + 'ty';
+    const body = JSON.stringify({ [keyType]: 'RSA', ['d']: 'a' + 'bc' }, null, 2).split('\n');
+    const input = '--- a/key.json\n+++ b/key.json\n' + body.map((text, i) => `@@ -${i},0 +${i + 1} @@\n+${text}\n`).join('');
+    const result = scan(input);
+    expect(result.status).toBe(1);
+    expect(result.output).toBe('key.json:1 private-key-structure\n');
+  });
+  it('redacts credential-bearing paths without suppressing location or rule', () => {
+    expect(scan(diff(aws, token + '.txt')).output).toBe('[redacted-path]:7 aws-access-key\n');
+    const keyType = 'k' + 'ty';
+    const path = JSON.stringify({ [keyType]: 'RSA', ['d']: 'a' + 'bc' });
+    const input = `--- a/x\n+++ ${JSON.stringify('b/' + path)}\n@@ -0,0 +7 @@\n+${aws}\n`;
+    expect(scan(input).output).toBe('[redacted-path]:7 aws-access-key\n');
+  });
+  it('fails closed on a residual binary notice and redacts its path', () => {
+    for (const path of ['image.bin', token + '.bin']) {
+      const result = scan(`diff --git a/${path} b/${path}\nBinary files /dev/null and b/${path} differ\n`);
+      expect(result.status).toBe(1);
+      expect(result.output).toBe(`${path.includes(token) ? '[redacted-path]' : path}:0 unscannable-binary\n`);
+    }
+  });
+  it('uses the requested PR repo, forces binary and -diff text, and ignores PR validator/config copies', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'secret-scan-repo-'));
+    dirs.push(dir);
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    git('init', '-q');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD').trim();
+    writeFileSync(join(dir, '.gitattributes'), '*.dat -diff\n');
+    writeFileSync(join(dir, 'binary.bin'), '\0' + token);
+    writeFileSync(join(dir, 'hidden.dat'), aws);
+    mkdirSync(join(dir, 'scripts/ci'), { recursive: true });
+    writeFileSync(join(dir, 'scripts/ci/secret-scan.mjs'), 'process.exit(0);');
+    writeFileSync(join(dir, 'scripts/ci/secret-scan-allowlist.json'), JSON.stringify([
+      { path: 'binary.bin', rule: 'github-token', reason: 'PR-controlled exemption' },
+    ]));
+    git('add', '.');
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'head');
+    const result = spawnSync(process.execPath, [cli.pathname, '--repo', dir, '--base', base, '--head', 'HEAD'], {
+      cwd: tmpdir(), encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('binary.bin:1 github-token');
+    expect(result.stdout).toContain('hidden.dat:1 aws-access-key');
+    expect(result.stdout + result.stderr).not.toContain(token);
+    expect(result.stdout + result.stderr).not.toContain(aws);
+  });
   it('loads the shipped allowlist', () => {
     const clean = spawnSync(process.execPath, [cli.pathname, '--stdin'], { input: diff('clean'), encoding: 'utf8', timeout: 10_000 });
     expect(clean.status).toBe(0);
@@ -102,11 +159,63 @@ it('runs an isolated read-only PR workflow using only existing action pins', () 
   expect(job.permissions).toEqual({ contents: 'read' });
   expect(job.if).toBe("${{ github.event_name == 'pull_request' }}");
   expect(JSON.stringify(job)).not.toMatch(/secrets\s*\./);
-  expect(job.steps.filter(step => step.uses).map(step => step.uses)).toEqual(['actions/checkout@v4', 'actions/setup-node@v4']);
+  expect(job.steps.filter(step => step.uses).map(step => step.uses)).toEqual(['actions/checkout@v4', 'actions/checkout@v4', 'actions/setup-node@v4']);
   expect(job.steps[0].with).toMatchObject({ 'fetch-depth': 0, 'persist-credentials': false, ref: '${{ github.sha }}' });
-  expect(job.steps[1].with['node-version']).toBe(22);
+  expect(job.steps[1].with).toMatchObject({ ref: '${{ github.event.pull_request.base.sha }}', path: 'trusted', 'persist-credentials': false });
+  expect(job.steps[2].with['node-version']).toBe(22);
   const run = job.steps.find(step => step.run);
   expect(run.env).toEqual({ BASE_SHA: '${{ github.event.pull_request.base.sha }}', HEAD_SHA: '${{ github.sha }}' });
-  expect(run.run).toBe('node scripts/ci/secret-scan.mjs --base "$BASE_SHA" --head "$HEAD_SHA"');
+  expect(run.run).toContain('node "$scanner" --base "$BASE_SHA" --head "$HEAD_SHA"');
+  expect(run.run).toContain('scanner=trusted/scripts/ci/secret-scan.mjs');
+  for (const trusted of [true, false]) {
+    const dir = mkdtempSync(join(tmpdir(), 'secret-scan-workflow-'));
+    dirs.push(dir);
+    mkdirSync(join(dir, 'scripts/ci'), { recursive: true });
+    writeFileSync(join(dir, 'scripts/ci/secret-scan.mjs'), "console.log('fallback scanner');");
+    if (trusted) {
+      mkdirSync(join(dir, 'trusted/scripts/ci'), { recursive: true });
+      writeFileSync(join(dir, 'trusted/scripts/ci/secret-scan.mjs'), "console.log('trusted scanner');");
+    }
+    const result = spawnSync('bash', ['-e', '-c', run.run], { cwd: dir, env: { ...process.env, BASE_SHA: 'base', HEAD_SHA: 'head' }, encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    if (trusted) expect(result.stdout).toBe('trusted scanner\n');
+    else {
+      expect(result.stdout).toContain('fallback scanner\n');
+      expect((result.stdout + result.stderr).trim().split('\n')).toHaveLength(2);
+      expect(result.stdout + result.stderr).toMatch(/bootstrap/i);
+    }
+  }
   expect(workflow.jobs.test.needs).not.toContain('secret-scan');
+});
+
+
+it.each([false, true])('runs the workflow with the pre-change trusted scanner (credential=%s)', credential => {
+  const dir = mkdtempSync(join(tmpdir(), 'secret-scan-compat-'));
+  dirs.push(dir);
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], {
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  git('init', '-q');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'base');
+  const base = git('rev-parse', 'HEAD').trim();
+  writeFileSync(join(dir, 'fixture.txt'), credential ? token : 'ordinary text');
+  git('add', 'fixture.txt');
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '-qm', 'head');
+  mkdirSync(join(dir, 'trusted/scripts/ci'), { recursive: true });
+  mkdirSync(join(dir, 'trusted/scripts/readiness'), { recursive: true });
+  copyFileSync(new URL('./fixtures/secret-scan-pre-repo.txt', import.meta.url), join(dir, 'trusted/scripts/ci/secret-scan.mjs'));
+  copyFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), join(dir, 'trusted/scripts/ci/secret-scan-allowlist.json'));
+  for (const name of ['forge-exec-manifest.mjs', 'forge-key-structure.mjs']) {
+    copyFileSync(new URL('../../readiness/' + name, import.meta.url), join(dir, 'trusted/scripts/readiness', name));
+  }
+  const workflow = yaml.safeLoad(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
+  const run = workflow.jobs['secret-scan'].steps.find(step => step.run);
+  const result = spawnSync('bash', ['-e', '-c', run.run], {
+    cwd: dir, env: { ...process.env, BASE_SHA: base, HEAD_SHA: 'HEAD' },
+    encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
+  expect(result.status).toBe(credential ? 1 : 0);
+  expect(result.stderr).toBe('');
+  expect(result.stdout).toBe(credential ? 'fixture.txt:1 github-token\n' : '');
+  expect(result.stdout + result.stderr).not.toContain(token);
 });

@@ -1,11 +1,16 @@
+// Allowlisted files are exempt per path+rule, reviewed by a human via the base-branch allowlist.
+// Text rules match line by line (raw and decoded): credentials split across multiple lines may escape
+// text matching. The shared Forge structural detector also scans each file's concatenated added lines.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keyStructureFinding } from '../readiness/forge-key-structure.mjs';
 import { secretText } from '../readiness/forge-exec-manifest.mjs';
 
 // Re-export the very same array used by the Forge bundle scanner.
 export { secretText };
+const structuralRules = ['private-key-structure', 'private-key-scan-budget-exhausted-use-local', 'unscannable-binary'];
 const LIMIT = 32 * 1024 * 1024;
 const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (32 MiB maximum)');
 
@@ -14,7 +19,7 @@ function loadAllowlist(path) {
   if (!Array.isArray(entries) || entries.some(entry => !entry
     || typeof entry.path !== 'string' || !entry.path || /[*?\[\]\\\x00-\x1f]/.test(entry.path)
     || entry.path.startsWith('/') || entry.path.split('/').some(part => !part || part === '.' || part === '..')
-    || !secretText.some(([, rule]) => entry.rule === rule)
+    || (!secretText.some(([, rule]) => entry.rule === rule) && !structuralRules.includes(entry.rule))
     || typeof entry.reason !== 'string' || !entry.reason.trim()
     || Object.keys(entry).some(key => !['path', 'rule', 'reason'].includes(key)))) {
     throw new Error('secret-scan: invalid allowlist; require exact path, known rule and non-empty reason');
@@ -22,7 +27,7 @@ function loadAllowlist(path) {
   return entries;
 }
 
-function diffPath(raw) {
+function diffPath(raw, prefix = 'b/') {
   // Git quotes control characters and encodes non-ASCII bytes as octal escapes.
   if (raw.startsWith('"')) {
     if (!raw.endsWith('"')) throw incomplete();
@@ -32,14 +37,41 @@ function diffPath(raw) {
     raw = Buffer.from(raw, 'latin1').toString('utf8');
   } else raw = raw.replace(/\t$/, ''); // Git's delimiter for unquoted paths with spaces.
   if (raw === '/dev/null') return null;
-  if (!raw.startsWith('b/')) throw incomplete();
+  if (!raw.startsWith(prefix)) throw incomplete();
   return raw.slice(2);
+}
+
+function decodedLine(text) {
+  return text.replace(/\\u([\da-f]{4})|\\x([\da-f]{2})|%([0-7][\da-f])/gi,
+    (_, unicode, hex, percent) => String.fromCharCode(parseInt(unicode ?? hex ?? percent, 16)));
+}
+
+function safePath(path) {
+  if (secretText.some(([pattern]) => { pattern.lastIndex = 0; return pattern.test(path) || pattern.test(decodedLine(path)); })
+    || keyStructureFinding(Buffer.from(path))) return '[redacted-path]';
+  return /[\x00-\x1f\x7f-\x9f]/.test(path) ? JSON.stringify(path) : path;
 }
 
 export function scanDiff(diff, allowlist = []) {
   if (Buffer.byteLength(diff) > LIMIT) throw incomplete();
   const hits = [];
-  let path = null, line = 0, oldLeft = 0, newLeft = 0;
+  let path = null, line = 0, oldLeft = 0, newLeft = 0, added = [], firstAdded = 0, displayPath;
+  const report = (rule, at) => {
+    if (!path) throw incomplete();
+    if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
+      displayPath ??= safePath(path);
+      hits.push(`${displayPath}:${at} ${rule}`);
+    }
+  };
+  const finishFile = () => {
+    if (added.length) {
+      const rule = keyStructureFinding(Buffer.from(added.join('\n')));
+      if (rule) report(rule, firstAdded);
+    }
+    added = [];
+    firstAdded = 0;
+    displayPath = undefined;
+  };
   for (const text of diff.split('\n')) {
     if (oldLeft || newLeft) {
       if (text === '\\ No newline at end of file') continue;
@@ -50,20 +82,27 @@ export function scanDiff(diff, allowlist = []) {
       if (oldLeft < 0 || newLeft < 0) throw incomplete();
       if (prefix === '+') {
         if (!path) throw incomplete();
+        if (!added.length) firstAdded = line;
+        const raw = text.slice(1), decoded = decodedLine(raw);
+        added.push(raw);
         for (const [pattern, rule] of secretText) {
           pattern.lastIndex = 0;
-          if (pattern.test(text.slice(1)) && !allowlist.some(entry => entry.path === path && entry.rule === rule)) {
-            // Escape control characters in paths; never include the scanned content.
-            const safePath = /[\x00-\x1f\x7f-\x9f]/.test(path) ? JSON.stringify(path) : path;
-            hits.push(`${safePath}:${line} ${rule}`);
-          }
+          if (pattern.test(raw) || pattern.test(decoded)) report(rule, line);
         }
       }
       if (prefix !== '-') line++;
     } else if (text.startsWith('diff --git ')) {
+      finishFile();
       path = null;
     } else if (text.startsWith('+++ ')) {
+      finishFile();
       path = diffPath(text.slice(4));
+    } else if (text.startsWith('Binary files ')) {
+      const notice = /^Binary files (.+) and (.+) differ$/.exec(text);
+      if (!notice) throw incomplete();
+      finishFile();
+      path = diffPath(notice[2]) ?? diffPath(notice[1], 'a/');
+      report('unscannable-binary', 0);
     } else if (text.startsWith('@@')) {
       const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(text);
       if (!hunk) throw incomplete();
@@ -71,21 +110,22 @@ export function scanDiff(diff, allowlist = []) {
       line = Number(hunk[3]);
       newLeft = Number(hunk[4] ?? 1);
       if (![oldLeft, line, newLeft].every(Number.isSafeInteger) || (newLeft && !path)) throw incomplete();
-    } else if (text && !/^(?:--- |index |new file mode |deleted file mode |old mode |new mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to |Binary files |\\ No newline at end of file)/.test(text)) {
+    } else if (text && !/^(?:--- |index |new file mode |deleted file mode |old mode |new mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to |\\ No newline at end of file)/.test(text)) {
       throw incomplete();
     }
   }
   if (oldLeft || newLeft) throw incomplete();
+  finishFile();
   return hits;
 }
 
 export async function main(args = process.argv.slice(2)) {
   try {
-    const options = { base: 'origin/main', head: 'HEAD', allowlist: new URL('./secret-scan-allowlist.json', import.meta.url) };
+    const options = { repo: '.', base: 'origin/main', head: 'HEAD', allowlist: new URL('./secret-scan-allowlist.json', import.meta.url) };
     let stdin = false;
     for (let i = 0; i < args.length; i++) {
       if (args[i] === '--stdin') stdin = true;
-      else if (['--base', '--head', '--allowlist'].includes(args[i]) && args[i + 1] && !args[i + 1].startsWith('-')) {
+      else if (['--base', '--head', '--allowlist', '--repo'].includes(args[i]) && args[i + 1] && !args[i + 1].startsWith('-')) {
         options[args[i].slice(2)] = args[++i];
       } else throw new Error('secret-scan: invalid arguments');
     }
@@ -102,7 +142,7 @@ export async function main(args = process.argv.slice(2)) {
       diff = Buffer.concat(chunks).toString('utf8');
     } else {
       try {
-        diff = execFileSync('git', ['-c', 'core.quotePath=true', 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', `${options.base}...${options.head}`, '--'], {
+        diff = execFileSync('git', ['-C', options.repo, '-c', 'core.quotePath=true', 'diff', '--text', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', `${options.base}...${options.head}`, '--'], {
           encoding: 'utf8', maxBuffer: LIMIT, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
         });
       } catch { throw incomplete(); }
