@@ -4,14 +4,15 @@
  * Run through host admission: node scripts/readiness/heavy-admission.mjs run -- npx vitest run scripts/lib/__tests__/settings-registry.test.mjs
  */
 import { test } from 'vitest';
+import { spawnSync, execFileSync } from 'node:child_process';
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, symlinkSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildRegistry, readMetadata, renderMarkdown, ensureRegistryDoc } from '../settings-registry.mjs';
+import { fixture as mergeFixture, snapshot, DOC, CLOSURE } from './fixtures/generated-merge.mjs';
 import { CAPACITY_LEAVES } from '../operator-override-reader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -127,6 +128,7 @@ test('real repository metadata is complete and generated documentation matches t
   assert.equal(registry.capacityRows.length, Object.keys(CAPACITY_LEAVES).length);
   assert.equal(execFileSync('git', ['ls-files', 'docs/agent/settings-registry.md'], { cwd: ROOT, encoding: 'utf8' }), '', 'generated doc must not be tracked');
   assert.equal(ensureRegistryDoc({ root: ROOT }), renderMarkdown(registry));
+  assert.equal(renderMarkdown(buildRegistry({ root: ROOT })), renderMarkdown(registry));
 });
 test('top proposals allow zero or ten and refuse incomplete, oversized or non-boolean selections', t => {
   const f = fixture(t);
@@ -206,6 +208,33 @@ test('current numeric discovery evidence converges for H but not the M tail', ()
   const md = renderMarkdown(buildRegistry({ root: ROOT }));
   assert.ok(md.includes('H-impact discovery converged'));
   assert.ok(md.includes('M-impact tail has not converged'));
+});
+
+test('--check succeeds without a tracked or local doc and writes nothing', t => {
+  const tracked = spawnSync('git', ['ls-files', '--', DOC], { cwd: ROOT, encoding: 'utf8' });
+  assert.equal(tracked.status, 0); assert.equal(tracked.stdout, '');
+  const ignored = spawnSync('git', ['check-ignore', '--', DOC], { cwd: ROOT, encoding: 'utf8' });
+  assert.equal(ignored.status, 0); assert.equal(ignored.stdout.trim(), DOC);
+  const f = mergeFixture(); t.onTestFinished(f.cleanup);
+  f.ok(['rm', '--', DOC]); f.write('.gitignore', `${DOC}\n`); f.commit('untrack doc');
+  const before = snapshot(f);
+  f.generate('--check'); f.generate('--check');
+  assert.equal(existsSync(join(f.root, DOC)), false);
+  assert.deepEqual(snapshot(f), before);
+  f.generate('--write'); assert.ok(existsSync(join(f.root, DOC)));
+  assert.equal(f.ok(['status', '--porcelain']), '');
+  f.json(`${META_DIR}/settings/sample.json`, {});
+  assert.throws(() => f.generate('--check'), /invalid description: sample/);
+});
+
+test('--check refuses unequal fresh renders without writing the doc', t => {
+  const f = mergeFixture(); t.onTestFinished(f.cleanup);
+  rmSync(join(f.root, DOC));
+  f.write(CLOSURE[0], readFileSync(join(f.root, CLOSURE[0]), 'utf8')
+    .replace('return out.join', 'return String(globalThis.renderCount = (globalThis.renderCount ?? 0) + 1) + out.join'));
+  const before = snapshot(f);
+  assert.throws(() => f.generate('--check'), /render is not deterministic/);
+  assert.deepEqual(snapshot(f), before);
 });
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
@@ -374,7 +403,6 @@ test('standalone timeout policy does not claim conveyor setting metadata', t => 
   assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });
 
-const DOC = 'docs/agent/settings-registry.md';
 function authoredFixture(t) {
   const f = fixture(t); split(f);
   for (const key of ['instantGaps', 'toSettle', 'discoveryPasses']) f.write(`${META_DIR}/lists/${key}.json`, f.meta[key]);

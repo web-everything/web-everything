@@ -25,7 +25,8 @@ export function fixture({ conflict } = {}) {
   for (const [key, value] of Object.entries({ 'user.name': 'fixture', 'user.email': 'fixture@localhost',
     'core.hooksPath': '/dev/null', 'commit.gpgsign': 'false', 'rerere.enabled': 'false' })) ok(['config', key, value]);
   for (const path of CLOSURE) write(path, readFileSync(resolve(path)));
-  mkdirSync(join(root, 'docs/agent'), { recursive: true });
+  // Keep the docs directory after git rm, as in the real repository.
+  write('docs/agent/README.md', 'Hand-written fixture documentation.\n');
   json('scripts/dispatch-settings.json', {});
   json('scripts/settings/seed.json', { sample: { base: 0 } });
   for (const path of ['delivery-platform-preferences', 'delivery-priority-settings']) json(`scripts/lib/${path}.json`, {});

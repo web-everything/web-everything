@@ -1,8 +1,6 @@
 // @vitest-environment node
-import {ensureRegistryDoc} from '../../lib/settings-registry.mjs';
-import {readFileSync} from 'node:fs';
-import {fileURLToPath} from 'node:url';
 import {describe,expect,it,vi} from 'vitest';
+import {buildRegistry,renderMarkdown} from '../../lib/settings-registry.mjs';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
 import {credentialBufferFinding} from '../forge-exec-manifest.mjs';
 
@@ -18,8 +16,8 @@ const stray='an unclosed '+q+' ';
 
 describe('forge key structure: bounded unclosed object scans fail closed',()=>{
   it('refuses the real settings registry promptly when an oversized candidate cannot be closed',()=>{
-    ensureRegistryDoc({root: fileURLToPath(new URL('../../../',import.meta.url))});
-    const bytes=readFileSync(new URL('../../../docs/agent/settings-registry.md',import.meta.url));
+    // The registry doc is generated locally and gitignored, so scan a fresh render of it instead of a tracked file.
+    const bytes=Buffer.from(renderMarkdown(buildRegistry()));
     const started=Date.now();
     // Operator ruling (round 2) supersedes the original "registry scans to null" acceptance: the registry has
     // truncated table cells (`{"a":{"service":…`) and the any-case `kty` gate matches `byTaskType`, so an

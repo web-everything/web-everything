@@ -15,7 +15,7 @@ const CLOSURE = ['scripts/lib/settings-registry.mjs', 'scripts/lib/settings-file
 const INPUTS = ['scripts/dispatch-settings.json',
   'scripts/lib/delivery-platform-preferences.json', 'scripts/lib/delivery-priority-settings.json'];
 
-function scenario(root, tamper = false, resolver = resolveOverlayConflict) {
+function scenario(root, tamper = false, resolver = resolveOverlayConflict, deletion = false) {
   if (!process.env.TMPDIR) throw new Error('task TMPDIR required');
   const dir = realpathSync(mkdtempSync(join(process.env.TMPDIR, 'soak-settings-registry-')));
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
@@ -59,6 +59,7 @@ function scenario(root, tamper = false, resolver = resolveOverlayConflict) {
     ok(['checkout', '-qb', 'lane/ours', 'base']);
     json('scripts/settings/soak-ours.json', { soakRegistryProbe: { soakOurs: 1 } });
     generate();
+    if (deletion) { ok(['rm', '--', DOC]); write('.gitignore', `${DOC}\n`); }
     const cur = commit('ours');
     ok(['checkout', '-qb', 'lane/theirs', 'base']);
     json('scripts/settings/soak-theirs.json', { soakRegistryProbe: { soakTheirs: 1 } });
@@ -84,17 +85,18 @@ function scenario(root, tamper = false, resolver = resolveOverlayConflict) {
       return problems;
     }
     if (result?.ok !== true || !/^[0-9a-f]{40}$/.test(result.tree ?? '')) return ['doc only: resolver did not return a merged tree'];
+    if (deletion) return ok(['ls-tree', result.tree, '--', DOC]) === '' ? [] : ['modify/delete: generated doc was retained'];
     const merged = ok(['show', `${result.tree}:${DOC}`]);
     return ['soakOurs', 'soakTheirs'].filter(setting => !merged.includes(setting)).map(setting => `doc only: merged doc lost ${setting}`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
 // Used by the synchronous presence probe with the resolver from the checkout being examined.
-export function docOnlyResolves(root, resolver) { return scenario(root, false, resolver).length === 0; }
+export function docOnlyResolves(root, resolver) { return scenario(root, false, resolver, true).length === 0; }
 
 export default {
   id: 'settings-registry-doc-conflict-regenerated',
-  title: 'settings registry doc conflicts regenerate both settings while candidate generator drift refuses',
+  title: 'settings registry conflicts take deletion or regenerate; candidate generator drift refuses',
   card: '0',
   fixedBy: { sha: 'HEAD', where: 'lane/settings-registry-regen-conflict', paths: [SOURCE] },
   fixPresent(root) {
@@ -107,7 +109,7 @@ export default {
     return result.status === 0;
   },
   async run({ root = ROOT } = {}) {
-    return { problems: [...scenario(root), ...scenario(root, true)] };
+    return { problems: [...scenario(root), ...scenario(root, true), ...scenario(root, false, resolveOverlayConflict, true), ...scenario(root, true, resolveOverlayConflict, true)] };
   },
   judge(report) { return report.problems; },
 };

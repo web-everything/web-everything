@@ -1,6 +1,6 @@
 /**
  * @file scripts/lib/settings-registry.mjs
- * @description Declared settings inventory and documentation generator; never resolves host overrides.
+ * @description Declared settings inventory and deterministic documentation renderer; never resolves host overrides.
  * Usage: node scripts/lib/settings-registry.mjs --write | --check
  * API: buildRegistry({ root }), renderMarkdown(registry), ensureRegistryDoc({ root }). Descriptions belong in per-key metadata files.
  */
@@ -243,6 +243,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     if (mode[0] === '--write') ensureRegistryDoc({ root: ROOT });
     else {
       const content = renderMarkdown(buildRegistry({ root: ROOT }));
+      if (renderMarkdown(buildRegistry({ root: ROOT })) !== content) throw Error('Settings registry render is not deterministic; repair the generator before regenerating');
       let existing;
       try { existing = readFileSync(join(ROOT, DOC), 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
       if (existing !== undefined && existing !== content) throw Error(`${DOC} is stale; run npm run settings:registry`);
