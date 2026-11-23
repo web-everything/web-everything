@@ -151,6 +151,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/lib/__tests__/settings-registry.test.mjs': 'false positive: git ls-files checks only the named generated settings-registry.md path is untracked; it does not enumerate the repo for a rule scan, and imports settings-registry.mjs so vitest related selects it when the generator changes',
   'scripts/lib/__tests__/deps-job-no-packages.test.mjs': 'walks the static import closure of deps-job.mjs; small hermetic parse; CI runs it on every PR and verify runs it when the test file itself changes',
   'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',
   'scripts/lib/__tests__/gh-ci-log.test.mjs': 'whole-tree structural check that every job-log reader under scripts/ and skills-src/ uses the shared gh-ci-log helper or is on its explicit deferred allowlist; it imports gh-ci-log.mjs so `vitest related` selects it when the helper changes, and CI runs it for any new bypass elsewhere',
