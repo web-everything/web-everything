@@ -85,17 +85,13 @@ jobs:
     timeout-minutes: 5
     outputs:
       light: ${{ steps.detect.outputs.light }}
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Enforce bot-owned test timings
-        if: github.event_name == 'pull_request'
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-        run: node scripts/ci/check-timings-bot-only.mjs
+          fetch-depth: 50
       - name: Is this a card-only PR?
         timeout-minutes: 4
         id: detect
@@ -121,6 +117,16 @@ jobs:
             fi
           fi
           node scripts/ci-card-only.mjs --event="$EVENT_NAME" --base="$BASE_SHA" --base-ref="$BASE_REF" --fresh-main-sha="$FRESH_MAIN_SHA" --head=HEAD >> "$GITHUB_OUTPUT"
+      - name: Enforce bot-owned test timings
+        if: github.event_name == 'pull_request'
+        # Changed files come from the GitHub API (no extra history fetch).
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: node scripts/ci/check-timings-bot-only.mjs
 
   # Sharded unit suite (#2682). The 2000+ vitest suite runs split across N parallel runners
   # (`vitest run --shard=i/N`) to cut the `test` gate's wall-clock. Each shard runs WITH coverage but

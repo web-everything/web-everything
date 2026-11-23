@@ -31,20 +31,33 @@ describe('bot-owned timings', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toMatch(/ci-timings-refresh.yml.*rerun CI/);
   });
-  it('CLI refuses an unavailable merge base', () => {
-    expect(cli({ GITHUB_EVENT_NAME: 'pull_request', BASE_SHA: '0'.repeat(40), HEAD_REF: 'lane/test' }).status).toBe(1);
+  it('CLI fails closed when the GitHub API call fails', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
+      expect(cli({ GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_REF: 'lane/test', PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('CLI reads the file list from the API and rejects a non-bot edit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nprocess.stdout.write('a.txt\\0\\n${file}\\0\\n');\n`, { mode: 0o755 });
+      const env = { GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', PATH: `${dir}:${process.env.PATH}` };
+      expect(cli({ ...env, HEAD_REF: 'lane/test' }).status).toBe(1);
+      expect(cli({ ...env, HEAD_REF: 'ci/refresh-test-timings' }).status).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('CLI fails closed on an oversized diff and asks a maintainer to inspect it', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-diff-'));
     try {
       // Fake git isolates the output bound without creating an enormous repository.
-      writeFileSync(join(dir, 'git'), `#!${process.execPath}
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
 const { writeSync } = require('node:fs');
 const chunk = Buffer.alloc(1024 * 1024, 97);
 for (let i = 0; i < 17; i++) writeSync(1, chunk);
 `, { mode: 0o755 });
       const result = cli({
-        GITHUB_EVENT_NAME: 'pull_request', BASE_SHA: 'a'.repeat(40), HEAD_REF: 'lane/test',
+        GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_REF: 'lane/test',
         PATH: `${dir}:${process.env.PATH}`,
       });
       expect(result.status).toBe(1);
@@ -58,10 +71,13 @@ for (let i = 0; i < 17; i++) writeSync(1, chunk);
     expect(step.if).toBe("github.event_name == 'pull_request'");
     expect(step.env).toEqual({
       GITHUB_EVENT_NAME: '${{ github.event_name }}',
-      BASE_SHA: '${{ github.event.pull_request.base.sha }}',
+      GH_TOKEN: '${{ github.token }}',
+      REPO: '${{ github.repository }}',
+      PR_NUMBER: '${{ github.event.pull_request.number }}',
       HEAD_REF: '${{ github.event.pull_request.head.ref }}',
     });
-    expect(steps[0].with['fetch-depth']).toBe(0);
+    expect(workflow.jobs.changes.permissions['pull-requests']).toBe('read');
+    expect(steps[0].with['fetch-depth']).toBe(50);
     expect(steps.indexOf(step)).toBeGreaterThan(0);
   });
   it('the writer allowlist matches the refresh workflow name', () => {

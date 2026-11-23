@@ -6418,8 +6418,8 @@ Merge-path checklist answers (this slice observes seat selection and has no gate
 ## Test timing ownership
 
 The scheduled bot refresh (`.github/workflows/ci-timings-refresh.yml`, currently weekly)
-owns `scripts/ci/test-timings.json`; PRs never edit it. PR authors adding unit tests
-or soak breaks leave that file to the weekly bot. Files without entries in that shared sharding map get their
+owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks should
+leave that file to the bot. Files without entries in that shared sharding map get their
 suite's median stored timing and still land in exactly one shard.
 
 Added and renamed soak tests need neither a shared timing entry nor a timing sidecar
