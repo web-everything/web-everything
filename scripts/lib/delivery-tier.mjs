@@ -70,9 +70,12 @@ function settingsHigh(opts) {
       ? opts.settings : JSON.parse((opts.readSettings ?? readFileSync)(SETTINGS_PATH, 'utf8'));
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return null;
     const extraHigh = Object.hasOwn(settings, 'extraHigh') ? settings.extraHigh : [];
-    if (!Array.isArray(extraHigh) || extraHigh.some(g => typeof g !== 'string' || !g.length)) return null;
+    if (!Array.isArray(extraHigh)) return null;
+    // Materialize holes as undefined before validation; only use the validated copy.
+    const rules = Array.from(extraHigh);
+    if (rules.some(g => typeof g !== 'string' || !g.length)) return null;
     // Only this additive key is read. Removal and lower-tier keys have no effect.
-    return extraHigh;
+    return rules;
   } catch {
     // Unknown settings evidence cannot license a LOW or MEDIUM classification.
     return null;

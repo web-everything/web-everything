@@ -97,6 +97,24 @@ describe('delivery tiers (observe-only)', () => {
     expect(classifyTier(['docs/x.md'], { settings }).tier).toBe('HIGH');
     expect(classifyTier(['docs/x.md'], { readSettings: () => JSON.stringify(settings) }).tier).toBe('HIGH');
   });
+  it.each([
+    ['all holes', Array(1)],
+    ['leading hole', [, 'private/**']],
+    ['interior hole', ['private/**', , 'other/**']],
+    ['trailing hole', ['private/**', ,]],
+    ['explicit undefined', [undefined]],
+  ])('invalid extraHigh fails closed for both APIs: %s', (_name, extraHigh) => {
+    const opts = { settings: { extraHigh } };
+    expect(classifyTier(['docs/x.md', 'scripts/conveyor/x.mjs'], opts)).toEqual({
+      tier: 'HIGH',
+      perFile: [
+        { path: 'docs/x.md', tier: 'HIGH', rule: 'settings-unavailable' },
+        { path: 'scripts/conveyor/x.mjs', tier: 'HIGH', rule: 'settings-unavailable' },
+      ],
+    });
+    expect(fileTier('docs/x.md', opts)).toBe('HIGH');
+    expect(fileTier('scripts/conveyor/x.mjs', opts)).toBe('HIGH');
+  });
   it('sparse arrays never classify LOW', () => {
     expect(classifyTier(Array(1), builtins).tier).toBe('HIGH');
     expect(classifyTier(Array(1), { readSettings: () => { throw new Error('x'); } }).tier).toBe('HIGH');
