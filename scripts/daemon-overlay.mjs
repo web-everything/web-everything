@@ -80,10 +80,12 @@
  * otherwise — including a `remove` of a ref that was never present, which is not a usage error.
  *
  * AUDIT ADMISSION: add/replace require exact-SHA canonical NOT WEAKENED evidence or a ruled-weakened
- * waiver. overlaySafety.auditEvidence defaults to refuse; WE_OVERLAY_AUDIT_EVIDENCE=refuse|warn|off (environment may only tighten settings)
- * overrides it. --unaudited-reason=<at least 10 characters> logs a warning and unaudited-override event.
+ * waiver. overlaySafety.auditEvidence (refuse|warn|off) defaults to refuse and resolves standard → platform →
+ * tool → environment. WE_OVERLAY_AUDIT_EVIDENCE may only TIGHTEN it (env warn/off over refuse is ignored); loosening
+ * takes the platform layer (WE_PLATFORM_PREFERENCES_FILE is the sanctioned test seam) or the tool settings file.
+ * --unaudited-reason=<at least 10 characters> logs a warning and unaudited-override event.
  * --audit-checked-by=prototype-load records the upstream checker in the added event; it grants no bypass.
- * --check stays read-only and does not run audit admission.
+ * --check runs audit admission read-only: it writes no registration or override event, and a refusal exits 3.
  *
  * THE NO-PR WARNING (xkhtg2a, incident 2026-10-08 — overlays without review or a merge link).
  * Adding without --pr warns loudly; overlaySafety.noPr=refuse (or WE_OVERLAY_NO_PR=refuse) refuses with exit 3

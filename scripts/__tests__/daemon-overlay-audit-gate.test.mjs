@@ -1,5 +1,5 @@
-import { test as nodeTest } from 'node:test';
-const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
+// Vitest-only: the guarded-registration and add --check tests below need `vi` (spies, env stubs).
+import { it as test } from 'vitest';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -98,6 +98,41 @@ test('a raced replacement restores the registered SHA and registration identity'
         tip: ref => ref === 'lane/new' ? newSha : 'c'.repeat(40) } });
     assert.equal(out.refused, 'replace-raced-restored');
     assert.deepEqual(readOverlays(root, { env }).find(entry => entry.ref === 'lane/old'), before);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('gate mode table: platform prefs file sets refuse/warn/off, env only tightens, with no evidence', () => {
+  // WE_PLATFORM_PREFERENCES_FILE is the policy-cascade's sanctioned platform-layer seam (tests, one-off live
+  // proofs). Pinned on purpose: a prefs file CAN set warn/off; the environment variable alone cannot.
+  const home = mkdtempSync(join(tmpdir(), 'overlay-gate-table-'));
+  const root = join(home, 'clone');
+  const { WE_OVERLAY_AUDIT_EVIDENCE: _inherited, ...baseEnv } = process.env;
+  void _inherited;
+  const prefsFor = (mode) => {
+    const file = join(home, `prefs-${mode}.json`);
+    writeFileSync(file, JSON.stringify({ overlaySafety: { auditEvidence: mode } }));
+    return file;
+  };
+  const gate = env => registrationAuditGate({ root, ref: 'lane/fix', sha, by: 'operator', readOnly: true,
+    env: { ...baseEnv, HOME: home, WE_DAEMON_OVERLAY_DIR: join(home, 'state'), ...env } });
+  try {
+    const rows = [
+      { prefs: 'refuse', expected: false },
+      { prefs: 'warn', expected: true },
+      { prefs: 'off', expected: true },
+      { prefs: 'warn', env: 'refuse', expected: false },
+      { prefs: 'off', env: 'refuse', expected: false },
+      { prefs: 'off', env: 'warn', expected: true },
+      { env: 'off', expected: false },
+      { env: 'warn', expected: false },
+    ];
+    for (const row of rows) {
+      const env = {};
+      if (row.prefs) env.WE_PLATFORM_PREFERENCES_FILE = prefsFor(row.prefs);
+      if (row.env) env.WE_OVERLAY_AUDIT_EVIDENCE = row.env;
+      assert.equal(gate(env), row.expected, JSON.stringify(row));
+    }
+    assert.equal(readdirSync(home).includes('state'), false, 'readOnly gate writes nothing');
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
