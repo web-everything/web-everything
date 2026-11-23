@@ -2,8 +2,8 @@
 import * as fs from 'node:fs';
 import { readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
-import { budgetFromSnapshot } from './resource-pool.mjs';
+import { basename, join } from 'node:path';
+import { POOL_DEFAULTS, validClasses, budgetFromSnapshot } from './resource-pool.mjs';
 import { readPoolLaneStatus, poolLaneLeased } from './resource-pool-lanes.mjs';
 import { admissionLockRoot, loadAdmissionPolicy, resolveSlotSpan, slotPath } from '../readiness/heavy-admission.mjs';
 import { EXEMPT_DISPATCH_KINDS, PREPARE_DISPATCH_KINDS } from '../readiness/heavy-queue-projection.mjs';
@@ -15,9 +15,14 @@ import { redTeamStatusDir } from './drain-red-team-evidence.mjs';
 import { probeSlotAlive } from '../operations/red-team-slots.mjs';
 import { pidStartTime, pidNamespace } from './pid-alive.mjs';
 import { liveReviewRoundBudget } from '../../skills-src/conveyor/review-daemon.mjs';
+import { operatorOverridesPath, CAPACITY_LEAVES } from './operator-override-reader.mjs';
+import { cascadePolicy, readPlatformPreferences, formatCascadeSourcesLine } from './policy-cascade.mjs';
+import { readEnumOverride } from './operator-enum-store.mjs';
+import { readSettingsChecked, SETTINGS_DIR, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 // No red-team job can legitimately retain a lease beyond one day.
 export const RED_TEAM_HARD_LEASE_CEILING_MS = 24 * 60 * 60 * 1000;
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+const integer = v => Number.isInteger(v) && v >= 0 && v <= 64;
 const clean = v => String(v).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
 /** Validate and read one opened object; bounded reads also refuse growth after fstat. */
 export function readPoolJson(path, { io = fs } = {}) {
@@ -35,11 +40,47 @@ export function readPoolJson(path, { io = fs } = {}) {
   } finally { io.closeSync(fd); }
 }
 const json = path => readPoolJson(path).data;
+/** Numeric override stores are flat: decode key tokens to catch escaped duplicates too. */
+export function readPoolOverrides({ file = operatorOverridesPath() } = {}) {
+  let checked;
+  try { checked = readPoolJson(file); } catch (e) { if (e.code === 'ENOENT') return {}; throw e; }
+  const seen = new Set();
+  for (const match of checked.text.matchAll(/"(?:[^"\\]|\\.)*"\s*:/g)) {
+    const key = JSON.parse(match[0].slice(0, match[0].lastIndexOf(':')).trim());
+    if (seen.has(key)) throw Error('duplicate capacity override key; repair operator store and rerun');
+    seen.add(key);
+  }
+  const result = {};
+  for (const [key, value] of Object.entries(checked.data)) {
+    if (!key.startsWith('resourcePool.')) continue;
+    if (!CAPACITY_LEAVES[key]?.validate(value)) throw Error('invalid resourcePool override; repair operator store and rerun');
+    result[key.slice('resourcePool.'.length)] = value;
+  }
+  return result;
+}
 const list = path => {
   const entries = readdirSync(path, { withFileTypes: true });
   if (entries.length > 20000) throw Error('source exceeds 20000 entries; inspect/archive source manually');
   return entries;
 };
+/** Dotted filename keys in unrelated settings are data, not resourcePool policy paths.
+ * Keep all read/parse/duplicate errors closed; waive only dotted-key taint from a
+ * readable layer proven unable to own this namespace (including dotted aliases). */
+export function readPoolSettingsChecked({ dir = SETTINGS_DIR,
+  legacyPath = LEGACY_SETTINGS_PATH } = {}) {
+  const checked = readSettingsChecked({ namespace: 'resourcePool', dir, legacyPath });
+  checked.taint = checked.taint.filter(t => {
+    if (t.reason !== 'dotted key') return true;
+    try {
+      const path = t.source === basename(LEGACY_SETTINGS_PATH) ? legacyPath
+        : /^settings\/[a-z0-9-]+\.json$/.test(t.source) ? join(dir, t.source.slice(9)) : null;
+      const data = json(path);
+      return Object.keys(data).some(k => k === 'resourcePool' || k.startsWith('resourcePool.'));
+    } catch { return true; }
+  });
+  return checked;
+}
+
 /** The tolerant admission status reader can hide malformed lock.json: validate each slot directly. */
 export function readPoolHeavyHeld({ env = process.env, root = admissionLockRoot(process.cwd(), env),
   cap = resolveSlotSpan(loadAdmissionPolicy({ env }).settings) } = {}) {
@@ -59,6 +100,54 @@ export function readPoolHeavyHeld({ env = process.env, root = admissionLockRoot(
   return { held };
 }
 
+/** Resolve each read afresh; unreadable layers never become permission to grant. */
+export function loadPoolSettings({ env = process.env, read = readPoolSettingsChecked,
+  platform, operatorOverride, overrideFile, enumOverride, log = () => {} } = {}) {
+  let error;
+  const project = p => {
+    if (p === undefined) return p;
+    if (!object(p)) { error = 'invalid resourcePool layer'; return {}; }
+    // Validate before the cascade flattens objects and can drop an empty value.
+    if (Object.keys(p).some(k => !['mode', 'builderFloor', 'classes', 'class'].includes(k))) error = 'unrecognized resourcePool key';
+    if (Object.hasOwn(p, 'mode') && !['off', 'shadow', 'enforce'].includes(p.mode)) error = 'invalid resourcePool mode';
+    if (Object.hasOwn(p, 'builderFloor') && !integer(p.builderFloor)) error = 'invalid resourcePool builderFloor';
+    const { classes, ...rest } = p;
+    const value = { ...rest, ...(classes === undefined ? {} : { class: classes }) };
+    if (value.class !== undefined && (!object(value.class) || Object.entries(value.class).some(([c, v]) =>
+      !['1', '2', '3', '4'].includes(c) || !object(v) || Object.entries(v).some(([k, n]) =>
+        !['reserve', 'max', ...(c === '1' ? ['class1Overdraw'] : [])].includes(k) || !integer(n))))) error = 'invalid resourcePool class bounds';
+    return value;
+  };
+  let tool;
+  try {
+    const checked = read();
+    if (!object(checked?.value) || !Array.isArray(checked.taint) || checked.taint.length) throw Error('unreadable/tainted resourcePool settings');
+    tool = project(checked.value);
+    if (platform === undefined) {
+      const result = readPlatformPreferences({ env });
+      if (result.errors.length) error = 'unreadable platform settings';
+      platform = Object.hasOwn(result.prefs, 'resourcePool') ? result.prefs.resourcePool : {};
+    }
+    if (operatorOverride === undefined) operatorOverride = readPoolOverrides({ file: overrideFile });
+    if (enumOverride === undefined) enumOverride = readEnumOverride('resourcePool.mode');
+  } catch (e) { error = clean(e.message); }
+  const valid = { mode: v => ['off', 'shadow', 'enforce'].includes(v), builderFloor: integer, class: object };
+  for (let c = 1; c <= 4; c++) for (const k of ['reserve', 'max', ...(c === 1 ? ['class1Overdraw'] : [])]) valid[`class.${c}.${k}`] = integer;
+  const resolved = cascadePolicy('resourcePool', tool, { env, platform: project(platform) ?? {}, operatorOverride: operatorOverride ?? null,
+    standard: { mode: 'shadow', builderFloor: 4, class: POOL_DEFAULTS.classes },
+    envValues: { mode: env.WE_RESOURCE_POOL_MODE }, valid });
+  if (enumOverride?.ok) { resolved.value.mode = enumOverride.value; resolved.sources.mode = 'operator-enum-db'; resolved.leafValues.mode = enumOverride.value; }
+  const { class: classes, ...rest } = resolved.value;
+  if (rest.mode === 'enforce') error = 'enforce is not yet supported; hold, select shadow/off or implement an enforcement gate';
+  const unknown = !!error || !!resolved.invalid.length || operatorOverride === null || !validClasses(classes)
+    || !integer(rest.builderFloor) || !valid.mode(rest.mode)
+    || !enumOverride || (!enumOverride.ok && !['absent', 'not-set'].includes(enumOverride.reason));
+  const configuredMode = rest.mode;
+  const value = { mode: configuredMode === 'off' ? 'off' : 'shadow', builderFloor: rest.builderFloor, classes };
+  const provenance = `${formatCascadeSourcesLine('resourcePool', resolved)}; S1a effective mode=${value.mode} (configured ${configuredMode})`;
+  log(provenance);
+  return { value, configuredMode, unknown, error: error ?? (unknown ? 'invalid settings; inspect layers and rerun' : undefined), provenance };
+}
 export const SOURCES = Object.freeze({ snapshot: 'resource-sampler snapshot (memory, swap, CPU)',
   rounds: 'liveReviewRoundBudget (bounded ps process inventory)', redTeam: 'redTeamStatusDir (canonical status files)',
   fix: 'fixDispatchClaimRoot (class-3 fix claims)', workers: 'read-only lane leases + heavy-admission held fix/ci-heal slots' });

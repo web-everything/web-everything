@@ -30,9 +30,11 @@ vi.mock('node:child_process', async importOriginal => {
   return { ...guarded, default: guarded };
 });
 const fs = await vi.importActual('node:fs');
+const { mkdirSync, writeFileSync } = fs;
 import { execFileSync } from 'node:child_process';
 import { readPoolSource, readPoolJson, readPoolHeavyHeld, poolPidAlive, poolSourcePaths,
-  SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS } from '../resource-pool-io.mjs';
+  SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
+import { POOL_DEFAULTS, grantDecision } from '../resource-pool.mjs';
 import { readPoolLaneStatus } from '../resource-pool-lanes.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 let coord, paths, env, laneDir;
@@ -55,6 +57,85 @@ afterEach(() => { guard.active = false; fs.rmSync(coord, { recursive: true, forc
 const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, namespace: 'local', host: 'studio',
   listCommands: () => `${process.pid} 1 node resource-pool.mjs`, roundBudget: () => ({ live: 2 }),
   laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), slotAlive: () => true, ...options });
+const settingsArgs = () => ({ env: {}, read: () => ({ value: structuredClone(POOL_DEFAULTS), taint: [] }),
+  platform: {}, operatorOverride: {}, enumOverride: { ok: false, reason: 'absent' } });
+const expectClosed = settings => {
+  expect(settings.unknown).toBe(true);
+  expect(settings.value.mode).not.toBe('enforce');
+  expect(grantDecision({ budget: 30, held: [], class: 4, size: 1,
+    classes: settings.value.classes, unknown: settings.unknown })).toMatchObject({ decision: 'hold', unknown: true });
+};
+it.each(['tool', 'platform', 'env', 'enum'])('enforce in %s is unknown and never grants', layer => {
+  const args = settingsArgs();
+  if (layer === 'tool') args.read = () => ({ value: { mode: 'enforce' }, taint: [] });
+  if (layer === 'platform') { args.read = () => ({ value: {}, taint: [] }); args.platform = { mode: 'enforce' }; }
+  if (layer === 'env') args.env.WE_RESOURCE_POOL_MODE = 'enforce';
+  if (layer === 'enum') args.enumOverride = { ok: true, value: 'enforce' };
+  expectClosed(loadPoolSettings(args));
+});
+it.each([{}, [], null, 1])('invalid mode %j cannot disappear during flattening', mode => {
+  for (const layer of ['tool', 'platform']) {
+    const args = settingsArgs();
+    if (layer === 'tool') args.read = () => ({ value: { mode }, taint: [] });
+    else args.platform = { mode };
+    expectClosed(loadPoolSettings(args));
+  }
+});
+it('rejects typo keys and explicit null platform namespace', () => {
+  expectClosed(loadPoolSettings({ ...settingsArgs(), platform: { builderFlor: 20 } }));
+  const file = join(coord, 'preferences.json'); writeFileSync(file, '{"resourcePool":null}');
+  const args = settingsArgs(); delete args.platform;
+  expectClosed(loadPoolSettings({ ...args, env: { WE_PLATFORM_PREFERENCES_FILE: file } }));
+});
+it('duplicate numeric override keys including escaped equivalents invalidate evidence', () => {
+  const file = join(coord, 'overrides.json');
+  for (const key of ['resourcePool.builderFloor', 'resourcePool.builderFlo\\u006fr']) {
+    writeFileSync(file, `{"resourcePool.builderFloor":20,"${key}":0}`);
+    expect(() => readPoolOverrides({ file })).toThrow(/duplicate/);
+    const args = settingsArgs(); delete args.operatorOverride;
+    // Exercise the loader's error path through its checked reader.
+    expectClosed(loadPoolSettings({ ...args, overrideFile: file }));
+  }
+});
+it('settings default shadow/floor4; enforce is refused; all sources logged', () => {
+  const log = vi.fn(); const result = loadPoolSettings({ ...settingsArgs(), log });
+  expect(result.value).toMatchObject({ mode: 'shadow', builderFloor: 4 }); expect(result.unknown).toBe(false);
+  expect(log.mock.calls[0][0]).toContain('tool');
+  const enforce = loadPoolSettings({ ...settingsArgs(), env: { WE_RESOURCE_POOL_MODE: 'enforce' } });
+  expect(enforce).toMatchObject({ configuredMode: 'enforce', unknown: true, error: expect.stringContaining('not yet supported') });
+  const overridden = loadPoolSettings({ ...settingsArgs(), operatorOverride: { builderFloor: 6, 'class.3.max': 10 }, enumOverride: { ok: true, value: 'off' } });
+  expect(overridden.value).toMatchObject({ mode: 'off', builderFloor: 6, classes: { 3: { max: 10 } } });
+  expect(overridden.provenance).toContain('operator-enum-db');
+});
+it('settings fail closed for unreadable layers, unknown enum and out-of-range/inverted bounds', () => {
+  for (const patch of [{ operatorOverride: null }, { enumOverride: { ok: false, reason: 'unreadable' } },
+    { enumOverride: { ok: true, value: 'live' } }, { read: () => { throw Error('unreadable'); } },
+    { read: () => ({ value: {}, taint: [{ reason: 'malformed' }] }) }, { platform: null },
+    { env: { WE_RESOURCE_POOL_MODE: 'live' } }]) expectClosed(loadPoolSettings({ ...settingsArgs(), ...patch }));
+  for (const bad of [-1, 65, NaN, 0.1, null, {}, []]) {
+    const args = settingsArgs(); args.read = () => ({ value: { builderFloor: bad }, taint: [] });
+    expectClosed(loadPoolSettings(args));
+    args.read = () => ({ value: { classes: { 2: { max: bad } } }, taint: [] });
+    expectClosed(loadPoolSettings(args));
+  }
+  const args = settingsArgs(); args.read = () => ({ value: { classes: { 2: { reserve: 9, max: 8 } } }, taint: [] });
+  expectClosed(loadPoolSettings(args));
+});
+it('unrelated dotted filenames do not taint pool settings, but unreadable or owning files do', () => {
+  const dir = join(coord, 'settings'); mkdirSync(dir); const legacyPath = join(coord, 'legacy.json');
+  writeFileSync(join(dir, 'pool.json'), JSON.stringify({ resourcePool: POOL_DEFAULTS }));
+  writeFileSync(join(dir, 'other.json'), '{"other":{"file.mjs":true}}');
+  expect(readPoolSettingsChecked({ dir, legacyPath }).taint).toEqual([]);
+  writeFileSync(join(dir, 'other.json'), '{'); expect(readPoolSettingsChecked({ dir, legacyPath }).taint.length).toBeGreaterThan(0);
+  const args = { ...settingsArgs(), read: () => readPoolSettingsChecked({ dir, legacyPath }) };
+  expectClosed(loadPoolSettings(args));
+  writeFileSync(join(dir, 'other.json'), '{"resourcePool":{"file.mjs":true}}');
+  expectClosed(loadPoolSettings(args));
+  writeFileSync(join(dir, 'other.json'), '{"resourcePool.mode":"off"}');
+  expectClosed(loadPoolSettings(args));
+  fs.rmSync(join(dir, 'other.json')); mkdirSync(join(dir, 'other.json'));
+  expectClosed(loadPoolSettings(args));
+});
 it('workers and lane inventory perform zero fs writes and never launch the lane-pool CLI', () => {
   fs.writeFileSync(join(laneDir, '.lane-lease'), JSON.stringify(lease()));
   const pool = join(laneDir, '..'); fs.mkdirSync(join(pool, '.quarantine-state'));
