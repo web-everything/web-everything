@@ -187,15 +187,16 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     validateLeanOpenPrs(inventory, OPEN_PR_LIST_LIMIT, repo);
     return [repo, inventory];
   }));
-  const revalidateAfterMembership = async writtenAt => {
+  const revalidateAfterMembership = async (writtenAt, refreshedRows = null) => {
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
       throw new Error('pass main changed while reading — use live listing or retry next pass');
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
-    // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    return readSources();
+    // Refreshed rows are used as returned (a slow cold refresh can outlive the shared cache TTL, so a cache-only
+    // re-read would fail); otherwise keep the current cache-only rows: a refreshed source cannot validate older evidence.
+    return refreshedRows ?? readSources();
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -212,14 +213,15 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     const hit = cached();
     if (hit) return revalidateMembership(hit);
     let writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
+    let refreshedRows = null;
     try { readSources(); } catch (e) {
       if (e?.code !== SNAPSHOT_UNAVAILABLE) throw e; // only an unavailable/stale cache may be refreshed; anything else stays fatal
       // Refresh outside the whole-read deadline; all subsequent reads share this one anchor.
-      readSources({ refresh: true });
+      refreshedRows = readSources({ refresh: true });
       writtenAt = now();
     }
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt);
+    const snapshots = await revalidateAfterMembership(writtenAt, refreshedRows);
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });

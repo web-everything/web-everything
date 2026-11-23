@@ -59,7 +59,7 @@ for (const refreshAvailable of [true, false]) {
       assert.deepEqual(result.snapshots.get(repo), [pr(7)]);
       const cached = await readFastDrainPassInventory(options);
       assert.deepEqual(cached.snapshots.get(repo), [pr(7)]);
-      assert.deepEqual(calls, [undefined, { refresh: true }, undefined, undefined]);
+      assert.deepEqual(calls, [undefined, { refresh: true }, undefined]);
     } else {
       await assert.rejects(readFastDrainPassInventory(options), /snapshot unavailable\/disabled\/stale\/dirty/);
       assert.deepEqual(calls, [undefined, { refresh: true }]);
