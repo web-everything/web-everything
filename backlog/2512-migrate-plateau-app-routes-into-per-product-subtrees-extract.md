@@ -369,3 +369,5 @@ redirect proof), **consumer** (low — reviewer additionally swept `plateau-app:
 `plateau-app:tools/explorer/`, `plateau-app:scripts/`, and the other e2e spec for hardcoded old-path
 references and found none beyond what's now listed; the `technical-configurator` seed files'
 `/backlog/NNN-slug/` hrefs point at the WE docs site, not plateau-app's own route, correctly out of scope).
+
+Will be closed when plan step DZ-SHELL and card xdzzp2l delivers; ruled 2026-11-22 (PL-ROUTES).
