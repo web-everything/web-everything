@@ -14,6 +14,7 @@
 # No secret is exposed: the job has only the read-scoped GITHUB_TOKEN and never executes PR code.
 # WHY `pull_request`, NOT `pull_request_target` (PRT-MIGRATE): GitHub blocks pull_request_target by default
 # for public repos from Dec 2; trial blocks ended our runs in startup_failure on Nov 9 and Nov 16.
+# The live org ruleset 24930207 pin is the load-bearing control, verified by the post-merge live probe (b) (a draft PR editing merge-gate.yml to `exit 0` must stay unmergeable), not by this repo.
 # The cost: GitHub reads the workflow file from the PR's merge ref for `pull_request`, so a PR can edit THIS
 # file to `exit 0`. The org ruleset pins merge-gate.yml to refs/heads/main so the required check runs main's YAML;
 # the `merge-gate` check comes from integration 15368 only. Together with the human-only workflow-edit hold in

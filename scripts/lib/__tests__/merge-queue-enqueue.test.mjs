@@ -39,19 +39,35 @@ const unreadableRuns = [
 ];
 
 describe('classifyStartupFailureGate', () => {
-  it('accepts pull_request startup failures', () => {
-    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ event: 'pull_request' })] }))
+  it('accepts main-pinned pull_request startup failures', () => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ event: 'pull_request', path: '.github/workflows/merge-gate.yml@refs/heads/main' })] }))
       .toMatchObject({ stale: true, runId: 123 });
   });
-  it.each([false, true])('new pull_request success supersedes old target startup failure (reverse order %s)', reverse => {
-    const runs = [startupRun({ id: 100 }), startupRun({ id: 200, event: 'pull_request', conclusion: 'success' })];
+  it.each([false, true])('new main-pinned pull_request success supersedes old target startup failure (reverse order %s)', reverse => {
+    const runs = [startupRun({ id: 100 }), startupRun({ id: 200, event: 'pull_request', path: '.github/workflows/merge-gate.yml@refs/heads/main', conclusion: 'success' })];
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: reverse ? runs.reverse() : runs }))
       .toMatchObject({ stale: false });
   });
-  it.each([false, true])('new pull_request startup failure supersedes old target success (reverse order %s)', reverse => {
-    const runs = [startupRun({ id: 100, conclusion: 'success' }), startupRun({ id: 200, event: 'pull_request' })];
+  it.each([false, true])('new main-pinned pull_request startup failure supersedes old target success (reverse order %s)', reverse => {
+    const runs = [startupRun({ id: 100, conclusion: 'success' }), startupRun({ id: 200, event: 'pull_request', path: '.github/workflows/merge-gate.yml@refs/heads/main' })];
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: reverse ? runs.reverse() : runs }))
       .toMatchObject({ stale: true, runId: 200 });
+  });
+  it.each(['.github/workflows/merge-gate.yml@refs/pull/7/merge', '.github/workflows/merge-gate.yml'])('ignores untrusted pull_request runs entirely: %s', path => {
+    const untrusted = startupRun({ id: 200, event: 'pull_request', path });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [untrusted] })).toMatchObject({ stale: false });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), { ...untrusted, conclusion: 'success' }] }))
+      .toMatchObject({ stale: true, runId: 123 });
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ conclusion: 'success' }), untrusted] }))
+      .toMatchObject({ stale: false });
+  });
+  it.each(['refs/heads/main', 'refs/pull/7/merge'])('accepts historical pull_request_target startup failures with any ref: %s', ref => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ path: `.github/workflows/merge-gate.yml@${ref}` })] }))
+      .toMatchObject({ stale: true, runId: 123 });
+  });
+  it('ignores another workflow even when pinned to main', () => {
+    expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun({ event: 'pull_request', path: '.github/workflows/ci.yml@refs/heads/main' })] }))
+      .toMatchObject({ stale: false });
   });
   it.each(['push', 'workflow_dispatch', 'issues'])('ignores a newer %s success when a PR startup failure exists', event => {
     expect(classifyStartupFailureGate({ headSha: HEAD, runs: [startupRun(), startupRun({ id: 200, event, conclusion: 'success' })] }))

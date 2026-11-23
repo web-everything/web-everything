@@ -482,8 +482,8 @@ export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMerg
   return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
 }
 
-/** Pure: select the newest Merge gate PR run across pull_request and historical pull_request_target runs.
- * Other events are ignored; never infer freshness from a check-run. */
+/** Pure: select the newest trusted Merge gate PR run: main-pinned pull_request or historical
+ * pull_request_target (always main's YAML). Ignore PR-controlled YAML; never infer freshness from a check-run. */
 export function classifyStartupFailureGate({ runs, headSha } = {}) {
   const no = reason => ({ stale: false, reason });
   if (!Array.isArray(runs) || typeof headSha !== 'string' || !headSha.trim()) return no('workflow runs or head unreadable');
@@ -493,7 +493,11 @@ export function classifyStartupFailureGate({ runs, headSha } = {}) {
     if (typeof run.head_sha !== 'string' || typeof run.event !== 'string') return no('workflow run head/event unreadable');
     if (run.head_sha !== headSha || (run.event !== 'pull_request' && run.event !== 'pull_request_target')) continue;
     if (typeof run.path !== 'string') return no('workflow run path unreadable');
-    if (run.path.split('@')[0] !== '.github/workflows/merge-gate.yml') continue;
+    const separator = run.path.indexOf('@');
+    const path = separator < 0 ? run.path : run.path.slice(0, separator);
+    const ref = separator < 0 ? undefined : run.path.slice(separator + 1);
+    if (path !== '.github/workflows/merge-gate.yml') continue;
+    if (run.event === 'pull_request' && ref !== 'refs/heads/main') continue;
     if (!Number.isSafeInteger(run.id) || run.id <= 0) return no('workflow run id unreadable');
     if (!newest || run.id > newest.id) newest = run;
   }

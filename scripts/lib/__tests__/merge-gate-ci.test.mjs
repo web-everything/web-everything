@@ -1266,6 +1266,11 @@ describe('verifyRunningWorkflow', () => {
 // ── operator guidance: the printed ruleset carries the workflows pin and the Actions integration id ───────
 
 describe('--print-ruleset (the operator ruleset steps come from rulesetSuggestion)', () => {
+  it('defines the merge-gate main pin and GitHub Actions integration restriction in the repo suggestion', () => {
+    const suggestion = rulesetSuggestion({});
+    expect(suggestion.requiredWorkflows).toContainEqual({ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' });
+    expect(suggestion.requiredStatusCheckIntegrationId).toBe(15368);
+  });
   it('prints the main-pinned required workflows and the GitHub Actions integration id', () => {
     const script = new URL('../../merge-gate-check.mjs', import.meta.url).pathname;
     const out = execFileSync(process.execPath, [script, '--print-ruleset'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
