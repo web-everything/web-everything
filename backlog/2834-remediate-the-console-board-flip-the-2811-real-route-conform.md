@@ -5,9 +5,9 @@ size: 8
 parent: "2804"
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: #2811 is unparked; remediation depends on the final route and tokens."
+maturityTrigger: "adoptionSignal: plan step PD-BOARD mounts the board in the new shell (final route and tokens exist)."
 dateParked: "2026-11-22"
-blockedBy: ["2811"]
+blockedBy: []
 scope:
   - "plateau-app:src/backlog-view/lane-board.ts"
   - "plateau-app:src/backlog-view/lane-board.css"
@@ -57,4 +57,4 @@ board is actually fixed. WE validates; plateau-app renders (MEMORY #6 preserved)
 - Full plateau-app `npm test` stays green; `we:` `check:standards` passes.
 - Delivered via a plateau-app PR left OPEN for the orchestrator's independent review of the red→green proof.
 
-Ruled PARK in the master plan (2026-11-22); blockedBy #2811 added so it re-enters readiness when #2811 resolves. Left parked rather than reopened: no declared operation moves a parked card to open, and #2811 is itself parked. Unpark when: #2811 is unparked.
+Ruled PARK in the master plan (2026-11-22), kept parked (operator ruling). No blockedBy on #2811: #2811's red-to-green proof depends on this remediation, so that edge would be circular. Unpark when: plan step PD-BOARD mounts the board in the new shell (final route and tokens exist). #2811's failing oracle is written first and is not deferred.

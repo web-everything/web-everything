@@ -10,7 +10,7 @@ priority: low
 dateOpened: "2026-07-11"
 dateResolved: "2026-11-23"
 graduatedTo: 5488
-codifiedIn: one-off
+codifiedIn: docs/agent/platform-decisions.md#devtools-placement
 preparedDate: "2026-07-28"
 researchTopic: delivery-coordinator-placement
 relatedReport: reports/2026-07-12-delivery-coordinator-placement.md

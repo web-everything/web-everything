@@ -20,6 +20,12 @@ A /delivery/ page in plateau-app (the product), routed like /wip: a route templa
 
 - [A1] **Executable** — From the plateau-app repository root, `npm test -- delivery-view.test` selects plateau-app:src/delivery/delivery-view.test.ts by filename filter; it fails before implementation and passes after, exercising every named case below.
 
+- [A2] Carried from #3736 (PL-WIP-CLEANUP): the page shows a ranked attention queue, with a named owner for the automatic queuing of Attention findings, and the full list is reachable from it; a test asserts the ranking, the owner and the full list.
+- [A3] Carried from #4007: each card shows its live plan steps and their state; a test fails if no live plan step is rendered for a card that has some.
+- [A4] Carried from #4199: a per-card activity panel lists sessions and jobs (review, fixer separately) with all required fields, the producer dependency, bounded validation, healthy-empty / unknown / stale kept distinguishable, verified transcript access or path fallback, and the publisher to relay to phone proof; each has a named test.
+- [A5] Carried from #5358: card focus and highlight from a deep link, the matching session's panel opens, and an unknown card or session identity is handled (no crash, no false highlight); each has a test.
+- [A6] Carried from #5593: deep-link actions apply only to the real snapshot, never to the fallback sample; a test asserts the fallback sample receives no deep-link action.
+
 ## Test plan
 
 All cases below are CAPABILITY tests (RED before implementation) in plateau-app:src/delivery/delivery-view.test.ts, exercising the real reader and mounted route with the collector contract fixture.

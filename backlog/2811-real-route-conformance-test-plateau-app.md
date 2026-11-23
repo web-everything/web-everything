@@ -32,3 +32,5 @@ real failure:
 - `render-slice`: resolve gates on the rendered red→green proof, human-reviewed.
 
 Parked 2026-11-22 (plateau ruling, master plan). Unpark when: the board is mounted in the new shell (plan step PD-BOARD) so the real-route oracle has a final route. Parked, not blockedBy, because the trigger is a plan step.
+
+Acceptance order (audit fix): the failing oracle is the FIRST acceptance item and is not deferred. The real-route conformance check must be written and shown RED against the current `/console-board` before any board remediation (#2834) starts. Only the remaining work (running it on the final route in the new shell, red to green) waits on the PD-BOARD trigger.
