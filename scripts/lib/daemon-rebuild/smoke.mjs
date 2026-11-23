@@ -22,7 +22,7 @@ import { dirname, join, posix } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
-import { pinnedStatus, planRebuild } from './plan.mjs';
+import { pinnedStatus, planRebuild, planStrictAdopt } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
@@ -476,10 +476,10 @@ export async function smokeAndAdopt({
   const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
     // Recovery uses only evidence collected in this run, never historical passing trees.
     const freshComparison = label != null;
-    if (freshComparison) changedFiles = null;
+    if (freshComparison || planStrictAdopt(plan)) changedFiles = null; // strictAdopt: full fresh smoke, no incremental checks
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = !freshComparison && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    const proven = !freshComparison && !planStrictAdopt(plan) && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
@@ -633,8 +633,15 @@ export async function smokeAndAdopt({
       const recorded = await locked((st) => { st.forceUnverifiedTrees = [tree, ...(st.forceUnverifiedTrees || []).filter((t) => t !== tree)].slice(0, 5); });
       if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
+    // strictAdopt: the fresh-smoke mark rides the ready record so a deferred adoption can prove its smoke was complete.
+    const strictBuild = planStrictAdopt(p) || planStrictAdopt(plan);
+    // Fresh means every row ran in THIS run for THIS candidate: no row reused from an earlier candidate/attempt.
+    const freshSmoke = !overFailedSmoke && readyMeta?.forced !== true && completeSmokePass(smokeResult)
+      && !smokeResult.smoke.results.some(row => row?.reused) ? p.finalSha : null;
     writeReadyCandidate(root, {
       ...readyMeta,
+      strictAdopt: strictBuild,
+      freshSmoke,
       prevHead,
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
@@ -662,7 +669,7 @@ export async function smokeAndAdopt({
       };
     }
     const fin = await withWriteLock(root, () => finalizeRebuild({
-      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
+      root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted, strictAdopt: strictBuild, freshSmoke, mainOnly,
       auditedTip: makeAuditedTipGate(env), // unaudited-tip: evidence revoked during the smoke must not be adopted
     }), finalizeLockOpts);
     if (!fin.ok) {
@@ -995,7 +1002,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0' && !planStrictAdopt(plan)) { // strictAdopt: never adopt over a failed smoke
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
