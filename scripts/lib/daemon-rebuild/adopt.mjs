@@ -5,7 +5,7 @@
 import { mkdirSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { hostname } from 'node:os';
-import { pinnedStatus, pinnedConflictSkippable, planStrictAdopt } from './plan.mjs';
+import { pinnedStatus, pinnedConflictSkippable, planStrictAdopt, adoptionDecisions } from './plan.mjs';
 import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { alertsFilePath, readRebuildState, writeRebuildState, clearReadyCandidate, appliedShape } from './state.mjs';
 import { verifyRev, makeGit } from './shared.mjs';
@@ -129,13 +129,17 @@ export function matchReadyCandidate({
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const revokedExact = revokedAudit(ready.adopt);
     if (revokedExact.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedExact };
-    return { adopt: ready.adopt, dropRefs: [], match: 'exact', ...staleInfo() };
+    // Legacy records can recover decisions from the identical live plan; never
+    // interpret an absent serialized field as proof that no overlay was omitted.
+    return { adopt: { ...ready.adopt, decisions: adoptionDecisions(ready.adopt, plan) }, dropRefs: [], match: 'exact', ...staleInfo() };
   }
   const planTree = treeOf(plan.finalSha);
   if (planTree && ready.tree && planTree === ready.tree) {
     if (!carriesOnlyWanted) return { adopt: null, reason: 'overlay-no-longer-wanted' };
     const adopt = {
       finalSha: plan.finalSha, inputsKey: plan.inputsKey, mainSha: plan.mainSha, applied: plan.applied,
+      // Retain recorded omissions that a main-only live plan did not examine.
+      decisions: adoptionDecisions(plan, ready.adopt),
     };
     const revokedSameTree = revokedAudit(adopt);
     if (revokedSameTree.length > 0) return { adopt: null, reason: 'ready-audit-revoked', omitted: revokedSameTree };
@@ -473,7 +477,9 @@ async function finalizeRebuildLocked({
         if (!live.overlays.some(o => o.ref === ref)
           || plan.decisions?.some(d => d.ref === ref && d.action === 'remove')) delete aside[ref];
       }
-      for (const d of plan.decisions ?? []) if (d.setAside) aside[d.ref] = d.setAside;
+      for (const d of plan.decisions ?? []) {
+        if (d.setAside && live.overlays.some(o => o.ref === d.ref)) aside[d.ref] = d.setAside;
+      }
       for (const a of state.adopted?.applied ?? []) delete aside[a.ref];
       // Unknown history survives when overlays were not examined or an unaudited ref is still held.
       if (state.setAside !== undefined || (!mainOnly && !plan.decisions?.some(d => d.reason === 'unaudited-tip-held'))) {
@@ -510,15 +516,9 @@ async function finalizeRebuildLocked({
   // Strictness is DERIVED FROM FACTS here, not trusted from planner decisions: the candidate's applied set is missing
   // any registered, non-retired overlay (smoke-fallback drops included), or the omission/set-aside history is unknown.
   const live = isRollback ? { overlays: [] } : readOverlayState(root, { env });
-  const appliedRefs = new Set((plan.applied ?? []).map(a => a.ref));
-  const retiredRefs = new Set((plan.decisions ?? []).filter(d => d?.action === 'remove').map(d => d.ref));
-  const factMissing = !isRollback && !live.corrupt && live.overlays.some(o => !appliedRefs.has(o.ref) && !retiredRefs.has(o.ref));
-  // Unknown history only matters when the candidate has lost something the last adoption carried (a missing/unreadable
-  // record cannot explain the loss); a candidate that carries everything the last adoption did owes no history.
-  const lostSinceAdopted = (state.adopted?.applied ?? []).some(a => !appliedRefs.has(a.ref) && !retiredRefs.has(a.ref));
-  const historyUnknown = !isRollback && ((state.setAside === undefined && lostSinceAdopted)
-    || (state.setAside != null && (typeof state.setAside !== 'object' || Array.isArray(state.setAside))));
-  const strict = strictAdopt === true || planStrictAdopt(plan) || factMissing || historyUnknown;
+  const strict = strictAdopt === true || planStrictAdopt(plan, isRollback ? {} : {
+    overlays: live.corrupt ? [] : live.overlays, state,
+  });
   if (strict && !isRollback && freshSmoke !== plan.finalSha) {
     alert('strict-adopt-refused', { target: plan.finalSha, message: 'a build that omits or sets aside an overlay is adopted only on a fresh complete smoke pass of this candidate; keeping last-good' });
     clearReadyCandidate(root, stEnv);

@@ -189,6 +189,24 @@ it('does not invent adopted ancestry for omitted content, and still audits its r
   } finally { f.cleanup(); }
 }, 60_000);
 
+it('ready-only set-aside adoption retains the audit requirement after a real branch repair', async () => {
+  const f = await createSetAsideFixture({ audited: true });
+  try {
+    const before = f.head();
+    expect(await f.rebuild({ readyOnly: true })).toMatchObject({ readyRecorded: true });
+    expect(f.head()).toBe(before);
+    expect(f.state().setAside?.[f.ref]).toBeUndefined();
+    expect(readReadyCandidate(f.root, f.env).adopt.decisions).toContainEqual(expect.objectContaining({
+      ref: f.ref, setAside: expect.objectContaining({ sha: f.tip }),
+    }));
+    expect(await f.rebuild({ adoptOnly: true })).toMatchObject({ adopted: true, readyMatch: 'exact' });
+    expect(f.state().setAside[f.ref]).toMatchObject({ sha: f.tip, mainSha: f.main });
+    await f.repair();
+    expect(f.state().adopted.applied.some(o => o.ref === f.ref)).toBe(false);
+    expect(f.alerts().some(a => a.kind === 'overlay-unaudited-tip')).toBe(true);
+  } finally { f.cleanup(); }
+}, 60_000);
+
 it('unreadable main-sync state keeps the live overlay hold and names operator repair', async () => {
   const f = await createSetAsideFixture();
   try {

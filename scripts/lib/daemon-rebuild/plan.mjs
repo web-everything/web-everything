@@ -45,9 +45,24 @@ export const PINNED_OVERLAY_GONE_MESSAGE = 'pinned overlay is gone (ref deleted 
 /** PURE: strictAdopt — any omission (set-aside, dropped overlay, or a tip held for an omitted base) puts the build in
  *  STRICT mode: full fresh smoke (no incremental/cached checks, no skip-unrelated), no adopt-over-failed-smoke
  *  fallback, and no first-adoption exemption (stack bases are audit-checked before being skipped). */
-export function planStrictAdopt(plan) {
-  return Array.isArray(plan?.decisions)
-    && plan.decisions.some((d) => d?.setAside || d?.action === 'drop' || d?.action === 'skip');
+export function planStrictAdopt(plan, { overlays = [], state = {} } = {}) {
+  if (Array.isArray(plan?.decisions)
+    && plan.decisions.some((d) => d?.setAside || d?.action === 'drop' || d?.action === 'skip')) return true;
+  // Main-only plans have no decisions. Smoke selection and finalization must still
+  // agree about omissions, including unknown history for a previously applied ref.
+  const applied = new Set((plan?.applied ?? []).map(a => a.ref));
+  const retired = new Set((plan?.decisions ?? []).filter(d => d?.action === 'remove').map(d => d.ref));
+  const missing = a => !applied.has(a.ref) && !retired.has(a.ref);
+  return overlays.some(missing)
+    || (state.setAside === undefined && (state.adopted?.applied ?? []).some(missing))
+    || (state.setAside != null && (typeof state.setAside !== 'object' || Array.isArray(state.setAside)));
+}
+
+/** A reduced or main-only plan did not re-examine every earlier omission. */
+export function adoptionDecisions(plan, previous) {
+  const decisions = plan.decisions ?? [];
+  return [...(previous?.decisions ?? []).filter(d => d.setAside
+    && !decisions.some(current => current.ref === d.ref)), ...decisions];
 }
 
 export function pinnedStatus(git, raw, mainSha, ovSha) {

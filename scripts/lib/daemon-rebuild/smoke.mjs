@@ -14,7 +14,7 @@ import { releaseBuildLease } from './lease.mjs';
 import { forceRequestFor, readForceAdopt, recordForcedAdoption, abortForcedAdoption, clearForceAdopt } from '../daemon-force-adopt.mjs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { finalizeRebuild, staleAlertDetail, dropSuspectOverlays } from './adopt.mjs';
-import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
+import { removeOverlay, appendOverlayEvent, readOverlayState } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +22,7 @@ import { dirname, join, posix } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
-import { pinnedStatus, planRebuild, planStrictAdopt } from './plan.mjs';
+import { pinnedStatus, planRebuild, planStrictAdopt, adoptionDecisions } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
@@ -404,6 +404,9 @@ export async function smokeAndAdopt({
   };
   const adoptedState = readRebuildState(root, stEnv).adopted ?? null;
   const adoptedHead = adoptedState?.head ?? null;
+  const strictPlan = planStrictAdopt(plan, {
+    overlays: readOverlayState(root, { env }).overlays, state: readRebuildState(root, stEnv),
+  });
 
   // xhiqxz3 — which overlays of a build need the real dispatch smoke (none when the setting is off).
   const dsm = await resolveDispatchSmoke(dispatchSmoke, env);
@@ -479,11 +482,11 @@ export async function smokeAndAdopt({
     // Recovery targets can omit registered overlays even when their plans have no drop decisions.
     // Collect every row afresh for adoption (including a deferred ready record). Only last-good's
     // diagnostic comparison may reuse external probes, and never for an already-strict build.
-    const freshAdoption = planStrictAdopt(plan) || (freshComparison && label !== 'last-good');
-    if (freshComparison || planStrictAdopt(plan)) changedFiles = null; // strictAdopt: full fresh smoke, no incremental checks
+    const freshAdoption = strictPlan || (freshComparison && label !== 'last-good');
+    if (freshComparison || strictPlan) changedFiles = null; // strictAdopt: full fresh smoke, no incremental checks
     const identity = smokePassIdentity(git, sha, cloneKind);
     const passes = readRebuildState(root, stEnv).smokePassed;
-    const proven = !freshComparison && !planStrictAdopt(plan) && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
+    const proven = !freshComparison && !strictPlan && reuse.reuseEnabled && identity && Array.isArray(passes) && passes.find(entry => {
       const age = now() - Date.parse(entry?.passedAt);
       return entry?.key === identity.key && age >= 0 && age < reuse.reuseHours * 3_600_000;
     });
@@ -615,6 +618,9 @@ export async function smokeAndAdopt({
    *  FIRST, so a lock refusal here never throws it away — the next write-lock holder (this process's next tick, or
    *  a sibling at its own tick start) adopts it without re-smoking (see prepareRebuild). */
   const finalize = async (p, onAdopted, readyMeta = { kind: 'candidate' }, smokeResult = null, { overFailedSmoke = false } = {}) => {
+    // Fallback plans only examine kept overlays. Carry the original omissions
+    // into both immediate finalization and the deferred ready record.
+    p = { ...p, decisions: adoptionDecisions(p, plan) };
     // Record, BEFORE adopting, that this build's tree passed with a busy-pool skip (see `changedSince`).
     const busySkipped = busyPoolSkippedChecks(smokeResult);
     if (busySkipped.length) {
@@ -638,7 +644,7 @@ export async function smokeAndAdopt({
       if (!recorded) throw new Error('adopted over a failed smoke: could not record it as unverified (write lock refused)');
     }
     // strictAdopt: the fresh-smoke mark rides the ready record so a deferred adoption can prove its smoke was complete.
-    const strictBuild = planStrictAdopt(p) || planStrictAdopt(plan);
+    const strictBuild = planStrictAdopt(p) || strictPlan;
     // Fresh means every row ran in THIS run for THIS candidate: no row reused from an earlier candidate/attempt.
     const freshSmoke = !overFailedSmoke && readyMeta?.forced !== true && completeSmokePass(smokeResult)
       && !smokeResult.smoke.results.some(row => row?.reused) ? p.finalSha : null;
@@ -650,6 +656,7 @@ export async function smokeAndAdopt({
       tree: verifyRev(git, `${p.finalSha}^{tree}`),
       adopt: {
         finalSha: p.finalSha, inputsKey: p.inputsKey, mainSha: p.mainSha, applied: p.applied,
+        decisions: p.decisions,
       },
       token: lease.token,
       pid: process.pid,
@@ -1006,7 +1013,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0' && !planStrictAdopt(plan)) { // strictAdopt: never adopt over a failed smoke
+    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0' && !strictPlan) { // strictAdopt: never adopt over a failed smoke
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);

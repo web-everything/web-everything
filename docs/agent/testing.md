@@ -6377,6 +6377,14 @@ the fallback tests asserting HEAD, adopted state and overlay removal, not just t
 reported reason. `rebuild-fallback-fresh-smoke` covers immediate and deferred adoption
 through real Git and `runLiveSmoke` with injected external children.
 
+`daemon-rebuild/__tests__/omission-evidence.test.mjs` runs the production smoke,
+ready matching, adoption, state readers and planner with synthetic Git responses.
+Keep main-only docs omissions strict with or without a cached smoke proof, including
+the skip-unrelated path. Ready records carry omission decisions through exact,
+same-tree, superseded and fallback adoption; only successful adoption persists them.
+The repaired tip must then reach the audit gate. The set-aside soak includes these
+omission probes alongside its real-Git conflict scenario.
+
 `daemon-rebuild/__tests__/main-sync-set-aside.test.mjs` drives the real Git fixture in
 `conveyor/soak/fixtures/rebuild-set-aside-probe.mjs`. Clear the sync worker's existing
 conflict wake before testing rebuild's wake producer; otherwise the worker masks a missing

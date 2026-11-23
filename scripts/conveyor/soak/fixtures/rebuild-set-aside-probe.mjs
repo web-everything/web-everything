@@ -6,8 +6,105 @@ import { spawnSync } from 'node:child_process';
 import { rebuildClone, readRebuildState } from '../../../lib/daemon-rebuild.mjs';
 import { runOverlayMainSync } from '../../../lib/daemon-rebuild/overlay-main-sync.mjs';
 import { addOverlay, readOverlays, overlayFilePath } from '../../../lib/daemon-overlays.mjs';
-import { writeRebuildState, alertsFilePath } from '../../../lib/daemon-rebuild/state.mjs';
+import { writeRebuildState, alertsFilePath, readReadyCandidate } from '../../../lib/daemon-rebuild/state.mjs';
 import { SMOKE_CHECKS } from '../../../lib/daemon-live-smoke.mjs';
+import { smokeAndAdopt, smokePassIdentity } from '../../../lib/daemon-rebuild/smoke.mjs';
+import { finalizeRebuild, matchReadyCandidate } from '../../../lib/daemon-rebuild/adopt.mjs';
+import { planRebuild } from '../../../lib/daemon-rebuild/plan.mjs';
+
+/** Real smoke/ready/adopt/state/planner wiring with synthetic Git; never writes a Git repository. */
+export async function probeOmissionEvidence({ mainOnly = false, readyOnly = false, cached = false, match = 'exact', failReset = false, fallback = false } = {}) {
+  const base = mkdtempSync(join(tmpdir(), 'rebuild-omission-evidence-'));
+  const root = join(base, 'clone');
+  mkdirSync(root);
+  const env = { PATH: process.env.PATH, WE_DAEMON_STATE_DIR: join(base, 'state'),
+    WE_DAEMON_OVERLAY_DIR: join(base, 'overlays'), WE_DAEMON_CLONE_LOCK_ROOT: join(base, 'locks'),
+    WE_DAEMON_EVENTS: join(base, 'events.jsonl'), WE_NEEDS_YOU_FEED: join(base, 'needs.jsonl'),
+    WE_PLATFORM_PREFERENCES_FILE: join(base, 'missing'), WE_DAEMON_OVERLAY_FOLLOW_TIP: 'follow' };
+  const previous = 'a'.repeat(40), main = 'b'.repeat(40), tip = 'c'.repeat(40), tree = 'd'.repeat(40);
+  const replacement = 'e'.repeat(40), next = 'f'.repeat(40), ref = 'lane/docs';
+  let head = previous, branch = tip;
+  const ok = (stdout = '') => ({ status: 0, stdout });
+  const run = args => {
+    if (args[0] === 'rev-parse') {
+      const rev = args.at(-1);
+      if (rev === 'MERGE_HEAD') return { status: 1, stdout: '' };
+      if (rev.endsWith('^{tree}')) return ok(tree);
+      if (rev === 'HEAD') return ok(head);
+      if (rev === 'origin/main^{commit}') return ok(main);
+      if (rev === `refs/remotes/origin/${ref}^{commit}`) return ok(branch);
+      if (rev === 'refs/remotes/origin/lane/bad^{commit}') return ok(next);
+      return ok(rev.replace(/\^\{commit\}$/, ''));
+    }
+    if (args[0] === 'merge-base') return args[1] === '--is-ancestor'
+      ? { status: args[2] === args[3] ? 0 : 1, stdout: '' } : ok(main);
+    if (args[0] === 'diff') return ok(args.includes('--') ? '' : 'README.md\n');
+    if (args[0] === 'reset') {
+      if (failReset && args.at(-1) !== previous) return { status: 1, stdout: '' };
+      head = args.at(-1); return ok();
+    }
+    if (args[0] === 'show') return { status: 1, stdout: '' };
+    if (args[0] === 'merge-tree') return ok('1'.repeat(40));
+    if (args[0] === 'cherry') return ok(`+ ${branch}\n`);
+    if (args[0] === 'commit-tree') return ok(next);
+    if (['worktree', 'ls-tree', 'ls-files', 'status', 'rev-list', 'log', 'config'].includes(args[0])) return ok();
+    if (args[0] === 'cat-file') return ok();
+    throw new Error(`unexpected synthetic Git call: ${JSON.stringify(args)}`);
+  };
+  const now = () => 1_790_000_000_000;
+  const aside = { eligible: true, ref, sha: tip, mainSha: main, reason: 'main-sync-conflict', files: ['README.md'] };
+  try {
+    addOverlay(root, { ref }, { env });
+    const identity = smokePassIdentity(run, main, 'clone');
+    writeRebuildState(root, { setAside: null, adopted: { head: previous, mainSha: previous,
+      applied: [{ ref, sha: tip, pr: null }], inputsKey: 'previous', at: new Date(now()).toISOString() },
+      smokePassed: cached ? [{ ...identity, passedAt: new Date(now()).toISOString() }] : [] }, env);
+    const plan = await planRebuild({ git: run, headSha: previous, mainRef: 'origin/main', mainOnly: true });
+    if (!mainOnly) plan.decisions = [{ ref, sha: tip, pr: null, action: 'skip', reason: 'main-sync-conflict', setAside: aside }];
+    if (fallback) {
+      addOverlay(root, { ref: 'lane/bad' }, { env });
+      plan.finalSha = next;
+      plan.applied = [{ ref: 'lane/bad', sha: next, pr: null }];
+    }
+    const checks = [];
+    const lease = { token: 'omission-probe', path: join(base, 'candidate') };
+    const options = { root, env, stEnv: env, run, now, plan, prevHead: previous, lease,
+      finalLockOpts: { lockRoot: join(base, 'locks'), waitMs: 100 },
+      overlaysBefore: [{ ref }, ...(fallback ? [{ ref: 'lane/bad' }] : [])], prepAlerts: [], mainOnly, readyOnly, log: { error() {} },
+      dispatchSmoke: { settings: { dispatchSmoke: 'off' }, run: async () => ({ ok: true }), match: () => [] },
+      runSmoke: async opts => {
+        checks.push({ changedFiles: opts.changedFiles, reuseCode: opts.reuseCode, reuseRows: opts.reuseRows });
+        if (fallback && checks.length === 1) return { verdict: 'code', smoke: { results: [
+          { name: 'dispatch-dry-run', ok: false, detail: 'broken overlay' },
+        ] } };
+        return { verdict: 'pass', smoke: { results: SMOKE_CHECKS.map(({ name, kind }) => ({ name, ok: true,
+          ...(kind === 'code' && (opts.changedFiles !== null || opts.reuseCode) ? { skipped: true } : {}) })) } };
+      } };
+    let result = await smokeAndAdopt(options);
+    const beforeAdopt = readRebuildState(root, env).setAside;
+    const ready = readReadyCandidate(root, env);
+    let readyMatch = null;
+    if (readyOnly && ready) {
+      const livePlan = match === 'exact' ? plan : { ...plan, finalSha: next, inputsKey: 'next' };
+      const matched = matchReadyCandidate({ ready, plan: livePlan, prevHead: previous,
+        treeOf: () => match === 'same-tree' ? tree : next, stillWanted: () => true,
+        verifyBuilt: () => true, liveApplied: [], nowMs: now(), maxAgeMs: 60_000 });
+      readyMatch = matched.match;
+      if (matched.adopt) result = await finalizeRebuild({ ...options, plan: matched.adopt,
+        strictAdopt: ready.strictAdopt, freshSmoke: ready.freshSmoke === ready.adopt.finalSha ? matched.adopt.finalSha : null });
+    }
+    const state = readRebuildState(root, env);
+    branch = replacement;
+    let audits = 0;
+    const repaired = await planRebuild({ git: run, headSha: head, mainRef: 'origin/main', overlays: [{ ref }],
+      edgeResolve: false, setAside: state.setAside === undefined ? null : state.setAside ?? {},
+      auditedTip: () => { audits++; return false; } });
+    return { adopted: result.adopted === true, reason: result.reason, checks, readyMatch,
+      beforeAdopt, aside: state.setAside?.[ref] ?? null, recordedDecisions: ready?.adopt?.decisions,
+      onTarget: head === (match === 'same-tree' ? next : main), unchanged: head === previous,
+      audits, held: repaired.decisions.some(d => d.reason === 'unaudited-tip-held'), applied: repaired.applied.length };
+  } finally { rmSync(base, { recursive: true, force: true }); }
+}
 
 export async function createSetAsideFixture({ pinned = false, guard = false, audited = false, sibling = false, pr = null } = {}) {
   const base = mkdtempSync(join(tmpdir(), 'rebuild-set-aside-'));

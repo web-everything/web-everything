@@ -778,7 +778,10 @@ export async function prepareRebuild({
           lease: { token: ready.token ?? null },
           mainOnly,
           strictAdopt: ready.strictAdopt !== false || planStrictAdopt(plan),
-          freshSmoke: typeof ready.freshSmoke === 'string' ? ready.freshSmoke : null,
+          // A same-tree match adopts the current plan's commit and decisions. Its
+          // complete smoke proof transfers only from the exact recorded candidate.
+          freshSmoke: m.match === 'same-tree' && ready.freshSmoke === ready.adopt.finalSha
+            ? m.adopt.finalSha : typeof ready.freshSmoke === 'string' ? ready.freshSmoke : null,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -857,7 +860,7 @@ export async function prepareRebuild({
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
   // An omission (set-aside or dropped overlay) changes what runs: it always gets the full candidate smoke.
-  const hasOmission = planStrictAdopt(plan);
+  const hasOmission = planStrictAdopt(plan, { overlays: overlaysBefore, state });
   if (typeof skipCheck === 'function' && !hasOmission && state.adopted?.head === prevHead && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
