@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
-import { readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
+import { readFastDrainContext, readFastDrainPassInventory, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
   fastDrainListingAfterBranches, validateLeanOpenPrs, listLeanOpenPrsPaged, LEAN_OPEN_PR_FIELDS } from '../lib/fast-drain-context.mjs';
 import { cachedDefaultBranch, DEFAULT_BRANCH_CACHE_TTL_MS, resolveCachedDefaultBranch, createLiveDefaultBranchReader } from '../lib/default-branch-cache.mjs';
 import { readSharedOpenPrs, SNAPSHOT_FIELDS, DEFAULT_TTL_MS } from '../lib/pr-snapshot.mjs';
@@ -27,6 +27,46 @@ const pr = (number, extra = {}) => ({
 });
 const inventory = (rows, extra = {}) => ({ rows, totalCount: rows.length, hasNextPage: false, truncated: false, ...extra });
 const lean = p => Object.fromEntries(LEAN_OPEN_PR_FIELDS.split(',').map(f => [f, p[f]]));
+
+for (const refreshAvailable of [true, false]) {
+  test(`pass inventory ${refreshAvailable ? 'refreshes an unavailable snapshot under the lock and reuses the cache' : 'fails closed when refreshing still returns null'}`, async () => {
+    let held = false, snapshot = null, published = null;
+    const calls = [];
+    const options = {
+      path: 'unused-pass-snapshot.json', repos: [repo], targetRepo: repo, env: {}, now: () => 1000,
+      readMain: async () => ({ sha: 'a'.repeat(40), defaultBranch: 'main' }),
+      listLean: async () => inventory([lean(pr(7))]),
+      readSnapshot: (r, o) => {
+        assert.equal(r, repo);
+        calls.push(o);
+        if (o?.refresh) {
+          assert.equal(held, true);
+          if (refreshAvailable) snapshot = [pr(7)];
+        }
+        return snapshot;
+      },
+      read: () => published,
+      write: (_path, value) => { published = value; },
+      lock: async fn => {
+        assert.equal(held, false);
+        held = true;
+        try { return { ok: true, value: await fn(() => held) }; }
+        finally { held = false; }
+      },
+    };
+    if (refreshAvailable) {
+      const result = await readFastDrainPassInventory(options);
+      assert.deepEqual(result.snapshots.get(repo), [pr(7)]);
+      const cached = await readFastDrainPassInventory(options);
+      assert.deepEqual(cached.snapshots.get(repo), [pr(7)]);
+      assert.deepEqual(calls, [undefined, { refresh: true }, undefined, undefined]);
+    } else {
+      await assert.rejects(readFastDrainPassInventory(options), /snapshot unavailable\/disabled\/stale\/dirty/);
+      assert.deepEqual(calls, [undefined, { refresh: true }]);
+      assert.equal(published, null);
+    }
+  });
+}
 
 async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, leanRead, snapshotRead,
   readFull, groups, setting = {}, enabled = true, repos = [repo], manifests = new Map() } = {}) {

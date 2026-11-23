@@ -153,8 +153,8 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return Number.isFinite(age) && age >= 0 && age < ttlSec * 1000;
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
-  const readSources = () => new Map(repos.map(repo => {
-    const rows = readSnapshot(repo);
+  const readSources = options => new Map(repos.map(repo => {
+    const rows = readSnapshot(repo, options);
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
   }));
@@ -209,8 +209,13 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    readSources();
+    let writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
+    try { readSources(); } catch {
+      // Cold/stale/dirty shared cache: this single-flight child refreshes it live (slow, often > the pass TTL).
+      // The bound restarts when the refresh completes; rows are still re-hydrated against live lean membership.
+      readSources({ refresh: true });
+      writtenAt = now();
+    }
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');

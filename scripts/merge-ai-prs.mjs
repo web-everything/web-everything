@@ -5930,7 +5930,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return stdout;
       },
     });
-    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    const readSnapshot = (repo, o) => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: !(o && o.refresh) });
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target

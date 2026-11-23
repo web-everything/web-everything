@@ -4,6 +4,7 @@ const PATTERNS = [
   ['gh-not-found', /http 404|not found|could not resolve to a/i],
   ['gh-rate-limit', /rate limit|http 403.*secondary|abuse|http 429/i],
   ['network', /ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network/i],
+  ['incomplete-context', /incomplete pass context|snapshot unavailable/i],
   ['parse', /SyntaxError|unexpected token|JSON/i],
 ];
 
