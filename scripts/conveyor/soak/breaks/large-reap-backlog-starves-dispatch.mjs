@@ -65,12 +65,14 @@ const MAX_STOPS_OVERRIDE = '5';
  *  (>= ~4.7s + ~17s ≈ 22s locally, and the stop spawns only get slower on a CI runner).
  *
  *  18s flaked too (main red @ bb1a87709: shard 7 measured 18.1s against the 18s bound, no reap/tick code
- *  changed) — a wall-clock bound just above the observed floor keeps getting re-crossed as the runner varies.
- *  So the margin is now structural: the bound is 45s (the green path measured 4.7s idle local, 10-18s CI, 30s on a loaded dev host, so
- *  >= 1.5x headroom over the worst) and BACKLOG_SIZE is 1500 (the real incident size), whose unbounded reap alone (~87s at ~58ms/stop,
- *  slower on CI) plus the floor stays well above 45s. The red path costs at most the bound (the harness IPC
- *  timeout aborts the tick), so the larger backlog adds no red-path time beyond the 45s. */
-const TICK_BOUND_MS = 45_000;
+ *  changed) — a fixed wall-clock bound just above one observed floor keeps getting re-crossed as the runner
+ *  varies. So the bound is now RUNNER-RELATIVE: a zero-backlog baseline tick is measured first in this same
+ *  process (`run`), and the bound is `max(TICK_BOUND_MS, BASELINE_MULTIPLE x baseline)`. On a healthy runner it
+ *  is exactly the old 18s; on a slow one it scales with that runner's own measured floor. BACKLOG_SIZE is the
+ *  real incident's 1,500 sessions, whose unbounded reap alone (~87s at ~58ms/stop) stays well above the scaled
+ *  bound. The red path costs at most the bound (the harness IPC timeout aborts the tick). */
+const TICK_BOUND_MS = 18_000;
+const BASELINE_MULTIPLE = 2.5;
 
 export default {
   id: 'large-reap-backlog-starves-dispatch',
@@ -89,6 +91,17 @@ export default {
     // Deterministic proof of the per-tick budget, independent of runner speed: how many seeded backlog
     // sessions were actually `claude stop`ped by the first tick (read at the start of round 1).
     const reapStats = { stoppedBeforeTick: {} };
+    // Zero-backlog baseline: the SAME fleet and env, one review tick, no seeded sessions — this runner's floor.
+    const baseline = await runSoak({
+      name: 'break:large-reap-backlog-starves-dispatch:baseline',
+      rounds: 1, daemons: ['review'], mainEvery: 0, scorecards: false,
+      env: { WE_SESSION_REAP_MAX_STOPS: MAX_STOPS_OVERRIDE },
+      bounds: { tickBoundMs: 120_000, owedGraceTicks: 0 },
+      log,
+    });
+    const floorMs = Number(baseline.ticks?.[0]?.ms) || 0;
+    const tickBoundMs = Math.max(TICK_BOUND_MS, Math.ceil(BASELINE_MULTIPLE * floorMs));
+    reapStats.tickBoundMs = tickBoundMs;
     const report = await runSoak({
       name: 'break:large-reap-backlog-starves-dispatch',
       rounds: 3,
@@ -96,7 +109,7 @@ export default {
       mainEvery: 0,
       scorecards: false,
       env: { WE_SESSION_REAP_MAX_STOPS: MAX_STOPS_OVERRIDE },
-      bounds: { tickBoundMs: TICK_BOUND_MS, owedGraceTicks: 0 },
+      bounds: { tickBoundMs, owedGraceTicks: 0 },
       log,
       perRound(w, round) {
         // Cumulative count of ALL sessions in the fake store that `claude stop` has ended, observed at the start
@@ -123,7 +136,7 @@ export default {
     // Every violation the harness recorded counts (bounded, owed, crash, no-throw, no-onTick-crash, isolation, ...):
     // nothing is filtered out, so a daemon failure after the first dispatch cannot hide behind this scenario.
     const found = report.violations.map((v) => `${v.daemon ?? '-'} tick ${v.tick ?? '-'}: [${v.invariant}] ${v.detail}`);
-    // The wall-clock bound ('bounded') is deliberately generous (runner variance, see TICK_BOUND_MS); the cap
+    // The wall-clock bound ('bounded') is deliberately generous (runner variance, see the runner-relative bound in `run`); the cap
     // itself is asserted by COUNT, every tick, so the scenario can never pass by skipping the reap or by
     // exceeding the per-tick budget.
     if (report.fatal) found.push(`[fatal] ${report.fatal}`);
