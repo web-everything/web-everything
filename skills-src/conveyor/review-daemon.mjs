@@ -105,6 +105,8 @@ import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs'
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue, readLiveRedTeamPr } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { runGateCatchUp } from '../../scripts/lib/red-team-gate-catchup.mjs';
+import { planAuditOwed, auditOwedLine, defaultAuditCheck, readAutoAuditMode } from '../../scripts/conveyor/audit-on-ready.mjs';
+import { resolveLanePoolRepoPath } from '../../scripts/conveyor/lane-pool-health-watch.mjs';
 import { tagReviewRound } from '../../scripts/conveyor/review-round-tag.mjs';
 import { tagReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs';
 import { PR_STATUS_LABEL_RE } from '../../scripts/conveyor/pr-status-label.mjs';
@@ -1490,6 +1492,22 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
 let redTeamDispatchQueue;
 const redTeamGateRetryHistory = new Map();
+const autoAuditSeen = new Set();
+
+/** S1.1: even mode=on is observation only. No writer or dispatcher is called here. */
+export function runAutoAuditShadow({ repo, rawPrs, mode, check, seen = autoAuditSeen, log = console } = {}) {
+  try {
+    const effectiveMode = mode ?? readAutoAuditMode();
+    if (effectiveMode !== 'shadow' && effectiveMode !== 'on') return;
+    const auditCheck = check ?? defaultAuditCheck({ repoDir: resolveLanePoolRepoPath(repo) ?? SESSION_REAPER_REPO_ROOT });
+    for (const row of planAuditOwed({ repo, rawPrs, check: auditCheck, seen })) {
+      const key = `${row.repo}#${row.pr}@${row.head}`;
+      if (seen.has(key)) continue;
+      log.error(auditOwedLine(row));
+      seen.add(key);
+    }
+  } catch { /* Audit observation must never block the capacity queue. */ }
+}
 let lastRedTeamQueueFloorLine;
 export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
@@ -1584,6 +1602,9 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           resolveProfile: o.resolveProfile,
           log: line => log.error(line) });
       } catch { /* Gate catch-up must never block the capacity queue. */ }
+      try {
+        runAutoAuditShadow({ repo: o.repo, rawPrs, log });
+      } catch { /* Audit observation must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
         dispatch: d => {
           const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });

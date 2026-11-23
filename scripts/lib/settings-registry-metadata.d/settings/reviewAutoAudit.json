@@ -1,0 +1,6 @@
+{
+  "description": "Audit-on-ready mode (off, shadow or on; S1.1 only logs audit debt) plus reserved per-tick and per-head limits. WE_REVIEW_AUTO_AUDIT_MODE overrides mode.",
+  "owner": "scripts/settings/review-auto-audit.json",
+  "changeVia": "pr",
+  "instant": false
+}

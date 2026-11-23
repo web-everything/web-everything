@@ -544,6 +544,16 @@ function findPriorityWriter(starvedRoot, { owner, nowMs, ttlMs, probe, after }) 
   return rec;
 }
 
+/** A live foreign rebuild claim, including the first give-up; never acquires a read slot. */
+export function readPendingRebuild(root, {
+  owner = defaultOwner(), lockRoot = defaultLockRoot(), nowMs = Date.now(),
+  ttlMs = resolveWriterClaimTtlMs(), probe = defaultProbePidLiveness,
+} = {}) {
+  return findPriorityWriter(cloneLockDirs(root, lockRoot).starvedRoot, {
+    owner, nowMs, ttlMs, probe, after: 1,
+  });
+}
+
 const isoMs = (s) => { const n = Date.parse(s || ''); return Number.isFinite(n) ? n : Infinity; };
 
 /**
