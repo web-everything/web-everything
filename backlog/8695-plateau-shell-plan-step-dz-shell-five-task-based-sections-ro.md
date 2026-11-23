@@ -1,4 +1,5 @@
 ---
+bornAs: xdzzp2l
 kind: story
 locus: plateau-app
 size: 8

@@ -1,9 +1,10 @@
 ---
+bornAs: x7r5pe5
 kind: story
 locus: plateau-app
 size: 5
 status: open
-blockedBy: ["xdzzp2l", "xqr3x2x", "xn8wrsi"]
+blockedBy: ["8695", "8697", "8696"]
 dateOpened: "2026-11-22"
 tags: [plateau, plateau-ui, design-plan]
 ---

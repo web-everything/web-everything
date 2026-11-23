@@ -1,4 +1,5 @@
 ---
+bornAs: x9sujbc
 kind: story
 locus: plateau-app
 size: 2

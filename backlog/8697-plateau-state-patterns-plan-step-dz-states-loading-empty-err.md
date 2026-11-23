@@ -1,20 +1,20 @@
 ---
+bornAs: xqr3x2x
 kind: story
 locus: plateau-app
 size: 5
 status: open
-blockedBy: ["xqr3x2x", "xdzzp2l"]
 dateOpened: "2026-11-22"
 tags: [plateau, plateau-ui, design-plan]
 ---
 
-# Plateau Today screen (plan step DZ-TODAY): task-based home replacing mock dashboard tiles
+# Plateau state patterns (plan step DZ-STATES): loading, empty, error and offline blocks
 
-Plan step DZ-TODAY in the plateau design plan (ruled 2026-11-22 by the operator): a Today screen listing the top-5 prepared decisions, needs-you items and live state, replacing the hard-coded example tiles on the dashboard home. Built in plateau-app by composing WE and FrontierUI blocks; blocked by DZ-STATES and DZ-SHELL.
+Plan step DZ-STATES in the plateau design plan: shared loading, empty, error and offline state blocks (FrontierUI block, plateau-app adopts) so every screen shows honest states; blocks DZ-TODAY and DZ-CATALOG. See the DZ-STATES prep.
 
 ## Acceptance
 
-- [A1] **Executable** — a plateau-app webcase/e2e test (named by the build slice) fails before this lands and passes after: the Today route renders the top-5 prepared decisions and needs-you items from the real data source, with no hard-coded example tiles left on the home route. Linked plan step: DZ-TODAY.
+- [A1] **Executable** — a plateau-app webcase/e2e test (named by the build slice) fails before this lands and passes after: one shared loading, empty, error and offline block set exists and the first adopting screen shows each state in a webcase. Linked plan step: DZ-STATES.
 
 
 

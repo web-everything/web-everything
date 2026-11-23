@@ -173,4 +173,4 @@ One incremental, single-repo (WE) PR — prompt text + one doc line + one new te
 cross-repo change; does not touch #2695's or #2950's files, so it can land independently of both and in any order
 relative to them.
 
-Will be closed when carry card x7ihyw5 delivers; ruled 2026-11-22 (master plan).
+Will be closed when carry card 8693 delivers; ruled 2026-11-22 (master plan).
