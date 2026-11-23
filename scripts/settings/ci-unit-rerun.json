@@ -1,0 +1,4 @@
+{
+  "$comment": "ciUnitRerun: one retry of failed unit files, with matching coverage mode. Defaults enabled=false, maxFiles=10, flakeAllowlist=[]. Only allowlisted repo-relative test paths may recover a shard; other passing retries are recorded as flakes and stay red. Standard -> platform ciUnitRerun -> tool -> WE_CI_UNIT_RERUN_ENABLED (true/false, 1/0), WE_CI_UNIT_RERUN_MAX_FILES (positive integer). Environment may only disable retries or lower the file cap. Effective values and sources logged through policy-cascade. Disabled retries or failures above the cap leave the shard red for operator inspection and manual rerun.",
+  "ciUnitRerun": { "enabled": false, "flakeAllowlist": [] }
+}

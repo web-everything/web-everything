@@ -238,6 +238,10 @@ test('--check refuses unequal fresh renders without writing the doc', t => {
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+// Migration checks cover the historical roster. The live inventory/drift test above
+// validates every current key, including settings added after the migration.
+const originalKey = key => Object.hasOwn(originalMetadata.settings, key);
+const originalRegistry = registry => ({ ...registry, rows: registry.rows.filter(row => originalKey(row.key)) });
 function split(f) {
   for (const section of ['settings', 'capacityLeaves']) {
     for (const [key, value] of Object.entries(f.meta[section])) f.write(`${META_DIR}/${section}/${filename(key)}`, value);
@@ -254,11 +258,15 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
 test('migration preserves the original registry plus the intentional shadow rotation description', t => {
   const f = fixture(t);
   rmSync(join(f.root, 'scripts/settings/feature.json'));
-  for (const row of buildRegistry().rows) for (const owner of row.owners) f.write(owner, JSON.parse(readFileSync(join(ROOT, owner), 'utf8')));
+  const current = originalRegistry(buildRegistry());
+  for (const owner of new Set(current.rows.flatMap(row => row.owners))) {
+    const declarations = JSON.parse(readFileSync(join(ROOT, owner), 'utf8'));
+    f.write(owner, Object.fromEntries(Object.entries(declarations).filter(([key]) => originalKey(key) || key.startsWith('$comment'))));
+  }
   const expectedMetadata = structuredClone(originalMetadata);
   expectedMetadata.settings.providerRotation.description = 'Shadow rotation policy, catalog, capacity and reviewer guards; inactive PROV-AB-G1 option A goLive records sticky subjects, 30 runs, 60/10 shares and 24h clean.';
   f.write(META, expectedMetadata);
-  assert.deepEqual(buildRegistry(), buildRegistry({ root: f.root }));
+  assert.deepEqual(current, buildRegistry({ root: f.root }));
 });
 test('a new metadata key file alone adds a row without editing the base metadata', t => {
   const f = fixture(t); split(f);
@@ -372,14 +380,22 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
-test('fresh render matches the shadow rotation and audit debounce snapshot with per-key, gitignored-doc authoring instructions', () => {
+test('fresh render matches the historical shadow rotation and audit debounce snapshot with per-key, gitignored-doc authoring instructions', () => {
   // The doc is generated locally and never committed, so pin a fresh render instead of a tracked file.
-  const doc = renderMarkdown(buildRegistry({ root: ROOT }));
+  const doc = renderMarkdown(originalRegistry(buildRegistry({ root: ROOT })));
   assert.ok(doc.includes('scripts/lib/settings-registry-metadata.d/settings/<encoded-key>.json'));
   assert.ok(doc.includes('`npm run docs:settings-registry` to generate the local, gitignored doc; never commit it'));
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  // Reconciled snapshot includes providerRotation and the two audit debounce/delta leaves.
-  assert.equal(createHash('sha256').update(original).digest('hex'), 'c925611b7ad32c041e28b23880c6598f490afaebf8aada02d502ef1f2f87cdf2');
+  // Reconciled snapshot includes providerRotation, ciUnitRerun and the two audit debounce/delta leaves.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '849afe0c18dfd0142cbeec070e2fdc74f52f4eac6da23efe55d293ba4fea3706');
   execFileSync(process.execPath, [join(ROOT, 'scripts/lib/settings-registry.mjs'), '--check']);
+});
+
+test('standalone timeout policy does not claim conveyor setting metadata', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/test-timeout-policy.json', { policyType: 'timeout', all: {}, tests: { 'a.test.mjs': { soft: 'PT1S' } } });
+  const r = f.build();
+  assert.deepEqual(r.problems, []);
+  assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });
