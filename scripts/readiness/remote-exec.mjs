@@ -1439,7 +1439,8 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     catch(error) {try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }}
   };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
-  if (!validRemoteHosts([{alias:host,root}])) return fallback('invalid-target');
+  if (!validRemoteHosts([{alias:host,root}]))
+    return fallback(root === '/srv/forge-exec' ? 'invalid-parameters' : 'invalid-target');
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   const guardSplit = splitGuardReport(argv);
   const guardOutputFile = guardSplit.outputFile;
@@ -1463,7 +1464,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   }
   const needsGit=standardsNeedGit||testNeedsGit;
   let bundleDirectory;
-  if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
+  if (!validateRunId(runId)) return fallback('invalid-parameters');
   try {exec=await bindGit({cwd,env,exec});}catch(error){return fallback(error.code??'unbound-worktree');}
   sshOptions ??= connectionOptions();
   const start=work=>Promise.resolve().then(work);

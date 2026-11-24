@@ -45,7 +45,7 @@ it.each(['selected','timeout','invalid JSON','non-vitest argv','unknown flag','m
   await expect(buildDeltaManifest({...options,base})).rejects.toMatchObject({code:'ignored-test-file'});
   const calls=[],exec=async call=>{
     calls.push(call);
-    if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
+    if(call.file==='ssh'&&JSON.stringify(call.args)===JSON.stringify(['--','forge','true']))return {code:0,stdout:Buffer.alloc(0)};
     if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
     return defaultExec(call);
   };
@@ -75,7 +75,7 @@ it.each(['static import','re-export','dynamic import','transitive import'])(
   const calls=[],exec=async call=>{
     calls.push(call);
     if(call.file==='git')return defaultExec(call);
-    if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
+    if(call.file==='ssh'&&JSON.stringify(call.args)===JSON.stringify(['--','forge','true']))return {code:0,stdout:Buffer.alloc(0)};
     throw new Error(`Unexpected transport: ${call.file}`);
   };
   expect(await runRemote({...options,exec,disableDelta:true,log:()=>{}}))
@@ -570,7 +570,7 @@ it.each(rows)('row %i: %s',async row=>{
   const exec=async call=>{
     calls.push(call);
     // Reachability is fixture evidence, never a probe of the developer's host.
-    if(call.file==='ssh'&&call.args.length===2&&call.args[1]==='true')return {code:0,stdout:Buffer.alloc(0)};
+    if(call.file==='ssh'&&JSON.stringify(call.args)===JSON.stringify(['--','forge','true']))return {code:0,stdout:Buffer.alloc(0)};
     if(call.file!=='git')throw new Error(`Unexpected transport: ${call.file}`);
     if(omit&&call.file==='git'&&call.args.includes('-i'))return {code:0,stdout:Buffer.alloc(0)};
     const result=await defaultExec({...call,env:call.env??hostile});

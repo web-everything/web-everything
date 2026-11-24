@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { DEFAULT_REMOTE_HOSTS, validRemoteHosts, pickRemoteTarget } from './remote-target.mjs';
 /**
  * @file scripts/readiness/heavy-admission.mjs
  * @description THE HEAVY-COMMAND ADMISSION QUEUE (#3461, ratified by #3456) — a capacity semaphore, distinct
@@ -146,6 +145,7 @@ import { DEFAULT_REMOTE_HOSTS, validRemoteHosts, pickRemoteTarget } from './remo
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
 import '../lib/tools-root-guard.mjs';
+import { DEFAULT_REMOTE_HOSTS, validRemoteHosts, pickRemoteTarget } from './remote-target.mjs';
 import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 pinDeveloperDir();
 import { constants, existsSync, mkdirSync, mkdtempSync, rmdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync, renameSync } from 'node:fs';
