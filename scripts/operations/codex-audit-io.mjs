@@ -122,6 +122,15 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       fs.mkdirSync(dirname(path), { recursive: true });
       fs.appendFileSync(path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
     },
+    escalate({ ref, head, streak, questionHash }) {
+      const path = join(dirname(recordPath()), 'audit-nonconvergence.jsonl');
+      let records = [];
+      try { records = fs.readFileSync(path, 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)); }
+      catch (error) { if (error?.code !== 'ENOENT') throw error; }
+      if (records.some(record => record.ref === ref && record.questionHash === questionHash)) return;
+      fs.mkdirSync(dirname(path), { recursive: true });
+      fs.appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), ref, head, streak, questionHash, kind: 'design-pass-request' })}\n`, { encoding: 'utf8', mode: 0o600 });
+    },
     now: () => new Date().toISOString(),
     stdout: text => process.stdout.write(text),
     stderr: text => process.stderr.write(text),

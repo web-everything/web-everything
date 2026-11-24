@@ -6,6 +6,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { matchesSome } from './audit-verdict.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { assessLineage, lineageRounds, NONCONVERGENCE_SIGNATURE } from './audit-nonconvergence.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
@@ -245,9 +246,24 @@ export async function main(argv, deps, { loadDeps = async () => (await import('.
     let fingerprint = null;
     try { fingerprint = (await deps.fingerprint?.(base, head)) || null; } catch { fingerprint = null; }
     if (pending?.check && await pending.check()) return 4;
+    let ref = flags.branch ?? null;
+    try { ref = flags.branch ?? await deps.findBranch?.(head) ?? null; } catch { ref = null; }
+    let nonconverge;
+    if (ref && deps.readRecords) {
+      let assessment;
+      try { assessment = assessLineage([...lineageRounds(await deps.readRecords(), ref), { head, verdict, findings }]); }
+      catch { assessment = { escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: 1 }; }
+      if (assessment.escalate) {
+        const { streak, rounds, reason } = assessment;
+        nonconverge = { streak, rounds, ...(reason ? { reason } : {}) };
+        deps.stderr(`${NONCONVERGENCE_SIGNATURE} ref=${clean(String(ref)).replace(/[\r\n\u2028\u2029]/g, '')} head=${head} streak=${streak}: stop patching, a design pass is required\n`);
+        try { await deps.escalate?.({ ref, head, streak, questionHash: QUESTION_HASH }); } catch { /* Routing cannot change the verdict or exit code. */ }
+      }
+    }
     try {
       await deps.appendRecord({ at: deps.now(), base, head, baseRef: flags.base,
-        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}), ...(basis ? { basis } : {}) });
+        questionHash: QUESTION_HASH, verdict, findings, ...(fingerprint ? { fingerprint } : {}), ...(basis ? { basis } : {}),
+        ...(ref !== null ? { ref } : {}), ...(nonconverge ? { nonconverge } : {}) });
     } catch {
       deps.stderr('Audit record write failed; repair the record path and retry.\n');
       return 3;
