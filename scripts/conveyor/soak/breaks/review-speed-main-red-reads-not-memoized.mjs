@@ -15,16 +15,17 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const pass = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-pass.mjs')).href);
     pass.resetMainRedMemo?.();
-    const calls = { ahead: 0, green: 0, signature: 0 };
+    const calls = { ahead: 0, green: 0 };
     const pr = { number: 1, headRefOid: 'memo-head', statusCheckRollup: [{ name: 'test',
       status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-10-01T00:00:00Z',
       detailsUrl: 'https://github.com/soak/memo/actions/runs/1/job/2' }] };
     const options = { repo: 'soak/memo', requiredChecks: ['test'],
+      readMainTip: () => 'a'.repeat(40),
       readMainRuns: () => [{ headSha: 'memo-main', status: 'queued', createdAt: '2026-10-02T00:00:00Z' }],
       readMainLatestCheckRuns: () => [{ name: 'test', conclusion: 'success', head_sha: 'memo-green' }],
       readAheadBy: () => { calls.ahead++; return 3; },
       readMainGreenFixFacts: () => { calls.green++; return { prContainsMainGreenSha: true, mergeBaseCheckRuns: null }; },
-      readMainFixedSignatureFacts: () => { calls.signature++; return { signatures: [] }; },
+      readMainFixedSignatureFacts: () => ({ signatures: [] }),
       readJobAttempt: () => 1, readBudget: () => null };
     try {
       pass.enrichPrsWithMainRedFacts([pr], options);
