@@ -142,10 +142,10 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
 /** One bounded, complete open-PR read; the checker never guesses at missing evidence. */
 export function readSiblingBase({ cwd, env, branch, ...opts }, gh = runGhSync) {
   const freshEnv = { ...(env ?? process.env), [WE_GH_READ_MEMO_DIR]: '' };
-  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,headRepositoryOwner,isCrossRepository'],
+  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,headRepositoryOwner,isCrossRepository'],
     { cwd, env: freshEnv, throttle: { env: freshEnv }, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   if (!Array.isArray(prs) || prs.length >= 1000) throw new Error('Open PR listing may be incomplete (1000 PR limit); ask a human to inspect the sibling history.');
-  return checkSiblingBase({ ...opts, openPrs: prs.filter(pr => !(pr?.headRefName === branch
+  return checkSiblingBase({ ...opts, branch, openPrs: prs.filter(pr => !(pr?.headRefName === branch
     && pr.isCrossRepository === false && pr.headRepositoryOwner?.login?.toLowerCase() === ghRepoSlug('we').split('/')[0].toLowerCase())) });
 }
 

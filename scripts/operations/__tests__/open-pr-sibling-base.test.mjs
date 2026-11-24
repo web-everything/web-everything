@@ -29,7 +29,8 @@ function fixture() {
     git('checkout', '-b', headRefName);
     const headRefOid = commit(`change-${number}`);
     git('update-ref', `refs/remotes/origin/${headRefName}`, headRefOid);
-    const pr = { number, headRefName, headRefOid };
+    const pr = { number, headRefName, headRefOid, baseRefName: 'main', isCrossRepository: false,
+      headRepositoryOwner: { login: ghRepoSlug('we').split('/')[0] } };
     openPrs.push(pr); return pr;
   };
   const check = (opts = {}) => checkSiblingBase({ git: createGitReader(dir), base: 'main', sha: git('rev-parse', 'HEAD'), openPrs, ...opts });
@@ -41,7 +42,7 @@ describe('sibling base admission', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/child'); f.commit('child');
     expect(f.check()).toEqual([{ number: 236, headRefName: pr.headRefName, count: 1 }]);
-    expect(f.check({ openPrs: [{ number: 237, headRefName: 'lane/distinct', headRefOid: f.git('rev-parse', 'HEAD') }] }))
+    expect(f.check({ openPrs: [{ number: 237, headRefName: 'lane/distinct', baseRefName: 'main', headRefOid: f.git('rev-parse', 'HEAD') }] }))
       .toEqual([{ number: 237, headRefName: 'lane/distinct', count: 2 }]);
   });
 
@@ -93,6 +94,79 @@ describe('sibling base admission', () => {
     expect(f.check({ base: pr.headRefName })).toEqual([]);
   });
 
+  it.each([false, true])('allows updating a parent with an open stacked child (review fix: %s)', reviewFix => {
+    const f = fixture(), parent = f.sibling(236);
+    const child = { ...f.sibling(237), baseRefName: parent.headRefName,
+      isCrossRepository: false };
+    f.git('checkout', parent.headRefName);
+    if (reviewFix) f.commit('parent-review-fix');
+    const gh = vi.fn(() => JSON.stringify([child]));
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, gh);
+    const result = runner(f, { siblingBase })({ argv: [`--ref=${parent.headRefName}`, '--check'] });
+    expect(result).toMatchObject({ outcome: 'checked', reason: 'check-ok' });
+    expect(result.blockers ?? []).toEqual([]);
+    expect(gh.mock.calls[0][0].at(-1).split(',')).toContain('baseRefName');
+  });
+
+  it('allows a parent with a deeper declared stack regardless of listing order', () => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237), grandchild = f.sibling(238);
+    child.baseRefName = parent.headRefName;
+    grandchild.baseRefName = child.headRefName;
+    f.git('checkout', parent.headRefName); f.commit('parent-review-fix');
+    const opts = { cwd: f.dir, branch: parent.headRefName, git: createGitReader(f.dir), sha: 'HEAD' };
+    expect(readSiblingBase(opts, () => JSON.stringify([grandchild, child, parent]))).toEqual([]);
+  });
+
+  it.each([true, undefined])('does not exempt a child without same-repository proof (%s)', isCrossRepository => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    child.baseRefName = parent.headRefName;
+    child.isCrossRepository = isCrossRepository;
+    f.git('checkout', parent.headRefName);
+    expect(f.check({ branch: parent.headRefName, openPrs: [child] }))
+      .toEqual([{ number: child.number, headRefName: child.headRefName, count: 1 }]);
+  });
+
+  it('does not follow a fork branch-name collision as an intermediate stack base', () => {
+    const f = fixture(), parent = f.sibling(236), fork = f.sibling(237), grandchild = f.sibling(238);
+    fork.baseRefName = parent.headRefName; fork.isCrossRepository = true;
+    grandchild.baseRefName = fork.headRefName;
+    f.git('checkout', parent.headRefName);
+    expect(f.check({ branch: parent.headRefName, openPrs: [grandchild, fork] }).map(pr => pr.number))
+      .toEqual([grandchild.number, fork.number]);
+  });
+
+  it('still refuses unrelated sibling ancestry when a declared child is open', () => {
+    const f = fixture(), sibling = f.sibling(235), parent = f.sibling(236), child = f.sibling(237);
+    child.baseRefName = parent.headRefName;
+    f.git('checkout', parent.headRefName); f.commit('parent-review-fix');
+    expect(f.check({ branch: parent.headRefName, openPrs: [child, sibling] }))
+      .toEqual([{ number: sibling.number, headRefName: sibling.headRefName, count: 1 }]);
+  });
+
+  it.each([undefined, '', 'lane//parent', 'lane/../parent', 'lane/parent\n'])('fails closed on missing or invalid base metadata (%s)', baseRefName => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    f.git('checkout', parent.headRefName);
+    expect(f.check({ branch: parent.headRefName, openPrs: [{ ...child, baseRefName }] }))
+      .toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it('fails closed on ambiguous or cyclic declared stack evidence', () => {
+    const f = fixture(), first = f.sibling(236), second = f.sibling(237);
+    first.baseRefName = second.headRefName;
+    second.baseRefName = first.headRefName;
+    expect(f.check()).toMatchObject({ reason: 'sibling-base-unreadable' });
+    expect(f.check({ openPrs: [first, { ...first, number: 238 }] }))
+      .toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it('requires readable child commit objects before exempting a declared descendant', () => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    f.git('checkout', parent.headRefName);
+    expect(f.check({ branch: parent.headRefName,
+      openPrs: [{ ...child, baseRefName: parent.headRefName, headRefOid: 'f'.repeat(40) }] }))
+      .toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
   it('fails closed when git state is unreadable', () => {
     const f = fixture(); f.sibling(236); f.commit('child');
     f.git('update-ref', '-d', 'refs/remotes/origin/main');
@@ -120,7 +194,7 @@ describe('sibling base admission', () => {
     expect(readSiblingBase({ cwd: f.dir, env, branch: 'lane/child', git: createGitReader(f.dir), base: 'main', sha: 'HEAD' }, gh))
       .toEqual([{ number: 236, headRefName: 'lane/sibling-236', count: 1 }]);
     expect(gh).toHaveBeenCalledOnce();
-    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,headRepositoryOwner,isCrossRepository'],
+    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,headRepositoryOwner,isCrossRepository'],
       expect.objectContaining({ cwd: f.dir, env: { ...env, WE_GH_READ_MEMO_DIR: '' }, timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   });
 
