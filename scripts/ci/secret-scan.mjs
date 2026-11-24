@@ -1,10 +1,13 @@
-// Allowlisted files are exempt per path+rule, reviewed by a human via the base-branch allowlist.
-// Text rules match line by line (raw and decoded): credentials split across multiple lines may escape
-// text matching. The shared Forge structural detector also scans each file's concatenated added lines,
-// including member fragments whose unchanged JWK type/enclosing object is absent from the diff.
-// Gaps also get a separate lexical view: unchanged syntax cannot be inferred from added lines.
-// Bare quoted values can also have an omitted private member name; reject these
-// ambiguous fragments conservatively, without inventing members in complete objects.
+/**
+ * PR tripwire: shared text rules inspect added lines (raw and decoded); structure
+ * rules inspect whole new blobs, preserving bytes. Exact path+rule exemptions
+ * require a reviewed reason in the trusted scanner's allowlist.
+ * Non-claims: secrets split across lines; token formats absent from secretText;
+ * base64/UTF-16 wrapped tokens; keys inside archives or in untouched files;
+ * secrets added then removed across commits (only the net PR diff is scanned).
+ * The workflow covers pull_request, not push or merge_group. This script cannot
+ * establish whether secret-scan is a required ruleset check; operators must verify.
+ */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -12,11 +15,11 @@ import { fileURLToPath } from 'node:url';
 import { keyStructureFinding } from '../readiness/forge-key-structure.mjs';
 import { secretText } from '../readiness/forge-exec-manifest.mjs';
 
-// Re-export the very same array used by the Forge bundle scanner.
 export { secretText };
-const structuralRules = ['private-key-structure', 'private-key-scan-budget-exhausted-use-local', 'unscannable-binary'];
+const structuralRules = ['private-key-structure', 'private-key-scan-budget-exhausted-use-local', 'unscanned-oversize'];
 const LIMIT = 32 * 1024 * 1024;
-const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (32 MiB maximum)');
+const FILE_LIMIT = 2 * 1024 * 1024;
+const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (500 files, 32 MiB per git output maximum)');
 
 function loadAllowlist(path) {
   // The shipped file is `{ "entries": [...] }`: a bare array would be refused by the Forge non-object-json rule.
@@ -33,160 +36,61 @@ function loadAllowlist(path) {
   return entries;
 }
 
-function diffPath(raw, prefix = 'b/') {
-  // Git quotes control characters and encodes non-ASCII bytes as octal escapes.
-  if (raw.startsWith('"')) {
-    if (!raw.endsWith('"')) throw incomplete();
-    raw = raw.slice(1, -1).replace(/\\([0-7]{3}|[abtnvfr"\\])/g, (_, code) =>
-      /^[0-7]{3}$/.test(code) ? String.fromCharCode(parseInt(code, 8))
-        : ({ a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', '"': '"', '\\': '\\' })[code]);
-    raw = Buffer.from(raw, 'latin1').toString('utf8');
-  } else raw = raw.replace(/\t$/, ''); // Git's delimiter for unquoted paths with spaces.
-  if (raw === '/dev/null') return null;
-  if (!raw.startsWith(prefix)) throw incomplete();
-  return raw.slice(2);
-}
-
 function decodedLine(text) {
   return text.replace(/\\u([\da-f]{4})|\\x([\da-f]{2})|%([0-7][\da-f])/gi,
     (_, unicode, hex, percent) => String.fromCharCode(parseInt(unicode ?? hex ?? percent, 16)));
 }
 
 function safePath(path) {
-  if (secretText.some(([pattern]) => { pattern.lastIndex = 0; return pattern.test(path) || pattern.test(decodedLine(path)); })
-    || addedStructureFinding(Buffer.from(path))) return '[redacted-path]';
+  if (secretText.some(([pattern]) => {
+    pattern.lastIndex = 0;
+    return pattern.test(path) || pattern.test(decodedLine(path));
+  }) || keyStructureFinding(Buffer.from(path))) return '[redacted-path]';
   return /[\x00-\x1f\x7f-\x9f]/.test(path) ? JSON.stringify(path) : path;
 }
 
-function addedStructureFinding(bytes, gaps = []) {
-  // Keep the original byte view first: DER must not make a UTF-8 round trip.
-  const finding = keyStructureFinding(bytes);
-  if (finding) return finding;
-  // A zero-context diff may contain only new private members of an existing public
-  // JWK. Supply a conservative type witness to the SAME detector around fragments
-  // and unclosed objects only. Complete added objects must supply their own key
-  // evidence: injecting a type into {p:"Paragraph"} would invent private material.
-  // `oct` covers asymmetric and symmetric private members; missing-context member
-  // fragments remain ambiguous and are intentionally rejected conservatively.
-  // Skip literals/comments so braces inside them cannot corrupt the member view.
-  const witness = '"kty":"oct",';
-  const text = bytes.toString('utf8');
-  const pieces = /"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|[{}\[\]]/g;
-  const stack = [], closed = new Set();
-  let gapIndex = 0, lastGap = -1;
-  for (const match of text.matchAll(pieces)) {
-    while (gapIndex < gaps.length && gaps[gapIndex] <= match.index) lastGap = gaps[gapIndex++];
-    const token = match[0];
-    if (token === '{' || token === '[') stack.push({ token, at: match.index });
-    else if (token === '}' || token === ']') {
-      const open = stack.pop();
-      // A matching brace across omitted lines is not evidence of a complete object:
-      // those lines may contain the real key type. Only contiguous objects are known.
-      if (open?.token === (token === '}' ? '{' : '[') && lastGap <= open.at) closed.add(open.at);
-    }
+// --raw -z emits one metadata field and one literal path per record, with no
+// quoting or line delimiters. --no-renames makes every record single-path.
+export function parseRawDiff(bytes) {
+  const files = [];
+  let offset = 0;
+  const field = () => {
+    const end = bytes.indexOf(0, offset);
+    if (end < 0) throw incomplete();
+    const value = bytes.subarray(offset, end);
+    offset = end + 1;
+    return value;
+  };
+  while (offset < bytes.length) {
+    const metadata = field().toString('ascii');
+    const match = /^:(100644|100755|120000|160000|000000) (100644|100755|120000|160000|000000) ([0-9a-f]{40}|[0-9a-f]{64}) ([0-9a-f]{40}|[0-9a-f]{64}) ([ADMT])$/.exec(metadata);
+    if (!match || !Buffer.from(metadata, 'ascii').equals(bytes.subarray(offset - metadata.length - 1, offset - 1))) throw incomplete();
+    const pathBytes = field(), path = pathBytes.toString('utf8');
+    if (!path || !Buffer.from(path).equals(pathBytes) || path.startsWith('/')
+      || path.split('/').some(part => !part || part === '.' || part === '..')) throw incomplete();
+    const [, oldMode, mode, oldSha, sha, status] = match;
+    if (oldSha.length !== sha.length || (oldMode === '000000') !== /^0+$/.test(oldSha)
+      || (mode === '000000') !== /^0+$/.test(sha)
+      || (status === 'A') !== (oldMode === '000000')
+      || (status === 'D') !== (mode === '000000')) throw incomplete();
+    files.push({ path, mode, sha, status });
+    if (files.length > 500) throw incomplete();
   }
-  let size = Buffer.byteLength(text) + witness.length + 4, depth = 1;
-  if (size > LIMIT) throw incomplete();
-  const trivia = /(?:\s+|\/\*[\s\S]*?\*\/|\/\/[^\r\n\u2028\u2029]*)*/y;
-  const fragments = text.replace(pieces, (token, offset) => {
-    let extra = '';
-    if (token === '{' || token === '[') {
-      depth++;
-      trivia.lastIndex = offset + 1;
-      trivia.exec(text);
-      // A type witness must not turn empty `oth: {}` into private material.
-      if (token === '{' && !closed.has(offset) && text[trivia.lastIndex] !== '}') extra = witness;
-    } else if (token === '}' || token === ']') {
-      if (--depth === 0) {
-        // An addition can first close an unchanged container, then add members
-        // in its parent. Start another witness instead of losing that suffix.
-        depth = 1;
-        extra = `\n{${witness}\n`;
-      }
-    }
-    size += extra.length;
-    if (size > LIMIT) throw incomplete();
-    return token + extra;
-  });
-  // The unchanged remainder may close added containers. Complete the synthetic
-  // view so an unclosed last container cannot hide earlier private members.
-  if (size + depth - 1 > LIMIT) throw incomplete();
-  return keyStructureFinding(Buffer.from(`{${witness}\n${fragments}\n${'}'.repeat(depth)}`));
+  return files;
 }
 
-function fileStructureFinding(added, starts) {
-  const runs = starts.map((start, index) => Buffer.concat(added.slice(start, starts[index + 1])));
-  const trivia = /^(?:\s+|\/\*[\s\S]*?\*\/|\/\/[^\r\n\u2028\u2029]*)*/;
-  for (const run of runs) {
-    const text = run.toString('utf8');
-    // A replacement can supply only the value of an unchanged `d`, `k`, etc.
-    // Examine each contiguous run separately: concatenating another addition can
-    // disguise that leading value as a member name or an earlier member's value.
-    // Skip trivia, then distinguish a quoted value from an ordinary quoted name.
-    const leading = trivia.exec(text)[0].length;
-    const literal = /^(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')/.exec(text.slice(leading));
-    if (!literal) continue;
-    const rest = text.slice(leading + literal[0].length);
-    if (rest[trivia.exec(rest)[0].length] === ':') continue;
-    const witness = '{"kty":"oct","d":\n';
-    if (Buffer.byteLength(text) + witness.length + 2 > LIMIT) throw incomplete();
-    const finding = keyStructureFinding(Buffer.from(`${witness}${text}\n}`));
-    if (finding) return finding;
-  }
-  if (runs.length === 1) return addedStructureFinding(runs[0]);
-  const scanRuns = chunks => {
-    let offset = 0;
-    const gaps = chunks.slice(0, -1).map(chunk => (offset += chunk.toString('utf8').length));
-    return addedStructureFinding(Buffer.concat(chunks), gaps);
-  };
-  const finding = scanRuns(runs);
-  if (finding) return finding;
-  // Each run contains consecutive added postimage lines. An unfinished literal or
-  // block comment at a gap may close on omitted lines. Drop only that unfinished
-  // token in this alternate view; retain the original byte view above for DER and
-  // structures genuinely spanning runs. Do not reset between consecutive additions.
-  // Match unfinished tokens in the same pass as closed tokens, so repeated openers
-  // without a terminator cannot cause repeated searches through the remaining run.
-  const pieces = /"(?:\\[\s\S]|[^"\\])*("|\\?$)|'(?:\\[\s\S]|[^'\\])*('|\\?$)|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(\*\/|$)/g;
-  return scanRuns(runs.map(run => Buffer.from(run.toString('utf8')
-    .replace(pieces, (token, doubleEnd, singleEnd, commentEnd) =>
-      (doubleEnd !== undefined && doubleEnd !== '"')
-      || (singleEnd !== undefined && singleEnd !== "'") || commentEnd === '' ? '\n' : token))));
-}
-
-export function scanDiff(diff, allowlist = []) {
-  if (!Buffer.isBuffer(diff)) diff = Buffer.from(diff, 'utf8');
-  if (diff.length > LIMIT) throw incomplete();
-  const hits = [];
-  let path = null, line = 0, oldLeft = 0, newLeft = 0, added = [], firstAdded = 0, displayPath, previousPrefix;
-  let starts = [], lastAdded = 0;
-  const report = (rule, at) => {
-    if (!path) throw incomplete();
-    if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
-      displayPath ??= safePath(path);
-      hits.push(`${displayPath}:${at} ${rule}`);
-    }
-  };
-  const finishFile = () => {
-    if (added.length) {
-      const rule = fileStructureFinding(added, starts);
-      if (rule) report(rule, firstAdded);
-    }
-    added = [];
-    starts = [];
-    lastAdded = 0;
-    firstAdded = 0;
-    displayPath = undefined;
-  };
-  // Split only on LF bytes. Decode metadata/text rules separately; DER must never
-  // pass through a UTF-8 round trip (including CR bytes and the final LF).
+// Metadata is irrelevant: the raw record supplies the path. Once a hunk starts,
+// every line must consume exactly its declared old/new counts.
+export function addedLines(diff) {
+  const result = [];
+  let oldLeft = 0, newLeft = 0, line = 0, started = false, previousPrefix;
   for (let offset = 0; offset < diff.length;) {
     const newline = diff.indexOf(10, offset);
-    const bytes = diff.subarray(offset, newline === -1 ? diff.length : newline);
-    offset = newline === -1 ? diff.length : newline + 1;
-    const text = bytes.toString('utf8');
+    if (newline < 0) throw incomplete();
+    const text = diff.subarray(offset, newline).toString('utf8');
+    offset = newline + 1;
     if (text === '\\ No newline at end of file') {
-      if (previousPrefix === '+') added[added.length - 1] = added.at(-1).subarray(0, -1);
+      if (!previousPrefix) throw incomplete();
       previousPrefix = undefined;
       continue;
     }
@@ -197,78 +101,80 @@ export function scanDiff(diff, allowlist = []) {
       if (prefix !== '+') oldLeft--;
       if (prefix !== '-') newLeft--;
       if (oldLeft < 0 || newLeft < 0) throw incomplete();
-      if (prefix === '+') {
-        if (!path) throw incomplete();
-        if (!added.length) firstAdded = line;
-        if (!added.length || line !== lastAdded + 1) starts.push(added.length);
-        lastAdded = line;
-        const raw = text.slice(1), decoded = decodedLine(raw);
-        added.push(Buffer.concat([bytes.subarray(1), Buffer.from('\n')]));
-        for (const [pattern, rule] of secretText) {
-          pattern.lastIndex = 0;
-          if (pattern.test(raw) || pattern.test(decoded)) report(rule, line);
-        }
-      }
+      if (prefix === '+') result.push({ line, text: text.slice(1) });
       previousPrefix = prefix;
       if (prefix !== '-') line++;
-    } else if (text.startsWith('diff --git ')) {
-      finishFile();
-      path = null;
-    } else if (text.startsWith('+++ ')) {
-      finishFile();
-      path = diffPath(text.slice(4));
-    } else if (text.startsWith('Binary files ')) {
-      const notice = /^Binary files (.+) and (.+) differ$/.exec(text);
-      if (!notice) throw incomplete();
-      finishFile();
-      path = diffPath(notice[2]) ?? diffPath(notice[1], 'a/');
-      report('unscannable-binary', 0);
     } else if (text.startsWith('@@')) {
       const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/.exec(text);
       if (!hunk) throw incomplete();
+      const oldLine = Number(hunk[1]);
       oldLeft = Number(hunk[2] ?? 1);
       line = Number(hunk[3]);
       newLeft = Number(hunk[4] ?? 1);
-      if (![oldLeft, line, newLeft].every(Number.isSafeInteger) || (newLeft && !path)) throw incomplete();
-    } else if (text && !/^(?:--- |index |new file mode |deleted file mode |old mode |new mode |similarity index |dissimilarity index |rename from |rename to |copy from |copy to |\\ No newline at end of file)/.test(text)) {
-      throw incomplete();
-    }
+      if (![oldLine, oldLeft, line, newLeft].every(Number.isSafeInteger)
+        || (!oldLeft && !newLeft) || (oldLeft && !oldLine) || (newLeft && !line)) throw incomplete();
+      started = true;
+    } else if (started || text.startsWith('+') && !text.startsWith('+++ ')) throw incomplete();
   }
   if (oldLeft || newLeft) throw incomplete();
-  finishFile();
+  return result;
+}
+
+function scan(options, allowlist) {
+  const git = args => {
+    try {
+      return execFileSync('git', ['--literal-pathspecs', '-C', options.repo, ...args], {
+        maxBuffer: LIMIT, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch { throw incomplete(); }
+  };
+  const range = `${options.base}...${options.head}`;
+  const flags = ['--no-ext-diff', '--no-textconv', '--no-color', '--no-renames'];
+  const files = parseRawDiff(git(['diff', '--raw', '-z', '--no-abbrev', ...flags, range, '--']));
+  const hits = [];
+  for (const { path, mode, sha, status } of files) {
+    if (status === 'D' || mode === '160000') continue;
+    const report = (rule, line = 0) => {
+      if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
+        hits.push(`${safePath(path)}:${line} ${rule}`);
+      }
+    };
+    const size = git(['cat-file', '-s', sha]).toString('ascii');
+    if (!/^(0|[1-9]\d*)\n$/.test(size) || !Number.isSafeInteger(Number(size))) throw incomplete();
+    if (Number(size) > FILE_LIMIT) {
+      report('unscanned-oversize');
+      continue;
+    }
+    const bytes = git(['cat-file', 'blob', sha]);
+    if (bytes.length !== Number(size)) throw incomplete();
+    const rule = keyStructureFinding(bytes);
+    if (rule) report(rule);
+    // --text also exposes binary additions: NUL bytes must not hide credentials.
+    const diff = git(['diff', '-U0', '--text', ...flags, range, '--', path]);
+    for (const { line, text } of addedLines(diff)) {
+      const decoded = decodedLine(text);
+      for (const [pattern, textRule] of secretText) {
+        pattern.lastIndex = 0;
+        if (pattern.test(text) || pattern.test(decoded)) report(textRule, line);
+      }
+    }
+  }
   return hits;
 }
 
 export async function main(args = process.argv.slice(2)) {
   try {
     const options = { repo: '.', base: 'origin/main', head: 'HEAD', allowlist: new URL('./secret-scan-allowlist.json', import.meta.url) };
-    let stdin = false;
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === '--stdin') stdin = true;
-      else if (['--base', '--head', '--allowlist', '--repo'].includes(args[i]) && args[i + 1] && !args[i + 1].startsWith('-')) {
+      if (['--base', '--head', '--allowlist', '--repo'].includes(args[i]) && args[i + 1] && !args[i + 1].startsWith('-')) {
         options[args[i].slice(2)] = args[++i];
       } else throw new Error('secret-scan: invalid arguments');
     }
-    const allowlist = loadAllowlist(options.allowlist);
-    let diff;
-    if (stdin) {
-      const chunks = [];
-      let size = 0;
-      for await (const chunk of process.stdin) {
-        size += chunk.length;
-        if (size > LIMIT) throw incomplete();
-        chunks.push(chunk);
-      }
-      diff = Buffer.concat(chunks);
-    } else {
-      try {
-        diff = execFileSync('git', ['-C', options.repo, '-c', 'core.quotePath=true', 'diff', '--text', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', `${options.base}...${options.head}`, '--'], {
-          maxBuffer: LIMIT, timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'],
-        });
-      } catch { throw incomplete(); }
-    }
-    const hits = scanDiff(diff, allowlist);
+    const hits = scan(options, loadAllowlist(options.allowlist));
     if (hits.length) process.stdout.write(hits.join('\n') + '\n');
+    if (hits.some(hit => hit.endsWith(' unscanned-oversize'))) {
+      process.stderr.write('secret-scan: review oversize files manually; exempt only with an exact path+rule allowlist entry and a reason\n');
+    }
     return hits.length ? 1 : 0;
   } catch (error) {
     // JSON, filesystem and subprocess errors may contain source text: never echo them.
