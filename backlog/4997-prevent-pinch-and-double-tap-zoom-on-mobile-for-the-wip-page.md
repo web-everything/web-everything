@@ -20,3 +20,5 @@ Filed from owner request R-V2G2G (story). Operator reports the /wip page zooms o
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Superseded by plan step DZ-SHELL (PL-WIP-CLEANUP, 2026-11-22). Unfinished acceptance carried to DZ-SHELL: no pinch or double-tap zoom on mobile, as a shell acceptance rule.
