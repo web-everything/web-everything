@@ -232,7 +232,9 @@ export async function main(argv, deps, { loadDeps = async () => (await import('.
     const verdict = lines.shift();
     if (verdict !== 'NOT WEAKENED' && verdict !== 'WEAKENED') throw new Error(`no verdict line (first line: ${JSON.stringify(clean(String(verdict ?? '')).slice(0, 80))})`);
     if (hasConflictingVerdict(verdict, lines)) throw new Error('conflicting verdict lines');
-    const findings = lines.filter(line => line.trim()).map(clean);
+    const findings = lines.map(clean).filter(line => line.trim());
+    // Reject incomplete evidence before it can make the persisted lineage unreadable.
+    if (verdict === 'WEAKENED' && !findings.length) throw new Error('WEAKENED verdict requires findings');
     const result = { verdict, base, head, questionHash: QUESTION_HASH, findings };
     // R503: store the head's net-diff fingerprint so the audit carries across a rebase/merge-of-main; unreadable = omitted.
     let fingerprint = null;

@@ -26,6 +26,27 @@ function scratch(run) {
   try { return run(dir); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
+it.each(['WEAKENED', 'WEAKENED\n', 'WEAKENED\r\n \t\r\n',
+  'WEAKENED\n\x1b[31m\x1b[0m\x07', 'WEAKENED\n \x00 \n'])
+('rejects an empty WEAKENED answer without poisoning the next audit: %j', async answer => {
+  const { deps, run } = fixture();
+  const records = [];
+  deps.readRecords = () => records;
+  deps.appendRecord.mockImplementation(record => records.push(record));
+  deps.runCodex = () => answer;
+  const incompleteExit = await run();
+  const incompleteRecords = records.slice();
+  deps.runCodex = () => 'NOT WEAKENED';
+  const passingExit = await run();
+  expect({ incompleteExit, passingExit, incompleteRecords }).toEqual({
+    incompleteExit: 3, passingExit: 0, incompleteRecords: [],
+  });
+  expect(records).toHaveLength(1);
+  expect(records[0]).toMatchObject({ verdict: 'NOT WEAKENED', findings: [] });
+  expect(deps.stderr.mock.calls.flat().join('')).toContain('WEAKENED verdict requires findings');
+  expect(deps.escalate).not.toHaveBeenCalled();
+});
+
 it('a historical NOT WEAKENED commentary resets the streak without reserving finding keys', () => {
   const note = { ...round('b', 'B1', 'NOT WEAKENED'), findings: round('c', 'D1').findings };
   expect(assessLineage([round('a'), note])).toMatchObject({ streak: 0, escalate: false });

@@ -159,7 +159,7 @@ describe('canonical audit', () => {
 
   it.each(conflictingAnswers)('findAudit ignores historical contradictory records: %j', async answer => {
     const verdict = answer.startsWith('WEAKENED') ? 'WEAKENED' : 'NOT WEAKENED';
-    const f = fixture(verdict);
+    const f = fixture(verdict === 'WEAKENED' ? `${verdict}\nscripts/gate.mjs:12 guard removed` : verdict);
     await main(ARGS, f.deps);
     const valid = { ...f.records[0], at: '2026-01-01T00:00:00.000Z' };
     const query = { base: BASE, head: HEAD, questionHash: QUESTION_HASH };
