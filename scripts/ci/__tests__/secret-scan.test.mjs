@@ -339,6 +339,44 @@ test('text attributes cannot hide tokens and PR scanner/config copies are ignore
   r.put('scripts/ci/secret-scan-allowlist.json', JSON.stringify({ entries: [exemption('hidden.dat', 'aws-access-key')] }));
   r.commit(); const result = r.scan(); assert.equal(result.status, 1); assert.match(result.stdout, /hidden.dat:1 aws-access-key/);
 });
+test('current trusted scanner ignores PR allowlist without --allowlist', () => {
+  const r = repo();
+  const trustedEntry = exemption('trusted-fixture.txt', 'github-token', token);
+  const prEntry = exemption('pr-secret.txt', 'github-token', token);
+  r.put('trusted-fixture.txt', token);
+  r.put('pr-secret.txt', token);
+  r.put('scripts/ci/secret-scan-allowlist.json', JSON.stringify({ entries: [trustedEntry, prEntry] }));
+  r.commit();
+
+  // Mirror CI's trusted checkout using the current scanner, not the historical fixture.
+  const trusted = join(r.dir, 'trusted/scripts');
+  mkdirSync(join(trusted, 'ci'), { recursive: true });
+  mkdirSync(join(trusted, 'readiness'), { recursive: true });
+  copyFileSync(cli, join(trusted, 'ci/secret-scan.mjs'));
+  for (const name of ['forge-exec-manifest.mjs', 'forge-key-structure.mjs']) {
+    copyFileSync(new URL('../../readiness/' + name, import.meta.url), join(trusted, 'readiness', name));
+  }
+  writeFileSync(join(trusted, 'ci/secret-scan-allowlist.json'), JSON.stringify({ entries: [trustedEntry] }));
+  const args = [join(trusted, 'ci/secret-scan.mjs'), '--base', r.base, '--head', 'HEAD'];
+  const invoke = (cwd, extra = []) => {
+    const result = spawnSync(process.execPath, [...args, ...extra], {
+      cwd, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.stderr, '');
+    return result;
+  };
+  // Both cwd-based CI usage and an explicit --repo must resolve config beside the scanner.
+  for (const [cwd, extra] of [[r.dir, []], [temporary(), ['--repo', r.dir]]]) {
+    const result = invoke(cwd, extra);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, 'pr-secret.txt:1 github-token\n');
+  }
+  // Prove the conflicting PR exemption really matches the committed bytes.
+  const control = invoke(r.dir, ['--allowlist', join(r.dir, 'scripts/ci/secret-scan-allowlist.json')]);
+  assert.equal(control.status, 0);
+  assert.equal(control.stdout, '');
+});
 test('strict NUL records and hunk counts refuse incomplete or unknown data', () => {
   for (const raw of ['bad', ':100644 100644 ' + 'a'.repeat(40) + ' ' + 'b'.repeat(40) + ' R100\0x\0y\0', ':bad\0x\0']) assert.throws(() => parseRawDiff(Buffer.from(raw)), /incomplete input/);
   for (const patch of ['@@ -0,0 +1,2 @@\n+fake\n', '@@ -1 +1 @@\n+fake\n', '@@ -0,0 +1 @@\n+fake\n+extra\n']) assert.throws(() => addedLines(Buffer.from(patch)), /incomplete input/);
