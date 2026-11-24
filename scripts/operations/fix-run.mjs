@@ -896,7 +896,7 @@ export async function runFixCli(argv = [], {
         const files = [], links = [], removed = [], refused = [];
         let total = 0;
         for (const path of paths) {
-          // Evidence paths reach here only for removal. Do not read a copy recreated after status (or its rename):
+          // Evidence paths reach here only for removal (including unmerged index stages). Do not read a copy recreated after status (or its rename):
           // the index must lose the old blob even while the new evidence remains on disk for the later read.
           if (path === '.fix-evidence.md') { removed.push(path); continue; }
           const dest = resolve(copy, path);
@@ -918,7 +918,7 @@ export async function runFixCli(argv = [], {
           if (e.mode === '120000') symlinkSync(e.data, dest);
           else writeFileSync(dest, e.data, { mode: e.mode === '100755' ? 0o755 : 0o644, flag: 'wx' });
         }
-        // Mode 0 drops every index stage of a path the agent deleted.
+        // Mode 0 drops every index stage of a deleted path or conflicted evidence artifact, preserving its worktree.
         if (removed.length) run('git', [...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info'], { cwd: lanePath, env: gitEnv, input: removed.map(path => `0 ${'0'.repeat(before.length)}\t${path}\0`).join('') });
         // `-f`: these paths come from the lane's own status, which already applied every ignore rule; the copy lacks the
         // lane's unchanged .gitignore files, so a negation there (`!keep.tmp`) would otherwise be lost.
@@ -1141,12 +1141,14 @@ export async function runFixCli(argv = [], {
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);
-      const stage = [...new Set([...unmerged.filter(path => isStageable(path)), ...unstagedPaths(statusAfterAgent)])];
+      // Conflicted evidence must lose its unmerged index stages; stageLaneFiles removes it without reading the worktree.
+      const stage = [...new Set([...unmerged.filter(path => isStageable(path, path === '.fix-evidence.md')), ...unstagedPaths(statusAfterAgent)])];
       stageLaneFiles(stage);
       // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
       const unresolvedStaged = unmerged.filter(path => {
         const entries = indexEntries(path);
+        if (path === '.fix-evidence.md') return entries.length !== 0;
         if (entries.length !== 1 || entries[0].stage !== '0' || !REGULAR_MODES.has(entries[0].mode)) return true;
         const { sizes, allowance } = markerSizes.get(path);
         return hasLeftoverMarkers(blob(entries[0].oid), sizes, allowance);

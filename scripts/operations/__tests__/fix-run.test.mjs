@@ -865,6 +865,88 @@ describe('runFixCli', () => {
     expect(m.calls.some(c => c.includes('commit'))).toBe(true);
     expect(m.calls.filter(c => c.includes('add')).flat()).not.toContain('.fix-evidence.md');
   });
+  it.each([
+    ['UU', null], ['AA', null], ['UU', 'file.txt'], ['AA', 'docs/.fix-evidence.md'], ['UU', '.fix-evidence.md.bak'],
+  ])('removes conflicted root evidence from the index while preserving its worktree (%s, companion=%s)', async (code, companion) => {
+    const lane = mkdtempSync(join(tmpdir(), 'fix-run-evidence-conflict-'));
+    try {
+      const m = mk(['aaa', 'bbb']);
+      let merging = false;
+      let removed = false;
+      let added = false;
+      const path = '.fix-evidence.md';
+      const evidence = 'private fix evidence\n';
+      writeFileSync(join(lane, path), '<<<<<<< HEAD\nold evidence\n=======\nother evidence\n>>>>>>> origin/main\n');
+      m.spawn.mockImplementation(async () => { writeFileSync(join(lane, path), evidence); });
+      if (companion) {
+        mkdirSync(dirname(join(lane, companion)), { recursive: true });
+        writeFileSync(join(lane, companion), 'resolved\n');
+      }
+      const removals = [];
+      const persistEvidence = vi.fn();
+      const stageEntry = vi.fn(laneStageEntry);
+      const run = (cmd, args, opts) => {
+        if (args.includes('acquire')) return JSON.stringify({ path: lane, holder: 'test-holder' });
+        if (args.includes('--git-path')) return 'MERGE_HEAD';
+        if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+        if (args.includes('status')) return `${code} ${path}\0` + (companion ? `UU ${companion}\0` : '');
+        if (args.includes('--numstat')) return `1\t1\t${path}\0` + (companion ? `1\t1\t${companion}\0` : '');
+        if (args.includes('ls-files')) {
+          const queried = args.at(-1);
+          if (queried === path && removed) return '';
+          if (queried === companion && added) return `100644 ${'c'.repeat(40)} 0\t${queried}\0`;
+          return (code === 'AA' && queried === path ? [2, 3] : [1, 2, 3])
+            .map(stage => `100644 ${String(stage).repeat(40)} ${stage}\t${queried}\0`).join('');
+        }
+        if (args.includes('cat-file')) return 'resolved\n';
+        if (args.includes('--index-info')) { removals.push(opts.input); removed = true; }
+        if (args.includes('add')) added = true;
+        if (args.includes('commit')) {
+          expect(removed).toBe(true);
+          expect(readFileSync(join(lane, path), 'utf8')).toBe(evidence);
+          merging = false;
+        }
+        if (args.includes('--abort')) merging = false;
+        return m.run(cmd, args, opts);
+      };
+      const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, stageEntry, persistEvidence,
+        fileExists: p => p.endsWith('MERGE_HEAD') ? merging : existsSync(p) });
+      expect(out.code).toBe(0);
+      expect(removals).toEqual([`0 ${'0'.repeat(3)}\t${path}\0`]);
+      expect(stageEntry.mock.calls.map(c => c[1])).toEqual(companion ? [companion] : []);
+      expect(m.calls.filter(c => c.includes('add')).flat()).not.toContain(path);
+      expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+      expect(persistEvidence).toHaveBeenCalledWith({ repoKey: 'o_r', pr: '7', text: evidence });
+      expect(readFileSync(join(lane, path), 'utf8')).toBe(evidence);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it.each(['unmerged', 'stage0', 'throw'])('refuses to commit when conflicted evidence removal fails (%s)', async failure => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    let attempted = false;
+    const recordOutcome = vi.fn();
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU .fix-evidence.md\0';
+      if (args.includes('--numstat')) return '1\t1\t.fix-evidence.md\0';
+      if (args.includes('--index-info')) { attempted = true; if (failure === 'throw') throw new Error('index removal failed'); }
+      if (args.includes('ls-files')) return (attempted && failure === 'stage0' ? [0] : [1, 2, 3])
+        .map(stage => `100644 ${'c'.repeat(40)} ${stage}\t.fix-evidence.md\0`).join('');
+      if (args.includes('cat-file')) return 'old evidence\n';
+      if (args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : true, readFile: () => 'private evidence\n' });
+    expect(out.code).toBe(1);
+    expect(attempted).toBe(true);
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+    expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed',
+      reason: failure === 'throw' ? 'index removal failed' : expect.stringContaining('conflict unresolved in .fix-evidence.md') }));
+  });
   it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
