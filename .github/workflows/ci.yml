@@ -144,6 +144,12 @@ jobs:
     timeout-minutes: 20
     steps:
       # Same sibling layout as the shards — check:standards shells out to FUI's render CLI.
+      - name: Restore main history mirror
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
+          restore-keys: main-history-v1-
       - name: Checkout WE
         uses: actions/checkout@v4
         with:
@@ -152,7 +158,22 @@ jobs:
       - name: Fetch main history (blobless)
         timeout-minutes: 4
         working-directory: web-everything
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
         run: sh scripts/ci/fetch-main-history.sh
+      # Saved from main pushes only (never PR or fork events), by this one job.
+      - name: Save main history mirror
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        working-directory: web-everything
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
+        run: sh scripts/ci/fetch-main-history.sh save
+      - name: Upload main history mirror cache
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
         if: vars.WE_APP_ID != ''
@@ -244,6 +265,13 @@ jobs:
       # published `@frontierui/*` package), mirroring the #1137 deploy.yml workaround:
       #   $GITHUB_WORKSPACE/web-everything  (this repo)
       #   $GITHUB_WORKSPACE/frontierui      (the sibling)
+      - name: Restore main history mirror
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
+          restore-keys: main-history-v1-
       - name: Checkout WE
         if: ${{ needs.changes.outputs.light != 'true' }}
         uses: actions/checkout@v4
@@ -254,6 +282,8 @@ jobs:
         timeout-minutes: 4
         if: ${{ needs.changes.outputs.light != 'true' }}
         working-directory: web-everything
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
         run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
@@ -552,6 +582,13 @@ jobs:
           fi
 
       # Same sibling layout as the shards.
+      - name: Restore main history mirror
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
+          restore-keys: main-history-v1-
       - name: Checkout WE
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: actions/checkout@v4
@@ -562,6 +599,8 @@ jobs:
         timeout-minutes: 4
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
         run: sh scripts/ci/fetch-main-history.sh
       - name: Mint FUI read token (GitHub App)
         id: fui-app-token
@@ -680,11 +719,19 @@ jobs:
     outputs:
       run: ${{ steps.scope.outputs.run }}
     steps:
+      - name: Restore main history mirror
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
+          restore-keys: main-history-v1-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 50
       - name: Fetch main history (blobless)
         timeout-minutes: 4
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
         run: sh scripts/ci/fetch-main-history.sh
 
       - name: Check soak scope safeguards (Node builtins only)
@@ -737,6 +784,12 @@ jobs:
         continue-on-error: true
         run: echo "SHARD_START_SECONDS=$(date +%s)" >> "$GITHUB_ENV"
 
+      - name: Restore main history mirror
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/main-history
+          key: main-history-v1-${{ github.run_id }}
+          restore-keys: main-history-v1-
       - uses: actions/checkout@v4
         with:
           # quarantine-skip proves the PR's changed files against its merge base: depth 50 plus blobless main
@@ -744,6 +797,8 @@ jobs:
           fetch-depth: 50
       - name: Fetch main history (blobless)
         timeout-minutes: 4
+        env:
+          MAIN_HISTORY_CACHE_DIR: ${{ runner.temp }}/main-history
         run: sh scripts/ci/fetch-main-history.sh
 
       - uses: actions/setup-node@v4

@@ -49,8 +49,11 @@ export function ciUnitPlan(workflow) {
 // Do not derive this allowlist from the workflow at runtime: new validation must update the mirror.
 const runText = run => run.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('#')).join('\n');
 const setupRuns = ['sh scripts/ci/fetch-main-history.sh', 'npm ci', 'npm ci\nnpm run build:tools'];
+const saveMainHistory = 'sh scripts/ci/fetch-main-history.sh save';
+const mainHistoryEnv = { MAIN_HISTORY_CACHE_DIR: '${{ runner.temp }}/main-history' };
+const mainPush = "${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}";
 const jobSetupRuns = {
-  standards: setupRuns, 'test-shard': setupRuns, 'integration-part': setupRuns,
+  standards: [...setupRuns, saveMainHistory], 'test-shard': setupRuns, 'integration-part': setupRuns,
   'coverage-merge': ['npm ci'],
 };
 const mirroredRuns = {
@@ -201,16 +204,30 @@ const siblingActions = [
     'node-version': 22, cache: 'npm', 'cache-dependency-path': 'web-everything/package-lock.json\nfrontierui/package-lock.json\n',
   } },
 ];
+// Cache transport changes no local suite: a miss still uses the full history fetch.
+// Pin its payload and write condition just like every other workflow action.
+const restoreMainHistory = {
+  name: 'Restore main history mirror', uses: 'actions/cache/restore@v4', with: {
+    path: '${{ runner.temp }}/main-history', key: 'main-history-v1-${{ github.run_id }}', 'restore-keys': 'main-history-v1-',
+  },
+};
+const uploadMainHistory = {
+  name: 'Upload main history mirror cache', uses: 'actions/cache/save@v4', if: mainPush, with: {
+    path: '${{ runner.temp }}/main-history', key: 'main-history-v1-${{ github.run_id }}',
+  },
+};
 const mirroredActions = {
   changes: [{ name: undefined, uses: 'actions/checkout@v4', with: { 'fetch-depth': 50 } }],
-  standards: siblingActions,
-  'integration-part': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
+  standards: [restoreMainHistory, siblingActions[0], uploadMainHistory, ...siblingActions.slice(1)],
+  'integration-part': [{ ...restoreMainHistory, if: "${{ steps.gate.outputs.run == 'true' }}" },
+    ...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)' ? step.if : "${{ steps.gate.outputs.run == 'true' }}" })),
     { name: 'Upload integration timings', if: "${{ needs.changes.outputs.light != 'true' && (always()) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'timing-integration-${{ matrix.group }}', path: 'web-everything/coverage/timing-integration-${{ matrix.group }}.json', 'if-no-files-found': 'ignore',
     } },
   ],
   integration: [],
-  'test-shard': [...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
+  'test-shard': [{ ...restoreMainHistory, if: "${{ needs.changes.outputs.light != 'true' }}" },
+    ...siblingActions.map(step => ({ ...step, if: step.name === 'Mint FUI read token (GitHub App)'
     ? "${{ needs.changes.outputs.light != 'true' && (vars.WE_APP_ID != '') }}" : "${{ needs.changes.outputs.light != 'true' }}" })),
     { name: 'Upload shard coverage', if: "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}", uses: 'actions/upload-artifact@v4', with: {
       name: 'coverage-shard-${{ matrix.shard }}', path: 'web-everything/coverage/coverage-final.json', 'if-no-files-found': 'error',
@@ -271,7 +288,7 @@ function mirroredRunContext(job, text) {
   const directory = text === 'npm ci\nnpm run build:tools' ? 'frontierui'
     : setup || job === 'standards' || (job === 'coverage-merge' && index === 1)
       || (job === 'test-shard' && [1, 2, 3].includes(index)) || (job === 'integration-part' && index === 1) ? 'web-everything' : undefined;
-  const condition = job === 'test-shard' ? (setup ? fullUnit : [
+  const condition = job === 'standards' && text === saveMainHistory ? mainPush : job === 'test-shard' ? (setup ? fullUnit : [
     "${{ needs.changes.outputs.light == 'true' }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}",
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
@@ -280,7 +297,7 @@ function mirroredRunContext(job, text) {
   ][index]) : job === 'changes' && index === 1 ? "github.event_name == 'pull_request'" : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
     'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && [3, 4].includes(index) ? true : undefined,
-    env: job === 'changes' && index === 1 ? {
+    env: text === setupRuns[0] || (job === 'standards' && text === saveMainHistory) ? mainHistoryEnv : job === 'changes' && index === 1 ? {
       GITHUB_EVENT_NAME: '${{ github.event_name }}', GH_TOKEN: '${{ github.token }}',
       REPO: '${{ github.repository }}', PR_NUMBER: '${{ github.event.pull_request.number }}',
       HEAD_REF: '${{ github.event.pull_request.head.ref }}', HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
