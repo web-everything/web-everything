@@ -539,7 +539,8 @@ describe('runReviewTick — the per-tick sequence', () => {
     const tagStatus = vi.fn();
     const out = runReviewTick({ reconcile, dispatch, tagRound, tagStatus, statusCandidates: () => [], now: () => 7 });
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'web-everything/web-everything', escalationReason: [], scopePaths: [] });
+    // No PR file snapshot is available: unknown scope must retain high-care routing.
+    expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: 'web-everything/web-everything', escalationReason: [], scopePaths: [], careLevel: 'high' });
     expect(tagRound).toHaveBeenCalledWith({ pr: 10, repo: expect.any(String), round: 2 }); // attempts+1
     expect(out).toEqual({
       reviewsOwed: 1, dispatched: [{ prNumber: 10, agentId: 'agent-10' }], failed: [], notStarted: [], refusals: 0,
@@ -1036,8 +1037,8 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       statusCandidates: () => [], acquirableLanes,
     });
     expect(dispatch).toHaveBeenCalledTimes(2);
-    expect(dispatch).toHaveBeenCalledWith({ pr: 100, repo: expect.any(String), escalationReason: [], scopePaths: [] });
-    expect(dispatch).toHaveBeenCalledWith({ pr: 101, repo: expect.any(String), escalationReason: [], scopePaths: [] });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 100, repo: expect.any(String), escalationReason: [], scopePaths: [], careLevel: 'high' });
+    expect(dispatch).toHaveBeenCalledWith({ pr: 101, repo: expect.any(String), escalationReason: [], scopePaths: [], careLevel: 'high' });
     expect(out.reviewsOwed).toBe(5); // still owed — a deferral is not a loss
     expect(out.dispatched).toHaveLength(2);
     expect(out.deferredForLanes).toBe(3);
@@ -3309,7 +3310,7 @@ describe('#4154 shared scan lane assignments', () => {
     });
     expect(out.deferredForLanes).toBe(1);
     expect(dispatch.mock.calls.map(([call]) => call)).toEqual([100, 101].map((pr, i) => ({
-      pr, repo: expect.any(String), escalationReason: [], scopePaths: [],
+      pr, repo: expect.any(String), escalationReason: [], scopePaths: [], careLevel: 'high',
       ...(Array.isArray(lanes) ? { preferLane: lanes[i] } : {}),
     })));
   });

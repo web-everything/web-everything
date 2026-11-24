@@ -244,6 +244,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
+  'scripts/lib/review-fast-pass-cli.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
