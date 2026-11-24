@@ -3,6 +3,55 @@ import { expect, it } from 'vitest';
 import { findRawPushes, isLintedScript } from '../lib/push-gate-lint.mjs';
 import { REPO_SCAN_TESTS } from '../lib/repo-scan-tests.mjs';
 
+it.each([
+  "execFileSync('echo', ['push']);",
+  "execFileSync('echo', ['git push']);",
+  "spawn('git push', []);",
+  "import { execFileSync as launchGit } from 'child_process'; launchGit('echo', ['push']);",
+  "execFileSync('git', ['checkout', 'push']);",
+  "spawn('git', ['--no-pager', 'log', '--grep', 'push']);",
+  "execSync('git --no-pager log --grep push');",
+  "execSync('echo git push');",
+  "execSync(\"echo 'git push'\");",
+  "execSync('git -C \"push; repo\" checkout push');",
+  "execFileSync('git', ['--version']);",
+  "git(['--help']);",
+  "git(['-C', 'push', 'checkout', 'push']);",
+  "io.git({ cwd: dir, args: ['checkout', 'push'] });",
+  "io.git({ cwd: dir, args: ['log', '--grep', 'push'] });",
+  "gitExec({ file: '/usr/bin/python3', args: ['push'] });",
+  "run(['checkout', 'push']);",
+])('ignores push when it is not the Git subcommand: %s', source => {
+  expect(findRawPushes(source)).toEqual([]);
+});
+
+it.each([
+  "io.git({ cwd: dir, args: ['push', 'origin', 'HEAD'] });",
+  "git({ args: ['-C', 'repo', 'push'], cwd: dir });",
+  "io.git({ 'args': [`push`], cwd: dir });",
+  "io.git({ ['args']: ['push'], cwd: dir });",
+  "git(['push'], { cwd: dir });",
+])('detects object-form Git push argv: %s', source => {
+  expect(findRawPushes(source)).toEqual([{ line: 1, kind: 'argv' }]);
+});
+
+it.each([
+  "io.git({ cwd: dir, args });",
+  "io.git({ cwd: dir, args: ['push', branch] });",
+  "io.git({ cwd: dir, args: [...args] });",
+  "io.git({ args: ['status'], ...options });",
+  "io.git({ ...options, args: ['push'] });",
+])('refuses unresolved object-form Git argv: %s', source => {
+  expect(findRawPushes(source)).toEqual([{ line: 1, kind: 'unresolved' }]);
+});
+
+it.each([
+  "run(['push', '--porcelain', remote, ref]);",
+  "runWt(['push', 'origin', ref], { cwd: dir });",
+])('retains Git argv wrapper push sites: %s', source => {
+  expect(findRawPushes(source)).toEqual([{ line: 1, kind: 'argv' }]);
+});
+
 it('refuses unreadable source and invalid syntax for manual inspection', () => {
   expect(() => findRawPushes(null)).toThrow(/unreadable source/);
   expect(() => findRawPushes('execSync(')).toThrow(/parse error/);
@@ -51,6 +100,11 @@ it.each([
 
 it.each([
   'spawn(`git`, [`push`]);',
+  "spawn('/usr/bin/git', ['push']);",
+  "spawn('C:\\\\tools\\\\git.exe', ['push']);",
+  "execSync('/usr/bin/git --no-pager push');",
+  "execSync('sh -c \"git push\"');",
+  "spawn('/bin/bash', ['-lc', 'git --no-pager push']);",
   "spawn('git', ['--git-dir=/x', '--work-tree=/x', '-C/x', '-c', 'k=v', 'push']);",
   'execSync(\'"git" "push"\');',
   'execSync(\'git "push"\');',

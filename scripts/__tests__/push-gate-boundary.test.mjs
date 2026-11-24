@@ -66,6 +66,17 @@ const pinned = { [fixtureFile]: { status: 'pending-migration', reason: 'fixture 
 it('refuses a new raw push parsed from fixture source through real admission', () => {
   expect(() => admit({ [fixtureFile]: "spawn('git', ['push']);" }, {})).toThrow(/pinned none/);
 });
+it('requires admission for object-form Git push arguments, including unresolved argv', () => {
+  for (const source of ["io.git({ cwd: dir, args: ['push', 'origin', 'HEAD'] });",
+    "io.git({ cwd: dir, args });"]) {
+    expect(() => admit({ [fixtureFile]: source }, {})).toThrow(/raw push count 1, pinned none/);
+    expect(() => admit({ [fixtureFile]: source }, pinned)).not.toThrow();
+  }
+});
+it('does not change admission counts for harmless push operands', () => {
+  expect(() => admit({ [fixtureFile]: "execFileSync('echo', ['push']); "
+    + "execFileSync('git', ['checkout', 'push']); execSync('git --no-pager log --grep push');" }, {})).not.toThrow();
+});
 it('refuses extra or removed sites in an allowlisted file', () => {
   for (const source of ["git('push'); git('push');", "git('status');"]) {
     expect(() => admit({ [fixtureFile]: source }, pinned)).toThrow(/raw push count/);
