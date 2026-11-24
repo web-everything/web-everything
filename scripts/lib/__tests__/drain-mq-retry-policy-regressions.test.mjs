@@ -56,6 +56,51 @@ describe('retired MQ signature setting', () => {
     expect(probe({ text: 'environment outage' }).decision.hold).toBe(true);
     expect(probe().decision.hold).toBe(true);
   });
+
+  it('does not let a leftover tool or platform signature override authorize a retry', () => {
+    // The cascade may carry an unknown key through; nothing reads it, so the guard still holds.
+    readDrainQueueSafety({ env: {}, tool: { mqInfraSignatures: ['tool outage'] },
+      platform: { mqInfraSignatures: ['platform outage'] } });
+    const { decision } = probe({ text: 'tool outage\nplatform outage\n' });
+    expect(decision.hold).toBe(true);
+    expect(decision.reason).toContain('non-infrastructure');
+  });
+
+  it('holds a wildcard signature the retired allowlist used to accept from the environment', () => {
+    vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', JSON.stringify(['disk full on \\S+ during checkout']));
+    const { decision, reads } = probe({ text: 'disk full on /var/tmp during checkout\n' });
+    expect(reads).toHaveLength(1);
+    expect(decision.hold).toBe(true);
+    expect(decision.reason).toContain('non-infrastructure');
+  });
+
+  it('holds when a signature is split across log lines', () => {
+    vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', JSON.stringify(['could not fetch \\S+ from\\s+promisor remote']));
+    expect(probe({ text: 'fatal: could not fetch deadbeef from\npromisor remote\n' }).decision.hold).toBe(true);
+    expect(probe({ text: 'unrelated failure\n' + signature }).decision.hold).toBe(true);
+  });
+
+  it('holds a signature followed by a 64 KiB tail, ASCII or multibyte', () => {
+    for (const suffix of ['x'.repeat(64 * 1024), 'é'.repeat(32 * 1024)]) {
+      const held = probe({ text: signature + suffix });
+      expect(held.reads).toHaveLength(1);
+      expect(held.decision.hold).toBe(true);
+      expect(held.decision.reason).toContain('non-infrastructure');
+      expect(probe({ text: suffix + '\n' + signature }).decision.hold).toBe(true);
+    }
+  });
+
+  it('holds a signature on an oversized line, truncated or not', () => {
+    const line = signature.trimEnd();
+    expect(probe({ text: line + 'x'.repeat(512) + '\nunrelated failure\n' }).decision.hold).toBe(true);
+    expect(probe({ text: 'x'.repeat(4096) + signature }).decision.hold).toBe(true);
+    expect(probe({ text: 'x'.repeat(4096) + '\n' + line + 'x'.repeat(512 - line.length) }).decision.hold).toBe(true);
+  });
+
+  it('holds a repeated-character log without scanning it as a signature', () => {
+    vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', JSON.stringify(['aaaaaaaaaaa\\S+a\\S+a\\S+b']));
+    expect(probe({ text: 'a'.repeat(4096) }).decision.hold).toBe(true);
+  });
 });
 
 describe('MQ log authorization guard regressions', () => {
