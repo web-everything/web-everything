@@ -287,7 +287,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (persisted.has(entry) && pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
-          delete entry.blocked; delete entry.lastProbeTurn;
+          delete entry.blocked; delete entry.blockedReason; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
         }
         if (!Array.isArray(pr.comments)) {
