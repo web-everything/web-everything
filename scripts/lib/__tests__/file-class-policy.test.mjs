@@ -2,6 +2,7 @@ import { test, expect, vi } from 'vitest';
 import { readFileSync, readdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import ts from 'typescript';
 import { classify, evaluate, cascadeLoosening, digestOf, recordOnly } from '../file-class-policy.mjs';
 const fixture = n => JSON.parse(readFileSync(`scripts/lib/__tests__/fixtures/file-class-policy/${n}.json`, 'utf8'));
 const chain = [fixture('policy.company'), fixture('manifest.web-everything')], presets = [fixture('preset.ours')];
@@ -61,9 +62,44 @@ test('unreadable or incomplete input refuses; no fail-open catch', () => {
   for (const x of ['missing-file-class-input.json', {}, { chain, change: {} }, { chain: [], change: { files: [] } }])
     expect(() => recordOnly(x)).toThrow();
 });
+// Inspect module specifiers: the shared guard floor exports the engine's path as inert data.
+const importsEngine = (source, path = 'script.mjs') => {
+  if (!source.includes('file-class-policy.mjs')) return false;
+  const tree = ts.createSourceFile(path, source, ts.ScriptTarget.Latest);
+  expect(tree.parseDiagnostics, path).toEqual([]);
+  let found = false;
+  const visit = node => {
+    const specifier = ts.isImportDeclaration(node) || ts.isExportDeclaration(node) ? node.moduleSpecifier
+      : ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || ts.isIdentifier(node.expression) && node.expression.text === 'require'
+        || ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'require') ? node.arguments[0] : undefined;
+    if (specifier && ts.isStringLiteralLike(specifier) && /(?:^|\/)file-class-policy\.mjs$/.test(specifier.text)) found = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(tree);
+  return found;
+};
+test.each([
+  "import { recordOnly } from './file-class-policy.mjs';",
+  "import './file-class-policy.mjs';",
+  "export { recordOnly } from './file-class-policy.mjs';",
+  "export * from './file-class-policy.mjs';",
+  "const engine = import('./file-class-policy.mjs');",
+  'const engine = import(`./file-class-policy.mjs`);',
+  "const engine = require('./file-class-policy.mjs');",
+  "const engine = require(\n './file-class-policy.mjs',\n);",
+  "const engine = module.require('./file-class-policy.mjs');",
+])('importer guard rejects executable engine reference %s', source => expect(importsEngine(source)).toBe(true));
+test('importer guard accepts exported path data and comments', () => {
+  expect(importsEngine("export const paths = ['scripts/lib/file-class-policy.mjs'];")).toBe(false);
+  expect(importsEngine("// import './file-class-policy.mjs';")).toBe(false);
+});
+test('importer guard refuses malformed source mentioning the engine', () => {
+  expect(() => importsEngine("import './file-class-policy.mjs")).toThrow();
+});
 test('no other script imports the module for merge decisions', () => {
   const walk = p => readdirSync(p, { withFileTypes: true }).flatMap(e => e.isDirectory() ? walk(join(p, e.name)) : [join(p, e.name)]);
   const callers = walk('scripts').filter(p => /\.[cm]?[jt]s$/.test(p) && !p.includes('__tests__') && !p.endsWith('/file-class-policy.mjs'))
-    .filter(p => /(?:import|require|export)[^;]*file-class-policy\.mjs/s.test(readFileSync(p, 'utf8')));
+    .filter(p => importsEngine(readFileSync(p, 'utf8'), p));
   expect(callers).toEqual([]);
 });
