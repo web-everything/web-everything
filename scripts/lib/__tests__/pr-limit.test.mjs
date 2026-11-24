@@ -41,6 +41,13 @@ describe('resolvePrLimit', () => {
     expect(PR_LIMIT_DEFAULTS).toEqual({ we: 15, frontierui: 5, 'plateau-app': 5 });
   });
 
+  it('the checked-in tool settings give every repo the same 15 cap', () => {
+    const tool = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../settings/pr-limit.json'), 'utf8')).prLimit;
+    for (const key of ['we', 'frontierui', 'plateau-app']) {
+      expect(readPrLimit(key, {}, { platform: {}, tool }).limit).toBe(15);
+    }
+  });
+
   it('platform 25 beats default 15', () => {
     expect(resolvePrLimitFrom('we', { platform: cap(25) })).toEqual({ limit: 25, source: 'platform' });
   });
