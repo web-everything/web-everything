@@ -32,6 +32,8 @@
 
 export const ACCEPTED_EVENTS = Object.freeze({
   pull_request: new Set(['opened', 'synchronize', 'ready_for_review', 'converted_to_draft', 'closed', 'labeled', 'unlabeled', 'reopened']),
+  // The merge queue (app webhook). Wake-only: only the head sha and the PR number from the queue ref are kept.
+  merge_group: new Set(['checks_requested', 'destroyed']),
   check_suite: new Set(['completed']),
   check_run: new Set(['completed']),
   pull_request_review: new Set(['submitted', 'dismissed']),
@@ -124,6 +126,11 @@ export function parseGithubEvent(eventName, payload, { deliveryId = null, receiv
     if (Array.isArray(pr.labels)) rec.labels = pr.labels.map((l) => l.name).filter((n) => typeof n === 'string');
     if (['open', 'closed'].includes(pr.state)) rec.state = pr.state;
     return rec;
+  }
+  if (eventName === 'merge_group') {
+    const g = payload.merge_group || {};
+    const m = /\/pr-(\d+)-/.exec(String(g.head_ref || ''));
+    return { ...base, prs: m ? [Number(m[1])] : [], sha: g.head_sha || null };
   }
   if (eventName === 'check_suite') {
     const s = payload.check_suite || {};
@@ -464,9 +471,12 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
 
   if (url.pathname === '/github/webhook') {
     if (request.method !== 'POST') return json(405, { error: 'method not allowed' });
-    if (!env.GITHUB_WEBHOOK_SECRET) return json(503, { error: 'webhook secret not configured' });
+    // Two separate bindings: the repo hook secret and the app (plateau-observer) hook secret. Either may verify.
+    const secrets = [env.GITHUB_WEBHOOK_SECRET, env.GITHUB_APP_WEBHOOK_SECRET].filter(Boolean);
+    if (!secrets.length) return json(503, { error: 'webhook secret not configured' });
     const raw = new Uint8Array(await request.arrayBuffer());
-    const ok = await verifySignature(env.GITHUB_WEBHOOK_SECRET, raw, request.headers.get('x-hub-signature-256'));
+    let ok = false;
+    for (const s of secrets) ok = (await verifySignature(s, raw, request.headers.get('x-hub-signature-256'))) || ok;
     if (!ok) return json(401, { error: 'bad signature' });
     const eventName = request.headers.get('x-github-event') || '';
     const deliveryId = request.headers.get('x-github-delivery') || null;
