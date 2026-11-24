@@ -71,6 +71,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
   "pre-existing-red-on-main": "A failing test on main is fixed on main via the filed card; the responder never edits tests or the gate.",
   "red-main-quarantined-test": "The health filing pipeline owns the quarantine repair card; the responder never edits quarantine entries, tests or the gate.",
+  "red-team-pending-overdue": "Overdue red-team pending requires queue and worker inspection; the responder never clears pending, changes labels or dispatches review.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
   "review-same-head-unposted": "Alert only; inspect failed posting effects and the review caps, never re-arm or post a review from the responder.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
@@ -80,7 +81,8 @@ export const OBSERVATION_ONLY = Object.freeze({
   "session-stuck": "Silence or repetition is a warning, not proof of death; the session watchdog and reaper alone act on the worker.",
   "stale-claim-or-binding": "Alert only; a slow or silent holder is not proof of death, so never release the claim or binding from the responder.",
   "stood-down-prs":"Terminal questions need explicit operator answers; never auto-call stand-down-answer.",
-  "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed."
+  "untracked-backlog-card": "Do not adopt/commit unknown daemon-clone files; normal owner/file-item delivery is owed.",
+  "zero-success-alarm": "Inspect the failing loop through its owner; never restart a daemon, dispatch work, change labels or merge from the responder."
 });
 export const CATALOGUE = Object.freeze({ ...OBSERVATION_ONLY,
   'draft-not-promoted': ['promote'],

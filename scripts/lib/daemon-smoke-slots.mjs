@@ -1,7 +1,7 @@
 /**
  * Purpose: cap host-wide daemon rebuild live smokes with persistent FIFO tickets.
  * Queue expiry fails closed: give up this attempt so the next rebuild job can retry within the cap.
- * Exports: acquireSmokeSlot({env, log, stateDir, pid, isAlive, now, sleep, onWait}) → {acquired, release()}.
+ * Exports: acquireSmokeSlot → {acquired, release()}, behindMainPriority → boolean.
  */
 import fs, { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -16,6 +16,16 @@ import { rebuildLeaseStaleMs } from './daemon-rebuild/lease.mjs';
 const failedTickets = new Set();
 
 const positive = value => Number.isSafeInteger(value) && value > 0;
+
+/** Opt-in only: missing/invalid thresholds or unreadable counts retain routine queue order. */
+export function behindMainPriority({ behind, env = {}, log = {} } = {}) {
+  const raw = env.WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD;
+  const threshold = typeof raw === 'string' && /^\d+$(?![\s\S])/.test(raw) ? Number(raw) : NaN;
+  // Short queue waits reset age on retry, so retain FIFO unless aging can protect them.
+  const maxWait = smokeQueueMaxWaitMs(env, log);
+  return maxWait > PRIORITY_OVERTAKE_AGE_MS && positive(threshold) && Number.isFinite(behind) && Number.isInteger(behind) && behind >= threshold;
+}
+
 // The queue-wait ceiling never collapses to 0: a short rebuild lease must still allow a capacity check.
 const MIN_QUEUE_WAIT_MS = 1000;
 const LEASE_RUN_RESERVE_MS = 2 * 60_000;
@@ -50,6 +60,11 @@ function setting(env, log, key, envKey, fallback, ceiling = Infinity) {
   }
   log.error?.(`daemon-live-smoke: ${key}=${value} (${source})`);
   return value;
+}
+
+function smokeQueueMaxWaitMs(env, log) {
+  return setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000,
+    queueWaitCeiling(rebuildLeaseStaleMs(env)));
 }
 
 function processAlive(pid) {
@@ -107,8 +122,7 @@ export async function acquireSmokeSlot({
 } = {}) {
   if (!positive(pid)) throw new Error('daemon-live-smoke: invalid slot pid');
   const cap = setting(env, log, 'smokeMaxConcurrent', 'WE_DAEMON_SMOKE_MAX_CONCURRENT', 2);
-  const maxWait = setting(env, log, 'smokeQueueMaxWaitMs', 'WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS', 900_000,
-    queueWaitCeiling(rebuildLeaseStaleMs(env)));
+  const maxWait = smokeQueueMaxWaitMs(env, log);
   const queuedAt = now();
   const deadline = queuedAt + maxWait;
   const expired = new Error('smoke queue expired');

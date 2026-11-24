@@ -56,6 +56,19 @@ describe('health responder closed decision table', () => {
     i.config.smells = { [e.smell]: true };
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
   });
+  it.each(Object.keys(ACTION_ALLOWLIST))('keeps overdue red-team pending observation-only despite a permitted %s plan', family => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'red-team-pending-overdue'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Clear pending and re-arm review';
+    facts.episodeKey = e.key;
+    facts.plan = { kind: 'permitted', family, capRemaining: 1 };
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+  });
   it('keeps nightly coroner failure alerts observation-only even with a permitted action plan', () => {
     const i = input();
     const e = i.episodes[0], facts = i.subjectFacts[e.key];
@@ -65,6 +78,19 @@ describe('health responder closed decision table', () => {
     i.subjectFacts = { [e.key]: facts };
     i.config.smells = { [e.smell]: true };
     expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false });
+  });
+  it.each(Object.keys(ACTION_ALLOWLIST))('keeps zero-success alarms observation-only despite a permitted %s plan', family => {
+    const i = input();
+    const e = i.episodes[0], facts = i.subjectFacts[e.key];
+    e.smell = 'zero-success-alarm'; e.subject = 'prepare'; e.key = `${e.smell}::${e.subject}`;
+    e.recommendation = 'Restart the daemon, dispatch work, change labels and merge';
+    facts.episodeKey = e.key;
+    facts.plan = { kind: 'permitted', family };
+    i.subjectFacts = { [e.key]: facts };
+    i.config.smells = { [e.smell]: true };
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
+    i.subjectFacts = {};
+    expect(decide(i)[0]).toMatchObject({ decision: 'noop', rule: 'observation-only', applied: false, actionFamily: null, actuator: null });
   });
   it('keeps disk-space alerts observation-only with or without subject facts', () => {
     const i = input();

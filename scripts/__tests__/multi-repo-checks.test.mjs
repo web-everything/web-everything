@@ -151,3 +151,10 @@ it('the orphan pagination soak resolves its repository and preserves incomplete-
   expect(scenario.judge(report)).toEqual([]);
   expect(report.got).toEqual([201]);
 }, 30_000);
+
+it('the pending-overdue soak resolves its registered repository and preserves the cached-draft replay', async () => {
+  const file = 'scripts/conveyor/soak/breaks/red-team-pending-overdue.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/red-team-pending-overdue.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);
