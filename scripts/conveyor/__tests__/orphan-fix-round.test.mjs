@@ -46,6 +46,12 @@ it('replays same-second operator rulings and malformed history through the orpha
   expect(scenario.judge(report)).toEqual([]);
 });
 
+it('holds a page-2 listing failure and escalates the capped orphan on a complete retry (PR #7429)', async () => {
+  const { default: scenario } = await import('../soak/breaks/orphan-guard-lists-past-200.mjs');
+  const report = await scenario.run({});
+  expect(scenario.judge(report)).toEqual([]);
+});
+
 describe('verdict-bound orphan re-arm markers', () => {
   const verdict = { ...VERDICT, id: 'IC_verdict' };
   const marker = binding => c('2026-10-10T15:22:00Z', REARM_COMMENT_MARKER + binding);
@@ -126,7 +132,7 @@ describe('defaultListBounced', () => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => restPr(i + 1))));
     const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      expect(defaultListBounced('o/capped', { exec })).toEqual([]);
+      expect(() => defaultListBounced('o/capped', { exec })).toThrow('listing cap hit');
       expect(exec).toHaveBeenCalledTimes(5);
       expect(warning).toHaveBeenCalledOnce();
       expect(warning.mock.calls[0][0]).toContain('listing cap hit (5 pages, 500 PRs); older PRs not scanned this pass');
@@ -147,7 +153,7 @@ describe('defaultListBounced', () => {
     const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       for (let pass = 0; pass < 2; pass++) {
-        expect(defaultListBounced('o/stateless', { exec }).map(p => p.number)).toEqual([51]);
+        expect(() => defaultListBounced('o/stateless', { exec })).toThrow('listing cap hit');
       }
       expect(exec).toHaveBeenCalledTimes(10);
       expect(exec.mock.calls.map(([, args]) => Number(new URLSearchParams(args[1].split('?')[1]).get('page'))))
@@ -165,7 +171,7 @@ describe('defaultListBounced', () => {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
     const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      expect(defaultListBounced('o/deadline', { exec, deadlineAt: 1000 }).map(p => p.number)).toEqual([100]);
+      expect(() => defaultListBounced('o/deadline', { exec, deadlineAt: 1000 })).toThrow('listing deadline reached');
       expect(exec).toHaveBeenCalledOnce();
       expect(warning).toHaveBeenCalledOnce();
       expect(warning).toHaveBeenCalledWith('orphan-guard: listing deadline reached; older PRs not scanned this pass');
@@ -175,16 +181,14 @@ describe('defaultListBounced', () => {
     }
   });
 
-  it.each([true, false])('keeps collected PRs after a later page fails (bounced=%s)', bounced => {
+  it.each([true, false])('rejects incomplete listings after a later page fails (bounced=%s)', bounced => {
     const prs = Array.from({ length: 100 }, (_, i) => restPr(100 - i));
     if (bounced) prs[0].labels = [{ name: 'review:changes' }];
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify(prs)).mockImplementationOnce(() => { throw new Error('unreadable'); });
     const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      expect(defaultListBounced('o/partial', { exec }).map(p => p.number)).toEqual(bounced ? [100] : []);
+      expect(() => defaultListBounced('o/partial', { exec })).toThrow('unreadable');
       expect(exec).toHaveBeenCalledTimes(2);
-      expect(warning).toHaveBeenCalledOnce();
-      expect(warning).toHaveBeenCalledWith('orphan-guard: listing page 2 failed; returning collected PRs');
     } finally {
       warning.mockRestore();
     }
@@ -195,6 +199,31 @@ describe('defaultListBounced', () => {
     const exec = vi.fn(() => { throw error; });
     expect(() => defaultListBounced('o/unreadable', { exec })).toThrow(error);
     expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a complete empty first page even when the deadline has expired', () => {
+    const exec = vi.fn(() => '[]');
+    expect(defaultListBounced('o/empty', { exec, deadlineAt: 0 })).toEqual([]);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it.each(['http', 'json', 'buffer'])('reports a later-page %s failure to the guard and preserves its retry cursor', async kind => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => restPr(i + 2))))
+      .mockImplementationOnce(() => {
+        if (kind === 'json') return '{';
+        throw new Error(kind === 'http' ? 'HTTP 503' : 'ENOBUFS');
+      });
+    const readComments = vi.fn();
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runOrphanFixRoundPass({ repos: [{ key: 'test', slug: 'o/partial' }], env: {},
+        cursor: { 'o/partial': 1 }, listBounced: slug => defaultListBounced(slug, { exec }), readComments });
+      expect(result.rows).toEqual([{ repo: 'o/partial', decision: 'error', reason: expect.stringContaining('listing failed:') }]);
+      expect(result.repoCursors).toEqual({ 'o/partial': 1 });
+      expect(readComments).not.toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 

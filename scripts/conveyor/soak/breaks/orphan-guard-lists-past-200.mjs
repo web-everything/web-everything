@@ -8,6 +8,8 @@
  *
  * SCENARIO: a fake `gh` returning 3 pages (100, 100, 1 PR); the lone PR on page 3 (position 201) carries
  * `review:changes`. Pre-fix the single capped call never reaches it.
+ * Also replay a page-2 HTTP 503 hiding a capped orphan: the pass must report a repo-level error, then
+ * escalate that orphan after a complete retry, without another redispatch.
  */
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -32,7 +34,9 @@ export default {
     try { return JSON.parse(r.stdout.trim().split('\n').pop())[0]?.[0] === 'api'; } catch { return false; }
   },
   async run({ root, log } = {}) {
-    const { defaultListBounced } = await import(pathToFileURL(join(root ?? process.cwd(), 'scripts/conveyor/orphan-fix-round.mjs')).href);
+    const { defaultListBounced, runOrphanFixRoundPass, CHANGES_VERDICT_PREFIX, ORPHAN_GUARD_MARKER } =
+      await import(pathToFileURL(join(root ?? process.cwd(), 'scripts/conveyor/orphan-fix-round.mjs')).href);
+    const { FIX_END_MARKER } = await import(pathToFileURL(join(root ?? process.cwd(), 'scripts/conveyor/fix-procedure.mjs')).href);
     const pages = [Array.from({ length: 100 }, (_, i) => pr(i + 1, false)), Array.from({ length: 100 }, (_, i) => pr(101 + i, false)), [pr(201, true)]];
     let call = 0;
     const queries = [];
@@ -50,6 +54,41 @@ export default {
     if (queries.some(query => !query.includes('sort=created&direction=desc&per_page=100'))) {
       violations.push({ invariant: 'newest-first', detail: 'listing must request newest PRs first' });
     }
+    const slug = 'web-everything/web-everything';
+    const comment = body => ({ body, createdAt: '2026-01-01T00:00:00Z', includesCreatedEdit: false,
+      author: { login: 'web-everything' } });
+    const comments = [comment(CHANGES_VERDICT_PREFIX),
+      comment(`${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`),
+      comment(`${ORPHAN_GUARD_MARKER} — re-dispatched a fixer`), comment(FIX_END_MARKER)];
+    const firstPage = Array.from({ length: 100 }, (_, i) => pr(101 - i, false));
+    const effects = [];
+    let failing = true;
+    let failureCalls = 0;
+    const list = repo => defaultListBounced(repo, { exec: (_cmd, args) => {
+      failureCalls++;
+      const page = Number(/[&?]page=(\d+)/.exec(String(args[1]))?.[1] ?? 1);
+      if (page === 1) return JSON.stringify(firstPage);
+      if (failing) throw new Error('HTTP 503');
+      return JSON.stringify([pr(1, true)]);
+    } });
+    const options = { repos: [{ key: 'we', slug }], env: {}, nowMs: Date.parse('2026-01-02T00:00:00Z'),
+      listBounced: list, isOwned: async () => false, readComments: async () => comments,
+      rearm: async () => { effects.push('rearm'); return { ok: true }; },
+      redispatch: async () => { effects.push('redispatch'); return { ok: true }; },
+      escalate: async ({ pr }) => { effects.push(`escalate:${pr}`); return { ok: true }; }, postComment: () => {} };
+    const failed = await runOrphanFixRoundPass({ ...options, cursor: { [slug]: 1 } });
+    if (!failed.rows.some(row => row.repo === slug && row.pr == null && row.decision === 'error')) {
+      violations.push({ invariant: 'incomplete-listing-held', detail: 'page-2 HTTP 503 did not produce a repo-level error to hold ordinary fix dispatch' });
+    }
+    if (failed.repoCursors?.[slug] !== 1 || effects.length || failureCalls !== 2) {
+      violations.push({ invariant: 'failed-listing-retry', detail: 'failed listing must retain its cursor, stop after two calls, and perform no guard effects' });
+    }
+    failing = false;
+    const retried = await runOrphanFixRoundPass({ ...options, cursor: failed.repoCursors });
+    if (effects.join(',') !== 'escalate:1' || retried.rows[0]?.result !== 'escalated') {
+      violations.push({ invariant: 'capped-orphan-escalated', detail: `complete retry must escalate the oldest orphan, got ${JSON.stringify(effects)}` });
+    }
+    log?.(`page-2 failure: errors=${failed.rows.filter(row => row.decision === 'error').length}; retry effects=${effects.join(',')}`);
     return { violations, got };
   },
   judge(report) {

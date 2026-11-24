@@ -188,29 +188,23 @@ const MAX_PAGES = 5;
 export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Infinity } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const perPage = 100, bounced = [];
-  let collected = 0;
   for (let page = 1; page <= MAX_PAGES; page++) {
     if (page > 1 && Date.now() >= deadlineAt) {
-      console.error('orphan-guard: listing deadline reached; older PRs not scanned this pass');
-      return bounced;
+      const reason = 'orphan-guard: listing deadline reached; older PRs not scanned this pass';
+      console.error(reason);
+      throw new Error(`${reason}; fix dispatch held until a complete listing succeeds (retry with more listing time)`);
     }
-    let prs;
-    try {
-      const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`], ghOpts());
-      prs = JSON.parse(String(out));
-    } catch (error) {
-      if (collected === 0) throw error;
-      console.error(`orphan-guard: listing page ${page} failed; returning collected PRs`);
-      return bounced;
-    }
-    collected += prs.length;
+    // Partial discovery cannot certify the repo: let the pass emit a repo-level error so the daemon holds fixes.
+    const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`], ghOpts());
+    const prs = JSON.parse(String(out));
     bounced.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
       number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
     })));
     if (prs.length < perPage) return bounced;
   }
-  console.error(`orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); older PRs not scanned this pass`);
-  return bounced;
+  const reason = `orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); older PRs not scanned this pass`;
+  console.error(reason);
+  throw new Error(`${reason}; fix dispatch held; operator must reduce the open-PR backlog or increase the listing cap`);
 }
 
 async function defaultReadComments(number, slug) {
