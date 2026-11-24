@@ -189,6 +189,10 @@ export class LeaseLostError extends LauncherError {}
 
 const SCRATCH_RE = /^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/;
 
+// The fixer's lane-root evidence file stays on disk (read after the run) but is never committed: web-everything
+// gitignores it, frontierui and plateau-app do not, so the launcher refuses to stage it in any repo.
+const isStageable = (p) => !!p && p !== '.fix-evidence.md' && !SCRATCH_RE.test(basename(p));
+
 /**
  * PURE. Paths a conflicted merge still needs `git add` for: unmerged rows plus anything whose WORKTREE column differs
  * from the index (agent edits, deletions, untracked files). Changes the merge already staged (clean deletions, renames,
@@ -204,7 +208,7 @@ export function unstagedPaths(porcelain) {
     if (/[RC]/.test(code[0])) i++; // the rename/copy source is never staged on its own
     if (code[1] !== ' ' || UNMERGED_CODES.has(code)) paths.push(row.slice(3));
   }
-  return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+  return [...new Set(paths.filter(isStageable))];
 }
 
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
@@ -217,7 +221,7 @@ export function changedPaths(porcelain) {
     paths.push(row.slice(3));
     if (/[RC]/.test(row.slice(0, 2))) paths.push(records[++i]);
   }
-  return [...new Set(paths.filter(p => p && !SCRATCH_RE.test(basename(p))))];
+  return [...new Set(paths.filter(isStageable))];
 }
 
 /** `merge` attribute values that still produce in-file conflict markers (unspecified, set, or the built-in text/union drivers). */
@@ -1128,7 +1132,7 @@ export async function runFixCli(argv = [], {
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);
-      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
+      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])].filter(isStageable);
       stageLaneFiles(stage);
       // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.

@@ -15,7 +15,7 @@ import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
-import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
+import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, unstagedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -815,6 +815,12 @@ describe('runFixCli', () => {
   });
   it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
     expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
+  });
+  it('never stages the lane-root .fix-evidence.md (sibling repos do not gitignore it) but still stages other files', () => {
+    const porcelain = '?? .fix-evidence.md\0 M src/a.ts\0?? docs/.fix-evidence.md\0A  .fix-evidence.md\0';
+    expect(changedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
+    expect(unstagedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
+    expect(changedPaths('?? .fix-evidence.md.bak\0?? my.fix-evidence.md\0')).toEqual(['.fix-evidence.md.bak', 'my.fix-evidence.md']);
   });
   it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
