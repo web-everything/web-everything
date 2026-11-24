@@ -1,3 +1,4 @@
+import { classifyMqTimeoutLog } from './mq-failure-evidence.mjs';
 /** Bounded Actions attempt matching. Check-run IDs are never Actions job IDs. */
 const claims = new WeakMap();
 const stamp = value => typeof value === 'string' ? Date.parse(value) : NaN;
@@ -86,4 +87,26 @@ export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, 
   } catch {
     return { reason: 'rerun request refused or unreadable; operator must inspect Actions before retrying' };
   }
+}
+
+/** Read every failed job, sharing the caller's budget. Check URLs and attempts bind logs to the MQ commit. */
+export function readMqTimeoutFailure({ failed, attempts, repo, exec, spend }) {
+  if (!failed.length || failed.length > 10 || attempts.reason
+    || attempts.candidates.length !== failed.length) return false;
+  let timeouts = 0;
+  try {
+    for (const check of failed) {
+      const job = mqActionsJob(check, repo);
+      if (check.conclusion !== 'failure' || !job || !attempts.candidates.includes(job.id)) return false;
+      spend();
+      const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${job.id}/logs`], {
+        encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
+      });
+      const kind = classifyMqTimeoutLog(text, check.name);
+      if (kind === 'mq-flake-timeout') timeouts++;
+      else if (kind !== 'upstream') return false;
+    }
+    return timeouts > 0;
+  } catch { return false; }
 }

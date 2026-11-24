@@ -1,5 +1,6 @@
+import { mqTimeoutRetryAllowance } from './mq-failure-ledger.mjs';
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
-import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
+import { inspectMqReruns, requestMqReruns, readMqTimeoutFailure } from './drain-mq-flake-rerun.mjs';
 import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -138,9 +139,11 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
+  const timeoutRetry = retryEvidence?.infra === 'mq-flake-timeout' && retryEvidence.mergeState === 'CLEAN'
+    && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !timeoutRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -158,6 +161,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
+      : timeoutRetry ? 'failed_checks mq-flake-timeout retry 1/1 (only Vitest test timeouts, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -696,7 +700,7 @@ function readMqRetryEvidence(options) {
     : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
-  if (base?.infra === 'cancelled-regroup') return live(base);
+  if (['cancelled-regroup', 'mq-flake-timeout'].includes(base?.infra)) return live(base);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
   // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
@@ -752,6 +756,18 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       }
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
+    const logCache = new Map(), read = exec;
+    exec = (file, args, options) => {
+      const endpoint = file === 'gh' && args.find(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg));
+      if (!endpoint) return read(file, args, options);
+      if (!logCache.has(endpoint)) {
+        try { logCache.set(endpoint, { value: read(file, args, options) }); }
+        catch (error) { logCache.set(endpoint, { error }); }
+      }
+      const cached = logCache.get(endpoint);
+      if (cached.error) throw cached.error;
+      return cached.value;
+    };
     const rawChecks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
     const cancelled = check => ['cancelled', 'startup_failure'].includes(check.conclusion);
     const passingCheck = check => ['success', 'neutral', 'skipped'].includes(check.conclusion);
@@ -792,6 +808,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       && MQ_AGGREGATE_SUMMARY_STEPS.has(localJob(check.name)));
     const failedNames = failed.map(check => (typeof check.name === 'string' ? check.name : 'unnamed')
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
+    // Timeout recovery never requests a job rerun. All failed logs must prove timeouts or upstream gates.
+    if (readMqTimeoutFailure({ failed, attempts, repo, exec, spend: () => {
+        if (budget-- <= 2) throw new Error('timeout evidence budget exceeded; operator inspection required');
+      } })) return { infra: 'mq-flake-timeout', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
     // readQuarantineCover validates the aggregators itself (positive evidence, no uncovered failure), so a
     // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
     if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
@@ -1110,7 +1130,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   return 'retry conditions not met';
 }
 
-export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, now = Date.now(),
+export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, log = () => {}, allowAlreadyQueued = true, refresh, dryRun = false, timeoutLedger, now = Date.now(),
   // Hermetic under test: the live ops/quarantine branch is only consulted when a test injects a reader.
   readFreeze = readSharedFreeze,
   quarantine = { readList: process.env.VITEST || process.env.WE_UNDER_TEST ? null : () => readQuarantine() } } = {}) {
@@ -1123,7 +1143,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] })) });
   const currentHead = mqOid(head);
   let timeline, retryEvidence;
-  const decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
+  let decision = queue.error || !currentHead || mqOid(queue.head) !== currentHead
     ? mqSameHeadHold({ pr, head }, 'unreadable or mismatched live merge-queue state; inspect queue before retrying')
     : allowAlreadyQueued && queue.inQueue === true ? { hold: false, line: null }
       : decideMqSameHead({ pr, head, timeline: (timeline = readMqTimeline({ repo, pr, exec })),
@@ -1131,6 +1151,13 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
           ? readMqRetryEvidence({ repo, pr, head: currentHead, timeline, exec, rerunScope, dryRun, quarantine, now, readFreeze,
             retryPolicy: readDrainQueueSafety().value }) : undefined),
         mergeState: timelineHasConflict(timeline) ? readMqMergeState({ repo, pr, head: currentHead, exec }) : undefined });
+  if (!decision.hold && retryEvidence?.infra === 'mq-flake-timeout') {
+    try {
+      if (!mqTimeoutRetryAllowance({ repo, pr, head: currentHead }, {
+        consume: !allowAlreadyQueued && !dryRun, ...(timeoutLedger ? { io: timeoutLedger } : {}),
+      })) decision = mqSameHeadHold({ pr, head }, 'mq-flake-timeout retry already spent; operator must inspect and enqueue manually');
+    } catch { decision = mqSameHeadHold({ pr, head }, 'timeout retry ledger unavailable; operator must inspect ledger and enqueue manually'); }
+  }
   if (!decision.hold && decision.line) log(decision.line);
   if (decision.hold) {
     log(decision.line);

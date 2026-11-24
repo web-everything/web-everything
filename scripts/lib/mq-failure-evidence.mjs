@@ -44,6 +44,52 @@ function hasOnlyUpstreamFailure(lines) {
     && lines.every(line => upstreamFailureOutcomes.has(line) || upstreamGateTranscript.has(line));
 }
 
+/** Complete Vitest timeout-only transcript, or a positively identified upstream aggregate.
+ * Unknown/oversized/truncated transcripts require operator inspection, never an automatic retry.
+ */
+export function classifyMqTimeoutLog(text, name) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) >= 4 * 1024 * 1024) return 'unknown';
+  const lines = clean(text).split(/\r?\n/).map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim());
+  if (lines.some(line => line.length > MAX_LINE)) return 'unknown';
+  if (derivedFailureJobs.has(localJobName(name))) return hasOnlyUpstreamFailure(lines.filter(Boolean)) ? 'upstream' : 'unknown';
+  let captured = false, headings = 0, timeouts = 0, pending = false;
+  let files = null, tests = null, exited = false;
+  const paths = new Set();
+  for (const line of lines) {
+    if (/^(?:stdout|stderr)\s*\|/.test(line)) { captured = true; continue; }
+    if (captured) {
+      if (!line) { captured = false; continue; }
+      // A summary without the closing blank makes captured output ambiguous.
+      if (/^(?:Test Files|Tests)\s/.test(line)) return 'unknown';
+      continue;
+    }
+    const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>\s+\S/.exec(line);
+    if (heading) {
+      if (pending || tests !== null) return 'unknown';
+      headings++; pending = true; paths.add(heading[1]); continue;
+    }
+    if (/^Error: Test timed out in [1-9][0-9]*ms\.$/.test(line)) {
+      if (!pending) return 'unknown';
+      timeouts++; pending = false; continue;
+    }
+    if (line === '##[error]Process completed with exit code 1.') {
+      if (tests === null || files === null || exited) return 'unknown';
+      exited = true; continue;
+    }
+    const summary = /^(Test Files|Tests)\s+([1-9][0-9]*) failed(?:\s+\|\s+\d+ (?:passed|skipped|todo))*\s*(?:\(\d+\))?$/.exec(line);
+    if (summary) {
+      if (pending || exited) return 'unknown';
+      if (summary[1] === 'Tests') { if (tests !== null) return 'unknown'; tests = Number(summary[2]); }
+      else { if (files !== null) return 'unknown'; files = Number(summary[2]); }
+      continue;
+    }
+    // Other causes (including an unrecognized FAIL or malformed summary) invalidate the whole log.
+    if (/AssertionError|\bExpected\b|\bReceived\b|\bFAIL\b|\bFAILED\b|Error:|Exception:|##\[error\]|Unhandled|^npm ERR|^fatal:|^(?:Test Files|Tests)\s/i.test(line)) return 'unknown';
+  }
+  return !captured && !pending && exited && tests === timeouts && timeouts === headings && timeouts > 0
+    && files === paths.size ? 'mq-flake-timeout' : 'unknown';
+}
+
 // Longest log line the parser reads. Real runner headings are far shorter; a longer line is not parsed past this
 // bound (every regex below is then bounded) and keeps path evidence incomplete, so it goes to the fixer.
 const MAX_LINE = 2048;

@@ -763,14 +763,16 @@ const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|s
 const UNSAFE_LOG_CHARS = /[^\x20-\x7e]/g;
 const URL_USERINFO =/:\/\/[^/\s]*@/;
 
-/** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
+/** First real stderr line (falling back to first non-empty), control characters stripped, capped, credential-looking lines redacted. PURE.
  * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
  * opaque credentials under unrecognised env names, values under 3 chars, or escaped/ANSI-interrupted values.
  * The spec (DRAIN-POSTMERGE-PROBE) deliberately publishes one sanitised first line.
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
   const raw = String(stderr ?? '');
-  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).find(Boolean);
+  const lines = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).filter(Boolean);
+  const noise = /^(?:\(node:\d+\) (?:\[DEP\d+\] )?(?:DeprecationWarning|ExperimentalWarning):.*|\(Use `node --trace-(?:deprecation|warnings)\b.*to show where the warning was created\))$/;
+  const line = lines.find(line => !noise.test(line)) ?? lines[0];
   if (!line) return '';
   if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
