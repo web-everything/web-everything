@@ -2,9 +2,11 @@
 bornAs: xux0rs9
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/operations/review-dispatch.mjs", "we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-11-24"
+graduatedTo: df031bf51d73ee7a39be3c14526cb94dc6bf8d6d
 tags: []
 ---
 
