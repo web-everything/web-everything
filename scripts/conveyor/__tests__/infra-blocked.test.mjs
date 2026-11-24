@@ -13,6 +13,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+// Load the replay's daemon graph during collection, outside the behavioral test's timeout.
+import { replay as replayInfraRetention } from '../soak/breaks/runtime-admission-infra-retention.mjs';
 import {
   classifyPrOpenFailure,
   correlateCause,
@@ -565,6 +567,5 @@ describe('infra recovery requires an injected runtime admission adapter', () => 
 
 
 it('admission refusals preserve the entire infra entry and real pr-land guards retain refusal accounting', async () => {
-  const { replay } = await import('../soak/breaks/runtime-admission-infra-retention.mjs');
-  expect((await replay()).violations).toEqual([]);
+  expect((await replayInfraRetention()).violations).toEqual([]);
 });

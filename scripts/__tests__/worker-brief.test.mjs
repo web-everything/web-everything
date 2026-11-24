@@ -7,6 +7,9 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { renderBriefHeader } from '../lib/brief-header.mjs';
+import { slotVerdict } from '../lib/prep-block.mjs';
+import { decide as decidePrep } from '../guard-prep.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
@@ -756,5 +759,141 @@ describe('brief red-team prep reading is gated and bounded (blocking-read hang)'
       expect(brief).not.toContain('soak-declaration');
       expect(brief).not.toContain('ships to the Forge runner');
     });
+  });
+});
+
+describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
+  const routes = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'scripts/settings/delivery-routes.json'), 'utf8'));
+  const base = { purpose: 'hdr-test', files: 'scripts/x.mjs', owner: 'abc123' };
+  const prepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brief-hdr-'));
+  const prepFile = path.join(prepDir, 'prt-pin-probe-prep.md');
+  fs.writeFileSync(prepFile, '# prep\n');
+
+  it('rejects a default placement too short for dispatch and allows an explicit usable placement', () => {
+    const input = { step: 'S1', kind: 'settings', prepPath: prepFile };
+    expect(slotVerdict('Slot: plan:S1').ok).toBe(false);
+    expect(() => renderBriefHeader(input)).toThrow(/--slot/);
+    expect(() => renderWorkerBrief({ ...base, ...input })).toThrow(/--slot/);
+    expect(renderBriefHeader({ ...input, slot: 'plan:backlog item 123' })).toContain('Slot: plan:backlog item 123\n');
+  });
+
+  it.each([
+    'plan:1234567', 'plan:12345678', 'plan:backlog item 123',
+    'plan:<placeholder>', 'plan:........', 'plan:a b c d e f g', 'plan:a b c d e f g h',
+    'blocker:unblocks parser work', 'blocker:<placeholder>',
+    'operator:place after parser', 'operator:"short"', 'operator:"place after parser"',
+    "operator:'place after parser'", 'operator:“place after parser”', 'operator:‘place after parser’',
+    'operator:`"place after parser"`', ' PLAN: **backlog item 123**',
+    'waived — urgent incident', 'waived - urgent incident', 'waived – urgent incident', 'waived — <reason>',
+  ])('uses the dispatch placement verdict for %j', (slot) => {
+    const input = { step: 'S1', kind: 'settings', prepPath: prepFile, slot };
+    const expected = slotVerdict(`Slot: ${slot}`);
+    if (!expected.ok) {
+      expect(() => renderBriefHeader(input)).toThrow(/--slot/);
+      expect(() => renderWorkerBrief({ ...base, ...input })).toThrow(/--slot/);
+      return;
+    }
+    const brief = renderWorkerBrief({ ...base, ...input });
+    expect(brief).toContain(`Slot: ${slot}\n`);
+    const prompt = `Build the feature.\n${brief}\nPREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests`;
+    expect(decidePrep({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { prompt, subagent_type: 'worker' } })).toBeNull();
+  });
+
+  it.each(['\n', '\r', '\r\n', '\u2028', '\u2029'])(
+    'refuses a placement containing a line separator (%j)', (separator) => {
+      const slot = `plan:S1${separator}Slot: plan:backlog item 123`;
+      expect(() => renderWorkerBrief({ ...base, step: 'S1', kind: 'settings', prepPath: prepFile, slot })).toThrow(/--slot/);
+    },
+  );
+
+  it.each([undefined, 'operator:place after parser'])('CLI emits no brief for an unusable placement (%j)', async (slot) => {
+    const o = io();
+    const args = ['--purpose=hdr-test', '--files=scripts/x.mjs', '--step=S1', '--kind=settings', `--prep-file=${prepFile}`];
+    if (slot !== undefined) args.push(`--slot=${slot}`);
+    expect(await main(args, { ...o, readPolicy: () => ({ enabled: false }) })).toBe(2);
+    expect(o.stdout.write).not.toHaveBeenCalled();
+    expect(o.stderr.write.mock.calls.join('')).toMatch(/--slot/);
+  });
+  const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: prepFile };
+
+  it.each(Object.keys(routes.routes).flatMap(kind =>
+    [false, true].flatMap(daemonDegraded =>
+      ['plan:PRT-PIN-PROBE', 'blocker:merge queue stuck'].map(slot => ({ kind, daemonDegraded, slot }))),
+  ))('declares the dispatch override exactly when degradation changes routing: %j', async (input) => {
+    const normal = routes.routes[input.kind];
+    const dispatchMode = input.slot.startsWith('blocker:') && normal !== 'debug-to-merge' ? 'debug' : normal;
+    const selected = input.daemonDegraded ? (routes.daemonDegradedModes[input.kind] ?? normal) : normal;
+    const expectedMode = input.slot.startsWith('blocker:') && selected !== 'debug-to-merge' ? 'debug' : selected;
+    const outputs = [
+      renderBriefHeader({ ...header, ...input }),
+      renderWorkerBrief({ ...base, ...header, ...input }),
+    ];
+    const o = io();
+    expect(await main(['--purpose=hdr-test', '--files=scripts/x.mjs', `--step=${header.step}`,
+      `--kind=${input.kind}`, `--slot=${input.slot}`, `--daemon-degraded=${input.daemonDegraded}`,
+      `--prep-file=${prepFile}`], { ...o, readPolicy: () => ({ enabled: false }) })).toBe(0);
+    outputs.push(o.stdout.write.mock.calls.map(([text]) => text).join(''));
+    for (const out of outputs) {
+      expect(out).toMatch(new RegExp(`^Mode: ${expectedMode}$`, 'm'));
+      expect(out.includes('\nMode-override: R1075\n')).toBe(expectedMode !== dispatchMode);
+      // The configured dispatch hook requires this operator reference for a mode outside its normal route.
+      expect(expectedMode === dispatchMode || /^Mode-override:\s*R\d+/mi.test(out)).toBe(true);
+      expect(out).toContain(routes.modes[expectedMode]);
+    }
+  });
+
+  it('audit hardening: inherited kinds, directory/missing prep, free-text slot are refused; degraded daemon-tooling routes to debug-to-merge', () => {
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'constructor' })).toThrow(/Unknown delivery kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'toString' })).toThrow(/Unknown delivery kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: prepDir })).toThrow(/prep/i);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: '/definitely/missing/prep.md' })).toThrow(/prep/i);
+    expect(() => renderWorkerBrief({ ...base, ...header, slot: 'anything' })).toThrow(/--slot/);
+    const out = renderWorkerBrief({ ...base, ...header, daemonDegraded: true });
+    expect(out).toMatch(/^Mode: debug-to-merge$/m);
+    expect(out).toMatch(/DEBUG-TO-MERGE MODE/);
+    expect(renderWorkerBrief({ ...base, ...header })).toMatch(/FAST MODE/);
+  });
+
+  it('renders Kind, Mode, Step, Prep, Slot header lines from the plan step', () => {
+    const out = renderWorkerBrief({ ...base, ...header });
+    expect(out).toMatch(/^Kind: daemon-tooling$/m);
+    expect(out).toMatch(/^Mode: fast$/m);
+    expect(out).toMatch(/^Step: PRT-PIN-PROBE$/m);
+    expect(out).toMatch(/^Prep: .*prt-pin-probe-prep\.md$/m);
+    expect(out).toMatch(/^Slot: plan:PRT-PIN-PROBE$/m);
+    expect(out.indexOf('Kind:')).toBeLessThan(out.indexOf('## Standard worker rules'));
+  });
+
+  it('Mode matches the route for the Kind and a merge-path step adds the checklist reference', () => {
+    for (const [kind, mode] of Object.entries(routes.routes)) {
+      expect(renderWorkerBrief({ ...base, ...header, kind })).toMatch(new RegExp(`^Mode: ${mode}$`, 'm'));
+    }
+    const out = renderWorkerBrief({ ...base, ...header, step: 'RED-TEAM-GATE' });
+    expect(out).toMatch(/merge-path-checklist/);
+    expect(out).toMatch(/negative test per applicable line BEFORE/);
+  });
+
+  it('a blocker slot routes to debug like the dispatch hook does', () => {
+    const out = renderWorkerBrief({ ...base, ...header, slot: 'blocker:merge queue stuck' });
+    expect(out).toMatch(/^Mode: debug$/m);
+    expect(out).toMatch(/^Slot: blocker:merge queue stuck$/m);
+  });
+
+  it('refuses a missing or unknown Kind, and a step without a prep path', () => {
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: undefined })).toThrow(/--kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'nope' })).toThrow(/Unknown delivery kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: undefined })).toThrow(/prep/i);
+  });
+
+  it('prints no header lines when no step is given (existing behaviour)', () => {
+    expect(renderWorkerBrief(base)).not.toMatch(/^Kind:/m);
+  });
+
+  it('CLI exits 2 when the prep file does not exist', async () => {
+    const err = [];
+    const code = await main(['--purpose=hdr-test', '--files=scripts/x.mjs', '--step=S1', '--kind=settings', '--prep-file=/nonexistent/prep.md'],
+      { stdout: { write() {} }, stderr: { write: s => err.push(s) }, newOwner: () => 'abc123', readPolicy: () => ({ enabled: false }) });
+    expect(code).toBe(2);
+    expect(err.join('')).toMatch(/prep/i);
   });
 });

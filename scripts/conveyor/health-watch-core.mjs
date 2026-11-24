@@ -34,6 +34,7 @@ import { CLAUDE_JOBS_ARCHIVE_DEFAULTS } from './claude-jobs-archive-config.mjs';
 import { TMP_SWEEP_DEFAULTS } from './tmp-sweep-config.mjs';
 import { foldPrAttempts } from './health-pr-attempts.mjs';
 import { foldBuilderTicks } from './health-builder-ticks.mjs';
+import { mergeLoopTicks, zeroSuccessWindowMinutes } from './health-loop-ticks.mjs';
 import { expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { isHighEntropyToken } from '../lib/secret-scrub.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from './health-smells-notify-list.mjs';
@@ -933,6 +934,12 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   // operator-hold-aged — the review daemon's structured hold snapshots, folded across samples. No probe this tick
   // leaves the memory as it is (the smell is then skipped, not evaluated as empty).
   const operatorHolds = probes.operatorHolds ? foldOperatorHolds(state.operatorHolds, probes.operatorHolds, now, { episodes: state.episodes }) : (state.operatorHolds ?? undefined);
+  // zero-success-alarm — loop tick records folded across samples (new records in, an hour kept in state).
+  // No probe this tick (collection failed): keep the memory, but do not evaluate, so nothing closes by aging.
+  const loopTickRecords = probes.loopTicks?.records
+    ? mergeLoopTicks(state.loopTicks, probes.loopTicks?.records, { now, windowMs: zeroSuccessWindowMinutes(process.env) * 60_000 })
+    : undefined;
+  if (loopTickRecords) probes = { ...probes, loopTicks: { records: loopTickRecords } };
   const ctx = {
     // Read-only view for smells that must close episodes of subjects they can no longer enumerate.
     episodes: state.episodes ?? {},
@@ -952,7 +959,7 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
       return { smell, results: null, error: String(e?.message || e) };
     }
   });
-  const stepped = stepEpisodes({ ...state, daemons, builder, probeErrors: errs, heavyHeldSince, ...(operatorHolds ? { operatorHolds } : {}) }, evaluations, now, { config: cfg, activeCards });
+  const stepped = stepEpisodes({ ...state, ...(loopTickRecords ? { loopTicks: loopTickRecords } : {}), daemons, builder, probeErrors: errs, heavyHeldSince, ...(operatorHolds ? { operatorHolds } : {}) }, evaluations, now, { config: cfg, activeCards });
   const smellsById = Object.fromEntries(smells.map((s) => [s.id, s]));
   const plan = planActions(stepped.transitions, smellsById, { mode: cfg.mode, investigateDispatch: cfg.investigateDispatch, fileDispatch: cfg.fileDispatch });
   return { state: stepped.state, transitions: stepped.transitions, plan, evaluations };

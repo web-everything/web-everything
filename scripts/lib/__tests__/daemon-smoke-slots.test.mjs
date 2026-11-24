@@ -8,8 +8,9 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
+import { acquireSmokeSlot, behindMainPriority } from '../daemon-smoke-slots.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import * as forceAdopt from '../daemon-force-adopt.mjs';
 import * as cloneLocks from '../daemon-clone-lock.mjs';
 import * as smoke from '../daemon-rebuild/smoke.mjs';
 import * as rebuildState from '../daemon-rebuild/state.mjs';
@@ -47,6 +48,81 @@ async function wake() {
 }
 
 describe('daemon smoke slots', () => {
+  it.each([[4, false], [5, true], [6, true]])('behind priority threshold edge: %s commits → %s', (behind, expected) => {
+    expect(behindMainPriority({ behind, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' } })).toBe(expected);
+  });
+
+  it.each([['1000', false], ['600000', false], ['600001', true], [undefined, true]])('behind priority respects queue wait %s', (wait, expected) => {
+    expect(behindMainPriority({ behind: 5, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: wait } })).toBe(expected);
+  });
+
+  it('behind priority uses the policy wait capped by the rebuild lease', () => {
+    const env = { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5', WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '900000' };
+    expect(behindMainPriority({ behind: 5, env })).toBe(false);
+    settings.value.smokeQueueMaxWaitMs = 600000;
+    expect(behindMainPriority({ behind: 5, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' } })).toBe(false);
+  });
+
+  it.each([undefined, '', '0', '-1', '1.5', 'NaN', 'Infinity', '5x', '5\n', ' 5 ', '9007199254740992'])('behind priority is off for setting %s', value => {
+    expect(behindMainPriority({ behind: 10, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: value } })).toBe(false);
+  });
+
+  it.each([undefined, null, NaN, Infinity, -Infinity, -1, 5.5, '5', 'unreadable'])('unreadable or invalid behind count %s fails closed', behind => {
+    expect(behindMainPriority({ behind, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' } })).toBe(false);
+  });
+
+  it('a daemon far behind main queues ahead of routine waiters without preempting a holder', async () => {
+    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' };
+    const holder = await acquire(11, { env });
+    const routine = acquire(12, { env });
+    await wake();
+    const behind = acquire(13, { env, priority: behindMainPriority({ behind: 5, env }) });
+    await wake();
+    expect(state().holders.map(e => e.pid)).toEqual([11]);
+    expect(state().waiters.map(e => e.pid)).toEqual([13, 12]);
+    await holder.release(); await wake();
+    const next = await behind;
+    expect(state().holders.map(e => e.pid)).toEqual([13]);
+    await next.release(); await wake();
+    await (await routine).release();
+  });
+
+  it.each(['5', '4', '', 'garbage', 'Infinity', 'failed', 'throws', 'off'].flatMap(count => [null, { sha: 'bad', ruling: 'R1', quote: 'operator' }].map(forced => [count, forced])))('rebuild count %s with invalid/missing force %j only changes queue priority, never adoption', async (count, forced) => {
+    vi.spyOn(forceAdopt, 'readForceAdopt').mockReturnValue(forced);
+    const prevHead = 'a'.repeat(40), mainSha = 'b'.repeat(40);
+    const lease = { token: 'behind-build' }, persisted = { building: lease };
+    const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir,
+      WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '900000',
+      WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: count === 'off' ? '0' : '5' };
+    vi.spyOn(cloneLocks, 'withWriteLock')
+      .mockResolvedValueOnce({ ok: true, value: { plan: { mainSha, finalSha: 'c'.repeat(40) }, prevHead, lease, alerts: [] } })
+      .mockImplementation(async (_root, action) => ({ ok: true, value: await action() }));
+    vi.spyOn(rebuildState, 'readReadyCandidate').mockReturnValue(null);
+    vi.spyOn(rebuildState, 'readRebuildState').mockReturnValue(persisted);
+    vi.spyOn(rebuildState, 'writeRebuildState').mockImplementation(() => {});
+    vi.spyOn(leases, 'readRebuildStarvation').mockReturnValue(0);
+    vi.spyOn(adoptions, 'checkPendingAdoptions').mockResolvedValue(undefined);
+    vi.spyOn(smoke, 'smokeAndAdopt').mockResolvedValue({ moved: true });
+    const run = vi.fn(args => {
+      expect(args).toEqual(['rev-list', '--count', `${prevHead}..${mainSha}`]);
+      if (count === 'throws') throw new Error('unreadable history');
+      return { status: count === 'failed' ? 1 : 0, stdout: count === 'failed' ? '5' : count };
+    });
+    const holder = await acquire(process.pid, { env });
+    let time = 0;
+    const result = await rebuildClone({ root: stateDir, env, log, run, versions: null, asJob: false,
+      readyOnly: true, emitEvent: vi.fn(), now: () => time, sleep: async ms => {
+        expect(state().waiters[0].priority === true).toBe(count === '5');
+        time += 900000;
+      } });
+    expect(result).toMatchObject({ reason: 'smoke-queue-timeout', moved: false, adopted: false });
+    expect(smoke.smokeAndAdopt).not.toHaveBeenCalled();
+    expect(time).toBe(900000);
+    expect(state().waiters).toEqual([]);
+    expect(run).toHaveBeenCalledTimes(count === 'off' ? 0 : 1);
+    await holder.release();
+  });
+
   it.each(['unreadable', 'unparseable'])('fails closed to cap 1 when bundled settings are %s', async failure => {
     const read = fs.readFileSync.getMockImplementation();
     fs.readFileSync.mockImplementation((path, ...args) => {
