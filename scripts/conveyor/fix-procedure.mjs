@@ -267,6 +267,7 @@ export function acquireFixClaim({
     // The CURRENT hold's draft state — always the latest `fix-begin` call's own values, never merged forward
     // from a prior reentrant hold: a fixer may discover a scope-change mid-hold and re-`fix-begin --draft` the
     // SAME claim, and the newer call's intent must win.
+    ...(own && prior.meta?.draftedByClaim === true ? { draftedByClaim: true } : {}),
     draft: Boolean(draft), reason: draft ? (reason ?? null) : null,
     ttlMinutes, host,
   };
@@ -706,7 +707,14 @@ export async function fixBegin({
   const heldToken = claim.token ?? token;
   const steps = [];
   try {
-    if (draft && !view.isDraft) { await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']); steps.push('draft'); }
+    if (draft && view.isDraft === false) {
+      await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']);
+      const current = readLockEntry(lockRoot, claim.resource);
+      if (!current || !isClaimHolder(current, { who, sessionId, token: heldToken })) throw new Error('Claim changed while drafting');
+      heartbeat(lockRoot, claim.resource, current.owner, new Date(nowMs).toISOString(), null,
+        { ...current.meta, draftedByClaim: true });
+      steps.push('draft');
+    }
   } catch (e) {
     releaseFixClaim({ repo: repoKey, pr, who, sessionId, token: heldToken, lockRoot });
     return { ok: false, reason: 'draft-failed', detail: String(e?.message ?? e).split('\n')[0], pr: Number(pr) };

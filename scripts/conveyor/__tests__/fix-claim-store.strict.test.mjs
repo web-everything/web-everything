@@ -15,7 +15,7 @@ function fixture() {
   const lockRoot = join(root, 'claims'), dir = join(lockRoot, 'claim.lock'), file = join(dir, 'lock.json');
   mkdirSync(dir, { recursive: true });
   const entry = { owner: 'fixture', heartbeatAt: new Date().toISOString(),
-    meta: { repo: 'we', kind: 'fix', pr: 42, branch: 'lane/isolated', sessionId: 'mine' } };
+    meta: { repo: 'we', kind: 'fix', pr: 42, ttlMinutes: 20, branch: 'lane/isolated', sessionId: 'mine' } };
   writeFileSync(file, JSON.stringify(entry));
   return { root, lockRoot, dir, file, entry };
 }
@@ -57,7 +57,7 @@ describe('Design A test 7: strict claim-store evidence', () => {
 });
 
 describe('strict claim shape refusals', () => {
-  it.each(['garbage', '', null, 'not-a-date'])('refuses invalid heartbeat %j rather than expiring it', heartbeatAt => {
+  it.each([1, 'garbage', '', null, 'not-a-date'])('refuses invalid heartbeat %j rather than expiring it', heartbeatAt => {
     const f = fixture(); f.entry.heartbeatAt = heartbeatAt;
     writeFileSync(f.file, JSON.stringify(f.entry));
     expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ entries: [], unreadable: true });
@@ -65,12 +65,21 @@ describe('strict claim shape refusals', () => {
       .toMatchObject({ code: 'claim-store-unreadable' });
   });
   it.each([
-    ['repo', 1], ['repo', ' '], ['repo', null], ['pr', '42'], ['pr', 0], ['pr', -1],
+    ['repo', 'unknown'], ['kind', 'unknown'], ['branch', 'main'], ['branch', 'lane/'], ['repo', 1], ['repo', ' '], ['repo', null], ['pr', '42'], ['pr', 0], ['pr', -1],
     ['pr', 1.5], ['pr', Number.MAX_SAFE_INTEGER + 1], ['kind', 1], ['kind', ' '],
     ['branch', null], ['branch', ' '], ['branch', 7], ['branch', undefined],
   ])('refuses malformed held-claim %s=%j', (key, value) => {
     const f = fixture(); f.entry.meta.kind = 'fixing'; f.entry.meta[key] = value;
     writeFileSync(f.file, JSON.stringify(f.entry));
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ entries: [], unreadable: true });
+    expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', strict: true, lockRoot: f.lockRoot }))
+      .toMatchObject({ code: 'claim-store-unreadable' });
+  });
+  it.each(['Infinity', Infinity, 0, -1, 1.5, 241, undefined])('refuses invalid TTL %j before expiry filtering', ttlMinutes => {
+    const f = fixture(); f.entry.meta.kind = 'fixing'; f.entry.meta.ttlMinutes = ttlMinutes;
+    // JSON's exponent syntax can parse to Infinity; exercise that raw input too.
+    writeFileSync(f.file, ttlMinutes === Infinity
+      ? JSON.stringify(f.entry).replace('\"ttlMinutes\":null', '\"ttlMinutes\":1e400') : JSON.stringify(f.entry));
     expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ entries: [], unreadable: true });
     expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', strict: true, lockRoot: f.lockRoot }))
       .toMatchObject({ code: 'claim-store-unreadable' });

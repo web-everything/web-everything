@@ -248,7 +248,7 @@ printf 'username=x-access-token\\npassword=%s\\n' "\${GH_TOKEN:-$GITHUB_TOKEN}"
     expect(f.io.gitPush).toHaveBeenCalledTimes(0);
   });
   it.each([false, true])('allows own-drafted=%s and pushes the exact lease once', draft => {
-    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine', draft } });
+    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine', draftedByClaim: draft } });
     f.io.ghPrView.mockImplementation(() => ({ ...view(), isDraft: draft, headRefOid: f.io.gitPush.mock.calls.length ? sha : head }));
     expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
@@ -302,13 +302,13 @@ describe('audit negative guarantees', () => {
   });
   it.each(['initial', 'pre-push', 'post-push'])('refuses nonboolean draft metadata at %s', phase => {
     const f = fixture(), bound = f.io.readClaim();
-    f.io.readClaim.mockReturnValue({ meta: { ...bound.meta, draft: 'true' } });
+    f.io.readClaim.mockReturnValue({ meta: { ...bound.meta, draftedByClaim: 'true' } });
     if (phase !== 'initial') f.io.readClaim.mockReturnValueOnce(bound);
     if (phase === 'post-push') f.io.readClaim.mockReturnValueOnce(bound);
     expect(authorizedPush(f)).toMatchObject({ code: phase === 'post-push' ? 'pushed-under-hold' : 'unreadable' });
     expect(f.io.gitPush).toHaveBeenCalledTimes(phase === 'post-push' ? 1 : 0);
   });
-  it.each([undefined, false])('a drafted PR requires draft === true, got %s', draft => {
+  it.each([undefined, false, true])('external draft with claim draft intent %s refuses without ownership', draft => {
     const f = fixture(), meta = { ...f.io.readClaim().meta, draft };
     if (draft === undefined) delete meta.draft;
     f.io.readClaim.mockReturnValue({ meta }); f.io.ghPrView.mockReturnValue({ ...view(), isDraft: true });

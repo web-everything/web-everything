@@ -13,6 +13,7 @@ import { POC_REGISTRY_PATH, normalizeRegistry } from './poc-branches.mjs';
 import { findTrackerPath, parseTracker } from './prototype-tracker-data.mjs';
 import { localToday } from './local-date.mjs';
 import { dirname, relative } from 'node:path';
+import { pushGuardDecision, readPushLease } from '../guard-git-push.mjs';
 import { PUSH_HOLD_LABELS } from './review-hold-model.mjs';
 
 const fail = (code, reason) => ({ ok: false, code, reason });
@@ -124,7 +125,7 @@ function claimRefusal(io, entry, holder, { repo, pr, branch }) {
   const meta = entry.meta;
   if (![meta.repo, meta.kind, meta.branch].every(v => typeof v === 'string' && v.trim())
     || !Number.isSafeInteger(meta.pr) || meta.pr <= 0
-    || ('draft' in meta && typeof meta.draft !== 'boolean')) throw new Error('Incomplete claim');
+    || ('draftedByClaim' in meta && typeof meta.draftedByClaim !== 'boolean')) throw new Error('Incomplete claim');
   if (meta.repo !== repoKeyOf(repo) || meta.pr !== pr || meta.kind !== 'fixing' || meta.branch !== branch)
     return fail('not-claim-holder', 'Claim does not match requested push');
   return null;
@@ -151,7 +152,7 @@ function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir, holder
     if (branchRefusal) return fail(branchRefusal.code || 'foreign-claim', branchRefusal.message || 'Branch has a foreign claim; coordinate with its holder');
     const view = readView(ports, repo, pr);
     if (view.state !== 'OPEN') return fail('pr-not-open', 'PR is not open');
-    if (view.isDraft && entry.meta?.draft !== true) return fail('draft', 'PR drafted outside this claim');
+    if (view.isDraft && entry.meta?.draftedByClaim !== true) return fail('draft', 'PR drafted outside this claim');
     const label = held(view);
     if (label) return fail('hold-label', label);
     if (view.isCrossRepository) return fail('cross-repo', 'Cross-repository PR');
@@ -182,6 +183,16 @@ function authorizedPush(options = {}) {
       const tracker = trackerRefusal(options, temp, git);
       if (tracker) return tracker;
     } catch { return fail('protected-branch', 'Cannot verify prototype tracker; restore evidence before retrying'); }
+    let lease = null, leaseReadError = false;
+    try {
+      lease = readPushLease({ cwd: gitDir, exec: (_bin, args) => {
+        const result = git(gitDir, args);
+        if (result.error || result.status !== 0) throw new Error('Lease path unreadable');
+        return result.stdout;
+      } });
+    } catch { leaseReadError = true; }
+    const guardReason = pushGuardDecision(`${sha} ${sha} refs/heads/${branch} ${expectedHead}`, { lease, leaseReadError });
+    if (guardReason) return fail(leaseReadError ? 'unreadable' : 'pinned-checkout', guardReason);
     try {
       const result = ports.gitPush ? ports.gitPush(temp, args) : git(temp, args);
       const lines = result.stdout?.split('\n');
@@ -201,7 +212,7 @@ function authorizedPush(options = {}) {
         return { ...fail('pushed-under-hold', 'Branch has a foreign claim; coordinate with its holder'), pushed: true };
       const view = readView(post, repo, pr);
       const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
-        : view.isDraft && entry.meta?.draft !== true ? 'PR drafted outside this claim'
+        : view.isDraft && entry.meta?.draftedByClaim !== true ? 'PR drafted outside this claim'
         : view.isCrossRepository ? 'Cross-repository PR'
         : view.headRefOid !== sha ? 'Post-push PR head differs'
         : view.headRefName !== branch ? 'Post-push PR branch differs' : null);

@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { createAuthorizedPushForTesting } from '../authorized-push-testing.mjs';
 const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
 const readPushAuthority = options => createAuthorizedPushForTesting(options.io).readPushAuthority(options);
+import { LEASE_FILENAME } from '../lane-lease.mjs';
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
 
 const roots = [];
@@ -68,6 +69,13 @@ function refused(f, code) {
   expect(f.pushes()).toHaveLength(0); expect(f.remoteHead()).toBe(f.options.expectedHead);
 }
 describe('Design A: isolated push (real Git, file-only transport)', () => {
+  it.each(['pinned', 'unreadable'])('refuses %s checkout lease with hooks off and zero pushes', kind => {
+    const f = fixture();
+    writeFileSync(join(f.lane, '.git', LEASE_FILENAME), kind === 'pinned'
+      ? JSON.stringify({ at: f.options.expectedHead }) : '{broken');
+    refused(f, kind === 'pinned' ? 'pinned-checkout' : 'unreadable');
+    for (const call of f.calls) expect(call.args).toContain('core.hooksPath=/dev/null');
+  });
   it('1: lane, global and env insteadOf/pushInsteadOf cannot redirect the literal destination', () => {
     for (const scope of ['lane', 'global', 'env']) for (const kind of ['insteadOf', 'pushInsteadOf']) {
       const f = fixture(), key = `url.${pathToFileURL(join(f.root, 'decoy.git')).href}.${kind}`;

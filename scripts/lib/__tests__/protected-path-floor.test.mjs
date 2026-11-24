@@ -59,7 +59,11 @@ describe('shared protected-path floor', () => {
   });
 });
 
-it.each(['scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs'])(
+it.each(['scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs',
+  'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
+  'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
+  'scripts/guard-git-push.mjs', 'scripts/lib/lane-lease.mjs',
+  'scripts/guard-prototype-tracker.mjs', 'scripts/conveyor/fix-procedure.mjs'])(
   'classifies %s as protected even without configured guard paths', path => {
     expect(matchesSome(path, shared.GUARD_FLOOR)).toBe(true);
   });
