@@ -925,7 +925,7 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST') && args.includes(`repos/${repo}/actions/jobs/31/rerun`))).toHaveLength(1);
   }));
 
-  it.each(['merge-gate freeze', 'runner-loss pattern', 'aggregator log fallback'])('preserves the two-removal log-based infrastructure retry: %s', route => exactFixture(f => {
+  it.each(['merge-gate freeze', 'runner-loss pattern', 'aggregator log fallback'])('only proven merge-gate freeze permits the two-removal retry: %s', route => exactFixture(f => {
     const infraLog = 'fatal: could not fetch abc123 from promisor remote\n';
     if (route === 'merge-gate freeze') {
       f.mqChecks = [check(36, 'merge-gate', 800, 'failure')];
@@ -939,13 +939,13 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
       delete f.jobs[33].steps;
     }
     f.artifacts = {}; f.reports = {};
-    expect(f.guard().hold).toBe(false);
+    expect(f.guard().hold).toBe(route !== 'merge-gate freeze');
     expect(f.exec.mock.calls.some(([, args]) => args.some(a => /\/logs$/.test(a)))).toBe(true);
     if (route === 'aggregator log fallback') {
       expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/32/logs`))).toBe(true);
       expect(f.exec.mock.calls.some(([, args]) => args.includes(`repos/${repo}/actions/jobs/33/logs`))).toBe(true);
     }
-    expect(f.log.mock.calls[0][0]).toMatch(/infra retry 2\/2/);
+    if (route === 'merge-gate freeze') expect(f.log.mock.calls[0][0]).toMatch(/infra retry 2\/2/);
   }));
 
   it('holds when numRuntimeErrorTestSuites is present but unreadable', () => exactFixture(f => {
