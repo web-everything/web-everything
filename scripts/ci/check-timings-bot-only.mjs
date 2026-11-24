@@ -39,9 +39,15 @@ function main() {
       console.error(`Cannot verify ${FILE}: the PR head moved to a newer commit; rerun CI on the new head. Only ${OWNER} owns it.`);
       return 1;
     }
-    // The PR files API lists every changed file (renames carry previous_filename); NUL separation keeps names literal.
-    const out = execFileSync('gh', ['api', `repos/${REPO}/pulls/${PR_NUMBER}/files`, '--paginate',
-      '--jq', '.[] | (.filename, (.previous_filename // empty)) + "\\u0000"'], {
+    // Only the PR's own edits count: diff the merge-base of the base branch and the head against the head (compare
+    // API, three-dot), not the PR files list, which includes bot refreshes that landed in main after a stale base.
+    const baseRef = execFileSync('gh', ['api', `repos/${REPO}/pulls/${PR_NUMBER}`, '--jq', '.base.ref'], {
+      encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (!/^[\w./-]+$/.test(baseRef)) throw new Error('Unreadable PR base ref');
+    // Renames carry previous_filename; NUL separation keeps names literal. A failed or empty compare throws (fails closed).
+    const out = execFileSync('gh', ['api', `repos/${REPO}/compare/${baseRef}...${HEAD_SHA}`, '--paginate',
+      '--jq', '.files[] | (.filename, (.previous_filename // empty)) + "\\u0000"'], {
       encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
     const result = checkTimingsBotOnly({ changedFiles: out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean), headRef: HEAD_REF, author: AUTHOR, headRepo: HEAD_REPO, repo: REPO });

@@ -43,7 +43,7 @@ describe('bot-owned timings', () => {
   it('CLI reads the file list from the API and rejects a non-bot edit', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nprocess.stdout.write(process.argv.includes('.head.sha') ? '${SHA}\\n' : 'a.txt\\0\\n${file}\\0\\n');\n`, { mode: 0o755 });
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nconst a = process.argv.join(' ');\nprocess.stdout.write(a.includes('.head.sha') ? '${SHA}\\n' : a.includes('.base.ref') ? 'main\\n' : 'a.txt\\0\\n${file}\\0\\n');\n`, { mode: 0o755 });
       const env = { GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_SHA: SHA, HEAD_REPO: 'o/r', PATH: `${dir}:${process.env.PATH}` };
       expect(cli({ ...env, HEAD_REF: 'lane/test', AUTHOR: 'developer' }).status).toBe(1);
       // The bot branch name alone is not enough: a human author or a fork is refused.
@@ -52,6 +52,36 @@ describe('bot-owned timings', () => {
       expect(cli({ ...env, HEAD_REF: 'ci/refresh-test-timings', AUTHOR: 'web-everything[bot]' }).status).toBe(0);
       // A moved head (newer push) fails closed.
       expect(cli({ ...env, HEAD_SHA: 'b'.repeat(40), HEAD_REF: 'ci/refresh-test-timings', AUTHOR: 'web-everything[bot]' }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // Fake gh: the pulls/files answer is stale (carries a bot refresh already in main); the compare answer is the merge-base diff.
+  const fakeGh = (dir, { compare, pullFiles = `a.txt\\0\\n${file}\\0\\n`, compareFails = false }) => writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const a = process.argv.join(' ');
+if (a.includes('.head.sha')) process.stdout.write('${SHA}\\n');
+else if (a.includes('.base.ref')) process.stdout.write('main\\n');
+else if (a.includes('/compare/')) { ${compareFails ? 'process.exit(1);' : `process.stdout.write('${compare}');`} }
+else process.stdout.write('${pullFiles}');
+`, { mode: 0o755 });
+  const stale = { GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_SHA: SHA, HEAD_REPO: 'o/r', HEAD_REF: 'lane/test', AUTHOR: 'developer' };
+  it('ignores a timings change that is only in main since the PR base (stale base after a bot refresh)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: 'a.txt\\0\\n' });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('still rejects a PR that itself edits the timings file (merge-base diff)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: `a.txt\\0\\n${file}\\0\\n`, pullFiles: 'a.txt\\0\\n' });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed when the merge-base compare is unavailable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: '', compareFails: true, pullFiles: 'a.txt\\0\\n' });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed at the API file cap', () => {
@@ -64,6 +94,7 @@ describe('bot-owned timings', () => {
       writeFileSync(join(dir, 'gh'), `#!${process.execPath}
 const { writeSync } = require('node:fs');
 if (process.argv.includes('.head.sha')) { writeSync(1, '${SHA}\\n'); process.exit(0); }
+if (process.argv.includes('.base.ref')) { writeSync(1, 'main\\n'); process.exit(0); }
 const chunk = Buffer.alloc(1024 * 1024, 97);
 for (let i = 0; i < 17; i++) writeSync(1, chunk);
 `, { mode: 0o755 });
