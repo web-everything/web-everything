@@ -7,7 +7,7 @@ description: Explain why an item or the cleared queue is not dispatching when th
 
 An alive runner with no progress is an admission question. The answer is usually one named gate,
 not a mystery requiring a manual trace. The method and output contract live in
-[we:docs/agent/testing.md → Dispatch eligibility reports](../../docs/agent/testing.md#dispatch-eligibility-reports).
+[we:docs/agent/testing.md → Dispatch eligibility reports](../../docs/agent/testing.d/047-dispatch-eligibility-reports.md#dispatch-eligibility-reports).
 
 ## Quick path
 

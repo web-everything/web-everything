@@ -26,13 +26,13 @@ describe('selectScanTests', () => {
     const entry = REPO_SCAN_TESTS.find(e => e.test === test);
     expect(entry).toBeDefined();
     for (const path of ['AGENTS.md', 'docs/agent/testing.md', 'docs/agent/new-caller.md',
-      'docs/agent/testing/new-topic.md', 'docs/agent/testing/README.md', 'scripts/check-standards.mjs', ...entry.inputs]) {
+      'docs/agent/testing.d/new-topic.md', 'docs/agent/testing.d/README.md', 'scripts/check-standards.mjs', ...entry.inputs]) {
       expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).toContain(test);
     }
     for (const path of ['docs/readme.md', 'docs/agent/other/nested.md', 'backlog/1-x.md', 'scripts/lib/unrelated.mjs']) {
       expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).not.toContain(test);
     }
-    expect(selectScanTests({ changedFiles: ['docs/agent/testing/removed-topic.md'], fileExists: () => false }).full).toEqual([]);
+    expect(selectScanTests({ changedFiles: ['docs/agent/testing.d/removed-topic.md'], fileExists: () => false }).full).toEqual([]);
   });
 
   it('scopes capability admission scans to production sources and widens when the rule changes', () => {
