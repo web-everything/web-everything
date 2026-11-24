@@ -41,7 +41,7 @@ export default {
         return 'posted';
       };
       try {
-        runStandDownAnswer(['7406', '--repo=web-everything/web-everything', '--reason=No code owed',
+        runStandDownAnswer(['7406', '--repo=no-code-owed-fixture/example', '--reason=No code owed',
           '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], { gh });
       } catch (error) {
         if (!/guard would ignore|no unresolved stand-down/.test(error.message)) throw error;
