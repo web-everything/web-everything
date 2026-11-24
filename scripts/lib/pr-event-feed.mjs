@@ -34,9 +34,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
-  PR_EVENTS_DEFAULTS, PR_EVENTS_FLAG_ENV, classifyFeedHealth, defaultStateDir, isRelevantEvent, pollEvents,
+  PR_EVENTS_DEFAULTS, PR_EVENTS_FLAG_ENV, classifyFeedHealth, defaultStateDir, isRelevantEvent,
   resolvePrEventsConfig, writeStatusFile,
 } from './pr-events.mjs';
+import { readChangeEvents } from './forge-adapter/change-events.mjs';
 
 export const FEED_STATE_VERSION = 1;
 export const FEED_MODES = Object.freeze(['off', 'shadow', 'on']);
@@ -292,7 +293,7 @@ export async function resolveShaFromMirror(repo, sha, { env = process.env } = {}
  */
 export function createFeedConsumer(o) {
   const {
-    role, url, token, repos = null, poll = pollEvents, resolveSha = resolveShaFromMirror,
+    role, url, token, repos = null, poll = readChangeEvents, resolveSha = resolveShaFromMirror,
     now = () => Date.now(), save = saveFeedState, load = loadFeedState, maxPages = FEED_DEFAULTS.maxPages,
     log = console, staleAfterMs = PR_EVENTS_DEFAULTS.staleAfterMs,
   } = o;
