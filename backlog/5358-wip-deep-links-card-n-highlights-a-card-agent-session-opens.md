@@ -39,3 +39,5 @@ Requested behavior: /wip?card=N scrolls to, highlights and focuses the card; /wi
 ## Open questions
 
 Which live product repo and existing mount/test own this feature, and what is the actual parent card? The original non-WE scope conflicts with the requested we:-only scope. This blocks a truthful executable acceptance test and implementation estimate; size 1 is retained provisionally.
+
+Superseded by plan step PD1 (PL-WIP-CLEANUP, 2026-11-22): PD1 ships `#step-<ID>` deep links in the Delivery detail sheet, replacing `?card=` / `?agent=`. /wip itself closes in DZ-RETIRE-WIP.

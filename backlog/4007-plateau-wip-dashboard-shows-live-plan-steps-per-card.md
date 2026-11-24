@@ -20,3 +20,5 @@ Child 7b (Plateau side) of #3922. The Plateau WIP dashboard reads the step statu
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22): live plan steps per card are built once in the Delivery detail sheet, not on /wip.

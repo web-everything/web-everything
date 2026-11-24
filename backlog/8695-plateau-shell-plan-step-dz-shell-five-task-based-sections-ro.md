@@ -19,6 +19,8 @@ Plan step DZ-SHELL in the plateau design plan (PL-ROUTES: five task sections own
 - [A2] Carried from #2512: legacy URLs keep working after the route move: static, dynamic (:id) and query-string redirects from each old path to its new path, query string and id preserved, redirect runs before the auth guard, no redirect loop; one browser test per class, each asserting the real destination content mounts with no visible 404 (not only the URL).
 - [A4] Auth membership is preserved: a test asserts that every route that is auth-guarded today stays guarded after the route table change (membership unchanged, so no previously protected route becomes public), and, in addition, each of the five routes #3130 lists is refused logged off. isProductRoute membership is otherwise unchanged (still excludes /skills and the four /console-* routes, as today).
 - [A5] Carried from #2512: updated test fixtures and cross-link generators (plateau-app backlog-view mount and ruling-surface tests, runsPage test, the board visual spec) use the new paths; npm test, npm run test:e2e and npm run build pass in plateau-app; the stale route-prefix comment in plateau-app:index.html and the old /console-cases mention in plateau-app docs are fixed.
+- [A6] Carried from #4984 (PL-WIP-CLEANUP): no horizontal overscroll or elastic scroll on mobile, and vertical scrolling does not regress; a mobile-viewport test asserts both.
+- [A7] Carried from #4997 (PL-WIP-CLEANUP): no pinch zoom and no double-tap zoom on mobile, and focusing an input does not zoom the page; a mobile-viewport test asserts each.
 - [A3] Carried from #2512: a sweep finds zero old internal links; every link, nav item and deep link points at the new path directly, not through a redirect.
 
 
