@@ -1527,7 +1527,8 @@ describe('request with an explicit --gate when the default selection is blocked'
   });
 });
 
-it('an unscopable default request refuses before stamping a runnable marker', () => {
+it('an opted-out default request refuses before stamping a runnable marker', () => {
+  vi.stubEnv('WE_DIFF_TEST_SELECTION', '0');
   execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'echo must-not-run' } }));
   const r = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8' });
@@ -1573,7 +1574,7 @@ import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
 import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
-appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
+appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
@@ -1591,7 +1592,7 @@ if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('-
   }
   process.exit(${retryExit});
 }
-if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit')) {
+if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit') || (args[0] === 'vitest' && args[1] === 'run' && args.length === 2)) {
   writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
   writeAllSync(2, ${JSON.stringify(stderr)});
   writeAllSync(1, ${JSON.stringify(stdout)});
@@ -1711,6 +1712,94 @@ process.exit(${standardsExit});
     expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
     expect(f.calls()[0].args).toEqual(['run', 'test:unit']);
     expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
+  });
+
+  function idleFallbackEnv({ timeout = false, standardsExit = 0, scripts = { 'test:unit': 'true' } } = {}) {
+    const saturationUrl = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
+    const admissionUrl = pathToFileURL(resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href;
+    const loader = join(dir, 'fallback-loader.mjs');
+    writeFileSync(loader, `
+export async function load(url, context, nextLoad) {
+  const result = await nextLoad(url, context);
+  if (url === ${JSON.stringify(saturationUrl)}) return { ...result,
+    source: String(result.source).replace('export function hostSaturation(', 'function originalHostSaturation(')
+      + '\\nexport const hostSaturation = () => ({ saturated: false, known: true });' };
+  if (${timeout} && url === ${JSON.stringify(admissionUrl)}) return { ...result,
+    source: String(result.source).replace('export async function acquireSlotBlocking(', 'async function originalAcquireSlotBlocking(')
+      + '\\nexport const acquireSlotBlocking = async () => ({ ok: false, timedOut: true, waitedMs: 1 });' };
+  return result;
+}
+`);
+    const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    // Force a broad diff and make direct standards execution observable.
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts/check-standards.mjs'), "import { appendFileSync } from 'node:fs'; appendFileSync('calls.jsonl', JSON.stringify({ args: ['direct-standards'], scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');\n"
+      + (standardsExit ? "console.log('  error  invisible-characters: U+200B in source.mjs');\n" : '')
+      + `process.exit(${standardsExit});\n`);
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts }));
+    return { NODE_OPTIONS: `--import=${preload}`, WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs,excluded.test.mjs',
+      WE_VERIFY_RUN_ALL_PHASES: '1' };
+  }
+
+  it('negative: idle fallback refuses a green guard report missing a declared file', () => {
+    const f = fixture({ guard: true, guardExcluded: true });
+    const npx = join(dir, 'bin/npx');
+    writeFileSync(npx, readFileSync(npx, 'utf8').replace(
+      "(args[0] === 'vitest' && args[1] === 'run' && args.length === 2)", 'false'));
+    const r = f.invoke([], idleFallbackEnv());
+    expect(r.json.status, r.stderr).toBe('red');
+    expect(r.json.phases.alwaysRun).toMatchObject({ executed: true, ran: ['guard.test.mjs'],
+      missing: ['excluded.test.mjs'], result: 'failed' });
+    expect(r.stderr).toContain('FAIL always-run guard');
+    expect(f.calls()[0].held).toHaveLength(1);
+  });
+
+  it('negative: idle fallback refuses admission timeout before any unslotted command', () => {
+    const f = fixture({ guard: true, guardExcluded: true });
+    const r = spawnSync('node', [VERIFY_LANE, '--json'], { cwd: dir,
+      env: { ...gateScrubbedEnv(), PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
+        LANE_POOL_ROOT: join(dir, 'pool'), WE_VERIFY_RETRY_FAILED: '0',
+        ...idleFallbackEnv({ timeout: true }) }, encoding: 'utf8' });
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.stderr).toMatch(/full fallback.*admission.*timed out/i);
+    expect(existsSync(join(dir, 'calls.jsonl'))).toBe(false);
+  });
+
+  it('never inherits the parent scan scope into the vitest, guard or standards phases', () => {
+    const f = fixture({ guard: true });
+    const pollutedRoot = mkdtempSync(join(tmpdir(), 'verify-scan-root-'));
+    const r = f.invoke([], { ...idleFallbackEnv(), VERIFY_SCAN_FILES: '[]', VERIFY_SCAN_ROOT: pollutedRoot });
+    const calls = f.calls();
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) expect(call, JSON.stringify(call.args)).toMatchObject({ scanFiles: null, scanRoot: null });
+  });
+
+  it('the scan phase gets only its inline scan scope, never the parent scan root', () => {
+    const f = fixture({ scan: true });
+    const pollutedRoot = mkdtempSync(join(tmpdir(), 'verify-scan-root-'));
+    const r = f.invoke([], { VERIFY_SCAN_FILES: '["polluted.mjs"]', VERIFY_SCAN_ROOT: pollutedRoot });
+    const calls = f.calls();
+    const scanCalls = calls.filter(call => call.args.some(a => a.includes('conformance')));
+    expect(scanCalls.length, r.stderr).toBeGreaterThan(0);
+    for (const call of scanCalls) {
+      expect(call.scanFiles).not.toBeNull();
+      expect(call.scanFiles).not.toBe('["polluted.mjs"]');
+      expect(call.scanRoot).toBeNull();
+    }
+    for (const call of calls.filter(c => !scanCalls.includes(c))) expect(call).toMatchObject({ scanFiles: null, scanRoot: null });
+  });
+
+  it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
+    const f = fixture({ standardsExit: 1 });
+    const r = f.invoke([], { ...idleFallbackEnv({ standardsExit: 1, scripts: { [script]: 'true' } }),
+      WE_VERIFY_ALWAYS_RUN_TESTS: '' });
+    expect(r.code, r.stderr).toBe(2);
+    expect(f.calls().map(call => call.args)).toEqual([
+      ['vitest', 'run'], ['direct-standards'],
+    ]);
+    expect(f.calls()[0].held).toHaveLength(1);
+    expect(r.json.phases.outcomes).toMatchObject({ vitest: { result: 'fail' },
+      standards: { result: 'fail', reason: 'invisible-characters' } });
   });
 
   it('retryFailed never clears a standards red after full-unit flake recovery', () => {
@@ -2399,12 +2488,12 @@ describe('full build gate default', () => {
     writeFileSync(preferences, '{}');
     vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
   });
-  it('standard full without a known diff fails closed instead of running the whole suite', () => {
+  it('standard full with selection opted out fails closed instead of running the whole suite', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
       'check:standards': 'exit 0',
     } }));
-    const env = { ...gateScrubbedEnv() };
+    const env = { ...gateScrubbedEnv(), WE_DIFF_TEST_SELECTION: '0' };
     delete env.WE_BUILD_FINAL_GATE;
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
     expect(r.status, r.stderr).toBe(3);
@@ -2413,17 +2502,24 @@ describe('full build gate default', () => {
     expect(JSON.parse(r.stdout).status).toBe('selection-required');
   });
 
-  // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
+  // On a known narrow diff only explicit full replaces selection; an explicit --gate still wins.
   it.each([
     ['full', true], ['related', false], ['none', false],
-  ])('finalGate=%s runs the whole unit tier only when full', (finalGate, wholeUnit) => {
+  ])('finalGate=%s on a known docs diff runs the whole unit tier only when full', (finalGate, wholeUnit) => {
     const scripts = {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
-      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')" --`,
     };
+    // Commit the package script fixture into the base; only notes.md belongs to the selection.
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
-    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate };
+    execFileSync('git', ['add', 'package.json'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'script fixture'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    writeFileSync(join(dir, 'notes.md'), 'known narrow diff\n');
+    // This empty fixture checkout has no repo-wide guard suites.
+    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate, WE_VERIFY_ALWAYS_RUN_TESTS: '' };
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.status, r.stderr).toBe(0);
     expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
     expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
     const explicit = spawnSync('node', [VERIFY_LANE, 'run', '--json', '--gate=npm run check:standards'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
@@ -2506,7 +2602,7 @@ describe('full build gate default', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts, description: 'dependency-surface change' }));
     git('add', 'package.json'); git('commit', '-qm', 'touch package.json');
     const env = (finalGate) => {
-      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate };
+      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate, WE_DIFF_TEST_SELECTION: '0' };
       if (finalGate === null) delete e.WE_BUILD_FINAL_GATE;
       return e;
     };
