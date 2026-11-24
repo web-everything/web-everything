@@ -25,7 +25,9 @@ const module_default = {
   card: 'frontierui#55 referral-persistence-failed (2026-11-23)',
   fixedBy: { sha: 'lane/referral-persist-recover', where: 'lane/referral-persist-recover', paths: ['scripts/lib/review-comment-edit.mjs'] },
   fixPresent(root) {
-    const src = `import(${JSON.stringify(import.meta.url)}).then(m => m.probe(${JSON.stringify(root)})).then(ok => process.exit(ok ? 0 : 1), () => process.exit(1));`;
+    // Fix is judged present when EITHER half of it is present (routed env, or refusal of an unrouted call), so a
+    // regression of one half leaves fixPresent true and the regression test fails loudly instead of flipping to it.fails.
+    const src = `import(${JSON.stringify(import.meta.url)}).then(m => m.probeEither(${JSON.stringify(root)})).then(ok => process.exit(ok ? 0 : 1), () => process.exit(1));`;
     return spawnSync(process.execPath, ['--input-type=module', '-e', src], { encoding: 'utf8', timeout: 60_000 }).status === 0;
   },
   async run({ sourceRoot = ROOT } = {}) {
@@ -52,4 +54,15 @@ export default module_default;
 export async function probe(root) {
   const { violations } = await module_default.run({ sourceRoot: root });
   return violations.length === 0;
+}
+
+export async function probeEither(root) {
+  const { createReferralGhProvider } = await import(pathToFileURL(join(root, 'scripts/lib/review-comment-edit.mjs')).href);
+  const envs = [];
+  const provider = createReferralGhProvider({ exec: (_argv, opts) => { envs.push(opts?.env); return OK; } });
+  let refused = false;
+  try { provider.editComment('IC_x', 'body'); } catch { refused = true; }
+  let routed = false;
+  try { provider.editComment('IC_x', 'body', { repo: 'frontier-ui/frontierui' }); routed = envs.at(-1)?.GH_REPO === 'frontier-ui/frontierui'; } catch { /* not routed */ }
+  return refused || routed;
 }

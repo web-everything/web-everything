@@ -35,6 +35,9 @@ describe('referral comment updates', () => {
     expect(envs[0].GH_REPO).toBe('frontier-ui/frontierui');
     // Fail closed: no repo named means the call is refused, never sent unrouted.
     expect(() => provider.editComment('IC_referral', 'body')).toThrow(/repo/);
+    for (const bad of ['!/repo', '-o/n', 'o/n/x', 'o/ n', 'o/']) {
+      expect(() => provider.editComment('IC_referral', 'body', { repo: bad })).toThrow(/repo/);
+    }
     expect(envs).toHaveLength(1);
   });
 

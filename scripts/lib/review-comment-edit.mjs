@@ -22,7 +22,7 @@ export function createReferralGhProvider({
       // The mutation names only a node id, so the app shim cannot tell which owner's installation to use and would
       // fall back to the daemon checkout's origin (live 2026-11-23, frontierui#55: the persist failed three times
       // and then again after #7399). Route it by the PR's repo, and refuse rather than send it unrouted.
-      if (!/^[^/\s]+\/[^/\s]+$/.test(String(repo ?? ''))) throw new Error('referral comment update needs the PR repo (owner/name) to route the call');
+      if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/.test(String(repo ?? ''))) throw new Error('referral comment update needs the PR repo (owner/name) to route the call');
       const result = JSON.parse(exec(['api', 'graphql', '-f',
         'query=mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id}}}',
         '-f', `id=${id}`, '-f', `body=${body}`], { maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GH_REPO: repo } }));
