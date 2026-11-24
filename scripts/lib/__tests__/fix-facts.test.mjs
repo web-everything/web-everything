@@ -58,6 +58,35 @@ import { ghRestGetJson as import_ghRestGetJson } from '../gh-rest-read.mjs';
 const tick = (gh, d, o = {}) => readTimeoutEvidence(pr, { repo, exec: gh.exec, reader: readerFor(gh, d), ...o });
 
 describe('fix dispatcher: immutable read cache', () => {
+  it.each([false, true])('permits escape-coded raw logs without flagging JSON reads (enabled=%s)', enabled => {
+    const gh = fakeGithub();
+    const calls = [];
+    const log = '\x1b[31mFAIL\x1b[0m\n';
+    const exec = (command, argv, opts) => {
+      calls.push({ argv, opts });
+      if (argv.at(-1).endsWith('/logs')) {
+        if (!argv.includes('--allow-escape-sequences')) throw new Error('the response contains terminal escape sequences');
+        return log;
+      }
+      return gh.exec(command, argv, opts);
+    };
+    const d = dirs();
+    const reader = enabled ? readerFor({ exec }, d)
+      : makeFixEvidenceReader({ repo, exec, env: { WE_FIX_FACTS: '0' } });
+    expect(reader.api('repos/o/r/pulls/5')).toMatchObject({ state: 'open' });
+    expect(reader.readLog({ id: 1, status: 'in_progress' })).toBe(log);
+    expect(reader.api('repos/o/r/actions/jobs/1/logs', true)).toBe(log);
+    const logCalls = calls.filter(({ argv }) => argv.at(-1).endsWith('/logs'));
+    expect(logCalls).toHaveLength(2);
+    for (const { argv, opts } of logCalls) {
+      expect(argv).toEqual(['api', '--allow-escape-sequences', 'repos/o/r/actions/jobs/1/logs']);
+      expect(opts).toMatchObject({ encoding: 'utf8', timeout: Infinity, maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'] });
+    }
+    expect(calls.filter(({ argv }) => !argv.at(-1).endsWith('/logs'))).toHaveLength(1);
+    expect(calls[0].argv).not.toContain('--allow-escape-sequences');
+  });
+
   it('a second read of the same completed job log makes 0 gh calls; an in-progress job is never cached', () => {
     const d = dirs();
     const gh = fakeGithub();
