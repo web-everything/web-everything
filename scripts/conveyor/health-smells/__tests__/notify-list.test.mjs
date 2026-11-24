@@ -65,11 +65,13 @@ const ADDED_2026_11_02 = ['pr-no-movement', 'pr-stage-stall'];
 const ADDED_2026_11_03 = ['forge-share-below-target', 'stale-claim-or-binding'];
 // Operator R951, 2026-11-15: Forge disk full / prune refusing must alert.
 const ADDED_2026_11_15 = ['forge-disk-prune'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, ...ADDED_2026_11_02, ...ADDED_2026_11_03, ...ADDED_2026_11_15, 'disk-space'])];
+// REDTEAM-STUCK-PENDING: overdue pending must notify even in shadow mode.
+const ADDED_2026_11_24 = ['red-team-pending-overdue'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08, ...ADDED_2026_10_27, ...ADDED_2026_10_09, ...ADDED_2026_10_14, ...ADDED_2026_10_15, ...ADDED_2026_10_17, ...ADDED_2026_10_28, ...ADDED_2026_11_02, ...ADDED_2026_11_03, ...ADDED_2026_11_15, ...ADDED_2026_11_24, 'disk-space'])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 35 entries', () => {
-    expect(APPROVED).toHaveLength(35);
+  it('is exactly the union of the approved operator decisions — 36 entries', () => {
+    expect(APPROVED).toHaveLength(36);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 

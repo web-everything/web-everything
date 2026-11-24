@@ -71,6 +71,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "pr-stage-stall": "Cluster is not a per-PR action authorization; reuse inspections and specific episodes.",
   "pre-existing-red-on-main": "A failing test on main is fixed on main via the filed card; the responder never edits tests or the gate.",
   "red-main-quarantined-test": "The health filing pipeline owns the quarantine repair card; the responder never edits quarantine entries, tests or the gate.",
+  "red-team-pending-overdue": "Overdue red-team pending requires queue and worker inspection; the responder never clears pending, changes labels or dispatches review.",
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
   "review-same-head-unposted": "Alert only; inspect failed posting effects and the review caps, never re-arm or post a review from the responder.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
