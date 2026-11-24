@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { FIX_EXECUTOR_RUNGS, FIX_EXECUTOR_CHAIN_DEFAULT, resolveFixExecutorChain, pickChainRung } from '../fix-executor-chain.mjs';
+import { FIX_EXECUTOR_RUNGS, FIX_EXECUTOR_CHAIN_DEFAULT, resolveFixExecutorChain, resolveFixCriticalGlobs, pickChainRung } from '../fix-executor-chain.mjs';
 import { chooseFixExecutor, formatFixExecutorLog } from '../fix-slot-borrow.mjs';
 import { codexModelSupportsEffort } from '../codex-model-routing.mjs';
 import { readFileSync } from 'node:fs';
@@ -41,6 +41,43 @@ describe('fix executor chain', () => {
     expect(pick({critical:true,trigger:'takeover'})).toMatchObject({executor:'codex',rung:'codex-alt'});
     expect(pick({critical:true,codexUnproductive:3})).toMatchObject({rung:'argon'});
     expect(pick({critical:true,codexUnproductive:4})).toMatchObject({executor:'claude',rung:'claude'});
+  });
+  it('logs the chosen rung and its provenance through chooseFixExecutor', () => {
+    const decision = chooseFixExecutor({chain:{value:chain,source:'repo'},critical:true,launcherAvailable:true});
+    expect(decision).toMatchObject({executor:'codex',rung:'codex',provider:'codex',source:'repo',requiresReview:true});
+    expect(formatFixExecutorLog(decision)).toContain('rung=codex');
+    expect(formatFixExecutorLog(decision)).toContain('requiresReview=true');
+    expect(formatFixExecutorLog(decision)).toContain('source repo');
+    const alt = chooseFixExecutor({chain:{value:chain,source:'env'},critical:true,strongerModel:true,launcherAvailable:true});
+    expect(alt).toMatchObject({rung:'codex-alt',source:'env',policyRoute:{model:'gpt-6-astra',effort:'high'}});
+    expect(formatFixExecutorLog(alt)).toContain('rung=codex-alt model=gpt-6-astra effort=high');
+  });
+  it('skips an unavailable launcher before the critical path applies', () => {
+    expect(pick({chain:['argon','codex-alt','claude'],critical:true,launcherAvailable:executor=>executor==='codex'})).toMatchObject({
+      executor:'codex',rung:'codex-alt',requiresReview:true,reason:expect.stringContaining('argon launcher unavailable, fallback')});
+    expect(pick({critical:true,launcherAvailable:()=>false})).toMatchObject({executor:'claude',rung:'claude',requiresReview:true});
+  });
+  it('keeps Claude-only paths outside the chain on Claude when critical', () => {
+    for (const entry of [{takeover:true},{rulingNotAddressed:true},{mainFix:true},{strongerModel:true},{codexUnproductive:2}]) {
+      expect(chooseFixExecutor({...entry,critical:true,launcherAvailable:true}).executor).toBe('claude');
+    }
+    expect(chooseFixExecutor({chain:{value:chain},mainFix:true,critical:true,launcherAvailable:true}).executor).toBe('claude');
+  });
+  it('follows directExecutorPlan for critical work with two unproductive runs, not a threshold', () => {
+    const critical = pick({critical:true,codexUnproductive:2});
+    expect(critical).toMatchObject({...pick({codexUnproductive:2}),requiresReview:true});
+    expect(critical).toMatchObject({executor:'codex',rung:'codex-alt'});
+    expect(pick({critical:true,codexUnproductive:3})).toMatchObject({executor:'antigravity',rung:'argon'});
+    expect(pick({critical:true,codexUnproductive:4})).toMatchObject({executor:'claude',rung:'claude'});
+  });
+  it('resolves the explicit critical path list through the default, platform and repo cascade', () => {
+    const globs = input => resolveFixCriticalGlobs({env:{},platform:{},repo:{},...input});
+    const shipped = globs({});
+    expect(shipped).toEqual(JSON.parse(readFileSync('scripts/settings/fix-executor.json','utf8')).fixExecutor.criticalGlobs);
+    expect(globs({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}}})).toEqual(['scripts/land/**']);
+    expect(globs({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:['scripts/security/**']}}})).toEqual(['scripts/security/**']);
+    for (const bad of [[],[''],['  '],[1],'scripts/**',null]) expect(globs({repo:{fixExecutor:{criticalGlobs:bad}}})).toEqual(shipped);
+    expect(globs({env:{WE_FIX_EXECUTOR_FALLBACK_CHAIN:'claude'},repo:{fixExecutor:{criticalGlobs:['x/**']}}})).toEqual(['x/**']);
   });
   it('records skipped Gemini before exhausted-chain Claude', () => {
     expect(pick({codexUnproductive:3,launcherAvailable:e=>e!=='antigravity'})).toMatchObject({executor:'claude',reason:expect.stringContaining('gemini skipped: no admitted fix path')});
