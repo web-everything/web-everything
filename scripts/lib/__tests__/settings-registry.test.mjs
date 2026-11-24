@@ -449,7 +449,8 @@ test('generated documentation preserves original bytes except the intentional pe
   const doc = renderMarkdown({ ...registry, capacityRows: registry.capacityRows.filter(row => Object.hasOwn(originalMetadata.capacityLeaves, row.key)) });
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
-  assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
+  // The original declaration fixture no longer advertises the retired MQ signature setting.
+  assert.equal(createHash('sha256').update(original).digest('hex'), '307ab2610c6c0c5efe3bd91c0d6a1c9d7afa5fe5e6e3d3152de798299783bd9d');
 });
 test('generated documentation retains rotation, rerun, audit debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
   const registry = buildRegistry(), doc = renderMarkdown(registry);
