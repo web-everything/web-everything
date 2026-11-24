@@ -7,7 +7,7 @@
  *   gate-comment re-checks in the runner) decides the starts. It never starts anything itself.
  *
  *   A PR is fed when it is open, not a draft, carries red-team:pending, has no red-team result comment for the
- *   live head, carries no hold label and no fix claim, is not already a refusal or a planned review dispatch, and
+ *   live head, carries no hold label and no fix claim, has no planned dispatch and no refusal except `nothing-owed`, and
  *   (a) its review of the live head is finished (a trusted reviewed-sha marker for the head), or (c) it has been
  *   quiet for more than 30 minutes AND the injected `hasLiveProcess` reader says no process holds it. Without that
  *   reader the quiet path stays off (fail closed).
@@ -22,7 +22,9 @@ const isHold = name => name === 'review:held-mechanical' || name === 'hold:fix' 
 
 /** PURE. Returns `[{ prNumber, headSha, reason: 'a'|'c' }]`. */
 export function planRedTeamFeed({ plan, rawPrs, now = Date.now(), hasLiveProcess } = {}) {
-  const taken = new Set([...(plan?.refusals ?? []), ...(plan?.dispatch ?? [])]
+  // nothing-owed describes ordinary review work, not a red-team nomination or a safety hold.
+  // Preserve every other refusal (including unknown kinds) and every planned dispatch as a blocker.
+  const taken = new Set([...(plan?.refusals ?? []).filter(row => row?.kind !== 'nothing-owed'), ...(plan?.dispatch ?? [])]
     .map(row => Number(row?.prNumber ?? row?.pr ?? row?.number)));
   const out = [];
   for (const pr of Array.isArray(rawPrs) ? rawPrs : []) {

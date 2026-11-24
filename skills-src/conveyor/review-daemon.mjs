@@ -1649,7 +1649,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
         }
         lastRedTeamQueueFloorLine = floorLine;
       }
-      // REDTEAM-FEED: nominate finished-review red-team:pending PRs the plan never refused (all logic in red-team-feed.mjs).
+      // REDTEAM-FEED: nominate finished-review red-team:pending PRs, including nothing-owed (all logic in red-team-feed.mjs).
       redTeamFeed ??= createRedTeamFeed({ log: options.log });
       const fedPlan = redTeamFeed(options);
       return runWithRedTeamQueue({ ...options, plan: fedPlan, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
