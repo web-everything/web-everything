@@ -2,12 +2,13 @@
 // Register with CI's runner while retaining the standalone node --test entrypoint.
 const { afterEach, test } = process.env.VITEST
   ? await import('vitest') : await import('node:test');
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, webcrypto } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import yaml from 'js-yaml';
 import { addedLines, parseRawDiff, secretText } from '../secret-scan.mjs';
 import { keyStructureFinding } from '../../readiness/forge-key-structure.mjs';
@@ -57,6 +58,75 @@ const exemption = (path, rule, bytes = token) => ({ path, rule, sha256: sha256(b
 // Assemble synthetic JWKs at runtime so this credential-named test source can ship to Forge.
 const jwk = (members, space) => JSON.stringify(Object.fromEntries([['kty', 'RSA'], ...members]), null, space);
 const privateJwk = jwk([['d', 'FAKE_TEST_ONLY']]);
+
+// Build source strings at runtime so this file itself contains no private JWK.
+const templateJwk = (key, members) => 'export default {' + Object.entries(key).map(([name, value]) =>
+  JSON.stringify(name) + ':' + (members.includes(name) ? '`' + value + '`' : JSON.stringify(value))).join(',') + '};';
+test('usable HMAC and Ed25519 JWKs with template-literal values fail the CLI scan', async () => {
+  const oct = Object.fromEntries([['kty', 'oct'], ['k', Buffer.alloc(16, 97).toString('base64url')]]);
+  const ed = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
+  for (const [key, algorithm, variants] of [
+    [oct, { name: 'HMAC', hash: 'SHA-256' }, [['k'], ['kty'], ['kty', 'k']]],
+    [ed, { name: 'Ed25519' }, [['d'], ['kty'], ['kty', 'd']]],
+  ]) {
+    for (const members of variants) {
+      const source = templateJwk(key, members);
+      const actual = runInNewContext('(' + source.slice('export default '.length, -1) + ')');
+      const imported = await webcrypto.subtle.importKey('jwk', actual, algorithm, false, ['sign']);
+      assert.ok((await webcrypto.subtle.sign(algorithm, imported, Buffer.from('probe'))).byteLength);
+      const r = repo(); r.put('signing-key.mjs', source); r.commit();
+      const result = r.scan();
+      assert.equal(result.status, 1, 'reject template values for ' + members.join(','));
+      assert.equal(result.stdout, 'signing-key.mjs:0 private-key-structure\n');
+      assert.ok(!result.output.includes(key.d ?? key.k), 'never echo key material');
+    }
+  }
+});
+test('escaped template values and value-only template edits fail the whole-file scan', () => {
+  const before = templateJwk(Object.fromEntries([['kty', 'oct'], ['k', 'FAKE_OLD']]), []);
+  const r = repo({ 'key.mjs': before });
+  const source = templateJwk(Object.fromEntries([['kty', '\\x6f\\u0063\\u{74}'], ['k', 'FAKE\\\n_TEST']]), ['kty', 'k']);
+  r.put('key.mjs', source); r.commit();
+  assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n');
+});
+test('template text containing syntax cannot hide a later private member', () => {
+  const r = repo();
+  r.put('key.mjs', templateJwk(Object.fromEntries([['note', 'quote" brace} comment/* escaped\\`'], ['kty', 'oct'], ['k', 'FAKE']]), ['note', 'k']));
+  r.commit();
+  assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n');
+});
+test('ordinary template values and templates inside quoted text pass', () => {
+  const r = repo();
+  r.put('ordinary.mjs', 'export default {k:`click`, label:`quote" brace} comment/*`};\n' + JSON.stringify('prose `with` delimiters'));
+  r.commit();
+  assert.equal(r.scan().status, 0);
+});
+test('each private JWK member stays detectable in nested objects with template values', () => {
+  for (const member of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'k']) {
+    const key = Object.fromEntries([['kty', member === 'k' ? 'oct' : 'RSA'], [member, 'FAKE']]);
+    const source = templateJwk(key, [member]).slice('export default '.length, -1);
+    const r = repo(); r.put('key.mjs', 'export default [\n/* existing */\n' + source + '\n];'); r.commit();
+    assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n', member);
+  }
+});
+test('opaque template interpolation cannot make private JWK material pass', () => {
+  const key = Object.fromEntries([['kty', '${"oc" + "t"}'], ['k', '${"FAKE"}']]);
+  const r = repo(); r.put('key.mjs', templateJwk(key, ['kty', 'k'])); r.commit();
+  assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n');
+});
+test('template JWKs in filenames are redacted by the same structure adapter', () => {
+  const key = Object.fromEntries([['kty', 'oct'], ['k', 'FAKE']]);
+  const path = templateJwk(key, ['k']).slice('export default '.length, -1) + '.mjs';
+  const r = repo(); r.put(path, privateJwk); r.commit();
+  assert.equal(r.scan().stdout, '[redacted-path]:0 private-key-structure\n');
+});
+test('quotes in a preceding regex cannot hide a template-literal JWK', () => {
+  const key = Object.fromEntries([['kty', 'oct'], ['k', 'FAKE']]);
+  const r = repo();
+  r.put('key.mjs', 'const pattern = /"/; ' + templateJwk(key, ['k']) + ' const label = "text";');
+  r.commit();
+  assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n');
+});
 
 test('DER key added as binary preserves NUL, CR, LF and invalid UTF-8 bytes', () => {
   const r = repo();

@@ -15,7 +15,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { keyStructureFinding } from '../readiness/forge-key-structure.mjs';
+import { keyStructureFinding as sharedKeyStructureFinding } from '../readiness/forge-key-structure.mjs';
 import { secretText } from '../readiness/forge-exec-manifest.mjs';
 
 export { secretText };
@@ -23,6 +23,31 @@ const structuralRules = ['private-key-structure', 'unscanned-oversize'];
 const LIMIT = 32 * 1024 * 1024;
 const FILE_LIMIT = 2 * 1024 * 1024;
 const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (500 files, 32 MiB per git output maximum)');
+
+function keyStructureFinding(bytes) {
+  const finding = sharedKeyStructureFinding(bytes);
+  if (finding) return finding;
+  const text = bytes.toString('utf8');
+  if (!text.includes('`')) return null;
+  // The shared parser accepts quoted literals. Give it an additional quoted
+  // view of templates too, without executing source. Skip quoted strings/comments;
+  // quotes, braces and comment markers inside a template remain string content.
+  const quoteTemplate = token => {
+    if (token[0] !== '`') return token;
+    const body = token.slice(1, -1);
+    // An interpolation is opaque: conservatively allow for an oct key type and
+    // nonempty private material rather than evaluating arbitrary JavaScript.
+    if (/(?:^|[^\\])(?:\\\\)*\$\{/.test(body)) return '"oct"';
+    return '"' + body.replace(/\\[\s\S]|"/g, piece => piece === '"' ? '\\"' : piece) + '"';
+  };
+  const normalized = text.replace(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|`(?:\\[\s\S]|[^`\\])*`/g, quoteTemplate);
+  const normalizedFinding = normalized === text ? null : sharedKeyStructureFinding(Buffer.from(normalized));
+  if (normalizedFinding) return normalizedFinding;
+  // Regex literals and prose can contain stray quotes. As in the shared parser's
+  // independent object pass, also visit templates without global quote pairing.
+  const independent = text.replace(/`(?:\\[\s\S]|[^`\\])*`/g, quoteTemplate);
+  return independent === text || independent === normalized ? null : sharedKeyStructureFinding(Buffer.from(independent));
+}
 
 function loadAllowlist(path) {
   // The shipped file is `{ "entries": [...] }`: a bare array would be refused by the Forge non-object-json rule.
