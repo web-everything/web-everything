@@ -101,7 +101,7 @@ it('parses logger-timestamp-prefixed prepare lines (production format) as failur
   const parsed = parsePrepareTicks(failed.join('\n'));
   expect(parsed).toHaveLength(4);
   expect(parsed.every((p) => p.failed === 1 && p.error === 'tick-failed')).toBe(true);
-  const withFailures = `﻿${stamp(5)} ${prepLine(5)}`;
+  const withFailures = `\uFEFF${stamp(5)} ${prepLine(5)}`;
   expect(parsePrepareTicks(withFailures)[0].failed).toBe(230);
   expect(Object.values(feed(failed.join('\n'), parsePrepareTicks, now).state.episodes)).toHaveLength(1);
 });
