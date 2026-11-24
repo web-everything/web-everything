@@ -82,6 +82,7 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
 import { sweepAuthorStamps } from '../lib/author-stamp-restore.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
+import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { sweepAutoRule, resolveAutoRuleSettings } from './referral-auto-rule.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { sweepAcceptCarry, defaultCloneDirFor } from './accept-carry-sweep.mjs';
@@ -178,7 +179,7 @@ export function createLiveHoldReaders({ run = runGhSync, read = execRead } = {})
 }
 
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling, autoRuleSettings, capacity, spawnRuler,
+  repo = null, listPrs = defaultListPrs, provider = createLiveHoldReaders().provider, dryRun = false, settings, runRuling, autoRuleSettings, capacity, take, spawnRuler,
   acceptCarry, readComments = createLiveHoldReaders().readComments, readPr = defaultReadPr,
   numberingRestamp = restampAfterNumbering, restoreStamps, publishNeedsYou = publishAttention, exec = execFileSync, now = Date.now, log = (line) => writeLineSync(2, line),
 } = {}) {
@@ -405,11 +406,11 @@ export function sweepReviewHoldLabels({
   }
   // Each composed writer gets its own live read. In particular, the ruling-label pass
   // must see any new rulings or label changes after auto-block, never reuse its decision record.
-  const autoRuleEnabled = (listPrs === defaultListPrs || autoRuleSettings !== undefined || capacity !== undefined || spawnRuler !== undefined)
+  const autoRuleEnabled = (settings ?? resolveReviewSettings()).referralDefault !== 'operator' && (listPrs === defaultListPrs || autoRuleSettings !== undefined || capacity !== undefined || spawnRuler !== undefined)
     && resolveAutoRuleSettings({ settings: autoRuleSettings }).enabled;
   try {
     if (autoRuleEnabled) for (const r of sweepAutoRule({ repo: repoOf(), listPrs: () => prs, readPr, dryRun,
-      settings: autoRuleSettings, ...(capacity ? { capacity } : {}), ...(spawnRuler ? { spawnRuler } : {}), ...(runRuling ? { runRuling } : {}) })) {
+      settings: autoRuleSettings, ...(take ? { take } : {}), ...(capacity ? { capacity } : {}), ...(spawnRuler ? { spawnRuler } : {}), ...(runRuling ? { runRuling } : {}) })) {
       results.push({ num: r.num, autoRule: r.action, findings: r.findings, operatorKept: r.operatorKept,
         escalated: r.escalated, ...(r.error ? { error: r.error } : {}) });
     }

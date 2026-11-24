@@ -32,8 +32,12 @@ export default {
   id: 'referral-auto-rule-no-sweep-dependency',
   title: 'a pending referral with review capacity receives a ruling without any judge sweep',
   card: 'REFERRAL-AUTO-RULE',
-  fixedBy: { sha: 'HEAD', where: 'referral-auto-rule', paths: [SOURCE] },
-  fixPresent: probe,
+  fixedBy: { sha: '828b743897e5b8b68de558cd8d59be2f90068148', where: 'referral-auto-rule', paths: [SOURCE] },
+  fixPresent(root) {
+    return spawnSync('git', ['merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'], {
+      cwd: root, stdio: 'ignore', timeout: 5000,
+    }).status === 0;
+  },
   run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     return { violations: probe(root) ? [] : ['pending referral did not receive a capacity-gated ruling'] };

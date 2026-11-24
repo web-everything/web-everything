@@ -32,10 +32,10 @@ function ruling(rec, result = 'not-real', extra = {}) {
     rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result, ...(result === 'card' ? { card } : {}) }], ...extra };
   return comment(buildOperatorRulingComment(r), r.actor === 'auto-policy' ? 'web-everything' : r.actor);
 }
-function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {} } = {}) {
+function harness(initial, { changedLines, compare = { status: 'identical', files: [] }, fileExists = true, env = {}, login = 'chalbert' } = {}) {
   const comments = [...initial], trace = [], warnings = [], logs = [];
   let liveHead = head;
-  const readJson = (args) => args[0] === 'api' && args[1] === 'user' ? { login: 'chalbert', type: 'User' }
+  const readJson = (args) => args[0] === 'api' && args[1] === 'user' ? { login, type: login === 'chalbert' ? 'User' : 'Bot' }
     : args[0] === 'pr' ? { headRefOid: liveHead, body, comments }
     : args[1].includes('/compare/') ? (compare instanceof Error ? (() => { throw compare; })() : compare) : { type: fileExists ? 'file' : 'dir' };
   const reader = createRecordReferralRulingReader({ readJson, changedLines, assertFresh: () => {},
@@ -337,4 +337,13 @@ describe('the ruling follow-up handles every open-finding state', () => {
     expect(planRulingFollowUp({ open: [ruled, other], selected: [ruled], ruling: 'not-real', reason: 'x', enabled: true, head }))
       .toMatchObject({ action: expected[state] });
   });
+});
+
+ it('delegate final write refuses an intervening human block before any ledger or comment write', async () => {
+  const source = record();
+  const h = harness(thread(source), { login: 'web-everything' });
+  const planned = h.plan({ actor: 'referral-ruler', expectHead: head });
+  h.comments.push(ruling(source, 'block'));
+  await expect(h.execute(planned)).rejects.toThrow(/protection|protected|pending/);
+  expect(h.trace).toEqual([]);
 });

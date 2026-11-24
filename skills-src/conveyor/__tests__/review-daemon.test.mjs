@@ -2461,9 +2461,9 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       repo: 'web-everything/web-everything',
     });
     expect(sweepHumanSurfaceReparkMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps,
-      capacity: expect.any(Function) });
+      capacity: expect.any(Function), take: expect.any(Function) });
     expect(sweepReviewHoldLabelsMock).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', restoreStamps: sweepAuthorStamps,
-      capacity: expect.any(Function) });
+      capacity: expect.any(Function), take: expect.any(Function) });
     expect(r.holdReconcile.map((h) => h.num)).toEqual([5193, 7]);
     expect(r.holdReconcile[0].repark).toBe('reparked');
   });
@@ -2481,7 +2481,7 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       holdReconcile, repo: 'plateauapp/plateau-app',
     });
     expect(holdReconcile).toHaveBeenCalledWith({ repo: 'plateauapp/plateau-app', restoreStamps: sweepAuthorStamps,
-      capacity: expect.any(Function) });
+      capacity: expect.any(Function), take: expect.any(Function) });
   });
 
   it('passes the stamp sweep to holdReconcile with shared reads', () => {
@@ -2493,7 +2493,7 @@ describe('runReviewTick — the review-hold reconcile sweep (#x01u7az)', () => {
       holdReconcile, repo: 'o/n', readPrs: () => prs, readAgents: () => [],
     });
     expect(holdReconcile).toHaveBeenCalledWith({ repo: 'o/n', restoreStamps: sweepAuthorStamps,
-      capacity: expect.any(Function), listPrs: expect.any(Function) });
+      capacity: expect.any(Function), take: expect.any(Function), listPrs: expect.any(Function) });
     expect(listedPrs).toBe(prs);
   });
 

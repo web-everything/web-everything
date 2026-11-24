@@ -1,6 +1,6 @@
 import { assertJudgeReason } from './record-referral-ruling.mjs';
 import { assertRulingIdentity } from '../lib/operator-identity.mjs';
-import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
+import { REFERRAL_RULER_ACTOR, JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
@@ -523,7 +523,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
       const checkedLogin = actor !== AUTO_POLICY_ACTOR ? assertRulingIdentity(readPosterIdentity(readJson, repo), actor) : null;
       const before = readPrThread(repo, pr, { readJson });
       if (before.headRefOid !== head) throw new Error(`PR #${pr}'s head moved to ${before.headRefOid} since the plan (${head}); nothing posted — re-run against the new head`);
-      if (actor === AUTO_POLICY_ACTOR) {
+      if ([AUTO_POLICY_ACTOR, REFERRAL_RULER_ACTOR].includes(actor)) {
         const fresh = readProtectionContext(before, { repo, pr, readJson, changedLines, env, log: warn, cardReadable: (ref) => readable(ref, root) });
         if (fresh.malformed || fresh.protectionMalformed) throw new Error('automatic policy refuses malformed referral history before writing');
         const targets = automaticPolicyTargets(fresh);
@@ -537,7 +537,7 @@ export function createRecordReferralRulingSinks({ judgeConfirm: confirm = judgeC
         }
         for (const ruling of rulings) {
           const target = targets.find((t) => t.runId === ruling.runId && t.key === ruling.key);
-          if (ruling.result !== 'block' || ruling.supersedes?.length || !target || target.protectionUnknown.length || target.protectingRulings.length) {
+          if ((actor === AUTO_POLICY_ACTOR ? ruling.result !== 'block' : !['card', 'block'].includes(ruling.result) || target?.state !== 'pending') || ruling.supersedes?.length || !target || target.protectionUnknown.length || target.protectingRulings.length) {
             throw new Error('automatic policy protection is unknown or protected; nothing written — require a fresh plan');
           }
         }

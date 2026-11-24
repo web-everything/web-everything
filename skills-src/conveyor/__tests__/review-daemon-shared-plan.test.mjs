@@ -173,3 +173,21 @@ describe('review tick plan sharing', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+it('referral capacity refuses an exhausted host cap and consumes one host start per spawn', () => {
+  let left = 1;
+  const take = vi.fn(n => { left -= n; });
+  const result = runReviewTick({ ...reviewOpts, repo, reconcile: () => empty(), liveReviewBudget: { left: 10, reserve: 0 },
+    hostAdmission: () => ({ admitted: true, maxPerTick: left, take }),
+    holdReconcile: ({ capacity, take: takeRuler }) => {
+      expect(capacity()).toBe(true);
+      expect(typeof takeRuler).toBe('function');
+      takeRuler();
+      expect(take).toHaveBeenCalledWith(1);
+      expect(capacity()).toBe(false);
+      return [];
+    },
+  });
+  expect(result.holdReconcileError).toBeNull();
+  expect(take).toHaveBeenCalledTimes(1);
+});

@@ -327,7 +327,7 @@ function selectOperatorRulingFindings(read, input) {
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   const supersedeIds = [...new Set(String(input.supersedes ?? '').split(',').map((x) => x.trim()).filter(Boolean))];
   if (byPolicy && supersedeIds.length) throw new Error('auto-policy cannot supersede rulings');
-  if (byPolicy && read.protectionMalformed) throw new Error('automatic policy refuses malformed referral history');
+  if ((byPolicy || actor === REFERRAL_RULER_ACTOR) && read.protectionMalformed) throw new Error('automatic policy refuses malformed referral history');
   // Disputed findings are ruled targets too: merge them over the ruled list (same finding = same runId + key).
   const ruled = [...(read.ruled ?? []).filter((r) => !(read.disputed ?? []).some((d) => d.runId === r.runId && d.key === r.key)),
     ...(read.disputed ?? [])];
@@ -339,7 +339,17 @@ function selectOperatorRulingFindings(read, input) {
   let supersedesFor = () => [];
   const autoSupersede = !supersedeIds.length && !selectsOpen(read.open, finding) && (read.disputed ?? []).length
     && selectsOpen(read.disputed, finding);
-  if (byPolicy) {
+  if (actor === REFERRAL_RULER_ACTOR) {
+    selected = selectFindings(read.open, finding);
+    for (const target of selected) {
+      if (target.state !== OPEN_FINDING_STATES.PENDING || (read.disputed ?? []).some(d => d.runId === target.runId && d.key === target.key)
+        || (read.ruled ?? []).some(r => r.runId === target.runId && r.key === target.key))
+        throw new Error('referral delegate may only rule pending findings');
+      if (!Array.isArray(target.protectingRulings) || !Array.isArray(target.protectionUnknown)
+        || target.protectingRulings.length || target.protectionUnknown.length)
+        throw new Error('referral delegate protection is unknown or protected; ask the operator');
+    }
+  } else if (byPolicy) {
     selected = selectFindings(automaticPolicyTargets(read), finding);
     for (const target of selected) {
       if (!Array.isArray(target.protectingRulings) || !Array.isArray(target.protectionUnknown)
@@ -399,6 +409,7 @@ export function planOperatorRuling(read, input) {
   if (selection.noop) return selection;
   const { selected, skipped, supersedesFor } = selection;
   if (actor === REFERRAL_RULER_ACTOR) {
+    if (ruling === 'card') assertCardDeferral(read, input, selected);
     if (input.expectHead !== read.head) throw new Error('referral delegate requires the expected live head');
     if (selected.some(o => supersedesFor(o).length || !(read.open ?? []).some(f => f.runId === o.runId && f.key === o.key)))
       throw new Error('referral delegate may only rule pending findings');
@@ -417,7 +428,7 @@ export function planOperatorRuling(read, input) {
     clearerId: read.clearerId,
     // PR #6529: bind the comment to the login the identity check passed, so the gate reader refuses any other author
     // (an App copy left by a credential split). A judge row is automation-authored and is checked by its own branch.
-    ...(checkedPoster && actor !== REFERRAL_RULER_ACTOR && actor !== JUDGE_ACTOR ? { poster: checkedPoster } : {}),
+    ...(checkedPoster && actor !== JUDGE_ACTOR ? { poster: String(checkedPoster).toLowerCase() } : {}),
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),
@@ -426,7 +437,7 @@ export function planOperatorRuling(read, input) {
   // The rendered body (finding text, channel) must be token-free too: refuse at plan time, not after approval.
   assertJudgeReason(actor, body);
   return { record, body, selected, skipped,
-    ...(byPolicy ? { protectionSnapshot: policyProtectionSnapshot(read) } : {}), open: read.open, disputed: read.disputed ?? [],
+    ...((byPolicy || actor === REFERRAL_RULER_ACTOR) ? { protectionSnapshot: policyProtectionSnapshot(read) } : {}), open: read.open, disputed: read.disputed ?? [],
     supersedes: record.rulings.flatMap((r) => r.supersedes ?? []), followUp };
 }
 
@@ -442,7 +453,7 @@ export function withNonRegressionEvidence(read, input) {
   if (!String(input.reason ?? '').trim()) throw new Error("--reason is required: the operator's words, verbatim");
   if (input.ruling !== 'card') throw new Error('--notWorseThanMain applies only to --ruling=card');
   if (read.cardAllowNonRegression?.value !== 'on') throw new Error('--notWorseThanMain requires the cardRuling.allowNonRegression setting to be on (R903); it is off');
-  if ([JUDGE_ACTOR, AUTO_POLICY_ACTOR].includes(String(input.actor ?? '').toLowerCase())) throw new Error('--notWorseThanMain is operator-only');
+  if ([JUDGE_ACTOR, AUTO_POLICY_ACTOR, REFERRAL_RULER_ACTOR].includes(String(input.actor ?? '').toLowerCase())) throw new Error('--notWorseThanMain is operator-only');
   return { input: { ...input, reason: `${input.reason} | Not worse than main (R903): ${evidence}` }, evidence };
 }
 
@@ -562,13 +573,19 @@ export function rulingCardSteps(readRulingContext, planCard, type, selectJudge) 
   };
 }
 
+export function assertCardDeferral(read, input, selected) {
+  if (!withNonRegressionEvidence(read, input).evidence && selected.some(f => f.securityReachableToday === true
+    || [f.findingClass, ...(f.alsoClasses ?? [])].some(isSecurityClass)
+    || classAction(f, read.findingClassPolicy) !== 'defer-card'))
+    throw new Error('card refuses a fix-now or security break; only coverage-class findings can be carded');
+}
+
 export function planReferralCard(read, input) {
   const mode = assertCardFiling(read, input);
   validateReferralRulingInput(input);
   if (read.malformed) throw new Error('the PR thread carries a malformed referral record or ruling; no card filed');
   const { selected } = selectOperatorRulingFindings(read, input);
-  if (!withNonRegressionEvidence(read, input).evidence && selected.some(f => f.securityReachableToday === true || classAction(f, read.findingClassPolicy) !== 'defer-card'))
-    throw new Error('fileCard refuses a fix-now or security break; only coverage-class findings can be carded');
+  assertCardDeferral(read, input, selected);
   return { mode, cardInput: buildRulingCardInput(read, input, selected), binding: cardFilingBinding(read, selected) };
 }
 

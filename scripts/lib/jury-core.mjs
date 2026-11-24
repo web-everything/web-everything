@@ -3739,9 +3739,10 @@ export const REFERRAL_RECORD_MARKER = 'mandatory-referrals-v1';
  */
 export function carriedActor(carried, { operatorRulings = [] } = {}) {
   if (carried.from.rulingId !== undefined) return 'reviewer';
-  if (carried.result !== 'block') return 'operator'; // the automatic policy can only ever rule `block`
   const backing = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.head === carried.from.head
     && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
+  if (backing?.actor === REFERRAL_RULER_ACTOR) return 'referral delegate';
+  if (carried.result !== 'block') return 'operator';
   if (!backing) return 'earlier';
   return backing.actor === REFERRAL_RULER_ACTOR ? 'referral delegate'
     : String(backing.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR ? 'automatic policy' : 'operator';
@@ -3873,9 +3874,10 @@ export function validateOperatorRuling(r) {
       if (!Array.isArray(r.rulings) || r.rulings.some(x => !['card', 'block'].includes(x?.result) || x.supersedes?.length)) return false;
     }
     else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
-    // PR #6529: the optional `poster` binds who may author the comment. Only an operator ruling carries it, and it can
-    // only name that same operator (lower-case, as the identity check returns it).
-    if (r.poster !== undefined && (r.poster !== r.actor.toLowerCase() || !OPERATOR_LOGINS.includes(r.poster))) return false;
+    // Operators stamp their own login; delegates stamp the registered automation login checked by the writer.
+    if (r.poster !== undefined && (r.actor === REFERRAL_RULER_ACTOR
+      ? !AUTOMATION_LOGINS.includes(r.poster)
+      : r.poster !== r.actor.toLowerCase() || !OPERATOR_LOGINS.includes(r.poster))) return false;
     if (typeof r.channel !== 'string' || !r.channel.trim() || /[\r\n]/.test(r.channel) || r.channel.length > 200) return false;
     if (typeof r.reason !== 'string' || !r.reason.trim() || r.reason.length > 4000) return false;
     if (typeof r.at !== 'string' || !Number.isFinite(Date.parse(r.at))) return false;
@@ -3975,7 +3977,8 @@ export function parseOperatorRulingComment(comment) {
   // automation (PR #5925: operator rulings posted under the App before the stamp existed) keeps it ONLY when GitHub
   // dated the comment, and its last edit, before poster stamping shipped. Omitting `poster` is otherwise a bypass (PR
   // #6529 red team, result 5acf690a8e9b87a6): a missing, unparseable or later date reads exactly like a poster mismatch.
-  if (record.actor === REFERRAL_RULER_ACTOR) return AUTOMATION_LOGINS.includes(login) ? { record } : null;
+  if (record.actor === REFERRAL_RULER_ACTOR)
+    return AUTOMATION_LOGINS.includes(login) && record.poster === login ? { record } : null;
   const legacyAutomation = record.poster === undefined && !OPERATOR_LOGINS.includes(login)
     && !commentPredatesPosterStamp(comment);
   if (legacyAutomation || (record.poster !== undefined && login !== record.poster)) {

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { writeFileSync, existsSync } from 'node:fs';
-import { sweepAutoRule, spawnReferralRuler, buildRulerPrompt, resolveAutoRuleSettings } from '../referral-auto-rule.mjs';
-import { H1, H2, repo, record, recordComment, BLOCK } from './ruling-fixtures.mjs';
+import { sweepAutoRule, spawnReferralRuler, buildRulerPrompt, resolveAutoRuleSettings, readCardText } from '../referral-auto-rule.mjs';
+import { H1, H2, repo, record, recordComment, BLOCK, SUMMARY } from './ruling-fixtures.mjs';
 import { DEFAULT_HUMAN_AT } from '../../lib/ruling-ledger.mjs';
 import { buildVerdictComment } from '../../review-set-label.mjs';
 import { sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
@@ -51,8 +51,8 @@ describe('referral auto ruler', () => {
     expect(f.runRuling).not.toHaveBeenCalled();
   });
   it('readable card is recorded through the CLI seam', () => {
-    const f = fixture('card', { card: 'we:backlog/123-gap.md' });
-    sweepAutoRule({ ...f.options, cardReadable: () => true });
+    const f = fixture('card', { card: 'we:backlog/123-gap.md', evidence: 'policy/pointer.md:12: `const missing = true` predates this PR and is a pre-existing coverage gap' });
+    sweepAutoRule({ ...f.options, cardReadable: () => true, cardText: () => `---\nstatus: open\n---\n1. \`we:policy/pointer.md:12\` — ${SUMMARY}` });
     expect(f.runRuling).toHaveBeenCalledWith(expect.arrayContaining(['--ruling=card', '--card=we:backlog/123-gap.md']));
   });
   it('environment kill switch overrides enabled setting', () => {
@@ -75,12 +75,15 @@ describe('referral auto ruler', () => {
     const reserve = vi.fn(() => ({ callIds: ['reserved'] }));
     const execute = vi.fn((_cmd, args, opts) => {
       expect(args).toContain('read-only');
+      expect(args).toContain('-m');
+      expect(args.some(a => a.startsWith('model_reasoning_effort='))).toBe(true);
+      expect(args).toContain('--output-schema');
       expect(opts.env.GH_TOKEN).toBeUndefined();
       expect(opts.env.GITHUB_TOKEN).toBeUndefined();
       expect(opts.maxBuffer).toBe(256 * 1024);
       expect(opts.input).toContain('UNTRUSTED DATA');
       answer = args[args.indexOf('--output-last-message') + 1];
-      writeFileSync(answer, JSON.stringify([{ key: f.key, verdict: 'real', evidence: 'quoted diff' }]));
+      writeFileSync(answer, JSON.stringify({ rulings: [{ key: f.key, verdict: 'real', evidence: 'quoted diff', card: null }] }));
     });
     const result = spawnReferralRuler({ repo, pr: f.live.number, head: H1, findings: [] }, {
       reserve, execute, env: { ...process.env, GH_TOKEN: 'private', GITHUB_TOKEN: 'private' },
@@ -150,6 +153,7 @@ describe('referral auto ruler', () => {
     const read = { ...open, head: H1, identity: { login: 'web-everything', type: 'Bot' }, now: '2026-11-24T12:00:00Z',
       clearerId: 'test', card: { ref: 'we:backlog/123-gap.md', readable: true } };
     const input = { repo, pr: live.number, finding: 'all-open', ruling: 'card', actor: 'referral-ruler', channel: 'referral-auto-rule', reason: 'Quoted evidence: pre-existing gap', expectHead: H1 };
+    read.open[0] = { ...read.open[0], findingClass: 'coverage-or-style', classBasis: 'coverage gap' };
     const plan = planOperatorRuling(read, input);
     expect(plan.body).toContain('delegate');
     expect(parseOperatorRulingComment({ body: plan.body, author: { login: 'web-everything' } })?.record.rulings[0].result).toBe('card');
@@ -157,4 +161,63 @@ describe('referral auto ruler', () => {
     expect(() => planOperatorRuling(read, { ...input, supersedes: 'existing' })).toThrow();
     expect(() => planOperatorRuling({ ...read, head: H2 }, input)).toThrow(/head/i);
   });
+});
+
+
+describe('canonical referral audit negative paths', () => {
+  it.each(['x', 'This is a pre-existing gap with no quoted code at all', 'The code `const missing = true` is introduced by this PR'])('refuses structurally unsupported card evidence: %s', evidence => {
+    const f = fixture('card', { card: 'we:backlog/123-gap.md', evidence });
+    sweepAutoRule({ ...f.options, cardReadable: () => true, cardText: () => 'policy/pointer.md' });
+    expect(f.runRuling).not.toHaveBeenCalled();
+  });
+  it('unrelated readable card stays escalated', () => {
+    const f = fixture('card', { card: 'we:backlog/123-gap.md', evidence: 'The code `const missing = true` predates this PR and is a pre-existing coverage gap' });
+    expect(sweepAutoRule({ ...f.options, cardReadable: () => true, cardText: () => 'An unrelated file' })[0].escalated).toContain(f.key);
+    expect(f.runRuling).not.toHaveBeenCalled();
+  });
+  it.each([{}, { enabled: 'yes' }, null, [], { enabled: 1 }])('invalid settings fail closed: %j', settings => {
+    expect(resolveAutoRuleSettings({ settings, env: {} }).enabled).toBe(false);
+  });
+  it('invalid environment switch fails closed', () => {
+    expect(resolveAutoRuleSettings({ settings: { enabled: true }, env: { WE_REFERRAL_AUTO_RULE: 'typo' } }).enabled).toBe(false);
+  });
+  it('operator default prevents the ruler hook', () => {
+    const f = fixture();
+    sweepReviewHoldLabels({ ...f.options, autoRuleSettings: { enabled: true }, settings: { referralDefault: 'operator' }, provider: {}, exec: () => '', numberingRestamp: () => null, readComments: () => f.live.comments, log: () => {} });
+    expect(f.spawnRuler).not.toHaveBeenCalled();
+  });
+  it('takes capacity once per actual spawn and never on a denied spawn', () => {
+    const f = fixture(), take = vi.fn();
+    sweepAutoRule({ ...f.options, take });
+    expect(take).toHaveBeenCalledTimes(1);
+    take.mockClear();
+    sweepAutoRule({ ...f.options, take, capacity: () => false });
+    expect(take).not.toHaveBeenCalled();
+  });
+});
+
+it.each(['unrelated-claim', 'oversized'])('refuses %s card bodies even on the cited file', mode => {
+  const f = fixture('card', { card: 'we:backlog/123-gap.md', evidence: 'The code `const missing = true` predates this PR and is a pre-existing coverage gap' });
+  const text = `---\nstatus: open\n---\n1. \`we:policy/pointer.md:12\` — ${mode === 'unrelated-claim' ? 'zebra banana orchard' : SUMMARY}` + (mode === 'oversized' ? 'x'.repeat(128 * 1024) : '');
+  expect(sweepAutoRule({ ...f.options, cardReadable: () => true, cardText: () => text })[0].escalated).toContain(f.key);
+  expect(f.runRuling).not.toHaveBeenCalled();
+});
+
+
+it('disk read boundary refuses an oversized local card without reading its body', () => {
+  const stat = vi.fn(() => ({ size: 128 * 1024 + 1 }));
+  const read = vi.fn(() => 'oversized body must never be read');
+  const result = readCardText('we:backlog/123-disk-bound.md', { stat, read });
+  expect(read).not.toHaveBeenCalled();
+  expect(result).toBeNull();
+  expect(stat).toHaveBeenCalledTimes(1);
+});
+
+it('disk read boundary permits a local card exactly at 128 KiB', () => {
+  const stat = vi.fn(() => ({ size: 128 * 1024 }));
+  const text = 'x'.repeat(128 * 1024);
+  const read = vi.fn(() => text);
+  expect(readCardText('we:backlog/123-disk-bound.md', { stat, read })).toBe(text);
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(read).toHaveBeenCalledWith(stat.mock.calls[0][0], 'utf8');
 });

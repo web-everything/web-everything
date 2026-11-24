@@ -24,7 +24,7 @@
 import { renderOperatorSendBackBrief, renderOperatorSendBackReviewBlock } from './operator-send-backs.mjs';
 import { readReferralRecords, referralRecheck, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isRestackOf } from './restack-equivalence.mjs';
-import { JUDGE_ACTOR, OPERATOR_LOGINS, isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { REFERRAL_RULER_ACTOR, JUDGE_ACTOR, OPERATOR_LOGINS, isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
 export const RULING_NEEDED_LABEL = 'advisory:ruling-needed';
@@ -245,7 +245,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // same finding coming back on a later head is an ignored ruling, so a fixer that keeps missing escalates to the
       // operator instead of being auto-blocked forever. The operator's own structured blocks are NOT registered here
       // (operator mode is unchanged).
-      if (ruled && x.result === 'block' && [AUTO_POLICY_ACTOR, JUDGE_ACTOR].includes(String(parsed.record.actor ?? '').toLowerCase())) {
+      if (ruled && x.result === 'block' && [AUTO_POLICY_ACTOR, JUDGE_ACTOR, REFERRAL_RULER_ACTOR].includes(String(parsed.record.actor ?? '').toLowerCase())) {
         blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
           finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
       }
