@@ -18,7 +18,7 @@ export default {
   fixedBy: { sha: FIX_SHA, where: 'lane/gh-webhook-pr-events', paths: ['scripts/conveyor/pr-events-worker/core.mjs', 'scripts/lib/forge-adapter/change-events.mjs'] },
   fixPresent(root) {
     // Git ancestry first; a squash merge rewrites the sha, so fall back to the port module existing in the tree.
-    const anc = spawnSync('git', ['merge-base', '--is-ancestor', FIX_SHA, 'HEAD'], { cwd: root, stdio: 'ignore' });
+    const anc = spawnSync('git', ['merge-base', '--is-ancestor', '061d000719befb220bc2b509c2b0749880515f0b', 'HEAD'], { cwd: root, stdio: 'ignore' });
     return anc.status === 0 || existsSync(join(root, 'scripts/lib/forge-adapter/change-events.mjs'));
   },
   async run() {
