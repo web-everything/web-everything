@@ -94,3 +94,14 @@ it('counts the drain catch handler "could not finish (class=...)" lines as failu
   const r = feed(text, parseDrainCatchupTicks);
   expect(Object.values(r.state.episodes)).toHaveLength(1);
 });
+
+it('parses logger-timestamp-prefixed prepare lines (production format) as failures', () => {
+  const stamp = (ageMin) => new Date(now - ageMin * minute).toISOString();
+  const failed = Array.from({ length: 4 }, (_, i) => `${stamp(i * 20)} ${JSON.stringify({ at: stamp(i * 20), event: 'tick-failed', timings: { loop: 'build' } })}`);
+  const parsed = parsePrepareTicks(failed.join('\n'));
+  expect(parsed).toHaveLength(4);
+  expect(parsed.every((p) => p.failed === 1 && p.error === 'tick-failed')).toBe(true);
+  const withFailures = `﻿${stamp(5)} ${prepLine(5)}`;
+  expect(parsePrepareTicks(withFailures)[0].failed).toBe(230);
+  expect(Object.values(feed(failed.join('\n'), parsePrepareTicks, now).state.episodes)).toHaveLength(1);
+});

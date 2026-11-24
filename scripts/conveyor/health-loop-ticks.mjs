@@ -82,7 +82,8 @@ const mostCommon = (xs) => { const c = new Map(); for (const x of xs) c.set(x, (
 export function parsePrepareTicks(text) {
   const out = [];
   for (const line of String(text ?? '').split('\n')) {
-    const t = line.trim();
+    // The installed logger may prefix each line with an ISO timestamp (and a BOM); strip it before parsing.
+    const t = line.trim().replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:\d\d)\s+(?=\{)/, '');
     if (!t.startsWith('{') || !t.includes('"timings"')) continue;
     let r; try { r = JSON.parse(t); } catch { continue; }
     const at = Date.parse(r?.at ?? '');
