@@ -12,7 +12,7 @@ const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) {
 
 // `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
 // `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome } = {}) {
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome, wrapperRoot } = {}) {
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
     .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
   // Local verification must acquire host admission even when launched from CI.
@@ -41,11 +41,13 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
   // Resolve before changing HOME or cwd; ~/ overrides and relative paths belong to the caller.
   const admissionPool = resolve(cwd, defaultPoolRoot(cwd, env));
   const run = (cmd, args, dir = cwd) => {
+    // The checkout under test may predate the child-env strip, so its wrapper is the runner's own copy.
+    if (wrapperRoot && String(args[0]).endsWith('heavy-admission.mjs')) args = [join(wrapperRoot, 'scripts/readiness/heavy-admission.mjs'), ...args.slice(1)];
     // Checkout-local bins only for the admission wrapper that runs vitest/npm; git, gh and plain node calls
     // (which decide trust, e.g. the FUI origin) get the system PATH so a local replacement cannot shadow them.
     // Checkout code (the wrapper's children) gets the throwaway HOME, never the real one that holds the signing key.
     const wrapper = String(args[0]).endsWith('heavy-admission.mjs');
-    const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
+    const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, WE_STRIP_POOL_ROOT_FROM_CHILD: '1', ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
     const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
     if (r.error || r.status !== 0) {
       const bytes = Buffer.from(String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n'));
@@ -95,13 +97,15 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     };
     try {
       const origin = run('git', ['remote', 'get-url', 'origin']).trim();
+      // The runner's own admission wrapper executes the isolated checkout's steps, so it must be committed code.
+      if (String(run('git', ['status', '--porcelain', '--', 'scripts/readiness', 'scripts/lib'])).trim() !== '') throw new Error('runner admission wrapper has uncommitted changes; refusing to run it');
       const objects = join(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim(), 'objects');
       resetCheckout();
       run('git', ['init', '-q', dir]);
       run('git', ['remote', 'add', 'origin', origin], dir);
       fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
       run('git', ['checkout', '-q', '--detach', sha], dir);
-      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome });
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd });
       if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }

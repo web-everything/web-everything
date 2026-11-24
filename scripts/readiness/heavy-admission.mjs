@@ -3110,6 +3110,8 @@ export async function runUnderAdmission({
   if (wholeSuiteRefused({ command, policy, env, log })) return { exitCode: 125 };
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
+  // urgent-verify needs the pool only for admission; tests it runs must not see the host lane pool (it only removes variables).
+  if (childEnv.WE_STRIP_POOL_ROOT_FROM_CHILD === '1') { delete childEnv.LANE_POOL_ROOT; delete childEnv.WE_STRIP_POOL_ROOT_FROM_CHILD; }
   if (bypass) {
     if (requireAdmission) {
       log(`✗ heavy-admission run: --require-admission refused: admission bypassed (${bypass}); the command was NOT run.\n`);
