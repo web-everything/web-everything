@@ -245,32 +245,33 @@ export function readLockEntry(lockRoot, path) { return readEntryInDir(lockDirFor
 
 function readEntryInDir(dir) {
   try {
-    const { entry, sidecarAt } = readClaimEvidence(dir);
+    const { entry, sidecarAt } = readClaimEvidence(dir, { strict: false });
     const parsed = parseLockEntry(JSON.stringify(entry));
     return parsed && { ...parsed, ...(sidecarAt ? { sidecarAt } : {}) };
   } catch { return null; }
 }
 
 /** Draft evidence belongs to one exact claim identity, never to its replacement. */
-export const draftSidecarFor = entry => `draft.${createHash('sha256').update([
+export const draftSidecarFor = entry => `draft.${createHash('sha256').update(JSON.stringify([
   entry.owner, entry.meta?.sessionId, entry.meta?.tokenHash, entry.meta?.claimedAt,
-].join('|')).digest('hex')}`;
+])).digest('hex')}`;
 
 /** Strict raw evidence for claim scans; fold in the same owner heartbeat as readLockEntry. */
-export function readClaimEvidence(dir) {
+export function readClaimEvidence(dir, { strict = true } = {}) {
   const entry = JSON.parse(readFileSync(join(dir, 'lock.json'), 'utf8'));
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid lock entry');
   try {
     const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
+    if (!beat || new Date(beat).toISOString() !== beat) throw new Error('Invalid heartbeat evidence');
     if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
   let sidecarAt = null;
   try {
     const draft = JSON.parse(readFileSync(join(dir, draftSidecarFor(entry)), 'utf8'));
     if (draft?.preDraft !== false || typeof draft.at !== 'string'
       || new Date(draft.at).toISOString() !== draft.at) throw new Error('Invalid draft evidence');
     sidecarAt = draft.at;
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
   return { entry, sidecarAt };
 }
 

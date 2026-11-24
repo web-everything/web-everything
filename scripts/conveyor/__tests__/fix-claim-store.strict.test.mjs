@@ -1,11 +1,14 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { draftSidecarFor, readClaimEvidence } from '../../readiness/file-locks.mjs';
 import { listFixDispatchClaimsStrict } from '../fix-claim-store.mjs';
 import { pushRefusal } from '../fix-procedure.mjs';
 
 const roots = [], restore = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const path of restore.splice(0)) chmodSync(path, 0o700);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -88,5 +91,50 @@ describe('strict claim shape refusals', () => {
     const f = fixture(); f.entry.meta.kind = kind; delete f.entry.meta.branch;
     writeFileSync(f.file, JSON.stringify(f.entry));
     expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ unreadable: false });
+  });
+});
+
+
+describe('strict sidecar audit regressions', () => {
+  const hbName = entry => `hb.${createHash('sha256').update(entry.owner).digest('hex').slice(0, 16)}`;
+  const refused = f => {
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toEqual({ entries: [], unreadable: true });
+    expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', strict: true, lockRoot: f.lockRoot }))
+      .toMatchObject({ refused: true, code: 'claim-store-unreadable' });
+  };
+  it.each(['hb', 'draft'])('fails closed on an unreadable %s sidecar', kind => {
+    const f = fixture();
+    mkdirSync(join(f.dir, kind === 'hb' ? hbName(f.entry) : draftSidecarFor(f.entry)));
+    expect(() => readClaimEvidence(f.dir)).toThrow();
+    refused(f);
+  });
+  it.each(['', 'garbage', '2020-01-01', '2026-01-01T00:00:00Z'])(
+    'fails closed on malformed heartbeat sidecar %j, including older timestamps', value => {
+      const f = fixture(); writeFileSync(join(f.dir, hbName(f.entry)), value);
+      expect(() => readClaimEvidence(f.dir)).toThrow();
+      refused(f);
+    },
+  );
+  it.each(['{broken', '{}', JSON.stringify({ preDraft: false, at: 'garbage' })])(
+    'fails closed on malformed draft sidecar %s', value => {
+      const f = fixture(); writeFileSync(join(f.dir, draftSidecarFor(f.entry)), value);
+      expect(() => readClaimEvidence(f.dir)).toThrow();
+      refused(f);
+    },
+  );
+  it.each(['entry', 'hb', 'draft'])('bounds future %s timestamps to 60 seconds of skew', kind => {
+    const f = fixture(), now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const stamp = offset => {
+      const at = new Date(now + offset).toISOString();
+      if (kind === 'entry') {
+        f.entry.heartbeatAt = at; writeFileSync(f.file, JSON.stringify(f.entry));
+      } else writeFileSync(join(f.dir, kind === 'hb' ? hbName(f.entry) : draftSidecarFor(f.entry)),
+        kind === 'hb' ? at : JSON.stringify({ preDraft: false, at }));
+    };
+    stamp(60_000);
+    expect(listFixDispatchClaimsStrict(f.lockRoot).unreadable).toBe(false);
+    stamp(60_001);
+    refused(f);
   });
 });

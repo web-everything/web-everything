@@ -15,7 +15,7 @@ import { createHash } from 'node:crypto';
 import {
   DEFAULT_LEASE_MINUTES, ENTRYLESS_LOCK_DIR_GRACE_MS, lockIdFor, parseLockEntry, makeLockEntry, isLeaseExpired,
   reclaimDecision, wasReclaimed, planReservations,
-  acquireLockDir, readLockEntry, heartbeat, heartbeatOwn, releaseLockDir, releaseLockDirIf, reserve, lockDirFor,
+  acquireLockDir, readLockEntry, heartbeat, heartbeatOwn, releaseLockDir, releaseLockDirIf, reserve, lockDirFor, draftSidecarFor, readClaimEvidence,
 } from '../file-locks.mjs';
 
 const T0 = Date.parse('2026-06-28T12:00:00.000Z');
@@ -287,7 +287,7 @@ describe('reserve — a lock dir with no entry yet is a winner still writing, no
     const { mkdtempSync, mkdirSync, rmSync, utimesSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
-    const { reserve, lockDirFor, readLockEntry, ENTRYLESS_LOCK_DIR_GRACE_MS } = await import('../file-locks.mjs');
+    const { reserve, lockDirFor, draftSidecarFor, readClaimEvidence, readLockEntry, ENTRYLESS_LOCK_DIR_GRACE_MS } = await import('../file-locks.mjs');
     const root = mkdtempSync(join(tmpdir(), 'file-locks-gap-'));
     try {
       const dir = lockDirFor(root, 'slot-0');
@@ -429,4 +429,30 @@ describe('reclaim never destroys a lock another owner has taken since', () => {
     expect(r).toMatchObject({ ok: false, reason: 'held', heldBy: 'C' });
     expect(readLockEntry(root, 'p').owner).toBe('C');         // C's live lock was NOT deleted by B
   });
+});
+
+
+describe('claim sidecar audit regressions', () => {
+  let root;
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'claim-sidecar-')); });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it('separates draft identities containing pipe delimiters', () => {
+    const a = { owner: 'fixer:a|b', meta: { sessionId: 'c', tokenHash: 'token', claimedAt: iso(T0) } };
+    const b = { ...a, owner: 'fixer:a', meta: { ...a.meta, sessionId: 'b|c' } };
+    expect(draftSidecarFor(a)).not.toBe(draftSidecarFor(b));
+  });
+
+  it.each(['{broken', JSON.stringify({ preDraft: true, at: iso(T0) })])(
+    'ignores bad draft evidence %s without hiding or reclaiming a live lock', raw => {
+      reserve(root, 'p', 'A', T0, iso(T0));
+      const entry = readLockEntry(root, 'p');
+      const dir = lockDirFor(root, 'p');
+      writeFileSync(join(dir, draftSidecarFor(entry)), raw);
+      expect(readLockEntry(root, 'p')).toEqual(entry);
+      expect(reserve(root, 'p', 'B', T0 + 1000, iso(T0 + 1000)))
+        .toMatchObject({ ok: false, reason: 'held', heldBy: 'A' });
+      expect(() => readClaimEvidence(dir)).toThrow();
+    },
+  );
 });

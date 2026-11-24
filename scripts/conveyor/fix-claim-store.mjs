@@ -125,6 +125,7 @@ export function validateFixClaimMeta(meta) {
 /** Fail closed on incomplete claim evidence; confirm concurrent directory removal. */
 export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
   const entries = [];
+  const latestEvidenceMs = Date.now() + 60_000; // Allow bounded clock skew, never an indefinitely live future claim.
   let names, unreadable = false;
   try { names = readdirSync(lockRoot); } catch { return { entries, unreadable: true }; }
   for (const name of names) {
@@ -133,6 +134,8 @@ export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
       if (!entry || typeof entry.owner !== 'string' || !entry.owner.trim()
         || typeof entry.heartbeatAt !== 'string'
         || new Date(entry.heartbeatAt).toISOString() !== entry.heartbeatAt
+        || Date.parse(entry.heartbeatAt) > latestEvidenceMs
+        || (sidecarAt && Date.parse(sidecarAt) > latestEvidenceMs)
         || !validateFixClaimMeta(entry.meta)) unreadable = true;
       else entries.push({ ...parseLockEntry(JSON.stringify(entry)), ...(sidecarAt ? { sidecarAt } : {}) });
     } catch (error) {
