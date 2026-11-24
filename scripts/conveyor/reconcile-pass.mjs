@@ -1018,7 +1018,10 @@ function mainRedMemoRead(memo, key, read, cacheable) {
  * PAYS THE EXTRA `gh run list --branch main` READ ONLY WHEN AT LEAST ONE PR NEEDS IT — a pass with nothing
  * currently `ci:failed` (the common case) costs nothing beyond the `latestRequiredCheck` scan it already had
  * every field for. `requiredCheckCompletedAt` comes off the ALREADY-FETCHED `statusCheckRollup` (no extra call);
- * Per-PR graph reads reuse stable evidence across ticks, bounded to 500 entries each.
+ * Per-PR graph reads reuse stable evidence across ticks, bounded to 500 entries each:
+ * ahead-by compares immutable SHAs, and only proven green-SHA ancestry is memoized.
+ * PR reruns do not invalidate graph facts. Merge-base check/run results remain live even after success:
+ * their independent reruns are not observable in the PR or latest-main run identity.
  * Main tip, runs, signatures and job attempts remain live; partial evidence is retried next tick.
  * @param {Array<object>} prs
  * soak-main-red (2026-09-26): judged across EVERY required check (`requiredChecks`, default
@@ -1063,15 +1066,13 @@ export function enrichPrsWithMainRedFacts(prs, {
     const check = failingRequiredCheckForAttribution(pr, { requiredChecks: checks, mainRedWindows });
     const aheadBy = pr?.headRefOid ? mainRedMemoRead(mainRedAheadMemo,
       tip ? JSON.stringify([repo, defaultBranch, pr.headRefOid, tip]) : null,
-      () => readAheadBy(pr.headRefOid, { repo, base: defaultBranch }), Number.isFinite) : null;
+      // Use the same immutable tip as the key; a branch compare can lag the tip read indefinitely.
+      () => readAheadBy(pr.headRefOid, { repo, base: tip || defaultBranch }), Number.isFinite) : null;
     const greenSha = mainLatestGreenShaForCheck({ failingCheckName: check?.name ?? null, mainLatestCheckRuns });
     const greenFix = greenSha && aheadBy !== 0
       ? mainRedMemoRead(mainRedGreenMemo, JSON.stringify([repo, defaultBranch, pr.headRefOid, greenSha, check.name]),
         () => readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name }),
-        facts => facts?.prContainsMainGreenSha === true || (Array.isArray(facts?.mergeBaseCheckRuns)
-          && facts.mergeBaseCheckRuns.length > 0 && facts.mergeBaseRunConclusion != null
-          && facts.mergeBaseCheckRuns.every(row => String(row?.status).toLowerCase() === 'completed'
-            && String(row?.conclusion).toLowerCase() === 'success')))
+        facts => facts?.prContainsMainGreenSha === true)
       : null;
     const detailsUrl = latestRequiredCheck(pr, check?.name)?.detailsUrl;
     const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({

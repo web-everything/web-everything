@@ -63,6 +63,42 @@ test('unknown tip never memoizes ahead', () => {
   assert.equal(f.calls.ahead, 2);
 });
 
+test('injected ahead reader without tip reader remains uncached', () => {
+  const f = fixture();
+  delete f.options.readMainTip;
+  const bases = [];
+  f.options.readAheadBy = (_head, { base }) => { f.calls.ahead++; bases.push(base); return 3; };
+  f.tick(); f.tick();
+  assert.equal(f.calls.ahead, 2);
+  assert.deepEqual(bases, ['main', 'main']);
+  assert.equal(f.calls.tip, 0);
+});
+
+test('ahead comparison uses the resolved tip even when branch replication lags', () => {
+  const f = fixture();
+  const bases = [];
+  f.options.readAheadBy = (head, { repo, base }) => pass.defaultReadAheadBy(head, {
+    repo, base, exec: (_file, args) => {
+      bases.push(args[3]);
+      return args[3].endsWith('...main') ? '3' : '0';
+    },
+  });
+  assert.equal(f.tick().prs[0].aheadByOnMain, 0);
+  assert.equal(f.tick().prs[0].aheadByOnMain, 0);
+  assert.deepEqual(bases, [`repos/memo/repo/compare/head...${'a'.repeat(40)}`]);
+});
+
+for (const field of ['detailsUrl', 'completedAt']) {
+  test(`PR rerun changes ${field} but reuses immutable ahead and ancestry facts`, () => {
+    const f = fixture(); f.tick();
+    f.pr.statusCheckRollup[0][field] = field === 'detailsUrl'
+      ? 'https://github.com/memo/repo/actions/runs/3/job/4' : '2026-10-04T00:00:00Z';
+    f.tick();
+    assert.equal(f.calls.ahead, 1); assert.equal(f.calls.green, 1);
+    assert.equal(f.calls.signature, 2);
+  });
+}
+
 for (const value of [null, Infinity, NaN]) {
   test(`unknown or non-finite ahead (${value}) is retried`, () => {
     const f = fixture();
@@ -92,13 +128,45 @@ for (const [name, facts] of [
   });
 }
 
-test('completed successful merge-base checks with a read run conclusion are reused; job attempts stay live', () => {
+test('completed successful merge-base checks remain live; job attempts stay live', () => {
   const f = fixture();
   f.setRuns([{ headSha: 'main', status: 'completed', conclusion: 'success', updatedAt: '2026-10-03' }]);
   f.options.readMainGreenFixFacts = () => { f.calls.green++; return {
     prContainsMainGreenSha: false, mergeBaseCheckRuns: [success], mergeBaseRunConclusion: 'success' }; };
-  f.tick(); f.tick(); assert.equal(f.calls.green, 1); assert.equal(f.calls.job, 2);
+  f.tick(); f.tick(); assert.equal(f.calls.green, 2); assert.equal(f.calls.job, 2);
 });
+
+for (const conclusion of ['failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'success', null]) {
+  test(`run conclusion ${conclusion} with successful check rows is retried`, () => {
+    const f = fixture();
+    f.options.readMainGreenFixFacts = () => { f.calls.green++; return {
+      prContainsMainGreenSha: false, mergeBaseCheckRuns: [success], mergeBaseRunConclusion: conclusion,
+    }; };
+    f.tick(); f.tick(); assert.equal(f.calls.green, 2);
+  });
+}
+
+for (const change of ['new run ID', 'changed completedAt', 'in-progress rerun', 'failed read']) {
+  test(`${change} refreshes merge-base evidence with unchanged PR, head and main`, () => {
+    const f = fixture();
+    let facts = { prContainsMainGreenSha: false, mergeBaseCheckRuns: [
+      { ...success, name: 'test', id: 1, completed_at: '2026-10-01T00:00:00Z' },
+    ], mergeBaseRunConclusion: 'success' };
+    f.options.readMainGreenFixFacts = () => { f.calls.green++; return facts; };
+    assert.equal(f.tick().prs[0].mergeBaseCheckRuns[0].conclusion, 'SUCCESS');
+    const row = { ...facts.mergeBaseCheckRuns[0], conclusion: 'failure' };
+    if (change === 'new run ID') row.id = 2;
+    if (change === 'changed completedAt') row.completed_at = '2026-10-04T00:00:00Z';
+    if (change === 'in-progress rerun') { row.status = 'in_progress'; row.conclusion = null; }
+    facts = { prContainsMainGreenSha: false,
+      mergeBaseCheckRuns: change === 'failed read' ? null : [row], mergeBaseRunConclusion: null };
+    const actual = f.tick().prs[0];
+    assert.equal(f.calls.green, 2);
+    assert.deepEqual(actual.mergeBaseCheckRuns, facts.mergeBaseCheckRuns);
+    assert.equal(actual.mergeBaseRunConclusion, null);
+    assert.equal(f.calls.ahead, 1);
+  });
+}
 
 test('repo, head, green SHA and check name isolate memo entries', () => {
   const f = fixture(); f.tick();
@@ -150,7 +218,15 @@ test('defaultReadMainTip rejects missing, malformed or failed reads', () => {
   assert.equal(pass.defaultReadMainTip({ exec: () => { throw new Error('unreadable'); } }), null);
 });
 
-test('soak scenario observes one ahead and green read across two ticks', async () => {
+test('soak scenario reuses graph facts and refreshes independent merge-base reruns', async () => {
   const { default: b } = await import('../soak/breaks/review-speed-main-red-reads-not-memoized.mjs');
   assert.deepEqual(b.judge(await b.run()), []);
+});
+
+test('unchanged-main second tick completes under 15 seconds under controlled reader load', async () => {
+  const { loadedMemoBenchmark } = await import('../soak/breaks/review-speed-main-red-reads-not-memoized.mjs');
+  const result = await loadedMemoBenchmark();
+  console.info(`enrich-main-red offline loaded benchmark: cold=${result.coldMs.toFixed(1)}ms warm=${result.warmMs.toFixed(1)}ms PRs=${result.prCount}`);
+  assert.ok(result.warmMs < 15_000, JSON.stringify(result));
+  assert.equal(result.signatureReads, result.prCount * 2);
 });
