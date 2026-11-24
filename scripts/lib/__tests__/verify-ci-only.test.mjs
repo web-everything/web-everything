@@ -35,6 +35,20 @@ describe('R1086 measured host saturation', () => {
       .toMatchObject({ saturated: false, known: false });
   });
 
+  it('negative: unknown load and non-load refusals never establish known idle capacity', () => {
+    for (const reason of ['host load unknown: denied', 'host memory headroom 10MB', 'host capacity: unknown mac reading']) {
+      expect(host(80, { admitted: false, reason })).toMatchObject({ saturated: false, known: false });
+    }
+    for (const load of [0, -1, NaN, Infinity, undefined]) {
+      expect(hostSaturation({ collect: () => ({}),
+        admission: () => ({ admitted: true, reason: 'host load ' + load + '/8=0.1' }) }))
+        .toMatchObject({ saturated: false, known: false });
+    }
+    expect(hostSaturation({ collect: () => ({}),
+      admission: () => ({ admitted: true, reason: 'host load 1.00/8=0.13' }) }))
+      .toMatchObject({ saturated: false, known: true });
+  });
+
   it('keeps ci-only decisions byte-identical regardless of the known field', () => {
     for (const saturated of [false, true]) {
       const original = decide({ saturation: () => ({ saturated, reason: 'test host' }) });

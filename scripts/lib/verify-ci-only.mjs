@@ -23,12 +23,14 @@ export function hostSaturation({ collect = collectHostCapacity, admission = host
   let admissionKnown = false;
   try {
     const verdict = admission({ interactive: false, capacity: () => reading });
-    admissionKnown = typeof verdict?.admitted === 'boolean';
+    const load = /^host load (\d+(?:\.\d+)?)\//.exec(verdict?.reason ?? '');
+    const positiveLoad = load !== null && Number.isFinite(Number(load[1])) && Number(load[1]) > 0;
+    admissionKnown = verdict?.admitted === true && (positiveLoad || (validIdle && validThreshold));
     if (verdict?.admitted === false && /^host load \d/.test(verdict.reason)) {
       return { saturated: true, known: true, reason: `${detail}; ${oneLine(verdict.reason)}` };
     }
   } catch { /* unknown admission is not evidence of saturation */ }
-  return { saturated: false, known: validIdle && validThreshold && admissionKnown, reason: `${detail}; no measured CPU or host-load saturation; retry local verification or inspect host probes` };
+  return { saturated: false, known: admissionKnown, reason: `${detail}; no measured CPU or host-load saturation; retry local verification or inspect host probes` };
 }
 
 /** Pure apart from the injected saturation reader; omitted verify preserves the existing finish guard. */

@@ -53,13 +53,31 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
 
 describe('broad selection host policy', () => {
+  const FALLBACK_GATE = 'npx vitest run && node scripts/check-standards.mjs';
   const idle = () => ({ saturated: false, known: true, reason: 'idle host' });
+  it('negative: removed standards script cannot bypass mandatory unscoped standards', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
+      runGit: fakeGit(['package.json']), saturation: idle, scripts: ['test:unit'] });
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+    expect(gate.command).toBe('npx vitest run && node scripts/check-standards.mjs');
+  });
+
+  it('negative: neutered or absent npm test scripts cannot bypass the repo Vitest config', () => {
+    for (const scripts of [[], ['test'], ['test:unit'], ['test', 'test:unit', 'check:standards']]) {
+      const gate = resolveDefaultGate({ fileConfig: null, env: TODAY,
+        runGit: fakeGit(['package.json']), saturation: idle, scripts });
+      expect(gate.testCommand).toBe('npx vitest run');
+      expect(gate.command).toBe('npx vitest run && node scripts/check-standards.mjs');
+    }
+  });
+
   it('package.json change on an idle host selects the full suite, not a refusal', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation: idle });
     expect(gate.decision.mode).toBe('full');
-    expect(gate.command).toBe(FULL_GATE);
-    expect(gate.testCommand).toBe('npm run test:unit');
-    expect(gate.standardsCommand).toBe('npm run check:standards');
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.testCommand).toBe('npx vitest run');
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
     expect(phaseAdmissionKind({ phase: 'vitest', decision: gate.decision, env: TODAY, fileConfig: null })).toEqual({ kind: 'other', lane: 'slow' });
   });
 
@@ -81,30 +99,27 @@ describe('broad selection host policy', () => {
         expect(gate.command).toBeNull();
         expect(deferred.ok).toBe(true);
       }
-      if (!saturated && gate.decision.mode !== 'shrink') expect(gate.command).toBe(FULL_GATE);
+      if (!saturated && gate.decision.mode !== 'shrink') expect(gate.command).toBe(FALLBACK_GATE);
     });
 
-  it.each([
-    [['test'], 'npm test'],
-    [['test:unit'], 'npm run test:unit'],
-    [['test', 'test:unit', 'check:standards'], FULL_GATE],
-  ])('idle full fallback uses available scripts %j', (scripts, command) => {
-    expect(resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
-      saturation: idle, scripts }).command).toBe(command);
-  });
+  it.each([['test'], ['test:unit'], ['test', 'test:unit', 'check:standards']])(
+    'idle full fallback bypasses checkout script names %s', (...scripts) => {
+      expect(resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+        saturation: idle, scripts }).command).toBe(FALLBACK_GATE);
+    });
 
   it('idle full fallback keeps unscoped standards even when selected policy skips them', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
       runGit: fakeGit(['package.json']), saturation: idle });
-    expect(gate.command).toBe(FULL_GATE);
+    expect(gate.command).toBe(FALLBACK_GATE);
     expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
   });
 
-  it('missing full test script refuses with an explicit gate fallback', () => {
+  it('missing full test script still runs direct tests and mandatory standards', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
       saturation: idle, scripts: ['check:standards'] });
-    expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
-    expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.decision).toMatchObject({ mode: 'full', standards: { run: true, scoped: false } });
   });
 
   it('oversized targets still refuse on an idle host with an explicit gate fallback', () => {

@@ -1592,7 +1592,7 @@ if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('-
   }
   process.exit(${retryExit});
 }
-if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit')) {
+if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit') || (args[0] === 'vitest' && args[1] === 'run' && args.length === 2)) {
   writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
   writeAllSync(2, ${JSON.stringify(stderr)});
   writeAllSync(1, ${JSON.stringify(stdout)});
@@ -1714,35 +1714,66 @@ process.exit(${standardsExit});
     expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
   });
 
-  it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
-    const f = fixture({ standardsExit: 1 });
-    // Pin the evidence at the module boundary so this test never samples the test runner's host.
-    const target = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
-    const loader = join(dir, 'idle-host-loader.mjs');
+  function idleFallbackEnv({ timeout = false, standardsExit = 0, scripts = { 'test:unit': 'true' } } = {}) {
+    const saturationUrl = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
+    const admissionUrl = pathToFileURL(resolve(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href;
+    const loader = join(dir, 'fallback-loader.mjs');
     writeFileSync(loader, `
 export async function load(url, context, nextLoad) {
   const result = await nextLoad(url, context);
-  if (url !== ${JSON.stringify(target)}) return result;
-  return { ...result, source: String(result.source).replace('export function hostSaturation(', 'function originalHostSaturation(')
-    + '\\nexport const hostSaturation = () => ({ saturated: false, known: true, reason: "fixture idle" });' };
+  if (url === ${JSON.stringify(saturationUrl)}) return { ...result,
+    source: String(result.source).replace('export function hostSaturation(', 'function originalHostSaturation(')
+      + '\\nexport const hostSaturation = () => ({ saturated: false, known: true });' };
+  if (${timeout} && url === ${JSON.stringify(admissionUrl)}) return { ...result,
+    source: String(result.source).replace('export async function acquireSlotBlocking(', 'async function originalAcquireSlotBlocking(')
+      + '\\nexport const acquireSlotBlocking = async () => ({ ok: false, timedOut: true, waitedMs: 1 });' };
+  return result;
 }
 `);
     const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
-    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
-    if (script === 'test') {
-      pkg.scripts.test = pkg.scripts['test:unit'];
-      delete pkg.scripts['test:unit'];
-      // The npm shim treats both full-test script names as the same red test phase.
-      const npm = join(dir, 'bin', 'npm');
-      writeFileSync(npm, readFileSync(npm, 'utf8').replace("(args[0] === 'run' && args[1] === 'test:unit')",
-        "((args[0] === 'run' && args[1] === 'test:unit') || args[0] === 'test')"));
-    }
-    writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg) + '\n');
-    const r = f.invoke([], { NODE_OPTIONS: `--import=${preload}`, WE_VERIFY_RUN_ALL_PHASES: '1' });
+    // Force a broad diff and make direct standards execution observable.
+    mkdirSync(join(dir, 'scripts'), { recursive: true });
+    writeFileSync(join(dir, 'scripts/check-standards.mjs'), "import { appendFileSync } from 'node:fs'; appendFileSync('calls.jsonl', JSON.stringify({ args: ['direct-standards'] }) + '\\n');\n"
+      + (standardsExit ? "console.log('  error  invisible-characters: U+200B in source.mjs');\n" : '')
+      + `process.exit(${standardsExit});\n`);
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts }));
+    return { NODE_OPTIONS: `--import=${preload}`, WE_VERIFY_ALWAYS_RUN_TESTS: 'guard.test.mjs,excluded.test.mjs',
+      WE_VERIFY_RUN_ALL_PHASES: '1' };
+  }
+
+  it('negative: idle fallback refuses a green guard report missing a declared file', () => {
+    const f = fixture({ guard: true, guardExcluded: true });
+    const npx = join(dir, 'bin/npx');
+    writeFileSync(npx, readFileSync(npx, 'utf8').replace(
+      "(args[0] === 'vitest' && args[1] === 'run' && args.length === 2)", 'false'));
+    const r = f.invoke([], idleFallbackEnv());
+    expect(r.json.status, r.stderr).toBe('red');
+    expect(r.json.phases.alwaysRun).toMatchObject({ executed: true, ran: ['guard.test.mjs'],
+      missing: ['excluded.test.mjs'], result: 'failed' });
+    expect(r.stderr).toContain('FAIL always-run guard');
+    expect(f.calls()[0].held).toHaveLength(1);
+  });
+
+  it('negative: idle fallback refuses admission timeout before any unslotted command', () => {
+    const f = fixture({ guard: true, guardExcluded: true });
+    const r = spawnSync('node', [VERIFY_LANE, '--json'], { cwd: dir,
+      env: { ...gateScrubbedEnv(), PATH: `${join(dir, 'bin')}:${process.env.PATH}`,
+        LANE_POOL_ROOT: join(dir, 'pool'), WE_VERIFY_RETRY_FAILED: '0',
+        ...idleFallbackEnv({ timeout: true }) }, encoding: 'utf8' });
+    expect(r.status, r.stderr).not.toBe(0);
+    expect(r.stderr).toMatch(/full fallback.*admission.*timed out/i);
+    expect(existsSync(join(dir, 'calls.jsonl'))).toBe(false);
+  });
+
+  it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
+    const f = fixture({ standardsExit: 1 });
+    const r = f.invoke([], { ...idleFallbackEnv({ standardsExit: 1, scripts: { [script]: 'true' } }),
+      WE_VERIFY_ALWAYS_RUN_TESTS: '' });
     expect(r.code, r.stderr).toBe(2);
     expect(f.calls().map(call => call.args)).toEqual([
-      script === 'test' ? ['test'] : ['run', 'test:unit'], ['run', 'check:standards'],
+      ['vitest', 'run'], ['direct-standards'],
     ]);
+    expect(f.calls()[0].held).toHaveLength(1);
     expect(r.json.phases.outcomes).toMatchObject({ vitest: { result: 'fail' },
       standards: { result: 'fail', reason: 'invisible-characters' } });
   });

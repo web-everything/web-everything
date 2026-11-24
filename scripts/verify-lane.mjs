@@ -30,6 +30,9 @@
  * Selected Vitest, scan, guard and the recognized full-unit default gate support this. The full default
  * runs tests and standards separately so retry never masks a standards failure. Opaque explicit combined
  * commands retain their original red: their other checks cannot be proven by a Vitest inventory.
+ * Broad related-selection fallbacks on a known idle host run direct `npx vitest run` plus mandatory
+ * unscoped `node scripts/check-standards.mjs`, independent of package scripts. They require a held
+ * heavy-admission slot (timeout refuses) and run always-run guards with executed-file inventory.
  * Explicit --gate commands retain precedence. Settings and their sources are logged through policy-cascade.
  *
  * Usage:
@@ -685,7 +688,8 @@ if (MODE === 'request') {
 // 2. Admission: queue on the #3461 heavy-command capacity semaphore BEFORE running the gate — `check:standards`
 //    and `test:unit` (this GATE) are named members of the closed heavy-command set, so this is the invocation-time
 //    (never lane-acquire-time) chokepoint the semaphore gates. Fails OPEN on a queuing timeout (proceeds unslotted
-//    with a stderr warning) — the residual-risk tradeoff `heavy-admission.mjs`'s own header names.
+//    with a stderr warning), except the idle-host full fallback, which refuses. Other gates retain the
+//    residual-risk tradeoff `heavy-admission.mjs`'s own header names.
 //
 // #4360 — THIS `acquireSlotBlocking` CALL IS THE SOLE ADMISSION CHOKEPOINT FOR THE WHOLE DISPATCH PATH,
 // including `scripts/conveyor/verify-dispatch.mjs`'s daemon-side dispatch of several lanes' gates at once.
@@ -712,7 +716,8 @@ if (fullRetryGate) {
   resolvedGate.standardsCommand = resolvedGate.command.includes('check:standards') ? 'npm run check:standards' : null;
 }
 // The idle-host fallback already supplies separate commands; runAllPhases applies even without retries.
-const fullFallbackGate = resolvedGate?.decision?.mode === 'full' && !!resolvedGate.testCommand;
+const fullFallbackGate = resolvedGate?.decision?.mode === 'full' && resolvedGate.testCommand === 'npx vitest run';
+const guardGate = retryableGate || fullFallbackGate;
 const phasedTestGate = retryableGate || fullRetryGate || fullFallbackGate;
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGate;
@@ -739,6 +744,9 @@ async function acquireAdmission(phase, command) {
     lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO, timeoutMs: ADMISSION_TIMEOUT_MS,
     lane: laneMatch ? laneMatch[1] : null, kind: routing.kind,
   });
+  if (fullFallbackGate && !acquired.ok) {
+    throw new Error('verify-lane: full fallback heavy admission timed out without a slot; retry when capacity frees or use CI for exhaustive verification.');
+  }
   if (acquired.timedOut) {
     process.stderr.write(`⚠ heavy-command admission: timed out after ${acquired.waitedMs}ms waiting for capacity (cap=${ADMISSION_CAP}) — proceeding unslotted.\n`);
   } else if (acquired.waitedMs > 0) {
@@ -1099,9 +1107,9 @@ const phaseResults = [];
 // The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
 // proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
 // silently while the rest still pass). Removed in the gate's `finally`.
-const alwaysRunReportDir = retryableGate && verifySetting('alwaysRunTests', process.env)?.length ? mkdtempSync(join(tmpdir(), 'verify-always-run-')) : null;
+const alwaysRunReportDir = guardGate && verifySetting('alwaysRunTests', process.env)?.length ? mkdtempSync(join(tmpdir(), 'verify-always-run-')) : null;
 const alwaysRunReport = alwaysRunReportDir ? join(alwaysRunReportDir, 'report.json') : null;
-const alwaysRun = retryableGate
+const alwaysRun = guardGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
@@ -1194,7 +1202,7 @@ try {
   }
   // #99 — the always-run guard set, independent of how many tests the related selection picked. Same phase kind as
   // the scanners ('scan'): admission, timing and outcome telemetry are shared; a red here is a `scan` redCause.
-  if (retryableGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
+  if (guardGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
     process.stderr.write(`⏱ always-run guard tests (#99): ${alwaysRun.files.length} file(s)\n`);
     const started = performance.now();
     let guard = await timedRunGate('scanMs', alwaysRun.command, undefined, { outcomeKey: 'guard' });

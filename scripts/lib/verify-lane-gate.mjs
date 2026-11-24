@@ -23,9 +23,10 @@
  *
  * LOCAL POLICY (fix-3311). Shared helper/fixture inputs use the related-test graph plus literal-reference
  * discovery. Broad config/dependency/deletion changes, an unknown/empty diff, opt-out, or an oversized
- * target list need broader evidence. Broad selections on an unsaturated host run the checkout's full test
- * script plus unscoped standards through normal heavy admission. On a saturated host they stay `blocked`
- * so ci-only can be used. Opt-out, unreadable saturation, and oversized target lists still refuse with
+ * target list need broader evidence. Broad selections on a known unsaturated host run `npx vitest run`
+ * plus mandatory unscoped `node scripts/check-standards.mjs`, independent of checkout npm scripts.
+ * The fallback requires a heavy-admission slot and runs always-run guards with executed-file inventory.
+ * On a saturated host they stay `blocked` so ci-only can be used. Opt-out, unreadable saturation, and oversized target lists still refuse with
  * an explicit affected-test gate as the fallback. Push defaults continue to require a shrink selection.
  *
  * THE check:standards HALF (#1937/#3395). #1937 (`#gate-on-merged-tree-lane-fast-fail`) already ruled that a
@@ -51,12 +52,13 @@
  * `verify-lane.mjs --repo=` also verifies sibling checkouts (plateau-app, frontierui). plateau-app has neither
  * script (its suite is `"test": "vitest run"`), so the WE-shaped gate always failed there with "Missing script".
  * The IO shell now injects the target checkout's npm script NAMES (`scripts`, read from its package.json) and
- * {@link composeGate} builds only the halves that checkout actually has:
+ * {@link composeGate} builds only the selected-gate halves that checkout actually has:
  *   - vitest half: `test:unit` or `test` present ⇒ the selected related command (or its empty-target echo);
- *     neither ⇒ skipped, with an explicit reason. Broad selections use the full script only when unsaturated.
+ *     neither ⇒ skipped, with an explicit reason.
  *   - check:standards half: included (scoped exactly as before) only when the checkout has `check:standards`.
  * `scripts` omitted/unknown ⇒ assumed WE-shaped, so a WE checkout's command is byte-for-byte unchanged. frontierui
- * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
+ * has both `test:unit` and `check:standards`, so it too gets today's selected gate unchanged.
+ * The broad idle-host fallback bypasses this script lookup: direct Vitest plus mandatory direct standards.
  */
 import { hostSaturation } from './verify-ci-only.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
@@ -135,7 +137,7 @@ export function scaledTimeoutFlags(factor) {
 /** Local target bound: refuse oversized selection; never promote it to a full suite. */
 export const MAX_RELATED_TARGETS = 300;
 
-/** Full unit suite plus repo health; also the idle-host broad-selection fallback. */
+/** Full unit suite plus repo health; the explicit full default (the idle-host fallback uses direct commands). */
 export const FULL_GATE = 'npm run test:unit && npm run check:standards';
 
 /** Script names a WE-shaped checkout is assumed to have when the caller injects none (back-compat default). */
@@ -495,16 +497,14 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
       try { host = saturation(); } catch { /* unreadable evidence keeps the refusal */ }
     }
     if (!optOut && host?.saturated === false && host.known === true) {
-      const have = new Set(scripts == null ? WE_SCRIPTS : scripts);
-      const script = have.has('test:unit') ? 'test:unit' : have.has('test') ? 'test' : null;
-      if (!script) return blocked(['No full test script in this checkout: supply an explicit affected-test --gate.']);
-      const testCommand = script === 'test' ? 'npm test' : 'npm run test:unit';
-      const standardsCommand = have.has('check:standards') ? 'npm run check:standards' : null;
-      const reason = 'broad selection on an unsaturated host — full suite plus available standards through heavy admission';
-      return { ...composeGate({ vitestCmd: testCommand, checkStandardsCmd: standardsCommand, scripts }),
+      // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
+      const testCommand = 'npx vitest run';
+      const standardsCommand = 'node scripts/check-standards.mjs';
+      const reason = 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission';
+      return { command: `${testCommand} && ${standardsCommand}`, testCommand, standardsCommand, scanCommands: [],
         gateReasons: [reason], decision: {
           ...local, reasons: [...local.reasons, reason], changedFiles, settingsSource, relatedMode,
-          standards: { ...standards, run: !!standardsCommand, scoped: false, reason },
+          standards: { ...standards, run: true, scoped: false, reason },
         } };
     }
     return blocked([
