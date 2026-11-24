@@ -335,6 +335,15 @@ const DRAFT_OPT_OUT = !!flags['no-draft'];
  *     also carry the auto-land signal. `park` is the ALREADY-VALIDATED label string (see `resolveParkLabel`).
  * @returns {{waitForChecks:boolean, labelWhenGreen:boolean, mergeWhenGreen:boolean, triggerDrain:boolean, mode:string, parkLabel?:string}}
  */
+/** A one-line note for a failed git child that never echoes its argv. execFileSync's `e.message` starts with
+ *  the whole command line, which carries the push URL and so any credentials embedded in it. Pure. */
+export function childFailureNote(e) {
+  if (e?.signal) return `signal ${e.signal}`;
+  if (Number.isInteger(e?.status)) return `exit ${e.status}`;
+  if (typeof e?.code === 'string' && /^[A-Z0-9_]{1,32}$/.test(e.code)) return e.code;
+  return 'failed';
+}
+
 export function planPrLand({ wait, labelOnGreen, park } = {}) {
   if (park) return { waitForChecks: false, labelWhenGreen: false, mergeWhenGreen: false, triggerDrain: false, mode: 'park', parkLabel: park };
   if (labelOnGreen) return { waitForChecks: true, labelWhenGreen: true, mergeWhenGreen: false, triggerDrain: false, mode: 'label-on-green' };
@@ -784,10 +793,13 @@ if (IS_CLI) runCli().catch((error) => emit({ repo: REPO, merged: false, reason: 
 async function runCli() {
   // Install the closure before setup so the entry-point catch can use the normal failure output.
   emit = emitResult;
+  const gitRaw = (args) => execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const gitC = (args) => {
-    const output = execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = gitRaw(args);
     return args.includes('-z') ? output : output.trim();
   };
+  // Git URL commands print one terminating LF. All other bytes belong to the URL, including whitespace.
+  const gitUrl = (args) => gitRaw(args).replace(/\n$/, '');
   // #2217 — pr-land is a SANCTIONED main-writer (fallback-git merge, post-land heal/regen). Those pushes go to
   // `main`, so they must carry the MAIN_PUSH_OK=1 override the new pre-push hook (guard-git-push.mjs) checks —
   // otherwise the strict-lock hook would block pr-land's own legitimate landing. Scoped to THESE calls only, so
@@ -962,15 +974,84 @@ async function runCli() {
     return soakPrecheckAtOpen({ title: createParams.title, body: CREATE_BODY, files });
   }
 
+  // Read-only decision: does the PUSH target already hold exactly refSha at the lane ref? (shared by the dry-run
+  // preview and the real push step). The tip is read from the URL the push goes to — `remote get-url --push`
+  // (pushurl if set, else url, after pushInsteadOf/insteadOf rewrites; it ignores a GIT_CONFIG override that
+  // only `git config` honours) — never from the remote NAME, which ls-remote resolves to the fetch URL. With no
+  // single, safe push URL (several URLs, an unreadable read, or one starting with "-" that ls-remote would parse
+  // as an option) nothing is read: no tip can skip or refuse, and the push runs. Any read failure means "no tip".
+  function pushSkipDecision() {
+    const remoteHeadRef = `refs/heads/${REF}`;
+    const validRefSha = /^[0-9a-f]{40}$/i.test(refSha);
+    let pushUrl = null;
+    try {
+      const pushUrls = gitUrl(['remote', 'get-url', '--push', '--all', REMOTE]).split('\n');
+      if (pushUrls.length === 1 && pushUrls[0] && !pushUrls[0].startsWith('-')) pushUrl = pushUrls[0];
+      // `get-url --push` already applied insteadOf/pushInsteadOf; `ls-remote <url>` applies insteadOf AGAIN, so a
+      // chained rule (X→B, B→C) would read C while the push writes B. Read only when ls-remote would contact
+      // exactly the URL the push goes to; otherwise read nothing and push.
+      if (pushUrl && gitUrl(['ls-remote', '--get-url', '--', pushUrl]) !== pushUrl) pushUrl = null;
+    } catch { pushUrl = null; }
+    const remoteTipLine = pushUrl ? tryGit(['ls-remote', '--', pushUrl, remoteHeadRef]) : null;
+    const remoteTipMatch = /^([0-9a-f]{40})\t([^\r\n]+)$/i.exec(remoteTipLine ?? '');
+    const remoteTip = remoteTipMatch?.[2] === remoteHeadRef ? remoteTipMatch[1] : null;
+    return { remoteTip, validRefSha, pushUrl, remoteHeadRef, alreadyPublished: validRefSha && remoteTip !== null && remoteTip === refSha };
+  }
+
+  // git's OWN non-force push checks fast-forward on the client: in a shallow clone, or with the push target's tip
+  // object missing locally, it rejects even a true fast-forward ("fetch first" / non-fast-forward). So before the
+  // push, best-effort: unshallow, then fetch the tip from the push URL (the one URL pushSkipDecision proved
+  // ls-remote and the push both contact). Both fetches name an explicit refspec with an empty --refmap, so they
+  // write only FETCH_HEAD (no remote-tracking ref, no prune, no local branch), and they never force. Each one is
+  // bounded, never prompts, and a failure is ignored with one stderr line: the guarded push still runs and git
+  // decides. The unshallow tries REMOTE (the fetch URL) and falls back to the push URL when the clone stays shallow.
+  function completeHistoryForPush({ remoteTip, pushUrl, remoteHeadRef }) {
+    const quietEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1' };
+    // BatchMode only when nothing else picks the ssh command: GIT_SSH_COMMAND overrides GIT_SSH and core.sshCommand,
+    // so forcing it would make this fetch use a different ssh identity than the push.
+    if (!process.env.GIT_SSH_COMMAND && !process.env.GIT_SSH && !tryGit(['config', '--get', 'core.sshCommand'])) {
+      quietEnv.GIT_SSH_COMMAND = 'ssh -o BatchMode=yes';
+    }
+    const fetchQuiet = (args) => {
+      try {
+        execFileSync('git', ['fetch', '-q', '--no-tags', '--refmap=', ...args], { cwd: REPO, stdio: ['ignore', 'ignore', 'pipe'],
+          timeout: 120_000, maxBuffer: 1024 * 1024, env: quietEnv });
+      } catch (e) {
+        process.stderr.write(`pr-land [${REPO}] · history fetch before push failed (${childFailureNote(e)}); pushing anyway\n`);
+      }
+    };
+    const isShallow = () => tryGit(['rev-parse', '--is-shallow-repository']) === 'true';
+    if (isShallow()) fetchQuiet(['--unshallow', REMOTE, remoteHeadRef]);
+    if (isShallow() && pushUrl) fetchQuiet(['--unshallow', '--', pushUrl, remoteHeadRef]);
+    let tipPresent = false;
+    try {
+      execFileSync('git', ['cat-file', '-e', `${remoteTip}^{commit}`], { cwd: REPO, stdio: 'ignore', timeout: 30_000, env: quietEnv });
+      tipPresent = true;
+    } catch { /* missing (a partial clone never lazy-fetches here): fetch it from the push URL */ }
+    if (pushUrl && !tipPresent) fetchQuiet(['--', pushUrl, remoteHeadRef]);
+  }
+
+  // Refuse before pushing ONLY on proof that the push target's tip is not an ancestor of refSha: merge-base exits
+  // exactly 1 in a clone git confirms is NOT shallow (past a shallow boundary merge-base can answer 1 falsely).
+  // A missing tip object (exit 128), a shallow or unreadable clone state, or any other failure proves nothing,
+  // so the guarded non-force push runs and git's own push validates fast-forward. Local refs/replace objects
+  // are ignored (`--no-replace-objects`): they rewrite local history the server never sees.
+  function provenNotAncestor(remoteTip) {
+    if (tryGit(['rev-parse', '--is-shallow-repository']) !== 'false') return false;
+    try { gitC(['--no-replace-objects', 'merge-base', '--is-ancestor', remoteTip, refSha]); return false; }
+    catch (e) { return e?.status === 1; }
+  }
+
   if (DRY_RUN) {
     const createArgs = buildCreateArgs(createParams);
+    const pushPreview = pushSkipDecision();
     const soak = soakCreatePrecheck();
     emit({
       repo: REPO, merged: false, reason: 'dry-run', ref: REF, base: BASE, method: METHOD,
       plan: [
         `node scripts/lint-locus-prefix.mjs ${buildLocusLintArgs({ root: REPO, range: `${REMOTE}/${BASE}..${refSha}` }).join(' ')}   # #2331 producer locus-prefix re-check (fail fast on the #2170 review-append leak) — swept in --root, the clone holding the commits (#3342)`,
         `soak precheck (if no PR exists yet): ${soak.ok ? soak.skipped || soak.reason : `REFUSE: ${soak.message}`}`,
-        `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
+        pushPreview.alreadyPublished ? `push skipped: ${REMOTE} already at ${refSha}` : `git push ${REMOTE} ${SRC}:refs/heads/${REF}   # publish the lane clone's ${SRC} (${refSha.slice(0, 8)}) to the lane ref`,
         prCreateBodyGuard(BODY).ok ? `gh ${createArgs.join(' ')}` : `REFUSE (if no PR exists yet): ${prCreateBodyGuard(BODY).reason}  # #2332 fail-fast — an existing PR for this head is exempt`,
         PLAN.waitForChecks ? 'poll: gh pr view <pr> mergeStateStatus + gh pr checks <pr> --required  (wait until green; abort on red)'
           : PLAN.mode === 'park' ? '(--park: skip check-wait — the PR is HELD for review, not landed by this run)'
@@ -989,7 +1070,7 @@ async function runCli() {
           ? `node scripts/merge-ai-prs.mjs --only=<pr> --label=${LABEL || 'ready-to-merge'} --this-repo   # #2290 single-couple FAST DRAIN (the drain lands it — pr-land never merges)`
           : PLAN.mode === 'park' ? '(--park: STOP — the PR is HELD review:*; a human clears it via /review, then the drain lands it)'
           : '(label-on-green: STOP after labelling — the standalone drain lands it; no direct merge here)',
-        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff ${REMOTE}/${REF} + push ${REMOTE} ${BASE}` : null,
+        FALLBACK_GIT ? `fallback on failure (BREAK-GLASS only, WE_MERGE_BREAK_GLASS=1): git merge --no-ff ${refSha} + push ${REMOTE} ${BASE}` : null,
       ].filter(Boolean),
       detail: `would open+label ${SRC} (${refSha.slice(0, 8)}) as a self-approved PR from ${REF}${PLAN.triggerDrain ? ' and trigger a single-couple drain' : ''} — the drain lands it onto ${BASE}`,
     }, 0);
@@ -1129,7 +1210,35 @@ async function runCli() {
     detail: ['all pre-push gates passed', ...info].join('\n') }, 0);
 
   // 2. Publish the source commit to the lane ref on origin (guard-safe: lane/*). Never force, no local branch.
-  try { gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
+  // Only an exact, readable remote tip can authorize skipping the network push. The repository's
+  // pre-push guards still run, including pinned/corrupt lease enforcement. Like Git, an up-to-date ref
+  // supplies no update entries: a synthetic same-SHA update would incorrectly trigger the tracker guard.
+  const pushTarget = pushSkipDecision();
+  const { remoteTip, validRefSha, alreadyPublished } = pushTarget;
+  if (!alreadyPublished && validRefSha && remoteTip) completeHistoryForPush(pushTarget);
+  if (alreadyPublished) {
+    try {
+      // These are the two guards wired by .githooks/pre-push. Resolve their entrypoints here so --repo
+      // also works for a checkout outside WE; each guard still reads the target checkout's lease via cwd.
+      for (const guard of ['./guard-git-push.mjs', './guard-prototype-tracker.mjs']) {
+        execFileSync(process.execPath, [fileURLToPath(new URL(guard, import.meta.url)), REMOTE, pushTarget.pushUrl], {
+          cwd: REPO, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+          input: '', timeout: 30_000, maxBuffer: 1024 * 1024,
+        });
+      }
+    } catch (e) {
+      // execFileSync's message includes argv (and potentially URL credentials). Keep only a guard's own
+      // refusal diagnostic, or a bounded status when the guard failed before producing one.
+      const guardReason = String(e.stderr ?? '').split('\n').find(line => line.startsWith('✗ pre-push BLOCKED:') || line.startsWith('pre-push BLOCKED —'))
+        ?? `pre-push guards ${childFailureNote(e)}`;
+      emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(guardReason, { SRC, REF, REMOTE }) }, 3);
+    }
+    process.stderr.write(`pr-land [${REPO}] · push skipped: ${REMOTE} already at ${refSha}\n`);
+  } else if (validRefSha && remoteTip && provenNotAncestor(remoteTip)) {
+    emit({ repo: REPO, merged: false, reason: 'push-failed',
+      detail: pushFailedDetail(`non-fast-forward: ${REMOTE}/${REF} (${remoteTip}) on the push target is ahead or diverged`, { SRC, REF, REMOTE }) }, 3);
+  }
+  try { if (!alreadyPublished) gitC(['push', REMOTE, `${refSha}:refs/heads/${REF}`]); }
   catch (e) { emit({ repo: REPO, merged: false, reason: 'push-failed', detail: pushFailedDetail(e.message || e, { SRC, REF, REMOTE }) }, 3); }
 
   // 2b. (#2291 — pruned) The PRE-CHECK id-collision self-heal (#2222) that used to run here is now DEAD wiring:
@@ -1574,9 +1683,11 @@ async function runCli() {
       // break-glass use emits the loud audit line). Capture the pre-merge base sha for the heal's onto-ref.
       assertMayMerge({ caller: 'pr-land', pr: null, repo: REPO });
       const preMergeBaseSha = tryGit(['rev-parse', `${REMOTE}/${BASE}`]) || null;
-      tryGit(['fetch', REMOTE, `${REF}`, '--quiet']);
+      // Merge the exact commit this run published (refSha), never the fetch-side `${REMOTE}/${REF}`: with a
+      // separate push URL that tracking ref is another repository's tip, and a failed fetch leaves it stale.
+      if (!/^[0-9a-f]{40}$/i.test(refSha ?? '')) throw new Error(`source commit unresolved (${refSha || 'empty'}) — refusing to merge`);
       gitC(['checkout', BASE]);
-      gitC(['merge', '--no-ff', `${REMOTE}/${REF}`, '-m', `merge ${REF} (pr-land git fallback)`]);
+      gitC(['merge', '--no-ff', refSha, '-m', `merge ${REF} (pr-land git fallback)`]);
       // JIT numbering (#2288 / #xzxc92d): the fallback-git merge is a LAND path too — the last one #2288 left
       // un-numbered. Number every provisional hash file the merge just brought onto BASE BEFORE the push, so
       // no hash strands on main (this is the exact route that stranded #xzxc92d itself). Shares lane-drain's
