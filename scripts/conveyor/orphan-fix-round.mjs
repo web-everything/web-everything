@@ -184,33 +184,30 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
 // ── IO shell ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
-const MAX_PAGES = 5;
 export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Infinity } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const perPage = 100, bounced = [];
-  // A full last page does not prove overflow: allow one bounded, deadline-checked lookahead.
-  for (let page = 1; page <= MAX_PAGES + 1; page++) {
-    if (page > 1 && Date.now() >= deadlineAt) {
+  const opts = ghOpts();
+  // Bound the whole listing by time, not repository size. A full page always needs another read,
+  // including past 500 PRs. Callers without a tick deadline share one child-timeout budget.
+  const listingDeadlineAt = Math.min(deadlineAt, Date.now() + opts.timeout);
+  for (let page = 1; ; page++) {
+    const remainingMs = listingDeadlineAt - Date.now();
+    if (page > 1 && remainingMs <= 0) {
       const reason = 'orphan-guard: listing deadline reached; older PRs not scanned this pass';
       console.error(reason);
       throw new Error(`${reason}; fix dispatch held until a complete listing succeeds (retry with more listing time)`);
     }
     // Partial discovery cannot certify the repo: let the pass emit a repo-level error so the daemon holds fixes.
-    const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`], ghOpts());
+    const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`],
+      { ...opts, timeout: Math.max(1, Math.ceil(remainingMs)) });
     const prs = JSON.parse(String(out));
     if (!Array.isArray(prs)) throw new Error('orphan-guard: invalid pulls listing (expected an array)');
-    if (page > MAX_PAGES) {
-      if (prs.length === 0) return bounced;
-      break; // Nonempty lookahead proves the 500-PR listing is incomplete; do not process it.
-    }
     bounced.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
       number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
     })));
     if (prs.length < perPage) return bounced;
   }
-  const reason = `orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); older PRs not scanned this pass`;
-  console.error(reason);
-  throw new Error(`${reason}; fix dispatch held; operator must reduce the open-PR backlog or increase the listing cap`);
 }
 
 async function defaultReadComments(number, slug) {
