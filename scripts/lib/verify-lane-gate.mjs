@@ -23,8 +23,11 @@
  *
  * LOCAL POLICY (fix-3311). Shared helper/fixture inputs use the related-test graph plus literal-reference
  * discovery. Broad config/dependency/deletion changes, an unknown/empty diff, opt-out, or an oversized
- * target list return `blocked` with no command. The CLI refuses before recording a request. The local gate
- * never automatically promotes a diff to the full suite; an explicit affected-test gate or CI is required.
+ * target list need broader evidence. Broad selections on a known unsaturated host run `npx vitest run`
+ * plus mandatory unscoped `node scripts/check-standards.mjs`, independent of checkout npm scripts.
+ * The fallback requires a heavy-admission slot and runs always-run guards with executed-file inventory.
+ * On a saturated host they stay `blocked` so ci-only can be used. Opt-out, unreadable saturation, and oversized target lists still refuse with
+ * an explicit affected-test gate as the fallback. Push defaults continue to require a shrink selection.
  *
  * THE check:standards HALF (#1937/#3395). #1937 (`#gate-on-merged-tree-lane-fast-fail`) already ruled that a
  * lane gate is not the authority for whole-repo/cross-lane invariants — those belong on the merged tree, in CI —
@@ -49,13 +52,15 @@
  * `verify-lane.mjs --repo=` also verifies sibling checkouts (plateau-app, frontierui). plateau-app has neither
  * script (its suite is `"test": "vitest run"`), so the WE-shaped gate always failed there with "Missing script".
  * The IO shell now injects the target checkout's npm script NAMES (`scripts`, read from its package.json) and
- * {@link composeGate} builds only the halves that checkout actually has:
+ * {@link composeGate} builds only the selected-gate halves that checkout actually has:
  *   - vitest half: `test:unit` or `test` present ⇒ the selected related command (or its empty-target echo);
- *     neither ⇒ skipped, with an explicit reason. R913 forbids promoting a local default to a whole suite.
+ *     neither ⇒ skipped, with an explicit reason.
  *   - check:standards half: included (scoped exactly as before) only when the checkout has `check:standards`.
  * `scripts` omitted/unknown ⇒ assumed WE-shaped, so a WE checkout's command is byte-for-byte unchanged. frontierui
- * has both `test:unit` and `check:standards`, so it too gets today's gate unchanged.
+ * has both `test:unit` and `check:standards`, so it too gets today's selected gate unchanged.
+ * The broad idle-host fallback bypasses this script lookup: direct Vitest plus mandatory direct standards.
  */
+import { hostSaturation } from './verify-ci-only.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
@@ -132,7 +137,7 @@ export function scaledTimeoutFlags(factor) {
 /** Local target bound: refuse oversized selection; never promote it to a full suite. */
 export const MAX_RELATED_TARGETS = 300;
 
-/** Explicit tool/env opt-in only: the full unit suite plus repo health, never a local default. */
+/** Full unit suite plus repo health; the explicit full default (the idle-host fallback uses direct commands). */
 export const FULL_GATE = 'npm run test:unit && npm run check:standards';
 
 /** Script names a WE-shaped checkout is assumed to have when the caller injects none (back-compat default). */
@@ -377,17 +382,17 @@ export function phaseAdmissionKind({ phase, decision, standardsScoped, env, file
 /**
  * Decide verify-lane's DEFAULT gate command from the actual diff against `base` (default `origin/main`).
  *   - the VITEST half: graph/reference selection, including shared helpers; at most 300 targets and
- *     32000 UTF-8 bytes. Unsafe or oversized selections are blocked with no runnable command.
+ *     32000 UTF-8 bytes. Broad selections use the full suite when unsaturated; oversized targets stay blocked.
  *   - the check:standards half: scoped to `--local --files=<changedFiles>` whenever
  *     {@link canScopeCheckStandards} allows it (#1937) — independently of the vitest half's mode, since it is a
  *     separately-safe, already-ratified mechanism, not gated behind the vitest shrink's not-yet-defaulted flag.
  * Selection is mandatory for the default local gate; opt-out requests require an explicit gate.
  * `scripts` (#3919): the target checkout's npm script names; omitted ⇒ WE-shaped (unchanged). See {@link composeGate}.
- * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
+ * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean, saturation?: () => {saturated: boolean, reason?: string}}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig, allowCardOnlySkip = true, hasGreen } = {}) {
-  const args = { runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip };
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig, allowCardOnlySkip = true, hasGreen, saturation = hostSaturation } = {}) {
+  const args = { runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip, saturation };
   const withMode = (gate, selectionMode) => ({ ...gate, decision: { ...gate.decision, selectionMode } });
   const setting = resolveVerifySettings({ fileConfig, env }).values.selection;
   if (setting !== 'since-last-green') return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', reason: `verify.selection is '${setting}'` });
@@ -440,7 +445,7 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
   }
 }
 
-function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip }) {
+function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip, saturation }) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
@@ -471,7 +476,7 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     : decideLocalSelection({ changedFiles: vitestChangedFiles, deletedFiles: vitestDeletedFiles, optOut });
 
   // Shared helpers are ordinary graph inputs locally; literal references supplement dynamic reads.
-  // CI still owns exhaustive coverage. A broad/unknown selection must never silently launch a full suite.
+  // Shared inputs can shrink; remaining broad selections consult host capacity below.
   if (local.mode === 'full' && !optOut && local.triggerFiles.length && !local.deletedSourceFiles.length
       && local.triggerFiles.every((f) => !LOCAL_FULL_SUITE_TRIGGERS.some((re) => re.test(f)))) {
     const ordinary = decideLocalSelection({
@@ -486,10 +491,27 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
   const blocked = (reasons, extra = {}) => ({ command: null, gateReasons: [], decision: {
     ...local, mode: 'blocked', reasons, changedFiles, standards, settingsSource, relatedMode, referencedTests: [], targets: [], ...extra,
   } });
-  if (local.mode === 'full') return blocked([
-    ...local.reasons.map((r) => r.replaceAll('full suite', 'broad selection')),
-    'No local full suite: supply an explicit affected-test --gate or use CI for exhaustive verification.',
-  ]);
+  if (local.mode === 'full') {
+    let host;
+    if (!optOut) {
+      try { host = saturation(); } catch { /* unreadable evidence keeps the refusal */ }
+    }
+    if (!optOut && host?.saturated === false && host.known === true) {
+      // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
+      const testCommand = 'npx vitest run';
+      const standardsCommand = 'node scripts/check-standards.mjs';
+      const reason = 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission';
+      return { command: `${testCommand} && ${standardsCommand}`, testCommand, standardsCommand, scanCommands: [],
+        gateReasons: [reason], decision: {
+          ...local, reasons: [...local.reasons, reason], changedFiles, settingsSource, relatedMode,
+          standards: { ...standards, run: true, scoped: false, reason },
+        } };
+    }
+    return blocked([
+      ...local.reasons.map((r) => r.replaceAll('full suite', 'broad selection')),
+      'No local full suite: supply an explicit affected-test --gate or use CI for exhaustive verification.',
+    ]);
+  }
 
   // #1937: scope only the local, non-authoritative fast-fail — the central, unscoped check:standards CI runs
   // against the real merged tree remains the actual authority and is untouched by this local shrink.

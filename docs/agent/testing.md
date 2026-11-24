@@ -5906,6 +5906,14 @@ CI `test` label gate. Unknown CPU/load evidence and memory-only admission refusa
 authorize it. Audit records live in `verify-ci-only`, separately from `verify-green`;
 `WE_VERIFY_CI_ONLY_LEDGER_DIR` explicitly selects an audit directory for fixtures.
 The scoped `scripts/lib/__tests__/verify-ci-only.test.mjs` exercises these boundaries.
+Broad verify selections (including unknown/empty diffs and source deletions) run `npx vitest run`
+with the repo config plus mandatory unscoped `node scripts/check-standards.mjs` on a known unsaturated
+host, independent of checkout npm scripts. Admission must succeed: a timeout refuses this fallback
+instead of running unslotted. The always-run guards also run and require an executed-file inventory;
+a missing guard keeps verification red. Idle evidence requires successful admission and measured
+positive load or valid CPU idle/threshold readings; unknown-load and non-load refusals stay unknown.
+Inject `saturation` in `resolveDefaultGate` fixtures; pin historical blocked cases to a saturated host instead of probing
+live capacity. Push defaults still require `shrink`; opt-out and oversized targets still refuse.
 ## Open-pr preflight
 
 `open-pr --check` collects audit, review/PREP enforcement and pre-push blockers without publishing, filing cards
