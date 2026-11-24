@@ -475,6 +475,7 @@ export function makeSnapshotHeadReader({ maxAgeMs = DEFAULT_SESSION_WATCHDOG.prH
   };
 }
 
+// Ruleset pin evidence lives in merge-gate-pin-probe.mjs; this pass probes session state only.
 export function defaultListAgentsJson(exec = execFileSync) {
   return JSON.parse(String(cachedClaudeAgents({ fetch: () => exec('claude', ['agents', '--json'], { cwd: homedir(), encoding: 'utf8', timeout: 60_000 }) })));
 }

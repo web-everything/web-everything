@@ -20,6 +20,8 @@
  * Pure: no fs, no child_process. `scopedScanFiles` reads only the env it is handed.
  */
 
+import { isLintedScript } from './push-gate-lint.mjs';
+
 /** Env var carrying the changed-file list (JSON array of repo-relative paths) a `scope: 'files'` scanner honours. */
 export const SCAN_FILES_ENV = 'VERIFY_SCAN_FILES';
 
@@ -42,6 +44,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
+  {
+    test: 'scripts/__tests__/push-gate-boundary.test.mjs',
+    scope: 'files',
+    why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',
+    matches: isLintedScript,
+    inputs: ['scripts/lib/push-gate-lint.mjs', 'scripts/push-gate-allowlist.json', 'scripts/__tests__/push-gate-boundary.test.mjs'],
+  },
   {
     test: 'scripts/__tests__/testing-notes-advisory.test.mjs',
     scope: 'full',
@@ -151,6 +160,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/lib/__tests__/file-class-policy.test.mjs': 'one record-only check walks scripts/ to assert no other script imports the file-class engine; it loads the engine so vitest related selects it when the engine changes, and CI runs it on every PR',
   'scripts/lib/__tests__/settings-registry.test.mjs': 'false positive: git ls-files checks only the named generated settings-registry.md path is untracked; it does not enumerate the repo for a rule scan, and imports settings-registry.mjs so vitest related selects it when the generator changes',
   'scripts/lib/__tests__/deps-job-no-packages.test.mjs': 'walks the static import closure of deps-job.mjs; small hermetic parse; CI runs it on every PR and verify runs it when the test file itself changes',
   'scripts/conveyor/soak/breaks/gh-log-escape-sequences-block-ci-heal.soak.test.mjs': 'false positive: its readdirSync calls only list scripts/ to symlink a throwaway pre-fix tree under mkdtemp for the break replay; it asserts a planner outcome, never a repo rule; the soak lane runs it',

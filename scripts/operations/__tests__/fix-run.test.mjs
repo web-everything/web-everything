@@ -15,7 +15,7 @@ import { buildFixEndComment } from '../../conveyor/fix-procedure.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT, FIX_RUN_EXECUTORS, FIX_RUN_CONFINEMENT } from '../dispatch-providers/fix.mjs';
 import { resolveDeliveryAgentProvider } from '../deliver-item-wrapper.mjs';
-import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
+import { childFailureReason, resolveAcquireWaitPolicy, parseFixRunArgv, readCiHealInputs, renderCiHealContext, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, unstagedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES, STAGE_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -816,6 +816,168 @@ describe('runFixCli', () => {
   it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
     expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
   });
+  it.each([' D', 'D ', 'MD', 'AD'])('allows removal of tracked lane-root evidence (%s)', code => {
+    const porcelain = `${code} .fix-evidence.md\0 M .gitignore\0`;
+    expect(changedPaths(porcelain)).toEqual(['.fix-evidence.md', '.gitignore']);
+    expect(unstagedPaths(porcelain)).toEqual(code[1] === 'D' ? ['.fix-evidence.md', '.gitignore'] : ['.gitignore']);
+    expect(changedPaths(`${code} .fix-evidence.md\0`)).toEqual(['.fix-evidence.md']);
+  });
+  it('allows removal of evidence renamed away while blocking evidence as a rename destination', () => {
+    expect(changedPaths('R  archived.md\0.fix-evidence.md\0')).toEqual(['archived.md', '.fix-evidence.md']);
+    expect(changedPaths('R  .fix-evidence.md\0old.md\0')).toEqual(['old.md']);
+    expect(unstagedPaths('R  archived.md\0.fix-evidence.md\0')).toEqual([]);
+    expect(changedPaths('C  archived.md\0.fix-evidence.md\0')).toEqual(['archived.md']);
+    expect(changedPaths('C  .fix-evidence.md\0old.md\0')).toEqual(['old.md']);
+  });
+  it('never stages additions or modifications of lane-root .fix-evidence.md (sibling repos do not gitignore it) but still stages other files', () => {
+    const porcelain = '?? .fix-evidence.md\0 M src/a.ts\0?? docs/.fix-evidence.md\0A  .fix-evidence.md\0';
+    expect(changedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
+    expect(unstagedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
+    expect(changedPaths('?? .fix-evidence.md.bak\0?? my.fix-evidence.md\0')).toEqual(['.fix-evidence.md.bak', 'my.fix-evidence.md']);
+  });
+  it.each(['??', 'A ', ' M', 'M ', 'AM', 'MM', 'UU', 'AA'])('excludes evidence writes (%s) from both helpers', code => {
+    expect(changedPaths(`${code} .fix-evidence.md\0`)).toEqual([]);
+    expect(unstagedPaths(`${code} .fix-evidence.md\0`)).toEqual([]);
+  });
+  it.each([false, true])('stages evidence removal without reading a recreated evidence file (conflicted merge=%s)', async merging => {
+    const m = mk(['aaa', 'bbb']);
+    let inMerge = false;
+    let added = false;
+    const removals = [];
+    const stageEntry = vi.fn((_lane, path) => ({ mode: '100644', data: Buffer.from(path === '.fix-evidence.md' ? 'new private evidence\n' : 'resolved\n') }));
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { inMerge = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return merging ? 'UU file.txt\0 D .fix-evidence.md\0' : ' D .fix-evidence.md\0';
+      if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
+      if (args.includes('--index-info')) removals.push(opts.input);
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files') && added) return `100644 ${'c'.repeat(40)} 0\tfile.txt\0`;
+      if (args.includes('cat-file')) return 'resolved\n';
+      if (args.includes('commit') || args.includes('--abort')) inMerge = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli(merging ? [...argv, '--merge-onto=main'] : argv, { ...m.io, run, stageEntry,
+      fileExists: path => path.endsWith('MERGE_HEAD') ? inMerge : true, readFile: () => 'resolved\n' });
+    expect(out.code).toBe(0);
+    expect(removals).toEqual([`0 ${'0'.repeat(3)}\t.fix-evidence.md\0`]);
+    expect(stageEntry).not.toHaveBeenCalledWith('/lanes/lane-5', '.fix-evidence.md');
+    expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+    expect(m.calls.filter(c => c.includes('add')).flat()).not.toContain('.fix-evidence.md');
+  });
+  it.each([
+    ['UU', null], ['AA', null], ['UU', 'file.txt'], ['AA', 'docs/.fix-evidence.md'], ['UU', '.fix-evidence.md.bak'],
+  ])('removes conflicted root evidence from the index while preserving its worktree (%s, companion=%s)', async (code, companion) => {
+    const lane = mkdtempSync(join(tmpdir(), 'fix-run-evidence-conflict-'));
+    try {
+      const m = mk(['aaa', 'bbb']);
+      let merging = false;
+      let removed = false;
+      let added = false;
+      const path = '.fix-evidence.md';
+      const evidence = 'private fix evidence\n';
+      const markers = '<<<<<<< HEAD\nold evidence\n=======\nother evidence\n>>>>>>> origin/main\n';
+      writeFileSync(join(lane, path), markers);
+      m.spawn.mockImplementation(async () => { writeFileSync(join(lane, path), evidence); });
+      if (companion) {
+        mkdirSync(dirname(join(lane, companion)), { recursive: true });
+        writeFileSync(join(lane, companion), 'resolved\n');
+      }
+      const removals = [];
+      const persistEvidence = vi.fn();
+      const stageEntry = vi.fn(laneStageEntry);
+      const run = (cmd, args, opts) => {
+        if (args.includes('acquire')) return JSON.stringify({ path: lane, holder: 'test-holder' });
+        if (args.includes('--git-path')) return 'MERGE_HEAD';
+        if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+        if (args.includes('status')) return `${code} ${path}\0` + (companion ? `UU ${companion}\0` : '');
+        if (args.includes('--numstat')) return `1\t1\t${path}\0` + (companion ? `1\t1\t${companion}\0` : '');
+        if (args.includes('ls-files')) {
+          const queried = args.at(-1);
+          if (queried === path && removed) return '';
+          if (queried === companion && added) return `100644 ${'c'.repeat(40)} 0\t${queried}\0`;
+          return (code === 'AA' && queried === path ? [2, 3] : [1, 2, 3])
+            .map(stage => `100644 ${String(stage).repeat(40)} ${stage}\t${queried}\0`).join('');
+        }
+        if (args.includes('cat-file')) return 'resolved\n';
+        if (args.includes('--index-info')) { removals.push(opts.input); removed = true; }
+        if (args.includes('add')) added = true;
+        if (args.includes('commit')) {
+          expect(removed).toBe(true);
+          // Evidence-only conflicts now finalize before the agent: no content needs resolving.
+          expect(readFileSync(join(lane, path), 'utf8')).toBe(companion ? evidence : markers);
+          merging = false;
+        }
+        if (args.includes('--abort')) merging = false;
+        return m.run(cmd, args, opts);
+      };
+      const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, stageEntry, persistEvidence,
+        fileExists: p => p.endsWith('MERGE_HEAD') ? merging : existsSync(p) });
+      expect(out.code).toBe(0);
+      expect(removals).toEqual([`0 ${'0'.repeat(3)}\t${path}\0`]);
+      expect(stageEntry.mock.calls.map(c => c[1])).toEqual(companion ? [companion] : []);
+      expect(m.calls.filter(c => c.includes('add')).flat()).not.toContain(path);
+      expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+      expect(persistEvidence).toHaveBeenCalledWith({ repoKey: 'o_r', pr: '7', text: evidence });
+      expect(readFileSync(join(lane, path), 'utf8')).toBe(evidence);
+    } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it.each(['markers left', 'deleted', 'rewritten', 'tracked-clean', 'absent'])('finalizes a companion conflict with root evidence %s', async state => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    let added = false;
+    const removals = [];
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU file.txt\0' + (['tracked-clean', 'absent'].includes(state) ? '' : 'UU .fix-evidence.md\0');
+      if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
+      if (args.includes('--index-info')) removals.push(opts.input);
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files') && args.at(-1) === 'file.txt' && added) return `100644 ${'c'.repeat(40)} 0\tfile.txt\0`;
+      if (args.includes('cat-file')) return 'resolved\n';
+      if (args.includes('commit') || args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run,
+      stageEntry: () => ({ mode: '100644', data: Buffer.from('resolved\n') }),
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : !(p.endsWith('.fix-evidence.md') && state === 'deleted' && m.spawn.mock.calls.length),
+      readFile: p => p.endsWith('.fix-evidence.md') && state === 'markers left'
+        ? '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/main\n' : 'resolved\n',
+    });
+    expect(out.code).toBe(0);
+    expect(removals).toEqual([`0 ${'0'.repeat(3)}\t.fix-evidence.md\0`]);
+    expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+    expect(m.calls.filter(c => c.includes('check-attr')).flat()).not.toContain('.fix-evidence.md');
+  });
+  it.each(['unmerged', 'stage0', 'throw'])('refuses to commit when conflicted evidence removal fails (%s)', async failure => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    let attempted = false;
+    const recordOutcome = vi.fn();
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU .fix-evidence.md\0';
+      if (args.includes('--numstat')) return '1\t1\t.fix-evidence.md\0';
+      if (args.includes('--index-info')) { attempted = true; if (failure === 'throw') throw new Error('index removal failed'); }
+      if (args.includes('ls-files')) return (attempted && failure === 'stage0' ? [0] : [1, 2, 3])
+        .map(stage => `100644 ${'c'.repeat(40)} ${stage}\t.fix-evidence.md\0`).join('');
+      if (args.includes('cat-file')) return 'old evidence\n';
+      if (args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : true, readFile: () => 'private evidence\n' });
+    expect(out.code).toBe(1);
+    expect(attempted).toBe(true);
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+    expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed',
+      reason: failure === 'throw' ? 'index removal failed' : expect.stringContaining('conflict unresolved in .fix-evidence.md') }));
+  });
   it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
@@ -867,6 +1029,8 @@ describe('runFixCli', () => {
       if (args.includes('add')) added = true;
       if (args.includes('ls-files')) {
         const path = args[args.length - 1];
+        // Only the declared conflicts exist in this fixture; evidence removal must observe an empty index entry.
+        if (!paths.includes(path)) return '';
         return added ? `100644 ${'c'.repeat(40)} 0\t${path}\0` : ['a', 'b', 'd'].map((x, i) => `100644 ${x.repeat(40)} ${i + 1}\t${path}\0`).join('');
       }
       if (args.includes('cat-file')) {
@@ -1032,10 +1196,12 @@ describe('runFixCli', () => {
       setup.ours({ dir, git });
       git('add', '-A'); setup.oursIndex?.({ dir, git }); git('commit', '-m', 'ours');
       const m = mk([]);
+      const indexWrites = [];
       m.spawn.mockImplementation(async () => { agent({ dir }); return { finalMessage: 'resolved' }; });
       const run = (cmd, args, opts) => {
         if (cmd === 'git') {
           m.calls.push([cmd, ...args]);
+          if (args.includes('update-index')) indexWrites.push(opts?.input);
           onGit?.(args, dir, opts);
           if (args.includes('fetch') || args.includes('push')) return '';
           return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: opts?.encoding === null ? null : 'utf8', stdio: 'pipe', input: opts?.input, maxBuffer: opts?.maxBuffer });
@@ -1046,9 +1212,61 @@ describe('runFixCli', () => {
       };
       const recordOutcome = vi.fn();
       const out = await runFixCli([...argv, '--merge-onto=target', ...extra], { ...m.io, run, recordOutcome, ...io });
-      await check({ out, m, git, dir, recordOutcome });
+      await check({ out, m, git, dir, recordOutcome, indexWrites });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
+  it.each([
+    ['UU', 'rewritten', true], ['UU', 'markers left', true], ['UU', 'deleted', true], ['UU', 'untouched', true],
+    ['AA', 'rewritten', true], ['UD', 'rewritten', true],
+    ['tracked-clean', 'untouched', true], ['deleted', 'rewritten', true], ['absent', 'rewritten', true],
+    ['UU', 'untouched', false], ['tracked-clean', 'untouched', false],
+  ])('real git merge excludes %s root evidence (%s, companion conflict=%s) from the commit tree', async (indexState, worktree, companion) => {
+    const evidencePath = '.fix-evidence.md';
+    const otherEvidence = ['docs/.fix-evidence.md', '.fix-evidence.md.bak', 'my.fix-evidence.md'];
+    const conflictingEvidence = ['UU', 'AA', 'UD'].includes(indexState);
+    let expectedEvidence;
+    await withRealMerge({
+      base: ({ dir }) => {
+        writeFileSync(join(dir, 'file.txt'), 'base\n');
+        mkdirSync(join(dir, 'docs'));
+        otherEvidence.forEach(path => writeFileSync(join(dir, path), 'keep this tracked file\n'));
+        if (!['AA', 'absent'].includes(indexState)) writeFileSync(join(dir, evidencePath), 'base evidence\n');
+      },
+      theirs: ({ dir }) => {
+        writeFileSync(join(dir, 'theirs.txt'), 'theirs\n');
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'theirs\n');
+        if (['UU', 'AA'].includes(indexState)) writeFileSync(join(dir, evidencePath), 'theirs evidence\n');
+        if (['UD', 'deleted'].includes(indexState)) rmSync(join(dir, evidencePath));
+      },
+      ours: ({ dir }) => {
+        writeFileSync(join(dir, 'ours.txt'), 'ours\n');
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'ours\n');
+        if (conflictingEvidence) writeFileSync(join(dir, evidencePath), 'ours evidence\n');
+        if (indexState === 'deleted') rmSync(join(dir, evidencePath));
+      },
+    }, {
+      agent: ({ dir }) => {
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'resolved companion\n');
+        const evidence = join(dir, evidencePath);
+        if (indexState === 'UU' || indexState === 'AA') expect(readFileSync(evidence, 'utf8')).toContain('<<<<<<< HEAD');
+        if (worktree === 'rewritten') writeFileSync(evidence, 'private fix evidence\n');
+        if (worktree === 'deleted') rmSync(evidence);
+        expectedEvidence = existsSync(evidence) ? readFileSync(evidence, 'utf8') : null;
+      },
+    }, ({ out, m, git, dir, recordOutcome }) => {
+      expect(out.code, JSON.stringify(recordOutcome.mock.calls)).toBe(0);
+      expect(m.spawn).toHaveBeenCalledOnce();
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+      expect(m.calls.filter(c => c.includes('commit'))).toHaveLength(1);
+      expect(git('rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ')).toHaveLength(3);
+      expect(git('ls-tree', '-r', '--name-only', '-z', 'HEAD').split('\0')).not.toContain(evidencePath);
+      expect(git('ls-files', '-s', '--', evidencePath)).toBe('');
+      expect(git('show', 'HEAD:file.txt')).toBe(companion ? 'resolved companion\n' : 'base\n');
+      otherEvidence.forEach(path => expect(git('show', `HEAD:${path}`)).toBe('keep this tracked file\n'));
+      expect(existsSync(join(dir, evidencePath))).toBe(expectedEvidence !== null);
+      if (expectedEvidence !== null) expect(readFileSync(join(dir, evidencePath), 'utf8')).toBe(expectedEvidence);
+    });
+  });
   it.each(['hardlink', 'symlink', 'directory'])('refuses a %s marker override before writes or merge', async (kind) => {
     const root = mkdtempSync(join(tmpdir(), 'fix-marker-link-'));
     const outside = join(root, 'outside');
@@ -1322,14 +1540,23 @@ describe('runFixCli', () => {
     conflict: { base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'base\n'),
       theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'), ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n') },
   };
+  const expectNoContentStaged = (m, indexWrites, kind) => {
+    // A clean merge removes root evidence before the agent starts. Permit only that exact deletion,
+    // including its stdin: any git add, refresh, other removal or blob insertion still fails this assertion.
+    expect(m.calls.filter(staged)).toEqual(kind === 'clean merge'
+      ? [['git', ...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info']] : []);
+    expect(indexWrites).toEqual(kind === 'clean merge'
+      ? [`0 ${'0'.repeat(40)}\t.fix-evidence.md\0`] : []);
+    expect(m.calls.some(c => c.includes('push'))).toBe(false);
+  };
   it.each(Object.keys(stagingCases))('refuses to stage a lane file hardlinked to a file outside the lane (%s): nothing added, nothing pushed', async (kind) => {
     await withSecret(async (secret) => {
       await withRealMerge(stagingCases[kind], { agent: ({ dir }) => {
         writeFileSync(join(dir, 'file.txt'), 'resolved\n');
         linkSync(secret, join(dir, 'leak.txt'));
-      } }, async ({ out, m, git, recordOutcome }) => {
+      } }, async ({ out, m, git, recordOutcome, indexWrites }) => {
         expect(out.code).toBe(1);
-        expect(m.calls.some(c => staged(c) || c.includes('push'))).toBe(false);
+        expectNoContentStaged(m, indexWrites, kind);
         expect(() => git('cat-file', '-e', git('hash-object', secret).trim())).toThrow(); // the secret never entered the object store
         expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage .*leak\.txt/) }));
       });
@@ -1367,7 +1594,7 @@ describe('runFixCli', () => {
           if (state === 'armed' && swap === 'parent' && path === 'sub/f.txt') doSwap();
           return laneStageEntry(l, path, racingFs);
         } },
-      }, async ({ out, m, git, recordOutcome }) => {
+      }, async ({ out, m, git, recordOutcome, indexWrites }) => {
         expect(state).not.toBe('armed');
         expect(() => git('cat-file', '-e', git('hash-object', secret).trim())).toThrow();
         if (swap === 'file') {
@@ -1376,7 +1603,7 @@ describe('runFixCli', () => {
           expect(m.calls.some(c => c.includes('push'))).toBe(true);
         } else {
           expect(out.code).toBe(1);
-          expect(m.calls.some(c => staged(c) || c.includes('push'))).toBe(false);
+          expectNoContentStaged(m, indexWrites, kind);
           expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage sub\/f\.txt/) }));
         }
       });
