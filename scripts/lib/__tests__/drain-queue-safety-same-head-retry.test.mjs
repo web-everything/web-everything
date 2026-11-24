@@ -102,18 +102,21 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
     expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-same-head-retry:'))).toBe(false);
   };
 
-  it.each(['throws', 'empty'])('allows one retry with main green and PR CLEAN when the non-gate log %s', kind => setup(f => {
-    if (kind === 'empty') f.logs[31] = ' \n';
-    else f.logErrors[31] = Object.assign(new Error('HTTP 404: Not Found'), { status: 1 });
-    expect(f.guard().hold).toBe(false);
-    expect(f.log.mock.calls[0][0]).toContain('unreadable-log retry 1/1 (failed job log unreadable, main green, PR CLEAN)');
-    expect(f.log.mock.calls[0][0]).toContain('; main run 900; failed check(s): test-shard (1)');
-    expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
-  }));
+  it.each(['unreadable', 'empty', 'whitespace-only', 'escape-only'])(
+    'holds a %s log with valid head/timestamps, blank summaries, green main and PR CLEAN', kind => setup(f => {
+      if (kind === 'empty') f.logs[31] = '';
+      if (kind === 'whitespace-only') f.logs[31] = ' \n';
+      if (kind === 'escape-only') f.logs[31] = '\x1b[31m\x1b[0m';
+      if (kind === 'unreadable') f.logErrors[31] = Object.assign(new Error('HTTP 404: Not Found'), { status: 1 });
+      expectHeld(f);
+      expect(declined(f).join('\n')).toContain('job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually');
+      expect(f.exec.mock.calls.some(([, args]) => args.includes('POST'))).toBe(false);
+    }));
 
-  it('allows whitespace-only output title and summary', () => setup(f => {
+  it('holds unreadable logs with whitespace-only output title and summary', () => setup(f => {
     f.checks[0].output = { title: ' \n', summary: '\t' };
-    expect(f.guard().hold).toBe(false);
+    expectHeld(f);
+    expect(declined(f).join('\n')).toContain('job log evidence unreadable or incomplete');
   }));
 
   it.each(['title', 'summary'])('holds with unreadable logs and non-empty output %s', field => setup(f => {
@@ -133,7 +136,7 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
       updated_at: new Date(REMOVED_AT - 60_000).toISOString() }];
   };
 
-  it('uses the single unreadable retry limit even when main was red at removal', () => setup(f => {
+  it('holds unreadable logs even when main was red at removal', () => setup(f => {
     withRedMainBefore(f);
     f.events = [removed(), added, removed()];
     expectHeld(f);
@@ -198,20 +201,20 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
     expectHeld(f);
   }));
 
-  it('detects soak feature presence even if the single-retry negative checks regress', () => {
+  it('detects the soak fix by holding unreadable logs and rejects retry authorization', () => {
     const root = mkdtempSync(join(tmpdir(), 'mq-unreadable-feature-'));
     try {
       mkdirSync(join(root, 'scripts/lib'), { recursive: true });
       writeFileSync(join(root, 'scripts/lib/drain-queue-safety.mjs'),
         `export const decideMqSameHead = () => ({ hold: false, line: 'unreadable-log retry 1/1' });`);
-      expect(unreadableBreak.fixPresent(root)).toBe(true);
+      expect(unreadableBreak.fixPresent(root)).toBe(false);
       writeFileSync(join(root, 'scripts/lib/drain-queue-safety.mjs'),
         `export const decideMqSameHead = () => ({ hold: true, line: 'held' });`);
-      expect(unreadableBreak.fixPresent(root)).toBe(false);
+      expect(unreadableBreak.fixPresent(root)).toBe(true);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it.each(['second removal', 're-queued', 're-queued and failed again'])('holds after %s: the single unreadable-log retry is spent', kind => setup(f => {
+  it.each(['second removal', 're-queued', 're-queued and failed again'])('holds unreadable logs after %s', kind => setup(f => {
     f.events = kind === 'second removal' ? [removed(), removed()]
       : kind === 're-queued' ? [removed(), added] : [removed(), added, removed()];
     expectHeld(f);
@@ -240,13 +243,13 @@ describe('merge-queue same-head retry for unreadable failed-job logs', () => {
   it('holds when main CI is not green', () => setup(f => {
     f.mainRuns[0].conclusion = 'failure';
     expectHeld(f);
-    expect(declined(f).join('\n')).toContain('main CI is not green');
+    expect(declined(f).join('\n')).toContain('job log evidence unreadable or incomplete');
   }));
 
   it('holds when the PR is not CLEAN', () => setup(f => {
     f.live.mergeStateStatus = 'BEHIND';
     expectHeld(f);
-    expect(declined(f).join('\n')).toContain('PR is not CLEAN (BEHIND)');
+    expect(declined(f).join('\n')).toContain('job log evidence unreadable or incomplete');
   }));
 });
 

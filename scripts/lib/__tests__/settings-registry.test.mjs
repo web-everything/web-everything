@@ -240,6 +240,47 @@ test('--check refuses unequal fresh renders without writing the doc', t => {
 
 // Immutable compact snapshot captured before the per-key migration (not regenerated).
 const originalMetadata = JSON.parse(readFileSync(join(ROOT, 'scripts/lib/__tests__/fixtures/settings-registry-original.json'), 'utf8'));
+// Literal B1 oracle: never derive these declarations from the live metadata.
+const poolMetadata = {
+  settings: { resourcePool: {
+    description: 'S1a shadow studio ledger: builder floor and maxima; reserves validated for later slices. Enforce is refused as unknown.',
+    owner: 'scripts/settings/resource-pool.json', changeVia: 'pr', instant: false,
+    leaves: {
+      builderFloor: { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.builderFloor' },
+      'classes.1.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.1.reserve' },
+      'classes.1.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.1.max' },
+      'classes.2.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.2.reserve' },
+      'classes.2.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.2.max' },
+      'classes.3.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.3.reserve' },
+      'classes.3.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.3.max' },
+      'classes.4.reserve': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.4.reserve' },
+      'classes.4.max': { range: 'integer 0–64', unit: 'units', note: 'also instant via resourcePool.class.4.max' },
+      mode: { range: 'off | shadow | enforce', unit: 'mode', note: 'instant via resourcePool.mode enum override; enforce is refused as unknown in S1a' },
+    },
+  } },
+  capacityLeaves: {
+    'resourcePool.builderFloor': { description: 'Protected builder capacity floor in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.1.reserve': { description: 'Class 1 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.1.max': { description: 'Maximum units for class 1 repair work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.2.reserve': { description: 'Class 2 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.2.max': { description: 'Maximum units for class 2 review work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.3.reserve': { description: 'Class 3 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.3.max': { description: 'Maximum units for class 3 fix work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.4.reserve': { description: 'Class 4 reserve policy, validated and retained for later pool slices.', range: 'integer 0–64', unit: 'units' },
+    'resourcePool.class.4.max': { description: 'Maximum units for class 4 builder work in shadow allocation decisions.', range: 'integer 0–64', unit: 'units' },
+  },
+};
+const poolValue = { mode: 'shadow', builderFloor: 4, classes: {
+  1: { reserve: 2, max: 4, class1Overdraw: 2 }, 2: { reserve: 6, max: 8 },
+  3: { reserve: 2, max: 6 }, 4: { reserve: 4, max: 64 },
+} };
+const poolCapacityValues = {
+  'resourcePool.builderFloor': 4,
+  'resourcePool.class.1.reserve': 2, 'resourcePool.class.1.max': 4,
+  'resourcePool.class.2.reserve': 6, 'resourcePool.class.2.max': 8,
+  'resourcePool.class.3.reserve': 2, 'resourcePool.class.3.max': 6,
+  'resourcePool.class.4.reserve': 4, 'resourcePool.class.4.max': 64,
+};
 // Declarations from the same pre-migration commit (sourceCommit in the fixture).
 // Ignore top-level $comments, replace account IDs with placeholders, and excerpt
 // the privacy allowlist. Every rendered default and leaf count stays unchanged.
@@ -250,6 +291,8 @@ function originalFixture(t) {
   rmSync(join(f.root, 'scripts/settings/feature.json'));
   for (const [path, value] of Object.entries(originalDeclarations.files)) f.write(path, value);
   Object.assign(f.meta, structuredClone(originalMetadata));
+  // Capacity declarations come from live code even with historical owner files.
+  Object.assign(f.meta.capacityLeaves, structuredClone(poolMetadata.capacityLeaves));
   return f;
 }
 function split(f) {
@@ -266,10 +309,10 @@ test('per-key directory reconstructs exactly the original metadata JSON shape an
   assert.deepEqual(f.build(), before);
 });
 test('migration preserves the registry built from the original repository metadata JSON', t => {
-  const f = originalFixture(t), before = f.build();
+  const f = originalFixture(t), metadata = structuredClone(f.meta), before = f.build();
   assert.deepEqual(before.problems, []);
   split(f);
-  assert.deepEqual(readMetadata({ root: f.root }), originalMetadata);
+  assert.deepEqual(readMetadata({ root: f.root }), metadata);
   assert.deepEqual(f.build(), before);
 });
 test('migration preserves the current registry including shadow rotation and hotpatch settings', t => {
@@ -396,10 +439,26 @@ test('malformed names, unexpected entries and unreadable per-key JSON fail close
   assert.throws(() => renderMarkdown(f.build()), /settings-registry-metadata\.d\/settings\/broken.json/);
 });
 
+test('generated documentation includes the literal B1 resourcePool declarations', () => {
+  const registry = buildRegistry();
+  assert.deepEqual(registry.problems, []);
+  assert.deepEqual(registry.rows.find(row => row.key === 'resourcePool').value, poolValue);
+  for (const [key, value] of Object.entries(poolCapacityValues))
+    assert.equal(CAPACITY_LEAVES[key].failClosedFallback, value);
+  const metadata = readMetadata();
+  for (const section of ['settings', 'capacityLeaves'])
+    for (const [key, value] of Object.entries(poolMetadata[section])) assert.deepEqual(metadata[section][key], value);
+  const doc = renderMarkdown(registry);
+  assert.match(doc, /^\| resourcePool \|/m);
+  for (const key of Object.keys(poolCapacityValues)) assert.ok(doc.includes(key), key);
+});
+
 test('generated documentation preserves original bytes except the intentional per-key authoring instruction', t => {
   const f = originalFixture(t);
   split(f);
-  const doc = renderMarkdown(f.build());
+  const registry = f.build();
+  // Keep the byte oracle on its historical capacity roster; B1 has its own literal oracle above.
+  const doc = renderMarkdown({ ...registry, capacityRows: registry.capacityRows.filter(row => Object.hasOwn(originalMetadata.capacityLeaves, row.key)) });
   const originalInstruction = 'For repo defaults, edit the owner file through a PR and rebuild the consuming daemon. Add or update metadata in scripts/lib/settings-registry-metadata.json, then run `node scripts/lib/settings-registry.mjs --write`. Verify with `node scripts/lib/settings-registry.mjs --check`. Missing declarations or invalid evidence block generation; repair the named file before regenerating.';
   const original = doc.replace(/^For repo defaults,.*$/m, originalInstruction);
   assert.equal(createHash('sha256').update(original).digest('hex'), '239663dfb7c702b1f8cf475f1b8659d16fea92c2deaa92c027f3a67f5106cc8d');
