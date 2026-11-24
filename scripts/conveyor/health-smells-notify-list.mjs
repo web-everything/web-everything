@@ -43,6 +43,7 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   'duplicate-live-sessions',    // already approved above too — listed once, a Set
   'draft-not-promoted',       // Operator duration policy, 2026-10-01 (#xyx5mea).
   'red-pr-unattended',
+  'red-team-pending-overdue', // REDTEAM-STUCK-PENDING: pending for 2x the max pending time.
   'repeated-pr-attempts', // Operator rule, 2026-09-30: surface repeated trials per PR.
   'pr-no-owner',
   // Operator order R437, 2026-11-02: PR movement and stage stalls notify in shadow.

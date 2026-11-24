@@ -13,7 +13,7 @@ import {
   maintainCloneObjects, cloneHasObjectBorrowers, cloneGitIsBusy, decideSelfSync, selfSyncCheckout, withSelfSync, readHeadSha, readOriginRefSha,
   DAEMON_SELF_SYNC_BRANCH_ENV, resolvePocSyncBranch, decidePocSelfSync, selfSyncCheckoutPoc,
   isSafeBranchName, decideRestart, collectImportClosure, changedFilesBetween, resolveRestartMinIntervalMs,
-  DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks,
+  DEFAULT_RESTART_MIN_INTERVAL_MS, resolveMaxAdoptWaitTicks, staleRefusalBehind, loadStaleUrgentSettings,
 } from '../daemon-self-sync.mjs';
 import { assertMainNotStale, isStaleMainRefusalMessage } from '../main-staleness.mjs';
 import { acquireRead, releaseRead, acquireWrite, releaseWrite, inspectCloneLock } from '../daemon-clone-lock.mjs';
@@ -1482,4 +1482,52 @@ setTimeout(() => { writeFileSync(process.env.PACK_FALLBACK_FILE, 'reached'); pro
       expect(exec).not.toHaveBeenCalled();
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+
+describe('STALE refusal urgency', () => {
+  it('loads the shipped urgency threshold of 10', () => {
+    expect(loadStaleUrgentSettings()).toBe(10);
+  });
+  const refusal = n => `STALE code from this checkout: ${n} commit(s) behind origin/main`;
+  it('parses the max stale count across failed and repos, ignoring other errors and malformed counts', () => {
+    expect(staleRefusalBehind({ failed: [{ error: refusal(12) }, { error: refusal(3) }],
+      repos: [{ error: refusal(27) }, { error: '999 commit(s) behind origin/main' }] })).toBe(27);
+    for (const result of [undefined, {}, { failed: [{ error: refusal('?') }, { error: null }] },
+      ...[-11, '0.11', '11.11', Number.MAX_SAFE_INTEGER + 1].map(n => ({ failed: [{ error: refusal(n) }] }))]) {
+      expect(staleRefusalBehind(result)).toBe(0);
+    }
+  });
+  it.each([undefined, -1, 1.5, '20', Number.MAX_SAFE_INTEGER + 1, 0, 20])(
+    'loads threshold %s with fail-closed urgency and provenance', value => {
+      const dir = mkdtempSync(join(tmpdir(), 'stale-settings-'));
+      try {
+        const path = join(dir, 'settings.json'), log = vi.fn();
+        writeFileSync(path, JSON.stringify({ staleUrgent: { behindThreshold: value } }));
+        const expected = Number.isSafeInteger(value) && value >= 0 ? value : Infinity;
+        expect(loadStaleUrgentSettings(path, { log })).toBe(expected);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining(`behindThreshold=${expected}`));
+        expect(loadStaleUrgentSettings(join(dir, 'missing'), { log })).toBe(Infinity);
+        expect(99 > loadStaleUrgentSettings(dir, { log })).toBe(false);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('urgency disabled, ordinary spaced rebuilds remain available'));
+        writeFileSync(path, '{');
+        expect(loadStaleUrgentSettings(path, { log })).toBe(Infinity);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  it.each([[0, false, false], [10, false, false], [11, false, true], [99, true, false]])(
+    'behind=%s yielded=%s requests urgent=%s only for a large stale refusal', async (behind, yielded, urgent) => {
+      const result = { failed: behind ? [{ error: refusal(behind) }] : [], yieldedForAdoption: yielded };
+      const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
+      const log = { error: vi.fn() };
+      const w = withSelfSync({ tickOnce: () => result }, {
+        root: '/x', env: {}, rebuild, log, onRestart: vi.fn(), background: false, versions: null,
+        acquireRead: () => ({ ok: true }), releaseRead: vi.fn(),
+        readState: () => ({ adopted: null, rejected: null, inProgress: null, quarantine: null }),
+        hasStaleRefusal: r => r.failed.some(x => isStaleMainRefusalMessage(x.error)),
+      });
+      await expect(w.tickOnce()).resolves.toBe(result);
+      expect(rebuild.mock.calls).toEqual(behind || yielded ? [[], urgent ? [{ urgent: true }] : []] : [[]]);
+      if (urgent) expect(log.error).toHaveBeenCalledWith(
+        'daemon-self-sync: STALE refusal with 11 commits behind (> 10) — requesting an urgent rebuild job (spacing bypassed)');
+    });
 });
