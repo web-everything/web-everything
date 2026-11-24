@@ -1,14 +1,17 @@
 /**
  * PR tripwire: shared text rules inspect added lines (raw and decoded); structure
- * rules inspect whole new blobs, preserving bytes. Exact path+rule exemptions
+ * rules inspect whole new blobs, preserving bytes. Exact path+rule+sha256 exemptions
  * require a reviewed reason in the trusted scanner's allowlist.
  * Non-claims: secrets split across lines; token formats absent from secretText;
  * base64/UTF-16 wrapped tokens; keys inside archives or in untouched files;
  * secrets added then removed across commits (only the net PR diff is scanned).
+ * Bootstrap non-claim: when the base has no scanner (first merge), the job runs
+ * the PR copy. After this merges, the base copy runs, so a PR cannot swap the scanner.
  * The workflow covers pull_request, not push or merge_group. This script cannot
  * establish whether secret-scan is a required ruleset check; operators must verify.
  */
-import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +19,7 @@ import { keyStructureFinding } from '../readiness/forge-key-structure.mjs';
 import { secretText } from '../readiness/forge-exec-manifest.mjs';
 
 export { secretText };
-const structuralRules = ['private-key-structure', 'private-key-scan-budget-exhausted-use-local', 'unscanned-oversize'];
+const structuralRules = ['private-key-structure', 'unscanned-oversize'];
 const LIMIT = 32 * 1024 * 1024;
 const FILE_LIMIT = 2 * 1024 * 1024;
 const incomplete = () => new Error('secret-scan: incomplete input; review the full diff manually and rerun with valid input (500 files, 32 MiB per git output maximum)');
@@ -29,16 +32,20 @@ function loadAllowlist(path) {
     || typeof entry.path !== 'string' || !entry.path || /[*?\[\]\\\x00-\x1f]/.test(entry.path)
     || entry.path.startsWith('/') || entry.path.split('/').some(part => !part || part === '.' || part === '..')
     || (!secretText.some(([, rule]) => entry.rule === rule) && !structuralRules.includes(entry.rule))
+    || typeof entry.sha256 !== 'string' || !/^[a-f\d]{64}$/i.test(entry.sha256)
     || typeof entry.reason !== 'string' || !entry.reason.trim()
-    || Object.keys(entry).some(key => !['path', 'rule', 'reason'].includes(key)))) {
-    throw new Error('secret-scan: invalid allowlist; require exact path, known rule and non-empty reason');
+    || Object.keys(entry).some(key => !['path', 'rule', 'sha256', 'reason'].includes(key)))) {
+    throw new Error('secret-scan: invalid allowlist; require exact path, known rule, 64-hex sha256 and non-empty reason');
   }
   return entries;
 }
 
 function decodedLine(text) {
-  return text.replace(/\\u([\da-f]{4})|\\x([\da-f]{2})|%([0-7][\da-f])/gi,
-    (_, unicode, hex, percent) => String.fromCharCode(parseInt(unicode ?? hex ?? percent, 16)));
+  return text.replace(/\\u\{([\da-f]{1,6})\}|\\u([\da-f]{4})|\\x([\da-f]{2})|%([0-7][\da-f])/gi,
+    (whole, point, unicode, hex, percent) => {
+      const code = parseInt(point ?? unicode ?? hex ?? percent, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+    });
 }
 
 function safePath(path) {
@@ -120,7 +127,7 @@ export function addedLines(diff) {
   return result;
 }
 
-function scan(options, allowlist) {
+async function scan(options, allowlist) {
   const git = args => {
     try {
       return execFileSync('git', ['--literal-pathspecs', '-C', options.repo, ...args], {
@@ -134,21 +141,49 @@ function scan(options, allowlist) {
   const hits = [];
   for (const { path, mode, sha, status } of files) {
     if (status === 'D' || mode === '160000') continue;
+    const size = git(['cat-file', '-s', sha]).toString('ascii');
+    if (!/^(0|[1-9]\d*)\n$/.test(size) || !Number.isSafeInteger(Number(size))) throw incomplete();
+    const oversize = Number(size) > FILE_LIMIT;
+    const bytes = oversize ? null : git(['cat-file', 'blob', sha]);
+    if (bytes && bytes.length !== Number(size)) throw incomplete();
+    let digest;
+    if (bytes) digest = createHash('sha256').update(bytes).digest('hex');
+    else if (allowlist.some(entry => entry.path === path)) {
+      // Hash oversized blobs as a stream; never buffer them or pass them to the structure scan.
+      const child = spawn('git', ['--literal-pathspecs', '-C', options.repo, 'cat-file', 'blob', sha], {
+        timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const done = new Promise(resolve => {
+        child.on('error', () => resolve(false));
+        child.on('close', code => resolve(code === 0));
+      });
+      const hash = createHash('sha256');
+      let length = 0;
+      try {
+        for await (const chunk of child.stdout) {
+          length += chunk.length;
+          if (length > Number(size)) { child.kill(); throw incomplete(); }
+          hash.update(chunk);
+        }
+      } catch { child.kill(); throw incomplete(); }
+      if (!await done || length !== Number(size)) throw incomplete();
+      digest = hash.digest('hex');
+    }
     const report = (rule, line = 0) => {
-      if (!allowlist.some(entry => entry.path === path && entry.rule === rule)) {
+      if (rule === 'private-key-scan-budget-exhausted-use-local'
+        || !allowlist.some(entry => entry.path === path && entry.rule === rule && entry.sha256.toLowerCase() === digest)) {
         hits.push(`${safePath(path)}:${line} ${rule}`);
       }
     };
-    const size = git(['cat-file', '-s', sha]).toString('ascii');
-    if (!/^(0|[1-9]\d*)\n$/.test(size) || !Number.isSafeInteger(Number(size))) throw incomplete();
-    if (Number(size) > FILE_LIMIT) {
-      report('unscanned-oversize');
-      continue;
+    for (const [pattern, textRule] of secretText) {
+      pattern.lastIndex = 0;
+      if (pattern.test(path)) report(textRule);
     }
-    const bytes = git(['cat-file', 'blob', sha]);
-    if (bytes.length !== Number(size)) throw incomplete();
-    const rule = keyStructureFinding(bytes);
-    if (rule) report(rule);
+    if (oversize) report('unscanned-oversize');
+    else {
+      const rule = keyStructureFinding(bytes);
+      if (rule) report(rule);
+    }
     // --text also exposes binary additions: NUL bytes must not hide credentials.
     const diff = git(['diff', '-U0', '--text', ...flags, range, '--', path]);
     for (const { line, text } of addedLines(diff)) {
@@ -170,10 +205,10 @@ export async function main(args = process.argv.slice(2)) {
         options[args[i].slice(2)] = args[++i];
       } else throw new Error('secret-scan: invalid arguments');
     }
-    const hits = scan(options, loadAllowlist(options.allowlist));
+    const hits = await scan(options, loadAllowlist(options.allowlist));
     if (hits.length) process.stdout.write(hits.join('\n') + '\n');
     if (hits.some(hit => hit.endsWith(' unscanned-oversize'))) {
-      process.stderr.write('secret-scan: review oversize files manually; exempt only with an exact path+rule allowlist entry and a reason\n');
+      process.stderr.write('secret-scan: review oversize files manually; exempt only with an exact path+rule+sha256 allowlist entry and a reason\n');
     }
     return hits.length ? 1 : 0;
   } catch (error) {

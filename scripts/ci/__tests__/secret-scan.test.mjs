@@ -2,6 +2,7 @@
 // Register with CI's runner while retaining the standalone node --test entrypoint.
 const { afterEach, test } = process.env.VITEST
   ? await import('vitest') : await import('node:test');
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -51,7 +52,8 @@ function repo(initial = {}) {
   };
   return { dir, git, put, commit, base, scan };
 }
-const exemption = (path, rule) => ({ path, rule, reason: 'Obviously fake scanner fixture, reviewed for this test' });
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const exemption = (path, rule, bytes = token) => ({ path, rule, sha256: sha256(bytes), reason: 'Obviously fake scanner fixture, reviewed for this test' });
 const privateJwk = '{"kty":"RSA","d":"FAKE_TEST_ONLY"}';
 
 test('DER private key added as binary preserves NUL, CR, LF and invalid UTF-8 bytes', () => {
@@ -90,13 +92,13 @@ for (const ordinary of ['{"p":"Paragraph"}', "{k:'click'}"]) test(`ordinary obje
 test('allowlisted fixture renamed to a different path is fully scanned', () => {
   const r = repo({ 'fixture.json': privateJwk });
   renameSync(join(r.dir, 'fixture.json'), join(r.dir, 'moved.json')); r.commit();
-  assert.equal(r.scan([exemption('fixture.json', 'private-key-structure')]).status, 1);
+  assert.equal(r.scan([exemption('fixture.json', 'private-key-structure', privateJwk)]).status, 1);
 });
 test('3 MiB lockfile requires an exact oversize exemption with a reason', () => {
   const r = repo(); r.put('package-lock.json', ' '.repeat(3 * 1024 * 1024)); r.commit();
   assert.equal(r.scan().stdout, 'package-lock.json:0 unscanned-oversize\n');
   assert.equal(r.scan().status, 1);
-  assert.equal(r.scan([exemption('package-lock.json', 'unscanned-oversize')]).status, 0);
+  assert.equal(r.scan([exemption('package-lock.json', 'unscanned-oversize', ' '.repeat(3 * 1024 * 1024))]).status, 0);
   assert.equal(r.scan([exemption('other.json', 'unscanned-oversize')]).status, 1);
   assert.equal(r.scan([{ path: 'package-lock.json', rule: 'unscanned-oversize', reason: '' }]).status, 1);
 });
@@ -108,7 +110,7 @@ test('token plus newline in filename is parsed and path redacted', () => {
   const r = repo(); r.put(token + '\n.txt', aws); r.commit();
   const result = r.scan();
   assert.equal(result.status, 1);
-  assert.equal(result.stdout, '[redacted-path]:1 aws-access-key\n');
+  assert.equal(result.stdout, '[redacted-path]:0 github-token\n[redacted-path]:1 aws-access-key\n');
 });
 test('bad base ref and hunk-count mismatch fail closed without source echo', () => {
   const r = repo(); r.put('source.txt', token); r.commit();
@@ -165,7 +167,7 @@ test('uses identical shared rules and reports each raw or encoded token without 
     assert.equal(r.scan().status, 1);
     assert.match(r.scan().stdout, /fixture.txt:1 github-token/);
     if (encoding === 'raw') assert.match(r.scan().stdout, /aws-access-key/);
-    assert.equal(r.scan([exemption('fixture.txt', 'github-token')]).status, encoding === 'raw' ? 1 : 0);
+    assert.equal(r.scan([exemption('fixture.txt', 'github-token', text)]).status, encoding === 'raw' ? 1 : 0);
   }
 });
 test('removed/context tokens are ignored; header-like added text is scanned', () => {
@@ -181,7 +183,7 @@ test('exact Unicode paths match exemptions and control characters are escaped', 
 test('whole-file exemptions are exact and deleted files are ignored', () => {
   const r = repo({ 'removed.json': privateJwk });
   rmSync(join(r.dir, 'removed.json')); r.put('fixture.json', privateJwk); r.commit();
-  assert.equal(r.scan([exemption('fixture.json', 'private-key-structure')]).status, 0);
+  assert.equal(r.scan([exemption('fixture.json', 'private-key-structure', privateJwk)]).status, 0);
   assert.equal(r.scan([exemption('fixture.json', 'github-token')]).status, 1);
 });
 test('literal pathspecs cannot hide a token in a bracket or wildcard filename', () => {
@@ -201,7 +203,7 @@ test('shipped allowlist covers only the fake structural fixture path and rule', 
   const source = readFileSync(new URL('./secret-scan.test.mjs', import.meta.url));
   assert.equal(keyStructureFinding(source), 'private-key-structure');
   const { entries } = JSON.parse(readFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), 'utf8'));
-  assert.ok(entries.some(e => e.path === 'scripts/ci/__tests__/secret-scan.test.mjs' && e.rule === 'private-key-structure' && e.reason.trim()));
+  assert.ok(entries.some(e => e.path === 'scripts/ci/__tests__/secret-scan.test.mjs' && e.rule === 'private-key-structure' && e.sha256 === sha256(source) && e.reason.trim()));
 });
 test('text attributes cannot hide tokens and PR scanner/config copies are ignored', () => {
   const r = repo(); r.put('.gitattributes', '*.dat -diff\n'); r.put('hidden.dat', aws);
@@ -245,11 +247,64 @@ test('workflow remains compatible with the pre-change trusted scanner', () => {
     mkdirSync(join(r.dir, 'trusted/scripts/ci'), { recursive: true }); mkdirSync(join(r.dir, 'trusted/scripts/readiness'), { recursive: true });
     copyFileSync(new URL('./fixtures/secret-scan-pre-repo.txt', import.meta.url), join(r.dir, 'trusted/scripts/ci/secret-scan.mjs'));
     // Pair the historical scanner with its text-only allowlist schema.
-    const historicalEntries = JSON.parse(readFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), 'utf8')).entries.filter(entry => sharedRules.some(([, rule]) => rule === entry.rule));
+    const historicalEntries = JSON.parse(readFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), 'utf8')).entries.filter(entry => sharedRules.some(([, rule]) => rule === entry.rule)).map(({ sha256, ...entry }) => entry);
     writeFileSync(join(r.dir, 'trusted/scripts/ci/secret-scan-allowlist.json'), JSON.stringify(historicalEntries));
     for (const name of ['forge-exec-manifest.mjs', 'forge-key-structure.mjs']) copyFileSync(new URL('../../readiness/' + name, import.meta.url), join(r.dir, 'trusted/scripts/readiness', name));
     const result = spawnSync('bash', ['-e', '-c', workflow.jobs['secret-scan'].steps.find(s => s.run).run], { cwd: r.dir, env: { ...process.env, BASE_SHA: r.base, HEAD_SHA: 'HEAD' }, encoding: 'utf8', timeout: 10_000 });
     assert.equal(result.status, credential ? 1 : 0); assert.equal(result.stderr, '');
     assert.equal(result.stdout, credential ? 'fixture.txt:1 github-token\n' : '');
   }
+});
+
+test('oversize exemption skips structure scanning but still rejects added tokens', () => {
+  const padding = ' '.repeat(3 * 1024 * 1024) + '\n';
+  const r = repo({ 'large.txt': padding });
+  const content = padding + token + '\n';
+  r.put('large.txt', content); r.commit();
+  const result = r.scan([exemption('large.txt', 'unscanned-oversize', content)]);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, 'large.txt:2 github-token\n');
+});
+test('scanner budget exhaustion fails and cannot be allowlisted', () => {
+  const content = '['.repeat(65) + ']'.repeat(65);
+  const r = repo(); r.put('nested.json', content); r.commit();
+  const result = r.scan();
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, 'nested.json:0 private-key-scan-budget-exhausted-use-local\n');
+  const exempt = r.scan([exemption('nested.json', 'private-key-scan-budget-exhausted-use-local', content)]);
+  assert.equal(exempt.status, 1); assert.match(exempt.stderr, /invalid allowlist/);
+});
+test('exemptions pin committed blob bytes and refuse a changed blob', () => {
+  const r = repo(); r.put('fixture.txt', token); r.commit();
+  const entry = exemption('fixture.txt', 'github-token', token);
+  assert.equal(r.scan([entry]).status, 0);
+  r.put('fixture.txt', token + ' changed'); r.commit();
+  // A worktree copy matching the old digest cannot exempt the committed blob.
+  r.put('fixture.txt', token);
+  const result = r.scan([entry]);
+  assert.equal(result.status, 1); assert.equal(result.stdout, 'fixture.txt:1 github-token\n');
+});
+test('missing, malformed sha256 and unknown allowlist keys fail closed', () => {
+  const r = repo(); r.put('fixture.txt', token); r.commit();
+  const entry = exemption('fixture.txt', 'github-token');
+  const { sha256: omitted, ...missing } = entry;
+  for (const invalid of [missing, ...['', 'a'.repeat(63), 'g'.repeat(64), 123].map(sha256 => ({ ...entry, sha256 })), { ...entry, extra: true }]) {
+    const result = r.scan([invalid]);
+    assert.equal(result.status, 1); assert.match(result.stderr, /invalid allowlist/);
+  }
+});
+for (const form of ['point', 'unicode', 'hex', 'mixed']) test(`escaped token decoded from ${form} fails`, () => {
+  const r = repo();
+  const forms = [c => '\\u{' + c.codePointAt(0).toString(16) + '}',
+    c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'),
+    c => '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0')];
+  const content = [...token].map((c, i) => forms[form === 'mixed' ? i % 3 : ['point', 'unicode', 'hex'].indexOf(form)](c)).join('');
+  r.put('escaped.txt', content); r.commit();
+  const result = r.scan(); assert.equal(result.status, 1);
+  assert.match(result.stdout, /escaped.txt:1 github-token/);
+});
+test('token in filename alone fails and the reported path is redacted', () => {
+  const r = repo(); r.put(token + '.txt', 'clean'); r.commit();
+  const result = r.scan(); assert.equal(result.status, 1);
+  assert.equal(result.stdout, '[redacted-path]:0 github-token\n');
 });
