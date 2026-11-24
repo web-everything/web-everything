@@ -37,7 +37,7 @@ describe('bot-owned timings', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
       writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nprocess.exit(1);\n`, { mode: 0o755 });
-      expect(cli({ GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_REF: 'lane/test', PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+      expect(cli({ GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_REF: 'lane/test', HEAD_SHA: SHA, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('CLI reads the file list from the API and rejects a non-bot edit', () => {
@@ -55,10 +55,13 @@ describe('bot-owned timings', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   // Fake gh: the pulls/files answer is stale (carries a bot refresh already in main); the compare answer is the merge-base diff.
-  const fakeGh = (dir, { compare, pullFiles = `a.txt\\0\\n${file}\\0\\n`, compareFails = false }) => writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+  const MB = 'c'.repeat(40);
+  const fakeGh = (dir, { compare, pullFiles = `a.txt\\0\\n${file}\\0\\n`, compareFails = false, blobs = ['x', 'x'] }) => writeFileSync(join(dir, 'gh'), `#!${process.execPath}
 const a = process.argv.join(' ');
 if (a.includes('.head.sha')) process.stdout.write('${SHA}\\n');
 else if (a.includes('.base.ref')) process.stdout.write('main\\n');
+else if (a.includes('.merge_base_commit.sha')) process.stdout.write('${MB}\\n');
+else if (a.includes('/contents/')) process.stdout.write(a.includes('ref=${MB}') ? '${blobs[0]}\\n' : '${blobs[1]}\\n');
 else if (a.includes('/compare/')) { ${compareFails ? 'process.exit(1);' : `process.stdout.write('${compare}');`} }
 else process.stdout.write('${pullFiles}');
 `, { mode: 0o755 });
@@ -81,6 +84,23 @@ else process.stdout.write('${pullFiles}');
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
       fakeGh(dir, { compare: '', compareFails: true, pullFiles: 'a.txt\\0\\n' });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed on an empty compare answer', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: '' });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a truncated 300-file compare falls back to the timings blob at merge-base vs head', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    const many = Array.from({ length: 300 }, (_, i) => `f${i}.txt\\0\\n`).join('');
+    try {
+      fakeGh(dir, { compare: many, blobs: ['x', 'x'] });
+      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(0);
+      fakeGh(dir, { compare: many, blobs: ['x', 'y'] });
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

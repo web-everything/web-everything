@@ -9,6 +9,8 @@ const OWNER = '.github/workflows/ci-timings-refresh.yml';
 const BOT_AUTHORS = ['web-everything[bot]', 'github-actions[bot]'];
 /** The PR files API stops at 3000 files; at or past that the list is not complete evidence. */
 export const API_FILE_CAP = 3000;
+/** The compare API returns at most 300 files; at that size the list may be truncated. */
+export const COMPARE_FILE_CAP = 300;
 
 export function checkTimingsBotOnly({ changedFiles, headRef, author, headRepo, repo }) {
   if (!Array.isArray(changedFiles) || !changedFiles.every(file => typeof file === 'string')) {
@@ -50,7 +52,20 @@ function main() {
       '--jq', '.files[] | (.filename, (.previous_filename // empty)) + "\\u0000"'], {
       encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const result = checkTimingsBotOnly({ changedFiles: out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean), headRef: HEAD_REF, author: AUTHOR, headRepo: HEAD_REPO, repo: REPO });
+    let changedFiles = out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean);
+    // A PR always changes something: empty output is not evidence.
+    if (changedFiles.length === 0) throw new Error('Empty compare answer');
+    if (changedFiles.length >= COMPARE_FILE_CAP) {
+      // The compare file list truncates at 300; prove the one file directly: its blob at the merge-base vs at the head.
+      const gh = args => execFileSync('gh', ['api', ...args], { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+      const mergeBase = gh([`repos/${REPO}/compare/${baseRef}...${HEAD_SHA}`, '--jq', '.merge_base_commit.sha']);
+      if (!/^[a-f0-9]{40,64}$/i.test(mergeBase)) throw new Error('Unreadable merge-base');
+      const blob = ref => gh([`repos/${REPO}/contents/${FILE}?ref=${ref}`, '--jq', '.sha']);
+      const [atBase, atHead] = [blob(mergeBase), blob(HEAD_SHA)];
+      if (!atBase || !atHead) throw new Error('Unreadable timings blob');
+      changedFiles = atBase === atHead ? ['(truncated compare; timings unchanged)'] : [FILE];
+    }
+    const result = checkTimingsBotOnly({ changedFiles, headRef: HEAD_REF, author: AUTHOR, headRepo: HEAD_REPO, repo: REPO });
     process[result.ok ? 'stdout' : 'stderr'].write(`${result.message}\n`);
     return result.ok ? 0 : 1;
   } catch {
