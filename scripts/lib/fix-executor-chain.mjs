@@ -1,5 +1,7 @@
 /** Configurable repair escalation rungs; launcher availability is supplied by the caller. */
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { ROUTED_CODEX_MAX_UNPRODUCTIVE } from './fix-slot-borrow.mjs';
@@ -15,9 +17,20 @@ export const FIX_EXECUTOR_RUNGS = Object.freeze({
   argon: rung('argon', 'antigravity', { provider: 'antigravity', model: 'gemini-4-argon-high' }),
   claude: rung('claude', 'claude'),
 });
-export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(['codex', 'codex-alt', 'claude']);
+const defaults = (() => {
+  try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../settings/fix-executor.json'), 'utf8'))?.fixExecutor ?? {}; }
+  catch { return {}; }
+})();
+const normalize = value => Array.isArray(value) ? value.map(id => id === 'gemini' ? 'argon' : id) : value;
 const valid = value => Array.isArray(value) && value.length > 0 && value.at(-1) === 'claude'
-  && new Set(value).size === value.length && value.every(id => Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
+  && new Set(value).size === value.length && value.every(id => typeof id === 'string' && Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
+const fallbackSeatMix = Object.freeze(['codex', 'codex-alt', 'gemini', 'claude']);
+export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(normalize(valid(normalize(defaults.fixSeatMix)) ? defaults.fixSeatMix : fallbackSeatMix));
+const validCriticalGlobs = value => Array.isArray(value) && value.length > 0
+  && value.every(glob => typeof glob === 'string' && !!glob.trim());
+// Unavailable policy must still require review: conservatively treat every path as critical.
+const fallbackCriticalGlobs = Object.freeze(['**']);
+const defaultCriticalGlobs = validCriticalGlobs(defaults.criticalGlobs) ? defaults.criticalGlobs : fallbackCriticalGlobs;
 const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
@@ -25,6 +38,18 @@ const platformPreferences = () => {
 /** Resolve each repair kind independently; a fix-filtered suffix cannot be reused for CI-heal. */
 export function resolveRepairExecutorChains(options = {}) {
   return Object.fromEntries(['fix', 'ci-heal'].map(kind => [kind, resolveFixExecutorChain({ ...options, kind })]));
+}
+
+/** One invocation-mode resolver for both repair roles; cascade logging includes effective sources. */
+export function resolveFixExecutionMode({ env = process.env, platform = platformPreferences(), repo = readDeclaredSettings().settings, kind = 'fix' } = {}) {
+  const valid = value => ['direct', 'wrapped'].includes(value);
+  const base = cascadePolicy('fixExecutor.executionMode', repo?.fixExecutor?.executionMode, { standard:'direct', platform:platform?.fixExecutor?.executionMode, env, envValues:{'':env.WE_FIX_EXECUTOR_EXECUTION_MODE}, valid });
+  const role = cascadePolicy(`fixExecutor.executionModeByRole.${kind}`, repo?.fixExecutor?.executionModeByRole?.[kind], { standard:base.value, platform:platform?.fixExecutor?.executionModeByRole?.[kind], env, valid });
+  return { mode:role.value, modeSource:role.sources[''] === 'standard' ? base.sources[''] : role.sources[''] };
+}
+export function resolveFixCriticalGlobs({ env = process.env, platform = platformPreferences(), repo = readDeclaredSettings().settings } = {}) {
+  return cascadePolicy('fixExecutor.criticalGlobs', repo?.fixExecutor?.criticalGlobs, { standard:defaultCriticalGlobs, platform:platform?.fixExecutor?.criticalGlobs, env,
+    valid:validCriticalGlobs }).value;
 }
 
 export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting, kind = 'fix', capacity, now = Date.now(), quota, records, record } = {}) {
@@ -38,8 +63,8 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
     catch { /* invalid env leaves the previous layer intact */ }
   }
   let result = { value: [...FIX_EXECUTOR_CHAIN_DEFAULT], source: 'default' };
-  for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain], ['repo', repo?.fixExecutor?.fallbackChain], ['aiRouting', aiRouting], ['env', rawEnv]]) {
-    if (valid(value)) result = { value: [...value], source };
+  for (const [source, value] of [['platform', platform?.fixExecutor?.fallbackChain ?? platform?.fixExecutor?.fixSeatMix], ['repo', repo?.fixExecutor?.fallbackChain ?? repo?.fixExecutor?.fixSeatMix], ['aiRouting', aiRouting], ['env', rawEnv]]) {
+    if (valid(normalize(value))) result = { value: [...normalize(value)], source };
   }
   // routing.builder=claude (or auto over the quota threshold) drops the codex rungs from every layer, env included.
   // To use Codex again set routing.builder=codex (or WE_ROUTING_BUILDER=codex); a chain alone cannot override it.
@@ -84,31 +109,15 @@ export function resolveFixExecutorChain({ env = process.env, platform = platform
     const kept = result.value.filter(id => FIX_EXECUTOR_RUNGS[id].executor !== 'codex');
     result = { value: kept, source: `${result.source}+routing.builder` };
   }
-  const rawCritical = env?.WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG;
-  const validCritical = value => Number.isSafeInteger(value) && value >= 1;
-  const scalarCritical = value => validCritical(value) ? value : undefined;
-  const critical = cascadePolicy('fixExecutor.criticalClaudeFromRung', scalarCritical(repo?.fixExecutor?.criticalClaudeFromRung), {
-    standard: 2, platform: scalarCritical(platform?.fixExecutor?.criticalClaudeFromRung) ?? null, env,
-    envValues: { '': typeof rawCritical === 'string' && /^\d+$/.test(rawCritical.trim()) ? Number(rawCritical) : undefined },
-    valid: validCritical,
-  });
-  const criticalSource = { standard: 'default', tool: 'repo' }[critical.sources['']] ?? critical.sources[''];
-  return { ...result, criticalClaudeFromRung: critical.value, criticalClaudeFromRungSource: criticalSource };
+  return { ...result, ...resolveFixExecutionMode({env,platform,repo,kind}), criticalGlobs:resolveFixCriticalGlobs({env,platform,repo}) };
 }
 
 export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, rungs = {}, trigger = null, codexUnproductive = 0,
-  critical = false, criticalClaudeFromRung = 2, criticalSource = 'default', launcherAvailable = () => true }) {
-  if (critical && ['takeover', 'ruling-not-addressed'].includes(trigger)
-    && (!chain.includes('claude') || !launcherAvailable('claude'))) {
-    return { executor: null, rung: null, reason: 'critical escalation requires Claude; Claude unavailable — wait for quota reset or clear provider hold', source: 'capacity' };
-  }
+  critical = false, launcherAvailable = () => true }) {
   if (!chain.length) return { executor: null, rung: null, reason: 'no eligible capacity; wait for quota reset or clear provider hold', source: 'capacity' };
   const unproductive = codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE;
   // Triggers and failure history describe the same progress: take their floor, never add them.
   const progress = Math.max(trigger ? 1 : 0, unproductive ? codexUnproductive - 1 : 0);
-  if (critical && progress >= criticalClaudeFromRung && !chain.includes('claude')) {
-    return { executor: null, rung: null, reason: 'critical escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
-  }
   if (unproductive && progress >= chain.length && !chain.includes('claude')) {
     return { executor: null, rung: null, reason: 'unproductive escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
   }
@@ -116,24 +125,17 @@ export function pickChainRung({ chain = FIX_EXECUTOR_CHAIN_DEFAULT, rungs = {}, 
   const prefix = trigger === 'takeover' ? 'takeover round' : trigger === 'ruling-not-addressed' ? 'ruling-not-addressed send-back'
     : unproductive ? `codex unproductive on this head (${codexUnproductive} unproductive runs)`
       : trigger === 'stronger-model' ? 'stronger-model rung' : 'codex-first ordinary repair';
-  const skips = [];
   const definition = id => Object.hasOwn(rungs, id) ? rungs[id] : FIX_EXECUTOR_RUNGS[id];
+  const skips = chain.slice(0,index).filter(id=>definition(id).executor === 'antigravity' && !launcherAvailable('antigravity')).map(()=> 'gemini skipped: no admitted fix path');
   while (index < chain.length && chain[index] !== 'claude' && !launcherAvailable(definition(chain[index]).executor)) {
-    skips.push(`${chain[index]} launcher unavailable, fallback`);
+    skips.push(`${chain[index]} launcher unavailable, fallback${chain[index] === 'argon' ? '; gemini skipped: no admitted fix path' : ''}`);
     index++;
   }
   if (index >= chain.length) return { executor: null, rung: null, reason: 'no available executor', source: 'capacity' };
-  if (critical && (trigger === 'takeover' || trigger === 'ruling-not-addressed')) {
-    return { executor: 'claude', rung: 'claude', reason: 'critical work never leaves Claude', source: 'default' };
-  }
-  if (critical && index >= criticalClaudeFromRung && !chain.includes('claude')) return { executor: null, rung: null,
-    reason: 'critical escalation requires Claude; Claude filtered out — wait for quota reset or clear provider hold', source: 'capacity' };
-  if (critical && index >= criticalClaudeFromRung) return { executor: 'claude', rung: 'claude',
-    reason: `critical work reaches Claude from rung ${criticalClaudeFromRung} (criticalClaudeFromRung=${criticalClaudeFromRung}, source=${criticalSource})`, source: 'default' };
   const selected = definition(chain[index]);
-  const reason = `${prefix} → ${selected.id === 'claude' ? 'falls back to Claude (chain exhausted)' : `chain rung ${index + 1}/${chain.length} ${selected.id}`}${skips.length ? `; ${skips.join('; ')}` : ''}${critical && selected.id !== 'claude' ? `; critical work stays on ${selected.id} below criticalClaudeFromRung=${criticalClaudeFromRung} (source=${criticalSource})` : ''}`;
+  const reason = `${prefix} → ${selected.id === 'claude' ? 'falls back to Claude (chain exhausted)' : `chain rung ${index + 1}/${chain.length} ${selected.id}`}${skips.length ? `; ${skips.join('; ')}` : ''}`;
   // Claude escalation uses its policy model even when its terminal capacity rung
   // was projected from an alias. Only ordinary work carries that alias's model.
   const policyRoute = selected.executor === 'claude' && progress > 0 ? null : selected.policyRoute;
-  return { executor: selected.executor, rung: selected.id, ...(policyRoute ? { policyRoute } : {}), reason, source: 'default' };
+  return { executor: selected.executor, rung: selected.id, ...(critical ? {requiresReview:true} : {}), ...(policyRoute ? { policyRoute } : {}), reason, source: 'default' };
 }

@@ -396,11 +396,22 @@ describe('tryResumeRoundFix', () => {
     expect(opts.prompt).toContain('New review round — PR #77');
     expect(opts.sessionCwdFor()).toBe('/scratch/x');
   });
-  it('declined: a critical round-3 fix cold-starts instead of resuming a Sonnet session', () => {
-    const resume = vi.fn();
+  it('a critical round-3 fix resumes its Sonnet session: critical scope no longer escalates the Claude model (PR 7384)', () => {
+    // Critical work runs the codex → codex-alt → gemini → claude ladder; its Claude rung uses the configured
+    // repair model (Sonnet), so a critical scope alone is no model escalation and does not force a cold start.
+    const resume = vi.fn(() => ({ resumed: true, result: { sessionId: SID, pr: 77, lane: null, resumed: true } }));
     const r = tryResumeRoundFix(planned({ attempts: 2, scope: ['we:scripts/lib/provider-routing.mjs'] }), { ...base, readInputs: () => ({ prior, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
+    expect(r.resumed).toBe(true);
+    expect(r.decision).toMatchObject({ resume: true, round: 3 });
+    expect(r.result).toMatchObject({ sessionId: SID, round: 3, roundResume: true });
+    expect(resume).toHaveBeenCalledTimes(1);
+    expect(resume.mock.calls[0][1].candidate).toBe(SID);
+  });
+  it('a critical round-3 fix still cold-starts a legacy Opus session (model mismatch with the Sonnet repair model)', () => {
+    const resume = vi.fn();
+    const r = tryResumeRoundFix(planned({ attempts: 2, scope: ['we:scripts/lib/provider-routing.mjs'] }), { ...base, readInputs: () => ({ prior, job: { ...job, respawnFlags: ['--model', 'opus'] }, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
     expect(r.resumed).toBe(false);
-    expect(r.resumeAttempt).toMatchObject({ attempted: false, refused: 'model-escalated', round: 3 });
+    expect(r.resumeAttempt).toMatchObject({ attempted: false, round: 3 });
     expect(resume).not.toHaveBeenCalled();
   });
   it('an ordinary round-3 fix resumes Sonnet, but cold-starts a legacy Opus session', () => {
