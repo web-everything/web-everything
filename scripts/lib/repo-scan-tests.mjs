@@ -20,6 +20,8 @@
  * Pure: no fs, no child_process. `scopedScanFiles` reads only the env it is handed.
  */
 
+import { isLintedScript } from './push-gate-lint.mjs';
+
 /** Env var carrying the changed-file list (JSON array of repo-relative paths) a `scope: 'files'` scanner honours. */
 export const SCAN_FILES_ENV = 'VERIFY_SCAN_FILES';
 
@@ -49,6 +51,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
     matches: (f) => f.startsWith('docs/agent/testing.d/'),
     inputs: ['scripts/__tests__/testing-notes-join.test.mjs', 'scripts/__tests__/fixtures/testing-notes-split-baseline.json',
       'scripts/lib/testing-notes-join.mjs', 'scripts/testing-notes.mjs', 'scripts/lib/rules-loader.cjs'],
+  },
+  {
+    test: 'scripts/__tests__/push-gate-boundary.test.mjs',
+    scope: 'files',
+    why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',
+    matches: isLintedScript,
+    inputs: ['scripts/lib/push-gate-lint.mjs', 'scripts/push-gate-allowlist.json', 'scripts/__tests__/push-gate-boundary.test.mjs'],
   },
   {
     test: 'scripts/__tests__/testing-notes-advisory.test.mjs',

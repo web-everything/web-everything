@@ -21,6 +21,16 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 
 describe('selectScanTests', () => {
+  it('selects scoped push boundaries for scripts and widens for rule or allowlist edits', () => {
+    const test = 'scripts/__tests__/push-gate-boundary.test.mjs';
+    for (const ext of ['mjs', 'js', 'cjs', 'ts', 'mts', 'cts']) {
+      expect(selectScanTests({ changedFiles: [`scripts/new.${ext}`] }).scoped.map(e => e.test)).toContain(test);
+    }
+    for (const path of ['scripts/push-gate-allowlist.json', 'scripts/lib/push-gate-lint.mjs', test]) {
+      expect(selectScanTests({ changedFiles: [path] }).widened.map(e => e.test)).toContain(test);
+    }
+    expect(selectScanTests({ changedFiles: ['scripts/__tests__/other.test.mjs'] }).scoped.map(e => e.test)).not.toContain(test);
+  });
   it('selects the testing notes scan for doc callers, guide targets, topics and rule inputs', () => {
     const test = 'scripts/__tests__/testing-notes-advisory.test.mjs';
     const entry = REPO_SCAN_TESTS.find(e => e.test === test);
@@ -183,7 +193,9 @@ describe('#3887 regression: a NEW file with a repo literal is caught by the veri
   const rel = 'scripts/lib/__verify-scan-regression-3887.mjs';
   // The violating file lives ONLY in a throwaway tree (VERIFY_SCAN_ROOT): written into the live scripts/lib it would be
   // visible, for the whole child vitest run, to any other worker scanning the real tree in parallel (PR #3890 review).
-  const run = (scanDir) => spawnSync('npx', ['vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
+  // Reuses the outer admission lease; standalone runs still enter the host queue.
+  const run = (scanDir) => spawnSync(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=900000', '--',
+    'npx', 'vitest', 'run', MULTI, '-t', 'keeps every scanned source', '--reporter=dot'], {
     cwd: root, encoding: 'utf8',
     env: { ...process.env, [SCAN_FILES_ENV]: JSON.stringify([rel]), [SCAN_ROOT_ENV]: scanDir },
   });
