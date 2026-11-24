@@ -82,10 +82,10 @@ describe('parseVitestFailures — a CI job log', () => {
   it('a summary naming more failed files than were parsed is not complete', () => {
     expect(parseVitestFailures(LOG.replace('1 failed', '2 failed')).complete).toBe(false);
   });
-  it('a suite that failed to load (`FAIL file [ file ]`) is still a failing file', () => {
+  it('a suite that failed to load (`FAIL file [ file ]`) cannot prove a quarantinable failure', () => {
     const f = parseVitestFailures(` FAIL  a/__tests__/x.test.mjs [ a/__tests__/x.test.mjs ]\n Test Files  1 failed | 3 passed (4)`);
-    expect(f.files).toEqual(['a/__tests__/x.test.mjs']);
-    expect(f.complete).toBe(true);
+    expect(f.files).toEqual([]);
+    expect(f.complete).toBe(false);
   });
   it('an unsafe path is never a test id', () => {
     expect(parseVitestFailures(' FAIL ../etc/x.test.mjs\n FAIL a/$(rm).test.mjs\n Test Files  2 failed').files).toEqual([]);

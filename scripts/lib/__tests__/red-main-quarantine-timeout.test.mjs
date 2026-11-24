@@ -23,7 +23,7 @@ function harness() {
   const readJobs = vi.fn(() => ({ failed: [{ id: 1, name: job }] }));
   function tick({ soft = limits.softMs, mixed = false, timeoutPolicy = policy, shadow = false, incomplete = false, run = 45080540441, now = Date.parse('2026-11-22T23:30:00Z'), error, count = 1, extra = {} } = {}) {
     const head = run.toString(16).padStart(40, '0');
-    const text = Array.from({ length: count }, (_, i) => `2026-11-22T23:25:07Z \x1b[31m FAIL \x1b[0m ${file} > 50 real daemon ticks: every invariant holds after every tick ${i}\n${error ?? `Error: Test timed out in ${soft}ms.`}\n`).join('') + `${mixed ? `FAIL ${file} > ordinary failure\nError: expected true\n` : ''}${incomplete ? '' : ' Test Files 1 failed | 2 passed'}`;
+    const text = Array.from({ length: count }, (_, i) => `2026-11-22T23:25:07Z \x1b[31m FAIL \x1b[0m ${file} > 50 real daemon ticks: every invariant holds after every tick ${i}\n${error ?? `Error: Test timed out in ${soft}ms.`}\n`).join('') + `${mixed ? `FAIL ${file} > ordinary failure\nAssertionError: expected true\n` : ''}${incomplete ? '' : ` Test Files 1 failed | 2 passed\n Tests ${count + (mixed ? 1 : 0)} failed`}`;
     return runSafetyNet({ dir, now, mode: { value: 'quarantine', source: 'test' }, live: !shadow, timeoutPolicy,
       settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS }, sources: {} },
       mainCiRuns: { runs: [{ databaseId: run, headSha: head, status: 'completed', conclusion: 'failure', createdAt: new Date(now).toISOString(), updatedAt: '2026-11-22T23:25:07Z', attempt: 1 }], failing: { runId: run, jobs: [job, 'daemon-soak'] }, priority: { prs: [99] } },
@@ -45,7 +45,7 @@ it.each([
 ])('%s never takes the immediate path and an empty red list alerts with WHY', (_, options) => {
   const h = harness(), out = h.tick(options);
   expect(out.plan.action).toBe('none'); expect(out.applied).toBe(false); expect(h.write).not.toHaveBeenCalled();
-  expect(h.lines()).toContainEqual(expect.objectContaining({ type: 'alert', why: out.plan.why }));
+  expect(h.lines()).toContainEqual(expect.objectContaining({ type: options.incomplete ? 'escalation' : 'alert', why: out.plan.why }));
   expect(h.log).toHaveBeenCalledWith(expect.stringContaining(out.plan.why));
 });
 it('hard timeout stays on red-main even if proof would otherwise be optional', () => {

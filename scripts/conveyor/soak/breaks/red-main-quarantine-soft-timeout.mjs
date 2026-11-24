@@ -15,7 +15,7 @@ const PROBE = (root) => `(async () => {
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const policy = JSON.parse(readFileSync(${JSON.stringify(join(root, 'scripts/settings/test-timeout-policy.json'))}, 'utf8'));
-  const text = '2026-11-22T23:25:07Z FAIL ' + ${JSON.stringify(FILE)} + ' > 50 real daemon ticks: every invariant holds after every tick\\nError: Test timed out in 1020000ms.\\n Test Files 1 failed | 2 passed';
+  const text = '2026-11-22T23:25:07Z FAIL ' + ${JSON.stringify(FILE)} + ' > 50 real daemon ticks: every invariant holds after every tick\\nError: Test timed out in 1020000ms.\\n Test Files 1 failed | 2 passed\\n Tests 1 failed';
   const dir = mkdtempSync(join(tmpdir(), 'soft-timeout-replay-'));
   try {
     const now = Date.parse('2026-11-22T23:26:00Z'), run = 45080540441;

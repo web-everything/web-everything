@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import * as q from '../../lib/red-main-quarantine.mjs';
 import { runSafetyNet, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
 import smell from '../health-smells/main-ci-red.mjs';
-import { parseTimeouts } from '../../lib/test-timeout-policy.mjs';
 
 const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs';
 const job = 'soak-shard (1)', now = Date.parse('2026-11-22T23:05:00Z');
@@ -14,7 +13,7 @@ const job = 'soak-shard (1)', now = Date.parse('2026-11-22T23:05:00Z');
 // File reporter line reconstructed from the prep; this is not the complete archived job log.
 const fragment = `❯ ${file} (1 test | 1 failed)\n  → Test timed out in 1020000ms.`;
 // Synthetic complete assertion log exercises repeat proof without timeout policy.
-const log = `FAIL ${file} > fails\nAssertionError: broken\nTest Files 1 failed`;
+const log = `FAIL ${file} > fails\nAssertionError: broken\nTest Files 1 failed\nTests 1 failed`;
 const red = { databaseId: 45080540441, headSha: '70001b920c55f4423d028a2a18d3d79c8a8b2757', status: 'completed', conclusion: 'timed_out',
   createdAt: '2026-11-22T22:57:00Z', updatedAt: '2026-11-22T23:00:00Z', attempt: 1 };
 const failure = () => q.parseVitestFailures(log);
@@ -65,8 +64,8 @@ it.each([
 
 it('requires proof for complete assertions and classifies every accepted timeout', () => {
   expect(plan().action).toBe('none');
-  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed`;
-  const timed = { ...q.parseVitestFailures(text), timeouts: parseTimeouts(text) };
+  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed\nTests 1 failed`;
+  const timed = q.parseVitestFailures(text);
   const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
   expect(timed.complete).toBe(true);
   expect(timed.timeouts).toEqual([{ file, name: 'slow', runnerLimitMs: 5000, truncated: true }]);
@@ -75,8 +74,8 @@ it('requires proof for complete assertions and classifies every accepted timeout
 });
 
 it('still refuses to quarantine a hard or unconfigured timeout (early quarantine never widens what can be quarantined)', () => {
-  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed`;
-  const timed = { ...q.parseVitestFailures(text), timeouts: parseTimeouts(text) };
+  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed\nTests 1 failed`;
+  const timed = q.parseVitestFailures(text);
   const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
   for (const timeoutPolicy of [{}, { all: { soft: 'PT1S', hard: 'PT2S' } }]) {
     const p = plan({ jobFailures: { [job]: timed }, flakeProof: proof, timeoutPolicy });
@@ -94,7 +93,7 @@ it.each([
   ['unsupported reporter arrow', fragment],
   ['unsupported reporter Error', `❯ ${file} (1 test | 1 failed)\nError: Test timed out in 5000ms.`],
 ])('escalates %s even with a summary and rerun proof', (_, text) => {
-  const parsed = { ...q.parseVitestFailures(`${text}\nTest Files 1 failed`), timeouts: parseTimeouts(text) };
+  const parsed = q.parseVitestFailures(`${text}\nTest Files 1 failed\nTests 1 failed`);
   expect(parsed.complete).toBe(false);
   expect(plan({ jobFailures: { [job]: parsed }, flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).action).toBe('none');
 });
@@ -197,7 +196,12 @@ it('keeps stale published proof out of the IO live list and escalates unknown fa
       mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
       timeoutPolicy: {}, readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
       readLog: () => q.parseVitestFailures('unreadable crash'), readList: () => ({ ok: true, list }),
-      write: () => { throw new Error('must not write'); }, log: () => {} });
+      write: ({ change }) => {
+        const result = change(list);
+        expect(result.list.entries).toEqual([]);
+        expect(result.events).toContainEqual(expect.objectContaining({ why: 'parser-version' }));
+        return result;
+      }, log: () => {} });
     expect(out.liveEntries).toEqual([]);
     expect(out.alerts).toContainEqual(expect.objectContaining({ type: 'escalation', why: expect.stringContaining('unknown') }));
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -208,9 +212,15 @@ it.each(['Unhandled Rejection', 'Uncaught Exception', 'Worker exited unexpectedl
     expect(q.parseVitestFailures(`${log}\n${diagnostic}`).complete).toBe(false);
   });
 
-it.each(['AssertionError: broken', 'Error: expected true to be false'])(
+it('rejects an Error: expected assertion head and a bare FAIL header', () => {
+  for (const text of [`FAIL ${file} > fails\nError: expected true to be false`, `FAIL ${file}`]) {
+    expect(q.parseVitestFailures(`${text}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(false);
+  }
+});
+
+it.each(['AssertionError: broken'])(
   'keeps ordinary assertion diagnostics complete: %s', diagnostic => {
-    expect(q.parseVitestFailures(`FAIL ${file} > fails\n${diagnostic}\nTest Files 1 failed`).complete).toBe(true);
+    expect(q.parseVitestFailures(`FAIL ${file} > fails\n${diagnostic}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(true);
   });
 
 it.each(['startup_failure', 'cancelled', 'action_required', 'neutral', 'stale'])(

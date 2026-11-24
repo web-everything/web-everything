@@ -27,7 +27,8 @@ function replay({ old = false, proof = true, rerun = false, entries = [], mutate
   const out = runSafetyNet({ mainCiRuns, dir, now, mode: { value: 'stop', source: 'tool' }, live: false,
     settings: { value: { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...(old ? { unitJobPattern: '^test-shard \\(\\d+\\)$', requireProvenFlake: false, fileCardPerEntry: false } : {}) }, sources: {} },
     readJobs: (id, opts) => (opts?.filter === 'all' ? { jobs: id === PROOF_RUN ? rerunJobs : [] } : { failed: fixture.failedJobs }),
-    readLog: () => parseVitestFailures(fixture.log),
+    // These proof scenarios use a synthetic assertion: the recorded timeout is now policy-classified.
+    readLog: () => parseVitestFailures(fixture.log.replace('Error: Test timed out in 180000ms.', 'AssertionError: broken')),
     readList: () => ({ ok: true, list: { version: 1, entries } }), log: () => {},
   });
   return { out, line: readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').map(JSON.parse).find(line => line.wouldDo) };

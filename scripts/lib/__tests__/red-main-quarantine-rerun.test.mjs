@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveQuarantineSettings, runSafetyNet, SAFETY_NET_LEDGER } from '../red-main-quarantine-io.mjs';
-import { planSafetyNet, validateQuarantineList } from '../red-main-quarantine.mjs';
+import { planSafetyNet, validateQuarantineList, QUARANTINE_PARSER_VERSION } from '../red-main-quarantine.mjs';
 
 const now = Date.parse('2026-10-28T12:00:00Z');
 const sha = 'a'.repeat(40);
@@ -115,7 +115,7 @@ function harness({ values = {} } = {}) {
 
 const snapshot = (run, jobFailures = { [job]: failure() }) => ({
   runId: run.databaseId, createdAt: run.createdAt, updatedAt: run.updatedAt, observedAt: now,
-  headSha: run.headSha, jobFailures,
+  headSha: run.headSha, jobFailures, parserVersion: QUARANTINE_PARSER_VERSION,
 });
 
 describe('red-main passively collects repeat evidence; the conveyor owns reruns', () => {

@@ -29,7 +29,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { resolveOrchestratorAuthority } from './orchestrator-authority-settings.mjs';
-import { parseTimeouts, timeoutOutcomes, allSoft, softRecord } from './test-timeout-policy.mjs';
+import { timeoutOutcomes, allSoft, softRecord } from './test-timeout-policy.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -279,7 +279,7 @@ function readRepeatRuns(mainCiRuns, { jobFailures, readJobs, readLog, settings }
 export function readJobFailures(jobId, { exec, repoSlug }) {
   // gh refuses a log with terminal escape sequences unless allowed (2026-11-22: every soak-shard read threw, so the net never acted).
   const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
-  return { ...parseVitestFailures(String(text ?? '')), timeouts: parseTimeouts(text) };
+  return parseVitestFailures(String(text ?? ''));
 }
 
 /**

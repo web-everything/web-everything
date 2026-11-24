@@ -23,7 +23,7 @@
  *   Audit trail (`events.jsonl`, same commit): quarantine changes and `card-owed` repair obligations.
  */
 
-import { parseTimeouts, timeoutOutcomes, allSoft } from './test-timeout-policy.mjs';
+import { timeoutOutcomes, allSoft } from './test-timeout-policy.mjs';
 
 export const QUARANTINE_BRANCH = 'ops/quarantine';
 export const QUARANTINE_REF = `refs/heads/${QUARANTINE_BRANCH}`;
@@ -72,6 +72,9 @@ export function activeEntries(list, { now }) {
     && ((e.proof === undefined && e.timeout === undefined && e.parserVersion === undefined)
       || e.parserVersion === QUARANTINE_PARSER_VERSION));
 }
+
+const staleParserEvidence = e => (e.proof !== undefined || e.timeout !== undefined)
+  && e.parserVersion !== QUARANTINE_PARSER_VERSION;
 
 /** The test file of an id (`a/b.test.mjs::name` → `a/b.test.mjs`). PURE. */
 export const testFileOf = (id) => String(id).split('::')[0];
@@ -160,7 +163,7 @@ export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-ne
   const keep = [];
   const events = [];
   for (const e of list?.entries ?? []) {
-    const why = mainGreen === true ? 'main-green' : !(now < e.expiresAt) ? 'expired' : null;
+    const why = staleParserEvidence(e) ? 'parser-version' : mainGreen === true ? 'main-green' : !(now < e.expiresAt) ? 'expired' : null;
     if (why) events.push({ type: 'quarantine-removed', at: now, actor, test: e.test, brokenSha: e.brokenSha, why });
     else keep.push(e);
   }
@@ -201,42 +204,86 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 
 /** Invalidate persisted parses whenever completeness rules change. */
-export const QUARANTINE_PARSER_VERSION = 3;
+export const QUARANTINE_PARSER_VERSION = 4;
 
-/**
- * Failing vitest tests from one CI job's log (untrusted text). Completeness requires
- * a matching failed-file summary and no crash diagnostics. Interrupted logs require a measured
- * timeout for every individual failure; unsupported diagnostics must escalate. PURE.
- */
+/** Trouble is untrusted unless a specific reporter construct claims the entire line. */
+const TROUBLE = /\w*Error\b|\berrors?\b|Exception|Unhandled|Uncaught|exit (?:with )?code|Killed|out of memory|FATAL|panic|Segmentation|core dumped|Aborted|timed out|exceeded|teardown|canceled|##\[error\]|::error|Worker.*(?:exit|fail)/i;
+const SYSTEM_TROUBLE = /\bE[A-Z]{3,}\b|\bSIG[A-Z]+\b/;
+const hasTrouble = line => TROUBLE.test(line) || SYSTEM_TROUBLE.test(line);
+
+/** Parse named Vitest failure blocks; unknown or incomplete evidence keeps main held. PURE. */
 export function parseVitestFailures(logText) {
-  const tests = [];
-  let failedFiles = null, interrupted = false, unknownError = false, crash = false, timeoutLines = 0;
-  const timeouts = parseTimeouts(logText);
+  const tests = [], timeouts = [], vetoes = [];
   const lines = String(logText ?? '').split('\n').map(raw => raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd());
-  const lastError = lines.findLastIndex(line => /Error:|##\[error\]/.test(line));
-  let inFailure = false;
-  for (const [index, line] of lines.entries()) {
-    const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line);
-    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
-      tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
-      inFailure = failedFiles === null;
+  const lastTrouble = lines.findLastIndex(hasTrouble);
+  let block = null, failedFiles = null, failedTests = null, headerCount = null;
+  let fileSummaries = 0, testSummaries = 0, trailers = 0, progress = false;
+  const veto = (line, reason) => { if (vetoes.length < 5) vetoes.push({ line, reason }); };
+  const close = () => {
+    if (block && !block.head) veto(block.line, 'missing failure head');
+    block = null;
+  };
+  for (const [index, raw] of lines.entries()) {
+    const line = raw.trim(), lineNumber = index + 1;
+    if (!line) continue;
+    const fail = /^FAIL\s+(\S+)\s+>\s+(.+)$/.exec(line);
+    const fileSummary = /^Test Files\s+(\d+) failed\b/.exec(line);
+    const testSummary = /^Tests\s+(\d+) failed\b/.exec(line);
+    const header = /^⎯+\s*Failed Tests\s+(\d+)\s*⎯+$/.exec(line);
+    if (/^FAIL\b/.test(line) || fileSummary || testSummary || /^⎯/.test(line)) close();
+    if (fail && SAFE_TEST.test(fail[1]) && !fail[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(fail[1])) {
+      const test = { file: fail[1], name: fail[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) };
+      tests.push(test);
+      block = { ...test, line: lineNumber, head: false };
+      progress = false;
+      continue;
     }
-    if (/Unhandled|Uncaught|Worker.*(?:exit|fail)|teardown/i.test(line)) crash = true;
-    const timeoutLine = /^\s*Error: Test timed out in \d+ms\.\s*$/.test(line);
-    const ciTrailer = /^\s*##\[error\]Process completed with exit code 1\.\s*$/.test(line) && index === lastError;
-    if (!ciTrailer && (/##\[error\]/.test(line) || (/\bError:/.test(line) && !inFailure && !timeoutLine))) crash = true;
-    if (timeoutLine) timeoutLines++;
-    if (/timed out|exceeded.*(?:execution time|timeout)|teardown/i.test(line)) { interrupted = true; if (!timeoutLine) unknownError = true; }
-    // Only the existing named FAIL + measured Error format supplies timeout evidence.
-    if (/Error\b|Assertion\b|Unhandled|Uncaught|Worker.*(?:exit|fail)|##\[error\]|^\s*→|^\s*[❯×].*\b\d+ failed\b/i.test(line)
-      && !timeoutLine && !ciTrailer) unknownError = true;
-    const summary = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
-    if (summary) { failedFiles = Number(summary[1]); inFailure = false; }
+    if (/^FAIL\b/.test(line)) { veto(lineNumber, 'unsupported FAIL header'); continue; }
+    if (fileSummary) {
+      failedFiles = Number(fileSummary[1]);
+      if (++fileSummaries > 1) veto(lineNumber, 'duplicate Test Files summary');
+      continue;
+    }
+    if (testSummary) {
+      failedTests = Number(testSummary[1]);
+      if (++testSummaries > 1) veto(lineNumber, 'duplicate Tests summary');
+      continue;
+    }
+    if (header) {
+      if (headerCount !== null) veto(lineNumber, 'duplicate Failed Tests header');
+      headerCount = Number(header[1]);
+      continue;
+    }
+    if (/^(?:stdout|stderr)\s*\|/.test(line)) { veto(lineNumber, 'console output block'); continue; }
+    if (block) {
+      if (!block.head) {
+        block.head = true;
+        const timeout = /^Error: Test timed out in (\d+)ms\.$/.exec(line);
+        if (timeout) timeouts.push({ file: block.file, name: block.name, runnerLimitMs: Number(timeout[1]), truncated: true });
+        else if (!/^AssertionError: .+$/.test(line)) veto(lineNumber, 'unsupported failure head');
+      } else if (hasTrouble(line) && !/^\s*\d+\s*\|/.test(raw) && !/^\s*\^+\s*$/.test(raw)
+        && !/^\s+at .+:\d+:\d+\)?$/.test(raw) && !/^\s*❯ \S+:\d+:\d+$/.test(raw) && !/^[-+] /.test(line)) {
+        veto(lineNumber, 'unclaimed failure diagnostic');
+      }
+      continue;
+    }
+    if (/^##\[error\]Process completed with exit code 1\.$/.test(line)) {
+      if (++trailers > 1 || index !== lastTrouble) veto(lineNumber, 'non-final or duplicate CI trailer');
+      continue;
+    }
+    if (/^❯\s+\S+\s+\(.+\)$/.test(line)) { progress = false; continue; }
+    if (/^×\s+.+/.test(line)) { progress = true; continue; }
+    if (progress && /^→\s+.+/.test(line)) { progress = false; continue; }
+    progress = false;
+    if (hasTrouble(line)) veto(lineNumber, 'unclaimed trouble token');
   }
+  close();
   const files = [...new Set(tests.map(t => t.file))];
-  const measured = timeoutLines === timeouts.length && tests.length === timeouts.length && tests.every((t, i) => t.file === timeouts[i].file && t.name === timeouts[i].name);
-  return { files, tests, failedFiles, timeouts, complete: !crash && files.length > 0 && failedFiles === files.length
-    && (!interrupted || (!unknownError && measured)) };
+  if (fileSummaries !== 1 || failedFiles !== files.length) veto(lines.length, 'missing or inconsistent Test Files summary');
+  if (testSummaries !== 1 || failedTests !== tests.length) veto(lines.length, 'missing or inconsistent Tests summary');
+  if (headerCount !== null && headerCount !== tests.length) veto(lines.length, 'inconsistent Failed Tests header');
+  return { files, tests, failedFiles, timeouts, complete: tests.length > 0 && vetoes.length === 0,
+    parserVersion: QUARANTINE_PARSER_VERSION, vetoes };
 }
 
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
@@ -337,7 +384,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
   const wantFix = Array.isArray(fixPrs) ? [...new Set(fixPrs.map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b) : null;
   const haveFix = [...(list?.fixPrs ?? [])].sort((a, b) => a - b);
   const fixDelta = wantFix && JSON.stringify(wantFix) !== JSON.stringify(haveFix) ? wantFix : null;
-  const expired = entries.some((e) => !(now < e.expiresAt));
+  const expired = entries.some((e) => !(now < e.expiresAt) || staleParserEvidence(e));
   const live = activeEntries(list, { now });
   // The fix-PR set is only worth a write while some entry is live (it exists to un-skip those entries for the fix PR).
   const liveFix = live.length ? fixDelta : null;
