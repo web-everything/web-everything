@@ -1,26 +1,14 @@
 /** @file Pure, prose-independent audit identities and approximate head-source symbol lookup. */
-import { posix } from 'node:path';
+import { normalizeFindingPath } from './finding-location.mjs';
+export { parseFindingLocation } from './finding-location.mjs';
 import { FINDING_CLASSES } from '../operations/audit-verdict.mjs';
 
 /** Repo-relative paths only; reject escaping/absolute evidence instead of guessing a root. */
 export function findingKey({ file, symbol = '<top>', class: cls }) {
-  if (typeof file !== 'string' || !file || /[\\|\s:]/.test(file) || file.startsWith('/')) throw new Error('invalid finding path');
-  const path = posix.normalize(file);
-  if (path === '.' || path === '..' || path.startsWith('../') || !FINDING_CLASSES.includes(cls)
+  const path = normalizeFindingPath(file);
+  if (!FINDING_CLASSES.includes(cls)
     || typeof symbol !== 'string' || /[|\r\n]/.test(symbol)) throw new Error('invalid finding identity');
   return `${path}|${symbol || '<top>'}|${cls}`;
-}
-
-/** Extract a single unambiguous path:line; prose otherwise never participates in identity. */
-export function parseFindingLocation(findingText) {
-  if (typeof findingText !== 'string') return null;
-  const matches = [...findingText.matchAll(/(?:^|[\s`(["'])((?:\.\/)?[\w./@+-]+):(\d+)(?=$|[\s`),;:.\]"'])/g)];
-  if (matches.length !== 1) return null;
-  const [, file, number] = matches[0], line = Number(number);
-  try {
-    const path = findingKey({ file, class: 'B1' }).split('|')[0];
-    return Number.isSafeInteger(line) && line > 0 ? { file: path, line } : null;
-  } catch { return null; }
 }
 
 /** Simple regex/brace scan, not a JS parser. Strings/comments are masked, preserving offsets. */
