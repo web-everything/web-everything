@@ -756,11 +756,27 @@ export function extractPassTimings(stderr) {
   return timings;
 }
 
+const STDERR_LINE_MAX = 200;
+const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
+const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred/i;
+
+/** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
+ * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
+export function firstStderrErrorLine(stderr, env = {}) {
+  const line = String(stderr ?? '').split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim()).find(Boolean);
+  if (!line) return '';
+  if (SECRET_LINE.test(line)) return '[redacted]';
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (SECRET_ENV_KEY.test(k) && typeof v === 'string' && v.length >= 6 && line.includes(v)) return '[redacted]';
+  }
+  return line.length > STDERR_LINE_MAX ? `${line.slice(0, STDERR_LINE_MAX)}...` : line;
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
     const output = () => ({
-      stdout, stderrBytes: stderr.length, errorClass: classifyChildFailure(stderr, { timedOut }),
+      stdout, stderrBytes: stderr.length, stderrFirstLine: firstStderrErrorLine(stderr, env), errorClass: classifyChildFailure(stderr, { timedOut }),
       passTimings: extractPassTimings(stderr), timedOut,
     });
     let child;
@@ -1203,7 +1219,7 @@ export function createEnqueueOnEvent({
         const exitFailed = !r.timedOut && r.code !== 0;
         // A failed child cannot supply success or permanent-decline evidence.
         const json = exitFailed ? null : lastJsonLine(r.stdout);
-        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}`;
+        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}${r.stderrFirstLine ? `, first error: ${r.stderrFirstLine}` : ''}`;
         const spawnFailed = r.errorClass === 'spawn-error';
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : spawnFailed ? `could not run (${diagnostic})` : summarizeFastDrain(json, p.num);
         const summary = what;
