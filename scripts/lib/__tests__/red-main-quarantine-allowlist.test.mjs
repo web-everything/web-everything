@@ -29,10 +29,10 @@ const negatives = [
   ['02 ENOSPC after summary', [V.replace('##[error]Process', 'ENOSPC\n##[error]Process')]],
   ['03 ENOSPC after trailer', [`${V}\nENOSPC`]],
   ['04 ENOSPC in setup', [`ENOSPC\n${V}`]],
-  ['05 worker failure', [`${V}\nError: Worker forks error`, `${V}\nWorker exited unexpectedly`]],
-  ['06 Unhandled Errors', [`${V}\n⎯ Unhandled Errors ⎯`]],
+  ['05 worker failure (regression guard)', [`${V}\nError: Worker forks error`, `${V}\nWorker exited unexpectedly`]],
+  ['06 Unhandled Errors (regression guard)', [`${V}\n⎯ Unhandled Errors ⎯`]],
   ['07 invalid error head', [head('TypeError: broken'), head('Error: ENOSPC'), head('Error: expected true to be false')]],
-  ['08 hook timeout head', [head('Error: Hook timed out in 5000ms.')]],
+  ['08 hook timeout head (regression guard)', [head('Error: Hook timed out in 5000ms.')]],
   ['09 process killed', [V.replace('exit code 1', 'exit code 137'), `${V}\nKilled`, `${V}\nSIGKILL`]],
   ['10 coverage threshold', [`${V}\nERROR: Coverage threshold not met`]],
   ['11 canceled or exceeded', [`${V}\n##[error]The operation was canceled`, `${V}\nmaximum duration exceeded`]],
@@ -40,7 +40,7 @@ const negatives = [
   ['13 indented ENOSPC', [beforeSeparator('    ENOSPC')]],
   ['14 missing head', [head('')]],
   ['15 stderr console block', [beforeSeparator('stderr | scripts/example.test.mjs > fails\nError: boom'), beforeSeparator('stdout | scripts/example.test.mjs > fails\nhello')]],
-  ['16 node:test only', ['TAP version 13\nnot ok 1 - fails\n# tests 1\n# fail 1']],
+  ['16 node:test only (regression guard)', ['TAP version 13\nnot ok 1 - fails\n# tests 1\n# fail 1']],
   ['17 stale parser evidence', null],
 ];
 it.each(negatives)('rejects %s', (name, logs) => {
@@ -142,6 +142,14 @@ it('freezes run 45080540441 as teardown-only negative evidence', () => {
   expect(parsed.tests).toHaveLength(1);
   expect(parsed.vetoes[0]).toEqual({ line: teardown, reason: 'unclaimed trouble token' });
   expect(parsed.vetoes.every(v => v.line >= teardown && v.line < trailer)).toBe(true);
+});
+
+it('accepts the SYNTHETIC soak-shard (3) positive: a real FAIL block with stderr and the annotation copy removed', () => {
+  const text = readFileSync(new URL('./fixtures/red-main-quarantine-soak-shard-3-synthetic-positive.log', import.meta.url), 'utf8');
+  const parsed = q.parseVitestFailures(text);
+  expect(parsed.vetoes).toEqual([]);
+  expect(parsed.complete).toBe(true);
+  expect(parsed.tests).toHaveLength(1);
 });
 
 it('finds timestamped ANSI Run groups and ignores endgroup as a step boundary', () => {

@@ -1,0 +1,36 @@
+##[group]Run npm run test:soak:shard -- --shard=3/8
+npm run test:soak:shard -- --shard=3/8
+##[endgroup]
+ ✓ scripts/conveyor/soak/breaks/scorecard-dirt.soak.test.mjs  (1 test) 653342ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  scripts/conveyor/soak/breaks/large-queue-slow-already-done.soak.test.mjs > daemon soak — break large-queue-slow-already-done > large queue and slow/rate-limited GitHub
+AssertionError: expected [ Array(1) ] to deeply equal []
+
+- Expected
++ Received
+
+- Array []
++ Array [
++   "[crash] Error: planner blocked on slow GitHub
++     at Timeout._onTimeout (scripts/conveyor/soak/breaks/large-queue-slow-already-done.mjs:47:103)
++     at listOnTimeout (node:internal/timers:585:17)
++     at processTimers (node:internal/timers:521:7)",
++ ]
+
+ ❯ scripts/conveyor/soak/define-break-test.mjs:23:31
+     21|     (present ? it : it.fails)(title, async () => {
+     22|       const report = await b.run({});
+     23|       expect(b.judge(report)).toEqual([]);
+       |                               ^
+     24|     });
+     25|   });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed | 58 passed (59)
+      Tests  1 failed | 84 passed (85)
+
+##[error]Process completed with exit code 1.
+Post job cleanup.
