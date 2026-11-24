@@ -41,7 +41,25 @@ describe('sibling base admission', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/child'); f.commit('child');
     expect(f.check()).toEqual([{ number: 236, headRefName: pr.headRefName, count: 1 }]);
-    expect(f.check({ openPrs: [{ number: 237, headRefName: 'lane/child', headRefOid: f.git('rev-parse', 'HEAD') }] })).toEqual([]);
+    expect(f.check({ openPrs: [{ number: 237, headRefName: 'lane/distinct', headRefOid: f.git('rev-parse', 'HEAD') }] }))
+      .toEqual([{ number: 237, headRefName: 'lane/distinct', count: 2 }]);
+  });
+
+  it.each(['replace', 'graft'])('ignores %s metadata that hides sibling ancestry', metadata => {
+    const f = fixture(), pr = f.sibling(236);
+    f.git('checkout', '-b', 'lane/child'); const head = f.commit('child');
+    if (metadata === 'replace') {
+      const replacement = f.git('commit-tree', `${head}^{tree}`, '-p', f.git('rev-parse', 'main'), '-m', 'fake parents');
+      f.git('replace', head, replacement);
+    } else writeFileSync(join(f.dir, '.git', 'info', 'grafts'), `${head} ${f.git('rev-parse', 'main')}\n`);
+    expect(f.check()).toEqual([{ number: 236, headRefName: pr.headRefName, count: 1 }]);
+  });
+
+  it('fails closed on shallow history even when no sibling overlap is visible', () => {
+    const f = fixture(); f.sibling(236); const head = f.commit('child');
+    writeFileSync(join(f.dir, '.git', 'shallow'), `${head}\n`);
+    expect(f.git('rev-parse', '--is-shallow-repository')).toBe('true');
+    expect(f.check()).toMatchObject({ reason: 'sibling-base-unreadable', detail: expect.stringContaining('non-shallow history') });
   });
 
   it('allows a branch cut on main, and a branch whose sibling commits already landed via their PRs', () => {
@@ -97,12 +115,49 @@ describe('sibling base admission', () => {
     const f = fixture(); f.sibling(236); f.commit('child');
     const env = { PATH: 'fixture-path' };
     const gh = vi.fn(() => JSON.stringify([...f.openPrs,
-      { number: 237, headRefName: 'lane/child', headRefOid: 'missing-self-is-excluded' }]));
+      { number: 237, headRefName: 'lane/child', headRefOid: 'missing-self-is-excluded',
+        isCrossRepository: false, headRepositoryOwner: { login: ghRepoSlug('we').split('/')[0] } }]));
     expect(readSiblingBase({ cwd: f.dir, env, branch: 'lane/child', git: createGitReader(f.dir), base: 'main', sha: 'HEAD' }, gh))
       .toEqual([{ number: 236, headRefName: 'lane/sibling-236', count: 1 }]);
     expect(gh).toHaveBeenCalledOnce();
-    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid'],
-      expect.objectContaining({ cwd: f.dir, env, timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,headRepositoryOwner,isCrossRepository'],
+      expect.objectContaining({ cwd: f.dir, env: { ...env, WE_GH_READ_MEMO_DIR: '' }, timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it.each([true, undefined])('retains a same-name PR without same-repository proof (cross-repository: %s)', isCrossRepository => {
+    const f = fixture(); const pr = f.sibling(236);
+    const gh = () => JSON.stringify([{ ...pr, isCrossRepository,
+      headRepositoryOwner: { login: ghRepoSlug('we').split('/')[0] } }]);
+    expect(readSiblingBase({ cwd: f.dir, branch: pr.headRefName, git: createGitReader(f.dir), sha: pr.headRefOid }, gh))
+      .toEqual([{ number: 236, headRefName: pr.headRefName, count: 1 }]);
+  });
+
+  it('disables the read memo in both the throttle and child environments', () => {
+    const f = fixture(); f.sibling(236);
+    const env = { WE_GH_READ_MEMO_DIR: join(f.dir, 'memo') };
+    const gh = vi.fn((_args, opts) => opts.throttle?.env.WE_GH_READ_MEMO_DIR
+      ? '[]' : JSON.stringify(f.openPrs));
+    expect(readSiblingBase({ cwd: f.dir, env, git: createGitReader(f.dir), sha: 'HEAD' }, gh)).toHaveLength(1);
+    const opts = gh.mock.calls[0][1];
+    expect(opts.throttle.env.WE_GH_READ_MEMO_DIR).toBe('');
+    expect(opts.env.WE_GH_READ_MEMO_DIR).toBe('');
+    expect(env.WE_GH_READ_MEMO_DIR).toBe(join(f.dir, 'memo'));
+  });
+
+  it.each(['overlap', 'unreadable'])('rechecks the canonical audit sha and refuses %s before publication', evidence => {
+    const f = fixture(); const clean = f.git('rev-parse', 'HEAD');
+    f.sibling(236); const audited = f.commit('child');
+    const siblingBase = vi.fn(({ sha }) => {
+      if (sha === audited && evidence === 'unreadable') throw new Error('missing audited objects');
+      return f.check({ sha });
+    });
+    const spawn = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
+    const result = runner(f, { siblingBase, spawn, canonicalAudit: () => ({ ok: true, sha: audited }) })
+      ({ argv: ['--ref=lane/child', `--sha=${clean}`] });
+    expect(siblingBase.mock.calls.map(([opts]) => opts.sha)).toEqual([clean, audited]);
+    expect(result).toMatchObject({ outcome: 'refused', reason: evidence === 'overlap' ? 'sibling-base' : 'sibling-base-unreadable' });
+    expect(spawn.mock.calls[0][1]).toContain('--check');
+    expect(spawn.mock.calls[0][1]).toContain(`--sha=${audited}`);
   });
 
   it('refuses an oversized or malformed open PR listing with an operator fallback', () => {
@@ -133,8 +188,13 @@ describe('sibling base admission', () => {
       .toMatchObject({ reason: 'sibling-base-unreadable' });
     const real = createGitReader(f.dir), git = vi.fn((...args) => real(...args));
     expect(f.check({ git })).toHaveLength(1);
-    for (const [, opts] of git.mock.calls) expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 8 * 1024 * 1024,
-      env: { GIT_NO_LAZY_FETCH: '1' } });
+    for (const [, opts] of git.mock.calls) {
+      expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 8 * 1024 * 1024,
+        env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
+      const pins = Object.fromEntries(Array.from({ length: Number(opts.env.GIT_CONFIG_COUNT) }, (_, i) =>
+        [opts.env[`GIT_CONFIG_KEY_${i}`], opts.env[`GIT_CONFIG_VALUE_${i}`]]));
+      expect(pins['core.commitGraph']).toBe('false');
+    }
   });
 });
 

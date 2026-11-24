@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { classifySubmit } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { checkSiblingBase } from '../lib/sibling-base-check.mjs';
-import { runGhSync } from '../lib/gh-throttle.mjs';
+import { runGhSync, WE_GH_READ_MEMO_DIR } from '../lib/gh-throttle.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
@@ -141,10 +141,12 @@ import { createGitReader } from '../lib/pr-size-admission.mjs';
 
 /** One bounded, complete open-PR read; the checker never guesses at missing evidence. */
 export function readSiblingBase({ cwd, env, branch, ...opts }, gh = runGhSync) {
-  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid'],
-    { cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+  const freshEnv = { ...(env ?? process.env), [WE_GH_READ_MEMO_DIR]: '' };
+  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,headRepositoryOwner,isCrossRepository'],
+    { cwd, env: freshEnv, throttle: { env: freshEnv }, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   if (!Array.isArray(prs) || prs.length >= 1000) throw new Error('Open PR listing may be incomplete (1000 PR limit); ask a human to inspect the sibling history.');
-  return checkSiblingBase({ ...opts, openPrs: prs.filter(pr => pr?.headRefName !== branch) });
+  return checkSiblingBase({ ...opts, openPrs: prs.filter(pr => !(pr?.headRefName === branch
+    && pr.isCrossRepository === false && pr.headRepositoryOwner?.login?.toLowerCase() === ghRepoSlug('we').split('/')[0].toLowerCase())) });
 }
 
 /**
@@ -238,10 +240,12 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
         return { outcome: 'refused', reason: String(e.message || e) };
       }
     }
-    if (!argv.includes('--dry-run')) {
+    let siblingCheckedSha;
+    const checkSiblings = sha => {
+      siblingCheckedSha = sha;
       let siblings;
       try {
-        siblings = siblingBase({ git, base: arg('base') || 'main', sha: arg('sha') || 'HEAD',
+        siblings = siblingBase({ git, base: arg('base') || 'main', sha,
           branch: arg('ref') || arg('branch') || '', env });
         if (!Array.isArray(siblings) && siblings?.reason !== 'sibling-base-unreadable') throw new Error('Sibling check returned no usable decision');
       } catch (error) {
@@ -253,13 +257,17 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
         const detail = siblings.map(pr => `PR #${pr.number} (${pr.headRefName}): ${pr.count} unlanded shared commits; git rebase --onto origin/main ${quote(pr.headRefName)} ${quote(branch)} (or wait for the sibling to land)`).join('; ');
         collect('sibling-base', 'sibling-base', detail);
       } else if (!Array.isArray(siblings)) collect('sibling-base', siblings.reason, siblings.detail);
-    }
+    };
+    if (!argv.includes('--dry-run')) checkSiblings(arg('sha') || 'HEAD');
     let audit;
     try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env, refreshMain: checking }); }
     catch { audit = { ok: false, reason: 'canonical-audit-missing', message: 'canonical audit check failed; resolve the full head sha and run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' }; }
     if (audit?.ok !== true) collect('canonical-audit', audit?.reason || 'canonical-audit-missing',
       audit?.message || 'canonical audit check returned no decision', audit?.sha || arg('sha'));
-    if (audit?.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
+    if (audit?.sha) {
+      if (!argv.includes('--dry-run') && audit.sha !== siblingCheckedSha) checkSiblings(audit.sha);
+      argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
+    }
     const collectOnly = checking || blockers.length > 0;
     if (collectOnly) argv = [...argv.filter(a => a !== '--check' && a !== '--dry-run'), '--check'];
     else if (bypass) {
