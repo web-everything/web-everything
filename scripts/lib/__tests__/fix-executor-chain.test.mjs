@@ -16,6 +16,9 @@ function probeSettings(contents, error) {
     const { contents, error } = JSON.parse(fs.readFileSync(0, 'utf8'));
     const read = fs.readFileSync;
     fs.readFileSync = (path, ...args) => {
+      // Exercise executor settings independently of the shipped auto-capacity routing policy.
+      // An absent builder retains the declared reader's fail-closed handling of read errors.
+      if (String(path).endsWith('/settings/routing.json')) return '{}';
       if (!String(path).endsWith('/settings/fix-executor.json')) return read(path, ...args);
       if (error) throw Object.assign(new Error('settings unavailable'), { code: error });
       return contents;
@@ -39,13 +42,13 @@ function probeSettings(contents, error) {
 describe('fix executor chain', () => {
   it.each([
     ['missing file', undefined, 'ENOENT'],
-    ['unreadable file', undefined, 'EACCES'],
-    ['invalid JSON', '{'],
-    ['empty file', ''],
+    ['unreadable file', undefined, 'EACCES', ['argon', 'claude']],
+    ['invalid JSON', '{', undefined, ['argon', 'claude']],
+    ['empty file', '', undefined, ['argon', 'claude']],
     ['empty object', '{}'],
-    ['null document', 'null'],
-    ['array document', '[]'],
-    ['scalar document', 'false'],
+    ['null document', 'null', undefined, ['argon', 'claude']],
+    ['array document', '[]', undefined, ['argon', 'claude']],
+    ['scalar document', 'false', undefined, ['argon', 'claude']],
     ['null namespace', '{"fixExecutor":null}'],
     ['scalar namespace', '{"fixExecutor":false}'],
     ['array namespace', '{"fixExecutor":[]}'],
@@ -55,16 +58,14 @@ describe('fix executor chain', () => {
     ['empty critical list', '{"fixExecutor":{"criticalGlobs":[]}}'],
     ['blank critical glob', '{"fixExecutor":{"criticalGlobs":[" "]}}'],
     ['scalar critical list', '{"fixExecutor":{"criticalGlobs":"scripts/**"}}'],
-  ])('imports and resolves both repair roles with %s', (_label, contents, error) => {
+  ])('imports and resolves both repair roles with %s', (_label, contents, error, declaredChain = chain) => {
     const { value, frozen, roles, declaredRoles } = probeSettings(contents, error);
     expect(value).toEqual(chain);
     expect(frozen).toBe(true);
     for (const kind of ['fix', 'ci-heal']) {
       expect(roles[kind]).toMatchObject({ value: chain, mode: 'direct', criticalGlobs: ['**'] });
-      // The declared reader retains its own routing failure handling; both paths must resolve.
-      expect(declaredRoles[kind].mode).toBe('direct');
-      expect(declaredRoles[kind].value.length).toBeGreaterThan(0);
-      expect(declaredRoles[kind].criticalGlobs).toEqual(['**']);
+      // Read/parse errors reserve Codex; a missing file or invalid executor leaf uses defaults.
+      expect(declaredRoles[kind]).toMatchObject({ value: declaredChain, mode: 'direct', criticalGlobs: ['**'] });
       for (const path of ['scripts/lib/fix-executor-chain.mjs', '.env', '.github/workflows/check.yml']) {
         expect(micromatch.isMatch(path, roles[kind].criticalGlobs, { nocase: true, dot: true })).toBe(true);
       }
@@ -72,10 +73,20 @@ describe('fix executor chain', () => {
   });
   it('preserves valid shipped settings during native initialization', () => {
     const fixExecutor = { fixSeatMix: ['codex-alt', 'gemini', 'claude'], criticalGlobs: ['scripts/security/**'] };
-    const { value, roles } = probeSettings(JSON.stringify({ fixExecutor }));
+    const { value, roles, declaredRoles } = probeSettings(JSON.stringify({ fixExecutor }));
     expect(value).toEqual(['codex-alt', 'argon', 'claude']);
     expect(roles.fix.criticalGlobs).toEqual(fixExecutor.criticalGlobs);
     expect(roles['ci-heal'].criticalGlobs).toEqual(fixExecutor.criticalGlobs);
+    for (const kind of ['fix', 'ci-heal']) {
+      expect(declaredRoles[kind]).toMatchObject({ value, mode: 'direct', criticalGlobs: fixExecutor.criticalGlobs });
+    }
+  });
+  it.each(['fix', 'ci-heal'])('%s with auto routing and no capacity refuses an executor', kind => {
+    const resolved = resolveFixExecutorChain({ env: {}, platform: {}, repo: { routing: { builder: 'auto' } },
+      kind, capacity: [], quota: () => null, record: () => {} });
+    expect(resolved).toMatchObject({ value: [], source: 'default+capacity', mode: 'direct' });
+    expect(pickChainRung({ chain: resolved.value })).toMatchObject({ executor: null, rung: null,
+      reason: expect.stringContaining('no eligible capacity') });
   });
   it.each([[], ['codex'], ['unknown', 'claude'], ['claude', 'claude'], null].map(value => [value]))('rejects invalid shipped seat mix %j with a frozen fallback', fixSeatMix => {
     const { value, frozen } = probeSettings(JSON.stringify({ fixExecutor: { fixSeatMix } }));
