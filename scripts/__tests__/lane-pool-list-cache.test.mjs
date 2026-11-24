@@ -118,10 +118,12 @@ afterEach(() => {
 });
 
 describe('#xn432dz lease-first + read-only git', () => {
-  it('runs NO git inside a live-leased lane, and still probes the unleased one', () => {
+  it.each(['matching', 'foreign'])('runs NO git inside a live-leased lane (%s origin), and still probes the unleased one', (origin) => {
     provision(3);
     leaseLane(1);
     leaseLane(2);
+    // Even a misconfigured occupied lane is excluded by its lease before any git origin probe.
+    if (origin === 'foreign') git(['remote', 'set-url', 'origin', join(base, 'foreign.git')], lanePath(2));
     resetTrace();
     expect(list(['--no-cache'])).toEqual([3]);
     const t = trace();

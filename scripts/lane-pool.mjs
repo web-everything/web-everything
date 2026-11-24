@@ -1803,12 +1803,13 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const lease = readLease(dir);
   // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
   if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };
+  // A live lease already excludes this lane; preserve lease-first's zero-git guarantee even for origin checks.
+  if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   // LANE-POOL-WRONG-REPO: a lane whose origin is not the pool's configured origin is never handed out.
   if (laneIsWrongOrigin(repo, dir)) {
     log(`  lane-${n}: wrong-origin (lane origin differs from pool origin) — never handed out; remove and re-provision it`);
     return { lane: n, exists: false, wrongOrigin: true };
   }
-  if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
     if (remoteShasBox.value === null) {
