@@ -454,7 +454,12 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
     rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
     if (strict && (!refs.size || refs.size >= OPEN_PR_REF_LIMIT || refs.failure)) throw Error('stack refs incomplete');
     // A strict single-PR lookup refuses when the target has no record: absent is unknown, never unstacked.
-    if (strict && requirePr !== null && !refs.has(requirePr)) throw Error('stack evidence unknown: pr-record-missing');
+    if (strict && requirePr !== null) {
+      const rec = refs.get(requirePr);
+      if (!rec || !SHA.test(String(rec.headRefOid ?? '')) || !rec.headRefName || !rec.baseRefName) {
+        throw Error('stack evidence unknown: pr-record-missing-or-incomplete');
+      }
+    }
     if (!refs.size) {
       const cause = ['refs-auth-failed', 'refs-rate-limited', 'refs-timeout', 'refs-parse-failed'].includes(refs.failure)
         ? refs.failure : 'refs-unreadable';

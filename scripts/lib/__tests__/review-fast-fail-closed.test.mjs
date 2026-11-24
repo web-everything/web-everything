@@ -21,6 +21,16 @@ describe('review fast path fails closed', () => {
     const noHead = args => args[0] === 'symbolic-ref' ? { status: 1, stdout: '' } : { status: 0, stdout: 'x\n' };
     expect(checkMainStaleness({ strict: true, cleanOnly: true, run: noHead })).toEqual({ offline: true });
   });
+  it('stale main: a dirty or off-base checkout is not fresh even when shas match', () => {
+    const dirty = args => args[0] === 'status' ? { status: 0, stdout: ' M x\n' } : { status: 0, stdout: 'main\n' };
+    expect(checkMainStaleness({ strict: true, cleanOnly: true, run: dirty })).toEqual({ offline: true });
+    const off = args => args[0] === 'symbolic-ref' ? { status: 0, stdout: 'other\n' } : args[0] === 'status' ? { status: 0, stdout: '' } : { status: 0, stdout: 'x\n' };
+    expect(checkMainStaleness({ strict: true, cleanOnly: true, run: off })).toEqual({ offline: true });
+  });
+  it('strict stack lookup refuses an incomplete target record', () => {
+    expect(() => readStackBase({ pr: 9, strict: true, settingOn: true, readRefs: () => new Map([[9, { headRefName: 'lane/x' }]]), readLanes: () => new Map() }))
+      .toThrow('incomplete');
+  });
   it('strict stack lookup refuses a PR with no record', () => {
     expect(() => readStackBase({ pr: 9, strict: true, settingOn: true, readRefs: () => new Map([[1, {}]]), readLanes: () => new Map() })).toThrow();
   });

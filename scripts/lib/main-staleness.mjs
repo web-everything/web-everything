@@ -87,8 +87,12 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
   if (local === origin) {
     if (strict) {
       // Fail closed: unreadable status or branch evidence is stale, never fresh.
-      if (run(['status', '--porcelain']).status !== 0) return { offline: true };
-      if (cleanOnly && run(['symbolic-ref', '--short', 'HEAD']).status !== 0) return { offline: true };
+      const st = run(['status', '--porcelain']);
+      if (st.status !== 0 || (cleanOnly && st.stdout && st.stdout.trim())) return { offline: true };
+      if (cleanOnly) {
+        const hd = run(['symbolic-ref', '--short', 'HEAD']);
+        if (hd.status !== 0 || hd.stdout.trim() !== base) return { offline: true };
+      }
     }
     return { fresh: true, behind: 0 };
   }
