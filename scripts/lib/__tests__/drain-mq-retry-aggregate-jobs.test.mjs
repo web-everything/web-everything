@@ -74,10 +74,10 @@ function fixture({ checks = [shard, ...aggregates], jobData = new Map(), logs = 
   }) };
 }
 
-function expectRetry(decision) {
-  expect(decision.hold).toBe(false);
-  expect(decision.line).toContain('failed_checks infra retry 1/2 (main green, PR CLEAN, infra)');
-  expect(decision.line).toContain('main run 102');
+function expectHold(decision) {
+  expect(decision.hold).toBe(true);
+  expect(decision.reason).toContain('non-infrastructure');
+  expect(decision.reason).toContain('main run 102');
   expect(decision.mainRunId).toBe(102);
 }
 
@@ -87,14 +87,13 @@ beforeEach(() => {
   vi.stubEnv('VITEST', '');
   vi.stubEnv('WE_UNDER_TEST', '');
   vi.stubEnv('WE_DRAIN_MQ_AGGREGATE_JOBS', undefined);
-  vi.stubEnv('WE_DRAIN_MQ_INFRA_SIGNATURES', undefined);
   settings.drain = {};
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); });
 
 describe('MQ infrastructure retry with derived aggregate jobs', () => {
-  it('accepts a promisor shard plus derived test and coverage-merge, carrying the deciding main run in the accept line', () => {
-    expectRetry(fixture().guard());
+  it('holds a promisor shard plus derived test and coverage-merge, carrying the deciding main run', () => {
+    expectHold(fixture().guard());
   });
 
   it.each(aggregates)('holds when $name has an intrinsic failed step alongside its dependency summary', aggregate => {
@@ -119,7 +118,7 @@ describe('MQ infrastructure retry with derived aggregate jobs', () => {
     expect(f.logReads).toHaveLength(0);
   });
 
-  it('requires every non-derived failure to match a signature', () => {
+  it('holds non-derived failures regardless of printed signatures', () => {
     const other = check(24, 'CI / test-shard (6)');
     const f = fixture({ checks: [shard, other, ...aggregates],
       logs: new Map([[9024, 'AssertionError: expected 2 to be 3\n']]) });
@@ -131,19 +130,19 @@ describe('MQ infrastructure retry with derived aggregate jobs', () => {
     ['API error', new Error('job unavailable')], ['invalid JSON', '{'], ['null job', null],
     ['missing steps', {}], ['null steps', { steps: null }], ['object steps', { steps: {} }],
     ['string steps', { steps: 'Gate on shard results' }],
-  ])('fails closed on %s: the aggregate still needs matching log evidence', (_label, data) => {
+  ])('fails closed on %s: the aggregate still requires proven evidence', (_label, data) => {
     const f = fixture({ jobData: new Map([[9022, data]]) });
     expect(f.guard().hold).toBe(true);
     expect(f.logReads.map(read => read.id)).toContain(9022);
   });
 
-  it('accepts an aggregate with a readable steps array with only its dependency summary step failed', () => {
+  it('holds an unproven shard even when aggregate steps prove dependency-only failures', () => {
     const f = fixture({ jobData: new Map(aggregates.map(c => [c.id + 9000, {
       id: c.id + 9000, name: c.name, head_sha: commit, status: 'completed', conclusion: 'failure',
       steps: [step('Set up job', 'success'), step(summarySteps.get(localName(c.name)), 'failure'),
         step('Complete job', 'success')],
     }])) });
-    expectRetry(f.guard());
+    expectHold(f.guard());
   });
 
   it('does not treat an arbitrary failed step containing dependency words as the known summary step', () => {
@@ -170,7 +169,7 @@ describe('MQ infrastructure retry with derived aggregate jobs', () => {
       expect(options.maxBuffer).toBeGreaterThan(0);
       expect(options.maxBuffer).toBeLessThanOrEqual(4 * 1024 * 1024);
     }
-    expectRetry(decision);
+    expectHold(decision);
   });
 
   it('holds above the existing ten-failed-job bound with an operator inspection fallback and no job reads', () => {
@@ -212,7 +211,7 @@ describe('drain.mqAggregateJobs settings contract', () => {
   it('uses the JSON environment override in the live guard instead of the tool default', () => {
     settings.drain = { mqAggregateJobs: ['other-gate'] };
     vi.stubEnv('WE_DRAIN_MQ_AGGREGATE_JOBS', JSON.stringify(standard));
-    expectRetry(fixture().guard());
+    expectHold(fixture().guard());
   });
 
   it.each([
