@@ -2,7 +2,7 @@
 /**
  * Machine-local Claude dispatch telemetry. Streams entire transcripts; never executes their commands.
  * Task and command attribution retain capped metadata, never raw prompts or content-bearing flag values.
- * See docs/agent/testing.md#claude-subagent-usage for schema, usage and inference limits.
+ * See docs/agent/testing.d/048-claude-subagent-usage.md#claude-subagent-usage for schema, usage and inference limits.
  */
 import { createReadStream, appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';

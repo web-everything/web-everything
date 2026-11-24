@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { changedLines } from './diff-branch-coverage.mjs';
 
 export const TESTING_GUIDE = 'docs/agent/testing.md';
-const HINT = 'Put new testing notes in docs/agent/testing/ as separate topic files; do not append to docs/agent/testing.md.';
+const HINT = 'Put new testing notes in docs/agent/testing.d/ as separate topic files; do not append to docs/agent/testing.md.';
 
 /** Pure: paths with added lines, not merely touched/deleted paths. Advisory only. */
 export function testingNotesAdvisory(addedPaths) {

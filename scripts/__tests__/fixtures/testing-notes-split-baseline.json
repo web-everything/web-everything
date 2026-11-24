@@ -1,0 +1,865 @@
+{
+  "sha": "9285f31d4c68c253c5c6ab342801c4f0e7d732ea",
+  "sha256": "2c7be2041672bd156a49eacb212c047ca38ff9922c9c26babcdf9c11c8b87fd9",
+  "lineCount": 6446,
+  "bodySha256": "1272284c3150dd0fe515d22b3106e177924bc512542b423ccc7adfe7756f7de5",
+  "sections": [
+    {
+      "file": "001-review-pr-fetch-isolation-r37.md",
+      "sha256": "64a52cc40c80779339a7e61f110f62498025ec6c676a7e0f5e356f663a163237",
+      "links": []
+    },
+    {
+      "file": "002-merge-drain-cli-fixtures-r1063a.md",
+      "sha256": "381ee78a610bdfff09db6029e60238e860575d5f607c7d83b9cf4a0eea78e355",
+      "links": []
+    },
+    {
+      "file": "003-review-pr-transport-isolation-r37.md",
+      "sha256": "44330657c6bfd4d61e213dad0db445b09f30db0b86278e8e98fc3ccc8cca51f1",
+      "links": []
+    },
+    {
+      "file": "004-human-only-enqueue-approval-license-r212.md",
+      "sha256": "e109e202a215dc33893506d112d32ae265d72b3b4eb89d8e45f641642cf7d7c6",
+      "links": []
+    },
+    {
+      "file": "005-direction-aware-operation-evidence-r131.md",
+      "sha256": "42e5ffb8e0cde48a6287d306b356e857de1a9c7a834cb526e15e59b5928a39b2",
+      "links": []
+    },
+    {
+      "file": "006-pr-size-admission-trust-boundary-fixtures.md",
+      "sha256": "a89fe250d60540c786ec296da5c08a507212bfce927c16e9c7c7d3e219cd92dd",
+      "links": []
+    },
+    {
+      "file": "007-drain-identity-admission-regressions.md",
+      "sha256": "ba8eccec9631fe123700a852768d2fb0d91363930679e145d7bf6eb1f07890bb",
+      "links": []
+    },
+    {
+      "file": "008-established-overlay-auto-rebase.md",
+      "sha256": "360088adafe15d9c1ef187b60510e9feb617cb5a654171c7db4d2ab2f75b9ac8",
+      "links": [
+        {
+          "original": "../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs",
+          "relocated": "../../../scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs"
+        }
+      ]
+    },
+    {
+      "file": "009-copied-cli-fixtures.md",
+      "sha256": "96bab129d597b301d7ef73004acfd32971d0f62871c882ec1136a0d3843623ba",
+      "links": []
+    },
+    {
+      "file": "010-health-tick-watchdog-deadlines.md",
+      "sha256": "59e7bb6f18bedf295abcd2a3d9db99cff0d71e3fcf6d1f12830194d788f76831",
+      "links": []
+    },
+    {
+      "file": "011-daemon-entry-boot-smoke.md",
+      "sha256": "3403c9e3c49304cb48bf7bc2b6d2e43ae0dcc40263638a2cea5ca36af78556f0",
+      "links": []
+    },
+    {
+      "file": "012-red-team-re-check-evidence.md",
+      "sha256": "0f8c544cf80e141b05cd95d58b82163481dd5e8f76497528b83e4cd04c246f8f",
+      "links": []
+    },
+    {
+      "file": "013-drain-red-team-disposition-and-retry-evidence.md",
+      "sha256": "fa6a8a6bf96aedf100645881d6fbba14fafbc471d7b416efbd3fd20902ab0a4c",
+      "links": []
+    },
+    {
+      "file": "014-heavy-admission-in-a-restricted-filesystem.md",
+      "sha256": "e1c32c4f695f8f21cb6b35bf89826046f38ad9f5c9dc11991d23ce5e781fa0c0",
+      "links": []
+    },
+    {
+      "file": "015-prepare-throughput.md",
+      "sha256": "883d12e15d247abbe7899301c9a7be42cce8c94b8bfd7912660fad66852c9ada",
+      "links": []
+    },
+    {
+      "file": "016-codex-usage-accounting.md",
+      "sha256": "9d5db5684ca4082bffa2486c9e1f6fc11f06ae3f0edf282acadc3bf4a81fc7f9",
+      "links": []
+    },
+    {
+      "file": "017-pr-time-loss-safeguards.md",
+      "sha256": "1812fee3460cbe67a465d7e9f11cd9e2e14729e7c559ad04b4c1aa029544a582",
+      "links": []
+    },
+    {
+      "file": "018-human-clearance-across-empty-commits.md",
+      "sha256": "cf92af6f2721a584d76662d5ce210aac52cbbe3d1a89d882a6c78df601d67583",
+      "links": []
+    },
+    {
+      "file": "019-human-clearance-across-drain-numbering.md",
+      "sha256": "605c2bb346471f65c332761869d87a86fe44840224170e04760800862e68ae60",
+      "links": []
+    },
+    {
+      "file": "020-human-only-re-park-net-basis.md",
+      "sha256": "f536dae58a7f17e389555684acd365b462ebe8110770d292eae99cd842c3cf04",
+      "links": []
+    },
+    {
+      "file": "021-quarantine-proof-fixtures.md",
+      "sha256": "2757ee380d9d2db5b22fe0250b79be79f0a9cde94952e6deed83e92861fb7e19",
+      "links": []
+    },
+    {
+      "file": "022-soak-shard-isolation.md",
+      "sha256": "e06841f7368c8f5e8e711d26155db42c56d9dc97b222026b9a1c30af8ba8a801",
+      "links": []
+    },
+    {
+      "file": "023-model-routing-retry-verification.md",
+      "sha256": "832fc5879d0e1900af05df7145d3492825fff04774616c8101ee2b461c02d526",
+      "links": []
+    },
+    {
+      "file": "024-rebuild-smoke-proof-reuse.md",
+      "sha256": "c76ee4a1eac8a1f3f6494e923391a3ac61fb39179ae11d46b608527fdaaefab1",
+      "links": []
+    },
+    {
+      "file": "025-daemon-entry-import-regression.md",
+      "sha256": "b7bc968f3b3baf85aac183bea03885b1499f832fefc3bc118df14d9bdc83863c",
+      "links": []
+    },
+    {
+      "file": "026-smoke-sentinel-worker-isolation.md",
+      "sha256": "f100149d991257664d1177f5819f61a399e179b6201d8a3dc32b368a2384f73d",
+      "links": []
+    },
+    {
+      "file": "027-wrapped-worker-verification-waits.md",
+      "sha256": "46f29d1b939c96b13f4cfda5239ad3a596796d5665a081eadd1193d3785296d8",
+      "links": []
+    },
+    {
+      "file": "028-github-priority-admission.md",
+      "sha256": "1988387f1e72c42b71985e896dc200aa0e2e1f896e468fcd1306c216f8c2ca32",
+      "links": []
+    },
+    {
+      "file": "029-standalone-probation-builds.md",
+      "sha256": "7eb88d40da612e0dd459c08f2a437e0e696579eceac14a5c0663ae7d23a14a8a",
+      "links": []
+    },
+    {
+      "file": "030-antigravity-quota-hold-evidence.md",
+      "sha256": "e23e93c76d96201a5b3b8f5442ebe91161133e6b0d56fe75385a735a3f5924e4",
+      "links": []
+    },
+    {
+      "file": "031-shadow-reviewer-agreement-evidence.md",
+      "sha256": "ef45cafe0cce34f1716afe1db947eb1148c52f3620b5875fdbf5cb4430161668",
+      "links": []
+    },
+    {
+      "file": "032-build-dispatch-prepare-retirement.md",
+      "sha256": "5071ac98f657be3226d1e37d35cf8c774a20e4a148fbcb695b8c48a00e452f8a",
+      "links": []
+    },
+    {
+      "file": "033-build-dispatch-executor-admission.md",
+      "sha256": "158785f9ec1cd6bf61fce15436a865763eb0153487c2f2a075ef7ab8a059d811",
+      "links": []
+    },
+    {
+      "file": "034-stacked-pr-check-absence.md",
+      "sha256": "941d9584aaaa48f536408fddffee53c0cbe425bd5f568770f18c6f847c5cb8bb",
+      "links": []
+    },
+    {
+      "file": "035-constellation-conveyor-probes.md",
+      "sha256": "0767dc6853dfcb913fe1d3780cbfeaf3e4e657d50ce3ec0d20ff3c0e57ad51c1",
+      "links": []
+    },
+    {
+      "file": "036-runner-activity-report.md",
+      "sha256": "8ca2eb441e798840f36b9b653202b5e0dbfa08a21529b6397a5be98f51a0ca76",
+      "links": []
+    },
+    {
+      "file": "037-proof-based-verification-observe-before-you-claim.md",
+      "sha256": "9c74f6553a594d9e36b7e912d5aeef4be8f9562c73cf80bd81cf4b90922b5c2b",
+      "links": [
+        {
+          "original": "../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-10--tool-bearing-doctrine-isolation-attempted-2026-09-10",
+          "relocated": "../../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-10--tool-bearing-doctrine-isolation-attempted-2026-09-10"
+        },
+        {
+          "original": "../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-11--dispatching-sessions-unsandboxed-deletion-proof-2026-09-10",
+          "relocated": "../../../backlog/3371-probe-one-alternate-provider-against-the-judge-contract.md#probe-11--dispatching-sessions-unsandboxed-deletion-proof-2026-09-10"
+        }
+      ]
+    },
+    {
+      "file": "038-pyramid.md",
+      "sha256": "ed5db455df809bd476ea79e919a29a1a70d52c8d326cc30fc43a37b08a7e13a8",
+      "links": []
+    },
+    {
+      "file": "039-what-to-test-where.md",
+      "sha256": "298221f51524a864015fddb1cc0c3fe6cfed441977603361f380bf06edb563dc",
+      "links": []
+    },
+    {
+      "file": "040-delivery-policy-path-probes.md",
+      "sha256": "5aa46197b27c9bd09246a45ec903b0a808ddae046a9bd2f00a14089e37fcf821",
+      "links": []
+    },
+    {
+      "file": "041-quality-guidelines.md",
+      "sha256": "b94ab3755955ea4de3fd81d6c82d5f595a3c9221bc96a5940ebc6fc0949e913a",
+      "links": []
+    },
+    {
+      "file": "042-coverage.md",
+      "sha256": "3c0940418b19737e3adfdfd17401b2c9f4343d05a5b187b6e05306570e09e6b1",
+      "links": []
+    },
+    {
+      "file": "043-commands.md",
+      "sha256": "35f75d8638d4296c875e8e5dee7fd8f22ac1a6eca5479685b4f9bc38aec0ee2b",
+      "links": []
+    },
+    {
+      "file": "044-developing-manually-testing-in-a-lane.md",
+      "sha256": "b01304c3522ea25ba8188917bb2d528e887355b737e1b97f47454ad9ecd8c7bc",
+      "links": [
+        {
+          "original": "platform-decisions.md#pr-flow-rollout-mechanism",
+          "relocated": "../platform-decisions.md#pr-flow-rollout-mechanism"
+        },
+        {
+          "original": "./platform-decisions.md#visual-regression-substrate",
+          "relocated": "../platform-decisions.md#visual-regression-substrate"
+        },
+        {
+          "original": "./platform-decisions.md#skill-memory-replay-substrate",
+          "relocated": "../platform-decisions.md#skill-memory-replay-substrate"
+        }
+      ]
+    },
+    {
+      "file": "045-web-cases-protocol-conformance-fixtures.md",
+      "sha256": "d22363d05d25c1ad3f740e02d4138abcfc23379223c71788522bb935caa52288",
+      "links": []
+    },
+    {
+      "file": "046-builder-prepare-admission-probes.md",
+      "sha256": "cdcf58bd661f2c2a62e82557bd50ce8b818615ec7a57bb8c28e01b5ac7acee29",
+      "links": []
+    },
+    {
+      "file": "047-dispatch-eligibility-reports.md",
+      "sha256": "e3c999e867da7894c491896c8e53cc18e2f6ca14719775abc6d9c0918955c98d",
+      "links": []
+    },
+    {
+      "file": "048-claude-subagent-usage.md",
+      "sha256": "fa0b5daefbf3594a4774546af825cc479af2a95ff9ffb88e8c6f710e427638c0",
+      "links": [
+        {
+          "original": "platform-decisions.md#daemon-claude-worker-risk",
+          "relocated": "../platform-decisions.md#daemon-claude-worker-risk"
+        }
+      ]
+    },
+    {
+      "file": "049-prepare-pr-isolation.md",
+      "sha256": "30a6a3ad3a72f11ab3177b348ee93094c8873115148c17ca5d2dead8be795e1d",
+      "links": []
+    },
+    {
+      "file": "050-prepare-failure-diagnosis-and-release.md",
+      "sha256": "6221fc3be2e756b318bf27ebcf81c8fad2728ae730b9c4c754803f71a3a92bda",
+      "links": []
+    },
+    {
+      "file": "051-github-spend-regression-probes.md",
+      "sha256": "ba58d85e89f6d7e6b8facd8f22cb66e2af19c9ce35ab46a693f2e17f1ff40d5b",
+      "links": []
+    },
+    {
+      "file": "052-auto-repair-round-boundary.md",
+      "sha256": "54d9e4bed990d9a723ef61737a7ba90c7bd13ce1e7b40f48719732024a3faf0c",
+      "links": []
+    },
+    {
+      "file": "053-referral-rulings-answering-stand-downs.md",
+      "sha256": "9b1d1a0c4bb2ef688f77e9f0a1fa2340bb09f001381e4fc0cf506e31eaa53bea",
+      "links": []
+    },
+    {
+      "file": "054-drain-enqueue-confirmation.md",
+      "sha256": "3f8643f8f46af3fae02504f753618b90e08b49fb10d6bb76c17e681f04e75eaa",
+      "links": []
+    },
+    {
+      "file": "055-automated-repair-hand-offs.md",
+      "sha256": "b5a5bdfd3ada520db8772c9ad36f76346b838eea5413ecf5616018a041814916",
+      "links": []
+    },
+    {
+      "file": "056-referral-re-checks-on-the-live-head.md",
+      "sha256": "de7bd8d3ca36fcc2572a6ea187d0b7df3124c090742c5c2bdea1183aaf306be5",
+      "links": []
+    },
+    {
+      "file": "057-false-finding-coroner-pass.md",
+      "sha256": "b48d71197a81b6d3783dba508bda0c1fb93a82d69fc5153fa2b8d5107d330ed5",
+      "links": []
+    },
+    {
+      "file": "058-drain-ci-pre-stage.md",
+      "sha256": "389b3700b4f9cfc93b2897c5bdbdcbbe26b47d6a26250e419ff9de4464c9f0a1",
+      "links": []
+    },
+    {
+      "file": "059-review-scratch-disk-retention.md",
+      "sha256": "ed52418ccefb94fcbc70873719bccaf559ba5e5963b478883cd0f89edd29eff8",
+      "links": []
+    },
+    {
+      "file": "060-github-app-daemon-fallback-probes.md",
+      "sha256": "a2bd4ed125e40e55ba4a2bb402d9a8695d02ff1fb5490670ad9dbeb9a1cfe418",
+      "links": []
+    },
+    {
+      "file": "061-fixer-lane-head-and-lease-probe.md",
+      "sha256": "d5ce79c02be3c21a9bf829778ef978fdce66962a9f0e086cff30e4323dffd0b6",
+      "links": []
+    },
+    {
+      "file": "062-forge-worker-reservations-and-git-gates.md",
+      "sha256": "e47aa523328909a1ad9eb15514cd289b74e1c929b00cc67d096442e3ae37985e",
+      "links": []
+    },
+    {
+      "file": "063-optional-early-review-and-delayed-fix-push.md",
+      "sha256": "ed3c00cdf0c69490159a23066eb2f98748de52c767d5adaf105bbd57f1cdbe8e",
+      "links": []
+    },
+    {
+      "file": "064-archive-only-host-retention-r217.md",
+      "sha256": "646cb903ad9653ff0bb249fd6b1370dbb50697712d6531184e7a63be2bf4a7f5",
+      "links": []
+    },
+    {
+      "file": "065-probe-worker-timeout-teardown.md",
+      "sha256": "78124eba604652a724d4197d6a93c4af237cf8a8bc7739c7ea6a5b758b8c3cfe",
+      "links": []
+    },
+    {
+      "file": "066-forge-manifest-reuse.md",
+      "sha256": "94e05626f74ae084254921f1c3da3afc11da6933ca40f7290c3330c0cde40694",
+      "links": []
+    },
+    {
+      "file": "067-worker-cancellation-during-module-loading.md",
+      "sha256": "99cffe9635400f1297293830be33087c16a6cf6812147d8e68c2174b82d61a9e",
+      "links": []
+    },
+    {
+      "file": "068-forge-synchronous-import-closure.md",
+      "sha256": "8478f8e5bec92a99ddbe2fc33f5b4de4779bc597dec3a4414ddb843ff73c4199",
+      "links": []
+    },
+    {
+      "file": "069-forge-prewarm-claim-boundary.md",
+      "sha256": "619d4576fe6c662fde7649aba13fc873f0c22f9da83d2cda27bf23b8170cb3ad",
+      "links": []
+    },
+    {
+      "file": "070-live-operator-routing-fixtures.md",
+      "sha256": "285f3c6b93e2f409941614b84270abd17eabf13f0e1c26ff2d8b3e7baf7e93d8",
+      "links": []
+    },
+    {
+      "file": "071-ci-heal-check-evidence-r272.md",
+      "sha256": "14f3e77f7deee26725083acf7a7d3c0ff80d1b832fd682e3bd20214e2559c67b",
+      "links": []
+    },
+    {
+      "file": "072-remote-client-import-failures.md",
+      "sha256": "bb8fe4d4f45159570aadc0ae12113576fbeed35a5cc319c108478cc92d7308c9",
+      "links": []
+    },
+    {
+      "file": "073-admission-imports-and-daemon-closures.md",
+      "sha256": "faafac6a7d4ced66f6e175d44c84c92ecf4c7f8e9208026e15ef1887b0ed1575",
+      "links": []
+    },
+    {
+      "file": "074-manual-daemon-pass-r247.md",
+      "sha256": "635955401710bfd2c7dba49e73a3ee22b0d5f0eee5a83b0eb142513f8366fd49",
+      "links": []
+    },
+    {
+      "file": "075-raw-red-team-recovery-witnesses-7537.md",
+      "sha256": "bbf563d011417936b0fc4f7362527b9c2429b2c234d6bd36da884b5c5a47f0dc",
+      "links": []
+    },
+    {
+      "file": "076-forge-coverage-timestamp-parity.md",
+      "sha256": "6735d8825b43c26bc7bf4c63ba621d6d7b9a4492fbaf5dae9a7a44f1814c66c1",
+      "links": []
+    },
+    {
+      "file": "077-forge-tracked-symlink-parity.md",
+      "sha256": "dfe009acad75b44f9a1f866ee7fd9ff60680233a8ddeeafd1c570ab695775484",
+      "links": []
+    },
+    {
+      "file": "078-forge-ignored-leaves-under-tracked-directory-links.md",
+      "sha256": "2ee001e2c53f274b7710f4598c041f541f183ffc7089457fec73d52a25b945a2",
+      "links": []
+    },
+    {
+      "file": "079-forge-ignored-test-discovery.md",
+      "sha256": "d966bf80d7ef1840e1728f8d8662f8fb0cdb63128a01ee8cc6c3bc72687fb70b",
+      "links": []
+    },
+    {
+      "file": "080-post-accept-advisory-shadow-evidence.md",
+      "sha256": "9182999271c2375dc7c33e5f0a419aec236aee29b0b33ebf03d4280ff0433d28",
+      "links": []
+    },
+    {
+      "file": "081-post-accept-advisory-replay-probes.md",
+      "sha256": "0d4a00e58c3bc489f44d772c2b05aa91228a51d01c5dd1e07454e59a7870634d",
+      "links": []
+    },
+    {
+      "file": "082-post-accept-advisory-production-ratings.md",
+      "sha256": "1a958231f25edf474785651089204b1ed5d2c21cac4ad1d5b30184768cfe81b2",
+      "links": []
+    },
+    {
+      "file": "083-review-label-body-file-checkout-regression.md",
+      "sha256": "910b3299566d5106c952904b60d4d1c6510f28050e7f5fca9b02cc48f81bc38e",
+      "links": []
+    },
+    {
+      "file": "084-verdict-ledger-contention-regression-r365-fix-2.md",
+      "sha256": "de69e32567f4767c130f14bc97e179d362e478a72f3aec58f49e52dbe912f3be",
+      "links": []
+    },
+    {
+      "file": "085-persisted-pending-and-queue-retention.md",
+      "sha256": "83bba0fc5b996e419384fde0c270d1ea8a1f9346b82081f09a56e5eb2c82a685",
+      "links": []
+    },
+    {
+      "file": "086-uid-scanner-idle-proofs.md",
+      "sha256": "83189f7cd19db373709c0a13a027052f42a1faeff3677b68d8dd44088f3af0b9",
+      "links": []
+    },
+    {
+      "file": "087-pr-sweep-invariant-replay-r437.md",
+      "sha256": "96e8ccd34dbd8c589d7412acc2c878c074849607dc7462400b1166e2c1f8a5e9",
+      "links": []
+    },
+    {
+      "file": "088-shard-split-retry-evidence.md",
+      "sha256": "abe24fdfb1ae76afbc65a2fb228f0bc33a4aa8ff4ef6574f136cb54f6c161b34",
+      "links": []
+    },
+    {
+      "file": "089-lane-release-preservation-guard.md",
+      "sha256": "7a57fa3680831688c9ed92b914866ef2bfa49a2ba8ce60e474b858830da7f699",
+      "links": []
+    },
+    {
+      "file": "090-author-stamp-repair-daemon-wiring.md",
+      "sha256": "7d9e0ded7e60401cdbca2c2f2edf32b007c23d02e5586f03e808c46d6b8ad8c3",
+      "links": []
+    },
+    {
+      "file": "091-bounded-review-run-scans.md",
+      "sha256": "d6721fb04409e29fb5b745a062155502569ad207a199bf2c8d0d63332980b8cb",
+      "links": []
+    },
+    {
+      "file": "092-refused-referral-reviews-re-read-standing-rulings.md",
+      "sha256": "3f4f58e3eae6e78b74eb82e59f820fa3d7c53bfb48f28d40d824e5b1ec74b886",
+      "links": []
+    },
+    {
+      "file": "093-suspended-mandatory-referral-handoff-r746.md",
+      "sha256": "3a94c82efa3862fcd3667da3465342ace5b1b4e8b67c8004135ce543e70af1c5",
+      "links": []
+    },
+    {
+      "file": "094-audit-path-grammar-integration.md",
+      "sha256": "e7a3e789e3bbceaa51b3a8f5c18353bc37c82a179b0429cf61e4c47d493cc161",
+      "links": []
+    },
+    {
+      "file": "095-shared-clone-owner-election-and-deferred-mutation-retries.md",
+      "sha256": "0ecacbcc6a5b5dd1a263502620ae1481c5094391ca8139c07bbbca8ed44cdfc5",
+      "links": []
+    },
+    {
+      "file": "096-live-owner-watch-import-ordering.md",
+      "sha256": "e8b738f25876b8604e47127c8b4752292cd131f44e9a5823a6aa81270fe47b61",
+      "links": []
+    },
+    {
+      "file": "097-pinned-hook-checkout-roots.md",
+      "sha256": "004ba91cb12341df170cf1b32de0e86573da05b3510090b80ee612551d79e5f8",
+      "links": []
+    },
+    {
+      "file": "098-recovering-a-red-team-result-whose-check-was-never-published.md",
+      "sha256": "e2084f70a9c2a7c6a8f73831e599d4f628a7f269173f860a5a055b3490e0149e",
+      "links": []
+    },
+    {
+      "file": "099-red-team-gate-catch-up-regressions.md",
+      "sha256": "75cb04a532a28cc933877af9058a2cc572f7b5ac46e495b2e2b794ad3d8dbba5",
+      "links": []
+    },
+    {
+      "file": "100-delivery-flow-policy-preview-pr1.md",
+      "sha256": "8c44958028f4ac9e99e43255a3c249085bee80262a67279f98d4172a4473a889",
+      "links": []
+    },
+    {
+      "file": "101-drain-freeze-read-recovery.md",
+      "sha256": "ce7e4016a31dd58eddbf8e42713589903e09701d6b0222404f6dce767fa6e07d",
+      "links": []
+    },
+    {
+      "file": "102-canonical-audit-admission-regression-fixtures.md",
+      "sha256": "da1fb4efba0b7c6fc7a0a929ebd2b490f1893692a13a1ec09c0d627ea9152c2e",
+      "links": []
+    },
+    {
+      "file": "103-canonical-audit-before-opening-prs.md",
+      "sha256": "904218ea0b51340d539720a46f05d79b1771845f3dde4b2e5799f4a2a9a743d8",
+      "links": []
+    },
+    {
+      "file": "104-bounded-red-team-probe-fairness.md",
+      "sha256": "4fb5ec089bd7d28a5eab5b699fcc112662475c434b1a259c837862abaa1b4b44",
+      "links": []
+    },
+    {
+      "file": "105-timeout-evidence-synchronous-worker-pool.md",
+      "sha256": "070c8229f47430fc5cd5c7e6c2f19b6c8fe942a299bba2fc483f45afaffd9f4b",
+      "links": []
+    },
+    {
+      "file": "106-r986-i1-probation-core-production-wiring-pending.md",
+      "sha256": "468e6e28e3e82139db1c666ded2b0bc7b2e57ca1b032a7fba9c6270aac0f739e",
+      "links": []
+    },
+    {
+      "file": "107-github-actions-job-log-readers.md",
+      "sha256": "ef4055e51ba29ceef9f6d9b0f049f206e751c6505dd503e89005f85466f6a68d",
+      "links": []
+    },
+    {
+      "file": "108-review-job-exit-evidence.md",
+      "sha256": "0b5d654b0c18c1051ae42fa452888c50779d159b186e2d5662a60be1eb07c606",
+      "links": []
+    },
+    {
+      "file": "109-required-check-evidence-contract-pr1.md",
+      "sha256": "d405c5076b98188c94fb8a45e0f1b4f681ba4ef1589324709793b6bbb054b0f7",
+      "links": []
+    },
+    {
+      "file": "110-pr1-audit-malformed-rows-human-holds-and-unavailable-rosters.md",
+      "sha256": "6e9806cbf8f3e9ba5e235de9b8a971d05ae0727e683c58a708d3cbc1e914f631",
+      "links": []
+    },
+    {
+      "file": "111-stuck-trace-isolation.md",
+      "sha256": "2f791fef47044d7ce7c92fbe124c4cd7e1ffa6d6de73d7f5b6c838bed2b4c70f",
+      "links": []
+    },
+    {
+      "file": "112-antigravity-binary-maintenance.md",
+      "sha256": "8fcc1df8eeb4822c7fee87a4842d668e55e49e369eda00a45aee737ca75bb794",
+      "links": []
+    },
+    {
+      "file": "113-binary-maintenance-hold-regressions.md",
+      "sha256": "baf612f6227ac3b7fa88741192151ad4257bae3c5adfca2ed70459e3750c55f0",
+      "links": []
+    },
+    {
+      "file": "114-capability-dispatch-boundary-audit-2026-11-18.md",
+      "sha256": "73f0d0d7b342cefba511499310e38f1993e42ba4d60ea582f73183ee210f8348",
+      "links": []
+    },
+    {
+      "file": "115-review-index-completeness-proof.md",
+      "sha256": "26bf6e8af962a5d1fcc72dd79403034278141a613435705dc977971981c2af95",
+      "links": []
+    },
+    {
+      "file": "116-fast-drain-round-listing-and-live-target-refresh.md",
+      "sha256": "d53d2ed5057a941343f99d902cd7d4ef720e249419ead8fbb63e298be6e159f2",
+      "links": []
+    },
+    {
+      "file": "117-drain-read-migration-fixture-imports.md",
+      "sha256": "ca755d8a7a2a3435a8216dedfe7253a5a41878b3ef966acd623a400155fe4ef1",
+      "links": []
+    },
+    {
+      "file": "118-ready-candidate-adoption-during-overlay-churn.md",
+      "sha256": "b16a81b50419343d0286e3d60acbbcc9ee83440bd5cd79b12b40bea8e9f6d61f",
+      "links": []
+    },
+    {
+      "file": "119-static-selection-edges-and-replay-affected-only-ci-s1.md",
+      "sha256": "92831d0827cd0ae0d9a35c262a0b489b0d6266bb043de5fb9b045727131cc8e5",
+      "links": []
+    },
+    {
+      "file": "120-shadow-dependency-tracing-s2.md",
+      "sha256": "8f1ce4c7c7a4fbfb8c66134dabd4435e984ac7010f3a04ad7f27dd9a3c6ff014",
+      "links": []
+    },
+    {
+      "file": "121-workflow-protection-review-admission.md",
+      "sha256": "4b8cb6c196c7342b69f16de87743b1021dd5cdaf5e699a73b42f96f8d40ec650",
+      "links": []
+    },
+    {
+      "file": "122-live-review-seat-policy-r1077.md",
+      "sha256": "0f206ef803760f93c7c5d550fb4580fd278e55c08e2c22f4421dc59cc3ce4fef",
+      "links": []
+    },
+    {
+      "file": "123-overlay-main-sync-interrupted-test-evidence.md",
+      "sha256": "49bc7d3f27707cf25a1217f3fed16a78dabba86b31d9f54930c8307495be8bce",
+      "links": []
+    },
+    {
+      "file": "124-carbon-review-admission-and-complete-escape-evidence-slice-a.md",
+      "sha256": "b35d36ac78cfb563d4a0497f9e2da5b3ebc603d461c2b79757efe1c9f9fb1a4e",
+      "links": []
+    },
+    {
+      "file": "125-owed-ci-rerun-execution.md",
+      "sha256": "9777af85735a48d4e7d846d9779fddfe8dd4dd62bdbe39dedf8cbf70849b0fb1",
+      "links": []
+    },
+    {
+      "file": "126-review-ci-fixture-provenance.md",
+      "sha256": "8c384b1c5017cf18c395210c863a4b6495169384f97d86a79c9f65e5dd119602",
+      "links": []
+    },
+    {
+      "file": "127-event-fast-drain-context-freshness.md",
+      "sha256": "c6ec9728144801c823b3a2a90379a52e80d0770f6d287591c44bedc31ccb73b0",
+      "links": []
+    },
+    {
+      "file": "128-antigravity-advisory-seating-and-unavailable-provider-evidence.md",
+      "sha256": "7dbb14a13237ed91abaff7dc98310063527d6ed49487c8e18da3f22c24f490ea",
+      "links": []
+    },
+    {
+      "file": "129-forge-pool-grow-failure-fixtures.md",
+      "sha256": "61853345d2498c6924fbca57a27b2bd4d820b6a9fec2f300ef34142ed3af4de0",
+      "links": []
+    },
+    {
+      "file": "130-verify-failed-file-recovery.md",
+      "sha256": "1065aa0d45cf385ac43378d6a0ccb42281fdaf9f3443f9e70aeb4196e2683b8d",
+      "links": []
+    },
+    {
+      "file": "131-urgent-prototype-verification.md",
+      "sha256": "a00cb1caa88a1b4ce6e74cf519b2e4b3735f3cea8f82223289f8b6fa790ff560",
+      "links": []
+    },
+    {
+      "file": "132-urgent-local-verification-receipts.md",
+      "sha256": "7eed81301ecdc46a0b4d797a4ce8a5fea0c27860828cfe455902238b554a130d",
+      "links": []
+    },
+    {
+      "file": "133-urgent-unload-adoption.md",
+      "sha256": "804b779ccc99da99bfdb2c21e94d7a32b31faf2223be56bb4c7bb21a3aac7f83",
+      "links": []
+    },
+    {
+      "file": "134-urgent-sweep-guarded-withdrawals.md",
+      "sha256": "a3213ea560e92eb8baf9559abab7216f7e04a7f9fd6f01f14f514d5940e40598",
+      "links": []
+    },
+    {
+      "file": "135-review-capability-admission-at-maintenance-boundaries.md",
+      "sha256": "5533bbdabae675475e77da80b44c9bd891537bed94a75dc97adf1266254d7296",
+      "links": []
+    },
+    {
+      "file": "136-concurrent-added-review-seats.md",
+      "sha256": "2162381ff917a76789506b5f8c214701590dce98d69bbf4d1e6a9df97211d079",
+      "links": []
+    },
+    {
+      "file": "137-forge-tracked-at-head-manifests-s1.md",
+      "sha256": "82d9bb33f5801c36ea0d69e1e5b0bd46f06a8f7d01038df4ff39e23198094986",
+      "links": []
+    },
+    {
+      "file": "138-negative-review-run-proofs.md",
+      "sha256": "e900ccf7120b5e11477edc73bb57d08b7f74d55eff2c2e2df7af1a9fc1ed7c57",
+      "links": []
+    },
+    {
+      "file": "139-forge-sweep-partial-work.md",
+      "sha256": "41ca73346e44a69882c52395c0ce8118e46293d617f508f79b8305ad088b8180",
+      "links": []
+    },
+    {
+      "file": "140-runtime-infra-recovery-identity.md",
+      "sha256": "3bcb70ae522e3f76af9376c8e9354850f8837cd70ecfc00c95923384f0f6a0b2",
+      "links": []
+    },
+    {
+      "file": "141-expectation-babysitter-replay-s1.md",
+      "sha256": "335ce302322ffaf209d993b6e8c27385f98a70ec7a863c7e15168c08646e41d6",
+      "links": []
+    },
+    {
+      "file": "142-review-run-filename-discovery-r1099.md",
+      "sha256": "4da3061cf20c30039b8c8906db848fd83fe4fd6e5297f5547ddb1ad85c251478",
+      "links": []
+    },
+    {
+      "file": "143-ci-only-pr-opening-r1086.md",
+      "sha256": "5a816f22e8ecd4733321f19df700b31be37d60a3c491e24d2f7f07135ddc9450",
+      "links": []
+    },
+    {
+      "file": "144-open-pr-preflight.md",
+      "sha256": "1365089d00cc35fe38a3ed96d832cee55163570591584c520cb507bfb6d5635d",
+      "links": []
+    },
+    {
+      "file": "145-between-tick-rebuild-launch-probes.md",
+      "sha256": "80a591a1a94d5b7589d49dcba0eb94e32ad80d9aadb48e1bc6ac394f8a71ec4f",
+      "links": []
+    },
+    {
+      "file": "146-shadow-only-static-selection-edges.md",
+      "sha256": "32460b44858e7f8c78736bd496215e97214395efde6b2b9c7a9f1a288e7b5a47",
+      "links": []
+    },
+    {
+      "file": "147-ci-workflow-self-test-ci-self-yml.md",
+      "sha256": "c222a0f43daafee88bfa7bd48351c31166d80f745328dc7ad0610468ae64750b",
+      "links": []
+    },
+    {
+      "file": "148-file-item-card-publication-replay.md",
+      "sha256": "fa696b04f86975866522266de2cef54513e6fbe3b1143b21ded46caead7efc55",
+      "links": []
+    },
+    {
+      "file": "149-lane-reset-safety-probe-regressions.md",
+      "sha256": "c23172bff18a537a3a5a677161fc684edb6d6ea84a95fd5610a03d2edde31c49",
+      "links": []
+    },
+    {
+      "file": "150-async-drain-worker-cli-fixtures.md",
+      "sha256": "7bd6e7492c79d48559e4083b42d444796d7b347be75379eba50e55ece575bd2d",
+      "links": []
+    },
+    {
+      "file": "151-file-item-batch-history-and-warning-coverage.md",
+      "sha256": "7a98d93fb7cb468219b598f1cd54c8cd6ccecbbee57a6c947edad9de2a482d32",
+      "links": []
+    },
+    {
+      "file": "152-pinned-merge-drain-leaf-fixtures-r1105.md",
+      "sha256": "56e3b564f12babefc7f4a4ff44cd7a903b11d03686f96826c516734f2bd7b807",
+      "links": []
+    },
+    {
+      "file": "153-journal-stale-remover-scheduling.md",
+      "sha256": "5dea7f7deb1a1bf6477939f6b41b0daf108c8f6d8232dd54834c5193a47338b4",
+      "links": []
+    },
+    {
+      "file": "154-live-owner-adapter-fixture-imports.md",
+      "sha256": "2a7ad1f4075963ae09c31c6559990c6e191d6db92b355f8e5a90e1487fe2d6dc",
+      "links": []
+    },
+    {
+      "file": "155-lane-eligibility-absent-checkout-versus-failed-probe.md",
+      "sha256": "6a0f2167baa0cd7fd21cc8678f7f4e520d2a13afd21d9d63302cf160766ba3f3",
+      "links": []
+    },
+    {
+      "file": "156-label-timeline-and-clearance-race-fixtures.md",
+      "sha256": "b97fe8d3a616d802cc89fc500d07b08fca8771171149dee7bec2918817a02061",
+      "links": []
+    },
+    {
+      "file": "157-per-topic-notes.md",
+      "sha256": "22ada514d8c2b8c6b84ff7945e35a47c38e3032a124a9356aa8b707f7058720e",
+      "links": []
+    },
+    {
+      "file": "158-s1b-shadow-accuracy-evidence.md",
+      "sha256": "a795754f9edac6516b66d9767bb11f663b7be2f36e90f96b5f4a68031e3d7400",
+      "links": []
+    },
+    {
+      "file": "159-conflict-watcher-cli-contracts.md",
+      "sha256": "b4f682021e6e2c3c3feb3e53a9bcdb18630619fcf8e154823ad772a403d52f3c",
+      "links": []
+    },
+    {
+      "file": "160-orphan-exclusions-precede-stand-down-answers.md",
+      "sha256": "583cb2905266605cfe2415c234ef36eb18fa290ccb318a525d7e3eef2c77d920",
+      "links": []
+    },
+    {
+      "file": "161-bounded-verify-selection-and-ceiling-recovery.md",
+      "sha256": "dfaa9b25119aee9b558f92f1fec8d3f4854933356b871566fe4a648afef85599",
+      "links": []
+    },
+    {
+      "file": "162-build-priority-named-file-allowlist-fixtures.md",
+      "sha256": "3300ec0140d1519fb2f568dcc28069a327916a0c19b6bd72538b4fa14eeef0f6",
+      "links": []
+    },
+    {
+      "file": "163-provider-rotation-shadow-prov-ab-s1-2.md",
+      "sha256": "a49fc7a6dbb4a333291171dad0fa2243ec4b724dba7edb51ae5444fe799b18c0",
+      "links": [
+        {
+          "original": "testing/README.md",
+          "relocated": "README.md"
+        }
+      ]
+    },
+    {
+      "file": "164-test-timing-ownership.md",
+      "sha256": "6f842305ea98d966d46edf976cca3042ba5f175bf8ff0bdc65e32cf7f7318a8c",
+      "links": []
+    }
+  ]
+}

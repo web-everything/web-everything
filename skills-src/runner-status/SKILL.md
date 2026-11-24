@@ -14,7 +14,7 @@ node scripts/operations/run.mjs runner-activity --json
 ```
 
 Read `verdict` in the standard operation envelope. Use `--limit=N` for the last N terminal
-dispatch records (default 10). See [the report contract](../../docs/agent/testing.md#runner-activity-report).
+dispatch records (default 10). See [the report contract](../../docs/agent/testing.d/036-runner-activity-report.md#runner-activity-report).
 
 ## Read the evidence
 
