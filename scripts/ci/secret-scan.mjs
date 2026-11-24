@@ -3,6 +3,8 @@
 // text matching. The shared Forge structural detector also scans each file's concatenated added lines,
 // including member fragments whose unchanged JWK type/enclosing object is absent from the diff.
 // Gaps also get a separate lexical view: unchanged syntax cannot be inferred from added lines.
+// Bare quoted values can also have an omitted private member name; reject these
+// ambiguous fragments conservatively, without inventing members in complete objects.
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -113,8 +115,25 @@ function addedStructureFinding(bytes, gaps = []) {
 }
 
 function fileStructureFinding(added, starts) {
-  if (starts.length === 1) return addedStructureFinding(Buffer.concat(added));
   const runs = starts.map((start, index) => Buffer.concat(added.slice(start, starts[index + 1])));
+  const trivia = /^(?:\s+|\/\*[\s\S]*?\*\/|\/\/[^\r\n\u2028\u2029]*)*/;
+  for (const run of runs) {
+    const text = run.toString('utf8');
+    // A replacement can supply only the value of an unchanged `d`, `k`, etc.
+    // Examine each contiguous run separately: concatenating another addition can
+    // disguise that leading value as a member name or an earlier member's value.
+    // Skip trivia, then distinguish a quoted value from an ordinary quoted name.
+    const leading = trivia.exec(text)[0].length;
+    const literal = /^(?:"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*')/.exec(text.slice(leading));
+    if (!literal) continue;
+    const rest = text.slice(leading + literal[0].length);
+    if (rest[trivia.exec(rest)[0].length] === ':') continue;
+    const witness = '{"kty":"oct","d":\n';
+    if (Buffer.byteLength(text) + witness.length + 2 > LIMIT) throw incomplete();
+    const finding = keyStructureFinding(Buffer.from(`${witness}${text}\n}`));
+    if (finding) return finding;
+  }
+  if (runs.length === 1) return addedStructureFinding(runs[0]);
   const scanRuns = chunks => {
     let offset = 0;
     const gaps = chunks.slice(0, -1).map(chunk => (offset += chunk.toString('utf8').length));

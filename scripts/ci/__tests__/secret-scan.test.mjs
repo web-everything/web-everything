@@ -187,6 +187,37 @@ describe('secret-scan', () => {
     expect(result.status).toBe(1);
     expect(result.output).toBe('key.json:2 private-key-structure\n');
   });
+  it.each([false, true])('rejects a value-only replacement under an unchanged private JWK member (context=%s)', context => {
+    const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const jwk = privateKey.export({ format: 'jwk' });
+    const publicLines = JSON.stringify(publicKey.export({ format: 'jwk' }), null, 2).split('\n');
+    const before = [...publicLines.slice(0, -1), ', "d":', '""', '}'];
+    const after = [...before.slice(0, -2), JSON.stringify(jwk.d), '}'];
+    expect(createPrivateKey({ key: JSON.parse(after.join('\n')), format: 'jwk' }).asymmetricKeyType).toBe('ec');
+    expect(keyStructureFinding(Buffer.from(after.join('\n')))).toBe('private-key-structure');
+    const at = before.length - 1;
+    const input = '--- a/key.json\n+++ b/key.json\n'
+      + (context ? `@@ -1,${before.length} +1,${after.length} @@\n`
+        + before.slice(0, -2).map(text => ` ${text}\n`).join('') : `@@ -${at} +${at} @@\n`)
+      + `-""\n+${JSON.stringify(jwk.d)}\n` + (context ? ' }\n' : '');
+    const result = scan(input);
+    expect(result.output).toBe(`key.json:${at} private-key-structure\n`);
+    expect(result.status).toBe(1);
+    expect(scan(input, [{ path: 'key.json', rule: 'private-key-structure', reason: 'Generated fixture' }]).status).toBe(0);
+  });
+  it.each([
+    '"abc",', "'abc',", '"\\u0061bc",', '"a" + "bc",',
+    '/* value */\r\u2028"abc",', '// value\n"abc",',
+  ])('rejects a quoted value fragment with omitted member syntax %#', value => {
+    const lines = value.split('\n');
+    const input = '--- a/key.json\n+++ b/key.json\n@@ -1 +1 @@\n-old\n+// changed metadata\n'
+      + `@@ -10 +10,${lines.length} @@\n-""\n` + lines.map(text => `+${text}\n`).join('');
+    expect(scan(input).output).toBe('key.json:1 private-key-structure\n');
+  });
+  it.each(['"",', "'',", '"description": "clean",', '/* comment */ "description": "clean",'])
+    ('keeps empty values and ordinary member fragments clean %#', value => {
+      expect(scan(diff(value)).status).toBe(0);
+    });
   it.each(['d', 'p', 'q', 'dp', 'dq', 'qi', 'k', 'oth'])('scans an inserted %s member without its unchanged JWK enclosure or type', name => {
     const value = name === 'oth' ? [Object.fromEntries(['r', 'd', 't'].map(member => [member, 'abc']))] : 'abc';
     const body = `${JSON.stringify(name)}: ${JSON.stringify(value)},`;
