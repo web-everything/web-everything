@@ -327,6 +327,7 @@ export const LOCK_USERS = Object.freeze([
 // blocks more, and the audit-verdict test lists that over-capture.
 // A Set: the lock users repeat a few modules other entries already name.
 export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
+  'scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',

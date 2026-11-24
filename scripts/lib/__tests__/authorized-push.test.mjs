@@ -1,18 +1,16 @@
 /** @file Hermetic authorized-push refusals, live reads and lease boundary. */
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { authorizedPush, readPushAuthority } from '../authorized-push.mjs';
+import { createAuthorizedPushForTesting } from '../authorized-push-testing.mjs';
+const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
+const readPushAuthority = options => createAuthorizedPushForTesting(options.io).readPushAuthority(options);
 import { PUSH_HOLD_LABELS } from '../review-hold-model.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
-import { resolveRealGhBinary } from '../gh-app-shim.mjs';
+import { authorizedPush as publicPush, readPushAuthority as publicRead } from '../authorized-push.mjs';
 
-vi.mock('../gh-app-shim.mjs', async importOriginal => {
-  const actual = await importOriginal();
-  return { ...actual, resolveRealGhBinary: vi.fn(actual.resolveRealGhBinary) };
-});
 vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...await importOriginal(), runGhSync: vi.fn() }));
 vi.mock('../../conveyor/fix-procedure.mjs', async importOriginal => ({ ...await importOriginal(), pushRefusal: vi.fn(() => null) }));
 afterEach(() => { vi.clearAllMocks(); pushRefusal.mockReturnValue(null); });
@@ -22,7 +20,7 @@ const pushed = () => ({ status: 0, stdout: `To ${url}\n \t${sha}:refs/heads/lane
 const view = () => ({ labels: [], state: 'OPEN', isDraft: false, headRefOid: head,
   headRefName: 'lane/fix', isCrossRepository: false });
 function fixture() {
-  const io = { readClaim: vi.fn(() => ({ meta: { sessionId: 'mine' } })),
+  const io = { stat: () => ({ isFile: () => true, uid: process.getuid(), mode: 0o755 }), readClaim: vi.fn(() => ({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine' } })),
     isClaimHolder: vi.fn((entry, holder) => entry.meta.sessionId === holder?.sessionId),
     ghPrView: vi.fn(() => ({ ...view(), headRefOid: (io.gitPush?.mock.calls.length || io.spawn?.mock.calls.some(([, args]) => args.includes('push'))) ? sha : head })), isAncestor: vi.fn(() => true),
     branchClaimRefusal: vi.fn(() => null),
@@ -36,7 +34,7 @@ const throws = () => { throw new Error('unreadable'); };
 describe('authorized push', () => {
   it.each(['initial', 'pre-push', 'post-push'])('refuses an unbound who-only claim at %s', phase => {
     const f = fixture(); f.io.isClaimHolder.mockReturnValue(true);
-    const bound = { meta: { sessionId: 'mine' } }, unbound = { meta: { who: 'worker' } };
+    const bound = { meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine' } }, unbound = { meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', who: 'worker' } };
     f.io.readClaim.mockReturnValue(unbound);
     if (phase !== 'initial') f.io.readClaim.mockReturnValueOnce(bound);
     if (phase === 'post-push') f.io.readClaim.mockReturnValueOnce(bound);
@@ -71,7 +69,7 @@ describe('authorized push', () => {
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
   });
   it.each([
-    ['released or expired', null], ['reassigned', { meta: { sessionId: 'other' } }], ['unreadable', throws],
+    ['released or expired', null], ['reassigned', { meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'other' } }], ['unreadable', throws],
   ])('blocks hand-back when post-push claim is %s', (_name, entry) => {
     const f = fixture(); f.io.gitPush.mockImplementation(() => {
       f.io.readClaim.mockImplementation(typeof entry === 'function' ? entry : () => entry);
@@ -82,7 +80,7 @@ describe('authorized push', () => {
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
   });
   it('allows a token-bound sessionless holder', () => {
-    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { who: 'worker', tokenHash: 'hash' } });
+    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', who: 'worker', tokenHash: 'hash' } });
     f.io.isClaimHolder.mockReturnValue(true);
     expect(authorizedPush(f)).toMatchObject({ ok: true, pushed: sha });
     expect(f.io.readClaim).toHaveBeenCalledTimes(3);
@@ -100,11 +98,11 @@ describe('authorized push', () => {
   });
   it.each([
     ['released or expired', null, 'not-claim-holder'],
-    ['reassigned', { meta: { sessionId: 'other' } }, 'not-claim-holder'],
+    ['reassigned', { meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'other' } }, 'not-claim-holder'],
     ['unreadable', throws, 'unreadable'],
   ])('refuses a claim %s at the final gate', (_name, entry, code) => {
     const f = fixture();
-    f.io.readClaim.mockReturnValueOnce({ meta: { sessionId: 'mine' } })
+    f.io.readClaim.mockReturnValueOnce({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine' } })
       .mockImplementation(typeof entry === 'function' ? entry : () => entry);
     expect(authorizedPush(f)).toMatchObject({ ok: false, code });
     expect(f.io.readClaim).toHaveBeenCalledTimes(2);
@@ -156,8 +154,9 @@ printf 'username=x-access-token\\npassword=%s\\n' "\${GH_TOKEN:-$GITHUB_TOKEN}"
       vi.stubEnv(key, 'fixture-token-only'); vi.stubEnv('GH_CONFIG_DIR', config);
       vi.stubEnv('GIT_CONFIG_COUNT', '1'); vi.stubEnv('GIT_CONFIG_KEY_0', 'credential.helper');
       vi.stubEnv('GIT_CONFIG_VALUE_0', '!false');
-      resolveRealGhBinary.mockReturnValueOnce(helper);
+
       const f = fixture(), spawn = f.io.spawn; delete f.io.gitPush;
+      f.io.gh = helper;
       let credentials;
       f.io.spawn = vi.fn((bin, args, opts) => {
         if (!args.includes('push')) return spawn(bin, args, opts);
@@ -249,7 +248,7 @@ printf 'username=x-access-token\\npassword=%s\\n' "\${GH_TOKEN:-$GITHUB_TOKEN}"
     expect(f.io.gitPush).toHaveBeenCalledTimes(0);
   });
   it.each([false, true])('allows own-drafted=%s and pushes the exact lease once', draft => {
-    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { sessionId: 'mine', draft } });
+    const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch: 'lane/fix', sessionId: 'mine', draft } });
     f.io.ghPrView.mockImplementation(() => ({ ...view(), isDraft: draft, headRefOid: f.io.gitPush.mock.calls.length ? sha : head }));
     expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
@@ -283,7 +282,96 @@ printf 'username=x-access-token\\npassword=%s\\n' "\${GH_TOKEN:-$GITHUB_TOKEN}"
     expect(runGhSync).toHaveBeenCalledTimes(1);
     expect(runGhSync).toHaveBeenCalledWith(['pr', 'view', '42', '--repo',
       expect.any(String), '--json', 'labels,state,isDraft,headRefOid,headRefName,isCrossRepository'],
-    expect.objectContaining({ throttle: { noMemo: true } }));
+    expect.objectContaining({ throttle: { noMemo: true, bin: expect.any(String) } }));
     expect(f.io.gitPush).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe('audit negative guarantees', () => {
+  it.each(['repo', 'pr', 'kind', 'branch'])('refuses mismatched claim %s despite matching holder', key => {
+    const f = fixture(), meta = { ...f.io.readClaim().meta, [key]: key === 'pr' ? 99 : 'foreign' };
+    f.io.readClaim.mockReturnValue({ meta });
+    expect(authorizedPush(f)).toMatchObject({ code: 'not-claim-holder' });
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it.each(['repo', 'pr', 'kind', 'branch'])('refuses missing claim %s', key => {
+    const f = fixture(), meta = { ...f.io.readClaim().meta }; delete meta[key];
+    f.io.readClaim.mockReturnValue({ meta });
+    expect(authorizedPush(f)).toMatchObject({ code: 'unreadable' });
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it.each(['initial', 'pre-push', 'post-push'])('refuses nonboolean draft metadata at %s', phase => {
+    const f = fixture(), bound = f.io.readClaim();
+    f.io.readClaim.mockReturnValue({ meta: { ...bound.meta, draft: 'true' } });
+    if (phase !== 'initial') f.io.readClaim.mockReturnValueOnce(bound);
+    if (phase === 'post-push') f.io.readClaim.mockReturnValueOnce(bound);
+    expect(authorizedPush(f)).toMatchObject({ code: phase === 'post-push' ? 'pushed-under-hold' : 'unreadable' });
+    expect(f.io.gitPush).toHaveBeenCalledTimes(phase === 'post-push' ? 1 : 0);
+  });
+  it.each([undefined, false])('a drafted PR requires draft === true, got %s', draft => {
+    const f = fixture(), meta = { ...f.io.readClaim().meta, draft };
+    if (draft === undefined) delete meta.draft;
+    f.io.readClaim.mockReturnValue({ meta }); f.io.ghPrView.mockReturnValue({ ...view(), isDraft: true });
+    expect(authorizedPush(f)).toMatchObject({ code: 'draft' });
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'foreign-owner', 'group-writable', 'world-writable'])('refuses %s gh candidates without PATH fallback', kind => {
+    const f = fixture(), paths = [];
+    f.io.stat = path => {
+      paths.push(path);
+      if (kind === 'missing') throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { isFile: () => true, uid: kind === 'foreign-owner' ? process.getuid() + 1 : process.getuid(),
+        mode: kind === 'group-writable' ? 0o775 : kind === 'world-writable' ? 0o757 : 0o755 };
+    };
+    expect(authorizedPush(f)).toMatchObject({ code: 'unreadable' });
+    expect(paths).toEqual(['/opt/homebrew/bin/gh', '/usr/local/bin/gh']);
+    expect(f.io.gitPush).not.toHaveBeenCalled(); expect(f.io.ghPrView).not.toHaveBeenCalled();
+  });
+  it('resolves gh once and pins the same binary for all PR reads and the helper', () => {
+    const f = fixture(); delete f.io.ghPrView;
+    f.io.stat = vi.fn(() => ({ isFile: () => true, uid: 0, mode: 0o755 }));
+    runGhSync.mockReturnValueOnce(JSON.stringify(view())).mockReturnValueOnce(JSON.stringify(view()))
+      .mockReturnValue(JSON.stringify({ ...view(), headRefOid: sha }));
+    expect(authorizedPush(f)).toMatchObject({ ok: true });
+    expect(f.io.stat).toHaveBeenCalledTimes(1);
+    for (const [, opts] of runGhSync.mock.calls) {
+      expect(opts.throttle.bin).toBe('/opt/homebrew/bin/gh');
+      expect(opts.env.GH_CONFIG_DIR).toEqual(expect.any(String));
+      expect(opts.env).not.toHaveProperty('GIT_CONFIG_COUNT');
+    }
+    expect(f.io.spawn.mock.calls[0][1]).toContain("credential.helper=!'/opt/homebrew/bin/gh' auth git-credential");
+  });
+  it.each(['stale', 'unreadable'])('blocks protected branches for %s tracker evidence with hooks off, even with ambient override', mode => {
+    const f = fixture(), branch = 'lane/mechanical-dispatcher', spawn = f.io.spawn;
+    f.branch = branch; const meta = { ...f.io.readClaim().meta, branch };
+    f.io.readClaim.mockReturnValue({ meta }); f.io.ghPrView.mockReturnValue({ ...view(), headRefName: branch });
+    f.io.spawn = vi.fn((bin, args, opts) => {
+      if (args.includes('show')) return mode === 'unreadable' ? { status: 1 } : { status: 0, stdout: '## Session update (2020-01-01) — stale\n' };
+      if (args.includes('diff')) return { status: 0, stdout: 'other-file\n' };
+      return spawn(bin, args, opts);
+    });
+    vi.stubEnv('PROTOTYPE_TRACKER_PUSH_OK', '1');
+    try {
+      expect(authorizedPush(f)).toMatchObject({ code: 'protected-branch' });
+      expect(f.io.gitPush).not.toHaveBeenCalled();
+      if (mode === 'stale') expect(f.io.spawn.mock.calls.some(([, args]) => args.includes('diff'))).toBe(true);
+      for (const [, args] of f.io.spawn.mock.calls) expect(args).toContain('core.hooksPath=/dev/null');
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it.each(['io', 'remoteUrl', 'protocolAllow'])('public entry points refuse injected %s', key => {
+    const f = fixture(), options = { ...f }; delete options.io;
+    for (const call of [publicPush, publicRead]) expect(call({ ...options, [key]: f.io }))
+      .toMatchObject({ code: 'bad-input', ok: false });
+    for (const call of [publicPush, publicRead]) expect(call(Object.assign(Object.create({ [key]: f.io }), options)))
+      .toMatchObject({ code: 'bad-input', ok: false });
+    expect(f.io.readClaim).not.toHaveBeenCalled(); expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it('no production module imports the test-only factory', () => {
+    const scan = dir => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const path = join(dir, entry.name);
+      return entry.isDirectory() ? entry.name === '__tests__' ? [] : scan(path) : /\.[cm]?[jt]s$/.test(path) ? [path] : [];
+    });
+    for (const path of scan('scripts').filter(path => !path.endsWith('authorized-push-testing.mjs')))
+      expect(readFileSync(path, 'utf8'), path).not.toMatch(/(?:from\s*|import\s*\()\s*['"][^'"]*authorized-push-testing/);
   });
 });

@@ -110,7 +110,14 @@ export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
   for (const name of names) {
     try {
       const entry = parseLockEntry(readFileSync(join(lockRoot, name, 'lock.json'), 'utf8'));
-      if (!entry?.meta?.repo || !entry.meta.pr || !entry.meta.kind) unreadable = true;
+      const nonempty = value => typeof value === 'string' && value.trim().length > 0;
+      const meta = entry?.meta;
+      if (!entry || !Number.isFinite(Date.parse(entry.heartbeatAt))
+        || !nonempty(meta?.repo) || !Number.isSafeInteger(meta?.pr) || meta.pr <= 0
+        || !nonempty(meta?.kind)
+        // Dispatcher claims have no branch; a held repair claim must identify its branch.
+        || (!['fix', 'ci-heal'].includes(meta.kind) && !nonempty(meta.branch))
+        || ('branch' in meta && !nonempty(meta.branch))) unreadable = true;
       else entries.push(entry);
     } catch (error) {
       if (error.code === 'ENOENT') {

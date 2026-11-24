@@ -3,7 +3,9 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { authorizedPush, readPushAuthority } from '../authorized-push.mjs';
+import { createAuthorizedPushForTesting } from '../authorized-push-testing.mjs';
+const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
+const readPushAuthority = options => createAuthorizedPushForTesting(options.io).readPushAuthority(options);
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
 
 const roots = [];
@@ -33,8 +35,8 @@ function fixture() {
   git(lane, 'remote', 'add', 'origin', url);
   const calls = [], temps = new Set();
   const remoteHead = () => git(remote, 'rev-parse', `refs/heads/${branch}`);
-  const io = {
-    readClaim: () => ({ meta: { sessionId: 'mine' } }), isClaimHolder: () => true,
+  const io = { stat: () => ({ isFile: () => true, uid: process.getuid(), mode: 0o755 }),
+    readClaim: () => ({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch, sessionId: 'mine' } }), isClaimHolder: () => true,
     branchClaimRefusal: () => null,
     ghPrView: () => ({ labels: [], state: 'OPEN', isDraft: false, isCrossRepository: false,
       headRefName: branch, headRefOid: remoteHead() }),

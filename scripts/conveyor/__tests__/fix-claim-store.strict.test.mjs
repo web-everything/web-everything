@@ -55,3 +55,29 @@ describe('Design A test 7: strict claim-store evidence', () => {
     expect(scan.entries).toMatchObject([f.entry]); expect(scan.unreadable).toBeTruthy();
   });
 });
+
+describe('strict claim shape refusals', () => {
+  it.each(['garbage', '', null, 'not-a-date'])('refuses invalid heartbeat %j rather than expiring it', heartbeatAt => {
+    const f = fixture(); f.entry.heartbeatAt = heartbeatAt;
+    writeFileSync(f.file, JSON.stringify(f.entry));
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ entries: [], unreadable: true });
+    expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', strict: true, lockRoot: f.lockRoot }))
+      .toMatchObject({ code: 'claim-store-unreadable' });
+  });
+  it.each([
+    ['repo', 1], ['repo', ' '], ['repo', null], ['pr', '42'], ['pr', 0], ['pr', -1],
+    ['pr', 1.5], ['pr', Number.MAX_SAFE_INTEGER + 1], ['kind', 1], ['kind', ' '],
+    ['branch', null], ['branch', ' '], ['branch', 7], ['branch', undefined],
+  ])('refuses malformed held-claim %s=%j', (key, value) => {
+    const f = fixture(); f.entry.meta.kind = 'fixing'; f.entry.meta[key] = value;
+    writeFileSync(f.file, JSON.stringify(f.entry));
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ entries: [], unreadable: true });
+    expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', strict: true, lockRoot: f.lockRoot }))
+      .toMatchObject({ code: 'claim-store-unreadable' });
+  });
+  it.each(['fix', 'ci-heal'])('accepts branchless dispatcher kind %s', kind => {
+    const f = fixture(); f.entry.meta.kind = kind; delete f.entry.meta.branch;
+    writeFileSync(f.file, JSON.stringify(f.entry));
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ unreadable: false });
+  });
+});

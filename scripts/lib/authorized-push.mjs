@@ -2,32 +2,69 @@
  * @file Claim-bound push authority: live PR evidence, ancestry, one leased push, then a hold recheck.
  */
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { resolveRealGhBinary } from './gh-app-shim.mjs';
 import { readLiveFixClaim, isClaimHolder, pushRefusal, repoKeyOf } from '../conveyor/fix-procedure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { runGhSync } from './gh-throttle.mjs';
+import { protectedBranchNames, staleTrackerPushDecision } from '../guard-prototype-tracker.mjs';
+import { POC_REGISTRY_PATH, normalizeRegistry } from './poc-branches.mjs';
+import { findTrackerPath, parseTracker } from './prototype-tracker-data.mjs';
+import { localToday } from './local-date.mjs';
+import { dirname, relative } from 'node:path';
 import { PUSH_HOLD_LABELS } from './review-hold-model.mjs';
 
 const fail = (code, reason) => ({ ok: false, code, reason });
 const hex = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const fields = 'labels,state,isDraft,headRefOid,headRefName,isCrossRepository';
+function resolveGh(io) {
+  if (io.gh) return io.gh; // Private test factory only.
+  for (const path of ['/opt/homebrew/bin/gh', '/usr/local/bin/gh']) {
+    try {
+      const stat = (io.stat || statSync)(path);
+      if (stat.isFile() && [0, process.getuid()].includes(stat.uid) && !(stat.mode & 0o022)) return path;
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  throw new Error('Trusted GitHub CLI unavailable');
+}
+function childEnv(home) {
+  const env = { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: home,
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C',
+    GH_CONFIG_DIR: process.env.GH_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'gh'),
+    GH_HOST: 'github.com' };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN']) if (process.env[key] !== undefined) env[key] = process.env[key];
+  return env;
+}
+function trackerRefusal({ repo, branch, expectedHead, sha }, temp, git) {
+  // Read the hook's registry strictly: its tolerant reader would erase unreadable protection evidence.
+  const raw = JSON.parse(readFileSync(POC_REGISTRY_PATH, 'utf8'));
+  const registry = normalizeRegistry(raw);
+  if (!Array.isArray(raw.branches) || registry.dropped.length) throw new Error('Protection registry unreadable');
+  if (repoKeyOf(repo) !== 'we' || !protectedBranchNames(registry).includes(branch)) return null;
+  const root = resolve(dirname(POC_REGISTRY_PATH), '../..');
+  const tracker = findTrackerPath({ backlogDir: join(root, 'backlog') });
+  if (!tracker) return fail('protected-branch', 'Restore prototype tracker before retrying');
+  const path = relative(root, tracker);
+  const read = args => {
+    const result = git(temp, args);
+    if (result.error || result.status !== 0) throw new Error('Tracker evidence unreadable');
+    return result.stdout;
+  };
+  const latest = parseTracker(read(['show', `${sha}:${path}`])).latestDate;
+  if (!latest) return fail('protected-branch', 'Restore prototype tracker date before retrying');
+  const reason = staleTrackerPushDecision({ matchedLines: [{ branch }], trackerLatestDate: latest,
+    todayDate: localToday(), touchesTracker: read(['diff', '--name-only', expectedHead, sha]).split('\n').includes(path) });
+  return reason ? fail('protected-branch', reason) : null;
+}
 function isolatedGit(gitDir, io, use) {
   const temp = mkdtempSync(join(tmpdir(), 'we-push-'));
   try {
     chmodSync(temp, 0o700);
-    const gh = resolveRealGhBinary();
+    const gh = io.gh;
     if (!gh) throw new Error('GitHub CLI unavailable');
-    const env = { PATH: '/usr/bin:/bin', HOME: temp, XDG_CONFIG_HOME: temp,
-      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
-      GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C',
-      GH_CONFIG_DIR: process.env.GH_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'gh'),
-      GH_HOST: 'github.com' };
-    for (const key of ['GH_TOKEN', 'GITHUB_TOKEN']) {
-      if (process.env[key] !== undefined) env[key] = process.env[key];
-    }
+    const env = childEnv(temp);
     const config = ['core.hooksPath=/dev/null', 'core.commitGraph=false', 'core.fsmonitor=false',
       'gc.auto=0', 'maintenance.auto=false', 'protocol.allow=never',
       `protocol.${io.protocolAllow || 'https'}.allow=always`, 'http.followRedirects=false', 'http.proxy=',
@@ -60,11 +97,11 @@ function defaults(io = {}) {
     readClaim: (repo, pr) => readLiveFixClaim({ repo, pr }), isClaimHolder,
     branchClaimRefusal: (repo, branch, holder) => pushRefusal({ repo, branch,
       sessionId: holder?.sessionId, who: holder?.who, token: holder?.token, strict: true }),
-    ghPrView: (repo, pr) => JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo',
+    ghPrView: (repo, pr) => JSON.parse((io.runGh || runGhSync)(['pr', 'view', String(pr), '--repo',
       `github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}`, '--json', fields], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
-      env: { ...process.env, GH_HOST: 'github.com' },
-      throttle: { noMemo: true },
+      env: childEnv(homedir()),
+      throttle: { noMemo: true, bin: io.gh },
     })),
     isAncestor: (dir, head, sha) => isolatedGit(dir, io, (_temp, _git, ancestor) => ancestor(head, sha)),
     ...io,
@@ -81,14 +118,22 @@ function readView(io, repo, pr) {
 }
 const held = view => view.labels.find(label => PUSH_HOLD_LABELS.includes(label.name))?.name;
 
-function claimRefusal(io, entry, holder) {
+function claimRefusal(io, entry, holder, { repo, pr, branch }) {
   if (!entry || !io.isClaimHolder(entry, holder)) return fail('not-claim-holder', 'Live claim required');
   if (!entry.meta?.sessionId && !entry.meta?.tokenHash) return fail('not-claim-holder', 'Unbound claim');
+  const meta = entry.meta;
+  if (![meta.repo, meta.kind, meta.branch].every(v => typeof v === 'string' && v.trim())
+    || !Number.isSafeInteger(meta.pr) || meta.pr <= 0
+    || ('draft' in meta && typeof meta.draft !== 'boolean')) throw new Error('Incomplete claim');
+  if (meta.repo !== repoKeyOf(repo) || meta.pr !== pr || meta.kind !== 'fixing' || meta.branch !== branch)
+    return fail('not-claim-holder', 'Claim does not match requested push');
   return null;
 }
 
+// Private factory; only the separate test harness exposes injected ports.
+function createAuthorizedPush(testIo = {}) {
 /** Read-only authority check. Callers supply pins and identity, never cached PR evidence. */
-export function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir, holder, purpose, io } = {}) {
+function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir, holder, purpose, io } = {}) {
   try {
     if (!hex(sha) || !hex(expectedHead) || typeof branch !== 'string' || !branch.startsWith('lane/')
       || !branch.slice(5) || typeof repo !== 'string' || !repo.trim()
@@ -96,16 +141,17 @@ export function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir,
       || typeof gitDir !== 'string' || !gitDir.trim()) return fail('bad-input', 'Invalid push inputs');
     repoKeyOf(repo);
   } catch { return fail('bad-input', 'Unknown repo'); }
-  const ports = defaults(io);
+  let ports;
+  try { ports = defaults({ ...testIo, ...io, gh: io?.gh || resolveGh(testIo) }); } catch { return fail('unreadable', 'Trusted GitHub CLI unavailable'); }
   try {
     const entry = ports.readClaim(repo, pr);
-    const refusal = claimRefusal(ports, entry, holder);
+    const refusal = claimRefusal(ports, entry, holder, { repo, pr, branch });
     if (refusal) return refusal;
     const branchRefusal = ports.branchClaimRefusal(repo, branch, holder);
     if (branchRefusal) return fail(branchRefusal.code || 'foreign-claim', branchRefusal.message || 'Branch has a foreign claim; coordinate with its holder');
     const view = readView(ports, repo, pr);
     if (view.state !== 'OPEN') return fail('pr-not-open', 'PR is not open');
-    if (view.isDraft && !entry.meta?.draft) return fail('draft', 'PR drafted outside this claim');
+    if (view.isDraft && entry.meta?.draft !== true) return fail('draft', 'PR drafted outside this claim');
     const label = held(view);
     if (label) return fail('hold-label', label);
     if (view.isCrossRepository) return fail('cross-repo', 'Cross-repository PR');
@@ -117,20 +163,25 @@ export function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir,
 }
 
 /** The push boundary: a rejected lease is never retried. */
-export function authorizedPush(options = {}) {
+function authorizedPush(options = {}) {
   const { repo, pr, branch, expectedHead, sha, gitDir, purpose } = options;
-  const ports = defaults(options.io);
+  let ports;
+  try { ports = defaults({ ...testIo, gh: resolveGh(testIo) }); } catch { return fail('unreadable', 'Trusted GitHub CLI unavailable'); }
   // Validate and read initial evidence before constructing the isolated transport.
   const authority = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
   if (!authority.ok) return authority;
-  try { return isolatedGit(gitDir, options.io || {}, (temp, git, ancestor) => {
-    if ((options.io?.isAncestor || ((_dir, head, next) => ancestor(head, next)))(temp, expectedHead, sha) !== true)
+  try { return isolatedGit(gitDir, ports, (temp, git, ancestor) => {
+    if ((testIo.isAncestor || ((_dir, head, next) => ancestor(head, next)))(temp, expectedHead, sha) !== true)
       return fail('not-descendant', 'Push must descend from expected head');
-    const url = options.io?.remoteUrl || `https://github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}.git`;
+    const url = testIo.remoteUrl || `https://github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}.git`;
     const args = ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--no-recurse-submodules',
       `--force-with-lease=refs/heads/${branch}:${expectedHead}`, url, `${sha}:refs/heads/${branch}`];
     const final = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
     if (!final.ok) return final;
+    try {
+      const tracker = trackerRefusal(options, temp, git);
+      if (tracker) return tracker;
+    } catch { return fail('protected-branch', 'Cannot verify prototype tracker; restore evidence before retrying'); }
     try {
       const result = ports.gitPush ? ports.gitPush(temp, args) : git(temp, args);
       const lines = result.stdout?.split('\n');
@@ -141,16 +192,16 @@ export function authorizedPush(options = {}) {
         || ref[1] !== `${sha}:refs/heads/${branch}` || !/^[a-f0-9]+\.\.[a-f0-9]+$/.test(ref[2]))
         return fail('push-rejected', 'Push rejected; inspect remote and re-read authority before retrying');
     } catch { return fail('push-rejected', 'Push failed; inspect remote before retrying'); }
-    const post = defaults(options.io);
+    const post = defaults({ ...testIo, gh: ports.gh });
     try {
       const entry = post.readClaim(repo, pr);
-      const refusal = claimRefusal(post, entry, options.holder);
+      const refusal = claimRefusal(post, entry, options.holder, { repo, pr, branch });
       if (refusal) return { ...fail('pushed-under-hold', refusal.reason), pushed: true };
       if (post.branchClaimRefusal(repo, branch, options.holder))
         return { ...fail('pushed-under-hold', 'Branch has a foreign claim; coordinate with its holder'), pushed: true };
       const view = readView(post, repo, pr);
       const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
-        : view.isDraft && !entry.meta?.draft ? 'PR drafted outside this claim'
+        : view.isDraft && entry.meta?.draft !== true ? 'PR drafted outside this claim'
         : view.isCrossRepository ? 'Cross-repository PR'
         : view.headRefOid !== sha ? 'Post-push PR head differs'
         : view.headRefName !== branch ? 'Post-push PR branch differs' : null);
@@ -159,3 +210,14 @@ export function authorizedPush(options = {}) {
     return { ok: true, pushed: sha, purpose };
   }); } catch { return fail('unreadable', 'Cannot read isolated push evidence; restore evidence before retrying'); }
 }
+
+  return { authorizedPush, readPushAuthority };
+}
+const publicKeys = new Set(['repo', 'pr', 'branch', 'expectedHead', 'sha', 'gitDir', 'holder', 'purpose']);
+function publicCall(method, options = {}) {
+  if (!options || typeof options !== 'object' || Reflect.ownKeys(options).some(key => !publicKeys.has(key))
+    || ['io', 'remoteUrl', 'protocolAllow'].some(key => key in options)) return fail('bad-input', 'Unknown push option');
+  return createAuthorizedPush()[method](options);
+}
+export const authorizedPush = options => publicCall('authorizedPush', options);
+export const readPushAuthority = options => publicCall('readPushAuthority', options);
