@@ -20,6 +20,24 @@ describe('deps job import walker', () => {
     expect(packageChains('e.mjs', () => "function f() {\n  return import('lazy');\n}")).toEqual([]);
   });
 
+  it.each([
+    ["const s = '/*'; import x from 'ext'; const e = '*/';", ['e.mjs -> ext']],
+    ["  import x from 'ext';", ['e.mjs -> ext']],
+    ["const a = 1; import x from 'ext';", ['e.mjs -> ext']],
+    ["await import(\n'ext'\n);", ['e.mjs -> ext']],
+    ["{ await import('ext'); }", ['e.mjs -> ext']],
+    ["(async () => { await import('ext'); })();", ['e.mjs -> ext']],
+    ['await import(`ext`);', ['e.mjs -> ext']],
+    ['const n = "x"; await import(n);', ['e.mjs -> <non-literal specifier>']],
+    ["import 'node:missing-builtin';", ['e.mjs -> node:missing-builtin']],
+    ["// import x from 'ext';\n/* import y from 'ext'; */\nimport 'node:fs';", []],
+    ["import { createRequire } from 'node:module'; const r = createRequire(import.meta.url); r('ext');", ['e.mjs -> ext']],
+    ["import { createRequire } from 'node:module'; createRequire(import.meta.url)('ext');", ['e.mjs -> ext']],
+    ["export function f() { return import('ext'); }", []],
+  ])('judges startup loads from the AST: %s', (source, expected) => {
+    expect(packageChains('e.mjs', () => source)).toEqual(expected);
+  });
+
   it('passes on the current tree', () => {
     expect(b.judge(b.run({}))).toEqual([]);
   });
