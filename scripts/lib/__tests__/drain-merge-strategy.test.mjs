@@ -1,3 +1,4 @@
+import { readQueuePlannerBlock } from '../red-team-queue-state.mjs';
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -1368,6 +1369,38 @@ describe('red-team wait deadline never merges without a result (redTeam.deadline
     clock.t += 45 * 60_000;
     return { h, clock, notes, firstAttempt };
   };
+
+  it.each(['missing reason', 'wrong head', 'wrong repo', 'unreadable'])('fails closed for queue block with %s', kind => {
+    const readRedTeamQueueBlock = key => readQueuePlannerBlock({ ...key, readFile: () => {
+      if (kind === 'unreadable') throw new Error('unreadable');
+      return JSON.stringify([{ key: `${LOCAL}#5283`, repo: kind === 'wrong repo' ? 'other/repo' : LOCAL,
+        pr: 5283, head: kind === 'wrong head' ? 'a'.repeat(40) : HEAD, blocked: 'planner-skip',
+        ...(kind === 'missing reason' ? {} : { blockedReason: 'policy hold' }) }]);
+    } });
+    const { h } = pastDeadline({ strategyExtra: { readRedTeamQueueBlock } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(h.logs.join('')).toContain('no red-team request path');
+  });
+
+  it('annotates the hold with a recorded planner reason, still holds, and still reaches the deadline path', () => {
+    const reason = 'later verdict or hold supersedes acceptance';
+    const readRedTeamQueueBlock = key => readQueuePlannerBlock({ ...key, readFile: () => JSON.stringify([
+      { key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, blocked: 'planner-skip', blockedReason: reason },
+    ]) });
+    const h = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, strategyExtra: { readRedTeamQueueBlock } });
+    const outcome = h.s.enqueue({ num: 5283 }, HEAD);
+    expect(outcome).toMatchObject({ enqueued: false });
+    expect(JSON.stringify(outcome)).toContain(reason);
+    expect(JSON.stringify(Object.values(h.state()?.redTeamPending ?? {}))).toContain(reason);
+    expect(h.calls.some(c => c.some(a => String(a).includes('enqueuePullRequest')))).toBe(false);
+    // A null reader adds no annotation (negative case).
+    const none = harness({ strategy: 'github-merge-queue', labels: ACCEPTED, strategyExtra: { readRedTeamQueueBlock: () => null } });
+    expect(JSON.stringify(none.s.enqueue({ num: 5283 }, HEAD))).not.toContain('planner blocked');
+    // Past the deadline the operator is still notified exactly once; the block never suppresses escalation.
+    const late = pastDeadline({ strategyExtra: { readRedTeamQueueBlock } });
+    expect(late.h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deadlineHeld: true });
+    expect(late.notes.length).toBe(1);
+  });
 
   it('deadline passed + no result: held with a clear reason, one operator note for repo/PR/head, no enqueue', () => {
     const { h, clock, notes } = pastDeadline();

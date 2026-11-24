@@ -748,7 +748,7 @@ function readFreshCache(path) {
 // The owner this call targets: the argv's own repo, else the current checkout's origin remote, else null.
 function targetOwner(argv, env) {
   const fromArgv = ownerFromGhArgv(argv);
-  if (fromArgv) return fromArgv;
+  if (fromArgv !== null) return fromArgv;
   if (env.GH_REPO) { const o = ownerOfSlug(String(env.GH_REPO).split('/').slice(-2).join('/')); if (o) return o; }
   try {
     if (!existsSync('/usr/bin/git')) return null;
@@ -782,6 +782,10 @@ function requestedRole(env) {
 }
 function freshCachedToken() {
   const owner = targetOwner(process.argv.slice(2), process.env);
+  if (owner === false) {
+    // Use mainFlow's refusal/error exit without entering any credential fallback or refresh.
+    throw new Error('REFUSING personal-auth fallback: unresolved GraphQL owner/name/repo fields; supply consistent literal owner and name (or repo) fields');
+  }
   const role = requestedRole(process.env);
   const loud = Object.keys(ROLE_IDENTITIES).length > 0;
   const chain = [];

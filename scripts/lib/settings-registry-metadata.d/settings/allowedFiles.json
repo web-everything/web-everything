@@ -1,0 +1,6 @@
+{
+  "owner": "scripts/settings/build-priority-scope.json",
+  "description": "Exact-case WE files on pinned main. Empty refuses all scopes; add files via reviewed settings PR. Guard checks and unreadable/over-64-KiB evidence still refuse.",
+  "changeVia": "pr",
+  "instant": true
+}
