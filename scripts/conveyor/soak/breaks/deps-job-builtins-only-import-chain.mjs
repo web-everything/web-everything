@@ -90,7 +90,8 @@ export function probe(checkout) {
 
 // Fix presence is decided by git ancestry of the fixing commit, never by the import walk the break judges.
 function fixPresent(checkout) {
-  return spawnSync('git', ['merge-base', '--is-ancestor', FIX_SHA, 'HEAD'], { cwd: checkout, maxBuffer: 1024 * 1024 }).status === 0;
+  // Keep argv literal so the push-boundary lint can classify this read-only Git command.
+  return spawnSync('git', ['merge-base', '--is-ancestor', '186ce82511', 'HEAD'], { cwd: checkout, maxBuffer: 1024 * 1024 }).status === 0;
 }
 
 export default {
