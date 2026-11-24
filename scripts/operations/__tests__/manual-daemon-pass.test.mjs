@@ -196,16 +196,15 @@ describe('manual-daemon-pass admission and audit', () => {
       expect(f.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ result }));
     } finally { await rm(root, { recursive: true, force: true }); }
   });
-  it.each(['session', 'red-team'])('does not comment when the real %s dispatcher refuses a lane checkout', async mode => {
+  it.each(['job', 'session', 'red-team'])('does not comment when the real %s dispatcher refuses a lane checkout', async mode => {
     const root = join(tmpdir(), 'lane-999999');
     const f = fixture({ dispatch: value => dispatchManualPass(value, { env: {}, readHead: () => sha, load: async () => ({
       dispatchReviewJob: options => dispatchReviewJob({ ...options, root, io: { liveHead: () => sha } }),
-      dispatchReviewByMode: options => dispatchReviewByMode({ ...options, root, mode,
+      dispatchReviewByMode: options => dispatchReviewByMode({ ...options, root, mode, io: { liveHead: () => sha },
         stackCheck: () => ({ base: null }) }),
     }) }) });
     await expect(f.run({ ...input, repo: 'web-everything/web-everything',
-      daemon: mode === 'red-team' ? 'red-team' : 'review',
-      ...(mode === 'red-team' ? { expectedHead: sha } : {}) })).rejects.toThrow(/refusing to start a delivery agent from the lane checkout/);
+      daemon: mode === 'red-team' ? 'red-team' : 'review', expectedHead: sha })).rejects.toThrow(/refusing to start a delivery agent from the lane checkout/);
     expect(f.postComment).not.toHaveBeenCalled();
     expect(f.appendEvent).toHaveBeenCalledTimes(1);
   });
