@@ -14,6 +14,11 @@ import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Like daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs, these cases create real Git repos and
+// rebuild candidate worktrees (including plain-main and last-good controls on failure). The boot-failure case
+// exceeded Vitest's 5s default in CI; use the sibling suites' bounded hang guard for subprocess-heavy fixtures.
+vi.setConfig({ testTimeout: 60_000 });
+
 const tempDirs = [];
 function mktemp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
