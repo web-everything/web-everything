@@ -34,7 +34,7 @@ describe('probePrs — the fields the queue smells read', () => {
 
 describe('probePrLimit', () => {
   it('reads each repo cap through pr-limit (env override respected) and the global-off state', () => {
-    expect(probePrLimit({ env: {}, readState: emptyLimitState })).toEqual({ limits: { we: 15, frontierui: 5, 'plateau-app': 5 }, globalOff: false });
+    expect(probePrLimit({ env: {}, readState: emptyLimitState })).toEqual({ limits: { we: 15, frontierui: 15, 'plateau-app': 15 }, globalOff: false });
     expect(probePrLimit({ env: { WE_PR_LIMIT_WE: '40' }, readState: emptyLimitState }).limits.we).toBe(40);
     const off = setGlobalOff(emptyLimitState(), { reason: 'r', untilMs: 3_600_000 }, Date.parse('2026-09-29T11:30:00Z'));
     expect(probePrLimit({ env: {}, readState: () => off, nowMs: Date.parse('2026-09-29T12:00:00Z') }).globalOff).toBe(true);
