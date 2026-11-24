@@ -62,7 +62,7 @@ describe('expected review head admission', () => {
     expect(runReviewJob(options, io)).toMatchObject(refused);
     expect(io.runRedTeam).not.toHaveBeenCalled();
   });
-  it('missing expected head refuses, no verdict written', () => {
+  it('dispatch only: missing expected head refuses before any claim or job start', () => {
     const { io, options } = fixture();
     delete options.expectedHead;
     expect(dispatchReviewJob(options)).toMatchObject({ refused: true, outcome: 'refused-no-expected-head' });

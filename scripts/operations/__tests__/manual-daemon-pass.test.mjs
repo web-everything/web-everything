@@ -159,10 +159,11 @@ describe('manual-daemon-pass admission and audit', () => {
     expect(readHead).not.toHaveBeenCalled();
     expect(dispatchJob).toHaveBeenCalledTimes(1);
     expect(dispatchJob).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env: {} });
-    expect(result).toMatchObject({ status: 'returned', outcome: { refused: true, outcome: 'refused-no-expected-head' } });
+    expect(result).toMatchObject({ status: 'refused', outcome: { refused: true, outcome: 'refused-no-expected-head' } });
+    expect(result.status).not.toBe('returned');
     expect(liveHead).not.toHaveBeenCalled();
     expect(spawnJob).not.toHaveBeenCalled();
-    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.postComment).not.toHaveBeenCalled();
     expect(f.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ result }));
     expect(f.appendEvent).toHaveBeenCalledTimes(1);
   });

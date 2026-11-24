@@ -96,6 +96,8 @@ export function createManualDaemonPassSinks({
       assertManualPassAllowed(input, readStatus());
       result = { status: 'dispatching' };
       const outcome = await dispatch(input);
+      // A head-guard refusal started nothing: no "Manual R247 pass" note (accept-carry-forward reads it) and no returned status.
+      if (outcome?.refused === true) { result = { status: 'refused', outcome }; return result; }
       // The reader (accept-carry-forward) recognises this note by this exact template: build it with the shared builder.
       await postComment({ ...input, body: manualPassNote({ daemon: input.daemon, reason: input.reason, sha }) });
       result = { status: 'returned', outcome: outcome ?? null };

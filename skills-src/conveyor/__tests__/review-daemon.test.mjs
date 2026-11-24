@@ -136,6 +136,23 @@ describe('live review cap with Node configuration options', () => {
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 1, expectedHead: head }));
   });
 
+  it.each([['head-moved', false], ['refused-no-expected-head', true]])('counts a dispatch refusal (%s) as refused: seat refunded, no tag, no take', async (outcome, attention) => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '' });
+    const tagRound = vi.fn(), take = vi.fn();
+    const tick = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, headRefOid: 'c'.repeat(40) }], refusals: [] }),
+      dispatch: () => ({ refused: true, outcome, reason: 'x' }), holdReconcile: () => [], tagRound, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 40, host: { admitted: true, take } });
+    expect(tick.refused).toEqual([expect.objectContaining({ prNumber: 1, outcome })]);
+    expect(tick.dispatched).toEqual([]);
+    expect(tick.attention ?? []).toHaveLength(attention ? 1 : 0);
+    expect(budget.left).toBe(3);
+    expect(tagRound).not.toHaveBeenCalled();
+    expect(take).not.toHaveBeenCalled();
+  });
+
   it.each([
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs --files=changed.mjs',
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs run --files=changed.mjs',
