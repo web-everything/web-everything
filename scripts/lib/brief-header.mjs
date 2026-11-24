@@ -2,11 +2,11 @@
 import { statSync } from 'node:fs';
 import { loadDeliveryRoutes, modeForKind } from './delivery-routes.mjs';
 import { readSettingsChecked } from './settings-files.mjs';
+import { slotVerdict } from './prep-block.mjs';
 
 // Same pattern the dispatch hook (guard-delivery-mode.mjs) uses to demand the merge-path checklist reference.
 const MERGE_PATH = /merge[- ]?gate|merge-ai-prs|red[- ]?team|publication hold|review[- ]?gate|clear-human|waiver|quarantine|forge-exec|uid|enqueue|verdict/i;
 const STEP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
-const SLOT = /^(plan:\S+|blocker:\S.*|operator:\S.*|waived — \S.*)$/;
 const MAX_PREP_BYTES = 128 * 1024;
 
 /** Mode for a Kind through the shared checked loader (fails closed on taint/duplicates); a blocker slot routes to debug (R852), as the hook does. */
@@ -29,7 +29,9 @@ export function renderBriefHeader({ step, kind, slot, prepPath, daemonDegraded, 
   if (typeof prepPath !== 'string' || !prepFileOk(prepPath)) throw new Error('--step needs an existing regular prep file (--prep-file, max 128 KiB): refusing to invent a Prep path.');
   if (/[\r\n]/.test(prepPath)) throw new Error('--prep-file must be a single line.');
   const slotText = slot || `plan:${step}`;
-  if (!SLOT.test(slotText)) throw new Error('--slot must be plan:<item>, blocker:<what>, operator:<quote> or "waived — <reason>".');
+  if (typeof slotText !== 'string' || /[\r\n\u2028\u2029]/.test(slotText) || !slotVerdict(`Slot: ${slotText}`).ok) {
+    throw new Error('--slot must be a valid single-line placement (at least 8 non-whitespace characters; operator placement must be quoted). Supply --slot explicitly if plan:<step> is unusable.');
+  }
   const { mode, text } = routeMode(kind, slotText, { ...(cfg ? { cfg } : {}), daemonDegraded });
   return `Kind: ${kind}\nMode: ${mode}\nStep: ${step}\nPrep: ${prepPath}\nSlot: ${slotText}\n${text}\n`;
 }

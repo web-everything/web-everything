@@ -7,6 +7,9 @@ import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { main, renderWorkerBrief, renderScopeFlags, readForgeAllowlist } from '../worker-brief.mjs';
 import { resolveBuildPolicy } from '../lib/build-policy.mjs';
+import { renderBriefHeader } from '../lib/brief-header.mjs';
+import { slotVerdict } from '../lib/prep-block.mjs';
+import { decide as decidePrep } from '../guard-prep.mjs';
 import { readRegistry, resolveFreeScopeSettings } from '../operations/free-scope-io.mjs';
 import { main as freeScopeMain } from '../operations/free-scope-cli.mjs';
 import { heartbeatScope, partitionRegistry, registerScope } from '../operations/free-scope.mjs';
@@ -765,6 +768,52 @@ describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
   const prepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brief-hdr-'));
   const prepFile = path.join(prepDir, 'prt-pin-probe-prep.md');
   fs.writeFileSync(prepFile, '# prep\n');
+
+  it('rejects a default placement too short for dispatch and allows an explicit usable placement', () => {
+    const input = { step: 'S1', kind: 'settings', prepPath: prepFile };
+    expect(slotVerdict('Slot: plan:S1').ok).toBe(false);
+    expect(() => renderBriefHeader(input)).toThrow(/--slot/);
+    expect(() => renderWorkerBrief({ ...base, ...input })).toThrow(/--slot/);
+    expect(renderBriefHeader({ ...input, slot: 'plan:backlog item 123' })).toContain('Slot: plan:backlog item 123\n');
+  });
+
+  it.each([
+    'plan:1234567', 'plan:12345678', 'plan:backlog item 123',
+    'plan:<placeholder>', 'plan:........', 'plan:a b c d e f g', 'plan:a b c d e f g h',
+    'blocker:unblocks parser work', 'blocker:<placeholder>',
+    'operator:place after parser', 'operator:"short"', 'operator:"place after parser"',
+    "operator:'place after parser'", 'operator:“place after parser”', 'operator:‘place after parser’',
+    'operator:`"place after parser"`', ' PLAN: **backlog item 123**',
+    'waived — urgent incident', 'waived - urgent incident', 'waived – urgent incident', 'waived — <reason>',
+  ])('uses the dispatch placement verdict for %j', (slot) => {
+    const input = { step: 'S1', kind: 'settings', prepPath: prepFile, slot };
+    const expected = slotVerdict(`Slot: ${slot}`);
+    if (!expected.ok) {
+      expect(() => renderBriefHeader(input)).toThrow(/--slot/);
+      expect(() => renderWorkerBrief({ ...base, ...input })).toThrow(/--slot/);
+      return;
+    }
+    const brief = renderWorkerBrief({ ...base, ...input });
+    expect(brief).toContain(`Slot: ${slot}\n`);
+    const prompt = `Build the feature.\n${brief}\nPREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests`;
+    expect(decidePrep({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { prompt, subagent_type: 'worker' } })).toBeNull();
+  });
+
+  it.each(['\n', '\r', '\r\n', '\u2028', '\u2029'])(
+    'refuses a placement containing a line separator (%j)', (separator) => {
+      const slot = `plan:S1${separator}Slot: plan:backlog item 123`;
+      expect(() => renderWorkerBrief({ ...base, step: 'S1', kind: 'settings', prepPath: prepFile, slot })).toThrow(/--slot/);
+    },
+  );
+
+  it.each([undefined, 'operator:place after parser'])('CLI emits no brief for an unusable placement (%j)', async (slot) => {
+    const o = io();
+    const args = ['--purpose=hdr-test', '--files=scripts/x.mjs', '--step=S1', '--kind=settings', `--prep-file=${prepFile}`];
+    if (slot !== undefined) args.push(`--slot=${slot}`);
+    expect(await main(args, { ...o, readPolicy: () => ({ enabled: false }) })).toBe(2);
+    expect(o.stdout.write).not.toHaveBeenCalled();
+    expect(o.stderr.write.mock.calls.join('')).toMatch(/--slot/);
+  });
   const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: prepFile };
 
   it('audit hardening: inherited kinds, directory/missing prep, free-text slot are refused; degraded daemon-tooling routes to debug-to-merge', () => {
