@@ -105,6 +105,7 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { SHARD_LOCAL_ENV } from './lib/verify-shard-run.mjs';
+import { SCAN_FILES_ENV, SCAN_ROOT_ENV } from './lib/repo-scan-tests.mjs';
 import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
@@ -819,6 +820,9 @@ async function runGate(command, args, { forgeDispatch = false } = {}) {
   }
   // Never inherit forced-local shard routing; --local scopes it to each validated wrapper (timedRunGate).
   delete childEnv[SHARD_LOCAL_ENV];
+  // The scan scope comes only from inline gate prefixes and is never inherited from the parent env.
+  delete childEnv[SCAN_FILES_ENV];
+  delete childEnv[SCAN_ROOT_ENV];
   const collector = createFailureCollector({ cwd: REPO });
   const output = { stdout: '', stderr: '' };
   const outputTail = createOutputTail();

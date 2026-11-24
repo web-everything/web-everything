@@ -1574,7 +1574,7 @@ import { admissionLockRoot, heldSlots } from ${JSON.stringify(admissionModule)};
 import { writeAllSync } from ${JSON.stringify(resolve(process.cwd(), 'scripts/lib/write-all-sync.mjs'))};
 const args = process.argv.slice(2);
 const held = heldSlots({ lockRoot: admissionLockRoot(process.cwd()), cap: 1, fastSlots: 1 });
-appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null }) + '\\n');
+appendFileSync('calls.jsonl', JSON.stringify({ args, held, inherited: process.env.WE_HEAVY_ADMISSION_HELD, nonce: process.env.WE_VERIFY_MARKER_NONCE ?? null, scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');
 if (${live} && args[0] === 'vitest') {
   const { spawnSync } = await import('node:child_process');
   const result = spawnSync(process.execPath, [${JSON.stringify(resolve(process.cwd(), 'node_modules/vitest/vitest.mjs'))}, ...args.slice(1), ...(!args.includes('--maxWorkers=1') ? ['--maxWorkers=1', '--minWorkers=1'] : [])], { stdio: 'inherit' });
@@ -1733,7 +1733,7 @@ export async function load(url, context, nextLoad) {
     const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
     // Force a broad diff and make direct standards execution observable.
     mkdirSync(join(dir, 'scripts'), { recursive: true });
-    writeFileSync(join(dir, 'scripts/check-standards.mjs'), "import { appendFileSync } from 'node:fs'; appendFileSync('calls.jsonl', JSON.stringify({ args: ['direct-standards'] }) + '\\n');\n"
+    writeFileSync(join(dir, 'scripts/check-standards.mjs'), "import { appendFileSync } from 'node:fs'; appendFileSync('calls.jsonl', JSON.stringify({ args: ['direct-standards'], scanFiles: process.env.VERIFY_SCAN_FILES ?? null, scanRoot: process.env.VERIFY_SCAN_ROOT ?? null }) + '\\n');\n"
       + (standardsExit ? "console.log('  error  invisible-characters: U+200B in source.mjs');\n" : '')
       + `process.exit(${standardsExit});\n`);
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module', scripts }));
@@ -1763,6 +1763,30 @@ export async function load(url, context, nextLoad) {
     expect(r.status, r.stderr).not.toBe(0);
     expect(r.stderr).toMatch(/full fallback.*admission.*timed out/i);
     expect(existsSync(join(dir, 'calls.jsonl'))).toBe(false);
+  });
+
+  it('never inherits the parent scan scope into the vitest, guard or standards phases', () => {
+    const f = fixture({ guard: true });
+    const pollutedRoot = mkdtempSync(join(tmpdir(), 'verify-scan-root-'));
+    const r = f.invoke([], { ...idleFallbackEnv(), VERIFY_SCAN_FILES: '[]', VERIFY_SCAN_ROOT: pollutedRoot });
+    const calls = f.calls();
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    for (const call of calls) expect(call, JSON.stringify(call.args)).toMatchObject({ scanFiles: null, scanRoot: null });
+  });
+
+  it('the scan phase gets only its inline scan scope, never the parent scan root', () => {
+    const f = fixture({ scan: true });
+    const pollutedRoot = mkdtempSync(join(tmpdir(), 'verify-scan-root-'));
+    const r = f.invoke([], { VERIFY_SCAN_FILES: '["polluted.mjs"]', VERIFY_SCAN_ROOT: pollutedRoot });
+    const calls = f.calls();
+    const scanCalls = calls.filter(call => call.args.some(a => a.includes('conformance')));
+    expect(scanCalls.length, r.stderr).toBeGreaterThan(0);
+    for (const call of scanCalls) {
+      expect(call.scanFiles).not.toBeNull();
+      expect(call.scanFiles).not.toBe('["polluted.mjs"]');
+      expect(call.scanRoot).toBeNull();
+    }
+    for (const call of calls.filter(c => !scanCalls.includes(c))) expect(call).toMatchObject({ scanFiles: null, scanRoot: null });
   });
 
   it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
