@@ -10,16 +10,15 @@ const root = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'mq-timeou
 afterEach(() => { roots.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
 it('pure timeout without pass proof refuses across guard instances', () => {
   const dir = root();
-  const first = timeoutFixture(dir).guard();
+  const first = timeoutFixture(dir, { qualifying: false }).guard();
   expect(first.hold).toBe(true);
   expect(first.line).toContain('failed_checks');
-  expect(timeoutFixture(dir).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { qualifying: false }).guard().hold).toBe(true);
 });
 it('a second flake failure on the same head stays refused', () => {
   expect(timeoutFixture(root(), { repeats: true }).guard().hold).toBe(true);
 });
 it.each([
-  ['assertion failure', { text: timeoutLog.replace('Error: Test timed out in 5000ms.', 'AssertionError: expected true to be false\nExpected: false\nReceived: true') }],
   ['unreadable logs', { unreadable: true }],
   ['mixed timeout and assertion', { text: timeoutLog.replace('Tests 1 failed', 'AssertionError: expected 2 to be 3\nTests 2 failed') }],
   ['incomplete log', { text: timeoutLog.split('Test Files')[0] }],
@@ -39,14 +38,14 @@ it('stderr picker skips real Node warnings and trace hint, preserving fallback a
 
 it('preflight, dry-run and mutation all refuse timeout-only evidence', () => {
   const dir = root();
-  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
-  expect(timeoutFixture(dir, { dryRun: true }).guard().hold).toBe(true);
-  expect(timeoutFixture(dir).guard().hold).toBe(true);
-  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { preflight: true, qualifying: false }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { dryRun: true, qualifying: false }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { qualifying: false }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { preflight: true, qualifying: false }).guard().hold).toBe(true);
 });
 it('timeout-only evidence refuses before consulting the ledger', () => {
   let reads = 0;
-  const result = timeoutFixture(root(), { ledger: { atomicUpdate() { reads++; throw Error('corrupt'); } } }).guard();
+  const result = timeoutFixture(root(), { qualifying: false, ledger: { atomicUpdate() { reads++; throw Error('corrupt'); } } }).guard();
   expect(result.hold).toBe(true);
   expect(reads).toBe(0);
 });
@@ -74,18 +73,18 @@ it('timeout-only evidence blocks enqueue before any mutation', () => {
     preparedSurface: { headSha, base: 'main', baseSha, files: ['scripts/example.mjs'] },
     sameHeadAdmission: () => {
       // Recreate the guard and file-backed ledger for each mutation attempt.
-      const decision = timeoutFixture(dir).guard();
+      const decision = timeoutFixture(dir, { qualifying: false }).guard();
       admissions.push(decision);
       return decision;
     },
   });
 
-  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { preflight: true, qualifying: false }).guard().hold).toBe(true);
   expect(enqueue()).toMatchObject({ ok: false, held: true, reason: 'mq-same-head-failed' });
   expect(admissions).toHaveLength(1);
   expect(admissions[0].hold).toBe(true);
   expect(mutations).toBe(0);
-  const fresh = timeoutFixture(dir, { preflight: true }).guard();
+  const fresh = timeoutFixture(dir, { preflight: true, qualifying: false }).guard();
   expect(fresh.hold).toBe(true);
   expect(fresh.line).toContain('failed_checks');
   expect(enqueue()).toMatchObject({ ok: false, held: true, reason: 'mq-same-head-failed' });
@@ -100,4 +99,35 @@ it('timeout log missing only the final exit annotation stays refused', () => {
   expect(text).toContain('Tests 1 failed | 8410 passed');
   expect(text).not.toContain('##[error]');
   expect(timeoutFixture(root(), { text }).guard().hold).toBe(true);
+});
+
+it('complete timeout proof admits once and then holds on the persisted allowance', () => {
+  const dir = root();
+  expect(timeoutFixture(dir).guard()).toMatchObject({ hold: false, line: expect.stringContaining('mq-flake-timeout') });
+  expect(timeoutFixture(dir).guard().hold).toBe(true);
+});
+it.each([
+  ['rejected run metadata', { runEvent: 'pull_request' }],
+  ['unreadable ledger', { ledger: { atomicUpdate() { throw Error('unreadable'); } } }],
+  ['spent ledger', { ledger: { atomicUpdate() { return false; } } }],
+  ['unfinished same-named head check', { extraHeadCheck: { status: 'in_progress', conclusion: null } }],
+  ['undated same-named success', { undatedPass: true }],
+  ['undated same-named failure', { extraHeadCheck: { conclusion: 'failure', completed_at: undefined } }],
+  ['tied same-named failure', { extraHeadCheck: { conclusion: 'failure' } }],
+])('%s holds with otherwise complete timeout pass proof', (_, options) => {
+  expect(timeoutFixture(root(), options).guard().hold).toBe(true);
+});
+it('a 64 MiB quarantine read cannot satisfy the subsequent 4 MiB reader', () => {
+  const text = timeoutLog.replace('Error: Test timed out in 5000ms.', 'AssertionError: expected true to be false') + 'padding\n'.repeat(600_000);
+  const f = timeoutFixture(root(), { text, runEvent: 'pull_request', boundedLogs: true, quarantine: {
+    readList: () => ({ ok: true, list: { mode: 'quarantine', entries: [{ test: 'unrelated.test.mjs', expiresAt: Date.now() + 3_600_000 }] } }),
+  } });
+  expect(f.guard().hold).toBe(true);
+  expect(f.logReads).toContain(64 * 1024 * 1024);
+  expect(f.logReads).toContain(4 * 1024 * 1024);
+});
+
+it('an ordinary assertion with complete pass proof retains the ordinary flake retry', () => {
+  const text = timeoutLog.replace('Error: Test timed out in 5000ms.', 'AssertionError: expected true to be false');
+  expect(timeoutFixture(root(), { text }).guard().hold).toBe(false);
 });

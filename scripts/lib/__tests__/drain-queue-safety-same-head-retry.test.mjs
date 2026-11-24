@@ -381,6 +381,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
   }));
 
   const timeoutEvidence = f => {
+    for (const c of f.headChecks) c.completed_at = new Date(REMOVED_AT + 120_000).toISOString();
     for (const c of f.checks) Object.assign(c, { head_sha: mergeCommit,
       started_at: new Date(REMOVED_AT - 120_000).toISOString(),
       completed_at: new Date(REMOVED_AT - 60_000).toISOString() });

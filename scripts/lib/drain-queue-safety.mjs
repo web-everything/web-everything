@@ -760,15 +760,19 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       throw new Error('truncated retry evidence; operator must inspect full history');
     };
     const logCache = new Map(), read = exec;
+    let timeoutCandidate = false;
     exec = (file, args, options) => {
       const jobLogEndpoint = file === 'gh' && args.find(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg));
       if (!jobLogEndpoint) return read(file, args, options);
-      if (!logCache.has(jobLogEndpoint)) {
-        try { logCache.set(jobLogEndpoint, { value: read(file, args, options) }); }
-        catch (error) { logCache.set(jobLogEndpoint, { error }); }
+      const key = JSON.stringify([jobLogEndpoint, options.maxBuffer]);
+      if (!logCache.has(key)) {
+        try { logCache.set(key, { value: read(file, args, options) }); }
+        catch (error) { logCache.set(key, { error }); }
       }
-      const cached = logCache.get(jobLogEndpoint);
+      const cached = logCache.get(key);
       if (cached.error) throw cached.error;
+      // Candidate detection is sticky even when strict classification or metadata rejects the log.
+      if (typeof cached.value === 'string' && /Test timed out in /.test(cached.value)) timeoutCandidate = true;
       return cached.value;
     };
     const rawChecks = readPages(`repos/${repo}/commits/${oid}/check-runs?filter=all`, 'check_runs');
@@ -817,7 +821,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       } });
     // readQuarantineCover validates the aggregators itself (positive evidence, no uncovered failure), so a
     // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
-    if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
+    if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }) && !timeoutCandidate)
       return { mainGreen: false, mainRunId: null, infra: 'quarantined', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
     const summaryInfra = check => infraConclusions.has(check.conclusion);
     // Infra proof without logs: every failed job was cancelled/never ran, or the only real failure is the
@@ -933,6 +937,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         }
       }
     }
+    if (timeoutCandidate && !timeoutOnly)
+      return { logReason: 'timeout classification or Actions metadata unavailable or invalid; operator must inspect failed jobs and enqueue manually' };
     const intrinsic = failed.filter(check => !derived.has(check.id));
     const derivedNames = failed.filter(check => derived.has(check.id)).map(check => check.name
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' '));
@@ -1021,6 +1027,12 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         let headGreen = true;
         for (const name of new Set(failed.map(check => localJob(check.name)))) {
           const same = headChecks.filter(c => localJob(c.name) === name);
+          if (timeoutCandidate) {
+            const proof = strictHeadSuccess(same, passing);
+            if (!proof.win) { flakeReason = `PR head ${name}: ${proof.reason}`; headGreen = false; break; }
+            newestSuccess.set(name, proof.win);
+            continue;
+          }
           const wins = same.filter(c => c.status === 'completed' && c.conclusion === 'success').sort((a, b) => doneAt(b) - doneAt(a) || b.id - a.id);
           if (!wins.length) { flakeReason = `PR head has no successful run of ${name}`; headGreen = false; break; }
           if (same.some(c => c !== wins[0] && c.status === 'completed' && !passing.has(c.conclusion) && doneAt(c) > doneAt(wins[0]))) {
@@ -1106,7 +1118,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? (timeoutOnly ? 'mq-flake-timeout' : 'flaky-test') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked || timeoutCandidate && !timeoutOnly ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? (timeoutOnly ? 'mq-flake-timeout' : 'flaky-test') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       testPassProven: flaky,
       logReason,
       flakeReason: flaky ? null : flakeReason,
