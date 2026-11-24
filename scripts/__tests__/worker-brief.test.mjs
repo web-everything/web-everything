@@ -762,14 +762,29 @@ describe('brief red-team prep reading is gated and bounded (blocking-read hang)'
 describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
   const routes = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'scripts/settings/delivery-routes.json'), 'utf8'));
   const base = { purpose: 'hdr-test', files: 'scripts/x.mjs', owner: 'abc123' };
-  const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: '/h/designs/prt-pin-probe-prep.md' };
+  const prepDir = fs.mkdtempSync(path.join(os.tmpdir(), 'brief-hdr-'));
+  const prepFile = path.join(prepDir, 'prt-pin-probe-prep.md');
+  fs.writeFileSync(prepFile, '# prep\n');
+  const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: prepFile };
+
+  it('audit hardening: inherited kinds, directory/missing prep, free-text slot are refused; degraded daemon-tooling routes to debug-to-merge', () => {
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'constructor' })).toThrow(/Unknown delivery kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'toString' })).toThrow(/Unknown delivery kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: prepDir })).toThrow(/prep/i);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: '/definitely/missing/prep.md' })).toThrow(/prep/i);
+    expect(() => renderWorkerBrief({ ...base, ...header, slot: 'anything' })).toThrow(/--slot/);
+    const out = renderWorkerBrief({ ...base, ...header, daemonDegraded: true });
+    expect(out).toMatch(/^Mode: debug-to-merge$/m);
+    expect(out).toMatch(/DEBUG-TO-MERGE MODE/);
+    expect(renderWorkerBrief({ ...base, ...header })).toMatch(/FAST MODE/);
+  });
 
   it('renders Kind, Mode, Step, Prep, Slot header lines from the plan step', () => {
     const out = renderWorkerBrief({ ...base, ...header });
     expect(out).toMatch(/^Kind: daemon-tooling$/m);
     expect(out).toMatch(/^Mode: fast$/m);
     expect(out).toMatch(/^Step: PRT-PIN-PROBE$/m);
-    expect(out).toMatch(/^Prep: \/h\/designs\/prt-pin-probe-prep\.md$/m);
+    expect(out).toMatch(/^Prep: .*prt-pin-probe-prep\.md$/m);
     expect(out).toMatch(/^Slot: plan:PRT-PIN-PROBE$/m);
     expect(out.indexOf('Kind:')).toBeLessThan(out.indexOf('## Standard worker rules'));
   });
@@ -791,7 +806,7 @@ describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
 
   it('refuses a missing or unknown Kind, and a step without a prep path', () => {
     expect(() => renderWorkerBrief({ ...base, ...header, kind: undefined })).toThrow(/--kind/);
-    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'nope' })).toThrow(/Unknown kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'nope' })).toThrow(/Unknown delivery kind/);
     expect(() => renderWorkerBrief({ ...base, ...header, prepPath: undefined })).toThrow(/prep/i);
   });
 

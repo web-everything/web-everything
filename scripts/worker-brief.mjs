@@ -1,7 +1,6 @@
 import { resolveBuildPolicy, renderBuildRequirements } from './lib/build-policy.mjs';
 import { testsFirstWorkerRule } from './lib/tests-first-policy.mjs';
-import { renderBriefHeader, renderMergePathLine } from './lib/brief-header.mjs';
-import { existsSync } from 'node:fs';
+import { renderBriefHeader, renderMergePathLine, prepFileOk } from './lib/brief-header.mjs';
 import { resolveFreeScopeSettings } from './operations/free-scope-io.mjs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -62,7 +61,7 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
   --files=a,b             Required allowed files; bare paths receive we:
   --edge-clone=<path>     Include daemon overlay and adoption instructions
   --proof=<text>          Override the live before/after proof requirement
-  --step=<id> --kind=<kind> [--slot=<text>]  Print the dispatch-hook header lines (Kind, Mode from delivery-routes.json, Step,
+  --step=<id> --kind=<kind> [--slot=<text>] [--daemon-degraded=true]  Print the dispatch-hook header lines (Kind, Mode from delivery-routes.json, Step,
                           Prep from --prep-file which must exist, Slot) plus the merge-path checklist line when needed
   --prep-file=<path>      Red-team prep/acceptance file (regular file, max 128 KiB; pipes refused; fail open)
   --repo=we|plateau-app   Lane repository (default: we)
@@ -86,8 +85,8 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
  * @param {object} [params.freeScope] Resolved shared free-scope settings; defaults to the registry's platform/env cascade.
  * @returns {string} Markdown with a trailing newline.
  */
-export function renderWorkerBrief({ step, kind, slot, prepPath, ...params } = {}) {
-  const header = renderBriefHeader({ step, kind, slot, prepPath });
+export function renderWorkerBrief({ step, kind, slot, prepPath, daemonDegraded, ...params } = {}) {
+  const header = renderBriefHeader({ step, kind, slot, prepPath, daemonDegraded });
   const body = renderStandardBrief(params);
   if (!header) return body;
   const text = header + body;
@@ -292,7 +291,7 @@ export function renderReportStep() {
 export async function main(argv, { stdout = process.stdout, stderr = process.stderr, writeFile = defaultWriteFile,
   newOwner = () => randomUUID().slice(0, 8), redTeamBrief = defaultRedTeamBrief,
   readText = readPrepFile, readPolicy = readBriefRedTeamPolicy } = {}) {
-  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner', 'prep-file', 'step', 'kind', 'slot']);
+  const flags = new Set(['purpose', 'files', 'edge-clone', 'proof', 'repo', 'report-lines', 'out', 'owner', 'prep-file', 'step', 'kind', 'slot', 'daemon-degraded']);
   const options = {};
   let brief;
   let renderParams;
@@ -310,7 +309,8 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
       proof: options.proof, repo: options.repo, owner: options.owner ?? newOwner(),
       reportLines: options['report-lines'] === undefined ? 8 : Number(options['report-lines']),
       step: options.step, kind: options.kind, slot: options.slot,
-      prepPath: options.step !== undefined && options['prep-file'] && existsSync(options['prep-file']) ? options['prep-file'] : undefined,
+      prepPath: options.step !== undefined && options['prep-file'] && prepFileOk(options['prep-file']) ? options['prep-file'] : undefined,
+      daemonDegraded: options['daemon-degraded'] === 'true',
     };
     brief = renderWorkerBrief(renderParams);
   } catch (error) {
