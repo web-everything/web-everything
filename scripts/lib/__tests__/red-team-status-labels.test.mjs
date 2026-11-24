@@ -1,9 +1,9 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { readDrainRedTeamEvidence, recordRedTeamStatus, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import { resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
@@ -217,5 +217,29 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
   });
   it('still removes a stale clear label alongside the pending one', () => {
     expect(plan(['red-team:pending', 'red-team:clear'], { loopPayload: card }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
+  });
+});
+
+describe('awaiting human confirm', () => {
+  it.each([false, true])('plans clear only when the finished pass is newer (run newer: %s)', newer => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-confirm-labels-'));
+    try {
+      const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') }, at = Date.parse('2026-11-24T08:22:00Z');
+      const run = { op: 'review-pr', input: { repo: input.repo, pr: input.pr },
+        findings: { read: { netBasis: { rev: head } } }, pending: { kind: 'confirm', step: 'confirm' },
+        verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
+        effects: [{ type: 'review.advisory-note', status: 'applied' }],
+        stepTimings: [{ step: 'read', startedAt: new Date(at - 1000).toISOString() }, { step: 'advise', finishedAt: new Date(at).toISOString() }] };
+      recordRedTeamStatus({ ...input, loopPayload: run, status: 'finished', result: { status: 'ran', foldedVerdict: 'accept', findings: [] } }, { env });
+      const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${input.pr}-${head}.json`);
+      utimesSync(statusPath, (at + (newer ? -60_000 : 60_000)) / 1000, (at + (newer ? -60_000 : 60_000)) / 1000);
+      const older = { ...run, effects: [{ type: 'review.advisory-note', status: 'failed' }],
+        stepTimings: [{ step: 'read', startedAt: new Date(at - 60_000).toISOString() }] };
+      const evidence = readDrainRedTeamEvidence({ ...input, env, runsDir: env.WE_SHARED_RUNS_DIR,
+        list: () => ['review-pr-new', 'review-pr-old'], read: id => id === 'review-pr-new' ? run : older,
+        stat: path => ({ mtimeMs: path.endsWith('review-pr-new.json') ? at : at - 60_000 }), readScorecards: () => [] });
+      expect(planRedTeamStatusLabels({ ...input, env, labels: [], comments: [], evidence }).add)
+        .toBe(newer ? 'red-team:pending' : 'red-team:clear');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

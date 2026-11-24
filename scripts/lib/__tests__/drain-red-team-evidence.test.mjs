@@ -1088,6 +1088,57 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
 
 import { readRecoveryWitness, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
+describe('awaiting human confirm', () => {
+  function parked(change = () => {}, newer = false) {
+    const f = fixture(), at = Date.parse('2026-11-24T08:22:00Z');
+    const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
+      verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
+      pending: { kind: 'confirm', step: 'confirm' }, effects: [{ type: 'review.advisory-note', status: 'applied' }],
+      stepTimings: [{ step: 'read', startedAt: new Date(at - 1000).toISOString() }, { step: 'advise', finishedAt: new Date(at).toISOString() }] };
+    const older = { ...run, effects: [{ type: 'review.advisory-note', status: 'failed' }],
+      stepTimings: [{ step: 'read', startedAt: new Date(at - 60_000).toISOString() }] };
+    change(run);
+    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished',
+      result: { status: 'ran', foldedVerdict: 'accept', findings: [] } }, f);
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    utimesSync(path, (at + (newer ? -60_000 : 60_000)) / 1000, (at + (newer ? -60_000 : 60_000)) / 1000);
+    return { run, evidence: readDrainRedTeamEvidence({ ...f, list: () => ['review-pr-new', 'review-pr-old'],
+      read: id => id === 'review-pr-new' ? run : older,
+      stat: path => ({ mtimeMs: path.endsWith('review-pr-new.json') ? at : at - 60_000 }) }) };
+  }
+  it('releases the #7385 parked panel despite an older failed advisory-note effect', () => {
+    const { evidence } = parked();
+    expect(evidence.ok).not.toBe(false);
+    expect(evidence).toMatchObject({ recorded: true, status: { status: 'finished', result: { status: 'ran' } } });
+  });
+  it.each([
+    ['unfinished advise', r => { delete r.stepTimings[1].finishedAt; }],
+    ...['pending', 'failed', 'refused', 'in-flight', 'unknown'].map(status => [`effect ${status}`, r => { r.effects[0].status = status; }]),
+    ['confirm recorded', r => { r.findings.confirm = 'accept'; }],
+    ['resumed from', r => { r.resumeOf = 'prior'; }],
+    ['resume timestamp', r => { r.resumedAt = '2026-11-24T08:22:00Z'; }],
+    ...['accept', 'changes'].map(verdict => [`verdict ${verdict}`, r => { r.verdict.verdict = verdict; }]),
+    ['another head', r => { r.findings.read.netBasis.rev = 'a'.repeat(40); }],
+    ['missing head', r => { delete r.findings.read.netBasis.rev; }],
+    ['missing human requirement', r => { delete r.verdict.humanRequired; }],
+    ['wrong pending kind', r => { r.pending.kind = 'effect'; }],
+    ['wrong pending step', r => { r.pending.step = 'advise'; }],
+    ['refused outcome', r => { r.outcome = 'refused'; }],
+    ['missing effects', r => { delete r.effects; }],
+    ['malformed finishedAt', r => { r.stepTimings[1].finishedAt = {}; }],
+    ['malformed advise timing', r => { r.stepTimings[1] = null; }],
+    ['malformed effect', r => { r.effects = [null]; }],
+  ])('fails closed for %s', (_name, change) => {
+    expect(parked(change).evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it('still schedules a pass owed by a run written after the finished status', () => {
+    const { run, evidence } = parked(() => {}, true);
+    expect(redTeamOwedFor(run)).toBe(true);
+    expect(evidence).toMatchObject({ scheduled: true, recorded: false });
+    expect(evidence.status).toBeUndefined();
+  });
+});
+
 describe('bounded review evidence scans', () => {
   // Records 10 s apart by mtime. A record is written after its read step starts, so its mtime bounds that start.
   const big = { list: () => Array.from({ length: 5000 }, (_, i) => `review-pr-${i}`),

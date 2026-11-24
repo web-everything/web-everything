@@ -291,6 +291,19 @@ const supersededUnfinished = (run, head) => {
   const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
   return rev !== null && live !== null && rev !== live;
 };
+// Confirm belongs to the human; the red-team result is evidence that human reads, so waiting for
+// confirm here would deadlock it. review:human/review:changes still holds the merge. Keep this run
+// in newest/exact: a write newer than the status must still schedule any pass it owes.
+const awaitingHumanConfirm = (run, head) => {
+  const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
+  return run?.pending?.kind === 'confirm' && run.pending.step === 'confirm'
+    && verdictOf(run) === 'needs-human' && run.verdict.humanRequired === true
+    && run.findings?.confirm == null && run.outcome !== 'refused'
+    && run.resumeOf == null && run.resumedAt == null
+    && Array.isArray(run.stepTimings) && run.stepTimings.some(t => t?.step === 'advise' && typeof t.finishedAt === 'string' && Number.isFinite(Date.parse(t.finishedAt)))
+    && Array.isArray(run.effects) && run.effects.every(effect => effect?.status === 'applied')
+    && rev !== null && live !== null && rev === live;
+};
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
@@ -528,7 +541,7 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
-            if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
+            if (unfinishedReview(run) && !supersededUnfinished(run, head) && !awaitingHumanConfirm(run, head)) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
