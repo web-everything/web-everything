@@ -111,7 +111,7 @@ describe('planSafetyNet — pure rules', () => {
     expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: ['test-shard (1)'], jobFailures: { 'test-shard (1)': many }, list: { version: 1, entries: [] }, now, settings: { ...SETTINGS.value, maxTests: 1 } }).action).toBe('none');
   });
   it('main green with entries ⇒ prune (main-green)', () => {
-    const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }).list;
+    const list = addEntries(null, { ttlMs: quarantine.QUARANTINE_DEFAULT_TTL_MS, tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }).list;
     expect(planSafetyNet({ status: 'green', list, now })).toMatchObject({ action: 'prune', mainGreen: true });
   });
   it('an entry for this red that already expired is never re-added (stale-entry guard)', () => {
@@ -246,7 +246,7 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
     expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
   });
   it('a prune-only live write does not mark the mode as published', () => {
-    const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list; // unstamped
+    const list = addEntries(null, { ttlMs: quarantine.QUARANTINE_DEFAULT_TTL_MS, tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list; // unstamped
     const g = net({ mode: QUARANTINE, mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, list, now: at + MIN });
     expect(g.r.plan.action).toBe('prune');
     expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at + 2 * MIN }).calls.reads).toBe(0);
@@ -434,7 +434,7 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
       expect(back.calls.writes).toHaveLength(1);
     });
     it('a stamp-only push is refused when the ledger cannot record it (else a stale "unstamped" record would hide it)', () => {
-      const unstamped = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list;
+      const unstamped = addEntries(null, { ttlMs: quarantine.QUARANTINE_DEFAULT_TTL_MS, tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list;
       mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // the ledger write fails (the tick's own read records "unstamped")
       const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
       expect(calls.writes).toEqual([]);
@@ -448,8 +448,8 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
     });
   });
   it('an operator add or a prune keeps the published mode; a bad mode makes the list unreadable', () => {
-    const stamped = { ...addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list, mode: 'quarantine' };
-    expect(addEntries(stamped, { tests: ['a/b.test.mjs'], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list.mode).toBe('quarantine');
+    const stamped = { ...addEntries(null, { ttlMs: quarantine.QUARANTINE_DEFAULT_TTL_MS, tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list, mode: 'quarantine' };
+    expect(addEntries(stamped, { ttlMs: quarantine.QUARANTINE_DEFAULT_TTL_MS, tests: ['a/b.test.mjs'], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list.mode).toBe('quarantine');
     expect(pruneOnGreen(stamped, { mainGreen: null, now: at }).list.mode).toBe('quarantine');
     expect(setMode(stamped, { mode: 'stop', actor: 'red-main-safety-net', now: at }).list.mode).toBe('stop');
     expect(setMode(stamped, { mode: 'stop', actor: 'someone', now: at }).ok).toBe(false);
@@ -502,7 +502,7 @@ describe('main-ci-red smell hook', () => {
     const seen = [];
     const ctx = { now: T('2026-10-10T19:20:00Z'), config: {}, quarantineSafetyNet: (m) => { seen.push(m); return { mode: 'stop', shadow: true, plan: { action: 'add', tests: [TEST_FILE], why: 'w' } }; } };
     const res = smell.evaluate({ mainCiRuns: { runs: RED_RUNS, failing: FAILING } }, ctx);
-    expect(res[0].measure.quarantine).toEqual({ mode: 'stop', shadow: true, action: 'add', tests: [TEST_FILE], why: 'w' });
+    expect(res[0].measure.quarantine).toEqual({ mode: 'stop', shadow: true, action: 'add', tests: [TEST_FILE], why: 'w', alerts: [] });
     expect(smell.evaluate({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: {} } }, ctx)).toEqual([]);
     expect(seen).toHaveLength(2); // green ticks still reach the net (that is where prune happens)
   });

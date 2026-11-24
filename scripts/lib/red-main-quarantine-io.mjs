@@ -605,7 +605,11 @@ export function runSafetyNet({
           ...(output.type === 'quarantine' ? { entry: published } : {}) });
       }
       const alerts = listEmpty ? [] : timeoutAlerts.map(outcome => ({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome }));
-      if (state.status === 'red' && listEmpty && !out.applied && (isLive || !activeEntries(ledger.shadowList, { now }).length)) alerts.push({ type: 'alert', ref: `red-main:${sha}`, why: out.error ?? out.plan?.why ?? 'no action; quarantine list empty' });
+      if (state.status === 'red' && listEmpty && (!out.applied || !out.liveEntries.length) && (isLive || !activeEntries(ledger.shadowList, { now }).length)) {
+        const why = out.error ?? out.plan?.why ?? 'no action; quarantine list empty';
+        alerts.push({ type: /unknown|unreadable|outside the unit|no unit job failed|cap .*reached|bound|expired|invalid/i.test(why) ? 'escalation' : 'alert', ref: `red-main:${sha}`, why });
+      }
+      out.alerts = alerts.map(alert => ({ at: now, ...alert }));
       // Persist one bounded signature per red window, including the run and mode.
       // A changed reason/run emits again; unchanged ticks (including restarts) do not.
       const alertState = rec ?? ledger;
@@ -707,7 +711,7 @@ export function runAddCommand(f, { now = Date.now(), write = writeQuarantineChan
   const brokenSha = typeof f['broken-sha'] === 'string' ? f['broken-sha'].toLowerCase() : f['broken-sha'];
   const out = write({
     env, platform, tool, actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(brokenSha).slice(0, 9)}, by ${f.actor})`,
-    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, orchestratorAuthority, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null, job: f.job }),
+    change: (cur) => addEntries(cur, { tests, brokenSha, owner: f.owner, reason: f.reason, actor: f.actor, orchestratorAuthority, now, ttlMs, area: f.area ?? null, job: f.job }),
   });
   const result = out?.ok === false ? undefined : rerun({ brokenSha, ...(f.dir ? { dir: f.dir } : {}) });
   return result ? { ...out, rerun: result } : out;
