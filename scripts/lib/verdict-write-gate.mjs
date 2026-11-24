@@ -47,26 +47,36 @@ export async function writeVerdict({ repo, pr, expectedHead, kind, write, io = {
   catch (error) { writeError = error; writeThrew = true; }
   const after = await readLive(reader, repo, pr);
   const verdictUnderMove = !after || after.headRefOid !== expectedHead || after.state !== 'OPEN';
+  const writeFailed = !result || typeof result !== 'object' || result.ok === false;
+  const writeReason = result?.reason ?? result?.error ?? 'non-object write result';
   if (verdictUnderMove) {
     const actualHead = after?.headRefOid;
     try {
-      await io.recordIncident({
+      const recorded = await io.recordIncident({
         kind: 'verdict-under-move', repo, pr, expectedHead, actualHead, writeKind: kind,
         ...(writeThrew ? { writeThrew: true } : {}),
       });
+      if (recorded?.ok === false) throw recorded.error ?? recorded.reason ?? 'incident recorder returned ok:false';
     } catch (error) {
       const incidentError = String(error?.message ?? error);
       if (writeThrew) {
-        try { writeError.incidentError = incidentError; }
-        catch { /* Annotation must never replace the original thrown value. */ }
+        try {
+          if (writeError === null || !['object', 'function'].includes(typeof writeError)) throw new Error();
+          Object.assign(writeError, { incidentRecorded: false, incidentError });
+        } catch {
+          writeError = Object.assign(new Error(writeError?.message ?? String(writeError), { cause: writeError }),
+            { incidentRecorded: false, incidentError });
+        }
         throw writeError;
       }
-      return { ok: false, written: true, verdictUnderMove: true, incidentRecorded: false,
+      return { ok: false, code: 'incident-record-failed', written: true, verdictUnderMove: true, incidentRecorded: false,
         incidentError, result, actualHead };
     }
     if (writeThrew) throw writeError;
-    return { ok: true, written: true, result, verdictUnderMove: true, incidentRecorded: true, actualHead };
+    return { ok: false, code: 'verdict-under-move', written: true, result, verdictUnderMove: true,
+      incidentRecorded: true, actualHead, ...(writeFailed ? { writeReason } : {}) };
   }
   if (writeThrew) throw writeError;
+  if (writeFailed) return { ok: false, code: 'write-failed', written: false, reason: writeReason, result };
   return { ok: true, written: true, result, verdictUnderMove: false };
 }
