@@ -130,7 +130,7 @@ export function parseDrainCatchupTicks(text) {
 
 /** Merge new records into the kept memory; drop anything older than the window, cap the size. */
 export function mergeLoopTicks(prev, fresh, { now, windowMs = 60 * MINUTE, max = 2000 } = {}) {
-  const keep = [...(Array.isArray(prev) ? prev : []), ...(fresh || [])].filter((r) => r && now - r.at <= windowMs + 10 * MINUTE);
+  const keep = [...(Array.isArray(prev) ? prev : []), ...(fresh || [])].filter((r) => r && now - r.at <= windowMs + 10 * MINUTE && r.at <= now + MINUTE);
   const seen = new Set();
   const uniq = [];
   for (const r of keep.sort((a, b) => a.at - b.at)) {
@@ -139,12 +139,37 @@ export function mergeLoopTicks(prev, fresh, { now, windowMs = 60 * MINUTE, max =
     seen.add(k); uniq.push(r);
   }
   // Cap per loop, so a busy loop cannot evict another loop's evidence.
-  const counts = new Map();
-  const kept = [];
-  for (const r of uniq.reverse()) {
-    const c = counts.get(r.loop) || 0;
-    if (c >= max) continue;
-    counts.set(r.loop, c + 1); kept.push(r);
+  const byLoop = new Map();
+  for (const r of uniq) {
+    if (!byLoop.has(r.loop)) byLoop.set(r.loop, []);
+    byLoop.get(r.loop).push(r);
   }
-  return kept.reverse();
+  const kept = [];
+  for (const records of byLoop.values()) {
+    if (records.length <= max) { kept.push(...records); continue; }
+    if (max < 5) { kept.push(...records.slice(records.length - max)); continue; }
+    const worked = records.filter((r) => r.attempted > 0);
+    // Preserve the supported minimum-tick ceiling (500), plus witnesses for any success or failure.
+    // Keeping the latest success is sufficient: every earlier success expires before it does.
+    const recentLimit = Math.min(500, max - 5);
+    const selected = new Set(worked.slice(worked.length - recentLimit));
+    selected.add(records.at(-1));
+    const success = records.findLast((r) => r.succeeded > 0);
+    const failure = worked.findLast((r) => r.failed > 0);
+    if (success) selected.add(success);
+    if (failure) selected.add(failure);
+    // Stable time buckets retain the oldest work across the whole window, even across repeated merges.
+    // The retained interval includes 10m grace and 1m future slack. N bucket widths intersect at most
+    // N+1 buckets; reserve that extra slot. At max=2000 even a 24h window has buckets under one minute,
+    // comfortably inside the verdict's 15m slack. Storage stays bounded independently of tick rate.
+    const bucketMs = (windowMs + 11 * MINUTE) / (max - recentLimit - 4);
+    const buckets = new Set();
+    for (const r of worked) {
+      const bucket = Math.floor(r.at / bucketMs);
+      if (buckets.has(bucket)) continue;
+      buckets.add(bucket); selected.add(r);
+    }
+    kept.push(...selected);
+  }
+  return kept.sort((a, b) => a.at - b.at);
 }

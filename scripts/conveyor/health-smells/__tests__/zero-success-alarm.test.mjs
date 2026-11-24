@@ -1,13 +1,77 @@
-import { expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import smell from '../zero-success-alarm.mjs';
 import { runHealthTick } from '../../health-watch-core.mjs';
-import { zeroSuccessVerdicts, parseLoopTicks } from '../../health-loop-ticks.mjs';
+import { zeroSuccessVerdicts, parseLoopTicks, mergeLoopTicks } from '../../health-loop-ticks.mjs';
 
 const minute = 60_000;
 const now = Date.parse('2026-11-24T12:00:00Z');
 const tick = (ageMin, o = {}) => ({ at: now - ageMin * minute, loop: 'prepare', attempted: 230, succeeded: 0, failed: 230, error: 'spawn ENOENT', ...o });
 const failing = (n = 7, step = 10) => Array.from({ length: n }, (_, i) => tick(i * step));
 const run = (records, prev = null, t = now) => runHealthTick(prev, { loopTicks: { records } }, [smell], t);
+afterEach(() => vi.unstubAllEnvs());
+
+it('retains an hour of outage evidence when failures arrive every second', () => {
+  const records = Array.from({ length: 3601 }, (_, i) => tick(i / 60));
+  const result = run(records);
+  expect(result.state.loopTicks.length).toBeLessThanOrEqual(2000);
+  expect(Object.values(result.state.episodes)).toHaveLength(1);
+});
+
+it('retains a full configured day of drain failures and keeps alarming as the window rolls', () => {
+  vi.stubEnv('WE_ZERO_SUCCESS_MINUTES', '1440');
+  const records = Array.from({ length: 2881 }, (_, i) => tick(i / 2, { loop: 'drain-catchup' }));
+  let result = run(records);
+  expect(Object.values(result.state.episodes)).toHaveLength(1);
+  for (let hour = 6; hour <= 48; hour += 6) {
+    const fresh = Array.from({ length: 720 }, (_, i) => tick(-hour * 60 + i / 2, { loop: 'drain-catchup' }));
+    result = run(fresh, JSON.parse(JSON.stringify(result.state)), now + hour * 60 * minute);
+    expect(result.state.loopTicks.length).toBeLessThanOrEqual(2000);
+    expect(Object.values(result.state.episodes).filter((e) => e.status === 'open')).toHaveLength(1);
+  }
+});
+
+it('keeps an older success until it expires despite thousands of newer failures', () => {
+  const records = Array.from({ length: 3601 }, (_, i) => tick(i / 60));
+  const success = tick(59, { succeeded: 1 });
+  const first = run([...records, success]);
+  expect(Object.values(first.state.episodes)).toHaveLength(0);
+  const replay = run(records, JSON.parse(JSON.stringify(first.state)));
+  expect(Object.values(replay.state.episodes)).toHaveLength(0);
+  const expired = run([tick(-2)], replay.state, now + 2 * minute);
+  expect(Object.values(expired.state.episodes).filter((e) => e.status === 'open')).toHaveLength(1);
+});
+
+it('retains up to 500 work ticks amid idle floods without inventing work on replay', () => {
+  vi.stubEnv('WE_ZERO_SUCCESS_MIN_TICKS', '500');
+  const idle = Array.from({ length: 4001 }, (_, i) => tick(i / 60, { attempted: 0, failed: 0 }));
+  const work = Array.from({ length: 500 }, (_, i) => tick(i * 60 / 499));
+  const first = run([...idle, ...work.slice(1)]);
+  expect(Object.values(first.state.episodes)).toHaveLength(0);
+  expect(Object.values(run([...idle, ...work.slice(1)], first.state).state.episodes)).toHaveLength(0);
+  const complete = run([work[0]], first.state);
+  expect(Object.values(complete.state.episodes)).toHaveLength(1);
+  expect(complete.state.loopTicks.length).toBeLessThanOrEqual(2000);
+});
+
+it('caps each loop separately and preserves the latest failure even among neutral work', () => {
+  const records = Array.from({ length: 4001 }, (_, i) => tick(i / 60, { failed: 0 }));
+  const failure = tick(40.005);
+  const secondLoop = failing().map((r) => ({ ...r, loop: 'drain-catchup' }));
+  const kept = mergeLoopTicks([], [...records, failure, ...secondLoop], { now });
+  expect(kept.filter((r) => r.loop === 'prepare').length).toBeLessThanOrEqual(2000);
+  expect(kept.filter((r) => r.loop === 'drain-catchup')).toHaveLength(7);
+  expect(kept).toContain(failure);
+  expect(zeroSuccessVerdicts(kept, { now }).every((v) => v.breach)).toBe(true);
+});
+
+it('honors the bound across retention grace and future clock slack', () => {
+  const records = Array.from({ length: 87_061 }, (_, i) => tick((i - 60) / 60));
+  const tooFarAhead = tick(-2);
+  const kept = mergeLoopTicks([], [...records, tooFarAhead], { now, windowMs: 1440 * minute });
+  expect(kept.length).toBeLessThanOrEqual(2000);
+  expect(kept).not.toContain(tooFarAhead);
+  expect(zeroSuccessVerdicts(kept, { now, windowMs: 1440 * minute })[0].breach).toBe(true);
+});
 
 it('raises one alarm after an hour of ticks with zero successes', () => {
   const r = run(failing());
