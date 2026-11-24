@@ -1,10 +1,1 @@
-## MQ timeout admission
-
-MQ timeout admission is a complete-log proof: every failed Vitest test needs its own FAIL heading
-and `Error: Test timed out in <N>ms.` headline, matching failed-test/file totals and the final exit
-annotation. Failed `test`/`coverage-merge` jobs need positive upstream-gate logs. Missing, oversized,
-unreadable or mixed-cause evidence retains the operator hold. `drain-mq-timeout-retry.test.mjs`
-and the behaviour-decided `mq-timeout-same-head` soak cover this rule. Preflight reads the shared
-MQ failure ledger; only admission at the enqueue mutation boundary consumes the one allowance
-keyed by repo/PR/head. An ambiguous enqueue failure consumes it too; operators inspect and enqueue
-manually after it is spent. Run the soak wrapper with `vitest.soak.config.ts` through heavy admission.
+Recovery claims one retry per repo/PR/head only for complete timeout evidence; unknown evidence requires operator inspection. Mutation admission rereads the timeline; changed or unreadable history retains the hold. Fixtures and the behavioural soak exercise fresh adapters and the persisted allowance. Ledger claims can reject asynchronously on storage failure: synchronous admission handles the rejection immediately and retains the hold for Promise results.

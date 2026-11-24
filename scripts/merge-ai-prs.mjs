@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { retryMqTimeoutOnHold } from './lib/drain-mq-failure-recovery-io.mjs';
 import { readReviewChecks } from './lib/review-ci-gate-io.mjs';
 import { classifyChildFailure } from './lib/child-failure-class.mjs';
 import { assertCapability } from './lib/repo-profile.mjs';
@@ -5269,11 +5270,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       log: line => process.stderr.write(`${line}\n`) });
     // The visible reason (decline/accept text with the deciding main run id) replaces the bare hold line.
     const shown = { line: guard.reason ?? guard.line };
-    if (guard.hold) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
+    const timeoutRetry = guard.hold && guard.line?.startsWith('mq-same-head-failed:')
+      && retryMqTimeoutOnHold({ repo: c.repo ?? localSlug, pr: c.num, head: sha, guard, dryRun: DRY_RUN });
+    if (guard.hold && !timeoutRetry?.retry) return { enqueued: false, kind: 'mq-same-head-failed', reason: shown.line };
     const result = mergeStrategy.enqueue(c, sha, { ...options,
       // The early queued bypass authorizes bookkeeping only. If membership disappears during the
       // strategy's other checks, require fresh timeline admission immediately before any mutation.
-      sameHeadAdmission: () => mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
+      sameHeadAdmission: () => timeoutRetry?.retry ? timeoutRetry.sameHeadAdmission() : mqSameHeadGuard({ repo: c.repo ?? localSlug, pr: c.num, head: sha,
         allowAlreadyQueued: false, refresh, dryRun: DRY_RUN, log: line => process.stderr.write(`${line}\n`) }) });
     if (result?.enqueued === true) {
       try { shadow?.recordActual({ repo: c.repo || localSlug, num: c.num, headSha: sha }); } catch { /* Timing only. */ }

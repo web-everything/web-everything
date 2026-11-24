@@ -137,7 +137,7 @@ describe('real drain pre-stage path', () => {
     expect(end).toBeGreaterThan(start);
     const body = source.slice(start, end);
     expect(body).toMatch(/\bmqSameHeadGuard\s*\(/);
-    expect(body).toMatch(/if\s*\([^)]*\.hold\s*\)\s*(?:\{\s*)?return\s*\{/);
+    expect(body).toMatch(/if\s*\([^)]*\.hold(?:\s*&&\s*!timeoutRetry(?:\?\.retry)?)?\s*\)\s*(?:\{\s*)?return\s*\{/);
     expect(body).toMatch(/enqueued:\s*false/);
     expect(body).toMatch(/kind:\s*['"]mq-same-head-failed['"]/);
     expect(body).toMatch(/reason:\s*\w+\.line/);
@@ -154,7 +154,7 @@ describe('real drain pre-stage path', () => {
     const line = `mq-same-head-failed: #42 head ${sha} — failed_checks`;
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
     expect(next.stderr).toContain(line);
-    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(1);
+    expect(next.calls.filter(a => a.some(x => x.includes('timelineItems(')))).toHaveLength(2);
   }));
   it.each([false, true])('manual removal permits re-enqueue through the cascade/prestage path (green event: %s)', green => world(async ({pr,run}) => {
     if (green) expect((await run()).stderr).toContain('eligible=true');

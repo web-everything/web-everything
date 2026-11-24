@@ -89,8 +89,6 @@ export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, 
     return { reason: 'rerun request refused or unreadable; operator must inspect Actions before retrying' };
   }
 }
-
-/** Read every failed job, sharing the caller's budget. Actions metadata must corroborate check URLs. */
 export function readMqTimeoutFailure({ failed, attempts, repo, exec, spend }) {
   if (!failed.length || failed.length > 10 || attempts.reason
     || attempts.candidates.length !== failed.length) return false;
@@ -101,23 +99,21 @@ export function readMqTimeoutFailure({ failed, attempts, repo, exec, spend }) {
       if (check.conclusion !== 'failure' || !job || !attempts.candidates.includes(job.id)) return false;
       const readJson = endpoint => {
         spend();
-        return JSON.parse(exec('gh', ['api', `repos/${repo}/actions/${endpoint}`], {
-          encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
-          stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
-        }));
+        return JSON.parse(exec('gh', ['api', `repos/${repo}/actions/${endpoint}`], { encoding: 'utf8',
+          timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
       };
       const metadata = readJson(`jobs/${job.id}`);
       if (metadata?.id !== job.id || String(metadata.run_id) !== job.run || !check.head_sha
-        || metadata.head_sha !== check.head_sha || metadata.name !== check.name || metadata.conclusion !== 'failure'
+        || metadata.status !== 'completed' || metadata.head_sha !== check.head_sha || metadata.name !== check.name || metadata.conclusion !== 'failure'
         || metadata.run_url !== `https://api.github.com/repos/${repo}/actions/runs/${job.run}`) return false;
       const run = readJson(`runs/${job.run}`);
       if (String(run?.id) !== job.run || run.head_sha !== check.head_sha || run.event !== 'merge_group'
+        || run.status !== 'completed' || run.conclusion !== 'failure'
+        || !Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1 || metadata.run_attempt !== run.run_attempt
         || run.repository?.full_name !== repo || run.path !== '.github/workflows/ci.yml') return false;
       spend();
-      const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${job.id}/logs`), {
-        encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
-      });
+      const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${job.id}/logs`), { encoding: 'utf8',
+        timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
       const kind = classifyMqTimeoutLog(text, check.name);
       if (kind === 'mq-flake-timeout') timeouts++;
       else if (kind !== 'upstream') return false;

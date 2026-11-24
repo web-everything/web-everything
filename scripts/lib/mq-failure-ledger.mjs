@@ -47,7 +47,7 @@ export function createMqFailureLedger({ io = mqFailureLedgerStorage() } = {}) {
   };
   return {
     claim(identity) {
-      if (!['route', 'refresh'].includes(identity.kind)) return Promise.reject(new TypeError('Unknown MQ ledger claim kind'));
+      if (!['route', 'refresh', 'mq-flake-timeout'].includes(identity.kind)) return Promise.reject(new TypeError('Unknown MQ ledger claim kind'));
       return transaction(identity, state => {
         const key = keyFor(identity);
         if (state[key]) return { state, result: { claimed: false, note: identity.kind === 'refresh'
@@ -77,17 +77,4 @@ export function createMqFailureLedger({ io = mqFailureLedgerStorage() } = {}) {
         result: state[keyFor({ ...identity, kind: 'refresh-successor' })] === true }));
     },
   };
-}
-
-/** Synchronous drain admission: preflight reads; the mutation boundary consumes before enqueue.
- * Ambiguous enqueue failures consume the allowance too. Shared atomic storage survives daemon restarts.
- */
-export function mqTimeoutRetryAllowance(identity, { consume = false, io = mqFailureLedgerStorage() } = {}) {
-  if (!identityValid(identity)) throw new TypeError('MQ ledger requires repo/PR/full head identity');
-  return io.atomicUpdate(state => {
-    checkState(state);
-    const key = keyFor({ ...identity, kind: 'mq-flake-timeout' });
-    if (state[key]) return { state, result: false };
-    return { state: consume ? { ...state, [key]: true } : state, result: true };
-  });
 }

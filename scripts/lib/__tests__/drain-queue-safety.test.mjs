@@ -1,3 +1,4 @@
+import { retryMqTimeoutOnHold, createDrainMqFailureRecoveryIo } from '../drain-mq-failure-recovery-io.mjs';
 // @vitest-environment node
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -199,6 +200,7 @@ describe('merge-queue same-head failure admission', () => {
           resolveApprovalLicensesEnqueue: () => { stages.push('license setting'); return { value: outcome !== 'license disabled', source: 'settings' }; },
           proveHumanOnlyLicense,
           mqSameHeadGuard: opts => mqSameHeadGuard({ ...opts, exec, log: f.log }),
+          retryMqTimeoutOnHold: opts => retryMqTimeoutOnHold({ ...opts, io: createDrainMqFailureRecoveryIo({ exec }) }),
         };
         try {
           const enqueue = new Function(...Object.keys(wiring), source.slice(start, end)

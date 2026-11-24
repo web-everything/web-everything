@@ -35,9 +35,6 @@ function hasOnlyUpstreamFailure(lines) {
     && lines.every(line => upstreamFailureOutcomes.has(line) || upstreamGateTranscript.has(line));
 }
 
-/** Complete Vitest timeout-only transcript, or a positively identified upstream aggregate.
- * Unknown/oversized/truncated transcripts require operator inspection, never an automatic retry.
- */
 export function classifyMqTimeoutLog(text, name) {
   if (typeof text !== 'string' || Buffer.byteLength(text) >= 4 * 1024 * 1024) return 'unknown';
   const lines = clean(text).split(/\r?\n/).map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim());
@@ -47,8 +44,6 @@ export function classifyMqTimeoutLog(text, name) {
   let files = null, tests = null, exited = false;
   const paths = new Set(), identities = new Set();
   for (const line of lines) {
-    // Captured output is arbitrary and cannot be distinguished from independent failures.
-    // Refuse it along with every other unrecognized line below, rather than skipping a block.
     const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>\s+(\S.*)$/.exec(line);
     if (heading) {
       if (pending || tests !== null) return 'unknown';
@@ -71,14 +66,12 @@ export function classifyMqTimeoutLog(text, name) {
       else { if (files !== null) return 'unknown'; files = Number(summary[2]); }
       continue;
     }
-    // Explicit benign runner formatting only. Unknown output requires operator inspection.
     if (!line || /^⎯+\s*(?:Failed Tests [1-9][0-9]*\s*⎯+|\[[1-9][0-9]*\/[1-9][0-9]*\]\s*⎯+)?$/.test(line)) continue;
     return 'unknown';
   }
   return !pending && exited && tests === timeouts && timeouts === identities.size && timeouts > 0
     && files === paths.size ? 'mq-flake-timeout' : 'unknown';
 }
-
 // Longest log line the parser reads. Real runner headings are far shorter; a longer line is not parsed past this
 // bound (every regex below is then bounded) and keeps path evidence incomplete, so it goes to the fixer.
 const MAX_LINE = 2048;
