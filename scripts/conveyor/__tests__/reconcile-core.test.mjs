@@ -1448,8 +1448,8 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
       expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 2783 })]);
     });
 
-    const defaultPolicyPlan = (label, checks, { requiredChecks = ['gate'], conversion = false } = {}) => planReconcileCore({
-      requiredChecks, prs: [pr2783({ labels: lbl(label, 'ci:failed'), statusCheckRollup: checks,
+    const defaultPolicyPlan = (label, checks, { requiredChecks = ['gate'], conversion = false, ...prOverrides } = {}) => planReconcileCore({
+      requiredChecks, prs: [pr2783({ labels: lbl(label, 'ci:failed'), statusCheckRollup: checks, ...prOverrides,
         comments: [
           ...(conversion ? [
             { author: AUTOMATION, body: `✅ review — accepted\n\n${buildReviewedShaMarker(HEAD_2783)}` },
@@ -1460,6 +1460,27 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
       })], agents: [], now: NOW,
     });
     const fastGreen = ['standards', 'test-shard (1)'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
+
+    it('default policy leaves a ci:failed PR without a review-owed label at the escalation refusal', () => {
+      const plan = defaultPolicyPlan('ci:failed', [...fastGreen, ...greenRollup]);
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated' })]);
+      expect(plan.refusals[0].reviewRefusal).toBeUndefined();
+    });
+
+    it.each(['DIRTY', 'CONFLICTING', 'BEHIND', 'UNKNOWN', undefined, 'UNRECOGNIZED'])(
+      'default policy folds a merge refusal for an accepted PR with merge state %s', mergeStateStatus => {
+        const plan = defaultPolicyPlan('review:accepted', [...fastGreen, ...greenRollup], { mergeStateStatus });
+        expect(plan.dispatch).toEqual([]);
+        expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated',
+          reviewRefusal: expect.objectContaining({ kind: 'merge-conflict' }) })]);
+      });
+
+    it.each(['review:pending', 'review:accepted', 'review:human'])(
+      'default policy dispatches review for %s with CLEAN merge state and green checks', label => {
+        const plan = defaultPolicyPlan(label, [...fastGreen, ...greenRollup]);
+        expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+      });
 
     it('default policy refuses an accepted PR with green fast checks but missing required integration', () => {
       const plan = defaultPolicyPlan('review:accepted', [...fastGreen, ...greenRollup], { requiredChecks: ['gate', 'integration'] });

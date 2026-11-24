@@ -4,13 +4,13 @@
  * refusal ONLY for a PR labelled `review:pending`. A PR in any other review phase (accepted and owed its red-team,
  * human re-review) stopped at the `ci-heal-escalated` refusal and got no review row, so nothing ever advanced it.
  *
- * FIX — the not-a-ci-break fold applies in every review phase; the shared review dispatcher still enforces the
- * required-check and head prerequisites.
+ * FIX — the not-a-ci-break fold applies only in review-owed phases with non-conflicted merge evidence;
+ * the shared review dispatcher still enforces the required-check and head prerequisites.
  *
  * SCENARIO: an `review:accepted` PR, every required check green, carrying a not-a-ci-break escalation on its current
  * head, through the tree's production `planReconcile`. RED = no `review` dispatch row.
  *
- * fixPresent is decided by a SEPARATE behavioural probe (a different phase, `review:human`, run in a child process),
+ * fixPresent is decided by a SEPARATE behavioural probe (a DIRTY accepted PR must carry the folded merge-conflict refusal, run in a child process),
  * never by the accepted-PR scenario the break itself asserts, and never by a marker string.
  */
 import { existsSync } from 'node:fs';
@@ -31,20 +31,21 @@ const { planReconcile } = await import(core);
 const { buildCiHealEscalationComment } = await import(mark);
 const label = process.env.SOAK_LABEL;
 const pr = { rowsComplete: true, rowsHead: '${HEAD}', number: 2783, state: 'OPEN', headRefName: 'lane/x', headRefOid: '${HEAD}',
-  labels: [{ name: label }, { name: 'ci:failed' }], mergeStateStatus: 'CLEAN',
-  statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+  labels: [{ name: label }, { name: 'ci:failed' }], mergeStateStatus: process.env.SOAK_MERGE || 'CLEAN',
+  statusCheckRollup: ['gate', 'standards', 'test-shard (1)'].map(name => ({ name, status: 'completed', conclusion: 'success' })),
   comments: [{ author: { login: 'web-everything' }, body: buildCiHealEscalationComment({ headSha: '${HEAD}', outcome: 'not-a-ci-break', reason: 'review gate only' }) }] };
 const plan = planReconcile({ prs: [pr], agents: [], requiredChecks: ['gate'], now: ${NOW} });
-console.log(JSON.stringify(plan.dispatch.map((d) => d.kind)));
+console.log(JSON.stringify({ kinds: plan.dispatch.map((d) => d.kind), folded: plan.refusals.map((r) => r.reviewRefusal?.kind ?? null) }));
 `;
 
-function planKinds(root, label) {
+function plan(root, label, merge = 'CLEAN') {
   const out = execFileSync(process.execPath, ['--input-type=module', '-e', PLAN_SOURCE], {
-    env: { ...process.env, SOAK_CORE: pathToFileURL(join(root, CORE)).href, SOAK_MARK: pathToFileURL(join(root, MARK)).href, SOAK_LABEL: label },
+    env: { ...process.env, SOAK_CORE: pathToFileURL(join(root, CORE)).href, SOAK_MARK: pathToFileURL(join(root, MARK)).href, SOAK_LABEL: label, SOAK_MERGE: merge },
     encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'ignore'],
   });
   return JSON.parse(out.trim().split('\n').pop());
 }
+const planKinds = (root, label) => plan(root, label).kinds;
 
 export default {
   id: 'ci-heal-not-a-ci-break-blocks-red-team',
@@ -53,7 +54,10 @@ export default {
   fixedBy: { sha: 'lane/ci-heal-escalation-nonblock', where: 'lane/ci-heal-escalation-nonblock', paths: [CORE] },
   fixPresent(root) {
     if (!existsSync(join(root, CORE)) || !existsSync(join(root, MARK))) return false;
-    return planKinds(root, 'review:human').includes('review');
+    // Fix-only behaviour, independent of the dispatch the scenario asserts: a conflicted accepted PR carries the
+    // folded merge-conflict refusal in its escalation row (the pre-fix planner folds nothing outside review:pending).
+    const p = plan(root, 'review:accepted', 'DIRTY');
+    return !p.kinds.includes('review') && p.folded.includes('merge-conflict');
   },
   async run({ log } = {}) {
     try {

@@ -3463,10 +3463,18 @@ export function planReconcile({
           });
           if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
           // Retain the escalation and fold the review prerequisite into the same row for every
-          // review phase, including accepted and re-review PRs. Newly admitted phases require
-          // strict CI evidence before the shared dispatcher can apply fast-check or conversion policy.
-          if (isNotCiBreak) {
+          // owed label, including accepted and re-review PRs. Newly admitted phases require
+          // known non-conflicted merge state and strict CI evidence before the shared dispatcher.
+          if (isNotCiBreak && withPhase.labels.some(label =>
+            [REVIEW_LABELS.pending, REVIEW_LABELS.accepted, REVIEW_LABELS.human, 'review:changes'].includes(label))) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'ciHealNotCiBreak');
+            // classifyPr treats BEHIND as conflicted too; unknown evidence must wait for a fresh read.
+            if (!withPhase.labels.includes(REVIEW_LABELS.pending)
+              && !['CLEAN', 'UNSTABLE', 'HAS_HOOKS', 'BLOCKED'].includes(String(pr?.mergeStateStatus ?? '').toUpperCase())) {
+              foldRefusal('merge-conflict', { mergeStateStatus: pr?.mergeStateStatus ?? null,
+                why: 'review waits for a known non-conflicted merge state; refresh merge evidence or resolve the branch conflict' });
+              continue;
+            }
             if (!withPhase.labels.includes(REVIEW_LABELS.pending) && !reviewCi.allowed) {
               foldRefusal('review-ci', { ci: reviewCi,
                 why: `${reviewCi.reason}: ${reviewCi.affected.map(row => `${row.name}=${row.reason}`).join(', ')}` });
