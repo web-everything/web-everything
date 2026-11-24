@@ -1151,10 +1151,9 @@ describe('merge-queue same-head failure admission', () => {
         }
       }));
     it.each([['title', 'Runner disconnected'], ['summary', 'Lost communication with worker'],
-      ['summary', 'SELF-HOSTED RUNNER went away']])('guard treats runner loss in output.%s as infrastructure (%s)', (field, text) => fixture(f => {
+      ['summary', 'SELF-HOSTED RUNNER went away']])('guard holds summary-only runner loss in output.%s (%s)', (field, text) => fixture(f => {
       f.checks[0] = { ...f.checks[0], conclusion: 'failure', output: { [field]: text } };
-      expect(f.guard().hold).toBe(false);
-      expect(f.log.mock.calls).toEqual([[retryLine('infra')]]);
+      f.expectHeld();
     }));
     it('guard holds when any failed check is a real test failure', () => fixture(f => {
       f.checks.push({ id: 22, status: 'completed', conclusion: 'failure', output: { title: 'Assertion failed', summary: 'expected 1 to equal 2' } });

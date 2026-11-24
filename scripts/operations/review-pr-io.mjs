@@ -1299,7 +1299,7 @@ export function createReviewPrSinks({
             if (!previous.id || !labelProvider.editComment) throw new Error('mandatory referral: cannot update existing comment; hold retained');
             const next = readReferralRecords([...before.comments, { ...previous, body }], context(before));
             if (next.malformed || !next.records.some(same)) throw new Error('mandatory referral: non-monotonic snapshot; hold retained');
-            labelProvider.editComment(previous.id, body);
+            labelProvider.editComment(previous.id, body, { repo: read.repo });
           } else labelProvider.postComment(read.repo, read.pr, body);
         }
         const state = fresh();

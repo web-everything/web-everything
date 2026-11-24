@@ -156,3 +156,26 @@ describe('last-read operator park guard', () => {
     },
   );
 });
+
+// Only the final refresh is malformed: the candidate and planning reads are valid.
+describe('final label evidence', () => {
+  it.each([null, {}, 7, true, function namedLabel() {}, { name: 7 }, { name: '' }])('retries malformed final label entry %j without promoting', label => {
+    const ready = vi.fn();
+    let reads = 0;
+    const view = { ...draft, state: 'OPEN', isDraft: true, baseRefName: 'main',
+      comments: [], labels: [], isCrossRepository: false, body: '', mergeStateStatus: 'CLEAN',
+      statusCheckRollup: [check('test')] };
+    const result = runDraftPromotionStep({
+      repos: [fixture.repo], listDrafts: () => [draft], absentNotApplicable: [],
+      readHeadCheckState: () => ({ state: 'green' }),
+      readPrView: () => ({ ...view, labels: ++reads === 2 ? [label] : [] }),
+      readAgents: () => [], readRequiredChecks: () => ({ checks: ['test'] }), readClaim: () => null,
+      ready, clearAwaiting: () => {},
+    });
+    expect(reads).toBe(2);
+    expect(result.rows).toEqual([expect.objectContaining({
+      action: 'error', why: expect.stringContaining('retry next step'),
+    })]);
+    expect(ready).not.toHaveBeenCalled();
+  });
+});
