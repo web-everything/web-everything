@@ -27,7 +27,11 @@ export function readTimeoutBudget({ dir, ...evidence }) {
     // no confirmed budget, but the planner counts them against the infra re-run cap so a persistently rejected re-run
     // reaches ci-heal instead of being re-planned forever. An early `released` reservation (a failed observation or a
     // stale head: nothing was ever sent) is transient and is NOT counted.
-    return { confirmed: requests.filter((r) => r.status === 'confirmed').length,
+    // `expired` = a pending request that was LOST (no run ever observed; RERUN-PENDING-EXPIRY). It spent a re-run
+    // attempt, so it counts toward `confirmed` (the cap) but is no longer `pending`.
+    const expired = requests.filter((r) => r.status === 'expired').length;
+    return { confirmed: requests.filter((r) => r.status === 'confirmed').length + expired,
+      ...(expired ? { expired } : {}),
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
       pending: requests.some((r) => r.status === 'pending'),
       // When the oldest still-pending request was reserved: lets the planner tell a rerun that is simply in

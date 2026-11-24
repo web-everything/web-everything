@@ -4004,9 +4004,48 @@ describe('xng7q1p mechanical timeout precedence', () => {
     expect(result.refusals[0].kind).toBe('ci-timeout-rerun-in-flight');
     expect(result.notes.some((n) => n.kind === 'timeout-retry-needs-human')).toBe(false);
   });
-  it('a re-run unresolved past the window still escalates; unreadable state escalates at once', () => {
+  // RERUN-PENDING-EXPIRY (live we#7431): a lost re-run marker held the PR forever. In flight = younger than the window AND
+  // (once it had time to start) a live run on the head; otherwise it is lost and the PR re-plans (never a human first).
+  it('a pending re-run older than the window is lost: it re-plans a mechanical re-run, never holds or escalates', () => {
     const old = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
-    const stale = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true, pendingSince: old } })], now: NOW });
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, pendingSince: old } })], now: NOW });
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+    expect(r.refusals.map((x) => x.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.notes.some((n) => n.kind === 'timeout-retry-needs-human')).toBe(false);
+  });
+  it('a lost marker with the re-run cap spent falls to ci-heal', () => {
+    const old = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 2, pending: true, pendingSince: old } })], now: NOW });
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
+  });
+  it('a young pending re-run with no live run on the head, past the start grace, is lost', () => {
+    const since = new Date(NOW - 8 * 60 * 1000).toISOString();
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, pendingSince: since } })], now: NOW });
+    expect(r.refusals.map((x) => x.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+  });
+  it('rerunInFlight: young + live run holds; young + no live run past grace, and old, are lost; unreadable holds', () => {
+    const since = (ms) => new Date(NOW - ms).toISOString();
+    const live = pr({ statusCheckRollup: [{ name: 'gate', status: 'IN_PROGRESS' }] });
+    const dead = pr();
+    const b = (ms, extra = {}) => ({ confirmed: 0, pending: true, pendingSince: since(ms), ...extra });
+    const o = { requiredChecks: ['gate'], now: NOW };
+    expect(rerunInFlight(live, { ...o, budget: b(8 * 60_000) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: b(60_000) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000) })).toBe(false);
+    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000, { reason: 'timeout-state-unreadable:x' }) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: { confirmed: 0, pending: false } })).toBe(false);
+  });
+  it('mediation: no refusal site reads budget.pending directly; all go through rerunInFlight()', () => {
+    const src = readFileSync(join(process.cwd(), 'scripts/conveyor/reconcile-core.mjs'), 'utf8');
+    const direct = src.split('\n').filter((l) => /[bB]udget\??\.pending\b/.test(l) && !/^\s*\/\//.test(l));
+    // The one allowed bare read is the escalation guard, whose body routes the hold through rerunInFlight().
+    expect(direct.filter((l) => !l.includes('rerunInFlight')).map((l) => l.trim())).toEqual(['if (!budget?.pending) return false;', 'if (retryBudget?.pending) {']);
+    expect(src.match(/rerunInFlight\(/g).length).toBeGreaterThanOrEqual(6);
+  });
+  it('a re-run unresolved without a timestamp escalates; unreadable state escalates at once', () => {
+    const stale = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true } })], now: NOW });
     expect(stale.refusals[0].kind).toBe('ci-heal-escalated');
     const fresh = new Date(NOW - 1000).toISOString();
     const unreadable = planReconcile({ prs: [pr({ timeoutRetryBudget: { pending: true, pendingSince: fresh, reason: 'timeout-state-unreadable:x' } })], now: NOW });
@@ -4246,7 +4285,7 @@ describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
 import { REVIEW_PR_FOOTER } from '../mechanical-round-cap.mjs';
 import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
-import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+import { countUnresolvedStandDowns, rerunInFlight } from '../reconcile-core.mjs';
 it('legacy #3881 waits on host load, not a human', () => {
   const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
   expect(countUnresolvedStandDowns([comment])).toBe(0);

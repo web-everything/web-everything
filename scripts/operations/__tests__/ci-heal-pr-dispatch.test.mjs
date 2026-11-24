@@ -750,6 +750,16 @@ describe('xng7q1p retry reservation and restart soak', () => {
     await dispatchTimeoutRetry(e, { dir, repo: e.repo, now: () => t0,
       effects: { observe, request: () => ({ status: 'ambiguous' }) } });
   }
+  // RERUN-PENDING-EXPIRY: a lost pending marker is expired through the one writer, counts toward the cap, and never holds forever.
+  it('a lost pending request (run completed, no new attempt, past the start grace) is expired and counts toward the cap', async () => harness(async (dir) => {
+    const e = evidence(); await reservePending(dir, e);
+    const opts = { dir, repo: e.repo, effects: { observe, request: () => ({ status: 'ambiguous' }) } };
+    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 60_000 })).toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(readState(dir, e).requests[0].status).toBe('pending');
+    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 20 * 60_000 })).toMatchObject({ reason: 'retry-expired-replan' });
+    expect(readState(dir, e).requests[0]).toMatchObject({ status: 'expired', expiredReason: expect.any(String) });
+    expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ confirmed: 1, expired: 1, pending: false });
+  }));
   it('a closed-PR pending reservation stops being polled after one observation', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
     const poll = vi.fn((...args) => ({ ...observe(...args), open: false }));

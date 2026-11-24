@@ -880,7 +880,10 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
   };
 }
 
-function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed').length; }
+function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed' || r.status === 'expired').length; }
+/** A pending request must show a newer run attempt within this long; past it (or once its run is completed with no new attempt) it is lost. */
+const PENDING_START_GRACE_MS = 3 * 60 * 1000;
+const PENDING_LOST_WINDOW_MS = 30 * 60 * 1000;
 
 /** An ambiguous request must not become an agent heal just because this tick's evidence read failed. */
 export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
@@ -1034,7 +1037,21 @@ export async function dispatchTimeoutRetry(evidence, {
     && observed.run === target.run && observed.jobRun === target.run && observed.job === target.job;
   if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
   if (selected.pending) {
-    if (observed.attempt <= target.attempt) return refuse('retry-outcome-pending');
+    if (observed.attempt <= target.attempt) {
+      // RERUN-PENDING-EXPIRY: the one writer that expires a lost marker (live we#7431). It counts toward the cap and the
+      // PR re-plans next tick (one mechanical re-run if under the cap, else ci-heal).
+      const age = now() - Date.parse(selected.pending.reservedAt);
+      const lost = Number.isFinite(age) && (age >= PENDING_LOST_WINDOW_MS || (age >= PENDING_START_GRACE_MS && observed.status === 'completed'));
+      if (!lost) return refuse('retry-outcome-pending');
+      timeoutTransaction(path, initial, (state) => {
+        const request = state.requests[selected.pending.id];
+        if (request.status === 'pending') {
+          request.status = 'expired'; request.expiredAt = new Date(now()).toISOString();
+          request.expiredReason = `no newer run attempt observed ${Math.round(age / 1000)}s after the request; treated as lost`;
+        }
+      });
+      return refuse('retry-expired-replan');
+    }
     timeoutTransaction(path, initial, (state) => {
       const pending = state.requests[selected.pending.id];
       if (pending.status === 'pending') {
