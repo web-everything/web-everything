@@ -7,9 +7,10 @@ import { randomUUID } from 'node:crypto';
 
 // Accept a plain reply; empty output, diagnostics, and machine/terminal garbage are not auth evidence.
 export function classifyAgyProbe({ stdout = '', stderr = '', exitCode, timedOut } = {}) {
+  if (timedOut) return 'signed-out'; // Acceptance: the hard timeout is a signed-out result.
+  if (typeof stdout !== 'string' || typeof stderr !== 'string') return 'unreadable';
   if (/sign[ -]?in|auth|not logged in/i.test(`${stdout}\n${stderr}`)) return 'signed-out';
-  const text = String(stdout).trim().toLowerCase().replace(/\p{P}/gu, '');
-  return exitCode === 0 && !timedOut && /^ok(?:\s|$)/.test(text) ? 'signed-in' : 'unreadable';
+  return exitCode === 0 && !stderr.trim() && /^ok[.!]?$/i.test(stdout.trim()) ? 'signed-in' : 'unreadable';
 }
 const timestamp = value => typeof value === 'number' ? value : typeof value === 'string' ? Date.parse(value) : NaN;
 export function agyAuthOff(record, now = Date.now(), periodMs = 15 * 60000) {
@@ -29,11 +30,17 @@ export function reduceAuthState(prev, classification, now, periodMs = 15 * 60000
 }
 const title = 'agy signed out: sign in to agy on the Studio';
 export function fileCard({ title, outageId }, exec = execFileSync) {
-  exec(process.execPath, ['scripts/operations/run.mjs', 'file-item', `--title=${title}`,
+  try { exec(process.execPath, ['scripts/operations/run.mjs', 'file-item', `--title=${title}`,
     '--kind=task', '--workItem=task', '--queue=false',
     `--notDuplicateReason=New authentication outage ${outageId}; a previous sign-in action does not resolve this outage.`,
-    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore routing.`],
+    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore the auth record. Production routing requires auth-record integration.`],
   { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), stdio: 'ignore', timeout: 45000, maxBuffer: 65536 });
+  } catch (error) {
+    // Only a failure to START the child proves no card was created. Nonzero exit/timeout
+    // can occur after creation; keep those pending and require operator reconciliation.
+    if (['ENOENT', 'EACCES', 'ENOTDIR'].includes(error?.code) && (error.pid == null || error.pid === 0)) error.publicationFailed = true;
+    throw error;
+  }
 }
 export async function runProbe({ spawn = nodeSpawn, statePath = join(homedir(), '.plateau', 'agy-auth-state.json'),
   lockDir = join(dirname(statePath), 'agy-auth-probe.lock'), now = Date.now, fileCard: publish = fileCard } = {}) {
@@ -42,16 +49,10 @@ export async function runProbe({ spawn = nodeSpawn, statePath = join(homedir(), 
   await fs.mkdir(base, { recursive: true });
   try { await fs.mkdir(lock); } catch (error) {
     if (error.code !== 'EEXIST') throw error;
-    let owner;
-    try { owner = JSON.parse(await fs.readFile(join(lock, 'owner.json'), 'utf8')); } catch { /* legacy/incomplete lock: use age */ }
-    const at = Number.isFinite(owner?.timestamp) ? owner.timestamp : (await fs.stat(lock)).mtimeMs;
-    let dead = false;
-    if (Number.isInteger(owner?.pid) && owner.pid > 0) {
-      try { process.kill(owner.pid, 0); } catch (error) { dead = error.code === 'ESRCH'; }
-    }
-    if (!dead && now() - at <= 5 * 60000) return { skipped: true };
-    await fs.rm(lock, { recursive: true, force: true });
-    try { await fs.mkdir(lock); } catch (error) { if (error.code === 'EEXIST') return { skipped: true }; throw error; }
+    // Never reclaim from an age/PID observation: a second contender can remove the
+    // replacement lock. Operators may remove an abandoned lock with probes stopped.
+    // This lock excludes PROBES only; dispatch jobs do not yet participate.
+    return { skipped: true };
   }
   const temporary = `${statePath}.${randomUUID()}.tmp`;
   const save = async record => {
@@ -82,21 +83,31 @@ export async function runProbe({ spawn = nodeSpawn, statePath = join(homedir(), 
     const record = reduceAuthState(prev, classifyAgyProbe(result), now());
     const sameOutage = record.outageId && record.outageId === prev?.outageId;
     record.cardPending = Boolean(sameOutage && prev?.cardPending);
+    record.cardFailed = Boolean(sameOutage && prev?.cardFailed);
     // Historical records with cardNeeded=false have already filed their card.
     record.cardFiled = Boolean(sameOutage && (prev?.cardFiled || (prev?.cardFiled === undefined && prev?.cardNeeded === false)));
     record.cardNeeded ||= record.state === 'off' && prev?.cardNeeded === true;
     const shouldPublish = record.cardNeeded && !record.cardFiled && !record.cardPending;
     if (shouldPublish) record.cardPending = true;
     await save(record);
+    if (record.cardPending && !shouldPublish && !record.cardFiled) {
+      throw new Error('action card publication is pending; reconcile file-item output before clearing cardPending');
+    }
     if (shouldPublish) {
-      await publish({ title, outageId: record.outageId });
-      record.cardPending = false; record.cardFiled = true; record.cardNeeded = false;
+      try { await publish({ title, outageId: record.outageId }); }
+      catch (error) {
+        record.cardFailed = true;
+        if (error?.publicationFailed === true) record.cardPending = false;
+        await save(record);
+        throw error;
+      }
+      record.cardPending = false; record.cardFailed = false; record.cardFiled = true; record.cardNeeded = false;
       await save(record);
     }
     return record;
   } finally { await fs.unlink(temporary).catch(() => {}); await fs.rm(lock, { recursive: true, force: true }); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runProbe().then(record => console.log(record.skipped ? 'agy auth probe skipped: lock held' : `agy auth: ${record.state}`))
+  runProbe().then(record => console.log(record.skipped ? 'agy auth probe skipped: lock held or abandoned; inspect owner.json; remove abandoned lock only with probes stopped' : `agy auth: ${record.state}`))
     .catch(() => { console.error('agy auth probe failed; check state storage and file-item on the Studio; inspect cardPending before retrying publication'); process.exitCode = 1; });
 }
