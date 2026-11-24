@@ -11,7 +11,7 @@ import { delimiter, dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import { addedLines, parseRawDiff, secretText } from '../secret-scan.mjs';
 import { keyStructureFinding } from '../../readiness/forge-key-structure.mjs';
-import { secretText as sharedRules } from '../../readiness/forge-exec-manifest.mjs';
+import { credentialContentFinding, secretText as sharedRules } from '../../readiness/forge-exec-manifest.mjs';
 
 const cli = new URL('../secret-scan.mjs', import.meta.url).pathname;
 const token = 'ghp' + '_' + 'a'.repeat(36), aws = 'AKIA' + 'A'.repeat(16);
@@ -54,7 +54,8 @@ function repo(initial = {}) {
 }
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const exemption = (path, rule, bytes = token) => ({ path, rule, sha256: sha256(bytes), reason: 'Obviously fake scanner fixture, reviewed for this test' });
-const privateJwk = '{"kty":"RSA","d":"FAKE_TEST_ONLY"}';
+// Build fake private members at runtime so Forge can ship this test source.
+const privateJwk = JSON.stringify(Object.fromEntries([['kty', 'RSA'], ['d', 'FAKE_TEST_ONLY']]));
 
 test('DER private key added as binary preserves NUL, CR, LF and invalid UTF-8 bytes', () => {
   const r = repo();
@@ -80,8 +81,9 @@ test('d added after an unchanged closing block comment fails', () => {
   assert.match(r.scan().stdout, /private-key-structure/);
 });
 test('value-only replacement of d in an existing private JWK fails', () => {
-  const r = repo({ 'key.json': '{\n"kty":"RSA",\n"d":\n"FAKE_OLD"\n}' });
-  r.put('key.json', '{\n"kty":"RSA",\n"d":\n"FAKE_NEW"\n}');
+  const before = JSON.stringify(Object.fromEntries([['kty', 'RSA'], ['d', 'FAKE_OLD']]), null, 2).replace('"d": ', '"d":\n');
+  const r = repo({ 'key.json': before });
+  r.put('key.json', before.replace('FAKE_OLD', 'FAKE_NEW'));
   r.commit();
   assert.equal(r.scan().status, 1);
 });
@@ -199,11 +201,12 @@ test('more than 500 changed files fails with manual-review fallback', () => {
   const r = repo(); for (let i = 0; i < 501; i++) r.put(`f${i}`, 'clean'); r.commit();
   const result = r.scan(); assert.equal(result.status, 1); assert.match(result.stderr, /review the full diff manually/);
 });
-test('shipped allowlist covers only the fake structural fixture path and rule', () => {
+test('runtime-built structural fixtures are detected while test source needs no exemption', () => {
   const source = readFileSync(new URL('./secret-scan.test.mjs', import.meta.url));
-  assert.equal(keyStructureFinding(source), 'private-key-structure');
+  assert.equal(keyStructureFinding(Buffer.from(privateJwk)), 'private-key-structure');
+  assert.equal(credentialContentFinding(Buffer.from('scripts/ci/__tests__/secret-scan.test.mjs'), source), null);
   const { entries } = JSON.parse(readFileSync(new URL('../secret-scan-allowlist.json', import.meta.url), 'utf8'));
-  assert.ok(entries.some(e => e.path === 'scripts/ci/__tests__/secret-scan.test.mjs' && e.rule === 'private-key-structure' && e.sha256 === sha256(source) && e.reason.trim()));
+  assert.ok(!entries.some(e => e.path === 'scripts/ci/__tests__/secret-scan.test.mjs'));
 });
 test('text attributes cannot hide tokens and PR scanner/config copies are ignored', () => {
   const r = repo(); r.put('.gitattributes', '*.dat -diff\n'); r.put('hidden.dat', aws);
