@@ -3,6 +3,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { renewedLease } from '../../../lib/lane-lease.mjs';
+import { readGit } from '../../../lib/proc-read.mjs';
 import { withGhStub } from '../../../__tests__/fixtures/shared-git-fixture.mjs';
 
 // Real CLI and local git clones; no network, daemon, or simulated lease decisions.
@@ -10,15 +11,14 @@ export function leasePool() {
   const base = mkdtempSync(join(tmpdir(), 'lease-keep-'));
   const origin = join(base, 'origin.git'), reference = join(base, 'reference');
   const dir = join(base, 'pool', 'keep', 'lane-1');
-  const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' }).trim();
   mkdirSync(reference);
-  git(['init', '-q', '--initial-branch=main'], reference);
-  git(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'base'], reference);
-  git(['clone', '-q', '--bare', reference, origin]);
-  git(['remote', 'add', 'origin', origin], reference);
-  git(['update-ref', 'refs/remotes/origin/main', 'HEAD'], reference);
+  readGit(['init', '-q', '--initial-branch=main'], { cwd: reference });
+  readGit(['-c', 'user.name=fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'base'], { cwd: reference });
+  readGit(['clone', '-q', '--bare', reference, origin]);
+  readGit(['remote', 'add', 'origin', origin], { cwd: reference });
+  readGit(['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: reference });
   mkdirSync(join(base, 'pool', 'keep'), { recursive: true });
-  git(['clone', '-q', origin, dir]);
+  readGit(['clone', '-q', origin, dir]);
   const args = [`--origin=${origin}`, `--reference=${reference}`, '--name=keep', '--branch=main', '--no-install'];
   const env = withGhStub({ ...process.env, LANE_POOL_ROOT: join(base, 'pool') });
   const script = resolve('scripts/lane-pool.mjs');
