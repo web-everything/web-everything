@@ -31,11 +31,11 @@ export default {
     const res = await core.handleRequest(new Request('https://x/github/webhook', { method: 'POST', body,
       headers: { 'x-github-event': 'merge_group', 'x-github-delivery': 'soak-1', 'x-hub-signature-256': sig } }),
     { GITHUB_APP_WEBHOOK_SECRET: 'appsec' }, { getLog: () => log });
-    if (res.status !== 202) violations.push(`app-signed merge_group answered ${res.status}, not 202`);
+    if (res.status !== 202) violations.splice(0, 0, `app-signed merge_group answered ${res.status}, not 202`);
     try {
       const { detectSeqGap } = await import(pathToFileURL(join(root, 'scripts/lib/forge-adapter/change-events.mjs')).href);
-      if (!detectSeqGap(2, [{ seq: 4 }])) violations.push('a skipped seq was not flagged as a gap');
-    } catch { violations.push('forge.change-events port missing'); }
+      if (!detectSeqGap(2, [{ seq: 4 }])) violations.splice(0, 0, 'a skipped seq was not flagged as a gap');
+    } catch { violations.splice(0, 0, 'forge.change-events port missing'); }
     return { violations };
   },
   judge: (report) => report.violations,
