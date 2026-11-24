@@ -15,7 +15,7 @@
  *     - no live entry for the current red ⇒ fall back to STOP (fail closed).
  *
  *   List file (`quarantine.json` on `ops/quarantine`):
- *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area?, job?, proof? }] }`
+ *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area?, job?, proof?, parserVersion? }] }`
  *     plus optional `fixPrs:[n,..]` — the main-fix PR numbers CI runs the quarantined tests for (set by a writer only),
  *     and optional `mode:'stop'|'quarantine'` — the red-main mode the safety net resolved when it last wrote
  *     ({@link setMode}). CI reads it from here, as it reads the entries, so CI and the daemon use ONE switch (the
@@ -66,9 +66,11 @@ export function quarantineWriterError(actor) {
   return `writer "${actor}" refused: may not change the quarantine list (allowed: red-main-safety-net, operator; orchestrator requires orchestrator.authority.redMainQuarantine=true)`;
 }
 
-/** Entries not yet expired at `now`. PURE. */
+/** Unexpired entries with current parse-derived evidence; manual entries without proof keep their TTL. PURE. */
 export function activeEntries(list, { now }) {
-  return (list?.entries ?? []).filter((e) => Number.isFinite(e.expiresAt) && now < e.expiresAt);
+  return (list?.entries ?? []).filter((e) => Number.isFinite(e.expiresAt) && now < e.expiresAt
+    && ((e.proof === undefined && e.timeout === undefined && e.parserVersion === undefined)
+      || e.parserVersion === QUARANTINE_PARSER_VERSION));
 }
 
 /** The test file of an id (`a/b.test.mjs::name` → `a/b.test.mjs`). PURE. */
@@ -102,7 +104,7 @@ function fileExpiry(entries, { test, brokenSha, now, ttlMs }) {
  * Add entries (idempotent per test and job) — returns the new list and the audit events. Refuses an unknown writer. PURE.
  * @returns {{ok:boolean, list?:object, events?:object[], error?:string}}
  */
-export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs, area = null, job, proof, orchestratorAuthority = false }) {
+export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, now, ttlMs, area = null, job, proof, parserVersion = proof ? QUARANTINE_PARSER_VERSION : undefined, orchestratorAuthority = false }) {
   if (!canWriteQuarantine(actor, { orchestratorAuthority })) return { ok: false, error: quarantineWriterError(actor) };
   if (!isStr(owner)) return { ok: false, error: 'owner required' };
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) return { ok: false, error: 'positive ttlMs required' };
@@ -123,7 +125,7 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
       events.push({ type: 'quarantine-rekeyed', at: now, actor, from: base.entries[idx]?.brokenSha ?? null, ...e });
       continue;
     }
-    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: fileExpiry(entries, { test, brokenSha, now, ttlMs }), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}) };
+    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: fileExpiry(entries, { test, brokenSha, now, ttlMs }), ...(area ? { area } : {}), ...(job !== undefined ? { job } : {}), ...(proof ? { proof } : {}), ...(parserVersion !== undefined ? { parserVersion } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
@@ -199,7 +201,7 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 
 /** Invalidate persisted parses whenever completeness rules change. */
-export const QUARANTINE_PARSER_VERSION = 2;
+export const QUARANTINE_PARSER_VERSION = 3;
 
 /**
  * Failing vitest tests from one CI job's log (untrusted text). Completeness requires
@@ -210,21 +212,26 @@ export function parseVitestFailures(logText) {
   const tests = [];
   let failedFiles = null, interrupted = false, unknownError = false, crash = false, timeoutLines = 0;
   const timeouts = parseTimeouts(logText);
-  for (const raw of String(logText ?? '').split('\n')) {
-    const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
+  const lines = String(logText ?? '').split('\n').map(raw => raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd());
+  const lastError = lines.findLastIndex(line => /Error:|##\[error\]/.test(line));
+  let inFailure = false;
+  for (const [index, line] of lines.entries()) {
     const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line);
     if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
       tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
+      inFailure = failedFiles === null;
     }
     if (/Unhandled|Uncaught|Worker.*(?:exit|fail)|teardown/i.test(line)) crash = true;
     const timeoutLine = /^\s*Error: Test timed out in \d+ms\.\s*$/.test(line);
+    const ciTrailer = /^\s*##\[error\]Process completed with exit code 1\.\s*$/.test(line) && index === lastError;
+    if (!ciTrailer && (/##\[error\]/.test(line) || (/\bError:/.test(line) && !inFailure && !timeoutLine))) crash = true;
     if (timeoutLine) timeoutLines++;
     if (/timed out|exceeded.*(?:execution time|timeout)|teardown/i.test(line)) { interrupted = true; if (!timeoutLine) unknownError = true; }
     // Only the existing named FAIL + measured Error format supplies timeout evidence.
     if (/Error\b|Assertion\b|Unhandled|Uncaught|Worker.*(?:exit|fail)|##\[error\]|^\s*→|^\s*[❯×].*\b\d+ failed\b/i.test(line)
-      && !timeoutLine) unknownError = true;
+      && !timeoutLine && !ciTrailer) unknownError = true;
     const summary = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
-    if (summary) failedFiles = Number(summary[1]);
+    if (summary) { failedFiles = Number(summary[1]); inFailure = false; }
   }
   const files = [...new Set(tests.map(t => t.file))];
   const measured = timeoutLines === timeouts.length && tests.length === timeouts.length && tests.every((t, i) => t.file === timeouts[i].file && t.name === timeouts[i].name);

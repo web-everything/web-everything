@@ -138,7 +138,7 @@ it('publishes synthetic complete repeat evidence; unknown failures escalate imme
     console.info('synthetic complete-log dry-run', JSON.stringify({ at: new Date(now).toISOString(), entries: replay.plan.entries }));
     const second = invoke(retry);
     expect(second.applied).toBe(true);
-    expect(list.entries[0]).toMatchObject({ test: file, owner: 'red-main-safety-net', proof: { kind: 'repeat-failed', attempts: [1, 2] } });
+    expect(list.entries[0]).toMatchObject({ test: file, owner: 'red-main-safety-net', parserVersion: q.QUARANTINE_PARSER_VERSION, proof: { kind: 'repeat-failed', attempts: [1, 2] } });
     const output = smell.evaluate({ mainCiRuns: { runs: [red] } }, { now, config: {}, quarantineSafetyNet: () => first });
     expect(output[0].summary).toContain(first.alerts[0].why);
     list = { version: 1, entries: [] };
@@ -150,6 +150,59 @@ it('publishes synthetic complete repeat evidence; unknown failures escalate imme
 });
 
 // A file summary cannot account for an additional infrastructure crash.
+it.each([
+  `${log}\n##[error]\nError: ENOSPC: no space left on device`,
+  `${log}\nError: ENOSPC: no space left on device`,
+  `Error: ENOSPC: no space left on device\n${log}`,
+  `##[error]disk full\n${log}`,
+  `${log}\n##[error]Process completed with exit code 2.`,
+  `${log}\n##[error]Process completed with exit code 1.\nError: ENOSPC`,
+])('rejects infrastructure errors outside assertion blocks: %s', text => {
+  expect(q.parseVitestFailures(text).complete).toBe(false);
+});
+
+it('accepts the final exit-one CI trailer', () => {
+  expect(q.parseVitestFailures(`${log}\n##[error]Process completed with exit code 1.\ncleanup complete`).complete).toBe(true);
+});
+
+it.each([undefined, 1])('ignores published parse proof with parser version %s', parserVersion => {
+  const proof = { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 };
+  const added = q.addEntries(null, { tests: [file], brokenSha: red.headSha, owner: 'red-main-safety-net',
+    reason: 'failed main', actor: 'red-main-safety-net', now, ttlMs: 60_000, job, proof });
+  expect(added.ok).toBe(true);
+  const list = { ...added.list, entries: [{ ...added.list.entries[0], parserVersion }] };
+  expect(q.validateQuarantineList(list).ok).toBe(true);
+  expect(q.activeEntries(list, { now })).toEqual([]);
+  expect(q.testsToSkip({ list, now })).toEqual([]);
+  expect(q.decideQuarantineHold({ list, now, files: ['unrelated/file.mjs'], fixFiles: [], signal: { fixPrs: [], firstRedSha: red.headSha } }).hold).toBe(true);
+  expect(plan({ list, addedForRed: [file], flakeProof: { [job]: proof } }).why).toContain('expired');
+  const current = { ...list, entries: [{ ...list.entries[0], parserVersion: q.QUARANTINE_PARSER_VERSION }] };
+  expect(q.activeEntries(current, { now })).toHaveLength(1);
+  expect(q.testsToSkip({ list: current, now })).toEqual([file]);
+  expect(q.decideQuarantineHold({ list: current, now, files: ['unrelated/file.mjs'], fixFiles: [], signal: { fixPrs: [], firstRedSha: red.headSha } }).hold).toBe(false);
+  // Manual entries without parse-derived proof retain their existing lifetime.
+  const { proof: _proof, parserVersion: _version, ...manual } = list.entries[0];
+  expect(q.activeEntries({ ...list, entries: [manual] }, { now })).toHaveLength(1);
+});
+
+it('keeps stale published proof out of the IO live list and escalates unknown failures', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
+  const list = { ...q.addEntries(null, { tests: [file], brokenSha: red.headSha, owner: 'red-main-safety-net',
+    reason: 'failed main', actor: 'red-main-safety-net', now, ttlMs: 60_000, job,
+    proof: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } }).list, mode: 'quarantine' };
+  list.entries[0].parserVersion = 1;
+  try {
+    const out = runSafetyNet({ dir, now, live: true,
+      mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
+      mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+      timeoutPolicy: {}, readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
+      readLog: () => q.parseVitestFailures('unreadable crash'), readList: () => ({ ok: true, list }),
+      write: () => { throw new Error('must not write'); }, log: () => {} });
+    expect(out.liveEntries).toEqual([]);
+    expect(out.alerts).toContainEqual(expect.objectContaining({ type: 'escalation', why: expect.stringContaining('unknown') }));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 it.each(['Unhandled Rejection', 'Uncaught Exception', 'Worker exited unexpectedly', 'Worker failed', 'teardown failed'])(
   'rejects a complete assertion summary with extra crash: %s', diagnostic => {
     expect(q.parseVitestFailures(`${log}\n${diagnostic}`).complete).toBe(false);

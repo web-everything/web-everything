@@ -495,7 +495,7 @@ export function runSafetyNet({
         const liveFiles = activeEntries(cur, { now }).map((e) => e.test.split('::')[0]);
         if (new Set([...liveFiles, ...plan.tests]).size > settings.value.maxTests) return { ok: false, error: `quarantine cap ${settings.value.maxTests} reached` };
         const changes = plan.entries.map(({ test, job, proof, timeout }) => (list) => {
-          const r = addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR,
+          const r = addEntries(list, { tests: [test], job, proof, parserVersion: QUARANTINE_PARSER_VERSION, brokenSha: sha, owner: SAFETY_NET_ACTOR,
             reason: timeout ? `${timeout.outcomes.length} soft timeout(s); measurements and policy sources in timeout.outcomes` : `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs });
           if (r.ok && timeout && r.events.length) {
             for (const e of [...r.list.entries, ...r.events]) if (e.test === test && e.job === job) Object.assign(e, { timeout, release: timeout.release, note: timeout.note });
