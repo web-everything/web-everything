@@ -57,13 +57,13 @@ import { execFileSync } from 'node:child_process';
 import { readGit } from '../lib/proc-read.mjs';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { hostname } from 'node:os';
-import { statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { statSync, writeFileSync, rmSync } from 'node:fs';
+import { resolve, join } from 'node:path';
 
-import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor } from '../readiness/file-locks.mjs';
+import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor, draftSidecarFor } from '../readiness/file-locks.mjs';
 import {
-  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim,
-  fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
+  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, listFixDispatchClaimsStrict, readFixDispatchClaim,
+  fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, normalizeBranch,
 } from './fix-claim-store.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
@@ -124,9 +124,7 @@ export function fixClaimOwner(who) {
 }
 
 /** Strip `refs/heads/` so a branch compares equal however it was spelled. */
-export function normalizeBranch(ref) {
-  return String(ref ?? '').trim().replace(/^refs\/heads\//, '');
-}
+export { normalizeBranch };
 
 /** Is this claim entry still live at `nowMs`? Honors the TTL the claim was written with. */
 export function isLiveFixClaim(entry, nowMs = Date.now()) {
@@ -318,22 +316,28 @@ export function listLiveFixClaims({ repo = null, lockRoot = fixDispatchClaimRoot
  * @returns {null | {refused:true, pr:number, repo:string, holder:string, why:string, message:string}}
  */
 export function pushRefusal({
-  repo = null, branch, sessionId = null, who = null, token = null, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
+  repo = null, branch, sessionId = null, who = null, token = null, strict = false, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
 } = {}) {
   const b = normalizeBranch(branch);
   if (!b) return null;
   let repoKey = null;
   try { repoKey = repo == null ? null : repoKeyOf(repo); } catch { repoKey = null; }
-  const claims = listLiveFixClaims({ lockRoot, nowMs })
+  const scan = strict ? listFixDispatchClaimsStrict(lockRoot) : null;
+  if (scan?.unreadable) return { refused: true, code: 'claim-store-unreadable',
+    message: 'Claim store unreadable; restore claim evidence before retrying' };
+  const claims = (scan ? scan.entries.filter(e => e.meta?.kind === FIXING_KIND && isLiveFixClaim(e, nowMs))
+    : listLiveFixClaims({ lockRoot, nowMs }))
     .filter((e) => e.meta?.branch === b && (repoKey == null || e.meta.repo === repoKey));
   for (const entry of claims) {
-    if (isClaimHolder(entry, { sessionId, who, token })) continue;
+    if (strict ? (entry.meta.sessionId && entry.meta.sessionId === sessionId)
+      || (entry.meta.tokenHash && tokenMatches(entry, token))
+      : isClaimHolder(entry, { sessionId, who, token })) continue;
     const holder = entry.meta.who;
     // Draft is no longer a given (operator ruling 2026-09-27, draft-only-on-withdrawal): only say "the PR is
     // draft" when this held claim actually drafted it.
     const draftNote = entry.meta.draft ? ' (the PR is draft until then)' : '';
     return {
-      refused: true, pr: entry.meta.pr, repo: entry.meta.repo, holder,
+      refused: true, ...(strict ? { code: 'foreign-claim' } : {}), pr: entry.meta.pr, repo: entry.meta.repo, holder,
       why: entry.meta.why || '',
       message: `push to ${b} refused: ${holder} holds the fix claim on PR #${entry.meta.pr} (${entry.meta.repo})`
         + `${entry.meta.why ? ` — ${entry.meta.why}` : ''}. Only the claim holder may push while it is live. Wait `
@@ -701,10 +705,23 @@ export async function fixBegin({
   if (!claim.ok) return { ok: false, reason: claim.reason, heldBy: claim.heldBy, ...(claim.dispatchKind ? { dispatchKind: claim.dispatchKind } : {}), pr: Number(pr) };
   const heldToken = claim.token ?? token;
   const steps = [];
+  const draftFile = join(lockDirFor(lockRoot, claim.resource), draftSidecarFor(claim.entry));
   try {
-    if (draft && !view.isDraft) { await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']); steps.push('draft'); }
+    // Every begin must earn its own conversion evidence, including a reentrant begin.
+    rmSync(draftFile, { force: true });
+    if (draft && typeof view.isDraft !== 'boolean') throw new Error('Draft state unreadable');
+    if (draft && view.isDraft === false) {
+      await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']);
+      writeFileSync(draftFile, JSON.stringify({ preDraft: false, at: new Date(nowMs).toISOString() }));
+      const current = readLockEntry(lockRoot, claim.resource);
+      if (!current || draftSidecarFor(current) !== draftSidecarFor(claim.entry)) throw new Error('Claim changed while drafting');
+      steps.push('draft');
+    }
   } catch (e) {
-    releaseFixClaim({ repo: repoKey, pr, who, sessionId, token: heldToken, lockRoot });
+    rmSync(draftFile, { force: true });
+    const current = readLockEntry(lockRoot, claim.resource);
+    if (current && draftSidecarFor(current) === draftSidecarFor(claim.entry))
+      releaseFixClaim({ repo: repoKey, pr, who, sessionId, token: heldToken, lockRoot });
     return { ok: false, reason: 'draft-failed', detail: String(e?.message ?? e).split('\n')[0], pr: Number(pr) };
   }
   // Label + comment are the human-visible half: best-effort, reported, never a reason to drop the claim.

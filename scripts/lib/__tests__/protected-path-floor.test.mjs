@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
+import { matchesSome } from '../audit-path.mjs';
 import * as shared from '../protected-path-floor.mjs';
 import * as audit from '../audit-settings.mjs';
 
@@ -57,3 +58,12 @@ describe('shared protected-path floor', () => {
     expect(shared.GUARD_FLOOR).toContain('scripts/lib/protected-path-floor.mjs');
   });
 });
+
+it.each(['scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs', 'scripts/lib/strict-utc-timestamp.mjs',
+  'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
+  'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
+  'scripts/guard-git-push.mjs', 'scripts/lib/lane-lease.mjs',
+  'scripts/guard-prototype-tracker.mjs', 'scripts/conveyor/fix-procedure.mjs'])(
+  'classifies %s as protected even without configured guard paths', path => {
+    expect(matchesSome(path, shared.GUARD_FLOOR)).toBe(true);
+  });

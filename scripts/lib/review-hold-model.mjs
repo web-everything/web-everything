@@ -13,6 +13,8 @@
 import { DRAIN_GATES, GATE_IDS } from './merge-gate-inventory.mjs';
 import { parsePrResultTable } from './merge-gate-verdict.mjs';
 
+export const PUSH_HOLD_LABELS = Object.freeze(['review:human','red-team:blocked','red-team:pending','review:held-mechanical']);
+
 export const HOLD_CLASSES = Object.freeze(['R', 'A', 'H', 'S', 'X', 'U']);
 /** Exact red-team reasons (red-team-check-run.mjs): only plain absence or the review's own in-flight round. */
 export const RED_TEAM_MISSING = 'no red-team check run on head';
