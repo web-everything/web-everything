@@ -78,3 +78,16 @@ export function createMqFailureLedger({ io = mqFailureLedgerStorage() } = {}) {
     },
   };
 }
+
+/** Synchronous drain admission: preflight reads; the mutation boundary consumes before enqueue.
+ * Ambiguous enqueue failures consume the allowance too. Shared atomic storage survives daemon restarts.
+ */
+export function mqTimeoutRetryAllowance(identity, { consume = false, io = mqFailureLedgerStorage() } = {}) {
+  if (!identityValid(identity)) throw new TypeError('MQ ledger requires repo/PR/full head identity');
+  return io.atomicUpdate(state => {
+    checkState(state);
+    const key = keyFor({ ...identity, kind: 'mq-flake-timeout' });
+    if (state[key]) return { state, result: false };
+    return { state: consume ? { ...state, [key]: true } : state, result: true };
+  });
+}

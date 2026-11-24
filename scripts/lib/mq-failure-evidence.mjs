@@ -30,18 +30,53 @@ const upstreamGateTranscript = new Set([
   'exit 1', 'fi', '##[endgroup]', '##[error]Process completed with exit code 1.',
 ]);
 function hasOnlyUpstreamFailure(lines) {
-  // A hosted-runner log (it has ##[group] step markers) is long boilerplate: judge only its ##[error]
-  // annotations. Every one must be a known upstream outcome or the generic exit-code annotation, and at
-  // least one must be an upstream outcome. Plain transcripts keep the whole-log rule below.
-  if (lines.some(line => line.startsWith('##[group]'))) {
-    const errors = lines.filter(line => line.startsWith('##[error]'));
-    // Un-annotated error text (a thrown Error, fatal:, npm ERR) is an independent failure, never boilerplate.
-    if (lines.some(line => /Error\b|Exception\b|\bE(?:NOENT|ACCES|PIPE|TIMEDOUT)\b|\bpanic\b|Traceback|^fatal:|^npm ERR|[Uu]nexpected|[Tt]erminated|[Cc]rash|[Tt]imed? ?out|[Cc]ancel|[Kk]illed|[Aa]bort/.test(line))) return false;
-    return lines.some(line => upstreamFailureOutcomes.has(line))
-      && errors.every(line => upstreamFailureOutcomes.has(line) || line === '##[error]Process completed with exit code 1.');
-  }
+  if (lines.at(-1) !== '##[error]Process completed with exit code 1.') return false;
   return lines.some(line => upstreamFailureOutcomes.has(line))
     && lines.every(line => upstreamFailureOutcomes.has(line) || upstreamGateTranscript.has(line));
+}
+
+/** Complete Vitest timeout-only transcript, or a positively identified upstream aggregate.
+ * Unknown/oversized/truncated transcripts require operator inspection, never an automatic retry.
+ */
+export function classifyMqTimeoutLog(text, name) {
+  if (typeof text !== 'string' || Buffer.byteLength(text) >= 4 * 1024 * 1024) return 'unknown';
+  const lines = clean(text).split(/\r?\n/).map(line => line.replace(/^\d{4}-\d\d-\d\dT\S+\s+/, '').trim());
+  if (lines.some(line => line.length > MAX_LINE)) return 'unknown';
+  if (derivedFailureJobs.has(localJobName(name))) return hasOnlyUpstreamFailure(lines.filter(Boolean)) ? 'upstream' : 'unknown';
+  let timeouts = 0, pending = false;
+  let files = null, tests = null, exited = false;
+  const paths = new Set(), identities = new Set();
+  for (const line of lines) {
+    // Captured output is arbitrary and cannot be distinguished from independent failures.
+    // Refuse it along with every other unrecognized line below, rather than skipping a block.
+    const heading = /^FAIL\s+(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>\s+(\S.*)$/.exec(line);
+    if (heading) {
+      if (pending || tests !== null) return 'unknown';
+      const identity = JSON.stringify([heading[1], heading[2]]);
+      if (identities.has(identity)) return 'unknown';
+      identities.add(identity); pending = true; paths.add(heading[1]); continue;
+    }
+    if (/^Error: Test timed out in [1-9][0-9]*ms\.$/.test(line)) {
+      if (!pending) return 'unknown';
+      timeouts++; pending = false; continue;
+    }
+    if (line === '##[error]Process completed with exit code 1.') {
+      if (tests === null || files === null || exited) return 'unknown';
+      exited = true; continue;
+    }
+    const summary = /^(Test Files|Tests)\s+([1-9][0-9]*) failed(?:\s+\|\s+\d+ (?:passed|skipped|todo))*\s*(?:\(\d+\))?$/.exec(line);
+    if (summary) {
+      if (pending || exited) return 'unknown';
+      if (summary[1] === 'Tests') { if (tests !== null) return 'unknown'; tests = Number(summary[2]); }
+      else { if (files !== null) return 'unknown'; files = Number(summary[2]); }
+      continue;
+    }
+    // Explicit benign runner formatting only. Unknown output requires operator inspection.
+    if (!line || /^⎯+\s*(?:Failed Tests [1-9][0-9]*\s*⎯+|\[[1-9][0-9]*\/[1-9][0-9]*\]\s*⎯+)?$/.test(line)) continue;
+    return 'unknown';
+  }
+  return !pending && exited && tests === timeouts && timeouts === identities.size && timeouts > 0
+    && files === paths.size ? 'mq-flake-timeout' : 'unknown';
 }
 
 // Longest log line the parser reads. Real runner headings are far shorter; a longer line is not parsed past this

@@ -56,6 +56,8 @@ function fixture(mode = 'real') {
         ...(sibling ? [{ id: 902, name: 'e2e', status: 'completed', conclusion: sibling }] : [])] });
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
+      if (mode === 'gh escape refusal' && !args.includes('--allow-escape-sequences'))
+        throw new Error('the response contains terminal escape sequences; pass --allow-escape-sequences');
       if (mode === 'expired log') throw new Error('410 expired');
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
@@ -196,4 +198,12 @@ describe('drain production ancestry proof', () => {
       expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: false });
       expect(f.writes()).toEqual([]);
     });
+});
+
+it('recovery reads job logs when gh requires the escape-sequence flag', async () => {
+  const f = fixture('gh escape refusal');
+  expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
+  expect(f.writes()).toHaveLength(2);
+  expect(f.exec.mock.calls.find(([, args]) => args.some(arg => /\/logs$/.test(arg)))[1])
+    .toContain('--allow-escape-sequences');
 });
