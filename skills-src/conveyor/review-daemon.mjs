@@ -151,6 +151,8 @@ import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '..
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
 import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
+import { saveFastPlan, runFastPassCli } from '../../scripts/lib/review-fast-pass-cli.mjs';
+import { defaultResolveMainSha } from '../../scripts/conveyor/reconcile-pass.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -452,6 +454,7 @@ export function runReviewTick({
   rearmStaleAccepts = null,
   noteRearms = null,
   onPlan = null,
+  readMainSha = () => null,
   executeOwedReruns = executeOwedCiReruns,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -509,6 +512,7 @@ export function runReviewTick({
   // Shared PRs were read before the hold sweep; agent discovery and any captured PR-read failure
   // are isolated with reconcile here. Its injected readers reuse those same snapshots.
   let plan;
+  const planMainSha = onPlan ? readMainSha() : null;
   let rawAgents = null;
   try {
     if (sharedReads) {
@@ -612,7 +616,8 @@ export function runReviewTick({
     replanError = replanError ?? out.replanError ?? null;
     if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
-  try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
+  try { onPlan?.({ repo, plan, rawPrs,
+    mainSha: planMainSha === readMainSha() ? planMainSha : null }); } catch { /* observation never breaks a tick */ }
   // Keep the synchronous tick API; the daemon awaits this mechanical work before its next pass.
   const rerunRows = replanError ? [] : (plan.dispatch ?? []).filter(row => row.kind === 'ci-timeout-rerun');
   let owedCiReruns;
@@ -1551,6 +1556,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    readMainSha: () => defaultResolveMainSha('main'),
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
@@ -2089,7 +2095,10 @@ export function buildCliDaemonEffects({
       factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
-      const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
+      const onPlan = snapshot => {
+        if (sharing.reusePlan) plans.set(snapshot.repo, { plan: snapshot.plan, rawPrs: snapshot.rawPrs });
+        try { saveFastPlan(snapshot); } catch (error) { log.error(`review-fast-pass: plan save failed: ${error.message}`); }
+      };
       let phaseStarted = Date.now();
       const phaseMs = {};
       // Live-caught 2026-09-26: the reap runs BEFORE discovery, not after. A hung fix/ci-heal session bound to a
@@ -2242,6 +2251,9 @@ export function buildCliDaemonEffects({
 
 async function main() {
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
+  if (process.argv.includes('--fast-pass')) return runFastPassCli({
+    repos: REVIEW_DAEMON_REPOS, cliReviewTickOpts, liveReviewRoundBudget, runDaemonLoop,
+  });
   const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });
