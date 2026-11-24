@@ -776,7 +776,9 @@ export function probeRestBudget({ exec = run } = {}) {
   return { limit: j?.limit ?? null, used: j?.used ?? null, remaining: j?.remaining ?? null, reset: j?.reset ?? null };
 }
 
-export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {} } = {}) {
+export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {}, clock = Date.now, readSnapshot = null } = {}) {
+  // One deadline across every repo: exhaustion leaves evidence unknown, never clean.
+  const pendingDeadline = clock() + 60_000;
   const out = [];
   out.inventoryComplete = true;
   const { redTeamPendingMaxMin } = readDrainQueueSafety({ log: line => console.error(line), ...drainOptions }).value;
@@ -788,28 +790,52 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     // watch's own way (needs `mergeable`) and reads its markers off the thread; `stood-down-prs` counts the
     // stand-down markers. Both are already in the shared snapshot's field set, so the snapshot path costs nothing extra.
     const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
-    const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
-    const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
-    const inventoryComplete = Array.isArray(listed) && listed.length < 100;
+    const shared = readSnapshot ? readSnapshot({ repo: slug, fields })
+      : exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
+    const listed = shared ?? JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
+    const inventoryComplete = Array.isArray(listed) && listed.length < (shared != null ? 500 : 100);
     if (!inventoryComplete) out.inventoryComplete = false;
-    const rows = Array.isArray(listed) ? listed.slice(0, 100) : [];
+    const rows = Array.isArray(listed) ? listed : [];
     // Missing subjects remain unknown to the pending smell even when a deferred repo yields zero rows.
     // Carry completeness on rows too (array metadata may be lost during JSON transport).
     for (const pr of rows) {
+      let cachedLabels = shared != null;
+      let pendingLabels = pr.labels;
+      // A snapshot's missing label is not proof of a clear. Fresh confirmation shares
+      // the timeline deadline; failed/deferred reads leave cachedLabels set for carry-forward.
+      if (cachedLabels && !pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+        const remaining = pendingDeadline - clock();
+        if (remaining > 0) try {
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels'],
+            { timeoutMs: Math.min(15_000, remaining) }));
+          if (Array.isArray(live?.labels) && live.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0)) {
+            pendingLabels = live.labels;
+            cachedLabels = false;
+          }
+        } catch { /* Unknown labels carry forward; only fresh evidence can clear. */ }
+      }
       let redTeamPendingSince = null;
-      if (!pr.isDraft && pr.labels?.some?.(l => l?.name === 'red-team:pending')) {
+      let redTeamPendingPartial = false;
+      if (!pr.isDraft && pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+        redTeamPendingPartial = true;
         const [owner, name] = slug.split('/');
         const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr.number)}) {
           timelineItems(last:30,itemTypes:[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } }
         } } }`;
         try {
-          const tail = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`], { timeoutMs: 15_000 }));
-          if (!tail.errors?.length) {
+          const remaining = pendingDeadline - clock();
+          const tail = remaining > 0
+            ? JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`], { timeoutMs: Math.min(15_000, remaining) }))
+            : null;
+          if (tail && !tail.errors?.length) {
             const events = tail?.data?.repository?.pullRequest?.timelineItems?.nodes;
             const pending = Array.isArray(events) ? events.filter(e => e?.label?.name === 'red-team:pending') : [];
             // Timeline nodes are chronological; an unreadable latest event remains unknown.
             const latest = pending.at(-1)?.createdAt;
-            if (Number.isFinite(Date.parse(latest))) redTeamPendingSince = latest;
+            if (Number.isFinite(Date.parse(latest))) {
+              redTeamPendingSince = latest;
+              redTeamPendingPartial = false;
+            }
           }
         } catch { /* Unknown age must alert; never substitute updatedAt. */ }
       }
@@ -829,7 +855,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
             ...(exec !== run ? { exec: args => exec('gh', args) } : {}) }) };
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
-        reviewObservation, redTeamPendingSince, redTeamPendingMaxMin, inventoryComplete,
+        reviewObservation, redTeamPendingSince, redTeamPendingPartial, redTeamPendingMaxMin, inventoryComplete, cachedLabels,
         repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
@@ -837,8 +863,8 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
         comments: (pr.comments || []).map((c) => ({
           body: c.body, createdAt: c.createdAt, author: { login: c.author?.login ?? null }, viewerDidAuthor: c.viewerDidAuthor,
         })),
-        labels: Array.isArray(pr.labels) ? pr.labels.map(l => ({ name: l?.name })) : [],
-        labelsValid: Array.isArray(pr.labels) && pr.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0),
+        labels: Array.isArray(pendingLabels) ? pendingLabels.map(l => ({ name: l?.name })) : [],
+        labelsValid: Array.isArray(pendingLabels) && pendingLabels.every(l => l && typeof l.name === 'string' && l.name.length > 0),
         // `status` (draft-first PRs, operator-approved 2026-09-27) — carried alongside `state`/`conclusion` so
         // `we:scripts/operations/pr-status.mjs#reduceCheckState` (the `draft-not-promoted` smell's own green
         // check) reads the SAME completion signal every other CI-truth consumer in this repo does off a raw

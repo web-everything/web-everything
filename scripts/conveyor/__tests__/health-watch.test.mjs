@@ -1910,3 +1910,55 @@ describe('REDTEAM-STUCK-PENDING probe evidence', () => {
     if (rows.length) expect(rows.every(row => row.inventoryComplete === false)).toBe(true);
   });
 });
+
+
+describe('REDTEAM-STUCK-PENDING audit regressions', () => {
+  const labels = [{ name: 'review:pending' }, { name: 'red-team:pending' }];
+  const drainOptions = { env: {}, tool: { redTeamPendingMaxMin: 23 }, platform: {} };
+  const timeline = JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: [
+    { createdAt: '2026-11-24T00:00:00Z', label: { name: 'red-team:pending' } },
+  ] } } } } });
+  it('retains all 500 shared snapshot rows including pending beyond row 100', () => {
+    const snapshot = Array.from({ length: 500 }, (_, i) => ({ number: i + 1, labels }));
+    const rows = probePrs({ readSnapshot: () => snapshot, exec: () => timeline, drainOptions });
+    expect(rows.filter(pr => pr.number === 500)).not.toHaveLength(0);
+    expect(rows.length % 500).toBe(0);
+    expect(rows.every(pr => pr.inventoryComplete === false && pr.cachedLabels === true)).toBe(true);
+  });
+  it('a shared snapshot below 500 is complete even above the gh fallback limit', () => {
+    const rows = probePrs({ readSnapshot: () => Array.from({ length: 101 }, (_, i) => ({ number: i + 1, labels })), exec: () => timeline, drainOptions });
+    expect(rows.inventoryComplete).toBe(true);
+    expect(rows.every(pr => pr.inventoryComplete)).toBe(true);
+  });
+  it('shares a 60s deadline across repositories and clips the last timeline timeout', () => {
+    let elapsed = 0;
+    const timeouts = [];
+    const rows = probePrs({ clock: () => elapsed, drainOptions, exec: (_bin, args, options) => {
+      if (args[1] === 'list') return JSON.stringify([{ number: 1, labels }, { number: 2, labels }]);
+      timeouts.push(options.timeoutMs);
+      elapsed += 14000;
+      return timeline;
+    } });
+    expect(timeouts).toEqual([15000, 15000, 15000, 15000, 4000]);
+    expect(rows.at(-1)).toMatchObject({ redTeamPendingSince: null, redTeamPendingPartial: true });
+  });
+  it.each(['fresh-clear', 'fresh-pending', 'failed', 'deferred', 'budget'])('cached clear requires bounded fresh labels: %s', mode => {
+    let elapsed = 0;
+    const reads = [];
+    const rows = probePrs({ clock: () => elapsed, drainOptions,
+      readSnapshot: () => { if (mode === 'budget') elapsed = 60000; return [{ number: 1, labels: [{ name: 'review:pending' }] }]; },
+      exec: (_bin, args, options) => {
+        reads.push({ args, options });
+        if (mode === 'failed') throw new Error('unreadable');
+        if (mode === 'deferred') return JSON.stringify({ deferred: true });
+        if (args[0] === 'api') return timeline;
+        return JSON.stringify({ labels: mode === 'fresh-pending' ? labels : [] });
+      } });
+    if (mode === 'budget') expect(reads).toEqual([]);
+    else expect(reads[0]).toMatchObject({ args: ['pr', 'view', '1', '--repo', rows[0].repo, '--json', 'labels'], options: { timeoutMs: 15000 } });
+    if (mode.startsWith('fresh-')) {
+      expect(rows[0].cachedLabels).toBe(false);
+      expect(rows[0].labels).toEqual(mode === 'fresh-pending' ? labels : []);
+    } else expect(rows[0].cachedLabels).toBe(true);
+  });
+});

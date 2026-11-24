@@ -21,3 +21,27 @@ it.each(['never-alert', 'always-alert', 'updated-at-age'])('fixPresent does not 
     expect(scenario.judge(await scenario.run({ sourceRoot: root })).length).toBeGreaterThan(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+
+it.each(['missing', 'syntax', 'throws', 'capability', 'unreadable-result'])('fixPresent refuses to expected-fail an import/capability failure: %s', async mode => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-import-'));
+  try {
+    const dir = join(root, 'scripts/conveyor/health-smells');
+    mkdirSync(dir, { recursive: true });
+    const sources = { syntax: 'export default {', throws: "throw new Error('import failed');",
+      capability: "export default { id: 'red-team-pending-overdue' };",
+      'unreadable-result': "export default { id: 'red-team-pending-overdue', evaluate() { return null; } };" };
+    if (mode !== 'missing') writeFileSync(join(dir, 'red-team-pending-overdue.mjs'), sources[mode]);
+    expect(scenario.fixPresent(root)).toBe(true);
+    expect(scenario.judge(await scenario.run({ sourceRoot: root })).length).toBeGreaterThan(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('fixPresent returns false only for a successfully evaluated absent capability', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-absent-'));
+  try {
+    const dir = join(root, 'scripts/conveyor/health-smells');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'red-team-pending-overdue.mjs'), "export default { id: 'old-smell', evaluate() { return []; } };");
+    expect(scenario.fixPresent(root)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

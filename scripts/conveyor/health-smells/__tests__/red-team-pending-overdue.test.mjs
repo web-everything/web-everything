@@ -15,8 +15,8 @@ describe('red-team-pending-overdue', () => {
     expect(evaluate(row(age, { labels: ['red-team:pending'] }))[0].breach).toBe(breach);
   });
   it('draft PR with pending is ignored', () => expect(evaluate(row(100, { isDraft: true }))[0].breach).toBe(false));
-  it('blocked label is another path and does not breach here', () => {
-    expect(evaluate(row(100, { labels: ['red-team:pending', 'red-team:blocked'] }))[0].breach).toBe(false);
+  it('blocked label does not suppress overdue pending', () => {
+    expect(evaluate(row(100, { labels: ['red-team:pending', 'red-team:blocked'] }))[0].breach).toBe(true);
   });
   it('a contradictory clear label never hides an overdue pending', () => {
     expect(evaluate(row(100, { labels: ['red-team:pending', 'red-team:clear'] }))[0].breach).toBe(true);
@@ -68,4 +68,24 @@ it('is alert-only even when investigation and filing dispatch are enabled', () =
   const plan = planActions(opened.transitions, { [smell.id]: smell },
     { mode: 'active', investigateDispatch: true, fileDispatch: true });
   expect(plan.some(p => ['investigate', 'file', 'repair'].includes(p.kind))).toBe(false);
+});
+
+it('future pending timestamp alerts with unknown age', () => {
+  expect(evaluate(row(-1))[0]).toMatchObject({ breach: true, measure: { pendingForMin: null } });
+});
+it.each([{ labels: [] }, { isDraft: true }, { redTeamPendingSince: new Date(now).toISOString() }])(
+  'cached labels alone cannot report clean or close a persisted episode: %j', extra => {
+    const opened = JSON.parse(JSON.stringify(step(emptyHealthState(), [row(100)]).state));
+    const cached = row(100, { ...extra, cachedLabels: true });
+    expect(evaluate(cached)).toEqual([]);
+    const next = step(opened, [cached]);
+    expect(next.transitions.some(t => t.type === 'closed')).toBe(false);
+    expect(Object.values(next.state.episodes)).toHaveLength(1);
+  });
+it('partial pending evidence alerts even with an apparently recent timestamp', () => {
+  expect(evaluate(row(1, { redTeamPendingPartial: true }))[0]).toMatchObject({ breach: true, measure: { pendingForMin: null } });
+});
+it('fresh labels can close a persisted pending episode', () => {
+  const opened = step(emptyHealthState(), [row(100)]).state;
+  expect(step(opened, [row(100, { labels: [], cachedLabels: false })]).transitions.some(t => t.type === 'closed')).toBe(true);
 });

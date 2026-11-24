@@ -16,9 +16,12 @@ export default {
     const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
       import smell from ${JSON.stringify(pathToFileURL(join(root, PATH)).href)};
       const result = smell.evaluate({ prs: [] }, { now: 0, config: { drain: { redTeamPendingMaxMin: 10 } } });
-      process.exit(smell.id === 'red-team-pending-overdue' && Array.isArray(result) && result.length === 0 ? 0 : 1);
+      if (!Array.isArray(result)) throw new Error('unreadable capability result');
+      process.exit(smell.id === 'red-team-pending-overdue' && Array.isArray(result) && result.length === 0 ? 0 : 42);
     `], { timeout: 15000, maxBuffer: 65536, encoding: 'utf8', env: { ...process.env, WE_UNDER_TEST: '1' } });
-    return !probe.error && probe.status === 0;
+    // Only the explicit, successfully evaluated absence selects expected-fail.
+    // Import/shape/runtime errors must use plain it so the replay fails visibly.
+    return Boolean(probe.error) || probe.status !== 42;
   },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
