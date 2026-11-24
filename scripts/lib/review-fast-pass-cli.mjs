@@ -105,7 +105,8 @@ export async function runFastPassCli({ repos, cliReviewTickOpts, sharedHostBudge
           options.hostAdmission = sharedHostBudget(options.hostAdmission, log);
           const starts = { count: 0 };
           let results = [];
-          for (const repo of repos) results = [...results, await runFastPass(fastPassOptions({ repo, options, starts, log, io: optionsIo }))];
+          for (const repo of repos) results = [...results, await runFastPass({ ...fastPassOptions({ repo, options, starts, log, io: optionsIo }),
+            leaseHeld: () => heartbeatRunnerLease(lockRoot, owner, { key: DISPATCH_LEASE_KEY }) === true })];
           return { failed: results.flatMap(r => r.failed.map(f => ({ error: f.reason }))) };
         } finally { releaseRunnerLeaseIfOwned(lockRoot, owner, { key: DISPATCH_LEASE_KEY }); }
       },

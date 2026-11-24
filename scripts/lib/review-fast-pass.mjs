@@ -5,8 +5,10 @@ import { reviewDispatchContext } from './review-dispatch-context.mjs';
  * same admission/planner gates as the tick. liveCap returns the total ceiling, never saved free slots.
  */
 export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAgents, readJobs,
-  dispatch, hostAdmission, liveCap, mainSha, acquirableLanes, starts = { count: 0 }, budget, log = () => {}, now = Date.now }) {
+  dispatch, hostAdmission, liveCap, mainSha, acquirableLanes, starts = { count: 0 }, budget, log = () => {}, now = Date.now,
+  leaseHeld = () => true }) {
   const result = { dispatched: [], failed: [] };
+  let leaseLost = false;
   const note = (pr, reason) => {
     result.failed.push({ prNumber: pr, reason });
     log(`review-fast-pass: ${repo}#${pr ?? '?'} ${reason}; deferred to normal tick`.replace(/[\x00-\x1f\x7f-\x9f]/g, ' '));
@@ -39,6 +41,7 @@ export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAge
     if (candidates.size > 8) note(null, 'fast pass limited to 8 candidates');
     const ordered = [...candidates].sort(([a], [b]) => Number(recent.has(b)) - Number(recent.has(a)));
     for (const [number, plannedHead] of ordered.slice(0, 8)) {
+      if (leaseLost) break;
       try {
         if (!Number.isSafeInteger(number) || number < 1) throw Error('invalid PR number');
         const pr = await readPr({ repo, pr: number });
@@ -61,6 +64,10 @@ export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAge
         if (budget && !(budget.left > (budget.reserve ?? 0))) throw Error('live-review reserve exhausted');
         const host = await hostAdmission();
         if (host?.admitted !== true || !(host.maxPerTick > 0) || !((host.startBudget ?? host.maxPerTick) > starts.count)) throw Error('host admission refused');
+        // Heartbeat and re-check the dispatch lease right before spending capacity; a lost lease stops the pass.
+        let held = false;
+        try { held = (await leaseHeld()) === true; } catch { /* unknown means lost */ }
+        if (!held) { leaseLost = true; throw Error('dispatch lease lost'); }
         starts.count++;
         occupiedLanes++;
         host.take?.(1);

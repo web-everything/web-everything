@@ -649,12 +649,18 @@ export function dispatchReview({
     && !['head-changed', 'unreadable-ci', 'missing-head', 'unknown-required-set', 'untrusted-required-set'].includes(String(ci.reason ?? '').split(' (')[0])
     && !(ci.affected ?? []).some(row => ['wrong-head', 'malformed', 'missing'].includes(row.reason));
   if (!ci?.allowed && !waived) return { pr: planned.pr, repo: planned.repo, headSha: ci?.headSha ?? null, skipped: formatReviewCiSkip(ci), ci };
-  const { prompt, unknownTokens } = fillReviewBrief(readBrief(root), {
+  const filled = fillReviewBrief(readBrief(root), {
     PR: planned.pr, REPO: planned.repo, LANE_REPO: planned.laneRepo, SESSION_SLUG: planned.sessionSlug, JUDGE_PROVIDER: judgeProvider,
     // #4174 — the checkout this dispatch is FROM, same as `root` always was; needed now that the session's
     // cwd (below) is no longer `root` itself.
     WE_ROOT: root,
   });
+  const { unknownTokens } = filled;
+  // Pin the admitted head into the session worker, as job mode does with --expected-head: the worker must
+  // refuse (exit without reviewing) when the live head differs from the head that passed admission.
+  const prompt = expectedHead === undefined ? filled.prompt
+    : `${filled.prompt}\n\nPINNED HEAD: ${expectedHead}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of ${planned.repo}#${planned.pr}; if it is not exactly ${expectedHead}, exit without reviewing.\n`;
   const sessionId = String(mintSessionId());
   // #4174 — THE FIX: this session's cwd is a scratch directory outside `root`, never `root` itself.
   const sessionCwd = ensureSessionCwd(sessionCwdFor(sessionId));

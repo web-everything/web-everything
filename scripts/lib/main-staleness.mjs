@@ -84,7 +84,14 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
   const local = rev(base);
   const origin = rev(`origin/${base}`);
   if (!local || !origin) return { offline: true };
-  if (local === origin) return { fresh: true, behind: 0 };
+  if (local === origin) {
+    if (strict) {
+      // Fail closed: unreadable status or branch evidence is stale, never fresh.
+      if (run(['status', '--porcelain']).status !== 0) return { offline: true };
+      if (cleanOnly && run(['symbolic-ref', '--short', 'HEAD']).status !== 0) return { offline: true };
+    }
+    return { fresh: true, behind: 0 };
+  }
   const count = (range) => { const r = run(['rev-list', '--count', range]);
     if (strict && (r.status !== 0 || !/^\d+$/.test(r.stdout.trim()))) return NaN;
     return r.status === 0 ? Number(r.stdout.trim()) || 0 : 0; };

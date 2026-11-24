@@ -433,7 +433,7 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
  */
 export function readStackBases({ strict = false, root = ROOT, env = process.env, prs = null, readRefs = readOpenPrRefs,
   readLanes = readOriginLaneTips, run = gitRun(root), settingOn = resolveStackAwareReview(env),
-  prlessBase = false, diag = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
+  prlessBase = false, diag = null, requirePr = null, log = (m) => process.stderr.write(m + '\n') } = {}) {
   const out = new Map();
   let rows = [];
   let failure = 'refs-read-threw';
@@ -453,6 +453,8 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
       : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
     rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
     if (strict && (!refs.size || refs.size >= OPEN_PR_REF_LIMIT || refs.failure)) throw Error('stack refs incomplete');
+    // A strict single-PR lookup refuses when the target has no record: absent is unknown, never unstacked.
+    if (strict && requirePr !== null && !refs.has(requirePr)) throw Error('stack evidence unknown: pr-record-missing');
     if (!refs.size) {
       const cause = ['refs-auth-failed', 'refs-rate-limited', 'refs-timeout', 'refs-parse-failed'].includes(refs.failure)
         ? refs.failure : 'refs-unreadable';
@@ -548,5 +550,5 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
 
 /** The stack base for one open PR, or null. Fails open. */
 export function readStackBase({ pr, ...opts } = {}) {
-  return readStackBases(opts).get(Number(pr)) ?? null;
+  return readStackBases({ ...opts, requirePr: Number(pr) }).get(Number(pr)) ?? null;
 }

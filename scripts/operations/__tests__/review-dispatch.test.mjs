@@ -905,4 +905,10 @@ describe('session expectedHead binding immediately before spawn', () => {
       readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40), wrapReview: false, spawnAgent });
     expect(spawnAgent).toHaveBeenCalledOnce();
   });
+  it('pins the admitted head into the session worker prompt', () => {
+    const out = dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40),
+      wrapReview: false, spawnAgent: vi.fn() });
+    expect(out.prompt).toContain(`PINNED HEAD: ${'a'.repeat(40)}`);
+  });
 });
