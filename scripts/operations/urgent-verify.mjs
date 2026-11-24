@@ -12,7 +12,11 @@ const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) {
 
 // `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
 // `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome, wrapperRoot } = {}) {
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
+  // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 40).
+  // Scoped (worktree) deps inherit the parent's deadline so the limit covers the run, not each child.
+  const limitMin = Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 40;
+  deadline ??= Date.now() + limitMin * 60_000;
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
     .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
   // Local verification must acquire host admission even when launched from CI.
@@ -48,7 +52,10 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     // Checkout code (the wrapper's children) gets the throwaway HOME, never the real one that holds the signing key.
     const wrapper = String(args[0]).endsWith('heavy-admission.mjs');
     const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, WE_STRIP_POOL_ROOT_FROM_CHILD: '1', ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
-    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: 4 * 60 * 60_000, maxBuffer: 16 * 1024 * 1024 });
+    // Own process group (detached) so an expired child's whole tree dies, and only that tree: -pid is our spawn's group.
+    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: Math.max(1000, deadline - Date.now()), maxBuffer: 16 * 1024 * 1024, detached: true });
+    const timedOut = r.error?.code === 'ETIMEDOUT';
+    if (timedOut && Number.isInteger(r.pid) && r.pid > 1) { try { process.kill(-r.pid, 'SIGKILL'); } catch { /* already gone */ } }
     if (r.error || r.status !== 0) {
       const bytes = Buffer.from(String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n'));
       let start = Math.max(0, bytes.length - 8192);
@@ -56,7 +63,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       for (; start < bytes.length && (bytes[start] & 0xc0) === 0x80; start++) { /* continuation byte */ }
       const tail = bytes.subarray(start).toString('utf8');
       const err = new Error(`urgent-verify subprocess failed or admission unavailable (exit ${r.status ?? r.error?.code ?? 'unknown'}): ${cmd} ${args.join(' ')}`);
-      err.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : undefined, stderrTail: tail };
+      err.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : undefined, stderrTail: tail, ...(timedOut ? { timedOut: true, limitMinutes: limitMin } : {}) };
+      err.stdout = String(r.stdout ?? '');
       throw err;
     }
     return r.stdout;
@@ -105,7 +113,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       run('git', ['remote', 'add', 'origin', origin], dir);
       fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
       run('git', ['checkout', '-q', '--detach', sha], dir);
-      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd });
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd, deadline });
       if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }
@@ -166,8 +174,14 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       const script = group && JSON.parse(fs.readFileSync(join(cwd, 'package.json'), 'utf8')).scripts?.[group === 'covered' ? 'test:coverage:shard' : 'test:unit'];
       const command = group ? script?.match(/^node scripts\/readiness\/heavy-admission\.mjs run -- (vitest run(?: [\w:./=-]+)*)$/)?.[1]?.split(' ') : ['vitest', 'run'];
       if (!command) throw new Error('unreadable CI Vitest command; repair the runner or wait for CI');
-      run(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=60000', '--require-admission', '--', 'vitest', 'run',
-        ...command.slice(2), ...(group ? files : [`--shard=${shard}`])]);
+      try {
+        run(process.execPath, ['scripts/readiness/heavy-admission.mjs', 'run', '--wait-ms=60000', '--require-admission', '--', 'vitest', 'run',
+          ...command.slice(2), ...(group ? files : [`--shard=${shard}`])]);
+      } catch (e) {
+        // Hung-file report: assigned files that never printed a result line before the limit expired.
+        if (e.failure?.timedOut && group) e.failure.hungFiles = files.filter(f => !e.stdout?.includes(f)).slice(0, 20);
+        throw e;
+      }
       if (group === 'covered') {
         const dest = join(cwd, 'coverage-shards', `coverage-shard-${shard.split('/')[0]}`);
         fs.mkdirSync(dest, { recursive: true });

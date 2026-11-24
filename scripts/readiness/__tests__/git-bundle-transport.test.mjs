@@ -568,7 +568,7 @@ describe('R593 raw commit object scan (R559)', () => {
   const rawCommit = (extraHeader) => {
     const tree = git(lane, 'rev-parse', 'HEAD^{tree}');
     const body = `tree ${tree}\nparent ${tip}\nauthor F <f@example.invalid> 1700000000 +0000\ncommitter F <f@example.invalid> 1700000000 +0000\n${extraHeader}\nempty child\n`;
-    const r = spawnSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: lane, input: body, encoding: 'utf8' });
+    const r = spawnSync('git', ['hash-object', '-t', 'commit', '-w', '--stdin'], { cwd: lane, input: body, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (r.status !== 0) throw new Error(r.stderr);
     return r.stdout.trim();
   };

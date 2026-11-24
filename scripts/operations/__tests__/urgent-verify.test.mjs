@@ -968,3 +968,33 @@ describe('urgent-verify signing isolation', () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining('the command was NOT run'));
   });
 });
+
+describe('urgent-verify wall-clock limit', () => {
+  const env = { PATH: '/bin', HOME: '/home/test' };
+  it('caps every child at the remaining limit (default 40 min) and runs it in its own process group', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env, spawnSync }).standards();
+    const opts = spawnSync.mock.calls[0][2];
+    expect(opts.detached).toBe(true);
+    expect(opts.timeout).toBeLessThanOrEqual(40 * 60_000);
+    expect(opts.timeout).toBeGreaterThan(39 * 60_000);
+  });
+  it('honours maxMinutes', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env, spawnSync, maxMinutes: 5 }).standards();
+    expect(spawnSync.mock.calls[0][2].timeout).toBeLessThanOrEqual(5 * 60_000);
+  });
+  it('on expiry kills only the spawned process group and names the unfinished test files', () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const spawnSync = vi.fn((cmd, args) => args[0]?.includes('shard-assign') ? { status: 0, stdout: 'a.test.mjs\nhung.test.mjs\n' }
+      : { pid: 4242, status: null, error: Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: ' ✓ a.test.mjs (3 tests)\n', stderr: '' });
+    const fs = { readFileSync: () => JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run --no-coverage' } }), rmSync() {} };
+    const deps = createUrgentDeps({ cwd: '/repo', env, spawnSync, fs });
+    let err;
+    try { deps.shard({ group: 'nocov', shard: '1/1' }); } catch (e) { err = e; }
+    expect(kill).toHaveBeenCalledWith(-4242, 'SIGKILL');
+    expect(kill).toHaveBeenCalledTimes(1);
+    kill.mockRestore();
+    expect(err.failure).toMatchObject({ timedOut: true, hungFiles: ['hung.test.mjs'] });
+  });
+});
