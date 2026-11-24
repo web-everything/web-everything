@@ -57,7 +57,7 @@ const exemption = (path, rule, bytes = token) => ({ path, rule, sha256: sha256(b
 // Build fake private members at runtime so Forge can ship this test source.
 const privateJwk = JSON.stringify(Object.fromEntries([['kty', 'RSA'], ['d', 'FAKE_TEST_ONLY']]));
 
-test('DER private key added as binary preserves NUL, CR, LF and invalid UTF-8 bytes', () => {
+test('PKCS#1 DER added as binary preserves NUL, CR, LF and invalid UTF-8 bytes', () => {
   const r = repo();
   // Deliberately tiny, unusable PKCS#1 integers: no generated or real secret.
   const fields = [0, 0x80, 0x0d, 0x0a, 0, 1, 2, 3, 0xff];
