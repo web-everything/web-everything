@@ -23,7 +23,7 @@ function probe(gate, questionHash, { mkdtempSync, mkdirSync, writeFileSync, rmSy
     writeFileSync(join(repo, 'main.mjs'), 'export const value = 2;');
     const waivedSha = commit(base);
     mkdirSync(join(repo, '__tests__'));
-    writeFileSync(join(repo, '__tests__/value.mjs'), '// test-only descendant');
+    writeFileSync(join(repo, '__tests__/value.test.mjs'), '// test-only descendant');
     const head = commit(waivedSha);
     git('update-ref', 'refs/remotes/origin/main', base);
     const record = { head: waivedSha, base, questionHash, at: '2026-11-24T00:00:00Z',

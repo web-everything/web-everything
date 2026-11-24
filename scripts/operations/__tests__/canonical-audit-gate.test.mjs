@@ -68,12 +68,13 @@ describe('canonical audit before opening a PR', () => {
   describe('test-only waiver carry', () => {
     const waivedSha = other;
     const audited = { ...weak, head: waivedSha };
-    const files = ['scripts/operations/__tests__/example.ts', 'scripts/example.test.mjs'];
-    const git = ({ delta = files.map(p => `M\0${p}\0`).join(''), fail, imported = '' } = {}) => (args, resolved) => {
+    const files = ['scripts/operations/__tests__/example.test.ts', 'scripts/example.test.mjs'];
+    const git = ({ delta = files.map(p => `M\0${p}\0`).join(''), fail, imported = '', needle, numstat = '1\t0\t' } = {}) => (args, resolved) => {
       if (args.includes(fail)) throw new Error('git failed');
+      if (args.includes('--numstat')) return numstat + args.at(-1) + '\0';
       if (args.includes('diff')) return delta;
       if (args.includes('grep')) {
-        if (imported) return `${sha}:${imported}\0`;
+        if (imported && (!needle || args.includes(needle))) return `${sha}:${imported}\0`;
         throw Object.assign(new Error('no matches'), { status: 1 });
       }
       return resolved;
@@ -85,6 +86,8 @@ describe('canonical audit before opening a PR', () => {
       expect(result).toMatchObject({ ok: true, record: audited, carry: { waivedSha, head: sha, files } });
       const [, args, options] = calls.find(([, args]) => args.includes('diff'));
       expect(args).toEqual(expect.arrayContaining(['-z', '-M', '--no-renames']));
+      expect(calls.some(([, args]) => args.includes('--all-match') && args.includes('__tests__')
+        && args.includes('readdirSync'))).toBe(true);
       expect(options.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_DIR: sha });
     });
     it.each([
@@ -95,6 +98,14 @@ describe('canonical audit before opening a PR', () => {
       ['refuses audit settings changes', { delta: 'M\0scripts/settings/codex-audit.json\0' }],
       ['refuses changes to the gate itself', { delta: 'M\0scripts/operations/canonical-audit-gate.mjs\0' }],
       ['refuses unreadable import evidence', { fail: 'grep' }],
+      ['refuses deleting a carried test', { delta: 'D\0scripts/a.test.mjs\0' }],
+      ['refuses modified tests with deleted lines', { numstat: '1\t1\t' }],
+      ['refuses unreadable line counts', { fail: '--numstat' }],
+      ['refuses malformed line counts', { numstat: 'unknown\t0\t' }],
+      ['refuses a non-test helper under __tests__', { delta: 'A\0scripts/__tests__/helper.mjs\0' }],
+      ['refuses extensionless imports from production', { imported: 'src/main.mjs', needle: 'example.test' }],
+      ['refuses import.meta.glob directory loaders', { imported: 'src/main.mjs', needle: 'import.meta.glob' }],
+      ['refuses readdirSync directory loaders', { imported: 'src/main.mjs', needle: 'readdirSync' }],
       ['refuses malformed diff output', { delta: 'M\0scripts/a.test.mjs' }],
       ['refuses more than 128 changed paths', { delta: Array.from({ length: 129 }, (_, i) => `M\0scripts/${i}.test.mjs\0`).join('') }],
       ['refuses oversized diff output', { delta: 'M\0scripts/a.test.mjs\0'.repeat(60000) }],
@@ -116,6 +127,15 @@ describe('canonical audit before opening a PR', () => {
     });
     it('a new head audit cannot be bypassed by an older waiver', () => {
       expect(run({}, { records: [audited, weak] }).result.ok).toBe(false);
+    });
+    it('a newer foreign WEAKENED with the live fingerprint vetoes carry', () => {
+      const fp = 'd'.repeat(64);
+      expect(run({}, { records: [audited, { ...weak, head: 'e'.repeat(40), fingerprint: fp,
+        at: '2026-11-18T00:00:00Z' }], liveFingerprint: (_records, head) => head === waivedSha ? null : fp })
+        .result).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    });
+    it('a stale waiver with unrelated findings cannot carry a passing ancestor audit', () => {
+      expect(run({}, { records: [{ ...green, head: waivedSha }] }).result.ok).toBe(false);
     });
     it('carry still requires the waived findings and main coverage', () => {
       expect(run({}, { records: [{ ...audited, findings: ['another finding'] }] }).result.ok).toBe(false);

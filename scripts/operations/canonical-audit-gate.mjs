@@ -9,7 +9,7 @@ import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs'
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
-const isTestOnlyPath = path => /(?:^|\/)__tests__\/.*\.(?:mjs|js|ts)$/.test(path) || path.endsWith('.test.mjs');
+const isTestOnlyPath = path => /\.test\.(?:mjs|js|ts)$/.test(path);
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -127,13 +127,23 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       if (parts.length % 2 || parts.length > 256) return null;
       for (let i = 0; i < parts.length; i += 2) {
         const path = parts[i + 1];
-        if (!/^[AMD]$/.test(parts[i]) || !isTestOnlyPath(path)) return null;
+        if (!/^[AM]$/.test(parts[i]) || !isTestOnlyPath(path)) return null;
+        if (parts[i] === 'M') {
+          const stat = run('diff', '--numstat', '-z', '--no-renames', '--no-ext-diff', '--no-textconv',
+            '--ignore-submodules=none', '--no-relative', `${waivedSha}..${fullSha}`, '--', path).split('\t');
+          if (stat.length !== 3 || !/^\d+$/.test(stat[0]) || stat[1] !== '0' || stat[2] !== `${path}\0`) return null;
+        }
         files.push(path);
-        let hits;
-        try { hits = run('grep', '-l', '-z', '-F', '-e', path.split('/').pop(), fullSha, '--'); }
-        catch (error) { if (error.status === 1) continue; throw error; }
-        if (hits.length > 1024 * 1024 || !hits.endsWith('\0') || hits.slice(0, -1).split('\0').some(hit =>
-          !hit.startsWith(`${fullSha}:`) || !isTestOnlyPath(hit.slice(41)))) return null;
+        const segments = path.split('/'), name = segments.pop(), dir = segments.pop() || '.';
+        const queries = [['-e', name, '-e', name.replace(/\.[^.]+$/, '')],
+          ...['import.meta.glob', 'readdirSync'].map(loader => ['--all-match', '-e', dir, '-e', loader])];
+        for (const query of queries) {
+          let hits;
+          try { hits = run('grep', '-l', '-z', '-F', ...query, fullSha, '--'); }
+          catch (error) { if (error.status === 1) continue; throw error; }
+          if (hits.length > 1024 * 1024 || !hits.endsWith('\0') || hits.slice(0, -1).split('\0').some(hit =>
+            !hit.startsWith(`${fullSha}:`) || !isTestOnlyPath(hit.slice(41)))) return null;
+        }
       }
       return { waivedSha, head: fullSha, files };
     } catch { return null; }
@@ -148,11 +158,13 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
         const waivedSha = entry.sha.toLowerCase();
+        if (waivedSha !== fullSha && evidence.reason !== 'no-record') continue;
         const carry = waivedSha === fullSha ? null : testCarry(waivedSha);
         // A current-head audit always decides; an older waiver cannot supersede it.
         if (waivedSha !== fullSha && (!carry || records.some(r => r.head.toLowerCase() === fullSha))) continue;
-        const waived = canonicalAuditEvidence(records, waivedSha, covers,
-          carry ? liveFingerprint(records, waivedSha) : fp, { ruledWeakened: {
+        const waivedFp = carry ? liveFingerprint(records, waivedSha) : fp;
+        if (carry && canonicalAuditEvidence(records, waivedSha, covers, waivedFp).reason !== 'weakened') continue;
+        const waived = canonicalAuditEvidence(records, waivedSha, covers, waivedFp, { ruledWeakened: {
             ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: waivedSha, fingerprint: null },
           } });
         if (waived.ok && carry && waived.record?.head.toLowerCase() === waivedSha) {
