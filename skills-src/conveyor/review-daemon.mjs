@@ -102,6 +102,7 @@ import { pidAlive } from '../../scripts/lib/pid-alive.mjs';
 import { sampleHost } from '../../scripts/lib/host-sample.mjs';
 import { DEFAULT_MAX_REVIEW_DISPATCH_PER_TICK, loadHostOverloadSettings } from '../../scripts/lib/host-overload-settings.mjs';
 import { runRedTeamOnSkip } from '../../scripts/lib/review-red-team-on-skip.mjs';
+import { createRedTeamFeed } from '../../scripts/lib/red-team-feed.mjs';
 import { createRedTeamDispatchQueue, loadRedTeamQueueFloor, raiseReviewStartsPerTick, runWithRedTeamQueue, readLiveRedTeamPr } from '../../scripts/lib/red-team-dispatch-queue.mjs';
 import { syncResultOnHeadLabels } from '../../scripts/lib/red-team-result-label-sync.mjs';
 import { runGateCatchUp } from '../../scripts/lib/red-team-gate-catchup.mjs';
@@ -1491,6 +1492,7 @@ export function defaultReviewHostAdmission({ env = process.env, admission = host
 /** The real effects the CLI daemon's review pass runs with (the default `runReview` of {@link buildCliDaemonEffects}
  *  spreads these under its per-tick opts). Builds nothing that does IO until a tick calls it. */
 let redTeamDispatchQueue;
+let redTeamFeed;
 const redTeamGateRetryHistory = new Map();
 const autoAuditSeen = new Set();
 
@@ -1647,7 +1649,10 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
         }
         lastRedTeamQueueFloorLine = floorLine;
       }
-      return runWithRedTeamQueue({ ...options, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
+      // REDTEAM-FEED: nominate finished-review red-team:pending PRs, including nothing-owed (all logic in red-team-feed.mjs).
+      redTeamFeed ??= createRedTeamFeed({ log: options.log });
+      const fedPlan = redTeamFeed(options);
+      return runWithRedTeamQueue({ ...options, plan: fedPlan, queue: redTeamDispatchQueue, run: runRedTeamOnSkip,
         floor, readLivePr: readQueuePr, readCpuIdlePct: () => sampleHost().idlePct });
     },
     poolExhaustion: DAEMON_POOL_EXHAUSTION,
