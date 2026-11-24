@@ -1,6 +1,58 @@
 // @vitest-environment node
-import { it, expect, vi } from 'vitest';
+import { beforeEach, it, expect, vi } from 'vitest';
 import { resourcePoolOperation, renderResourcePool, finishResourcePool, digestLine } from '../resource-pool.mjs';
+import { collectResourcePool, appendShadowRows } from '../../lib/resource-pool-io.mjs';
+import { resolveOperation } from '../run.mjs';
+import { runOperationCli } from '../cli-adapter.mjs';
+import { createMemoryRunStore } from '../run-store.mjs';
+import { handleOperationRequest } from '../http-adapter.mjs';
+
+const poolIo = vi.hoisted(() => ({ collectResourcePool: vi.fn(), appendShadowRows: vi.fn() }));
+vi.mock('../../lib/resource-pool-io.mjs', () => poolIo);
+beforeEach(() => {
+  vi.clearAllMocks();
+  appendShadowRows.mockReturnValue(true);
+});
+const wiringReport = () => ({ mode: 'shadow', configuredMode: 'shadow', digest: 'pool wiring digest',
+  settings: { provenance: 'fixture' }, sources: [], summary: {}, holders: [],
+  rows: ['review', 'redTeam', 'fix'].map(kind => ({ kind, poolDecision: 'grant' })) });
+
+it.each([false, true])('run.mjs binds the resource-pool finish to appendShadowRows (json=%s)', async json => {
+  const report = wiringReport();
+  collectResourcePool.mockReturnValue(report);
+  const resolved = resolveOperation('resource-pool', { cli: true });
+  const outcome = await runOperationCli({ ...resolved, argv: json ? ['--json'] : [],
+    store: createMemoryRunStore(), newRunId: () => 'pool-cli' });
+  expect(outcome.code).toBe(0);
+  expect(collectResourcePool).toHaveBeenCalledTimes(1);
+  expect(appendShadowRows).not.toHaveBeenCalled();
+  const result = resolved.finish({ ...outcome, json });
+  expect(result.code).toBe(0);
+  expect(appendShadowRows).toHaveBeenCalledTimes(1);
+  expect(appendShadowRows).toHaveBeenCalledWith(report.rows, { mode: 'shadow' });
+  expect(result.lines.join('\n')).toContain(report.digest);
+  if (json) expect(JSON.parse(result.lines.join('\n')).verdict.rows).toEqual(report.rows);
+  else expect(result.lines).toEqual([renderResourcePool(report)]);
+});
+
+it.each(['', '/run'])('HTTP GET resource-pool%s never invokes finish or writes shadow rows', async suffix => {
+  const report = wiringReport();
+  collectResourcePool.mockReturnValue(report);
+  const resolved = resolveOperation('resource-pool');
+  const finish = vi.spyOn(resolved, 'finish');
+  const response = await handleOperationRequest({ method: 'GET', url: `/operations/resource-pool${suffix}` }, {
+    resolve: name => { expect(name).toBe('resource-pool'); return resolved; },
+    names: () => ['resource-pool'], newRunId: () => 'pool-http',
+  });
+  expect(response.status).toBe(200);
+  if (suffix) {
+    expect(collectResourcePool).toHaveBeenCalledTimes(1);
+    expect(response.body).toMatchObject({ verdict: report, persisted: false, status: 'complete' });
+  } else expect(collectResourcePool).not.toHaveBeenCalled();
+  expect(finish).not.toHaveBeenCalled();
+  expect(appendShadowRows).not.toHaveBeenCalled();
+});
+
 it('requires a reader and declares a readout without admission effect steps', () => {
   expect(() => resourcePoolOperation()).toThrow(/collect/);
   expect(resourcePoolOperation({ collect: vi.fn() })).toBeTruthy();

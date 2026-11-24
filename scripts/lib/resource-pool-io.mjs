@@ -289,11 +289,13 @@ export function collectResourcePool({ env = process.env, nowMs = Date.now(), coo
   });
   // Claims bridge dispatch to worker startup: both observations describe one job.
   // Missing job identity stays separately counted; never guess from a lane or display ID.
+  // An explicit repo scopes a jobId; identical IDs from different repos are distinct jobs.
   const jobs = new Set();
   const holders = sources.flatMap(s => s.ok ? s.holders : []).filter(holder => {
     if (holder.kind !== 'fix' || typeof holder.jobId !== 'string' || !holder.jobId) return true;
-    if (jobs.has(holder.jobId)) return false;
-    jobs.add(holder.jobId);
+    const jobKey = JSON.stringify([holder.repo ?? null, holder.jobId]);
+    if (jobs.has(jobKey)) return false;
+    jobs.add(jobKey);
     return true;
   });
   const unknown = !!settings.unknown || sources.some(s => !s.ok)

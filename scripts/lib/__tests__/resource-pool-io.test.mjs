@@ -459,6 +459,16 @@ it('duplicate fix jobId across claim and workers counts once while unrelated and
   expect(report.summary['studio.units'].classes[3]).toBe(10);
 });
 
+it('same fix jobId in different repos stays counted while each claim/worker pair deduplicates', () => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    holders: ['fix', 'workers'].includes(source) ? ['owner/first', 'owner/second'].map(repo => ({
+      resource: 'studio.units', source, kind: 'fix', class: 3, size: 2, jobId: 'same-job', repo,
+    })) : [] }) });
+  expect(report.unknown).toBe(false);
+  expect(report.holders.map(holder => holder.repo)).toEqual(['owner/first', 'owner/second']);
+  expect(report.summary['studio.units'].classes[3]).toBe(4);
+});
+
 it('the ledger read guard records deliberate reads through named, default and promise fs APIs', async () => {
   const guardedFs = await import('node:fs');
   const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
