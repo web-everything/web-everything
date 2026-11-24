@@ -6906,9 +6906,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         let liveHead = null;
         let clearedAt = null;
         try {
-          const ud = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
+          const ud = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           liveHead = typeof ud.headRefOid === 'string' ? ud.headRefOid : null;
-          clearedAt = parseLatestHumanClearedSha(ud.comments || []);
+          // The COMPLETE thread (a truncated page could hide the latest clearance or a later hold marker).
+          clearedAt = parseLatestHumanClearedSha(readCompletePrComments(v.num, { repo: v.repo || localSlug, exec: execFileSync }));
         } catch { /* fetch miss → both null → the hold stands (fails closed) */ }
         unverifiedCleared = !shouldReparkForUnverifiedDiff({ unverified: true, findings: gaming.findings,
           humanClearedSha: clearedAt, headSha: liveHead, pinnedHeadSha: v.listedHeadSha || v.headSha || null });

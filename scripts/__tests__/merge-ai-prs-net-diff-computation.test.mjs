@@ -1392,7 +1392,7 @@ describe('CLEAR-HUMAN-NOT-STICKY: a recorded human clearance honours the unverif
     } finally { vi.doUnmock('node:child_process'); vi.resetModules(); }
     return out;
   }
-  const accept = (sha, human) => [{ author: { login: 'chalbert' }, createdAt: new Date().toISOString(),
+  const accept = (sha, human) => [{ id: "C_1", author: { login: 'chalbert' }, createdAt: new Date().toISOString(),
     body: `cleared\n\n<!-- reviewed-sha: ${sha} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
 
   it('drain: unverified diff + human clearance on this head is NOT re-parked', async () => {
