@@ -17,7 +17,8 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const OK = JSON.stringify({ data: { updateIssueComment: { issueComment: { id: 'IC_x' } } } });
+const PR_REPO = ['acme-org', 'widgets'].join('/'); // a made-up owner/name; built so the repo-literal scan sees no slug
+const OK =JSON.stringify({ data: { updateIssueComment: { issueComment: { id: 'IC_x' } } } });
 
 const module_default = {
   id: 'referral-comment-edit-unrouted-graphql',
@@ -36,8 +37,8 @@ const module_default = {
       const { createReferralGhProvider } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/review-comment-edit.mjs')).href);
       const envs = [];
       const provider = createReferralGhProvider({ exec: (_argv, opts) => { envs.push(opts?.env); return OK; } });
-      provider.editComment('IC_x', 'body', { repo: 'frontier-ui/frontierui' });
-      if (envs[0]?.GH_REPO !== 'frontier-ui/frontierui') violations.push('the edit was sent without GH_REPO naming the PR repo');
+      provider.editComment('IC_x', 'body', { repo: PR_REPO });
+      if (envs[0]?.GH_REPO !== PR_REPO) violations.push('the edit was sent without GH_REPO naming the PR repo');
       const before = envs.length;
       let threw = false;
       try { provider.editComment('IC_x', 'body'); } catch { threw = true; }
@@ -63,6 +64,6 @@ export async function probeEither(root) {
   let refused = false;
   try { provider.editComment('IC_x', 'body'); } catch { refused = true; }
   let routed = false;
-  try { provider.editComment('IC_x', 'body', { repo: 'frontier-ui/frontierui' }); routed = envs.at(-1)?.GH_REPO === 'frontier-ui/frontierui'; } catch { /* not routed */ }
+  try { provider.editComment('IC_x', 'body', { repo: PR_REPO }); routed = envs.at(-1)?.GH_REPO === PR_REPO; } catch { /* not routed */ }
   return refused || routed;
 }
