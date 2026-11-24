@@ -34,15 +34,19 @@ export default {
       const filler = Array.from({ length: count }, () => bot('chatter'));
       const pr = { number: 6001, headRefOid: HEAD, headRefName: 'lane/x', state: 'OPEN', isDraft: false, labels: [],
         comments: [...filler, result, gate], commentsComplete: flag, commits: [], statusCheckRollup: [], mergeStateStatus: 'CLEAN' };
-      const out = [];
-      runEligibilityShadow({ mode: 'shadow', now: () => 0, readLocals: locals, appendLine: l => out.push(l),
+      const out = [], errors = [];
+      runEligibilityShadow({ mode: 'shadow', now: () => 0, readLocals: locals, appendLine: l => out.push(JSON.parse(l)),
+        onError: e => errors.push(e),
         dispatch: [{ kind: 'fix', prNumber: 6001, why: 'x', nested: { scope: ['scripts/example.mjs'] } }], prs: [pr] });
-      return out;
+      return { out, errors };
     };
     const violations = [];
-    if (lines(10, undefined).length) violations.push('a 12-comment thread with the flag unset was logged unknown');
-    if (!lines(98, undefined).length) violations.push('a thread at the cap (100) was treated as complete');
-    if (!lines(10, false).length) violations.push('an explicit commentsComplete=false was overridden');
+    const unknownThread = r => r.errors.length === 0 && r.out.length === 1
+      && r.out[0].gate === 'unknown' && r.out[0].reasons.length === 1 && r.out[0].reasons[0] === 'thread';
+    const short = lines(10, undefined);
+    if (short.errors.length || short.out.length) violations.push('a 12-comment thread with the flag unset was logged or errored');
+    if (!unknownThread(lines(98, undefined))) violations.push('a thread at the cap (100) was not logged unknown: thread');
+    if (!unknownThread(lines(10, false))) violations.push('an explicit commentsComplete=false was not logged unknown: thread');
     log?.(`violations=${violations.length}\n`);
     return { violations };
   },

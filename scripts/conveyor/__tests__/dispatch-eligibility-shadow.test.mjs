@@ -92,8 +92,10 @@ describe('runEligibilityShadow observational contract', () => {
     const base = sentBackPr();
     const filler = Array.from({ length: count - base.comments.length }, () => bot('chatter'));
     const p = { ...base, comments: [...filler, ...base.comments], commentsComplete: undefined };
-    run({ dispatch: [entry()], prs: [p], appendLine });
-    expect(appendLine.mock.calls).toEqual([]);
+    const onError = vi.fn();
+    expect(run({ dispatch: [entry()], prs: [p], appendLine, onError })).toEqual({ checked: 1, disagreements: 0 });
+    expect(onError).not.toHaveBeenCalled(); // an evaluation failure also logs nothing, so rule it out
+    expect(appendLine).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -103,8 +105,12 @@ describe('runEligibilityShadow observational contract', () => {
   ])('a thread %s still logs unknown thread', (_name, count, flag) => {
     const appendLine = vi.fn();
     const comments = Array.from({ length: count }, () => bot('chatter'));
-    run({ dispatch: [entry()], prs: [pr(6001, { comments, commentsComplete: flag })], appendLine });
-    expect(JSON.parse(appendLine.mock.calls[0][0]).reasons).toEqual(['thread']);
+    const onError = vi.fn();
+    expect(run({ dispatch: [entry()], prs: [pr(6001, { comments, commentsComplete: flag })], appendLine, onError }))
+      .toEqual({ checked: 1, disagreements: 1 });
+    expect(onError).not.toHaveBeenCalled();
+    expect(appendLine).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ gate: 'unknown', reasons: ['thread'] });
   });
 
   it.each([
