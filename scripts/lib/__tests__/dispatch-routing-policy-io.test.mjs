@@ -263,6 +263,8 @@ it.each([
   const record = vi.fn();
   const route = resolveDispatchRoute({ kind: 'fix', size: 3, scopePaths: ['we:scripts/example.mjs'] }, {
     env: {}, routingPolicy: DEFAULT_ROUTING_POLICY, now, capacity, availability: { codex: 'operator hold' },
+    // Model/capacity eligibility is tested with authentication explicitly healthy.
+    agyAuth: { state: 'on', lastProbeAt: now },
     quota: () => null, record, scorecards: [], repo: { routing: { builder: 'auto' }, providerCapacity: { providers } },
   });
   const expected = gemini ? 'claude' : id;

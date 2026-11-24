@@ -13,7 +13,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -42,12 +42,7 @@ import {
 } from '../provider-routing.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
 import { routeDispatch, decideDispatchRoute } from '../dispatch-contracts.mjs';
-import { runProbe } from '../../operations/agy-auth-probe.mjs';
-
-vi.mock('node:os', async importOriginal => {
-  const actual = await importOriginal();
-  return { ...actual, homedir: vi.fn(actual.homedir) };
-});
+import { readAgyAuthState, runProbe } from '../../operations/agy-auth-probe.mjs';
 
 describe('production dispatch consumes the persisted agy auth record', () => {
   let home, statePath;
@@ -61,11 +56,12 @@ describe('production dispatch consumes the persisted agy auth record', () => {
   const save = record => writeFile(statePath, typeof record === 'string' ? record : JSON.stringify(record));
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'agy-routing-'));
-    vi.mocked(homedir).mockReturnValue(home);
+    // The hermetic harness makes native homedir() follow HOME for every consumer.
+    process.env.HOME = home;
     await mkdir(join(home, '.plateau'));
     statePath = join(home, '.plateau', 'agy-auth-state.json');
   });
-  afterEach(async () => { vi.mocked(homedir).mockReset(); await rm(home, { recursive: true, force: true }); });
+  afterEach(async () => { await rm(home, { recursive: true, force: true }); });
 
   it('honors explicit off even when the persisted record is on', async () => {
     await save({ state: 'on', lastProbeAt: now });
@@ -89,6 +85,7 @@ describe('production dispatch consumes the persisted agy auth record', () => {
   });
   it('filters agy from policy fallback chains, and retains healthy policy routes', async () => {
     await save({ state: 'on', lastProbeAt: now });
+    expect(readAgyAuthState()).toEqual({ state: 'on', lastProbeAt: now });
     expect(decideDispatchRoute(dispatch, { routingPolicy: policy, now }).policyRoute.provider).toBe('antigravity');
     await save({ state: 'off' });
     const fallbackPolicy = { ...policy, operations: { ...policy.operations,
