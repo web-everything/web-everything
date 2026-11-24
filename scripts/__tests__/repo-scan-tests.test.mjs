@@ -23,7 +23,7 @@ const MULTI = 'scripts/__tests__/multi-repo-checks.test.mjs';
 describe('selectScanTests', () => {
   it('selects scoped push boundaries for scripts and widens for rule or allowlist edits', () => {
     const test = 'scripts/__tests__/push-gate-boundary.test.mjs';
-    for (const ext of ['mjs', 'js', 'cjs', 'ts']) {
+    for (const ext of ['mjs', 'js', 'cjs', 'ts', 'mts', 'cts']) {
       expect(selectScanTests({ changedFiles: [`scripts/new.${ext}`] }).scoped.map(e => e.test)).toContain(test);
     }
     for (const path of ['scripts/push-gate-allowlist.json', 'scripts/lib/push-gate-lint.mjs', test]) {

@@ -79,6 +79,7 @@ it('refuses an allowlisted file with invalid syntax instead of counting a site',
 describe('push-gate boundary over the real tree', () => {
   it('admits only reviewed site counts, with no stale entries or parse errors', () => {
     const allow = JSON.parse(readFileSync(new URL('../push-gate-allowlist.json', import.meta.url), 'utf8'));
+    // Enumerate all scripts; the shared predicate includes .mts/.cts and excludes only test filenames/directories.
     const files = execFileSync('git', ['ls-files', '-z', 'scripts'], { cwd: root, encoding: 'utf8', maxBuffer: 1 << 26 })
       .split('\0').filter(isLintedScript);
     const sources = Object.fromEntries(scopedScanFiles(files).map(file => [file, readFileSync(join(scanRoot(root), file), 'utf8')]));

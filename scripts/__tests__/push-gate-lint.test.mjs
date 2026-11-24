@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { expect, it } from 'vitest';
 import { findRawPushes, isLintedScript } from '../lib/push-gate-lint.mjs';
+import { REPO_SCAN_TESTS } from '../lib/repo-scan-tests.mjs';
 
 it('refuses unreadable source and invalid syntax for manual inspection', () => {
   expect(() => findRawPushes(null)).toThrow(/unreadable source/);
@@ -57,14 +58,32 @@ it.each([
   expect(findRawPushes(source)).toHaveLength(1);
 });
 
-it.each(['mjs', 'js', 'cjs', 'ts'])('scans non-test .%s scripts', ext => {
+it.each(['mjs', 'js', 'cjs', 'ts', 'mts', 'cts'])('scans non-test .%s scripts', ext => {
   expect(isLintedScript(`scripts/nested/source.${ext}`)).toBe(true);
   expect(isLintedScript(`scripts/source.test.${ext}`)).toBe(false);
   expect(isLintedScript(`scripts/source.spec.${ext}`)).toBe(false);
 });
-it('parses TypeScript with its source grammar', () => {
-  expect(findRawPushes("const args: string[] = ['push']; spawn('git', args);", 'scripts/source.ts'))
+it.each(['ts', 'mts', 'cts'])('parses .%s with TypeScript source grammar', ext => {
+  expect(findRawPushes("const args: string[] = ['push']; spawn('git', args);", `scripts/source.${ext}`))
     .toEqual([{ line: 1, kind: 'unresolved' }]);
+});
+
+it.each(['mjs', 'js', 'cjs', 'ts', 'mts', 'cts'])('shares filename-only test exclusions with scan selection for .%s', ext => {
+  const scan = REPO_SCAN_TESTS.find(entry => entry.test === 'scripts/__tests__/push-gate-boundary.test.mjs');
+  expect(scan.matches).toBe(isLintedScript);
+  for (const path of [`scripts/task.test.data/worker.${ext}`, `scripts/task.spec.data/worker.${ext}`,
+    `scripts/worker.test.data.${ext}`]) {
+    expect(isLintedScript(path), path).toBe(true);
+    expect(scan.matches(path), path).toBe(true);
+  }
+  expect(scan.matches(`scripts/task.test.data/worker.test.${ext}`)).toBe(false);
+  expect(scan.matches(`scripts/task.spec.data/worker.spec.${ext}`)).toBe(false);
+});
+
+it('counts every push in one shell string and resets matching between strings and calls', () => {
+  const source = "sh('git push && git -C repo push; git push'); sh('git status'); sh('git push');";
+  expect(findRawPushes(source)).toEqual(Array.from({ length: 4 }, () => ({ line: 1, kind: 'shell' })));
+  expect(findRawPushes(source)).toHaveLength(4);
 });
 
 it.each(['--git-dir=/x', '--work-tree=/x', '-C/x'])('detects push directly after attached global option %s', flag => {

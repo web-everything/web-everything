@@ -1,26 +1,35 @@
-/** Static raw-push boundary: inspect syntax only, never execute the source. */
+/**
+ * NON-CLAIMS: This lint is a tripwire for honest accidental pushes only.
+ * Deliberate evasion (dynamic or concatenated command strings, executable variables,
+ * reassigned aliases, dynamic imports, .call(), shell escapes such as g\it pu\sh,
+ * unlisted git global flags, and call identity beyond the pinned per-file count)
+ * is NOT caught. The security boundary is the S1 gate (scripts/lib/authorized-push.mjs)
+ * plus S6's shell refusal. authorized-push.mjs is exempt because it is the gate itself.
+ * Inspect syntax only, never execute the source.
+ */
 import ts from 'typescript';
 
 const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'execFileSync', 'fork']);
 const GLOBAL_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env',
   '--exec-path', '--bare', '--no-pager', '--paginate', '--no-replace-objects', '--literal-pathspecs',
   '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-optional-locks']);
-const SHELL_PUSH = /\bgit\s+(?:-\S+\s+(?:\S+\s+)?)*push\b/;
+const SHELL_PUSH = /\bgit\s+(?:-\S+\s+(?:\S+\s+)?)*push\b/g;
 const CHILD_PROCESS = new Set(['node:child_process', 'child_process']);
 
 /** Paths come from git ls-files; reject paths outside the tracked scripts shape. */
 export function isLintedScript(path) {
-  return typeof path === 'string' && /^scripts\/(?:[^/]+\/)*[^/]+\.(?:mjs|js|cjs|ts)$/.test(path)
+  return typeof path === 'string' && /^scripts\/(?:[^/]+\/)*[^/]+\.(?:mjs|js|cjs|ts|mts|cts)$/.test(path)
     && !path.includes('\\')
     && !path.split('/').some(part => ['.', '..', '__tests__'].includes(part))
-    && !/\.(?:test|spec)\.(?:mjs|js|cjs|ts)$/.test(path) && path !== 'scripts/lib/authorized-push.mjs';
+    && !/\.(?:test|spec)\.(?:mjs|js|cjs|ts|mts|cts)$/.test(path.split('/').at(-1))
+    && path !== 'scripts/lib/authorized-push.mjs';
 }
 
-/** One site per matching call; unreadable or unparsable evidence requires manual inspection. */
+/** One site per shell match or argv call; unreadable or unparsable evidence requires manual inspection. */
 export function findRawPushes(source, filename = 'scripts/source.mjs') {
   if (typeof source !== 'string') throw new Error(`${filename}: unreadable source; inspect manually`);
   const file = ts.createSourceFile(filename, source, ts.ScriptTarget.Latest, true,
-    filename.endsWith('.ts') ? ts.ScriptKind.TS : ts.ScriptKind.JS);
+    /\.(?:ts|mts|cts)$/.test(filename) ? ts.ScriptKind.TS : ts.ScriptKind.JS);
   if (file.parseDiagnostics.length) throw new Error(`${filename}: parse error; inspect manually`);
   const sites = [], bindings = new Set(), namespaces = new Set();
   const nameOf = node => ts.isIdentifier(node) || ts.isStringLiteralLike(node) ? node.text
@@ -60,8 +69,9 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
   };
   const shellKind = text => {
     const words = text.replace(/["']/g, '');
-    if (SHELL_PUSH.test(words)) return 'shell';
-    if (/\bgit\s+/.test(words) && words.includes('${}')) return 'unresolved';
+    const count = [...words.matchAll(SHELL_PUSH)].length;
+    if (count) return { kind: 'shell', count };
+    if (/\bgit\s+/.test(words) && words.includes('${}')) return { kind: 'unresolved', count: 1 };
   };
   const scanArgs = elements => {
     for (let i = 0; i < elements.length; i++) {
@@ -71,7 +81,7 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
       if (ts.isStringLiteralLike(node) && text === 'push') {
         const previous = i ? staticText(elements[i - 1]) : undefined;
         if (!previous?.startsWith('-') || GLOBAL_FLAGS.has(previous)
-          || /^(?:--[\w-]+=|-C.|-c.)/.test(previous)) return 'argv';
+          || /^(?:--[\w-]+=|-C.|-c.)/.test(previous)) return { kind: 'argv', count: 1 };
       }
       if (ts.isArrayLiteralExpression(node)) {
         const kind = scanArgs(node.elements);
@@ -92,8 +102,10 @@ export function findRawPushes(source, filename = 'scripts/source.mjs') {
         // Process options are not argv. A git helper may also accept a trailing options object.
         const argv = gitCommand ? Array.from(node.arguments).slice(1, 2)
           : Array.from(node.arguments).filter(arg => !ts.isObjectLiteralExpression(arg));
-        if ((gitCommand || /git/i.test(name)) && !argv.every(fullyStatic)) kind = 'unresolved';
-        if (kind) sites.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, kind });
+        if ((gitCommand || /git/i.test(name)) && !argv.every(fullyStatic)) kind = { kind: 'unresolved', count: kind?.count || 1 };
+        if (kind) for (let i = 0; i < kind.count; i++) {
+          sites.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, kind: kind.kind });
+        }
       }
     }
     ts.forEachChild(node, visit);
