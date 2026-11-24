@@ -2,7 +2,7 @@ import { readQueuePlannerBlock } from '../red-team-queue-state.mjs';
 // @vitest-environment node
 import { describe, it, expect, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -180,8 +180,10 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
   it('default strategy wiring requests a red-team round once per head', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rt-skip-'));
     const file = join(dir, 'queue.json');
-    const entry = (extra = {}) => ({ key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, enqueuedAt: 1, attempts: 0, ...extra });
-    writeFileSync(file, JSON.stringify([entry({ blocked: 'planner-skip', blockedReason: 'later verdict supersedes acceptance' })]));
+    const inbox = () => readdirSync(join(dir, 'red-team-reprobe-requests')).filter(n => n.endsWith('.req'));
+    const queueText = JSON.stringify([{ key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, enqueuedAt: 1, attempts: 0,
+      blocked: 'planner-skip', blockedReason: 'later verdict supersedes acceptance', lastProbeTurn: 1 }]);
+    writeFileSync(file, queueText);
     const clock = { t: 1000 };
     const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1', WE_RED_TEAM_QUEUE_FILE: file };
     const options = { strategy: 'github-merge-queue', env, now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'], defaultRequest: true,
@@ -189,23 +191,31 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     try {
       const h = harness(options); // no requestRedTeam supplied: the default wiring must act
       h.s.enqueue({ num: 5283 }, HEAD);
+      expect(existsSync(join(dir, 'red-team-reprobe-requests'))).toBe(false); // not overdue yet
       clock.t += 60_001;
       h.s.enqueue({ num: 5283 }, HEAD);
-      const [row] = JSON.parse(readFileSync(file, 'utf8'));
-      expect(row.blocked).toBeUndefined();
-      expect(row.reprobeReason).toBe('later verdict supersedes acceptance');
-      // once per head: a re-blocked entry is not re-requested on the same head, even after a restart
-      writeFileSync(file, JSON.stringify([entry({ blocked: 'planner-skip', blockedReason: 'again' })]));
-      harness({ ...options, initial: h.state() }).s.enqueue({ num: 5283 }, HEAD);
-      expect(JSON.parse(readFileSync(file, 'utf8'))[0].blocked).toBe('planner-skip');
-      // a real review-unfinished block is never overridden
-      writeFileSync(file, JSON.stringify([entry({ blocked: 'review-unfinished' })]));
-      const other = harness({ ...options, ghView: { 5283: { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] } } });
-      other.s.enqueue({ num: 5283 }, HEAD); clock.t += 120_000; other.s.enqueue({ num: 5283 }, HEAD);
-      expect(JSON.parse(readFileSync(file, 'utf8'))[0].blocked).toBe('review-unfinished');
+      expect(inbox()).toHaveLength(1);
+      expect(readFileSync(file, 'utf8')).toBe(queueText); // the drain never writes the queue file
+      // a fresh drain state (restart / other gate source ledger) is deduped by the shared inbox ledger
+      const fresh = harness(options);
+      fresh.s.enqueue({ num: 5283 }, HEAD); clock.t += 60_001; fresh.s.enqueue({ num: 5283 }, HEAD);
+      expect(inbox()).toHaveLength(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('an explicit hold policy never spends a red-team request', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rt-hold-'));
+    const file = join(dir, 'queue.json');
+    const clock = { t: 1000 };
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1', WE_RED_TEAM_QUEUE_FILE: file,
+      WE_RED_TEAM_DEADLINE_ACTION: 'hold' };
+    try {
+      const h = harness({ strategy: 'github-merge-queue', env, now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'], defaultRequest: true,
+        strategyExtra: { readRedTeamCheck: () => ({ ok: false, reason: 'no red-team check run on head' }) } });
+      h.s.enqueue({ num: 5283 }, HEAD); clock.t += 60_001; h.s.enqueue({ num: 5283 }, HEAD);
+      expect(existsSync(join(dir, 'red-team-reprobe-requests'))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it.each(['both', 'drain-scan', 'check-run'])('reads live evidence but leaves pending waits to check-run in mode %s', source => {
     const readRedTeamEvidence = vi.fn(() => ({ scheduled: true, inFlight: true }));
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],

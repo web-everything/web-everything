@@ -44,7 +44,7 @@ import { readRedTeamPublicationHold, readDrainRedTeamEvidence, settleUnknownEvid
 import { readDrainQueueSafety, redTeamEnqueueHold, redTeamLabelHoldReason, dequeueSentBack, sendBackReason, queueLabels } from './drain-queue-safety.mjs';
 import { readRedTeamDeadlineAction, RED_TEAM_DEADLINE_OVERRIDE } from './red-team-gate.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
-import { readQueuePlannerBlock, requestPlannerSkipReprobe } from './red-team-queue-state.mjs';
+import { readQueuePlannerBlock, requestRedTeamReprobe } from './red-team-queue-state.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 import { defaultPostConflictFinding } from './conflict-finding.mjs';
@@ -315,7 +315,8 @@ export function createDrainMergeStrategy({
     // ("… incomplete at 100-run bound …") is not fixed by a new round, so it never spends the once-per-head request.
     const recoverable = unpublished || /^(no red-team check run on head|red-team check run in progress or incomplete)$/.test(reason);
     if (recoverable && now() - wait.firstPendingAt >= (safety.value.redTeamPendingMaxMin ?? 45) * 60_000
-      && wait.attemptedAt == null && wait.attemptedHeads?.[head] == null && typeof requestRedTeam === 'function') {
+      && wait.attemptedAt == null && wait.attemptedHeads?.[head] == null && typeof requestRedTeam === 'function'
+      && deadlineAction !== 'hold') {
       wait.attemptedAt = now();
       wait.attemptedHeads ??= {};
       wait.attemptedHeads[head] = wait.attemptedAt;
@@ -329,7 +330,7 @@ export function createDrainMergeStrategy({
   // Default wiring: a planner-skipped queue entry is re-requested (re-probed) once per head; the caller's once-per-head
   // spend is written before this runs. A dry run never writes the queue file.
   const requestRedTeam = requestRedTeamOpt !== undefined ? requestRedTeamOpt
-    : dryRun ? null : input => requestPlannerSkipReprobe({ repo: input.repo, pr: input.pr, head: input.head, env });
+    : dryRun ? null : input => requestRedTeamReprobe({ repo: input.repo, pr: input.pr, head: input.head, env });
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
   const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
   const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';

@@ -4,7 +4,8 @@
  * (block cleared, old reason kept as evidence); a different block reason must never be overridden.
  * Production modules come from sourceRoot; command and state IO is injected, the queue file is a temp file.
  */
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, readdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -20,7 +21,20 @@ export default {
   fixedBy: { sha: 'pending', where: 'lane/redteam-planner-skip',
     paths: ['scripts/lib/drain-merge-strategy.mjs', 'scripts/lib/red-team-queue-state.mjs'] },
   fixPresent(root) {
-    try { return /export function requestPlannerSkipReprobe\b/.test(readFileSync(join(root, 'scripts/lib/red-team-queue-state.mjs'), 'utf8')); }
+    // Decided by behaviour: a throwaway process asks the queue's one skip writer for a reasonless skip (must throw)
+    // and the requester for a request (must land in the inbox, never in the queue file).
+    const code = `
+      import { mkdtempSync, readdirSync, existsSync } from 'node:fs';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      const q = await import(${JSON.stringify(pathToFileURL(join(root, 'scripts/lib/red-team-dispatch-queue.mjs')).href)});
+      let threw = false;
+      try { q.writeBlock({}, { code: 'planner-skip' }); } catch { threw = true; }
+      const dir = mkdtempSync(join(tmpdir(), 'soak-fixpresent-'));
+      const file = join(dir, 'q.json');
+      const r = q.requestRedTeamReprobe({ repo: 'o/r', pr: 1, head: 'a'.repeat(40), env: { WE_RED_TEAM_QUEUE_FILE: file } });
+      process.exit(threw && r.requested === true && !existsSync(file) && readdirSync(join(dir, 'red-team-reprobe-requests')).length === 1 ? 0 : 1);`;
+    try { return spawnSync(process.execPath, ['--input-type=module', '-e', code], { timeout: 30_000 }).status === 0; }
     catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -33,9 +47,12 @@ export default {
       const { createDrainMergeStrategy } = await load('scripts/lib/drain-merge-strategy.mjs');
       const { resolveMergeDeliveryPolicy } = await load('scripts/lib/merge-delivery-policy.mjs');
       for (const blocked of ['planner-skip', 'review-unfinished']) {
-        const file = join(dir, `${blocked}.json`);
-        writeFileSync(file, JSON.stringify([{ key: `${REPO}#${PR}`, repo: REPO, pr: PR, head: HEAD, enqueuedAt: 1, attempts: 0,
-          blocked, blockedReason: 'soak reason' }]));
+        const sub = join(dir, blocked);
+        mkdirSync(sub);
+        const file = join(sub, 'queue.json');
+        const queueText = JSON.stringify([{ key: `${REPO}#${PR}`, repo: REPO, pr: PR, head: HEAD, enqueuedAt: 1, attempts: 0,
+          blocked, blockedReason: 'soak reason', lastProbeTurn: 3 }]);
+        writeFileSync(file, queueText);
         const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1',
           WE_RED_TEAM_QUEUE_FILE: file };
         let clock = 1000, stored = { pending: [], followedUp: [] };
@@ -67,11 +84,20 @@ export default {
         s.enqueue({ num: PR }, HEAD, { comments: [] });
         clock += 60_001;
         s.enqueue({ num: PR }, HEAD, { comments: [] });
-        const [row] = JSON.parse(readFileSync(file, 'utf8'));
+        check(readFileSync(file, 'utf8') === queueText, `${blocked}: the drain wrote the queue file directly`);
+        const inbox = join(sub, 'red-team-reprobe-requests');
+        check(existsSync(inbox) && readdirSync(inbox).filter(n => n.endsWith('.req')).length === 1,
+          `${blocked}: the overdue head was not re-requested exactly once`);
+        // The running queue object applies the request inside its own tick, bounded by its probe limits.
+        const { createRedTeamDispatchQueue } = await load('scripts/lib/red-team-dispatch-queue.mjs');
+        const queue = createRedTeamDispatchQueue({ file, readLivePr: () => ({ state: 'OPEN', comments: [], headRefOid: HEAD }) });
+        queue.reconcile({ readLivePr: () => ({ state: 'OPEN', comments: [], headRefOid: HEAD }) });
+        const [row] = queue.entries();
         if (blocked === 'planner-skip') {
-          check(row.blocked === undefined, 'planner-skip: the overdue head was never re-requested (block still set)');
+          check(row.blocked === 'planner-skip' && row.lastProbeTurn === 0, 'planner-skip: not moved to the front of the bounded probe order');
           check(row.reprobeReason === 'soak reason', 'planner-skip: the old reason is not kept as re-request evidence');
-        } else check(row.blocked === 'review-unfinished', `${blocked}: a non planner-skip block was overridden`);
+          check(queue.admit(REPO, 0, { maxProbes: 0 }).length === 0, 'planner-skip: the request bypassed the probe bound');
+        } else check(row.blocked === 'review-unfinished' && row.lastProbeTurn === 3, `${blocked}: a non planner-skip block was overridden`);
       }
     } catch (error) {
       violations.push(`scenario threw: ${error?.message ?? error}`);

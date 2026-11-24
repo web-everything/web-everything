@@ -17,7 +17,7 @@ vi.mock('../operator-override-reader.mjs', async importOriginal => {
 // Exercise the real reader/cascade with a temporary store via its explicit file seam.
 const operatorEnv = file => { operatorFixture.file = file; return {}; };
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as redTeamQueue from '../red-team-dispatch-queue.mjs';
 import { dirname, join } from 'node:path';
@@ -725,7 +725,8 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why }] });
     };
     skip(undefined);
-    expect(f.queue.entries()[0].blockedReason).toBeUndefined();
+    expect(f.queue.entries()[0].blocked).toBeUndefined(); // a reasonless skip is never recorded (fail open)
+    expect(f.logs.join('\n')).toContain('redteam-skip-unreasoned');
     const why = 'later verdict or hold supersedes acceptance';
     skip(why); skip(why);
     expect(f.open().entries()[0]).toMatchObject({ blocked: 'planner-skip', blockedReason: why });
@@ -1085,7 +1086,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     const persistedBlocked = (f, reason, runnable = []) => {
       f.files.set(f.file, JSON.stringify(candidates([1, 2, 3, 4, 5, ...runnable]).map(c => ({
         key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
-        ...(c.pr <= 5 ? { blocked: reason } : {}),
+        ...(c.pr <= 5 ? { blocked: reason, blockedReason: 'fixture evidence' } : {}),
       }))));
       return f.open();
     };
@@ -1151,10 +1152,10 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       queue.admit(repo, 0, { maxProbes: 2 });
       queue.settle(repo, { notStarted: [1, 2].map(prNumber => ({ prNumber, reason: 'temporary start failure' })) });
       queue.admit(repo, 0, { maxProbes: 2 });
-      queue.settle(repo, { rows: [3, 4].map(prNumber => ({ prNumber, action: 'skip' })) });
+      queue.settle(repo, { rows: [3, 4].map(prNumber => ({ prNumber, action: 'skip', why: 'fixture evidence' })) });
       const maxTurn = Math.max(...queue.entries().map(entry => entry.lastProbeTurn ?? 0));
       queue.admit(repo, 1, { allowProbes: false });
-      queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip' }] });
+      queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'fixture evidence' }] });
       expect(queue.entries().find(entry => entry.pr === 1).lastProbeTurn).toBeGreaterThan(maxTurn);
     });
     it('settlement rebases overflowing turns within its repository before appending new blocks', () => {
@@ -1166,7 +1167,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
       f.files.set(f.file, JSON.stringify([...own, foreign]));
       const reopened = f.open();
       reopened.admit(repo, 2, { allowProbes: false });
-      reopened.settle(repo, { rows: [6, 7].map(prNumber => ({ prNumber, action: 'skip' })) });
+      reopened.settle(repo, { rows: [6, 7].map(prNumber => ({ prNumber, action: 'skip', why: 'fixture evidence' })) });
       expect(reopened.entries().filter(entry => entry.repo === repo).map(entry => entry.lastProbeTurn))
         .toEqual([1, 2, 3, 4, 5, 6, 7]);
       expect(reopened.entries().find(entry => entry.repo === otherRepo)).toEqual(foreign);
@@ -1297,7 +1298,7 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     it.each([-1, 1.5, '1', null])('invalid persisted probe turn %j is corrupt and loads empty', lastProbeTurn => {
       const f = fixture();
       f.files.set(f.file, JSON.stringify([{ key: `${repo}#1`, repo, pr: 1, head: head(1),
-        enqueuedAt: 1, attempts: 0, blocked: 'planner-skip', lastProbeTurn }]));
+        enqueuedAt: 1, attempts: 0, blocked: 'planner-skip', blockedReason: 'fixture evidence', lastProbeTurn }]));
       expect(f.open().entries()).toEqual([]);
       expect(f.logs.some(line => line.includes('invalid persisted entries'))).toBe(true);
     });
@@ -1600,7 +1601,7 @@ function savedProbeQueue({ count = 10, turns } = {}) {
   const ids = Array.from({ length: count }, (_, index) => index + 1);
   f.files.set(f.file, JSON.stringify(candidates(ids).map(c => ({
     key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head, enqueuedAt: 1, attempts: 0,
-    blocked: c.pr % 2 ? 'review-unfinished' : 'planner-skip',
+    blocked: c.pr % 2 ? 'review-unfinished' : 'planner-skip', blockedReason: 'fixture evidence',
     ...(turns ? { lastProbeTurn: turns(c.pr) } : {}),
   }))));
   f.queue = f.open();
@@ -2019,23 +2020,66 @@ describe('REDTEAM-STUCK-PENDING', () => {
   });
 });
 
-describe('planner-skip re-request', () => {
-  it('a requested planner-skip head is unblocked and re-probed', () => {
+describe('planner-skip re-request through the queue object', () => {
+  const head = 'a'.repeat(40);
+  const row = (extra = {}) => ({ key: 'o/r#9', repo: 'o/r', pr: 9, head, enqueuedAt: 1, attempts: 0, ...extra });
+  const live = ({ pr }) => ({ state: 'OPEN', comments: [], headRefOid: head, number: pr });
+  const withDir = run => {
     const dir = mkdtempSync(join(tmpdir(), 'rt-reprobe-'));
-    const file = join(dir, 'q.json');
-    const head = 'a'.repeat(40);
-    const row = (extra = {}) => ({ key: 'o/r#9', repo: 'o/r', pr: 9, head, enqueuedAt: 1, attempts: 0, ...extra });
-    const env = { WE_RED_TEAM_QUEUE_FILE: file };
-    try {
-      writeFileSync(file, JSON.stringify([row({ blocked: 'planner-skip', blockedReason: 'later verdict supersedes' })]));
-      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head: 'b'.repeat(40), env })).toEqual({ requested: false });
-      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: true });
-      const queue = createRedTeamDispatchQueue({ file });
-      expect(queue.entries()[0]).toMatchObject({ reprobeReason: 'later verdict supersedes' });
-      expect(queue.entries()[0].blocked).toBeUndefined();
-      expect(queue.admit('o/r', 1).map(e => e.pr)).toEqual([9]);
-      writeFileSync(file, JSON.stringify([row({ blocked: 'review-unfinished' })]));
-      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: false });
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+    try { run({ dir, file: join(dir, 'q.json'), env: { WE_RED_TEAM_QUEUE_FILE: join(dir, 'q.json') } }); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  it('a requested planner-skip head is unblocked and re-probed', () => withDir(({ file, env }) => {
+    const text = JSON.stringify([row({ blocked: 'planner-skip', blockedReason: 'later verdict supersedes', lastProbeTurn: 5 }),
+      row({ key: 'o/r#10', pr: 10, head, blocked: 'planner-skip', blockedReason: 'x', lastProbeTurn: 2 })]);
+    writeFileSync(file, text);
+    const queue = createRedTeamDispatchQueue({ file, readLivePr: live });
+    expect(redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: true });
+    expect(readFileSync(file, 'utf8')).toBe(text); // the requester never writes the queue file
+    queue.reconcile({ readLivePr: live });
+    // the RUNNING queue object holds the request: front of the probe order, still bounded, not a runnable bypass
+    expect(queue.entries().find(e => e.pr === 9)).toMatchObject({ blocked: 'planner-skip', lastProbeTurn: 0, reprobeReason: 'later verdict supersedes' });
+    expect(queue.admit('o/r', 0, { maxProbes: 0 })).toEqual([]);
+    expect(queue.admit('o/r', 0, { maxProbes: 1 }).map(e => e.pr)).toEqual([9]);
+  }));
+
+  it('a second request on the same head is deduped across gate sources, restarts and consumption', () => withDir(({ file, env }) => {
+    writeFileSync(file, JSON.stringify([row({ blocked: 'planner-skip', blockedReason: 'r', lastProbeTurn: 1 })]));
+    expect(redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: true });
+    expect(redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head, env })).toMatchObject({ requested: false, deduped: true });
+    createRedTeamDispatchQueue({ file, readLivePr: live }).reconcile({ readLivePr: live }); // consumed
+    expect(redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head, env })).toMatchObject({ requested: false, deduped: true });
+    expect(redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head: 'c'.repeat(40), env })).toEqual({ requested: true });
+  }));
+
+  it('a request for a head whose block is not a reasoned planner-skip changes nothing', () => withDir(({ file, env }) => {
+    writeFileSync(file, JSON.stringify([row({ blocked: 'review-unfinished', blockedReason: 'review of this head has not finished', lastProbeTurn: 3 })]));
+    const queue = createRedTeamDispatchQueue({ file, readLivePr: live });
+    redTeamQueue.requestRedTeamReprobe({ repo: 'o/r', pr: 9, head, env });
+    queue.reconcile({ readLivePr: live });
+    expect(queue.entries()[0]).toMatchObject({ blocked: 'review-unfinished', lastProbeTurn: 3 });
+    expect(queue.entries()[0].reprobeReason).toBeUndefined();
+  }));
+});
+
+describe('a skip cannot exist without a reason (complete mediation)', () => {
+  it('the one writer throws without a closed-list code or without evidence', () => {
+    const entry = {};
+    for (const bad of [undefined, {}, { code: 'planner-skip' }, { code: 'planner-skip', evidence: '  ' }, { evidence: 'why' },
+      { code: 'made-up', evidence: 'why' }]) expect(() => redTeamQueue.writeBlock(entry, bad)).toThrow(/reason code/);
+    expect(entry.blocked).toBeUndefined();
+    expect(redTeamQueue.writeBlock(entry, { code: 'planner-skip', evidence: 'superseded' })).toBe(true);
+    expect(entry).toMatchObject({ blocked: 'planner-skip', blockedReason: 'superseded' });
+  });
+
+  it('a stored skip with no reason is treated as not skipped and logged redteam-skip-unreasoned', () => {
+    const f = fixture();
+    f.files.set(f.file, JSON.stringify(candidates([1, 2]).map(c => ({ key: `${repo}#${c.pr}`, repo, pr: c.pr, head: c.head,
+      enqueuedAt: 1, attempts: 0, blocked: 'planner-skip', lastProbeTurn: 1 }))));
+    const queue = f.open();
+    expect(queue.entries().every(entry => entry.blocked === undefined)).toBe(true);
+    expect(queue.admit(repo, 2, { maxProbes: 0 }).map(e => e.pr)).toEqual([1, 2]); // runnable, so the red team runs
+    expect(f.logs.filter(line => line.includes('redteam-skip-unreasoned'))).toHaveLength(2);
   });
 });
