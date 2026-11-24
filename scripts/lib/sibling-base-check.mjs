@@ -1,10 +1,10 @@
-import { laneHistoryProofEnv } from './lane-git-hardening.mjs';
+import { laneHistoryProofEnv, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 
 /** Read-only ancestry/patch evidence. Returns sibling counts, or an unreadable refusal. */
 export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = '', openPrs }) {
   try {
     const read = args => git(args, { timeout: 5000, maxBuffer: 8 * 1024 * 1024,
-      env: laneHistoryProofEnv({ ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' }) });
+      env: laneHistoryProofEnv(scrubInheritedGitEnv(process.env)) });
     const oid = value => {
       if (!/^[a-f0-9]{40}$/.test(value)) throw new Error('invalid commit identity');
       return value;
@@ -53,7 +53,7 @@ export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = ''
     const siblings = [];
     for (const pr of openPrs) {
       const sibling = pin(pr.headRefOid);
-      if (base !== 'main' && base === pr.headRefName) continue;
+      if (base !== 'main' && base === pr.headRefName && pr.isCrossRepository === false) continue;
       // A child's shared commits came from this branch, including before a parent review fix.
       // Follow declared bases so deeper stacks work without trusting fork branch-name collisions.
       if (descendants.has(pr.number)) continue;

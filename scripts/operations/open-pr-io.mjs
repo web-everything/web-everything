@@ -25,6 +25,8 @@ import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
 import { checkSiblingBase } from '../lib/sibling-base-check.mjs';
 import { runGhSync, WE_GH_READ_MEMO_DIR } from '../lib/gh-throttle.mjs';
 import { ghRepoSlug } from '../lib/constellation-repos.mjs';
+import { repoSlugFromRemote } from '../lib/lane-verify.mjs';
+import { laneHistoryProofEnv, scrubInheritedGitEnv } from '../lib/lane-git-hardening.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim, isDaemonCaller } from '../lib/gh-app-shim.mjs';
@@ -140,13 +142,18 @@ export { createPrDiffStatReader, OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines
 import { createGitReader } from '../lib/pr-size-admission.mjs';
 
 /** One bounded, complete open-PR read; the checker never guesses at missing evidence. */
-export function readSiblingBase({ cwd, env, branch, ...opts }, gh = runGhSync) {
+export function readSiblingBase({ cwd, env, branch, git = createGitReader(cwd), ...opts }, gh = runGhSync) {
   const freshEnv = { ...(env ?? process.env), [WE_GH_READ_MEMO_DIR]: '' };
-  const prs = JSON.parse(gh(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,headRepositoryOwner,isCrossRepository'],
+  const repo = ghRepoSlug(repoSlugFromRemote(git(['remote', 'get-url', 'origin'], {
+    timeout: 5000, maxBuffer: 8 * 1024 * 1024,
+    env: laneHistoryProofEnv(scrubInheritedGitEnv({ ...process.env, ...env })),
+  })));
+  const owner = repo.split('/')[0].toLowerCase();
+  const prs = JSON.parse(gh(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,headRepositoryOwner,isCrossRepository'],
     { cwd, env: freshEnv, throttle: { env: freshEnv }, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   if (!Array.isArray(prs) || prs.length >= 1000) throw new Error('Open PR listing may be incomplete (1000 PR limit); ask a human to inspect the sibling history.');
-  return checkSiblingBase({ ...opts, branch, openPrs: prs.filter(pr => !(pr?.headRefName === branch
-    && pr.isCrossRepository === false && pr.headRepositoryOwner?.login?.toLowerCase() === ghRepoSlug('we').split('/')[0].toLowerCase())) });
+  return checkSiblingBase({ ...opts, git, branch, openPrs: prs.filter(pr => !(pr?.headRefName === branch
+    && pr.isCrossRepository === false && pr.headRepositoryOwner?.login?.toLowerCase() === owner)) });
 }
 
 /**

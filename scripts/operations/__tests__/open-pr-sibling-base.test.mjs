@@ -16,6 +16,7 @@ function fixture() {
   git('init', '-b', 'main');
   git('config', 'user.email', 'fixture@example.test');
   git('config', 'user.name', 'Fixture');
+  git('remote', 'add', 'origin', `https://github.com/${ghRepoSlug('we')}.git`);
   const commit = name => {
     writeFileSync(join(dir, name), name + '\n');
     git('add', name); git('commit', '-m', name);
@@ -92,6 +93,17 @@ describe('sibling base admission', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/237'); f.commit('child');
     expect(f.check({ base: pr.headRefName })).toEqual([]);
+  });
+
+  it.each([true, undefined])('does not exempt a declared-base name collision without same-repository proof (%s)', isCrossRepository => {
+    const f = fixture(), parent = f.sibling(236), fork = f.sibling(237);
+    f.commit('child');
+    const evidence = { ...fork, isCrossRepository };
+    const expected = [{ number: fork.number, headRefName: parent.headRefName, count: 1 }];
+    expect(f.check({ base: parent.headRefName, openPrs: [{ ...evidence, headRefName: parent.headRefName }] }))
+      .toEqual(expected);
+    expect(f.check({ base: parent.headRefName, openPrs: [evidence] }))
+      .toEqual([{ ...expected[0], headRefName: fork.headRefName }]);
   });
 
   it.each([false, true])('allows updating a parent with an open stacked child (review fix: %s)', reviewFix => {
@@ -187,7 +199,7 @@ describe('sibling base admission', () => {
 
   it('reads open PRs once with the runner env and excludes this ref', () => {
     const f = fixture(); f.sibling(236); f.commit('child');
-    const env = { PATH: 'fixture-path' };
+    const env = { PATH: process.env.PATH };
     const gh = vi.fn(() => JSON.stringify([...f.openPrs,
       { number: 237, headRefName: 'lane/child', headRefOid: 'missing-self-is-excluded',
         isCrossRepository: false, headRepositoryOwner: { login: ghRepoSlug('we').split('/')[0] } }]));
@@ -196,6 +208,59 @@ describe('sibling base admission', () => {
     expect(gh).toHaveBeenCalledOnce();
     expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid,baseRefName,headRepositoryOwner,isCrossRepository'],
       expect.objectContaining({ cwd: f.dir, env: { ...env, WE_GH_READ_MEMO_DIR: '' }, timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+  });
+
+  it.each([
+    ['we', 'https://github.com/web-everything/web-everything.git'],
+    ['frontierui', 'git@github.com:frontier-ui/frontierui.git'],
+    ['plateau-app', 'ssh://git@github.com:443/plateauapp/plateau-app.git'],
+    ['frontierui', 'https://github.com/chalbert/frontierui.git'],
+  ])('uses the target checkout repository for listing and self-exclusion (%s, %s)', (key, remote) => {
+    const f = fixture(), pr = f.sibling(236), slug = ghRepoSlug(key);
+    f.git('remote', 'set-url', 'origin', remote);
+    const owner = slug.split('/')[0];
+    const gh = vi.fn(() => JSON.stringify([
+      { ...pr, number: 237, headRefName: 'lane/child', headRefOid: 'excluded-self',
+        headRepositoryOwner: { login: owner.toUpperCase() } },
+      { ...pr, headRepositoryOwner: { login: owner } },
+      { ...pr, number: 238, headRefName: 'lane/child', isCrossRepository: true,
+        headRepositoryOwner: { login: owner } },
+      { ...pr, number: 239, headRefName: 'lane/child', headRepositoryOwner: { login: 'other-owner' } },
+    ]));
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, gh);
+    const result = runner(f, { siblingBase })({ argv: ['--ref=lane/child', '--check'] });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('#236');
+    expect(result.detail).toContain('#238');
+    expect(result.detail).toContain('#239');
+    expect(result.detail).not.toContain('#237');
+    expect(gh).toHaveBeenCalledOnce();
+    expect(gh.mock.calls[0][0]).toContain(slug);
+  });
+
+  it.each([null, '/local/repo', 'https://example.test/owner/repo.git'])('fails closed before listing when the checkout repository is unreadable (%s)', remote => {
+    const f = fixture(), gh = vi.fn(() => '[]');
+    if (remote === null) f.git('remote', 'remove', 'origin');
+    else f.git('remote', 'set-url', 'origin', remote);
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, gh);
+    expect(runner(f, { siblingBase })({ argv: ['--ref=lane/child', '--check'] }))
+      .toMatchObject({ outcome: 'refused', reason: 'sibling-base-unreadable' });
+    expect(gh).not.toHaveBeenCalled();
+  });
+
+  it('keeps repository selection and ancestry in the target checkout despite inherited Git overrides', () => {
+    const f = fixture(), decoy = fixture(), pr = f.sibling(236);
+    f.git('remote', 'set-url', 'origin', `https://github.com/${ghRepoSlug('frontierui')}.git`);
+    const gh = vi.fn(() => JSON.stringify([pr]));
+    const inherited = { GIT_DIR: join(decoy.dir, '.git'), GIT_WORK_TREE: decoy.dir,
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'remote.origin.url',
+      GIT_CONFIG_VALUE_0: `https://github.com/${ghRepoSlug('plateau-app')}.git` };
+    try {
+      Object.entries(inherited).forEach(([key, value]) => vi.stubEnv(key, value));
+      expect(readSiblingBase({ cwd: f.dir }, gh))
+        .toEqual([{ number: pr.number, headRefName: pr.headRefName, count: 1 }]);
+      expect(gh.mock.calls[0][0]).toContain(ghRepoSlug('frontierui'));
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it.each([true, undefined])('retains a same-name PR without same-repository proof (cross-repository: %s)', isCrossRepository => {
