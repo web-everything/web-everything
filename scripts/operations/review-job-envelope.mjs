@@ -17,6 +17,7 @@
  * (no `tooling-defect` / `permission-wall` kind is produced here), so no draft sink is wired.
  */
 import { finishEnvelopeRecord, newEnvelopeRecord } from './completion-record.mjs';
+import { shadowReviewStep } from '../lib/flow-engine/shadow.mjs';
 import { resolveCompletionsDir, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { routeWorkerResult, settleWorkerResult } from './worker-result-router.mjs';
 
@@ -68,7 +69,7 @@ export function writeReviewJobStarted({ session, pr, pid = process.pid, timeoutM
  * Write the job's v2 `done` record: the checked result, the routed action, and the v1 words unchanged.
  * @param {{session: string, pr: number|string, repo?: string, classified: object, pid?: number, timeoutMs?: number, dir?: string, now?: () => string}} o
  */
-export function writeReviewJobDone({ session, pr, repo = null, classified, pid = process.pid, timeoutMs = null, dir = resolveCompletionsDir(), now } = {}) {
+export function writeReviewJobDone({ session, pr, repo = null, classified, pid = process.pid, timeoutMs = null, dir = resolveCompletionsDir(), now, flowShadow = shadowReviewStep } = {}) {
   const clock = now ?? (() => new Date().toISOString());
   return withCompletionLock(session, () => {
     let started = null;
@@ -89,6 +90,8 @@ export function writeReviewJobDone({ session, pr, repo = null, classified, pid =
       label: classified?.label ? String(classified.label).slice(0, 500) : null,
     };
     writeCompletion(rec, dir);
+    // Observe only AFTER the actual durable result. No shadow value enters the result or router.
+    try { Promise.resolve(flowShadow(structuredClone({ repo, pr, classified }))).catch(() => {}); } catch { /* shadow never affects the tick */ }
     return rec;
   }, { dir });
 }

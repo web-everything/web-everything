@@ -10,7 +10,7 @@ import { prepareRebuild, readOverlayEventLog } from '../prepare.mjs';
 import * as feed from '../../../operations/needs-you-feed.mjs';
 import * as planner from '../plan.mjs';
 import * as detector from '../overlay-prune.mjs';
-import { readRebuildState } from '../state.mjs';
+import { readRebuildState, writeRebuildState } from '../state.mjs';
 import * as localState from '../local-state.mjs';
 import * as repair from '../../lane-repair.mjs';
 import * as fetcher from '../edge-fetch.mjs';
@@ -303,6 +303,7 @@ describe('finalize during an unsettled drop', () => {
   });
   it('the health-watch rollback to last-good still finalizes while a drop is pending', async () => {
     stubPrepare(); writePending('pending');
+    writeRebuildState(root, { adopted: { head: newSha, applied: [], at: new Date(0).toISOString() } }, env);
     const calls = [];
     const run = args => { calls.push(args); return { status: 0, stdout: args[0] === 'rev-parse' ? headSha : '' }; };
     const result = await finalizeRebuild({ root, env, run, now: () => 0, plan: { ok: true, finalSha: newSha, mainSha, inputsKey: 'k', applied: [{ ref, sha: sha('9') }] }, prevHead: headSha, lease: { token: 'force-adopt-rollback' } });

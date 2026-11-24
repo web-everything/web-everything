@@ -79,6 +79,7 @@ import {
  * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
  */
 export async function guardedRegister({ root, ref, pr, env, gate, register }) {
+  if (ref?.startsWith('hotpatch/')) return { registered: false, reason: 'hotpatch-requires-daemon-overlay-add' };
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
   const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {

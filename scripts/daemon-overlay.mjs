@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { admitHotpatch } from './lib/hotpatch-guards.mjs';
+import { createHotpatchReaders } from './lib/hotpatch-readers.mjs';
 /**
  * @file scripts/daemon-overlay.mjs
  * Pinned remove/retire publishes a durable rebuild request for the clone owner; unpinned withdrawals do not.
@@ -502,6 +504,14 @@ export function removeRegistration({ root, ref, expectedTip, by = null, reason =
   return result;
 }
 
+/** Shared automatic withdrawal: stack proof, entry guard, durable intent and post-drop tip check. */
+export async function withdrawRegistration({ root, ref, expectedTip, reason = 'hotpatch-flow', env = process.env, deps = {}, ...options }) {
+  const result = await retireRegistration({ root, ref, expectedTip, env, ...options, deps: { ...deps,
+    prove: () => proveOverlayWithdrawal({ root, ref, tip: expectedTip, reason, env, git: deps.git }),
+  } });
+  return { ...result, removed: result.retired === true };
+}
+
 /** Shared explicit/urgent withdrawal proof. Call under the add guard; cached stacks alone cannot prove independence. */
 export function proveOverlayWithdrawal({ root, ref, tip, reason, env = process.env, git = (...args) => {
   const result = spawnSync('git', args, { cwd: root, env, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
@@ -642,6 +652,7 @@ export async function retireRegistration({ root, ref, expectedTip, expectedEntry
  * `deps` ({contain, check, tip, afterDrop}) is a test seam.
  */
 export async function replaceRegistration({ root, ref, old, expectedSha, pr = null, by = null, reason = null, pinned, env = process.env, checkOnly = false, deps = {} }) {
+  if (ref?.startsWith('hotpatch/')) return { ok: false, refused: 'hotpatch-replace-forbidden', code: 3 };
   const contain = deps.contain ?? (() => proveReplaceContainment({ root, oldRef: old, newRef: ref, expectedSha, env }));
   const conflictCheck = deps.check ?? ((existingOverlays) => stackAwareOverlayCheck({ root, ref, pr, existingOverlays, env }));
   const tip = deps.tip ?? ((r) => remoteTip({ root, ref: r, env }));
@@ -881,7 +892,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (cmd === 'approve-edge' && typeof flags.sha !== 'string') {
     return fail('--sha=<full 40-hex tip of origin/edge/<ref>> is required for approve-edge');
   }
-  if (cmd === 'add' && Object.hasOwn(flags, 'expected-sha') && !/^[a-f0-9]{40}$/.test(flags['expected-sha'])) {
+  if (['add', 'remove'].includes(cmd) && Object.hasOwn(flags, 'expected-sha') && !/^[a-f0-9]{40}$/.test(flags['expected-sha'])) {
     return fail('--expected-sha=<full lowercase 40-hex approved tip> is required when supplied');
   }
 
@@ -954,7 +965,14 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     const runGuard = async () => {
       const overlayState = readOverlayState(root, { env });
       if (overlayState.corrupt) return { ok: false, reason: 'overlay-store-corrupt', corruptStore: true };
+      const hotpatchSha = flags.ref.startsWith('hotpatch/') ? flags.ref.slice(9) : null;
+      if (hotpatchSha !== null) {
+        const admission = await admitHotpatch(hotpatchSha, deps.hotpatchReaders ?? createHotpatchReaders({ cwd: root, env }));
+        if (admission.outcome !== 'pass') return { ok: false, reason: admission.detail, admission };
+        if (flags['expected-sha'] && flags['expected-sha'] !== hotpatchSha) return { ok: false, reason: 'hotpatch-ref-sha-mismatch' };
+      }
       const check = await stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      if (check.ok && hotpatchSha !== null && check.candSha !== hotpatchSha) return { ...check, ok: false, reason: 'hotpatch-ref-sha-mismatch' };
       // Compare the guard's fetched candidate INSIDE the add lock, before any registration write.
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
@@ -1115,8 +1133,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     output = await recoverDrops({ root, env, by });
     if (output.pending.length) process.exitCode = 3;
   } else if (cmd === 'remove') {
-    const viewerLogin = reason?.trim() ? await readOverrideViewerLogin() : null;
-    output = removeRegistration({ root, ref: flags.ref, by, reason, env, deps: { viewerLogin: () => viewerLogin } });
+    if (flags['expected-sha']) {
+      output = await (deps.withdrawRegistration ?? withdrawRegistration)({ root, ref: flags.ref, expectedTip: flags['expected-sha'], by, reason, env });
+    } else {
+      const viewerLogin = reason?.trim() ? await readOverrideViewerLogin() : null;
+      output = removeRegistration({ root, ref: flags.ref, by, reason, env, deps: { viewerLogin: () => viewerLogin } });
+    }
+    if (output.refused) process.exitCode = 3;
   } else if (cmd === 'approve-edge') {
     // The ONLY way an `origin/edge/<ref>` branch becomes adoptable by a rebuild: record actor + exact tip sha on
     // the registered overlay. A malformed sha, a missing actor or an unregistered ref is a usage error (exit 2).
