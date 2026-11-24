@@ -758,16 +758,20 @@ export function extractPassTimings(stderr) {
 
 const STDERR_LINE_MAX = 200;
 const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
-const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred/i;
+const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
+const URL_USERINFO = /:\/\/[^/\s]*@/;
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
-  const line = String(stderr ?? '').split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim()).find(Boolean);
+  const raw = String(stderr ?? '');
+  const line = raw.split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim()).find(Boolean);
   if (!line) return '';
-  if (SECRET_LINE.test(line)) return '[redacted]';
+  if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
+  // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
   for (const [k, v] of Object.entries(env ?? {})) {
-    if (SECRET_ENV_KEY.test(k) && typeof v === 'string' && v.length >= 6 && line.includes(v)) return '[redacted]';
+    if (!SECRET_ENV_KEY.test(k) || typeof v !== 'string') continue;
+    for (const part of v.split(/\r?\n/)) if (part.trim().length >= 3 && raw.includes(part)) return '[redacted]';
   }
   return line.length > STDERR_LINE_MAX ? `${line.slice(0, STDERR_LINE_MAX)}...` : line;
 }

@@ -448,7 +448,10 @@ describe('createEnqueueOnEvent', () => {
     children[0].stderr.emit('data', stderr);
     children[0].emit('close', code);
     const [result] = await tick;
+    // Deliberate change: only the sanitised first line may appear; the rest of stderr stays private.
+    expect(JSON.stringify({ result, lines })).not.toContain(stderr);
     expect(JSON.stringify({ result, lines })).not.toContain('second line must stay hidden');
+    expect(lines.find(line => line.includes('fast drain exit'))).toContain('first error: opaque diagnostic text');
     expect(lines.find(line => line.includes('fast drain exit'))).toContain('exit ' + code + ', ' + stderr.length + 'B stderr, class=unknown');
     expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
   });
@@ -470,8 +473,14 @@ describe('createEnqueueOnEvent', () => {
   it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {
     expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
     expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
-    expect(enqueueModule.firstStderrErrorLine('boom configured-env-secret', { SERVICE_SECRET: 'configured-env-secret' })).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('')).toBe('');
+    expect(enqueueModule.firstStderrErrorLine('fetch https://alice:hunter2@example.test failed')).toBe('[redacted]');
+    // Env-value redaction only (none of these match the pattern blacklist), including short, opaque, multiline and tab values.
+    expect(enqueueModule.firstStderrErrorLine('boom abc12', { SERVICE_TOKEN: 'abc12' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom zq81xk', { DATABASE_URL: 'zq81xk' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom line-one-xyz\nline-two-xyz', { DB_CONN: 'line-one-xyz\nline-two-xyz' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom a\tb-cred', { DB_CONN: 'a\tb-cred' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom ok', { DB_CONN: 'other-value' })).toBe('boom ok');
   });
 
   it('does not trust an enqueue-success JSON result from a nonzero-exit child', async () => {
