@@ -20,7 +20,7 @@ export async function exercise(root) {
     comments.push(trusted(a.at(-1), 'IC_answer')); return 'posted';
   };
   try {
-    runStandDownAnswer(['7281', '--repo=web-everything/web-everything', '--reason=Review the current head', '--actor=chalbert', '--channel=Codex chat', '--disposition=rearm-review'], { gh });
+    runStandDownAnswer(['7281', '--repo=owner/name', '--reason=Review the current head', '--actor=chalbert', '--channel=Codex chat', '--disposition=rearm-review'], { gh });
     return { violations: rearmWindow(comments).rearmed ? [] : ['guard ignored the posted answer'] };
   } catch (e) { return { violations: [e.message] }; }
 }

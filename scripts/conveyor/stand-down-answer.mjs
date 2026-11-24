@@ -73,8 +73,9 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   // Validate the ceremony before any IO. --reason is deliberately never trimmed or paraphrased.
   buildOperatorAnswer({ standDownId: 'validation', ...flags });
   let snapshot;
+  const readSnapshot = () => JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits,headRefOid']));
   try {
-    snapshot = JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits,headRefOid']));
+    snapshot = readSnapshot();
   } catch (error) {
     throw new Error(`Could not read comments for ${flags.repo} PR #${pr}: ${String(error.message || error).split(/[\r\n]/)[0]}`);
   }
@@ -106,7 +107,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
   const verify = (posted = false) => {
-    const fresh = JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits,headRefOid']));
+    const fresh = readSnapshot();
     if (!Array.isArray(fresh.comments) || fresh.headRefOid !== snapshot.headRefOid
       || fresh.comments.length !== snapshot.comments.length + Number(posted)
       || String(fresh.comments.findLast(isTerminalStandDown)?.id) !== String(target.id)) {
