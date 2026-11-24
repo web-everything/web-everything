@@ -38,6 +38,48 @@ describe('deps job import walker', () => {
     expect(packageChains('e.mjs', () => source)).toEqual(expected);
   });
 
+  it.each([
+    "(() => import('ext'))();",
+    "(() => require('ext'))();",
+    "(async () => import('ext'))();",
+    "((() => (import('ext'))))();",
+    "(() => (() => import('ext'))())();",
+    "import { createRequire } from 'node:module'; (() => createRequire(import.meta.url)('ext'))();",
+    "((x = import('ext')) => {})();",
+    "(function (x = require('ext')) {})();",
+    "(async (x = import('ext')) => {})();",
+    "(({ x = import('ext') } = {}) => {})();",
+    "(function ([x = require('ext')] = []) {})();",
+    "((x = (() => import('ext'))()) => {})();",
+  ])('catches loads in invoked function bodies and defaults: %s', source => {
+    expect(packageChains('e.mjs', () => source)).toEqual(['e.mjs -> ext']);
+  });
+
+  it.each([
+    "const lazy = () => import('ext');",
+    "function lazy(x = import('ext')) {}",
+    "const lazy = (x = require('ext')) => {};",
+    "(() => () => import('ext'))();",
+    "((x = () => import('ext')) => {})();",
+  ])('leaves uncalled function bodies and defaults lazy: %s', source => {
+    expect(packageChains('e.mjs', () => source)).toEqual([]);
+  });
+
+  it.each([
+    "(() => import('./rule.mjs'))();",
+    "((x = import('./rule.mjs')) => {})();",
+  ])('follows relative loads from IIFEs through the import chain: %s', entry => {
+    const files = { 'entry.mjs': entry, 'rule.mjs': "import 'ext';" };
+    expect(packageChains('entry.mjs', p => files[p])).toEqual(['entry.mjs -> rule.mjs -> ext']);
+  });
+
+  it.each([
+    '(() => import(name))();',
+    '((x = require(name)) => {})();',
+  ])('reports non-literal IIFE loads as unknown: %s', source => {
+    expect(packageChains('e.mjs', () => source)).toEqual(['e.mjs -> <non-literal specifier>']);
+  });
+
   it('passes on the current tree', () => {
     expect(b.judge(b.run({}))).toEqual([]);
   });

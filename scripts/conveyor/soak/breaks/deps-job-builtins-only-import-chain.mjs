@@ -45,10 +45,15 @@ function startupSpecifiers(source) {
       if (iife) {
         let fn = callee;
         while (ts.isParenthesizedExpression(fn)) fn = fn.expression;
-        if (ts.isFunctionExpression(fn) || ts.isArrowFunction(fn)) ts.forEachChild(fn.body, visit);
+        if (ts.isFunctionExpression(fn) || ts.isArrowFunction(fn)) {
+          // Defaults (including destructuring defaults) can load modules when the IIFE is called.
+          fn.parameters.forEach(visit);
+          // Visit the body itself: a concise arrow can be a load or another, still-lazy function.
+          visit(fn.body);
+        }
       }
     }
-    // Function bodies run later, so only their IIFEs (handled above) count as startup code.
+    // Uncalled function bodies and defaults run later; IIFEs are handled above.
     if (ts.isFunctionLike(node) && !ts.isSourceFile(node)) return;
     ts.forEachChild(node, visit);
   };
