@@ -1,6 +1,7 @@
 /** Read-only replay: label age survives unrelated PR activity and unknown evidence never clears it. */
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../../../lib/constellation-repos.mjs';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const PATH = 'scripts/conveyor/health-smells/red-team-pending-overdue.mjs';
@@ -38,7 +39,7 @@ export default {
       // Replay a promoted PR whose shared snapshot still says draft and lacks pending.
       // A fresh pending label must never borrow that cached draft status to close its episode.
       const { probePrs } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/health-watch.mjs')).href);
-      const promoted = { ...pr, repo: 'web-everything/web-everything' };
+      const promoted = { ...pr, repo: CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug };
       const promotedOpened = stepEpisodes(emptyHealthState(), [{ smell, results: evaluate([promoted]) }], now).state;
       const rows = probePrs({ now, clock: () => now,
         drainOptions: { env: {}, tool: { redTeamPendingMaxMin: 20 }, platform: {} },
