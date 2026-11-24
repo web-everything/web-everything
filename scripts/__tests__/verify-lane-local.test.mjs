@@ -9,6 +9,7 @@ import { homedir, tmpdir } from 'node:os';
 import { runInNewContext } from 'node:vm';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation, shouldConfirmRemoteRed, remoteInfrastructureFailure } from '../lib/verify-remote-routing.mjs';
 import { shellQuote, isShardWrapperCommand } from '../lib/verify-lane-gate.mjs';
+import { SCAN_FILES_ENV, SCAN_ROOT_ENV } from '../lib/repo-scan-tests.mjs';
 import { runLaneGate } from '../conveyor/verify-dispatch.mjs';
 import localPolicy from '../conveyor/soak/breaks/verify-request-local-policy.mjs';
 import { SHARD_LOCAL_ENV } from '../lib/verify-shard-run.mjs';
@@ -238,7 +239,7 @@ describe('verify-lane --local', () => {
     expect(admissionStart).toBeGreaterThan(-1);
     expect(admissionEnd).toBeGreaterThan(admissionStart);
     const context = {
-      FORCE_LOCAL: true, phaseAdmission, localPhaseReason, phaseAdmissionPlan,
+      FORCE_LOCAL: true, phaseAdmission, fullFallbackGate: false, localPhaseReason, phaseAdmissionPlan,
       decidePhaseRemote: vi.fn(async () => ({ remote: true })),
       acquireSlotBlocking: vi.fn(async () => ({ ok: true, slot: 0, waitedMs: 0 })),
       phaseAdmissionKind: () => ({ kind: 'files' }), classifyCommandKind: () => 'selected',
@@ -307,9 +308,10 @@ describe('verify-lane --local', () => {
         return child;
       });
       const context = {
-        process: { env: { WE_FORGE_GATE_DISPATCH: '1', [SHARD_LOCAL_ENV]: '1' }, stderr: { write: vi.fn() }, pid: 123 },
-        SHARD_LOCAL_ENV,
-        phaseAdmission: true, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation,
+        process: { env: { WE_FORGE_GATE_DISPATCH: '1', [SHARD_LOCAL_ENV]: '1',
+          [SCAN_FILES_ENV]: '["polluted.mjs"]', [SCAN_ROOT_ENV]: '/tmp/polluted-scan-root' }, stderr: { write: vi.fn() }, pid: 123 },
+        SHARD_LOCAL_ENV, SCAN_FILES_ENV, SCAN_ROOT_ENV,
+        phaseAdmission: true, fullFallbackGate: false, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation,
         isShardWrapperCommand,
         shouldConfirmRemoteRed, remoteInfrastructureFailure,
         decidePhaseRemote: vi.fn(async () => ({ remote: true, reason: 'test-remote-policy' })),
@@ -358,6 +360,10 @@ describe('verify-lane --local', () => {
       expect(result.exitCode).toBe(0);
       expect(spawn).toHaveBeenCalledTimes(1);
       const [executed, args, options] = spawn.mock.calls[0];
+      expect(options.env).not.toHaveProperty(SCAN_FILES_ENV);
+      expect(options.env).not.toHaveProperty(SCAN_ROOT_ENV);
+      expect(context.process.env[SCAN_FILES_ENV]).toBe('["polluted.mjs"]');
+      expect(context.process.env[SCAN_ROOT_ENV]).toBe('/tmp/polluted-scan-root');
       if (local) {
         expect(context.admission.ok).toBe(slotOk);
         expect(context.admission.remote).not.toBe(true);
