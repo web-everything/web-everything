@@ -81,6 +81,7 @@ export const SANDBOX_BEARING_FILES = [
   'scripts/codex-direct-task.mjs',
   'scripts/conveyor/health-investigate-dispatch.mjs',
   'scripts/conveyor/health-smells/dispatch-permission-stall.mjs',
+  'scripts/conveyor/referral-auto-rule.mjs',
   'scripts/gemini-direct-task.mjs',
   'scripts/lib/agy-review-juror.mjs',
   'scripts/lib/antigravity-judge-spawn.mjs',

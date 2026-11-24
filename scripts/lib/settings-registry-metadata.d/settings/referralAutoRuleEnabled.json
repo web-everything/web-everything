@@ -1,0 +1,6 @@
+{
+  "description": "Rule open review referrals immediately (card or block, never not-real) when a review seat is free. Env WE_REFERRAL_AUTO_RULE=0 is the kill switch.",
+  "owner": "scripts/settings/referral-auto-rule.json",
+  "changeVia": "pr",
+  "instant": false
+}
