@@ -1872,3 +1872,41 @@ it('wires each review sweep and disk probe into tick and publishes distinct open
     sweepReviewTmp.mockImplementation(real.sweepReviewTmp); probeDiskSpace.mockImplementation(real.probeDiskSpace);
   }
 }, 30000);
+
+
+describe('REDTEAM-STUCK-PENDING probe evidence', () => {
+  const pending = { number: 71, labels: [{ name: 'review:pending' }, { name: 'red-team:pending' }] };
+  it('reads one bounded timeline per non-draft pending PR and selects the latest pending addition', () => {
+    const calls = [];
+    const exec = (_bin, args) => {
+      if (args[1] === 'list') return JSON.stringify([pending, { ...pending, number: 72, isDraft: true },
+        { number: 73, labels: [{ name: 'review:pending' }] }]);
+      calls.push(args);
+      return JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: [
+        { createdAt: '2026-11-20T00:00:00Z', label: { name: 'red-team:pending' } },
+        { createdAt: '2026-11-24T00:00:00Z', label: { name: 'red-team:pending' } },
+        { createdAt: '2026-11-25T00:00:00Z', label: { name: 'other' } },
+      ] } } } } });
+    };
+    const rows = probePrs({ exec, drainOptions: { env: {}, tool: { redTeamPendingMaxMin: 23 }, platform: {} } });
+    expect(calls).toHaveLength(rows.length / 3);
+    expect(calls.every(args => args[0] === 'api' && args.join(' ').includes('last:30,itemTypes:[LABELED_EVENT]'))).toBe(true);
+    expect(rows[0]).toMatchObject({ redTeamPendingSince: '2026-11-24T00:00:00Z', redTeamPendingMaxMin: 23 });
+    expect(rows[1].redTeamPendingSince).toBeNull();
+  });
+  it.each(['throw', 'deferred', 'missing'])('unreadable timeline is unknown: %s', mode => {
+    const rows = probePrs({ exec: (_bin, args) => {
+      if (args[1] === 'list') return JSON.stringify([pending]);
+      if (mode === 'throw') throw new Error('unreadable');
+      return JSON.stringify(mode === 'deferred' ? { deferred: true } : { data: {} });
+    } });
+    expect(rows[0].redTeamPendingSince).toBeNull();
+  });
+  it.each(['limit', 'deferred'])('marks incomplete inventory: %s', mode => {
+    const rows = probePrs({ exec: () => JSON.stringify(mode === 'limit'
+      ? Array.from({ length: 100 }, (_, i) => ({ number: i + 1, labels: [{ name: 'review:pending' }] }))
+      : { deferred: true }) });
+    expect(rows.inventoryComplete).toBe(false);
+    if (rows.length) expect(rows.every(row => row.inventoryComplete === false)).toBe(true);
+  });
+});

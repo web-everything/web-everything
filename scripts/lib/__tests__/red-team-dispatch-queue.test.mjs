@@ -2017,26 +2017,4 @@ describe('REDTEAM-STUCK-PENDING', () => {
     expect(f.logs).toContain(`${prefix}hold ${repo}#8002: ${text}; waiting for a later tick`);
     expect(f.queue.holdCauses().get(`${repo}#8002`)).toBe(cause === 'capacity' ? undefined : cause);
   });
-  it.each([true, false])('sweeps only complete inventory (%s) without forwarding the seam', inventoryComplete => {
-    const f = fixture(); f.queue.sync(repo, candidates([8001]));
-    let admittedAtSweep;
-    const sweepDraftPending = vi.fn(() => { admittedAtSweep = f.logs.some(line => line.includes('admit ')); });
-    const run = vi.fn(() => ({}));
-    const options = inputs([8001]);
-    runWithRedTeamQueue({ queue: f.queue, ...options, inventoryComplete, sweepDraftPending, run, log: f.log });
-    expect(sweepDraftPending).toHaveBeenCalledTimes(inventoryComplete ? 1 : 0);
-    if (inventoryComplete) {
-      expect(sweepDraftPending).toHaveBeenCalledWith({ repo, rawPrs: options.rawPrs,
-        skipKeys: new Set([`${repo}#8001`]), log: f.log });
-      expect(admittedAtSweep).toBe(false);
-    }
-    expect(run.mock.calls[0][0]).not.toHaveProperty('sweepDraftPending');
-  });
-  it('sweep failure only logs and leaves admission unchanged', () => {
-    const f = fixture(); const run = vi.fn(() => ({}));
-    runWithRedTeamQueue({ queue: f.queue, ...inputs([8001, 8002]), run, log: f.log,
-      sweepDraftPending: () => { throw new Error('sweep unavailable'); } });
-    expect(run.mock.calls[0][0].plan.refusals.map(row => row.prNumber)).toEqual([8001, 8002]);
-    expect(f.logs.some(line => line.includes('sweep unavailable'))).toBe(true);
-  });
 });

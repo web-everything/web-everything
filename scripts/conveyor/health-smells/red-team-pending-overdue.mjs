@@ -8,24 +8,30 @@ export default {
   openAfter: 1,
   closeAfter: 1,
   severity: 'medium',
-  action: 'investigate',
-  maxPendingMs: 45 * MINUTE,
-  evaluate({ prs }, { now }) {
+  action: 'alert',
+  // Incomplete inventories (including an empty throttle deferral) cannot clear missing subjects.
+  // Close only on explicit readable evidence, as review-label-missing does.
+  missingSubjectsUnknown: true,
+  evaluate({ prs }, { now, config } = {}) {
     const out = [];
     for (const pr of prs || []) {
       const labels = (pr.labels || []).map(label => typeof label === 'string' ? label : label?.name);
-      if (pr.isDraft === true || !labels.includes('red-team:pending')
-        || labels.includes('red-team:blocked')) continue;
-      // An unreadable timestamp is unknown age, which must alert rather than read as clean.
-      const updated = Date.parse(pr.updatedAt || '');
-      const known = Number.isFinite(updated);
-      const age = known ? Math.max(0, now - updated) : Infinity;
       const subject = `${pr.repo}#${pr.number}@${String(pr.headRefOid || '').slice(0, 7)}`;
+      if (pr.isDraft === true || (pr.labelsValid !== false
+        && (!labels.includes('red-team:pending') || labels.includes('red-team:blocked')))) {
+        out.push({ subject, breach: false });
+        continue;
+      }
+      const since = Date.parse(pr.redTeamPendingSince || '');
+      const maxMin = config?.drain?.redTeamPendingMaxMin ?? pr.redTeamPendingMaxMin;
+      const known = pr.labelsValid !== false && Number.isFinite(since);
+      const age = known ? Math.max(0, now - since) : Infinity;
+      const thresholdKnown = typeof maxMin === 'number' && Number.isFinite(maxMin) && maxMin > 0;
       out.push({
         subject,
-        breach: age >= 2 * this.maxPendingMs,
+        breach: !known || !thresholdKnown || age >= 2 * maxMin * MINUTE,
         measure: { pendingForMin: known ? Math.round(age / MINUTE) : null, head: pr.headRefOid, title: String(pr.title || '').slice(0, 80) },
-        summary: `${subject} has red-team:pending ${known ? `after ${fmtAge(age)} without a PR update` : 'with an unreadable update time'}.`,
+        summary: `${subject} has red-team:pending ${known ? `for ${fmtAge(age)} since the label was added` : 'with unknown label evidence or pending age'}.`,
         recommendation: 'Investigate the red-team queue and review worker; obtain a result for this head before clearing pending.',
       });
     }

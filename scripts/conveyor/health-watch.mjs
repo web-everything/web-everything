@@ -104,6 +104,7 @@ import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-en
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
 import { ghThrottleLockRoot, ghThrottleLogPath, budgetProbeArgs } from '../lib/gh-throttle.mjs';
 import { persistSpendHours } from '../lib/gh-spend.mjs';
+import { readDrainQueueSafety } from '../lib/drain-queue-safety.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readClaudeAuthExpiredInfo, readHungInfo } from './hung-session.mjs';
 import { readJsonlTail } from '../operations/land-advance-io.mjs';
@@ -775,8 +776,10 @@ export function probeRestBudget({ exec = run } = {}) {
   return { limit: j?.limit ?? null, used: j?.used ?? null, remaining: j?.remaining ?? null, reset: j?.reset ?? null };
 }
 
-export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now() } = {}) {
+export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {} } = {}) {
   const out = [];
+  out.inventoryComplete = true;
+  const { redTeamPendingMaxMin } = readDrainQueueSafety({ log: line => console.error(line), ...drainOptions }).value;
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
     // #gh-graphql-budget — the host-shared open-PR snapshot when this is the real `run` (never a test's fake exec).
     // `isDraft` (draft-first PRs, operator-approved 2026-09-27) — already part of `SNAPSHOT_FIELDS`, added here
@@ -787,8 +790,29 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
     const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
     const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
-    const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
+    const inventoryComplete = Array.isArray(listed) && listed.length < 100;
+    if (!inventoryComplete) out.inventoryComplete = false;
+    const rows = Array.isArray(listed) ? listed.slice(0, 100) : [];
+    // Missing subjects remain unknown to the pending smell even when a deferred repo yields zero rows.
+    // Carry completeness on rows too (array metadata may be lost during JSON transport).
     for (const pr of rows) {
+      let redTeamPendingSince = null;
+      if (!pr.isDraft && pr.labels?.some?.(l => l?.name === 'red-team:pending')) {
+        const [owner, name] = slug.split('/');
+        const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr.number)}) {
+          timelineItems(last:30,itemTypes:[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } }
+        } } }`;
+        try {
+          const tail = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`], { timeoutMs: 15_000 }));
+          if (!tail.errors?.length) {
+            const events = tail?.data?.repository?.pullRequest?.timelineItems?.nodes;
+            const pending = Array.isArray(events) ? events.filter(e => e?.label?.name === 'red-team:pending') : [];
+            // Timeline nodes are chronological; an unreadable latest event remains unknown.
+            const latest = pending.at(-1)?.createdAt;
+            if (Number.isFinite(Date.parse(latest))) redTeamPendingSince = latest;
+          }
+        } catch { /* Unknown age must alert; never substitute updatedAt. */ }
+      }
       // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell — and only a PR
       // whose cached labels hold no `review:*` label can be in breach, so a labelled PR costs no per-PR call
       // (the shared snapshot stays the budgeted path for the common case). The labelled row still reports a clean
@@ -805,7 +829,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
             ...(exec !== run ? { exec: args => exec('gh', args) } : {}) }) };
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
-        reviewObservation,
+        reviewObservation, redTeamPendingSince, redTeamPendingMaxMin, inventoryComplete,
         repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
         isDraft: !!pr.isDraft,
         mergeable: pr.mergeable ?? null,
