@@ -2,7 +2,7 @@
 import {createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {inspect} from 'node:util';
 import {runInNewContext} from 'node:vm';
-import {describe,expect,it} from 'vitest';
+import {describe,expect,it,vi} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
 import {scanBundleRange} from '../remote-git-bundle.mjs';
@@ -470,7 +470,6 @@ const timeOf=content=>{
   keyStructureFinding(content);
   return Number(process.hrtime.bigint()-start)/1e6;
 };
-const best=content=>Math.min(timeOf(content),timeOf(content),timeOf(content));
 
 describe('Forge key structure rescope: DSA and linear scan',()=>{
   it('blocks the red-team DSA layout in raw, base64 and hex form',()=>{
@@ -490,9 +489,27 @@ describe('Forge key structure rescope: DSA and linear scan',()=>{
   });
   it('scans repeated comment openers in linear time',()=>{
     const cases=[n=>'/* '+keyType+' '+'{/*'.repeat(n)+'*/',n=>'{/* '.repeat(n)];
-    for(const make of cases) {
-      const small=best(Buffer.from(make(7500))),large=best(Buffer.from(make(15000)));
-      expect(large/Math.max(small,1)).toBeLessThan(3.2);
+    const indexOf=String.prototype.indexOf;
+    for(const make of cases)for(const size of [7500,15000]) {
+      const text=make(size);
+      let calls=0,searched=0,finding;
+      // Count the actual comment-close search spans. Re-scanning each remaining
+      // tail is quadratic even if a fast or busy runner hides it in wall time.
+      const spy=vi.spyOn(String.prototype,'indexOf').mockImplementation(function(needle,from=0) {
+        const end=indexOf.call(this,needle,from);
+        if(needle==='*/') {
+          calls++;
+          searched+=(end<0?this.length:end+needle.length)-from;
+        }
+        return end;
+      });
+      try {finding=keyStructureFinding(Buffer.from(text));}
+      finally {spy.mockRestore();}
+      expect(finding).toBeNull();
+      expect(calls).toBeGreaterThan(0);
+      // A closed comment has both its original view and its unwrapped body;
+      // an unclosed comment has only the original view. Each may scan once.
+      expect(searched).toBeLessThanOrEqual(2*text.length);
     }
   });
   it('finishes 30,000 repetitions well under 4 s',()=>{
