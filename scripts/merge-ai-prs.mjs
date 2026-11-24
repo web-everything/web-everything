@@ -167,7 +167,7 @@ import { healNnnCollision } from './lib/nnn-collision-heal.mjs';
 // fingerprint reader (`parseReviewedDiff`), #2832/#984's hold-invariant helpers (`READY_TO_MERGE_LABEL`,
 // `isReviewHoldLabel`, `decideParkReadyStrip`), #2890's null-contract diff mapper (`diffHunksFrom`), and
 // #x9xqexm's contribution fingerprint reader (`parseReviewedContribution`). None supersedes another.
-import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewGate, acceptanceCoversHead, REVIEW_LABELS, REVIEW_LABEL_META, reconcileEscalationReasonBlock, decideDurableEscalationRecord, bodyHasEscalationReason, shouldApplyReviewLabel, hasUnclearedReviewLabel, hasReviewLabel, parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, parseLatestHumanClearedSha, shouldReparkForTestTampering, buildClearanceRevocationComment, READY_TO_MERGE_LABEL, isReviewHoldLabel, decideParkReadyStrip, isEngineTierPath,
+import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewGate, acceptanceCoversHead, REVIEW_LABELS, REVIEW_LABEL_META, reconcileEscalationReasonBlock, decideDurableEscalationRecord, bodyHasEscalationReason, shouldApplyReviewLabel, hasUnclearedReviewLabel, hasReviewLabel, parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, parseLatestHumanClearedSha, shouldReparkForTestTampering, shouldReparkForUnverifiedDiff, buildClearanceRevocationComment, READY_TO_MERGE_LABEL, isReviewHoldLabel, decideParkReadyStrip, isEngineTierPath,
   // #2766/#2767 — the mutual-exclusivity park decision (imported HERE, the leaf module, never from
   // `review-set-label.mjs`, which itself imports `computeNetDiffText` FROM this file — a back-import would
   // be a circular module cycle). `review-set-label.mjs` re-exports both for discoverability under the
@@ -6896,7 +6896,25 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
       // R1105: incomplete/head-mismatched evidence is an additional hold, never
       // clearance evidence. Leave the existing human-clearance decision unchanged.
-      if (!v.workflowHoldRepark && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
+      // CLEAR-HUMAN-NOT-STICKY — an UNVERIFIED net diff (no sibling clone, unscored, incomplete evidence) used to park
+      // `review:human` on every pass even beside a recorded `--to=clear-human` on this very head (live: frontierui #53).
+      // The recorded clearance bound to the EXACT live head (and the head this pass pinned) now honours it; a new head,
+      // an older clearance, a fetch miss or any real tamper finding keeps the hold (`shouldReparkForUnverifiedDiff`).
+      const unverifiedDiff = netDiffText.scored !== true || gaming.evidenceIncomplete === true;
+      let unverifiedCleared = false;
+      if (unverifiedDiff && !v.workflowHoldRepark && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
+        let liveHead = null;
+        let clearedAt = null;
+        try {
+          const ud = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
+          liveHead = typeof ud.headRefOid === 'string' ? ud.headRefOid : null;
+          clearedAt = parseLatestHumanClearedSha(ud.comments || []);
+        } catch { /* fetch miss → both null → the hold stands (fails closed) */ }
+        unverifiedCleared = !shouldReparkForUnverifiedDiff({ unverified: true, findings: gaming.findings,
+          humanClearedSha: clearedAt, headSha: liveHead, pinnedHeadSha: v.listedHeadSha || v.headSha || null });
+        if (unverifiedCleared && !AS_JSON) process.stderr.write(`  ✔ ${repoTag(v.repo)}${v.num} unverified net diff — human clearance recorded on the live head honoured\n`);
+      }
+      if (!v.workflowHoldRepark && !unverifiedCleared && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
