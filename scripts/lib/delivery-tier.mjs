@@ -20,15 +20,16 @@ const TRUST_CHAIN_FILES = [
   'dispatch-lane-io.mjs', 'runner.mjs', 'supervisor.mjs', 'gate-config.mjs', 'gate-invariants.test.mjs',
 ];
 
-export const NARROWED_NAME_GLOBS = Object.freeze([
-  'scripts/**/*merge*', 'scripts/**/*review*', 'scripts/**/*drain*',
-].map(oldGlob => Object.freeze({
-  oldGlob,
-  newGlobs: Object.freeze(['mjs', 'cjs', 'js', 'ts', 'json', 'sh'].map(ext => `${oldGlob}.${ext}`)),
-})));
+export const NARROWED_NAME_GLOBS = Object.freeze([]);
 
 export const HIGH_MUST_STAY = Object.freeze([
-  ...NARROWED_NAME_GLOBS.flatMap(entry => entry.newGlobs),
+  // Sensitive delivery trees retain broad name protection, regardless of extension.
+  'scripts/**/*merge*', 'scripts/**/*review*', 'scripts/**/*drain*',
+  'scripts/*merge*', 'scripts/*drain*',
+  'prompts/**/*merge*', 'prompts/**/*review*', 'prompts/**/*drain*',
+  'skills-src/**/*merge*', 'skills-src/**/*review*', 'skills-src/**/*drain*',
+  '.claude/**/*merge*', '.claude/**/*review*', '.claude/**/*drain*',
+  '.github/**/*merge*', '.github/**/*review*', '.github/**/*drain*',
   '**/__tests__/*safety*', '**/*safety*.test.*',
   'docs/governance/**', 'docs/**/governance*.md', 'AGENTS.md', 'CLAUDE.md', 'docs/agent/**',
   '**/skills-src/**', 'scripts/conveyor/advisory-label-sweep.mjs', '**/advisory-label-sweep*',

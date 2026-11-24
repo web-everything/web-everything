@@ -85,27 +85,40 @@ describe('delivery tiers (observe-only)', () => {
       expect(matchedHigh(path)).toBe(true);
     }
   });
-  it.each(['merge', 'review', 'drain'])('own %s name globs narrow to code/config while floors remain HIGH', name => {
-    for (const ext of ['mjs', 'cjs', 'js', 'ts', 'json', 'sh']) {
-      expect(matchedHigh(`scripts/docs/${name}-notes.${ext}`)).toBe(true);
-    }
-    const markdownTier = name === 'review' ? 'LOW' : 'HIGH';
-    expect(fileTier(`scripts/docs/${name}-notes.md`, builtins)).toBe(markdownTier);
-    const narrowing = NARROWED_NAME_GLOBS.find(entry => entry.oldGlob === `scripts/**/*${name}*`);
-    expect(narrowing.newGlobs).toEqual(['mjs', 'cjs', 'js', 'ts', 'json', 'sh'].map(ext => `scripts/**/*${name}*.${ext}`));
-    for (const glob of narrowing.newGlobs) expect(HIGH_MUST_STAY).toContain(glob);
-    expect(fileTier(`scripts/${name}-notes.md`, builtins)).toBe(markdownTier);
+  it.each(['scripts', 'prompts', 'skills-src', '.claude', '.github'])(
+    '%s merge/review/drain names stay explicitly HIGH at root and nested, regardless of extension', tree => {
+      for (const name of ['merge', 'review', 'drain']) {
+        expect(HIGH_MUST_STAY).toContain(`${tree}/**/*${name}*`);
+        for (const dir of ['', 'nested/']) {
+          for (const ext of ['', '.md', '.py', '.mjs', '.cjs', '.js', '.ts', '.json', '.sh']) {
+            expect(matchedHigh(`${tree}/${dir}${name}-notes${ext}`)).toBe(true);
+          }
+        }
+      }
+    },
+  );
+  it.each([
+    'scripts/review-instructions.md', 'scripts/__tests__/review-policy.test.py',
+    'scripts/conveyor/review-worker.py', 'prompts/review-notes.md',
+    '.github/review-x.md', 'skills-src/merge-x.md',
+  ])('sensitive name cannot fall to LOW with redMainFix:false: %s', path => {
+    expect(fileTier(path, builtins)).toBe('HIGH');
+    expect(matchedHigh(path)).toBe(true);
   });
-  it('only the three own name globs are narrowed', () => {
-    expect(NARROWED_NAME_GLOBS.map(entry => entry.oldGlob))
-      .toEqual(['scripts/**/*merge*', 'scripts/**/*review*', 'scripts/**/*drain*']);
+  it('exports no narrowed name globs and retains the original root variants', () => {
+    expect(NARROWED_NAME_GLOBS).toEqual([]);
+    for (const glob of ['scripts/*merge*', 'scripts/*drain*']) {
+      expect(HIGH_MUST_STAY).toContain(glob);
+    }
     expect(TIER_RULES.HIGH).toBe(HIGH_MUST_STAY);
   });
-  it('extraHigh can explicitly protect Markdown under narrowed names', () => {
+  it('names outside sensitive trees can be LOW unless extraHigh protects them', () => {
     for (const name of ['merge', 'review', 'drain']) {
-      const opts = { ...builtins, settings: { extraHigh: [`scripts/**/*${name}*`] } };
-      expect(classifyTier([`scripts/docs/${name}-notes.md`], opts).perFile[0])
-        .toMatchObject({ tier: 'HIGH', rule: `scripts/**/*${name}*` });
+      const path = `docs/${name}-notes.md`;
+      expect(fileTier(path, builtins)).toBe('LOW');
+      const opts = { ...builtins, settings: { extraHigh: [`docs/**/*${name}*`] } };
+      expect(classifyTier([path], opts).perFile[0])
+        .toMatchObject({ tier: 'HIGH', rule: `docs/**/*${name}*` });
     }
   });
   it('duplicate settings keys refuse', () => {
