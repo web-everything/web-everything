@@ -2,7 +2,7 @@
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { readFileSync } from 'node:fs';
 import { redTeamCardOnly, redTeamOwedOnHead } from './review-red-team-policy.mjs';
-import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly, redTeamClearGateCommentForHead } from './red-team-gate.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync, WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
@@ -50,6 +50,11 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
+    if (!pendingOnly && !evidence.carryConflict && !evidence.inFlight && !evidence.scheduled
+      && redTeamClearGateCommentForHead(comments, pr, head)) {
+      return { add: names.includes('red-team:clear') ? null : 'red-team:clear',
+        remove: names.filter(name => name === 'red-team:pending') };
+    }
     return { add: names.includes('red-team:pending') || names.includes('red-team:blocked') ? null : 'red-team:pending',
       remove: names.filter(name => name === 'red-team:clear') };
   }

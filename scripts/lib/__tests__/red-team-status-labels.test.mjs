@@ -73,6 +73,57 @@ it('a pending label with no result and nothing owed is kept, never planned for r
     .toEqual({ add: null, remove: ['red-team:clear'] });
 });
 
+describe('terminal gate comments with unreadable run evidence', () => {
+  const gate = (rev = head, outcome = 'card-queued', login = 'web-everything', pr = 42) => ({
+    author: { login }, body: `<!-- we:red-team-gate pr=${pr} rev=${rev} outcome=${outcome} -->`,
+  });
+  const plan = (comments, evidence = {}, extra = {}) => planRedTeamStatusLabels({ ...input,
+    labels: ['red-team:pending'], comments, evidence: { ok: false, reason: 'review-unfinished', ...evidence }, ...extra });
+  const pending = { add: null, remove: [] };
+
+  it('keeps pending for an older gate head', () => {
+    expect(plan([gate('b'.repeat(40))])).toEqual(pending);
+  });
+  it.each(['attacker', 'chalbert'])('keeps pending for non-bot author %s', login => {
+    expect(plan([gate(head, 'card-queued', login)])).toEqual(pending);
+    expect(plan([{ ...gate(head, 'card-queued', login), viewerDidAuthor: true }])).toEqual(pending);
+  });
+  it.each(['blocked', 'send-back', 'sent-back', 'held', 'unknown', 'round-cap', 'no-send-back'])('never clears outcome %s', outcome => {
+    expect(plan([gate(head, outcome)])).toEqual(pending);
+  });
+  it.each([{}, { ok: false, reason: 'status-unreadable' }])('keeps pending without a comment or readable status: %j', evidence => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [], evidence })).toEqual(pending);
+  });
+  it.each(['card-queued', 'clear'])('settles a trusted same-head %s despite unfinished evidence', outcome => {
+    expect(plan([gate(head, outcome)])).toEqual({ add: 'red-team:clear', remove: ['red-team:pending'] });
+  });
+  it('normalizes the full marker and live heads', () => {
+    expect(plan([gate(head.toUpperCase())], {}, { head: head.toUpperCase() }).add).toBe('red-team:clear');
+  });
+  it.each(['a'.repeat(39), 'a'.repeat(41), 'z'.repeat(40)])('rejects an invalid full head %s', rev => {
+    expect(plan([gate(rev)], {}, { head: rev })).toEqual(pending);
+  });
+  it('keeps pending for another PR', () => {
+    expect(plan([gate(head, 'clear', 'web-everything', 43)])).toEqual(pending);
+  });
+  it.each([{ carryConflict: true }, { inFlight: true }, { scheduled: true }])('preserves the run guard %j', evidence => {
+    expect(plan([gate()], evidence)).toEqual(pending);
+  });
+  it('preserves a recorded break over a clear gate', () => {
+    expect(plan([result(broken), gate(head, 'clear')]).add).toBe('red-team:blocked');
+  });
+  it('preserves a publication-pending hold over a clear gate', () => {
+    const root = mkdtempSync(join(tmpdir(), 'red-team-gate-pending-'));
+    const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') };
+    try {
+      recordRedTeamStatus({ repo: input.repo, pr: input.pr,
+        loopPayload: { findings: { read: { netBasis: { rev: head } } } },
+        status: 'finished', result: 'ran' }, { env, readPidStart: () => null });
+      expect(plan([gate(head, 'clear')], {}, { env })).toEqual(pending);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('finished stored results without a marker', () => {
   it.each([
     ['changes', 1, 'red-team:blocked'], ['accept', 0, 'red-team:clear'],

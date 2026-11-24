@@ -29,7 +29,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCascade, platformPreference, formatCascadeSourcesLine } from './policy-cascade.mjs';
-import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
+import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { isHumanOperatorComment, isRulingComment, judgePolicyOnce } from './operator-identity.mjs';
 
 import { parseVerdictCarriedMarker } from './review-verdict-carried-marker.mjs';
@@ -359,10 +359,24 @@ export function redTeamGateMarker(pr, rev, outcome, result = null, grantIds = nu
 /** PURE: parse the anchored gate marker, shared by gate reads and verdict carry. `grants=` takes any number of ids:
  * the writer records every grant it read, so a count bound here would make a valid record unreadable (fail-open). */
 export function parseRedTeamGateMarker(body) {
-  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))?(?: class=([1-9]\d*(?:,[1-9]\d*)*))?(?: actor=([^\s]+))? -->/.exec(String(body ?? '').trimStart());
-  return m ? { pr: Number(m[1]), rev: m[2], outcome: m[3], ...(m[4] ? { result: m[4] } : {}), ...(m[7] ? { actor: m[7] } : {}),
+  const m = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-fA-F]{40}) outcome=([a-z-]+)(?: result=([0-9a-f]{16}))?(?: grants=(none|[0-9a-f]{16}(?:,[0-9a-f]{16})*))?(?: class=([1-9]\d*(?:,[1-9]\d*)*))?(?: actor=([^\s]+))? -->/.exec(String(body ?? '').trimStart());
+  return m ? { pr: Number(m[1]), rev: m[2].toLowerCase(), outcome: m[3], ...(m[4] ? { result: m[4] } : {}), ...(m[7] ? { actor: m[7] } : {}),
     ...(m[5] ? { grantIds: m[5] === 'none' ? [] : m[5].split(',') } : {}),
     ...(m[6] ? { classCards: m[6].split(',').map(Number) } : {}) } : null;
+}
+
+/** PURE: a terminal gate comment can settle unreadable run evidence only for this exact head and a trusted bot. */
+export function redTeamClearGateCommentForHead(comments, pr, head) {
+  const live = String(head ?? '').toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(live)) return false;
+  return (Array.isArray(comments) ? comments : []).some(c => {
+    const login = c?.author?.login ?? c?.user?.login;
+    // Viewer ownership alone, and the shared trust check's human-operator path, are insufficient here.
+    if (!isTrustedMarkerAuthor(c) || typeof login !== 'string' || !AUTOMATION_LOGINS.includes(login.toLowerCase())) return false;
+    const marker = parseRedTeamGateMarker(c?.body);
+    return marker?.pr === Number(pr) && marker.rev === live
+      && (marker.outcome === 'clear' || marker.outcome === GATE_OUTCOMES.CARD_QUEUED);
+  });
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */
