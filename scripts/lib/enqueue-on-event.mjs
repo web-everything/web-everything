@@ -759,7 +759,9 @@ export function extractPassTimings(stderr) {
 const STDERR_LINE_MAX = 200;
 const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
-const URL_USERINFO = /:\/\/[^/\s]*@/;
+// Controls, line/paragraph separators, zero-width and bidi format characters (built from escapes so the source stays plain ASCII).
+const UNSAFE_LOG_CHARS = new RegExp('[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\ufeff]', 'g');
+const URL_USERINFO =/:\/\/[^/\s]*@/;
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
  * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
@@ -768,7 +770,7 @@ const URL_USERINFO = /:\/\/[^/\s]*@/;
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
   const raw = String(stderr ?? '');
-  const line = raw.split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f  ​-‏‪-‮⁠-⁤﻿]/g, ' ').trim()).find(Boolean);
+  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).find(Boolean);
   if (!line) return '';
   if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
