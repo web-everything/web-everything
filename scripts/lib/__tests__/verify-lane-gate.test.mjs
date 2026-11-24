@@ -30,8 +30,9 @@ const resolveDefaultGate = options => resolveGate({ saturation: () => ({ saturat
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
  *  `ls-files --others` the untracked ones; `grep -l -F -e <needle>…` the test files naming a needle (exit 1 —
  *  a throw — when none do, exactly as real `git grep`). No real git process. */
-function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } = {}) {
+function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {}, origin = 'https://github.com/web-everything/web-everything.git' } = {}) {
   return (args) => {
+    if (args[0] === 'remote') { if (origin === null) throw new Error('no origin'); return origin; }
     if (args[0] === 'merge-base') return 'deadbeef';
     if (args[0] === 'diff' && args.includes('--diff-filter=D')) return deleted.join('\n');
     if (args[0] === 'diff') {
@@ -124,10 +125,17 @@ describe('broad selection host policy', () => {
 
   it('sibling checkout without check-standards.mjs never runs that path; uses own script or skips with a reason', () => {
     const noWe = (p) => p !== 'scripts/check-standards.mjs';
-    const own = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+    const pa = { origin: 'git@github.com:plateauapp/plateau-app.git' };
+    const own = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json'], pa),
       saturation: idle, scripts: ['test', 'check:standards'], fileExists: noWe });
     expect(own.command).toBe('npx vitest run && npm run check:standards');
-    const none = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+    // fail closed: WE (validator deleted), unknown origin, or unreadable origin never skip standards
+    for (const origin of ['https://github.com/web-everything/web-everything.git', 'https://github.com/x/unknown.git', null]) {
+      const closed = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'always' },
+        runGit: fakeGit(['package.json'], { origin }), saturation: idle, scripts: ['test'], fileExists: noWe });
+      expect(closed.command).toBe(FALLBACK_GATE);
+    }
+    const none = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json'], pa),
       saturation: idle, scripts: ['test'], fileExists: noWe });
     expect(none.command).toBe('npx vitest run');
     expect(none.command).not.toContain('check-standards.mjs');

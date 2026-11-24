@@ -61,6 +61,7 @@
  * The broad idle-host fallback bypasses this script lookup: direct Vitest plus mandatory direct standards.
  */
 import { hostSaturation } from './verify-ci-only.mjs';
+import { repoKeyForSlug, DEFAULT_REPO_KEY } from './constellation-repos.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
@@ -445,6 +446,16 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
   }
 }
 
+/** True only when `origin` resolves to a known constellation repo other than WE (plateau-app, frontierui). */
+function isKnownSiblingCheckout(runGit) {
+  try {
+    const url = String(runGit(['remote', 'get-url', 'origin'])).trim();
+    const m = /[:/]([^/:]+\/[^/]+?)(?:\.git)?$/.exec(url);
+    const key = m ? repoKeyForSlug(m[1]) : null;
+    return key !== null && key !== DEFAULT_REPO_KEY;
+  } catch { return false; }
+}
+
 function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip, saturation }) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
@@ -502,7 +513,10 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
       // Sibling repos (plateau-app, frontierui) do not contain WE's check-standards script: when the caller can
       // tell the file is absent, use the checkout's own `check:standards` script, else skip with a logged reason.
       // Callers that cannot tell (no fileExists) keep the WE-shaped mandatory command.
-      const hasWeStandards = typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
+      // Fail closed: only a checkout whose origin is a KNOWN non-WE constellation repo may skip or substitute;
+      // WE, unknown or unreadable identity keeps the mandatory WE command (a deleted validator then fails loudly).
+      const knownSibling = isKnownSiblingCheckout(runGit);
+      const hasWeStandards = !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
       const ownScript = !hasWeStandards && scripts != null && [...scripts].includes('check:standards');
       const standardsCommand = hasWeStandards ? 'node scripts/check-standards.mjs' : ownScript ? 'npm run check:standards' : null;
       const reason = standardsCommand
