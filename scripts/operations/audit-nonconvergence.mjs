@@ -1,9 +1,20 @@
 /** @file Audit lineage routing only: new finding identities require a design pass. */
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 import { parseFindingLocation } from '../lib/finding-location.mjs';
 
 export const NONCONVERGENCE_SIGNATURE = 'audit-nonconvergence';
+
+const clean = text => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
+const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
+
+// Shared by live parsing, persisted audit lookup and lineage validation.
+export function hasConflictingVerdict(verdict, findings) {
+  const opposite = verdict === 'NOT WEAKENED' ? 'WEAKENED' : 'NOT WEAKENED';
+  return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), ...clean(line).split(LINE_BREAK)].some(part =>
+    clean(part).normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim() === opposite));
+}
 
 export function findingKeysOf(findings) {
   return findings.map(text => {
@@ -30,7 +41,8 @@ export function assessLineage(rounds) {
   if (rounds.some(round => !round || typeof round !== 'object' || typeof round.head !== 'string'
     || !/^[a-f0-9]{40}$/i.test(round.head) || !['WEAKENED', 'NOT WEAKENED'].includes(round.verdict)
     || !Array.isArray(round.findings) || round.findings.some(text => typeof text !== 'string')
-    || (round.verdict === 'WEAKENED' ? !round.findings.length : round.findings.length > 0))) {
+    || (round.verdict === 'WEAKENED' && !round.findings.length)
+    || hasConflictingVerdict(round.verdict, round.findings))) {
     return { escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: rounds.length };
   }
   rounds = distinctHeads(rounds);
@@ -38,7 +50,8 @@ export function assessLineage(rounds) {
   const seen = new Set();
   let streak = 0, newKeys = [];
   for (const round of rounds) {
-    const keys = [...new Set(findingKeysOf(round.findings))];
+    // Passing commentary resets the streak and cannot reserve a future finding's identity.
+    const keys = round.verdict === 'WEAKENED' ? [...new Set(findingKeysOf(round.findings))] : [];
     newKeys = keys.filter(key => !seen.has(key));
     streak = round.verdict === 'WEAKENED' && newKeys.length ? streak + 1 : 0;
     keys.forEach(key => seen.add(key));

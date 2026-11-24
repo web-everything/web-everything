@@ -1,5 +1,6 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { withLedgerAppendLock } from '../lib/ledger-append-lock.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -63,6 +64,12 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     return result.stdout;
   };
   const recordPath = () => resolveAuditRecordPath(readAuditSettings((p, enc) => fs.readFileSync(p, enc)), { home, cwd });
+  const readJsonl = path => {
+    let text;
+    try { text = fs.readFileSync(path, 'utf8'); }
+    catch (error) { if (error?.code === 'ENOENT') return []; throw error; }
+    return text.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+  };
   const remoteHeads = pattern => run('git', ['ls-remote', '--heads', 'origin', pattern], 30_000)
     .trim().split('\n').filter(Boolean).map(line => {
       const match = /^([a-fA-F0-9]{40})\t(refs\/heads\/[^\s]+)$/.exec(line);
@@ -81,7 +88,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     },
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     nowMs: () => Date.now(),
-    readRecords: () => fs.readFileSync(recordPath(), 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)),
+    readRecords: () => readJsonl(recordPath()),
     isAncestor(basis, head) {
       if (basis === head) return false;
       const result = spawnSync('git', ['merge-base', '--is-ancestor', basis, head],
@@ -124,12 +131,12 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     },
     escalate({ ref, head, streak, questionHash }) {
       const path = join(dirname(recordPath()), 'audit-nonconvergence.jsonl');
-      let records = [];
-      try { records = fs.readFileSync(path, 'utf8').split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line)); }
-      catch (error) { if (error?.code !== 'ENOENT') throw error; }
-      if (records.some(record => record.ref === ref && record.questionHash === questionHash)) return;
-      fs.mkdirSync(dirname(path), { recursive: true });
-      fs.appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), ref, head, streak, questionHash, kind: 'design-pass-request' })}\n`, { encoding: 'utf8', mode: 0o600 });
+      // A constant key in the queue's directory serialises every writer, including path aliases.
+      return withLedgerAppendLock('audit-nonconvergence', () => {
+        const records = readJsonl(path);
+        if (records.some(record => record.ref === ref && record.questionHash === questionHash)) return;
+        fs.appendFileSync(path, `${JSON.stringify({ at: new Date().toISOString(), ref, head, streak, questionHash, kind: 'design-pass-request' })}\n`, { encoding: 'utf8', mode: 0o600 });
+      }, { dir: dirname(path), waitMs: 30_000 });
     },
     now: () => new Date().toISOString(),
     stdout: text => process.stdout.write(text),

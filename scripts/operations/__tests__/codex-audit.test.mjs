@@ -34,6 +34,16 @@ function fixture(answer = 'NOT WEAKENED') {
 }
 
 describe('canonical audit', () => {
+  it('records NOT WEAKENED with commentary on a resolved ref without escalation', async () => {
+    const f = fixture('NOT WEAKENED\nNo weakening found in src/a.mjs.');
+    Object.assign(f.deps, { findBranch: () => 'lane/audit', readRecords: () => [], escalate: vi.fn() });
+    expect(await main([...ARGS, '--now'], f.deps)).toBe(0);
+    expect(f.records).toEqual([expect.objectContaining({ verdict: 'NOT WEAKENED', ref: 'lane/audit',
+      findings: ['No weakening found in src/a.mjs.'] })]);
+    expect(f.deps.escalate).not.toHaveBeenCalled();
+    expect(f.errors).toEqual([]);
+  });
+
   it('pins the question text and its sha256 hash', () => {
     expect(CANONICAL_QUESTION).toBe('You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.');
     expect(QUESTION_HASH).toMatch(/^[a-f0-9]{64}$/);

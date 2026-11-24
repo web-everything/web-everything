@@ -6,7 +6,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { resolveAuditSettings } from '../lib/audit-settings.mjs';
 import { matchesSome } from './audit-verdict.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { assessLineage, lineageRounds, NONCONVERGENCE_SIGNATURE } from './audit-nonconvergence.mjs';
+import { assessLineage, lineageRounds, NONCONVERGENCE_SIGNATURE, hasConflictingVerdict } from './audit-nonconvergence.mjs';
 
 export const CANONICAL_QUESTION = 'You are a read-only auditor. Judge the WHOLE diff `git diff <base>...<head>`, including pre-existing behaviour the diff now relies on, not only the changed lines. Does the change WEAKEN anything: a guard, gate, test, assertion or fail-closed path; a loosened check or threshold; removed validation; a new bypass, override or silent fallback; a test that no longer fails when the behaviour breaks? Pre-existing limitations the diff relies on count. Answer with the FIRST line exactly `NOT WEAKENED` or `WEAKENED`, then findings, one per line, each with file:line and why. Do not edit files.';
 export const QUESTION_HASH = createHash('sha256').update(CANONICAL_QUESTION).digest('hex');
@@ -16,14 +16,6 @@ export const EXHAUSTIVE_INSTRUCTION = 'List EVERY finding you can find in this o
 const SHA = /^[a-fA-F0-9]{40}(?![\s\S])/;
 const USAGE = 'usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json] [--now] [--branch=<ref>]\n';
 const clean = text => stripVTControlCharacters(text).replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, '');
-const LINE_BREAK = /\r\n|[\n\r\u2028\u2029]/;
-
-// Check whole verdict lines, including controls/Unicode that can disguise a contradiction.
-function hasConflictingVerdict(verdict, findings) {
-  const opposite = verdict === 'NOT WEAKENED' ? 'WEAKENED' : 'NOT WEAKENED';
-  return findings.some(line => typeof line === 'string' && [...line.split(LINE_BREAK), ...clean(line).split(LINE_BREAK)].some(part =>
-    clean(part).normalize('NFKC').replace(/\p{Default_Ignorable_Code_Point}/gu, '').trim() === opposite));
-}
 
 function parseArgs(argv) {
   const flags = {};
