@@ -451,7 +451,8 @@ function isKnownSiblingCheckout(runGit) {
   try {
     const url = String(runGit(['remote', 'get-url', 'origin'])).trim();
     const m = /[:/]([^/:]+\/[^/]+?)(?:\.git)?$/.exec(url);
-    const key = m ? repoKeyForSlug(m[1]) : null;
+    // GitHub owner/repo names are case-insensitive; retain the shared legacy-slug normalization too.
+    const key = m ? repoKeyForSlug(m[1].toLowerCase()) : null;
     return key !== null && key !== DEFAULT_REPO_KEY;
   } catch { return false; }
 }

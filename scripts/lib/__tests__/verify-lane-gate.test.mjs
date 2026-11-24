@@ -147,6 +147,33 @@ describe('broad selection host policy', () => {
     expect(we.command).toBe(FALLBACK_GATE);
   });
 
+  it.each([
+    'https://github.com/plateauapp/plateau-app.git',
+    'https://github.com/PlateauApp/plateau-app.git',
+    'git@github.com:PlateauApp/Plateau-App.git',
+    'ssh://git@github.com/FRONTIER-UI/FrontierUI.git',
+    'https://github.com/Chalbert/Plateau-App.git',
+  ])('sibling origin casing preserves its own standards script: %s', origin => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY,
+      runGit: fakeGit(['package.json'], { origin }), saturation: idle,
+      scripts: ['test', 'check:standards'], fileExists: p => p !== 'scripts/check-standards.mjs' });
+    expect(gate.command).toBe('npx vitest run && npm run check:standards');
+    expect(gate.standardsCommand).toBe('npm run check:standards');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+  });
+
+  it.each([
+    ['without fileExists', undefined],
+    ['with the WE standards file present', () => true],
+  ])('known sibling %s keeps mandatory direct standards', (_label, fileExists) => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
+      runGit: fakeGit(['package.json'], { origin: 'https://github.com/plateauapp/plateau-app.git' }),
+      saturation: idle, scripts: ['test', 'check:standards'], fileExists });
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+  });
+
   it('oversized targets still refuse on an idle host with an explicit gate fallback', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, saturation: idle,
       runGit: fakeGit(Array.from({ length: MAX_RELATED_TARGETS + 1 }, (_, i) => `scripts/m${i}.mjs`)) });
