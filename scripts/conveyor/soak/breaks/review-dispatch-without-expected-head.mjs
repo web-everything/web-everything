@@ -9,7 +9,8 @@
  *   C. the review daemon's tick must hand `expectedHead` (the planned head) to its dispatcher;
  *   D. the conveyor runner must carry its planned head through CLI argv into job admission;
  *   E. the manual-pass CLI declaration must project the operator's pin into its effect payload;
- *   F. session mode must refuse missing or moved heads before spawning and admit a matching head.
+ *   F. session mode and direct dispatch must refuse missing or moved heads and admit a matching head;
+ *   G. land-advance must defer an unpinned review without writing a launch ledger or spending capacity.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -25,6 +26,8 @@ import { join } from 'node:path';
 const src = process.env.SOAK_SOURCE_ROOT;
 const head = 'd'.repeat(40);
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
+const direct = await import(pathToFileURL(join(src, 'scripts/operations/review-dispatch.mjs')).href);
+const land = await import(pathToFileURL(join(src, 'scripts/operations/land-advance-io.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/review-daemon.mjs')).href);
 const runner = await import(pathToFileURL(join(src, 'skills-src/conveyor/runner.mjs')).href);
 const manual = await import(pathToFileURL(join(src, 'scripts/operations/manual-daemon-pass.mjs')).href);
@@ -42,17 +45,34 @@ catch (e) { out.noHead = { threw: String(e.message).split('\\n')[0] }; }
 spawns = 0;
 try { const r = job.dispatchReviewJob({ ...base, expectedHead: head, io, spawnJob: () => { spawns++; return 4242; } }); out.withHead = { spawns, jobPid: r.jobPid ?? null }; }
 catch (e) { out.withHead = { threw: String(e.message).split('\\n')[0] }; }
+for (const [entry, dispatch] of [['mode', job.dispatchReviewByMode], ['direct', direct.dispatchReview]]) {
 for (const [name, expectedHead, live] of [['missing', undefined, head], ['moved', head, 'e'.repeat(40)], ['matching', head, head]]) {
   let sessionSpawns = 0, headReads = 0;
   try {
-    const r = job.dispatchReviewByMode({ ...base, mode: 'session', expectedHead,
+    const r = dispatch({ ...base, mode: 'session', expectedHead,
       stackCheck: () => ({ base: null }), io: { liveHead: () => { headReads++; return live; } },
       readBrief: () => 'review', wrapReview: false, resolveSettingsEnv: () => ({}),
       ensureSessionCwd: () => process.env.SOAK_ROOT, isolateSession: () => ({}),
       spawnAgent: () => { sessionSpawns++; return ''; } });
-    out.sessions.push({ name, spawns: sessionSpawns, headReads, refused: r.refused === true, outcome: r.outcome });
-  } catch (e) { out.sessions.push({ name, threw: String(e.message).split('\\n')[0] }); }
+    out.sessions.push({ entry, name, spawns: sessionSpawns, headReads, refused: r.refused === true, outcome: r.outcome });
+  } catch (e) { out.sessions.push({ entry, name, threw: String(e.message).split('\\n')[0] }); }
 }
+}
+try {
+  let spawns = 0, fixes = 0;
+  const ledger = [];
+  const result = await land.createLandAdvanceApplier({
+    dispatchReview: input => direct.dispatchReview({ ...base, ...input, io, wrapReview: false,
+      readBrief: () => 'review', ensureSessionCwd: () => process.env.SOAK_ROOT, isolateSession: () => ({}),
+      spawnAgent: () => { spawns++; return 'backgrounded · review-session · review'; } }),
+    dispatchFix: () => { fixes++; return { agentId: 'fix-session' }; }, pickFixLane: () => 1,
+    readCapacity: () => ({ sessions: [], freeLanes: 1, load: 0 }), writeLedger: entry => ledger.push(entry),
+  })({ errors: [], rows: [], capacity: { budget: 1, cap: 1, loadThreshold: 1 }, proposed: [
+    { subject: 'review', pr: 77, repo: SLUG, owedAction: 'dispatch-review' },
+    { subject: 'fix', pr: 78, repo: SLUG, owedAction: 'dispatch-fix', fixPlan: {} },
+  ] });
+  out.land = { ...result, spawns, fixes, ledgerTargets: ledger.map(entry => entry.target) };
+} catch (e) { out.land = { threw: String(e.message).split('\\n')[0] }; }
 let seen = null;
 try {
   daemon.runReviewTickAllRepos({ startIndex: 0, repos: [SLUG],
@@ -144,12 +164,17 @@ export default {
       for (const session of out.sessions ?? []) {
         const matching = session.name === 'matching';
         const outcome = session.name === 'missing' ? 'refused-no-expected-head' : 'refused-head-moved';
-        if (matching ? session.spawns !== 1 || session.headReads !== 1 || session.refused
+        if (matching ? session.spawns !== 1 || session.headReads !== (session.entry === 'mode' ? 2 : 1) || session.refused
           : session.spawns !== 0 || !session.refused || session.outcome !== outcome) {
           violations.push({ invariant: 'session-head-admission', detail: JSON.stringify(session) });
         }
       }
-      if (out.sessions?.length !== 3) violations.push({ invariant: 'session-scenarios-ran', detail: JSON.stringify(out.sessions) });
+      if (out.sessions?.length !== 6) violations.push({ invariant: 'session-scenarios-ran', detail: JSON.stringify(out.sessions) });
+      if (out.land?.spawns !== 0 || out.land?.fixes !== 1 || out.land?.errors?.length !== 0
+        || JSON.stringify(out.land?.ledgerTargets) !== JSON.stringify(['fix'])
+        || out.land?.deferred?.[0]?.reason !== 'refused-no-expected-head') {
+        violations.push({ invariant: 'land-advance-head-admission', detail: JSON.stringify(out.land) });
+      }
       return { violations };
     } finally {
       rmSync(dir, { recursive: true, force: true });

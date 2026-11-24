@@ -111,7 +111,7 @@ import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './d
 import {
   decideJobClaim, diagnosticPath, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
-import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
+import { assertMainNotStale, dispatchReview, expectedHeadRefusal, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
@@ -1297,19 +1297,6 @@ function finalHeadSeatsGate(input, io) {
 
 /** An operator-pinned dispatch must refuse unknown or superseded live evidence. */
 export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
-function expectedHeadRefusal(expectedHead, input, io, { required = false } = {}) {
-  if (expectedHead === undefined) {
-    // Unknown reviewed head must mean no verdict: never fall back to whatever the checkout head happens to be.
-    return required
-      ? { refused: true, outcome: 'refused-no-expected-head', reason: 'no expected head: the reviewed head is unknown; dispatch with the head that was reviewed' }
-      : null;
-  }
-  try {
-    const head = io.liveHead(input);
-    if (isRealHead(expectedHead) && isRealHead(head) && head.toLowerCase() === expectedHead.toLowerCase()) return null;
-  } catch { /* unreadable evidence refuses */ }
-  return { refused: true, outcome: 'refused-head-moved', reason: 'PR head changed or unreadable; operator must inspect before retrying' };
-}
 
 function runReviewArc({
   pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
@@ -1708,7 +1695,7 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spaw
  */
 // Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
 export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
-  // Session mode has no dispatchReviewJob admission gate: apply the same check before any stack or launch effects.
+  // Refuse before stack effects; dispatchReview also checks admission for its direct callers.
   if (mode === 'session') {
     const refusal = expectedHeadRefusal(opts.expectedHead, { pr: opts.pr, repo: opts.repo },
       opts.io ?? createReviewJobIo({ root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }), { required: true });

@@ -247,6 +247,8 @@ export function createLandAdvanceApplier(ports = {}) {
           : await dispatchFix({ ...row.fixPlan, lane: await pickFixLane() }, { extraArgs, actions, repo: row.repo });
         if (result?.held) { deferred.push({ target: row.subject, reason: result.reason === 'unavailable' ? 'coordination-unavailable' : 'held-by-action-record' }); continue; }
         if (result?.ok === false || result?.error) throw new Error(result.error ?? 'dispatch failed');
+        // Head admission refusals never started either: preserve capacity and do not record a launch.
+        if (result?.refused) { deferred.push({ target: row.subject, reason: String(result.outcome) }); continue; }
         // A review refused by the fresh CI gate never started: no ledger entry, no capacity spent.
         if (result?.skipped) { deferred.push({ target: row.subject, reason: String(result.skipped) }); continue; }
         const session = result?.agentId ?? null;

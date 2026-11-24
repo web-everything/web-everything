@@ -3262,10 +3262,11 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
   const dispatched = [];
   for (const [head, status, conclusion] of sequence) {
     const out = runReviewTick({ repo: 'web-everything/web-everything',
-      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2 }], refusals: [] }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2, headRefOid: head.repeat(40) }], refusals: [] }),
       readPrs: () => [{ number: 3432, labels: [{ name: 'review:pending' }] }], readAgents: () => [],
       acquirableLanes: () => 1, tagRound, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
       dispatch: options => dispatchReview({ ...options, root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+        io: { liveHead: () => head.repeat(40) },
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
           readChecks: ({ headSha: rowsHead }) => completeCheckRows([{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }], rowsHead),
