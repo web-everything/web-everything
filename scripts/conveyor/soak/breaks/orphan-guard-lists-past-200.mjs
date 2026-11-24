@@ -3,8 +3,8 @@
  * `gh pr list --limit 200` and never paged, so a `review:changes` PR beyond the 200 newest was never seen and
  * never re-armed.
  *
- * Fix: `defaultListBounced` pages the open-PR list (100 per page, capped at 5 pages per pass, resuming on the next
- * pass) so a bounced PR at position 250 is returned.
+ * Fix: `defaultListBounced` pages the open-PR list (newest first, 100 per page, capped at 5 pages per
+ * pass) so a bounced PR at position 201 is returned. Every pass starts at page one.
  *
  * SCENARIO: a fake `gh` returning 3 pages (100, 100, 1 PR); the lone PR on page 3 (position 201) carries
  * `review:changes`. Pre-fix the single capped call never reaches it.
@@ -35,8 +35,10 @@ export default {
     const { defaultListBounced } = await import(pathToFileURL(join(root ?? process.cwd(), 'scripts/conveyor/orphan-fix-round.mjs')).href);
     const pages = [Array.from({ length: 100 }, (_, i) => pr(i + 1, false)), Array.from({ length: 100 }, (_, i) => pr(101 + i, false)), [pr(201, true)]];
     let call = 0;
+    const queries = [];
     const exec = (_cmd, args) => {
       call += 1;
+      queries.push(String(args[1]));
       if (args[0] === 'pr') return JSON.stringify([...pages[0], ...pages[1]].map((p) => ({ number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: false })));
       const m = /[&?]page=(\d+)/.exec(String(args[1]));
       return JSON.stringify(pages[Number(m?.[1] ?? 1) - 1] ?? []);
@@ -44,6 +46,10 @@ export default {
     const got = defaultListBounced('o/r', { exec }).map((p) => p.number);
     log?.(`calls=${call} bounced=${got.join(',')}`);
     const violations = got.includes(201) ? [] : [{ invariant: 'bounced-pr-past-200-listed', detail: `PR #201 (review:changes) was not listed; got [${got.join(', ')}]` }];
+    if (call !== 3) violations.push({ invariant: 'three-pages', detail: `expected 3 calls, got ${call}` });
+    if (queries.some(query => !query.includes('sort=created&direction=desc&per_page=100'))) {
+      violations.push({ invariant: 'newest-first', detail: 'listing must request newest PRs first' });
+    }
     return { violations, got };
   },
   judge(report) {

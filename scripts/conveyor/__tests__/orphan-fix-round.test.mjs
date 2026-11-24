@@ -103,21 +103,21 @@ describe('defaultListBounced', () => {
   const restPr = number => ({ number, labels: [], head: { sha: HEAD }, draft: false,
     body: `PR ${number}`, created_at: '2026-10-09T22:42:48Z' });
 
-  it('lists every open PR past the 200 page limit', () => {
-    const prs = Array.from({ length: 250 }, (_, i) => restPr(i + 1));
+  it('lists a bounced PR past the newest 200 within the newest 500', () => {
+    const prs = Array.from({ length: 250 }, (_, i) => restPr(250 - i));
     prs[249].labels = [{ name: 'review:changes' }];
     const exec = vi.fn()
       .mockReturnValueOnce(JSON.stringify(prs.slice(0, 100)))
       .mockReturnValueOnce(JSON.stringify(prs.slice(100, 200)))
       .mockReturnValueOnce(JSON.stringify(prs.slice(200)));
     expect(defaultListBounced('o/n', { exec })).toEqual([{
-      number: 250, labels: [{ name: 'review:changes' }], headRefOid: HEAD, isDraft: false,
-      body: 'PR 250', createdAt: prs[249].created_at,
+      number: 1, labels: [{ name: 'review:changes' }], headRefOid: HEAD, isDraft: false,
+      body: 'PR 1', createdAt: prs[249].created_at,
     }]);
     expect(exec).toHaveBeenCalledTimes(3);
     for (const [i, [command, args, opts]] of exec.mock.calls.entries()) {
       expect(command).toBe('gh');
-      expect(args).toEqual(['api', `repos/o/n/pulls?state=open&sort=created&direction=asc&per_page=100&page=${i + 1}`]);
+      expect(args).toEqual(['api', `repos/o/n/pulls?state=open&sort=created&direction=desc&per_page=100&page=${i + 1}`]);
       expect(opts).toMatchObject({ encoding: 'utf8', timeout: expect.any(Number), maxBuffer: 16 * 1024 * 1024 });
     }
   });
@@ -129,41 +129,72 @@ describe('defaultListBounced', () => {
       expect(defaultListBounced('o/capped', { exec })).toEqual([]);
       expect(exec).toHaveBeenCalledTimes(5);
       expect(warning).toHaveBeenCalledOnce();
-      expect(warning.mock.calls[0][0]).toMatch(/cap hit.*5 pages.*500 PRs/);
+      expect(warning.mock.calls[0][0]).toContain('listing cap hit (5 pages, 500 PRs); older PRs not scanned this pass');
       expect(warning.mock.calls[0][0]).not.toMatch(/[\r\n]/);
     } finally {
       warning.mockRestore();
     }
   });
 
-  it('eventually processes a bounced PR beyond page five and restarts the completed scan', async () => {
-    const slug = 'o/continuation';
-    const prs = Array.from({ length: 550 }, (_, i) => restPr(i + 1));
-    prs[549].labels = [{ name: 'review:changes' }];
+  it('starts at page one on every pass and never lists beyond the newest 500', () => {
+    const prs = Array.from({ length: 550 }, (_, i) => restPr(550 - i));
+    prs[499].labels = [{ name: 'review:changes' }];
+    prs[500].labels = [{ name: 'review:changes' }];
     const exec = vi.fn((_command, args) => {
       const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
       return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
     });
-    const readComments = vi.fn(async () => [VERDICT]);
-    const pass = () => runOrphanFixRoundPass({
-      repos: [{ key: 'test', slug }], nowMs: NOW,
-      listBounced: repo => defaultListBounced(repo, { exec }),
-      readComments, isOwned: async () => false,
-    });
     const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
-      await pass();
-      expect(exec).toHaveBeenCalledTimes(5);
-      expect(readComments).not.toHaveBeenCalled();
-      await pass();
-      expect(exec).toHaveBeenCalledTimes(6);
-      expect(exec.mock.calls[5][1][1]).toContain('page=6');
-      expect(readComments.mock.calls).toEqual([[550, slug]]);
-      await pass();
-      expect(exec.mock.calls[6][1][1]).toContain('page=1');
+      for (let pass = 0; pass < 2; pass++) {
+        expect(defaultListBounced('o/stateless', { exec }).map(p => p.number)).toEqual([51]);
+      }
+      expect(exec).toHaveBeenCalledTimes(10);
+      expect(exec.mock.calls.map(([, args]) => Number(new URLSearchParams(args[1].split('?')[1]).get('page'))))
+        .toEqual([1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+      expect(warning).toHaveBeenCalledTimes(2);
     } finally {
       warning.mockRestore();
     }
+  });
+
+  it('stops paging at the deadline but always fetches the first page', () => {
+    const prs = Array.from({ length: 100 }, (_, i) => restPr(100 - i));
+    prs[0].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn(() => JSON.stringify(prs));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(defaultListBounced('o/deadline', { exec, deadlineAt: 1000 }).map(p => p.number)).toEqual([100]);
+      expect(exec).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledWith('orphan-guard: listing deadline reached; older PRs not scanned this pass');
+    } finally {
+      clock.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it.each([true, false])('keeps collected PRs after a later page fails (bounced=%s)', bounced => {
+    const prs = Array.from({ length: 100 }, (_, i) => restPr(100 - i));
+    if (bounced) prs[0].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(prs)).mockImplementationOnce(() => { throw new Error('unreadable'); });
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(defaultListBounced('o/partial', { exec }).map(p => p.number)).toEqual(bounced ? [100] : []);
+      expect(exec).toHaveBeenCalledTimes(2);
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledWith('orphan-guard: listing page 2 failed; returning collected PRs');
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('rethrows a first-page failure without claiming an empty listing', () => {
+    const error = new Error('unreadable');
+    const exec = vi.fn(() => { throw error; });
+    expect(() => defaultListBounced('o/unreadable', { exec })).toThrow(error);
+    expect(exec).toHaveBeenCalledOnce();
   });
 });
 

@@ -185,27 +185,31 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
 
 const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
 const MAX_PAGES = 5;
-// The daemon keeps this per-repository continuation between ticks; a completed scan wraps to page one.
-const bouncedScanPages = new Map();
-
-export function defaultListBounced(slug, { exec = execFileSync } = {}) {
+export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Infinity } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const perPage = 100, bounced = [];
-  const startPage = bouncedScanPages.get(slug) ?? 1;
-  for (let page = startPage; page < startPage + MAX_PAGES; page++) {
-    const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=asc&per_page=${perPage}&page=${page}`], ghOpts());
-    const prs = JSON.parse(String(out));
+  let collected = 0;
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    if (page > 1 && Date.now() >= deadlineAt) {
+      console.error('orphan-guard: listing deadline reached; older PRs not scanned this pass');
+      return bounced;
+    }
+    let prs;
+    try {
+      const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`], ghOpts());
+      prs = JSON.parse(String(out));
+    } catch (error) {
+      if (collected === 0) throw error;
+      console.error(`orphan-guard: listing page ${page} failed; returning collected PRs`);
+      return bounced;
+    }
+    collected += prs.length;
     bounced.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
       number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
     })));
-    if (prs.length < perPage) {
-      bouncedScanPages.delete(slug);
-      return bounced;
-    }
+    if (prs.length < perPage) return bounced;
   }
-  const nextPage = startPage + MAX_PAGES;
-  bouncedScanPages.set(slug, nextPage);
-  console.error(`orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); next pass resumes at page ${nextPage}.`);
+  console.error(`orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); older PRs not scanned this pass`);
   return bounced;
 }
 
@@ -294,7 +298,7 @@ export async function runOrphanFixRoundPass({
   settledTtlMs = 6 * 60 * 60 * 1000,
   reconcile,
   repos = Object.entries(CONSTELLATION_REPOS).map(([key, r]) => ({ key, slug: r.slug })),
-  listBounced = (slug) => defaultListBounced(slug),
+  listBounced = (slug) => defaultListBounced(slug, { deadlineAt }),
   readComments = defaultReadComments,
   isOwned = defaultOwned,
   rearm = defaultRearm,
