@@ -1,0 +1,54 @@
+/** LANE-POOL-WRONG-REPO: `lane-pool provision --pool=P` run from another repo's checkout cloned that repo into P's lanes. */
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+const PATHS = ['scripts/lane-pool.mjs'];
+
+/** Replays the live case; returns the origin URL of the lane the pool grew for pool "project". */
+export function replayPoolOrigin(root = ROOT) {
+  const base = mkdtempSync(join(tmpdir(), 'soak-pool-origin-'));
+  const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  try {
+    const seed = (name) => {
+      const bare = join(base, `${name}.git`), work = join(base, name);
+      git(['init', '--quiet', '--bare', '--initial-branch=main', bare]);
+      git(['clone', '--quiet', bare, work]);
+      writeFileSync(join(work, 'f.txt'), `${name}\n`);
+      git(['add', '.'], work);
+      git(['-c', 'user.name=T', '-c', 'user.email=t@t.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'seed'], work);
+      git(['push', '--quiet', 'origin', 'main'], work);
+      return bare;
+    };
+    const poolOrigin = seed('project');
+    seed('caller');
+    const poolRoot = join(base, 'pool');
+    mkdirSync(poolRoot, { recursive: true });
+    const r = spawnSync('node', [join(root, 'scripts/lane-pool.mjs'), 'provision', '--pool=project', '--count=1', '--no-install'], {
+      cwd: join(base, 'caller'), encoding: 'utf8', timeout: 60000, env: { ...process.env, LANE_POOL_ROOT: poolRoot },
+    });
+    let lane = null;
+    try { lane = git(['remote', 'get-url', 'origin'], join(poolRoot, 'project', 'lane-1')); } catch { /* nothing cloned */ }
+    return { lane, poolOrigin, exit: r.status, out: `${r.stdout}${r.stderr}`.slice(-400) };
+  } finally { rmSync(base, { recursive: true, force: true }); }
+}
+
+export default {
+  id: 'lane-pool-wrong-repo-origin',
+  title: '--pool=P from another checkout must never clone the caller repo into P\'s lanes',
+  card: 'LANE-POOL-WRONG-REPO (plateau-app lanes 5 to 8 were web-everything clones)',
+  fixedBy: { sha: '108c8c30c4d', where: 'lane/lane-pool-wrong-repo', paths: PATHS },
+  fixPresent(root) {
+    try { const r = replayPoolOrigin(root); return r.lane === null || r.lane === r.poolOrigin; } catch { return false; }
+  },
+  async run({ sourceRoot = ROOT, log } = {}) {
+    const r = replayPoolOrigin(sourceRoot);
+    log?.(`pool=project lane origin=${r.lane} expected=${r.poolOrigin} exit=${r.exit}\n`);
+    return r;
+  },
+  judge: (r) => (r.lane !== null && r.lane !== r.poolOrigin
+    ? [`lane for pool "project" was cloned from ${r.lane}, not the pool origin ${r.poolOrigin}`] : []),
+};
