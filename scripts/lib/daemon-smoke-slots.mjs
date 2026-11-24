@@ -21,7 +21,9 @@ const positive = value => Number.isSafeInteger(value) && value > 0;
 export function behindMainPriority({ behind, env = {} } = {}) {
   const raw = env.WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD;
   const threshold = typeof raw === 'string' && /^\d+$(?![\s\S])/.test(raw) ? Number(raw) : NaN;
-  return positive(threshold) && Number.isFinite(behind) && Number.isInteger(behind) && behind >= threshold;
+  // Short queue waits reset age on retry, so retain FIFO unless aging can protect them.
+  const maxWait = Number(env.WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS ?? 900_000);
+  return maxWait > PRIORITY_OVERTAKE_AGE_MS && positive(threshold) && Number.isFinite(behind) && Number.isInteger(behind) && behind >= threshold;
 }
 
 // The queue-wait ceiling never collapses to 0: a short rebuild lease must still allow a capacity check.

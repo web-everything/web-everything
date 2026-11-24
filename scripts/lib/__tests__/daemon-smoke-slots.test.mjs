@@ -51,6 +51,10 @@ describe('daemon smoke slots', () => {
     expect(behindMainPriority({ behind, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' } })).toBe(expected);
   });
 
+  it.each([['1000', false], ['600000', false], ['600001', true], [undefined, true]])('behind priority respects queue wait %s', (wait, expected) => {
+    expect(behindMainPriority({ behind: 5, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: wait } })).toBe(expected);
+  });
+
   it.each([undefined, '', '0', '-1', '1.5', 'NaN', 'Infinity', '5x', '5\n', ' 5 ', '9007199254740992'])('behind priority is off for setting %s', value => {
     expect(behindMainPriority({ behind: 10, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: value } })).toBe(false);
   });
@@ -79,7 +83,7 @@ describe('daemon smoke slots', () => {
     const prevHead = 'a'.repeat(40), mainSha = 'b'.repeat(40);
     const lease = { token: 'behind-build' }, persisted = { building: lease };
     const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir,
-      WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '1000',
+      WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '900000',
       WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: count === 'off' ? '0' : '5' };
     vi.spyOn(cloneLocks, 'withWriteLock')
       .mockResolvedValueOnce({ ok: true, value: { plan: { mainSha, finalSha: 'c'.repeat(40) }, prevHead, lease, alerts: [] } })
@@ -100,10 +104,10 @@ describe('daemon smoke slots', () => {
     const result = await rebuildClone({ root: stateDir, env, log, run, versions: null, asJob: false,
       readyOnly: true, emitEvent: vi.fn(), now: () => time, sleep: async ms => {
         expect(state().waiters[0].priority === true).toBe(count === '5');
-        time += ms;
+        time += 900000;
       } });
     expect(result.reason).toBe('smoke-queue-timeout');
-    expect(time).toBe(1000);
+    expect(time).toBe(900000);
     expect(state().waiters).toEqual([]);
     expect(run).toHaveBeenCalledTimes(count === 'off' ? 0 : 1);
     await holder.release();
