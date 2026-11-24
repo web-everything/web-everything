@@ -43,7 +43,9 @@ function matchSegments(pattern, parts) {
   const [head, ...rest] = pattern;
   if (head === '**') return parts.some((_, i) => matchSegments(rest, parts.slice(i))) || matchSegments(rest, []);
   if (!parts.length) return false;
-  const re = new RegExp(`^${head.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*')}$`);
+  // `[0-9]` is the only supported class (version dirs); everything else is literal.
+  const re = new RegExp(`^${head.split('*').map(s => s.split('[0-9]')
+    .map(t => t.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[0-9]')).join('[^/]*')}$`);
   return re.test(parts[0]) && matchSegments(rest, parts.slice(1));
 }
 const matchesDataPath = (glob, path) => glob === path || (glob.includes('*') && matchSegments(glob.split('/'), path.split('/')));

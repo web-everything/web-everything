@@ -1,7 +1,7 @@
 /** delivery.sizeDataPaths: fixtures/vectors/traceability are data; protocol schema.json still counts. */
 import { describe, it, expect } from 'vitest';
 import { planSizeGrowth } from '../pr-size-admission.mjs';
-import { loadPrSizeSettingsFile } from '../pr-size-settings.mjs';
+import { loadPrSizeSettingsFile, resolvePrSizeSettings } from '../pr-size-settings.mjs';
 
 const settings = loadPrSizeSettingsFile(undefined, { platform: {}, env: {} });
 const lines = (rows) => planSizeGrowth({
@@ -20,6 +20,12 @@ describe('sizeDataPaths globs', () => {
   });
   it('does not over-match: nested non-fixture json and other traceability paths count', () => {
     expect(lines([[10, 'src/x/__fixtures__/sub/a.json'], [10, 'protocols/p/traceability.json'],
-      [10, 'src/x/vectors/a.json']])).toBe(30);
+      [10, 'src/x/vectors/a.json'], [10, 'protocols/p/versions/traceability.json']])).toBe(40);
+  });
+  it('rejects repository-wide globs in any settings layer', () => {
+    for (const bad of ['**/*.json', '*/a.json']) {
+      expect(() => resolvePrSizeSettings({ platform: {}, env: { WE_PR_SIZE_DATA_PATHS: JSON.stringify([bad]) } }))
+        .toThrow(/dataPaths/);
+    }
   });
 });

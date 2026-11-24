@@ -207,7 +207,7 @@ describe('PR size settings cascade', () => {
     expect(loadPrSizeSettingsFile(undefined, { platform: {}, env: {} })).toEqual({
       dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'],
       dataPaths: ['src/**/__fixtures__/*.json', 'protocols/**/vectors/*.json', 'protocols/**/fixtures/*.json',
-        'protocols/**/v*/traceability.json'],
+        'protocols/**/v[0-9]*/traceability.json'],
     });
   });
 
