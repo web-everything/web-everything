@@ -40,6 +40,7 @@
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
+import { isStrictUtcTimestamp } from '../lib/strict-utc-timestamp.mjs';
 
 /** Default lease before a held lock is considered stale and reclaimable. Short enough that a crashed
  *  owner frees a path within a working block; long enough to outlast a normal reserve→edit→commit→push
@@ -262,14 +263,13 @@ export function readClaimEvidence(dir, { strict = true } = {}) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid lock entry');
   try {
     const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
-    if (!beat || new Date(beat).toISOString() !== beat) throw new Error('Invalid heartbeat evidence');
+    if (!isStrictUtcTimestamp(beat)) throw new Error('Invalid heartbeat evidence');
     if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
   } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
   let sidecarAt = null;
   try {
     const draft = JSON.parse(readFileSync(join(dir, draftSidecarFor(entry)), 'utf8'));
-    if (draft?.preDraft !== false || typeof draft.at !== 'string'
-      || new Date(draft.at).toISOString() !== draft.at) throw new Error('Invalid draft evidence');
+    if (draft?.preDraft !== false || !isStrictUtcTimestamp(draft.at)) throw new Error('Invalid draft evidence');
     sidecarAt = draft.at;
   } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
   return { entry, sidecarAt };

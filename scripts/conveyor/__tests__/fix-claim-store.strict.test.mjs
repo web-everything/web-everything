@@ -108,10 +108,43 @@ describe('strict sidecar audit regressions', () => {
     expect(() => readClaimEvidence(f.dir)).toThrow();
     refused(f);
   });
-  it.each(['', 'garbage', '2020-01-01', '2026-01-01T00:00:00Z'])(
+  it.each(['', 'garbage', '2020-01-01', '2026-02-30T00:00:00Z'])(
     'fails closed on malformed heartbeat sidecar %j, including older timestamps', value => {
       const f = fixture(); writeFileSync(join(f.dir, hbName(f.entry)), value);
       expect(() => readClaimEvidence(f.dir)).toThrow();
+      refused(f);
+    },
+  );
+  it.each(['entry', 'hb', 'draft'].flatMap(kind => ['Z', '.1Z', '.12Z', '.123Z', '.000Z'].map(suffix => [kind, suffix])))(
+    'accepts strict UTC %s evidence with precision %s, including lease-extending heartbeats', (kind, suffix) => {
+      const f = fixture(), now = Date.parse('2026-11-24T16:00:00Z');
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+      const at = '2026-11-24T16:00:00' + suffix;
+      f.entry.meta.kind = 'fixing';
+      f.entry.heartbeatAt = kind === 'hb' ? new Date(now - 21 * 60_000).toISOString() : at;
+      writeFileSync(f.file, JSON.stringify(f.entry));
+      if (kind !== 'entry') writeFileSync(join(f.dir, kind === 'hb' ? hbName(f.entry) : draftSidecarFor(f.entry)),
+        kind === 'hb' ? at : JSON.stringify({ preDraft: false, at }));
+      expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ unreadable: false,
+        entries: [{ heartbeatAt: at, ...(kind === 'draft' ? { sidecarAt: at } : {}) }] });
+      expect(pushRefusal({ repo: 'we', branch: 'lane/isolated', sessionId: 'foreign', strict: true, lockRoot: f.lockRoot }))
+        .toMatchObject({ refused: true, code: 'foreign-claim' });
+    },
+  );
+  it('accepts an older no-millisecond heartbeat without replacing newer entry evidence', () => {
+    const f = fixture(); writeFileSync(join(f.dir, hbName(f.entry)), '2026-01-01T00:00:00Z');
+    expect(readClaimEvidence(f.dir).entry.heartbeatAt).toBe(f.entry.heartbeatAt);
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ unreadable: false, entries: [f.entry] });
+  });
+  it.each(['entry', 'hb', 'draft'].flatMap(kind => [
+    'garbage', '2026-02-30T16:00:00Z', '2026-02-29T16:00:00.1Z', '2026-11-24T24:00:00Z',
+    '2026-11-24T16:00:00.1234Z', '2026-11-24T16:00:00+00:00', '2026-11-24T16:00:00',
+  ].map(at => [kind, at])))(
+    'fails closed on invalid strict UTC %s evidence %s', (kind, at) => {
+      const f = fixture();
+      if (kind === 'entry') { f.entry.heartbeatAt = at; writeFileSync(f.file, JSON.stringify(f.entry)); }
+      else writeFileSync(join(f.dir, kind === 'hb' ? hbName(f.entry) : draftSidecarFor(f.entry)),
+        kind === 'hb' ? at : JSON.stringify({ preDraft: false, at }));
       refused(f);
     },
   );

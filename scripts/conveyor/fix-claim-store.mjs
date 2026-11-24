@@ -12,6 +12,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readLockEntry, parseLockEntry, isLeaseExpired, readClaimEvidence } from '../readiness/file-locks.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { isStrictUtcTimestamp } from '../lib/strict-utc-timestamp.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 
 /** How long an unreleased claim survives before a DIFFERENT owner may reclaim it (dead-holder floor). Chosen
@@ -132,8 +133,7 @@ export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
     try {
       const { entry, sidecarAt } = readClaimEvidence(join(lockRoot, name));
       if (!entry || typeof entry.owner !== 'string' || !entry.owner.trim()
-        || typeof entry.heartbeatAt !== 'string'
-        || new Date(entry.heartbeatAt).toISOString() !== entry.heartbeatAt
+        || !isStrictUtcTimestamp(entry.heartbeatAt)
         || Date.parse(entry.heartbeatAt) > latestEvidenceMs
         || (sidecarAt && Date.parse(sidecarAt) > latestEvidenceMs)
         || !validateFixClaimMeta(entry.meta)) unreadable = true;

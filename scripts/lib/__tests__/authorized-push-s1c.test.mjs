@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { userInfo } from 'node:os';
 import { authorizedPush, readPushAuthority } from '../authorized-push.mjs';
 import { createAuthorizedPushForTesting, nonTestFactoryImports, snapshotOptionsForTesting } from './helpers/authorized-push-factory.mjs';
 import { acquireFixClaim, fixBegin, fixEnd, pushRefusal, readLiveFixClaim } from '../../conveyor/fix-procedure.mjs';
@@ -68,6 +69,41 @@ function pushFixture() {
 }
 
 describe('PUSH-GATE-S1C Tier-1 negatives', () => {
+  it('default readers use passwd home despite a decoy HOME and still see the foreign claim', () => {
+    const f = fixture(), home = join(f.options.lockRoot, 'passwd-home'), decoy = join(f.options.lockRoot, 'decoy-home');
+    const originalResolve = vi.mocked(resolveCoordinationRoot).getMockImplementation();
+    const fixed = fixDispatchClaimRoot(originalResolve({ env: {}, home }));
+    const passwdHome = userInfo().homedir;
+    try {
+      // Redirect only the passwd-home root into the fixture; no real coordination files are touched.
+      vi.mocked(resolveCoordinationRoot).mockImplementation(options => originalResolve({ ...options,
+        home: options?.home === passwdHome ? home : decoy }));
+      for (const lockRoot of [fixed, fixDispatchClaimRoot(originalResolve({ env: {}, home: decoy }))])
+        expect(acquireFixClaim({ ...f.options, lockRoot, branch: 'lane/fix' }).ok).toBe(true);
+      expect(acquireFixClaim({ ...f.options, lockRoot: fixed, pr: 99, sessionId: 'foreign', branch: 'lane/fix' }).ok).toBe(true);
+      vi.stubEnv('HOME', decoy);
+      vi.mocked(resolveCoordinationRoot).mockClear();
+      vi.mocked(readLiveFixClaim).mockClear(); vi.mocked(pushRefusal).mockClear();
+      const gate = createAuthorizedPushForTesting({ gh: 'fixture-gh', ghPrView: () => f.view, isAncestor: () => true });
+      const result = gate.readPushAuthority({ repo: 'we', pr: 42, branch: 'lane/fix', expectedHead: head, sha: head,
+        gitDir: '.', purpose: 'repair', holder: { sessionId: 'mine' } });
+      expect.soft(resolveCoordinationRoot).toHaveBeenCalledWith({ env: {}, home: passwdHome });
+      expect.soft(readLiveFixClaim).toHaveBeenCalledWith({ repo: 'we', pr: 42, lockRoot: fixed });
+      expect.soft(pushRefusal).toHaveBeenCalledWith(expect.objectContaining({ lockRoot: fixed, strict: true }));
+      expect(result).toMatchObject({ ok: false, code: 'foreign-claim' });
+      expect(spawnSync).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(resolveCoordinationRoot).mockImplementation(originalResolve);
+      vi.unstubAllEnvs();
+    }
+  });
+  it.each(['Z', '.1Z', '.12Z', '.123Z', '.000Z'])('accepts own-draft timestamp precision %s at every push check', suffix => {
+    const f = pushFixture(), view = f.io.ghPrView;
+    f.entry.sidecarAt = '2026-11-24T16:00:00' + suffix;
+    f.io.ghPrView = () => ({ ...view(), isDraft: true });
+    expect(f.push()).toMatchObject({ ok: true, pushed: f.options.sha });
+    expect(f.io.gitPush).toHaveBeenCalledTimes(1);
+  });
   it('default ports ignore WE_COORDINATION_ROOT and see foreign claims under the fixed home layout at call time', () => {
     const f = fixture(), home = join(f.options.lockRoot, 'home');
     const originalResolve = vi.mocked(resolveCoordinationRoot).getMockImplementation();

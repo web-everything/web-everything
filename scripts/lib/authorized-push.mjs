@@ -5,10 +5,12 @@
  * (ii) No detection of a human marking ready and then drafting again within one hold. Hold labels are the human signal.
  * (iii) Tracker freshness is only as accurate as the hook's daysBetween.
  * (iv) Legacy unbound claims are fail-closed in strict mode only.
+ * (v) The final claim check and the final gh read cannot be atomic; a claim that expires during the last read (bounded by the gh timeout, far below the claim TTL) is accepted, and the post-push re-read detects it.
+ * (vi) The factory-import guard is a lint for honest code only; computed or indirect imports are in-process code, covered by (i).
  */
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir, tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readLiveFixClaim, isClaimHolder, pushRefusal, repoKeyOf } from '../conveyor/fix-procedure.mjs';
 import { fixDispatchClaimRoot, validateFixClaimMeta } from '../conveyor/fix-claim-store.mjs';
@@ -22,6 +24,7 @@ import { localToday } from './local-date.mjs';
 import { dirname, relative } from 'node:path';
 import { pushGuardDecision, readPushLease } from '../guard-git-push.mjs';
 import { PUSH_HOLD_LABELS } from './review-hold-model.mjs';
+import { isStrictUtcTimestamp } from './strict-utc-timestamp.mjs';
 
 const fail = (code, reason) => ({ ok: false, code, reason });
 const hex = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
@@ -101,7 +104,7 @@ function isolatedGit(gitDir, io, use) {
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 function defaults(io = {}) {
-  const lockRoot = fixDispatchClaimRoot(resolveCoordinationRoot({ env: {} }));
+  const lockRoot = fixDispatchClaimRoot(resolveCoordinationRoot({ env: {}, home: userInfo().homedir }));
   return {
     readClaim: (repo, pr) => readLiveFixClaim({ repo, pr, lockRoot }), isClaimHolder,
     branchClaimRefusal: (repo, branch, holder) => pushRefusal({ repo, branch,
@@ -132,8 +135,7 @@ function claimRefusal(io, entry, holder, { repo, pr, branch }) {
   if (!entry.meta?.sessionId && !entry.meta?.tokenHash) return fail('not-claim-holder', 'Unbound claim');
   const meta = entry.meta;
   if (!validateFixClaimMeta(meta)
-    || ('sidecarAt' in entry && (typeof entry.sidecarAt !== 'string'
-      || new Date(entry.sidecarAt).toISOString() !== entry.sidecarAt))) throw new Error('Incomplete claim');
+    || ('sidecarAt' in entry && !isStrictUtcTimestamp(entry.sidecarAt))) throw new Error('Incomplete claim');
   if (meta.repo !== repoKeyOf(repo) || meta.pr !== pr || meta.kind !== 'fixing' || meta.branch !== branch)
     return fail('not-claim-holder', 'Claim does not match requested push');
   return null;

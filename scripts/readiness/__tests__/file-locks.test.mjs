@@ -437,6 +437,18 @@ describe('claim sidecar audit regressions', () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'claim-sidecar-')); });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
 
+  it.each(['Z', '.1Z', '.12Z', '.123Z', '.000Z'])('fresh heartbeat precision %s extends an expired lease and prevents reclaim', suffix => {
+    reserve(root, 'p', 'A', T0, iso(T0));
+    const now = T0 + LEASE_MS + 5000;
+    const at = iso(now).slice(0, 19) + suffix;
+    heartbeatOwn(root, 'p', 'A', at);
+    const entry = readLockEntry(root, 'p');
+    expect(entry.heartbeatAt).toBe(at);
+    expect(isLeaseExpired(entry, now)).toBe(false);
+    expect(reserve(root, 'p', 'B', now, iso(now)))
+      .toMatchObject({ ok: false, reason: 'held', heldBy: 'A' });
+  });
+
   it('separates draft identities containing pipe delimiters', () => {
     const a = { owner: 'fixer:a|b', meta: { sessionId: 'c', tokenHash: 'token', claimedAt: iso(T0) } };
     const b = { ...a, owner: 'fixer:a', meta: { ...a.meta, sessionId: 'b|c' } };

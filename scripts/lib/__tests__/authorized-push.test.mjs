@@ -2,6 +2,7 @@
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { userInfo } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAuthorizedPushForTesting, nonTestFactoryImports } from './helpers/authorized-push-factory.mjs';
 const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
@@ -93,7 +94,7 @@ describe('authorized push', () => {
     pushRefusal.mockReturnValue({ refused: true, pr: 99 });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'foreign-claim' });
     expect(pushRefusal).toHaveBeenCalledWith({ repo: 'we', branch: 'lane/fix', ...f.holder, strict: true,
-      lockRoot: fixDispatchClaimRoot(resolveCoordinationRoot({ env: {} })) });
+      lockRoot: fixDispatchClaimRoot(resolveCoordinationRoot({ env: {}, home: userInfo().homedir })) });
     expect(f.io.gitPush).not.toHaveBeenCalled();
   });
   it('pins exactly the four push hold labels', () => {
