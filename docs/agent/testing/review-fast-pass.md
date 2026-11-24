@@ -1,4 +1,4 @@
-# Review fast pass
+## Review fast pass
 
 Run `node skills-src/conveyor/review-daemon.mjs --fast-pass --once` for one pass,
 or omit `--once` for the independent leased process. The default interval is 105 seconds;

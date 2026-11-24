@@ -27,9 +27,11 @@ export function fastPassOptions({ repo, options, liveReviewRoundBudget, log = co
   return {
     repo, log, readLastPlan: () => JSON.parse(readFileSync(fastPlanPath(repo), 'utf8')),
     mainSha: () => defaultResolveMainSha('main'),
+    // No server-side label filter (search-backed, #no-label-search): list open PRs and filter here.
     readPr: args => args.pending ? JSON.parse(runGhSync(['pr', 'list', '--repo', repo, '--state', 'open',
-      '--label', 'review:pending', '--limit', '101', '--json', 'number,headRefOid,labels,updatedAt'],
-    { encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, throttle: { maxAttempts: 1 } })) : readLiveRedTeamPr(args),
+      '--limit', '300', '--json', 'number,headRefOid,labels,updatedAt'],
+    { encoding: 'utf8', timeout: 15000, maxBuffer: 4 * 1024 * 1024, throttle: { maxAttempts: 1 } }))
+      .filter(pr => (pr.labels ?? []).some(l => (l?.name ?? l) === 'review:pending')) : readLiveRedTeamPr(args),
     readAgents: () => options.readAgents({ readOnly: true }), readJobs: () => listReviewJobAgents({ readOnly: true }),
     liveCap: ({ jobs }) => {
       const budget = liveReviewRoundBudget();
