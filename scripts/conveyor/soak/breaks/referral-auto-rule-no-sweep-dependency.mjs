@@ -34,7 +34,7 @@ export default {
   card: 'REFERRAL-AUTO-RULE',
   fixedBy: { sha: '828b743897e5b8b68de558cd8d59be2f90068148', where: 'referral-auto-rule', paths: [SOURCE] },
   fixPresent(root) {
-    return spawnSync('git', ['merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'], {
+    return spawnSync('git', ['merge-base', '--is-ancestor', '828b743897e5b8b68de558cd8d59be2f90068148', 'HEAD'], {
       cwd: root, stdio: 'ignore', timeout: 5000,
     }).status === 0;
   },
