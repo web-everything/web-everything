@@ -1527,7 +1527,8 @@ describe('request with an explicit --gate when the default selection is blocked'
   });
 });
 
-it('an unscopable default request refuses before stamping a runnable marker', () => {
+it('an opted-out default request refuses before stamping a runnable marker', () => {
+  vi.stubEnv('WE_DIFF_TEST_SELECTION', '0');
   execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
   writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { 'test:unit': 'echo must-not-run' } }));
   const r = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8' });
@@ -1711,6 +1712,39 @@ process.exit(${standardsExit});
     expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
     expect(f.calls()[0].args).toEqual(['run', 'test:unit']);
     expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
+  });
+
+  it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
+    const f = fixture({ standardsExit: 1 });
+    // Pin the evidence at the module boundary so this test never samples the test runner's host.
+    const target = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
+    const loader = join(dir, 'idle-host-loader.mjs');
+    writeFileSync(loader, `
+export async function load(url, context, nextLoad) {
+  const result = await nextLoad(url, context);
+  if (url !== ${JSON.stringify(target)}) return result;
+  return { ...result, source: String(result.source).replace('export function hostSaturation(', 'function originalHostSaturation(')
+    + '\\nexport const hostSaturation = () => ({ saturated: false, known: true, reason: "fixture idle" });' };
+}
+`);
+    const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+    if (script === 'test') {
+      pkg.scripts.test = pkg.scripts['test:unit'];
+      delete pkg.scripts['test:unit'];
+      // The npm shim treats both full-test script names as the same red test phase.
+      const npm = join(dir, 'bin', 'npm');
+      writeFileSync(npm, readFileSync(npm, 'utf8').replace("(args[0] === 'run' && args[1] === 'test:unit')",
+        "((args[0] === 'run' && args[1] === 'test:unit') || args[0] === 'test')"));
+    }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg) + '\n');
+    const r = f.invoke([], { NODE_OPTIONS: `--import=${preload}`, WE_VERIFY_RUN_ALL_PHASES: '1' });
+    expect(r.code, r.stderr).toBe(2);
+    expect(f.calls().map(call => call.args)).toEqual([
+      script === 'test' ? ['test'] : ['run', 'test:unit'], ['run', 'check:standards'],
+    ]);
+    expect(r.json.phases.outcomes).toMatchObject({ vitest: { result: 'fail' },
+      standards: { result: 'fail', reason: 'invisible-characters' } });
   });
 
   it('retryFailed never clears a standards red after full-unit flake recovery', () => {
@@ -2399,12 +2433,12 @@ describe('full build gate default', () => {
     writeFileSync(preferences, '{}');
     vi.stubEnv('WE_PLATFORM_PREFERENCES_FILE', preferences);
   });
-  it('standard full without a known diff fails closed instead of running the whole suite', () => {
+  it('standard full with selection opted out fails closed instead of running the whole suite', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
       'check:standards': 'exit 0',
     } }));
-    const env = { ...gateScrubbedEnv() };
+    const env = { ...gateScrubbedEnv(), WE_DIFF_TEST_SELECTION: '0' };
     delete env.WE_BUILD_FINAL_GATE;
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
     expect(r.status, r.stderr).toBe(3);
@@ -2413,17 +2447,24 @@ describe('full build gate default', () => {
     expect(JSON.parse(r.stdout).status).toBe('selection-required');
   });
 
-  // Only `full` replaces the default selection; `related` and `none` keep it, and an explicit --gate still wins.
+  // On a known narrow diff only explicit full replaces selection; an explicit --gate still wins.
   it.each([
     ['full', true], ['related', false], ['none', false],
-  ])('finalGate=%s runs the whole unit tier only when full', (finalGate, wholeUnit) => {
+  ])('finalGate=%s on a known docs diff runs the whole unit tier only when full', (finalGate, wholeUnit) => {
     const scripts = {
       'test:unit': `node -e "require('fs').writeFileSync('whole-unit-ran', 'yes')"`,
-      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')"`,
+      'check:standards': `node -e "require('fs').writeFileSync('standards-ran', 'yes')" --`,
     };
+    // Commit the package script fixture into the base; only notes.md belongs to the selection.
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts }));
-    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate };
+    execFileSync('git', ['add', 'package.json'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'script fixture'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    writeFileSync(join(dir, 'notes.md'), 'known narrow diff\n');
+    // This empty fixture checkout has no repo-wide guard suites.
+    const env = { ...gateScrubbedEnv(), WE_BUILD_FINAL_GATE: finalGate, WE_VERIFY_ALWAYS_RUN_TESTS: '' };
     const r = spawnSync('node', [VERIFY_LANE, 'run', '--json'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
+    expect(r.status, r.stderr).toBe(0);
     expect(r.stderr).toContain(`finalGate="${finalGate}" (env)`);
     expect(existsSync(join(dir, 'whole-unit-ran'))).toBe(wholeUnit);
     const explicit = spawnSync('node', [VERIFY_LANE, 'run', '--json', '--gate=npm run check:standards'], { cwd: dir, encoding: 'utf8', env, timeout: 60_000 });
@@ -2506,7 +2547,7 @@ describe('full build gate default', () => {
     writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts, description: 'dependency-surface change' }));
     git('add', 'package.json'); git('commit', '-qm', 'touch package.json');
     const env = (finalGate) => {
-      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate };
+      const e = { ...gateScrubbedEnv(), CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_BUILD_FINAL_GATE: finalGate, WE_DIFF_TEST_SELECTION: '0' };
       if (finalGate === null) delete e.WE_BUILD_FINAL_GATE;
       return e;
     };

@@ -396,7 +396,7 @@ function resolveBuildDefaultGate(env) {
     const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
     gate.gateReasons.push(reason);
     gate.decision.reasons = [...gate.decision.reasons, reason];
-    if (policy.finalGate === 'full') {
+    if (policy.finalGate === 'full' && gate.decision.mode !== 'full') {
       const downgrade = `build.finalGate=full (${policy.sources.finalGate}) downgraded to related selection — ${explicitFull ? 'no test:unit script in this checkout' : 'whole-suite execution requires an explicit tool/env opt-in'}; CI owns exhaustive verification`;
       gate.gateReasons.push(downgrade);
       gate.decision.reasons.push(downgrade);
@@ -461,7 +461,8 @@ if (typeof flags.gate === 'string') {
     let defaultBlocked = false;
     try {
       const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
-      defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
+      // A runnable broad fallback still requires affected-test evidence for an explicit override.
+      defaultBlocked = ['blocked', 'full'].includes(decision.mode) && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
     // The policy's own explicit (tool/env) whole-unit-tier command is the default gate, not an agent-supplied one.
     const policyFull = (() => { try {
@@ -710,7 +711,9 @@ if (fullRetryGate) {
   resolvedGate.testCommand = 'npm run test:unit';
   resolvedGate.standardsCommand = resolvedGate.command.includes('check:standards') ? 'npm run check:standards' : null;
 }
-const phasedTestGate = retryableGate || fullRetryGate;
+// The idle-host fallback already supplies separate commands; runAllPhases applies even without retries.
+const fullFallbackGate = resolvedGate?.decision?.mode === 'full' && !!resolvedGate.testCommand;
+const phasedTestGate = retryableGate || fullRetryGate || fullFallbackGate;
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGate;
 const admissionPhases = {};
@@ -1174,7 +1177,7 @@ try {
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
-  if (phasedTestGate && retryFailed > 0) result = await retryPhase(result, 'vitest');
+  if ((retryableGate || fullRetryGate) && retryFailed > 0) result = await retryPhase(result, 'vitest');
   phaseResults.push({ phase: 'vitest', result });
   // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
   // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.
