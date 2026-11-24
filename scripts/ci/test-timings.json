@@ -2496,8 +2496,7 @@
   "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/mq-refresh-live-hold.soak.test.mjs": 1
+  "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
  },
  "integration": {}
 }
