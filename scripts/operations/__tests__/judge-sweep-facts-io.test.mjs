@@ -1071,7 +1071,7 @@ it.each([
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it.each([['CONFLICTING', 'CONFLICTING'], ['UNKNOWN', 'UNKNOWN'], ['MERGEABLE', 'MERGEABLE']])(
+it.each([['CONFLICTING', 'CONFLICTING'], ['MERGEABLE', 'MERGEABLE']])(
   'reads the PR merge state into the facts (%s)', (mergeable, expected) => {
     const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
     const reader = createJudgeSweepFactsReader(options({ gh }));
@@ -1080,7 +1080,7 @@ it.each([['CONFLICTING', 'CONFLICTING'], ['UNKNOWN', 'UNKNOWN'], ['MERGEABLE', '
     expect(row.evidenceErrors).not.toContain('merge state unavailable; inspect PR mergeability');
     expect(gh.mock.calls[0][0].at(-1)).toContain('mergeable');
   });
-it.each([[undefined], [null], [7], ['BOGUS']])('records an evidence error for a missing or invalid merge state (%s)', mergeable => {
+it.each([[undefined], [null], [7], ['BOGUS'], ['UNKNOWN']])('records an evidence error for a missing or invalid merge state (%s)', mergeable => {
   const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
   const row = createJudgeSweepFactsReader(options({ gh }))({ repo }).prs[0];
   expect(row.mergeable).toBeNull();

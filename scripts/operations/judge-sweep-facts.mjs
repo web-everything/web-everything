@@ -30,10 +30,6 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
   if (pr.fixerRunning) return no('fixer running');
   if (pr.inCi) return no('in CI');
   if (Number.isFinite(pr.minutesSinceFixLoop) && pr.minutesSinceFixLoop < 60) return no('fix-loop active (<60 min)');
-  // A conflict is never "moving" on labels or an assignee alone: past the unowned age it needs judgment.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft !== true && ownerAge(pr) > limits.unownedMinutes) {
-    return yes('conflict-unattended: resolve the conflict');
-  }
   if (labels.includes('ready-to-merge')) return no('awaiting-merge');
   if (labels.includes('review:accepted') && labels.includes('review:human')) return yes('awaiting-operator');
   if (pr.fixerRunning === false && labels.some(l => ['status:answered-waiting-fixer', 'review:changes'].includes(l))
@@ -71,12 +67,6 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
     return result('judge', 'Inspect PR evidence and rule on the outstanding judgment.');
   }
   if (pr.fixerRunning) return result('fixer', 'Complete the active repair and publish its result.');
-  // Only an explicit CONFLICTING counts; UNKNOWN is transient. Checked before the label branches so a conflicted
-  // ready-to-merge or review:pending PR is still repaired. Drafts and holds keep their own owner below.
-  if (pr.mergeable === 'CONFLICTING' && pr.isDraft !== true && !labels.some(l =>
-    ['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].includes(l))) {
-    return result('fixer', 'Resolve the conflict.');
-  }
   if (labels.includes('ready-to-merge')) return result('drain', 'Merge after required gates pass.');
   if (labels.some(l => ['review:accepted', 'review:human', 'status:needs-you'].includes(l))) {
     return result('operator', 'Inspect the PR and provide the required operator decision.');
@@ -96,6 +86,10 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
     ['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].includes(l))) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
+  // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
+  if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes('hold:fix')) {
+    return result('fixer', 'Resolve the conflict.');
+  }
   return result('nobody', 'Inspect the PR and assign its next responsible worker.');
 }
 
@@ -103,7 +97,9 @@ export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
   const judgment = existingJudgment(pr, thresholds);
   if (judgment.reason === 'waiting on review' && !pr.owner && !pr.inCi
     && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)
-    && ['nobody', 'orchestrator'].includes(deriveNextOwner(pr, thresholds).nextOwner)) {
+    && (['nobody', 'orchestrator'].includes(deriveNextOwner(pr, thresholds).nextOwner)
+      // The conflict fallback names a fixer that may never have been dispatched: keep the stall guard.
+      || (pr.mergeable === 'CONFLICTING' && deriveNextOwner(pr, thresholds).nextOwner === 'fixer' && !pr.fixerRunning))) {
     return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
   }
   return judgment;

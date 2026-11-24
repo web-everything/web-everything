@@ -307,12 +307,20 @@ describe('next responsible owner from existing facts', () => {
     ['nobody', {}],
     ['nobody', { mergeable: 'UNKNOWN' }],
     ['nobody', { mergeable: 'MERGEABLE' }],
-    ['fixer', { mergeable: 'CONFLICTING' }],
-    ['fixer', { mergeable: 'CONFLICTING', fixerRunning: true }],
-    ['fixer', { mergeable: 'CONFLICTING', labels: ['ready-to-merge'] }],
-    ['fixer', { mergeable: 'CONFLICTING', labels: ['review:pending'] }],
-    ['fixer', { mergeable: 'CONFLICTING', owner: 'someone' }],
+    ['fixer', { mergeable: 'CONFLICTING', isDraft: false }],
+    ['fixer', { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: true }],
+    // The conflict branch is the empty-owner fallback only: every existing guard keeps its precedence.
+    ['nobody', { mergeable: 'CONFLICTING', isDraft: null }],
+    ['nobody', { mergeable: 'CONFLICTING' }],
+    ['nobody', { mergeable: 'CONFLICTING', isDraft: false, labels: ['hold:fix'] }],
+    ['drain', { mergeable: 'CONFLICTING', isDraft: false, labels: ['ready-to-merge'] }],
+    ['operator', { mergeable: 'CONFLICTING', isDraft: false, labels: ['status:needs-you'] }],
+    ['operator', { mergeable: 'CONFLICTING', isDraft: false, labels: ['review:human'] }],
+    ['red-team', { mergeable: 'CONFLICTING', isDraft: false, labels: ['red-team:pending'] }],
+    ['review', { mergeable: 'CONFLICTING', isDraft: false, labels: ['review:pending'] }],
+    ['judge', { mergeable: 'CONFLICTING', isDraft: false, round: 5 }],
     ['orchestrator', { mergeable: 'CONFLICTING', isDraft: true }],
+    ['orchestrator', { mergeable: 'CONFLICTING', isDraft: false, labels: ['status:needs-human'] }],
   ];
   it.each(ownerCases)('derives %s with a nonempty one-line next step from %j', (nextOwner, patch) => {
     const input = facts(patch);
@@ -325,24 +333,13 @@ describe('next responsible owner from existing facts', () => {
     expect(input).toEqual(before);
   });
   it('a conflicting PR with no fixer is owned by the fixer', () => {
-    expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', fixerRunning: false })))
+    expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false, fixerRunning: false })))
       .toEqual({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
   });
   it('a conflicting PR with no fixer still escalates when unattended past the unowned age', () => {
-    const stale = { mergeable: 'CONFLICTING', fixerRunning: false, owner: null, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
+    const stale = { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: false, owner: null, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
     expect(judgeSweepFacts.needsJudgment(facts(stale))).toMatchObject({ needsJudgment: true });
     expect(judgeSweepFacts.needsJudgment(facts({ ...stale, fixerRunning: true }))).toMatchObject({ needsJudgment: false });
-  });
-  it.each([['ready-to-merge'], ['review:pending']])('an aged conflict labelled %s still needs judgment', label => {
-    const aged = { mergeable: 'CONFLICTING', labels: [label], minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
-    expect(judgeSweepFacts.needsJudgment(facts(aged))).toMatchObject({ needsJudgment: true });
-    expect(judgeSweepFacts.needsJudgment(facts({ ...aged, mergeable: 'MERGEABLE' }))).toMatchObject({ needsJudgment: false });
-  });
-  it('an assignee does not count as activity for an aged conflict', () => {
-    const aged = { mergeable: 'CONFLICTING', owner: 'someone', minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
-    expect(judgeSweepFacts.needsJudgment(facts(aged))).toMatchObject({ needsJudgment: true });
-    expect(judgeSweepFacts.needsJudgment(facts({ ...aged, mergeable: 'MERGEABLE' })))
-      .toMatchObject({ needsJudgment: false, reason: 'owner present' });
   });
   it('keeps a running fixer responsible for a needs-human PR', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))
