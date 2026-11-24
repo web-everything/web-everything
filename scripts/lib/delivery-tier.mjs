@@ -35,6 +35,7 @@ export const HIGH_MUST_STAY = Object.freeze([
   '**/skills-src/**', 'scripts/conveyor/advisory-label-sweep.mjs', '**/advisory-label-sweep*',
   'scripts/**/*force*', 'scripts/**/*red-main*',
   'scripts/lib/delivery-tier*.mjs', 'scripts/settings/delivery-tiers.json',
+  'scripts/lib/__tests__/delivery-tier*',
   'scripts/settings/**', 'scripts/lib/*settings*', 'scripts/lib/presets-loader.cjs',
   '**/*preset*',
   '.github/workflows/**', 'vitest*.config.*', '**/vitest*.config.*', 'scripts/ci/**',
@@ -122,7 +123,7 @@ function validPath(path) {
 function quarantineContext(opts) {
   const paths = opts.quarantinedTests;
   if (paths === undefined) return undefined;
-  return Array.isArray(paths) && Array.from(paths).every(validPath)
+  return Array.isArray(paths) && Array.from(paths).every(path => validPath(path) && !path.includes('::'))
     ? new Set(paths) : null;
 }
 

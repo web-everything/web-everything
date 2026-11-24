@@ -66,10 +66,11 @@ describe('delivery tiers (observe-only)', () => {
     }
   });
   it.each([null, 'x', {}, [null], [1], Array(1), [''], ['./src/__tests__/x.test.mjs'],
+    ['src/__tests__/x.test.mjs::case'],
     ['src/../x'], ['src//x'], ['/src/x'], ['src/x/'], ['src\\x'], ['src/\nx'], ['src/\x7fx'],
   ])('invalid quarantine context refuses: %j', (quarantinedTests) => {
     const opts = { ...builtins, quarantinedTests };
-    const paths = ['README.md', 'scripts/conveyor/x.mjs', 'src/unknown.js'];
+    const paths = ['README.md', 'scripts/conveyor/x.mjs', 'src/unknown.js', 'src/__tests__/x.test.mjs'];
     expect(classifyTier(paths, opts).perFile.map(f => [f.tier, f.rule]))
       .toEqual(paths.map(() => ['HIGH', 'context-invalid']));
     for (const path of paths) expect(fileTier(path, opts)).toBe('HIGH');
@@ -79,6 +80,7 @@ describe('delivery tiers (observe-only)', () => {
     'docs/governance/policy.txt', 'docs/governance.md', 'docs/nested/governance-policy.md',
     'AGENTS.md', 'CLAUDE.md', 'docs/agent/testing.md', 'scripts/conveyor/advisory-label-sweep.mjs',
     'scripts/conveyor/__tests__/advisory-label-sweep.test.mjs',
+    'scripts/lib/__tests__/delivery-tier.test.mjs',
   ])('sensitive path has a HIGH rule: %s', path => expect(matchedHigh(path)).toBe(true));
   it('skills-src is HIGH', () => {
     for (const path of ['skills-src/x/SKILL.md', 'nested/skills-src/x/SKILL.md']) {
