@@ -383,8 +383,8 @@ export function redTeamClearGateCommentForHead(comments, pr, head, accepts = () 
   if (!gateOutcomesForHead([c], pr, live).has(marker.outcome)
     || !['clear', GATE_OUTCOMES.CARD_QUEUED].includes(marker.outcome)) return false;
   const hit = latestResult(records, pr, live);
-  if (marker.result && (!hit || marker.result !== redTeamResultId(hit.parsed))) return false;
-  return accepts(c) === true;
+  if (!marker.result || !hit || marker.result !== redTeamResultId(hit.parsed)) return false;
+  return accepts(c, hit.c) === true;
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */

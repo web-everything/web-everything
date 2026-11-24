@@ -54,7 +54,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
     if (evidence.reason === 'review-unfinished' && headVerified !== false && gateClear === true
       && names.includes('red-team:pending') && !names.includes('red-team:blocked')
       && !pendingOnly && !evidence.carryConflict && !evidence.inFlight && !evidence.scheduled
-      && redTeamClearGateCommentForHead(comments, pr, head, c => gateSettleBoundsAllow(evidence, c, pr, head))) {
+      && redTeamClearGateCommentForHead(comments, pr, head, (_gate, result) => gateSettleBoundsAllow(evidence, result, pr, head))) {
       return { add: names.includes('red-team:clear') ? null : 'red-team:clear',
         remove: names.filter(name => name === 'red-team:pending') };
     }
@@ -96,7 +96,7 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
       && !(desired === null && (l === 'red-team:blocked' || (l === 'red-team:pending' && !cardOnlyBypass)))) };
 }
 
-/** Same quiet/complete bounds as result-comment settlement; unknown bounds retain pending. */
+/** Bound to the review result time, with the same quiet/complete bounds as result-comment settlement. */
 function gateSettleBoundsAllow(evidence, comment, pr, head) {
   const bounds = evidence.settleBounds ?? {};
   const at = Date.parse(commentCreatedAt(comment));
@@ -208,7 +208,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     else if (gateSettle && (next.add === 'red-team:pending' || !next.remove.includes('red-team:pending')))
       return { add: null, remove: [], skipped: 'gate-changed' };
     else plan = next;
-    // Last head guard, after every read and right before the write.
+    // Fresh head and labels before the final clearance read.
     let last = null, lastLabels = null;
     try { const fresh = recheck.readPrState(repo, pr); last = fresh?.headRefOid; lastLabels = fresh?.labels; } catch { last = null; }
     if (last !== head) return { add: null, remove: [], skipped: 'head-moved' };
@@ -217,7 +217,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     if (plan.add !== 'red-team:blocked' && lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:blocked'))
       return { add: null, remove: [], skipped: 'blocked-label' };
     // Compare-and-swap: clear is written only while pending is still on the fresh labels and the check is still clear for this head.
-    if (plan.add === 'red-team:clear') {
+    if (plan.add === 'red-team:clear' || (plan.add === null && plan.remove.includes('red-team:pending'))) {
       if (!lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) return { add: null, remove: [], skipped: 'pending-gone' };
       let lastClear = false;
       try { lastClear = readClear({ repo, pr, head }) === true; } catch { lastClear = false; }
@@ -226,6 +226,12 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   }
   if (!dryRun && (plan.add || plan.remove.length)) {
     if (plan.add) provider.ensureLabel(repo, plan.add, RED_TEAM_STATUS_LABEL_META[plan.add]);
+    // Publication reads and label provisioning can race a push: pin the head again immediately before writing.
+    if (checkClear) {
+      let finalHead = null;
+      try { finalHead = recheck.readPrState(repo, pr)?.headRefOid; } catch { /* unreadable refuses the write */ }
+      if (finalHead !== head) return { add: null, remove: [], skipped: 'head-moved' };
+    }
     provider.setLabels(repo, pr, { add: plan.add, remove: plan.remove });
   }
   return plan;

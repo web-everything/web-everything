@@ -74,15 +74,44 @@ it('a pending label with no result and nothing owed is kept, never planned for r
 });
 
 describe('terminal gate comments with unreadable run evidence', () => {
+  const settledResult = { ...result(), createdAt: '2026-01-01T00:00:00Z' };
+  const resultId = redTeamResultId(parseRedTeamComment(settledResult.body));
   const gate = (rev = head, outcome = 'card-queued', login = 'web-everything', pr = 42) => ({
-    createdAt: '2026-01-02T00:00:00Z', author: { login }, body: `<!-- we:red-team-gate pr=${pr} rev=${rev} outcome=${outcome} -->`,
+    createdAt: '2026-01-02T00:00:00Z', author: { login }, body: `<!-- we:red-team-gate pr=${pr} rev=${rev} outcome=${outcome} result=${resultId} -->`,
   });
   const plan = (comments, evidence = {}, extra = {}) => planRedTeamStatusLabels({ ...input,
-    labels: ['red-team:pending'], comments, gateClear: true, evidence: { ok: false, reason: 'review-unfinished',
+    labels: ['red-team:pending'], comments: [settledResult, ...comments], gateClear: true, evidence: { ok: false, reason: 'review-unfinished',
       settleBounds: { unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
         evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead: () => ({ complete: true, blocked: false }) }, ...evidence }, ...extra });
   const pending = { add: null, remove: [] };
 
+  it.each(['clear', 'card-queued'])('requires a real same-head result binding for %s', outcome => {
+    const valid = gate(head, outcome);
+    const missing = { ...valid, body: valid.body.replace(` result=${resultId}`, '') };
+    const unmatched = { ...valid, body: valid.body.replace(resultId, 'f'.repeat(16)) };
+    const foreign = { ...settledResult, body: settledResult.body.replace(head, 'b'.repeat(40)) };
+    for (const comments of [[settledResult, missing], [settledResult, unmatched], [valid], [foreign, valid]]) {
+      expect(redTeamClearGateCommentForHead(comments, 42, head)).toBe(false);
+      expect(plan([], {}, { comments })).toEqual(pending);
+    }
+  });
+  it('a late gate cannot settle a result older than the unfinished review', () => {
+    const unfinishedStartedAt = Date.parse('2026-01-01T12:00:00Z');
+    expect(plan([gate()], { settleBounds: { unfinishedStartedAt, unfinishedUndecided: true,
+      unfinishedActiveAt: 0, evaluatedAt: ABANDONED_REVIEW_AFTER_MS,
+      completeHeadRead: () => ({ complete: true, blocked: false }) } })).toEqual(pending);
+  });
+  it('uses the bound result time for the unread boundary and complete-head read', () => {
+    const completeHeadRead = vi.fn(() => ({ complete: true, blocked: false }));
+    const bounds = { unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
+      evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead };
+    expect(plan([gate()], { settleBounds: { ...bounds, unreadBoundaryAt: Date.parse(settledResult.createdAt) } })).toEqual(pending);
+    expect(plan([gate()], { settleBounds: bounds }).add).toBe('red-team:clear');
+    expect(completeHeadRead).toHaveBeenCalledWith({ pr: 42, head, at: Date.parse(settledResult.createdAt) });
+  });
+  it('refuses a bound result without a readable timestamp', () => {
+    expect(plan([], {}, { comments: [result(), gate()] })).toEqual(pending);
+  });
   it.each(['run-start-missing', 'scan-capped', 'status-unreadable'])('refuses non-stuck reason %s', reason => {
     expect(plan([gate()], { reason })).toEqual(pending);
   });
@@ -96,15 +125,15 @@ describe('terminal gate comments with unreadable run evidence', () => {
     expect(plan([gate(), gate(head, outcome)])).toEqual(pending);
   });
   it('never uses an older result marker after a later restrictive result marker', () => {
-    const named = (outcome, id) => ({ ...gate(head, outcome), body: gate(head, outcome).body.replace(' -->', ` result=${id} -->`) });
+    const named = (outcome, id) => ({ ...gate(head, outcome), body: gate(head, outcome).body.replace(`result=${resultId}`, `result=${id}`) });
     expect(plan([named('clear', '1'.repeat(16)), named('sent-back', '2'.repeat(16))])).toEqual(pending);
   });
   it('binds the latest gate result id to the latest result, never a historical marker', () => {
     const first = result();
     const second = result(broken);
     expect(redTeamResultId(parseRedTeamComment(first.body))).not.toBe(redTeamResultId(parseRedTeamComment(second.body)));
-    const named = c => ({ ...gate(head, 'clear'), body: gate(head, 'clear').body.replace(' -->',
-      ` result=${redTeamResultId(parseRedTeamComment(c.body))} -->`) });
+    const named = c => ({ ...gate(head, 'clear'), body: gate(head, 'clear').body.replace(`result=${resultId}`,
+      `result=${redTeamResultId(parseRedTeamComment(c.body))}`) });
     expect(redTeamClearGateCommentForHead([first, second, named(first)], 42, head)).toBe(false);
     expect(redTeamClearGateCommentForHead([first, second, named(second)], 42, head)).toBe(true);
   });

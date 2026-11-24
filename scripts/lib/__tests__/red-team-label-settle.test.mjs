@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ABANDONED_REVIEW_AFTER_MS, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { parseRedTeamComment, redTeamResultId } from '../red-team-gate.mjs';
 import { createFreshGh, planRedTeamStatusLabels, readCheckClearFact, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const head = 'a'.repeat(40);
@@ -235,8 +236,11 @@ describe('red-team label settles from the head\'s check', () => {
 
 
 describe('gate-comment settle write guards', () => {
+  const result = { author: { login: 'web-everything' }, createdAt: '2026-01-01T00:00:00Z',
+    body: `<!-- we:red-team-advisory pr=42 rev=${head} -->` };
+  const resultId = redTeamResultId(parseRedTeamComment(result.body));
   const gate = { author: { login: 'web-everything' }, createdAt: '2026-01-02T00:00:00Z',
-    body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=clear -->` };
+    body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=clear result=${resultId} -->` };
   const evidence = { ok: false, reason: 'review-unfinished', settleBounds: {
     unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
     evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead: () => ({ complete: true, blocked: false }),
@@ -244,14 +248,39 @@ describe('gate-comment settle write guards', () => {
   const setup = () => {
     const live = { headRefOid: head, labels: ['red-team:pending'] };
     const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live),
-      readPrFiles: () => ['scripts/x.mjs'], readComments: vi.fn(() => [gate]) };
-    return { provider, args: { ...input, evidence, comments: [gate], live, provider, standingRuling: null, gh: ghFor([]) } };
+      readPrFiles: () => ['scripts/x.mjs'], readComments: vi.fn(() => [result, gate]) };
+    return { provider, args: { ...input, evidence, comments: [result, gate], live, provider, standingRuling: null, gh: ghFor([]) } };
   };
+  it.each(['hold', 'pending-gone'])('rechecks %s when clear and pending coexist', kind => {
+    const { provider, args } = setup();
+    args.live.labels.push('red-team:clear');
+    let reads = 0;
+    const gh = argv => {
+      ++reads;
+      if (reads === 2 && kind === 'pending-gone') provider.readPrState.mockReturnValue({ headRefOid: head, labels: ['red-team:clear'] });
+      return ghFor([], { statuses: reads === 3 && kind === 'hold' ? [
+        { id: 6, context: 'red-team/publication #42', state: 'pending', creator: { login: 'x' } },
+      ] : [] })(argv);
+    };
+    expect(syncRedTeamStatusLabels({ ...args, gh }).skipped).toBe(kind === 'hold' ? 'check-changed' : 'pending-gone');
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('refuses a head moving during the final publication read (clear present: %s)', clearPresent => {
+    const { provider, args } = setup();
+    if (clearPresent) args.live.labels.push('red-team:clear');
+    let reads = 0;
+    const gh = argv => {
+      if (++reads === 3) provider.readPrState.mockReturnValue({ headRefOid: old, labels: args.live.labels });
+      return ghFor([])(argv);
+    };
+    expect(syncRedTeamStatusLabels({ ...args, gh }).skipped).toBe('head-moved');
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
   it.each(['head', 'labels', 'thread'])('rechecks live %s before writing gate clearance', kind => {
     const { provider, args } = setup();
     const fresh = { readPrState: () => kind === 'head' ? { headRefOid: old } :
       { headRefOid: head, labels: kind === 'labels' ? ['red-team:pending', 'red-team:blocked'] : ['red-team:pending'] },
-      readComments: () => kind === 'thread' ? [] : [gate] };
+      readComments: () => kind === 'thread' ? [] : [result, gate] };
     syncRedTeamStatusLabels({ ...args, recheckProvider: fresh });
     expect(provider.setLabels).not.toHaveBeenCalled();
   });
