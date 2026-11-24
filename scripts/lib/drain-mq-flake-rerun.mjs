@@ -90,7 +90,9 @@ export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, 
   }
 }
 export function readMqTimeoutFailure({ failed, attempts, repo, exec, spend }) {
-  if (!failed.length || failed.length > 10 || attempts.reason
+  // No per-test pass proof is available here: only one failed unit shard may spend
+  // the persisted, single-use head claim. Other failures require operator inspection.
+  if (failed.length !== 1 || !/^test-shard \([1-9][0-9]*\)$/.test(failed[0].name) || attempts.reason
     || attempts.candidates.length !== failed.length) return false;
   let timeouts = 0;
   try {

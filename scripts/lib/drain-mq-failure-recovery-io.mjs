@@ -1,3 +1,4 @@
+import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /** Production adapter for a drain's held same-head MQ failure. No work runs at import time. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
@@ -47,6 +48,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
   return {
     ledger,
     forRoute: () => createDrainMqFailureRecoveryIo({ exec, ledger, maxCalls: limit }),
+    readQueue: ({ repo, pr }) => readMergeQueueState({ repo, pr, readJson: json }),
     readTimeline: ({ repo, pr }) => readMqTimeline({ repo, pr, exec: request }),
     readPr: ({ repo, pr }) => json(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,mergeStateStatus,baseRefName']),
     readLabels({ repo, pr }) {
@@ -55,6 +57,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
         && data.labels.every(label => typeof label?.name === 'string' && label.name.length > 0);
       return { labels: complete ? data.labels.map(label => label.name) : [], complete, head: data?.headRefOid };
     },
+    // Return the complete check-attempt snapshot so mutation admission can pin it.
     readTimeoutFailure({ removal }) {
       const checks = [];
       let page = 1;
@@ -69,7 +72,8 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
         removedAt: Date.parse(removal.removedAt) });
       const failed = checks.filter(check => check.conclusion === 'failure');
       if (failed.some(check => !mqActionsJob(check, removal.repo))) return false;
-      return readMqTimeoutFailure({ failed, attempts, repo: removal.repo, exec: rawRequest, spend });
+      return readMqTimeoutFailure({ failed, attempts, repo: removal.repo, exec: rawRequest, spend })
+        ? JSON.stringify(checks) : false;
     },
     collectEvidence({ removal }) {
       return collectMqFailureEvidence({ removal, io: {
@@ -109,16 +113,22 @@ export const productionIo = createDrainMqFailureRecoveryIo();
 function heldMqFailure({ repo, pr, head, guard, io }) {
     const identity = { repo, pr, head };
     if (!validIdentity(identity) || guard?.hold !== true || typeof guard.line !== 'string'
-      || !guard.line.startsWith('mq-same-head-failed:')) return { reason: 'No eligible same-head MQ hold' };
+      || guard.line !== `mq-same-head-failed: #${pr} head ${head} — failed_checks`) return { reason: 'No eligible same-head MQ hold' };
     const active = io.forRoute ? io.forRoute() : io;
+    const queue = active.readQueue({ repo, pr });
+    if (queue?.error || queue?.inQueue !== false || queue.head !== head)
+      return { reason: 'Unreadable or mismatched live queue state; operator inspection required' };
     const timeline = active.readTimeline({ repo, pr });
     if (timeline?.error || timeline?.hasPreviousPage !== false || !Array.isArray(timeline?.nodes)
       || timeline.nodes.length > 100) return { reason: 'Incomplete timeline; operator inspection required' };
     // Reuse the drain's second-parent binding and retry exhaustion decision. Unknown events/reasons,
     // repeated failures and a queue re-entry after failure cannot authorize a recovery route.
     const decision = decideMqSameHead({ ...identity, timeline });
-    if (!decision.hold || !decision.line?.endsWith(' — failed_checks'))
+    if (!decision.hold || decision.line !== guard.line)
       return { reason: 'No single eligible failed_checks removal; operator inspection required' };
+    if (timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
+      && event.reason?.trim().toLowerCase() === 'merge_conflict').length >= 3)
+      return { reason: 'Three merge_conflict removals; operator must inspect history and enqueue manually' };
     const removals = timeline.nodes.filter(event => event?.__typename === 'RemovedFromMergeQueueEvent'
       && event.reason?.trim().toLowerCase() === 'failed_checks'
       && event.beforeCommit?.parents?.nodes?.[1]?.oid === head); const event = removals[0];
@@ -174,17 +184,23 @@ export function retryMqTimeoutOnHold({ repo, pr, head, guard,
     const eligible = heldMqFailure({ repo, pr, head, guard, io });
     if (eligible.reason) return { retry: false, reason: eligible.reason };
     const { active, removal, removedAt, history } = eligible;
-    if (active.readTimeoutFailure({ removal: { ...removal, removedAt } }) !== true)
+    const checks = active.readTimeoutFailure({ removal: { ...removal, removedAt } });
+    if (typeof checks !== 'string')
       return { retry: false, reason: 'Timeout evidence unavailable; operator inspection required' };
     const claim = active.ledger.claim({ ...removal, kind: 'mq-flake-timeout' });
     if (typeof claim?.then === 'function') { Promise.resolve(claim).catch(() => {}); throw Error('MQ ledger unavailable'); }
     if (!claim?.claimed)
       return { retry: false, reason: 'Already retried this head' };
+    let admitted = false;
     const sameHeadAdmission = () => {
-      const refused = { hold: true, line: 'mq-same-head-failed: timeout retry history changed or unreadable; operator inspection required' };
+      const refused = { hold: true, line: 'mq-same-head-failed: timeout retry evidence changed, spent or unreadable; operator inspection required' };
+      if (admitted) return refused;
+      // Consume even a refused admission: ambiguous mutation outcomes must not repeat.
+      admitted = true;
       try {
-        const live = active.readTimeline({ repo, pr });
-        return !live?.error && live?.hasPreviousPage === false && JSON.stringify(live.nodes) === history
+        const fresh = heldMqFailure({ repo, pr, head, guard, io });
+        if (fresh.reason || fresh.history !== history) return refused;
+        return fresh.active.readTimeoutFailure({ removal: { ...fresh.removal, removedAt: fresh.removedAt } }) === checks
           ? { hold: false, line: null } : refused;
       } catch { return refused; }
     };

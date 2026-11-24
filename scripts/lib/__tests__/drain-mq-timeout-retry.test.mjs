@@ -15,6 +15,11 @@ const roots = [];
 const fixture = options => { const root = mkdtempSync(join(process.env.TMPDIR, 'mq-timeout-')); roots.push(root); return timeoutFixture(root, options); };
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 it.each([
+  ['unknown timeout check', { checkName: 'deterministic-deadlock' }],
+  ['multiple failed checks', { multipleFailures: true }], ['deterministic repeated attempt', { repeatedAttempt: true }],
+  ['unreadable queue', { queue: 'unreadable' }], ['mismatched queue', { queue: 'mismatched' }],
+  ['three conflicts', { conflicts: 3 }], ['over conflict cap', { conflicts: 4 }],
+  ['unrelated hold', { guard: { hold: true, line: 'mq-same-head-failed: unrelated hold' } }],
   ['assertion', { text: timeoutLog.replace('Error: Test timed out in 5000ms.', 'AssertionError: mismatch') }],
   ['mixed failure', { text: timeoutLog + 'AssertionError: mismatch' }],
   ['unreadable logs', { unreadable: true }], ['missing escape handling', { stripEscape: true }],
@@ -25,12 +30,12 @@ it.each([
   ['oversized log', { text: timeoutLog + 'x'.repeat(4 * 1024 * 1024) }], ['call budget', { maxCalls: 2 }], ['incomplete check page', { incomplete: true }],
 ])('%s refuses recovery', async (_, options) =>
   expect(await fixture(options).retry()).toMatchObject({ retry: false }));
-it('timeout plus derived test job retries once across fresh adapters sharing the ledger', async () => {
+it('sole failed timeout shard retries once across fresh adapters sharing the ledger', async () => {
   const f = fixture();
   expect(await f.retry()).toMatchObject({ retry: true, reason: 'mq-flake-timeout' });
   expect(await f.retry()).toMatchObject({ retry: false, reason: 'Already retried this head' });
 });
-it.each(['original', 'second', 'unreadable'])('mutation-boundary %s timeline refuses after timeout authorization', async phase => {
+it.each(['original', 'second', 'unreadable', 'queue unreadable', 'queue mismatched', 'attempt changed', 'dirty'])('mutation-boundary evidence %s is revalidated after timeout authorization', async phase => {
   const f = fixture(), authorized = await f.retry();
   expect(authorized.retry).toBe(true);
   f.setTimeline(phase);
@@ -47,4 +52,21 @@ it('ledger storage failure retains hold without unhandled rejection', async () =
     expect(fixture({ ledgerIo: { atomicUpdate() { throw Error('corrupt ledger'); } } }).retry()).toMatchObject({ retry: false, reason: expect.stringContaining('operator inspection required') });
     await new Promise(setImmediate); expect(errors).toEqual([]);
   } finally { process.removeListener('unhandledRejection', onRejection); }
+});
+
+it('two conflict removals remain below the explicit cap', () => {
+  expect(fixture({ conflicts: 2 }).retry()).toMatchObject({ retry: true });
+});
+it('the authorization callback cannot license a second mutation', () => {
+  const f = fixture(), authorized = f.retry();
+  expect(authorized.retry).toBe(true);
+  expect(authorized.sameHeadAdmission()).toEqual({ hold: false, line: null });
+  expect(f.enqueue(authorized.sameHeadAdmission).ok).toBe(false);
+  expect(f.mutations()).toBe(0);
+});
+it('an exact-looking stale hold cannot bypass unreadable or mismatched live queue state', () => {
+  const guard = { hold: true, line: `mq-same-head-failed: #42 head ${'a'.repeat(40)} — failed_checks` };
+  for (const queue of ['unreadable', 'mismatched']) {
+    expect(fixture({ queue, guard }).retry()).toMatchObject({ retry: false });
+  }
 });

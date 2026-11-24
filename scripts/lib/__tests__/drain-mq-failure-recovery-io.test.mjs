@@ -29,6 +29,7 @@ function fixture(mode = 'real') {
   const exec = vi.fn((file, args, options) => {
     expect(file).toBe('gh');
     if (mode === 'unreadable') throw new Error('unreadable remote');
+    if (args.some(arg => arg.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: false, headRefOid: identity.head } } } });
     if (args.includes('graphql')) return JSON.stringify({ data: { repository: { pullRequest: {
       timelineItems: { nodes: events, pageInfo: { hasPreviousPage: mode === 'incomplete timeline' } },
     } } } });
