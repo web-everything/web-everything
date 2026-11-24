@@ -213,10 +213,26 @@ describe('lane-pool release salvage push against a throwaway origin', () => {
     expect(recordFiles(backupRoot)).toEqual([]);
   });
 
-  it('uses the caller repo for a same-pool release without requiring a sibling primary', () => {
+  it('requires an explicit reference to salvage to a same-named caller origin when the selected primary is missing', () => {
     const sha = commitLocalWork();
     const caller = primaryCaller('releasesalvage');
-    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, caller));
+    const marker = join(laneDir, '.git', '.lane-lease');
+    const lease = readFileSync(marker, 'utf8');
+    // A matching remote basename does not establish the selected pool's authority.
+    expect(existsSync(join(base, 'releasesalvage'))).toBe(false);
+    expect(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller, stderr: /UNPUSHED_WORK/, expectedStatus: 1,
+    }).released).toBe(0);
+    expect(readFileSync(marker, 'utf8')).toBe(lease);
+    expect(git(['rev-parse', 'HEAD'], laneDir)).toBe(sha);
+    expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd)).toBe('');
+    expect(salvageBranches()).toEqual([]);
+    expect(recordFiles(backupRoot)).toEqual([]);
+
+    // The operator can explicitly authorize that checkout without relying on its basename.
+    assertReleased(runPool(['release', `--lane=${lane}`, '--pool=releasesalvage'], {}, {
+      ...caller, referencePath: caller.cwd,
+    }));
     expect(git(['ls-remote', '--heads', caller.callerOrigin, 'refs/heads/salvage/*'], caller.cwd))
       .toMatch(new RegExp(`^${sha}\\s+refs/heads/salvage/lane-1-`));
     expect(salvageBranches()).toEqual([]);
