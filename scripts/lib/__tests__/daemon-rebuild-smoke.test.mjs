@@ -98,6 +98,8 @@ afterEach(() => {
   tempDirs.length = 0;
 });
 
+// Real Git fixtures and rebuild fallbacks can exceed the 5s default on covered CI shards.
+// Match the 60s hang guard in daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs.
 describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
   // Operator decision (PR 5460, 2026-10-17): smoke failure details, held state and self-sync alerts carry an
   // allow-listed summary (typed fields, the error class, the 0600 stderr file's path), never raw child text. The
@@ -380,7 +382,7 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
     expect(r.reason).toBe('dispatch-smoke-failed');
     expect(head(f)).toBe(lastGood);
   });
-});
+}, 60_000);
 
 describe('dispatchSmokeSuspects', () => {
   const match = (files, pats) => files.filter((x) => pats.includes(x));
