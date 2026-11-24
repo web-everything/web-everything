@@ -2,9 +2,9 @@
  * @file scripts/operations/open-pr-io.mjs
  * @description THE IO SHELL of the `open-pr` declaration — one spawn of `we:scripts/pr-land.mjs`.
  *
- * It validates prepare isolation before shelling the home. No `gh` call of its own, no GitHub API, no branch push: every one
- * of those already belongs to `pr-land.mjs`, and a second route to any of them is the bypass this operation
- * exists to close. If this file ever grows an `https` import, the operation has become the problem it names.
+ * It validates prepare isolation and sibling ancestry before shelling the home. GitHub reads collect admission
+ * evidence; branch pushes and PR publication belong to `pr-land.mjs`. A second publication route would bypass
+ * that home. If this file ever grows an `https` import, the operation has become the problem it names.
  *
  * WHEN THERE IS NO CREDENTIAL, IT FAILS AND SAYS SO. `pr-land.mjs` shells `gh`; on a host where `gh` cannot
  * authenticate the spawn returns a non-verdict and `classifySubmit` reports `unrun` — never `opened`, and
@@ -22,6 +22,8 @@ import { fileURLToPath } from 'node:url';
 
 import { classifySubmit } from './open-pr.mjs';
 import { checkDuplicateBornAs } from '../lib/duplicate-bornas-added.mjs';
+import { checkSiblingBase } from '../lib/sibling-base-check.mjs';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { buildGhShimSettingsEnv, defaultShimDir, shimGhPath, resolveOrgAwareShimDir, pathWithOrgAwareShim, isDaemonCaller } from '../lib/gh-app-shim.mjs';
@@ -136,6 +138,14 @@ function failedGate(e, loadSettings) {
 export { createPrDiffStatReader, OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from '../lib/pr-size-admission.mjs';
 import { createGitReader } from '../lib/pr-size-admission.mjs';
 
+/** One bounded, complete open-PR read; the checker never guesses at missing evidence. */
+export function readSiblingBase({ cwd, env, branch, ...opts }, gh = runGhSync) {
+  const prs = JSON.parse(gh(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid'],
+    { cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
+  if (!Array.isArray(prs) || prs.length >= 1000) throw new Error('Open PR listing may be incomplete (1000 PR limit); ask a human to inspect the sibling history.');
+  return checkSiblingBase({ ...opts, openPrs: prs.filter(pr => pr?.headRefName !== branch) });
+}
+
 /**
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
  * `classifySubmit` is reachable with no `gh`, no network and no PR.
@@ -151,6 +161,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
   git: gitOpt,
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
+  siblingBase = spawn !== spawnSync ? () => [] : opts => readSiblingBase({ ...opts, cwd }),
 } = {}) {
   const git = gitOpt === undefined ? createGitReader(cwd) : gitOpt;
   return ({ argv, skipPrePrReview = '', actor = '', operatorInstruction = '' }) => {
@@ -225,6 +236,22 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
         // Legacy shape, kept: a prepare refusal stops before any child runs and its reason IS the message.
         return { outcome: 'refused', reason: String(e.message || e) };
       }
+    }
+    if (!argv.includes('--dry-run')) {
+      let siblings;
+      try {
+        siblings = siblingBase({ git, base: arg('base') || 'main', sha: arg('sha') || 'HEAD',
+          branch: arg('ref') || arg('branch') || '', env });
+        if (!Array.isArray(siblings) && siblings?.reason !== 'sibling-base-unreadable') throw new Error('Sibling check returned no usable decision');
+      } catch (error) {
+        siblings = { reason: 'sibling-base-unreadable', detail: `Cannot read complete sibling PR evidence: ${error.message}. Restore the local refs/objects or GitHub read access and retry --check.` };
+      }
+      if (Array.isArray(siblings) && siblings.length) {
+        const branch = arg('ref') || arg('branch') || '<branch>';
+        const quote = value => /^[A-Za-z0-9_./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+        const detail = siblings.map(pr => `PR #${pr.number} (${pr.headRefName}): ${pr.count} unlanded shared commits; git rebase --onto origin/main ${quote(pr.headRefName)} ${quote(branch)} (or wait for the sibling to land)`).join('; ');
+        collect('sibling-base', 'sibling-base', detail);
+      } else if (!Array.isArray(siblings)) collect('sibling-base', siblings.reason, siblings.detail);
     }
     let audit;
     try { audit = canonicalAudit({ repo: cwd, ref: arg('ref'), sha: arg('sha'), env, refreshMain: checking }); }

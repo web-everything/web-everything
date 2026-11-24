@@ -2,6 +2,8 @@
 const verify = 'run verify-lane';
 const audit = 'run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>; if WEAKENED needs a waiver request for sha X';
 export const HINTS = Object.freeze({
+  'sibling-base': 'git rebase --onto origin/main <sibling-head> <branch> (or wait for the sibling to land)',
+  'sibling-base-unreadable': 'restore complete local refs/objects and GitHub read access, then retry --check; ask a human to inspect history if the read limit is exceeded',
   'canonical-audit-missing': audit, 'canonical-audit-weakened': audit,
   unverified: verify, untracked: verify, 'verify-unfinished': verify,
   'verify-red': verify, 'verify-corrupt': verify, 'red-ci-gated': verify,
