@@ -8,7 +8,7 @@ vi.mock('node:fs', async importOriginal => {
   const wrap = api => Object.fromEntries(Object.entries(api).map(([key, value]) => {
     if (typeof value !== 'function') return [key, value];
     return [key, Object.assign((...args) => {
-      if (guard.ledgerReads && String(args[0]).endswith('pool-shadow.jsonl')) {
+      if (guard.ledgerReads && String(args[0]).endsWith('pool-shadow.jsonl')) {
         guard.ledgerReads.push(key); throw Error('grant path attempted ledger IO');
       }
       const mutation = /^(?:write|append|mkdir|mkdtemp|rm|rmdir|unlink|rename|copy|cp|link|symlink|truncate|chmod|chown|utimes|lutimes|fchmod|fchown|futimes|ftruncate|createWriteStream)/.test(key)
@@ -411,6 +411,32 @@ it.each([{ class: 0 }, { class: 4 }, { class: '3' }, { size: 0 }, { size: 3 }, {
     expect(report.holders).toEqual([]);
   });
 
+it.each([
+  ['missing budget', undefined], ['null budget', null], ['empty budget', {}],
+  ['unknown', { unknown: true, units: 30 }],
+  ['missing unknown', { units: 30 }], ['null unknown', { unknown: null, units: 30 }],
+  ['false-like unknown', { unknown: 0, units: 30 }],
+  ...[undefined, null, -1, 31, 999, 1.5, NaN, Infinity, '30'].map(units =>
+    [`invalid units ${String(units)}`, { unknown: false, units }]),
+])('collector fails closed for snapshot budget: %s', (_label, budget) => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget } : {}) }) });
+  expectPoolClosed(report);
+  expect(report.sources.find(row => row.source === 'snapshot'))
+    .toMatchObject({ ok: false, error: 'invalid source result' });
+  expect(report.sources.filter(row => row.source !== 'snapshot').every(row => row.ok)).toBe(true);
+  expect(report.holders).toEqual([]);
+});
+
+it.each([0, 30])('collector accepts snapshot budget endpoint %i as known evidence', units => {
+  const report = collectPool({ readSource: source => ({ ...validPoolSource(source),
+    ...(source === 'snapshot' ? { budget: { unknown: false, units } } : {}) }) });
+  expect(report.unknown).toBe(false);
+  expect(report.sources.every(row => row.ok)).toBe(true);
+  expect(report.budgets['studio.units']).toBe(units);
+  expect(report.rows.every(row => !row.unknown && row.poolDecision === (units === 0 ? 'hold' : 'grant'))).toBe(true);
+});
+
 it('off mode appends nothing', () => {
   const append = vi.fn();
   expect(appendShadowRows([{ kind: 'fix' }], { coord, mode: 'off', append })).toBe(false);
@@ -433,6 +459,21 @@ it('duplicate fix jobId across claim and workers counts once while unrelated and
   expect(report.summary['studio.units'].classes[3]).toBe(10);
 });
 
+it('the ledger read guard records deliberate reads through named, default and promise fs APIs', async () => {
+  const guardedFs = await import('node:fs');
+  const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
+  writeFileSync(ledger, 'guard sanity check');
+  guard.ledgerReads = [];
+  try {
+    for (const api of [guardedFs, guardedFs.default]) {
+      expect(() => api.readFileSync(ledger, 'utf8')).toThrow('grant path attempted ledger IO');
+      expect(() => api.openSync(ledger, fs.constants.O_RDONLY)).toThrow('grant path attempted ledger IO');
+      expect(() => api.promises.readFile(ledger, 'utf8')).toThrow('grant path attempted ledger IO');
+    }
+    expect(guard.ledgerReads).toEqual(['readFileSync', 'openSync', 'readFile', 'readFileSync', 'openSync', 'readFile']);
+  } finally { guard.ledgerReads = null; }
+});
+
 it('the ledger is never read by collector, pool grants, legacy admission or shadow admission', () => {
   const ledger = join(coord, 'resource', 'pool-shadow.jsonl');
   mkdirSync(join(coord, 'resource'), { recursive: true });
@@ -442,6 +483,9 @@ it('the ledger is never read by collector, pool grants, legacy admission or shad
     const policy = resolveResourcePolicy();
     const legacy = args => admit({ ...args, policy });
     const before = collectPool({ readSource: source => read(source), legacy });
+    expect(before.unknown).toBe(false);
+    expect(before.sources.every(source => source.ok)).toBe(true);
+    expect(before.rows.every(row => row.poolDecision === 'grant')).toBe(true);
     for (const kind of ['build', 'review', 'fix']) {
       expect(legacy({ kind, root: coord, nowMs, env: {} })).toBeTruthy();
       shadowAdmission({ kind, root: coord, nowMs, env: { WE_RESOURCE_SHADOW: 'on' }, log: () => {} });

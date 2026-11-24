@@ -6365,7 +6365,13 @@ unknown. Unreadable or malformed status evidence stays fail-closed. The IO suite
 25-hour expiry, the exact boundary, and one-hour foreign-host/live-local cases.
 Unknown evidence holds every hypothetical start; inspect the named source and rerun.
 The comparison column observes `resource-admission.admit` only, excluding dispatch caps.
-No grant path reads the shadow ledger. Enforce is refused as unknown; off disables the explicit
+No grant path reads the shadow ledger. The ledger-read guard must first prove that deliberate
+reads are recorded and rejected through named, default and promise fs APIs. The observation
+test also requires known sources and granting pool rows before comparing ledger contents,
+so swallowed IO errors cannot make the comparison pass trivially. Snapshot-budget cases
+exercise missing/unknown evidence, noninteger/out-of-range units and valid endpoints 0 and 30;
+invalid budgets must invalidate the snapshot source as well as hold every pool row.
+Enforce is refused as unknown; off disables the explicit
 CLI shadow sink. Mode has an instant enum leaf; bounds use the numeric override store.
 Reserves are retained/validated policy leaves for later slices; this slice's rule subtracts
 queued higher-class demand and protects unoccupied builderFloor without double counting reserves.
