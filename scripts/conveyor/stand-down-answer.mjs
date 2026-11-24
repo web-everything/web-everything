@@ -5,6 +5,14 @@ import { pathToFileURL } from 'node:url';
 import { rearmWindow } from './rearm-review.mjs';
 import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, isTerminalStandDown } from './stand-down-answer-core.mjs';
 
+const namedStandDownHead = c => /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1];
+function requireNoCodeHead(snapshot, target) {
+  const live = String(snapshot.headRefOid ?? '').toLowerCase();
+  const named = namedStandDownHead(target);
+  if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
+  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+}
+
 /**
  * ONLY an operator `rearm-review` may supersede an ALREADY-ANSWERED stand-down (#6748: the answer is exactly what
  * deadlocked the PR). Requires `status:answered-waiting-fixer` AND an unchanged head (no commit newer than the
@@ -23,12 +31,13 @@ function answeredStandDownToRearm(snapshot, noCodeOwed) {
     for (let j = i + 1; j < comments.length; j += 1) {
       if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins
     }
-    if (!c.id || !prior) return null;
+    if (!c.id || !prior?.id) return null;
     // Replay guard: only a cap-ignored answer may be replaced by an explicit no-code ruling.
     if (parseOperatorAnswer(prior).disposition === 'rearm-review' && !(noCodeOwed && win.capBlocked)) return null;
     // Same head: SHA identity when the stand-down names its head; else the head's commit must not post-date it
     // (and the last listed commit must be the live head).
-    const named = /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1]; // the TRAILER only
+    if (noCodeOwed) requireNoCodeHead(snapshot, c);
+    const named = namedStandDownHead(c); // the TRAILER only
     const live = String(snapshot.headRefOid ?? '').toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(live)) return null;
     if (named) return live.startsWith(named) ? { target: c, supersedes: String(prior.id) } : null;
@@ -75,6 +84,9 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
     if (snapshot.labels.some(l => l.name === 'red-team:blocked')) {
       throw new Error('rearm-review --no-code-owed refused: red-team:blocked stands, a fix is owed');
     }
+    if (snapshot.labels.some(l => l.name === 'red-team:pending')) {
+      throw new Error('rearm-review --no-code-owed refused: red-team:pending, a security verdict is not final');
+    }
   }
   let target = latestUnresolvedStandDown(snapshot.comments);
   let supersedes;
@@ -88,6 +100,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
     }
   }
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
+  if (flags.noCodeOwed) requireNoCodeHead(snapshot, target);
   const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
   // ONE durable write; no label swap, deletion, or automatic retry after an ambiguous write failure.

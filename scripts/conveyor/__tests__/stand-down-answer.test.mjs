@@ -390,7 +390,7 @@ describe('explicit no-code-owed ceremony', () => {
   const comments = [begin, stop, rearm(stop.id), begin, { ...stop, id: 'IC_second' }, rearm('IC_second'),
     begin, { ...stop, id: 'IC_third' }];
   const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
-  const mock = (labels) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments, labels }) : 'posted');
+  const mock = (labels) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments, labels, headRefOid: HEAD }) : 'posted');
 
   it('refuses noCodeOwed without rearm-review or with a non-boolean value', () => {
     for (const noCodeOwed of [true, false, 'true', null]) {
@@ -411,6 +411,33 @@ describe('explicit no-code-owed ceremony', () => {
   it('refuses no-code-owed while red-team:blocked stands without writing', () => {
     const gh = mock([{ name: 'red-team:blocked' }]);
     expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review --no-code-owed refused: red-team:blocked stands, a fix is owed');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('refuses no-code-owed while red-team:pending without writing', () => {
+    const gh = mock([{ name: 'red-team:pending' }]);
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review --no-code-owed refused: red-team:pending, a security verdict is not final');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, true])('refuses a moved named head (already answered: %s)', answered => {
+    const target = { ...comments.at(-1), body: comments.at(-1).body.replace(/ -->$/, ` head=${'a'.repeat(40)} -->`) };
+    const snapshot = { comments: [...comments.slice(0, -1), target, ...(answered ? [rearm(target.id)] : [])],
+      labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD };
+    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review --no-code-owed refused: head moved since the stand-down');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([undefined, '', 'b'.repeat(39), 'g'.repeat(40)])('refuses an unreadable live head without a named head (%s)', headRefOid => {
+    const gh = vi.fn(() => JSON.stringify({ comments, labels: [], headRefOid }));
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('live head is not a 40-hex SHA');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, true])('refuses a missing prior answer id (named head: %s)', named => {
+    const target = { ...comments.at(-1), ...(named ? { body: comments.at(-1).body.replace(/ -->$/, ` head=${HEAD} -->`) } : {}) };
+    const prior = { ...rearm(target.id), id: undefined };
+    const snapshot = { comments: [...comments.slice(0, -1), target, prior],
+      labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD };
+    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('no unresolved stand-down');
     expect(gh).toHaveBeenCalledTimes(1);
   });
   it.each([undefined, null, [{}]])('refuses no-code-owed with incomplete labels (%j)', labels => {

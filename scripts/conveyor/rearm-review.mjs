@@ -203,6 +203,7 @@ function normaliseComment(c) {
  * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
  */
 const REARM_WAIVER_CAP = 2;
+const NO_CODE_OWED_CAP = 1;
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
@@ -210,6 +211,7 @@ export function rearmWindow(comments) {
   let rearmed = false;
   let capBlockedId = null;
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
+  let overrides = 0;
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -218,7 +220,7 @@ export function rearmWindow(comments) {
     // The documented ceremony relays explicit operator instructions under automation credentials. Trust the actual
     // allowlisted poster, as parseOperatorAnswer does; --actor and viewerDidAuthor alone never authorize a waiver.
     const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
-    const capOverride = answer?.noCodeOwed === true && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
+    const capOverride = answer?.noCodeOwed === true && overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
     if ((!rearmed || capOverride) && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && operatorPoster) {
       claims = [];
       reviewedHead = null;
@@ -227,6 +229,7 @@ export function rearmWindow(comments) {
       capBlockedId = null;
       // An explicit no-code ruling closes the round without spending a bounded waiver.
       if (answer.noCodeOwed !== true) waivers += 1;
+      if (capOverride) overrides += 1;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
@@ -238,6 +241,7 @@ export function rearmWindow(comments) {
       standDownIds = [];
       rearmed = false;
       waivers = 0;
+      overrides = 0;
       capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);

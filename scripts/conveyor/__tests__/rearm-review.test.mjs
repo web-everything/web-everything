@@ -655,6 +655,15 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
     expect(rearmWindow(comments)).toMatchObject({ rearmed: false, capBlocked: false });
     expect(decideEmptyFixRound({ comments: [...comments, ans('IC_401', 'IC_400', 'rearm-review')], liveHead: HEAD }).empty).toBe(false);
   });
+  it('ignores a second cap override until a new verdict resets the window', () => {
+    const fourth = { ...stop106, id: 'IC_500' };
+    const comments = [...third, noCode(), begin('IC_490'), fourth, noCode('IC_500')];
+    expect(rearmWindow(comments)).toMatchObject({ capBlocked: true, standDownId: 'IC_500' });
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+    const reset = [...comments, ...third, noCode()];
+    expect(rearmWindow(reset)).toMatchObject({ capBlocked: false, standDownId: null });
+    expect(decideEmptyFixRound({ comments: reset, liveHead: HEAD }).empty).toBe(false);
+  });
   it('accepts the newest post-rearm stand-down even after another fix-begin, once', () => {
     expect(rearmWindow(renewed)).toMatchObject({ rearmed: false, standDownId: 'IC_300' });
     const twice = [...renewed, begin('IC_310'), ans('IC_320', 'IC_300', 'rearm-review')];
