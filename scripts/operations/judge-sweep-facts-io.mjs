@@ -229,7 +229,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
     };
     const argv = listArgv({ repo });
     // Assignees supply ownership; detail selection uses rounds and exit-ruling presence below.
-    argv[argv.length - 1] += ',assignees,isDraft';
+    argv[argv.length - 1] += ',assignees,isDraft,mergeable';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];
@@ -283,6 +283,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
         infraFailStreak: errors.includes('fix-loop ledger unreadable') ? null : infraFailStreak,
         isDraft: typeof p.isDraft === 'boolean' ? p.isDraft : null,
+        mergeable: typeof p.mergeable === 'string' ? p.mergeable : null,
         minutesSinceHeadChange: null,
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,

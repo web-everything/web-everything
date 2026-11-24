@@ -305,6 +305,12 @@ describe('next responsible owner from existing facts', () => {
     ['orchestrator', { labels: ['status:needs-human'] }],
     ['orchestrator', { labels: ['review-status:needs-human'] }],
     ['nobody', {}],
+    ['nobody', { mergeable: 'UNKNOWN' }],
+    ['nobody', { mergeable: 'MERGEABLE' }],
+    ['fixer', { mergeable: 'CONFLICTING' }],
+    ['fixer', { mergeable: 'CONFLICTING', fixerRunning: true }],
+    ['drain', { mergeable: 'CONFLICTING', labels: ['ready-to-merge'] }],
+    ['orchestrator', { mergeable: 'CONFLICTING', isDraft: true }],
   ];
   it.each(ownerCases)('derives %s with a nonempty one-line next step from %j', (nextOwner, patch) => {
     const input = facts(patch);
@@ -315,6 +321,10 @@ describe('next responsible owner from existing facts', () => {
     expect(result.nextStep).not.toMatch(/[\r\n]/);
     expect(judgeSweepFacts.deriveNextOwner(input)).toEqual(result);
     expect(input).toEqual(before);
+  });
+  it('a conflicting PR with no fixer is owned by the fixer', () => {
+    expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', fixerRunning: false })))
+      .toEqual({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
   });
   it('keeps a running fixer responsible for a needs-human PR', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))

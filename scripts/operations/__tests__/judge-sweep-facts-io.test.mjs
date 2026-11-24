@@ -1070,3 +1070,11 @@ it.each([
     expect(buildJudgeSweepBundle({ prs: [facts] }).prs[0].needsJudgment).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+it.each([['CONFLICTING', 'CONFLICTING'], ['UNKNOWN', 'UNKNOWN'], [undefined, null]])(
+  'reads the PR merge state into the facts (%s)', (mergeable, expected) => {
+    const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
+    const reader = createJudgeSweepFactsReader(options({ gh }));
+    expect(reader({ repo }).prs[0].mergeable).toBe(expected);
+    expect(gh.mock.calls[0][0].at(-1)).toContain('mergeable');
+  });

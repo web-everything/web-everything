@@ -86,6 +86,8 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
     ['review-status:draft-withdrawn', 'status:needs-human', 'review-status:needs-human'].includes(l))) {
     return result('orchestrator', 'Inspect the hold and assign the next responsible worker.');
   }
+  // Only an explicit CONFLICTING counts; UNKNOWN is transient. The unowned-age judgment above still surfaces a stall.
+  if (pr.mergeable === 'CONFLICTING') return result('fixer', 'Resolve the conflict.');
   return result('nobody', 'Inspect the PR and assign its next responsible worker.');
 }
 
