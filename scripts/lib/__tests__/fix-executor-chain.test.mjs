@@ -45,6 +45,31 @@ describe('fix executor chain', () => {
   it('records skipped Gemini before exhausted-chain Claude', () => {
     expect(pick({codexUnproductive:3,launcherAvailable:e=>e!=='antigravity'})).toMatchObject({executor:'claude',reason:expect.stringContaining('gemini skipped: no admitted fix path')});
   });
+  it('ignores a retired criticalClaudeFromRung input: critical work follows the ordinary ladder', () => {
+    for (const criticalClaudeFromRung of [1, 2, 99]) for (const codexUnproductive of [0, 2, 3]) {
+      const { requiresReview, ...decision } = pick({ critical: true, criticalClaudeFromRung, codexUnproductive });
+      expect(requiresReview).toBe(true);
+      expect(decision).toEqual(pick({ codexUnproductive }));
+    }
+  });
+  it('still skips unavailable launchers for critical work and keeps the review requirement', () => {
+    expect(pick({ chain: ['argon', 'codex-alt', 'claude'], critical: true, launcherAvailable: e => e === 'codex' }))
+      .toMatchObject({ executor: 'codex', rung: 'codex-alt', requiresReview: true, reason: expect.stringContaining('argon launcher unavailable, fallback') });
+  });
+  it('keeps non-critical decisions free of the review requirement', () => {
+    expect(pick({})).not.toHaveProperty('requiresReview');
+    expect(formatFixExecutorLog(chooseFixExecutor({ chain: { value: chain }, launcherAvailable: true }))).toContain('requiresReview=false');
+  });
+  it.each([{ takeover: true }, { rulingNotAddressed: true }, { mainFix: true }, { strongerModel: true }, { codexUnproductive: 2 }])('critical %j without a chain stays on the Claude-only path', entry => {
+    expect(chooseFixExecutor({ ...entry, critical: true, launcherAvailable: true })).toMatchObject({ executor: 'claude', requiresReview: true });
+  });
+  it('holds critical main-fix work when the chain has no Claude rung instead of routing it to Codex', () => {
+    expect(chooseFixExecutor({ chain: { value: ['codex', 'codex-alt'] }, mainFix: true, critical: true, launcherAvailable: true }))
+      .toMatchObject({ executor: null, requiresReview: true, reason: expect.stringContaining('main-fix requires Claude') });
+  });
+  it('reaches Claude through the legacy two-rung chain for critical work once Codex is unproductive', () => {
+    expect(pick({ chain: ['codex', 'claude'], critical: true, codexUnproductive: 2 })).toMatchObject({ executor: 'claude', rung: 'claude', requiresReview: true });
+  });
   it.each([null,'stronger-model','takeover','ruling-not-addressed'])('legacy chain reproduces %s', trigger => {
     for (const codexUnproductive of [0,1,2,3,9]) expect(pick({chain:['codex','claude'],trigger,codexUnproductive}).executor).toBe(trigger || codexUnproductive >= 2 ? 'claude' : 'codex');
   });
@@ -80,6 +105,15 @@ describe('chain settings cascade', () => {
     expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:['scripts/security/**']}}}).criticalGlobs).toEqual(['scripts/security/**']);
     expect(resolve({repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(resolve({}).criticalGlobs);
     expect(resolve({platform:{fixExecutor:{criticalGlobs:['scripts/land/**']}},repo:{fixExecutor:{criticalGlobs:[]}}}).criticalGlobs).toEqual(['scripts/land/**']);
+  });
+  it('ignores the retired critical Claude threshold in every layer', () => {
+    const retired = { fixExecutor: { criticalClaudeFromRung: 1 } };
+    const out = resolve({ platform: retired, repo: retired, env: { WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG: '1' } });
+    expect(out).toEqual({ ...defaults, value: FIX_EXECUTOR_CHAIN_DEFAULT, source: 'default' });
+    expect(out).not.toHaveProperty('criticalClaudeFromRung');
+  });
+  it.each([[['']], [['  ']], [[1]], ['scripts/**'], [{}]])('ignores invalid critical globs %j', raw => {
+    expect(resolve({ repo: { fixExecutor: { criticalGlobs: raw } } }).criticalGlobs).toEqual(resolve({}).criticalGlobs);
   });
   it.each([[],['codex'],['unknown','claude'],['claude','claude'],null,'codex,claude'])('ignores invalid layers %j', raw => {
     expect(resolve({platform:layer(['argon','claude']),repo:layer(raw),env:{WE_FIX_EXECUTOR_FALLBACK_CHAIN:'bad'}})).toEqual({...defaults,value:['argon','claude'],source:'platform'});
