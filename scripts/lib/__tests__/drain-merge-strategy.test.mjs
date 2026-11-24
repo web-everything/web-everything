@@ -39,7 +39,7 @@ const DRAIN = 'drain-bot';
 const policyClear = (pr, head = HEAD) => ({ author: { login: 'web-everything' },
   body: `${redTeamMarker(pr, head)}\nRed team not required on this head: card-only diff.` });
 
-function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
+function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = false, initial = null, ghView = {} , enqueueFails = false, onView = {}, viewThrows = [], selfLogin = DRAIN, withLock, mutation, inQueue, liveComments, postConflictFinding = () => {}, now, labels = ['ready-to-merge'], queued = false, queueFacts, env = process.env, evidence = { loopPayload: labels.includes('review:accepted') ? { verdict: { verdict: 'accept' } } : null, inFlight: false, recorded: false, scheduled: labels.includes('review:accepted') && !['off', 'false', '0'].includes(env.WE_REVIEW_RED_TEAM) && !['off', 'false', '0'].includes(env.WE_REVIEW_EXTRA_SEATS) }, requestRedTeam = null, defaultRequest = false, baseTip = () => BASE_TIP, publishNeedsYou, redTeamDeadline, labelProvider, strategyExtra = {} } = {}) {
   const calls = [];
   const readLive = onView.readLive;
   const logs = [];
@@ -100,7 +100,7 @@ function harness({ changedFiles = ['scripts/x.mjs'], strategy = null, dryRun = f
   const s = createDrainMergeStrategy({
     ...strategyExtra,
     writeFile: strategyExtra.writeFile ?? vi.fn(),
-    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
+    dryRun, env, labelProvider, readRedTeamEvidence: strategyExtra.readRedTeamEvidence ?? (() => { if (evidence.readError) throw new Error('evidence unreadable'); return evidence; }), requestRedTeam: defaultRequest ? undefined : requestRedTeam, publishNeedsYou, redTeamDeadline, isLocalRepo: (r) => r == null || r === LOCAL, localSlug: LOCAL, exec, statePath: '/x/state.json',
     cancelObsoleteRuns: () => {}, batching: { gate: () => ({ admit: true }), observe: () => ({}) },
     postConflictFinding, ...(now ? { now } : {}), resolved: policyOf(strategy), log: { write: (l) => logs.push(l) }, readFile, writeState, ...(withLock ? { withLock } : {}),
   });
@@ -175,6 +175,35 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     expect(current.s.enqueue({ num: 5283 }, HEAD, { comments: [] })).toMatchObject({ enqueued: false, deadlineHeld: true });
     expect(requests).toEqual([HEAD, otherHead]);
     expect(Object.keys(current.state().redTeamRequestAttempts['cwd#5283']).sort()).toEqual([HEAD, otherHead].sort());
+  });
+
+  it('default strategy wiring requests a red-team round once per head', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rt-skip-'));
+    const file = join(dir, 'queue.json');
+    const entry = (extra = {}) => ({ key: `${LOCAL}#5283`, repo: LOCAL, pr: 5283, head: HEAD, enqueuedAt: 1, attempts: 0, ...extra });
+    writeFileSync(file, JSON.stringify([entry({ blocked: 'planner-skip', blockedReason: 'later verdict supersedes acceptance' })]));
+    const clock = { t: 1000 };
+    const env = { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_DRAIN_RED_TEAM_PENDING_MAX_MIN: '1', WE_RED_TEAM_QUEUE_FILE: file };
+    const options = { strategy: 'github-merge-queue', env, now: () => clock.t, labels: ['ready-to-merge', 'review:accepted'], defaultRequest: true,
+      strategyExtra: { readRedTeamCheck: () => ({ ok: false, reason: 'no red-team check run on head' }) } };
+    try {
+      const h = harness(options); // no requestRedTeam supplied: the default wiring must act
+      h.s.enqueue({ num: 5283 }, HEAD);
+      clock.t += 60_001;
+      h.s.enqueue({ num: 5283 }, HEAD);
+      const [row] = JSON.parse(readFileSync(file, 'utf8'));
+      expect(row.blocked).toBeUndefined();
+      expect(row.reprobeReason).toBe('later verdict supersedes acceptance');
+      // once per head: a re-blocked entry is not re-requested on the same head, even after a restart
+      writeFileSync(file, JSON.stringify([entry({ blocked: 'planner-skip', blockedReason: 'again' })]));
+      harness({ ...options, initial: h.state() }).s.enqueue({ num: 5283 }, HEAD);
+      expect(JSON.parse(readFileSync(file, 'utf8'))[0].blocked).toBe('planner-skip');
+      // a real review-unfinished block is never overridden
+      writeFileSync(file, JSON.stringify([entry({ blocked: 'review-unfinished' })]));
+      const other = harness({ ...options, ghView: { 5283: { headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted'] } } });
+      other.s.enqueue({ num: 5283 }, HEAD); clock.t += 120_000; other.s.enqueue({ num: 5283 }, HEAD);
+      expect(JSON.parse(readFileSync(file, 'utf8'))[0].blocked).toBe('review-unfinished');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it.each(['both', 'drain-scan', 'check-run'])('reads live evidence but leaves pending waits to check-run in mode %s', source => {

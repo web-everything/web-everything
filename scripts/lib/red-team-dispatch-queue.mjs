@@ -3,7 +3,7 @@ import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { boundedReason, defaultQueueFile } from './red-team-queue-state.mjs';
-export { defaultQueueFile } from './red-team-queue-state.mjs';
+export { defaultQueueFile, requestPlannerSkipReprobe } from './red-team-queue-state.mjs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';

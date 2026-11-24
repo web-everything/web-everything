@@ -2018,3 +2018,24 @@ describe('REDTEAM-STUCK-PENDING', () => {
     expect(f.queue.holdCauses().get(`${repo}#8002`)).toBe(cause === 'capacity' ? undefined : cause);
   });
 });
+
+describe('planner-skip re-request', () => {
+  it('a requested planner-skip head is unblocked and re-probed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rt-reprobe-'));
+    const file = join(dir, 'q.json');
+    const head = 'a'.repeat(40);
+    const row = (extra = {}) => ({ key: 'o/r#9', repo: 'o/r', pr: 9, head, enqueuedAt: 1, attempts: 0, ...extra });
+    const env = { WE_RED_TEAM_QUEUE_FILE: file };
+    try {
+      writeFileSync(file, JSON.stringify([row({ blocked: 'planner-skip', blockedReason: 'later verdict supersedes' })]));
+      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head: 'b'.repeat(40), env })).toEqual({ requested: false });
+      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: true });
+      const queue = createRedTeamDispatchQueue({ file });
+      expect(queue.entries()[0]).toMatchObject({ reprobeReason: 'later verdict supersedes' });
+      expect(queue.entries()[0].blocked).toBeUndefined();
+      expect(queue.admit('o/r', 1).map(e => e.pr)).toEqual([9]);
+      writeFileSync(file, JSON.stringify([row({ blocked: 'review-unfinished' })]));
+      expect(redTeamQueue.requestPlannerSkipReprobe({ repo: 'o/r', pr: 9, head, env })).toEqual({ requested: false });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
