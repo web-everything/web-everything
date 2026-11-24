@@ -29,7 +29,7 @@ function fixture({ records = [green], auditText, tool = {}, writerSettings, targ
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   };
   const result = checkCanonicalAuditForOpen({ repo: '/repo', ref, sha: 'aaaaaaa', env, readFile, fetchMain, ancestor, liveFingerprint,
-    exec: (cmd, args) => { calls.push([cmd, args]); return execOverride ? execOverride(args, resolved) : resolved; } });
+    exec: (cmd, args, options) => { calls.push([cmd, args, options]); return execOverride ? execOverride(args, resolved) : resolved; } });
   return { result, reads, calls };
 }
 describe('canonical audit before opening a PR', () => {
@@ -64,6 +64,83 @@ describe('canonical audit before opening a PR', () => {
     const fp = 'd'.repeat(64);
     expect(fixture({ records: [{ ...green, head: other, fingerprint: fp }], liveFingerprint: () => fp }).result)
       .toMatchObject({ ok: false, reason: 'canonical-audit-missing', record: null });
+  });
+  describe('test-only waiver carry', () => {
+    const waivedSha = other;
+    const audited = { ...weak, head: waivedSha };
+    const files = ['scripts/operations/__tests__/example.test.ts', 'scripts/example.test.mjs'];
+    const git = ({ delta = files.map(p => `M\0${p}\0`).join(''), fail, imported = '', needle, numstat = '1\t0\t' } = {}) => (args, resolved) => {
+      if (args.includes(fail)) throw new Error('git failed');
+      if (args.includes('--numstat')) return numstat + args.at(-1) + '\0';
+      if (args.includes('diff')) return delta;
+      if (args.includes('grep')) {
+        if (imported && (!needle || args.includes(needle))) return `${sha}:${imported}\0`;
+        throw Object.assign(new Error('no matches'), { status: 1 });
+      }
+      return resolved;
+    };
+    const run = (options = {}, over = {}) => fixture({ records: [audited],
+      tool: { ruledWeakened: [{ ...waiver, sha: waivedSha }] }, execOverride: git(options), ...over });
+    it('a waiver carries to a head whose delta touches only test files', () => {
+      const { result, calls } = run();
+      expect(result).toMatchObject({ ok: true, record: audited, carry: { waivedSha, head: sha, files } });
+      const [, args, options] = calls.find(([, args]) => args.includes('diff'));
+      expect(args).toEqual(expect.arrayContaining(['-z', '-M', '--no-renames']));
+      expect(calls.some(([, args]) => args.includes('--all-match') && args.includes('__tests__')
+        && args.includes('readdirSync'))).toBe(true);
+      expect(options.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_DIR: sha });
+    });
+    it.each([
+      ['refuses carry when the delta adds a line to a test helper imported by code', { imported: 'src/main.mjs' }],
+      ['refuses carry when a test file is renamed into src', { delta: 'D\0scripts/a.test.mjs\0A\0src/a.mjs\0' }],
+      ['refuses when the delta cannot be read', { fail: 'diff' }],
+      ['refuses a delta with any non-test file', { delta: 'M\0scripts/foo.mjs\0' }],
+      ['refuses audit settings changes', { delta: 'M\0scripts/settings/codex-audit.json\0' }],
+      ['refuses changes to the gate itself', { delta: 'M\0scripts/operations/canonical-audit-gate.mjs\0' }],
+      ['refuses unreadable import evidence', { fail: 'grep' }],
+      ['refuses deleting a carried test', { delta: 'D\0scripts/a.test.mjs\0' }],
+      ['refuses modified tests with deleted lines', { numstat: '1\t1\t' }],
+      ['refuses unreadable line counts', { fail: '--numstat' }],
+      ['refuses malformed line counts', { numstat: 'unknown\t0\t' }],
+      ['refuses a non-test helper under __tests__', { delta: 'A\0scripts/__tests__/helper.mjs\0' }],
+      ['refuses extensionless imports from production', { imported: 'src/main.mjs', needle: 'example.test' }],
+      ['refuses import.meta.glob directory loaders', { imported: 'src/main.mjs', needle: 'import.meta.glob' }],
+      ['refuses readdirSync directory loaders', { imported: 'src/main.mjs', needle: 'readdirSync' }],
+      ['refuses malformed diff output', { delta: 'M\0scripts/a.test.mjs' }],
+      ['refuses more than 128 changed paths', { delta: Array.from({ length: 129 }, (_, i) => `M\0scripts/${i}.test.mjs\0`).join('') }],
+      ['refuses oversized diff output', { delta: 'M\0scripts/a.test.mjs\0'.repeat(60000) }],
+    ])('%s', (_name, options) => {
+      const { result, calls } = run(options);
+      expect(result.ok).toBe(false);
+      expect(result.message).toContain('codex-audit --base=origin/main');
+      expect(calls.some(([, args]) => args.includes('diff'))).toBe(true);
+    });
+    it('refuses when the waived sha is not an ancestor of the head', () => {
+      const { result, calls } = run({ fail: 'merge-base' });
+      expect(result.ok).toBe(false);
+      expect(calls.some(([, args]) => args.includes('merge-base') && args.includes('--is-ancestor'))).toBe(true);
+    });
+    it('carry never chains: always diffs back to the original waived sha', () => {
+      const { result, calls } = run();
+      expect(result.ok).toBe(true);
+      expect(calls.find(([, args]) => args.includes('diff'))[1]).toContain(`${waivedSha}..${sha}`);
+    });
+    it('a new head audit cannot be bypassed by an older waiver', () => {
+      expect(run({}, { records: [audited, weak] }).result.ok).toBe(false);
+    });
+    it('a newer foreign WEAKENED with the live fingerprint vetoes carry', () => {
+      const fp = 'd'.repeat(64);
+      expect(run({}, { records: [audited, { ...weak, head: 'e'.repeat(40), fingerprint: fp,
+        at: '2026-11-18T00:00:00Z' }], liveFingerprint: (_records, head) => head === waivedSha ? null : fp })
+        .result).toMatchObject({ ok: false, reason: 'canonical-audit-weakened' });
+    });
+    it('a stale waiver with unrelated findings cannot carry a passing ancestor audit', () => {
+      expect(run({}, { records: [{ ...green, head: waivedSha }] }).result.ok).toBe(false);
+    });
+    it('carry still requires the waived findings and main coverage', () => {
+      expect(run({}, { records: [{ ...audited, findings: ['another finding'] }] }).result.ok).toBe(false);
+      expect(run({}, { ancestor: () => false }).result.ok).toBe(false);
+    });
   });
   describe('merge-from-main carries the audit', () => {
     const fp = 'd'.repeat(64);
