@@ -4,6 +4,7 @@ import { chooseFixExecutor, formatFixExecutorLog } from '../fix-slot-borrow.mjs'
 import { codexModelSupportsEffort } from '../codex-model-routing.mjs';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import micromatch from 'micromatch';
 const chain = ['codex', 'codex-alt', 'argon', 'claude'];
 const pick = (input = {}) => pickChainRung({ chain, launcherAvailable: () => true, ...input });
@@ -20,7 +21,8 @@ function probeSettings(contents, error) {
       return contents;
     };
     syncBuiltinESMExports();
-    const module = await import(${JSON.stringify(new URL('../fix-executor-chain.mjs', import.meta.url).href)});
+    // Use a filesystem URL: the parent test's DOM URL base can be http://localhost.
+    const module = await import(${JSON.stringify(pathToFileURL('scripts/lib/fix-executor-chain.mjs').href)});
     const options = { env: {}, platform: {}, capacity: [], quota: () => null, record: () => {} };
     console.log(JSON.stringify({
       value: module.FIX_EXECUTOR_CHAIN_DEFAULT,
