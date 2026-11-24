@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { redTeamStatusDir } from '../drain-red-team-evidence.mjs';
+import { ABANDONED_REVIEW_AFTER_MS, redTeamStatusDir } from '../drain-red-team-evidence.mjs';
 import { createFreshGh, planRedTeamStatusLabels, readCheckClearFact, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 
 const head = 'a'.repeat(40);
@@ -230,5 +230,65 @@ describe('red-team label settles from the head\'s check', () => {
       syncRedTeamStatusLabels({ ...input, labels: [], live: { headRefOid: head, labels: [] }, provider, readCheckClear: reader, standingRuling: null });
       expect(reader).not.toHaveBeenCalled();
     });
+  });
+});
+
+
+describe('gate-comment settle write guards', () => {
+  const gate = { author: { login: 'web-everything' }, createdAt: '2026-01-02T00:00:00Z',
+    body: `<!-- we:red-team-gate pr=42 rev=${head} outcome=clear -->` };
+  const evidence = { ok: false, reason: 'review-unfinished', settleBounds: {
+    unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
+    evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead: () => ({ complete: true, blocked: false }),
+  } };
+  const setup = () => {
+    const live = { headRefOid: head, labels: ['red-team:pending'] };
+    const provider = { ensureLabel: vi.fn(), setLabels: vi.fn(), readPrState: vi.fn(() => live),
+      readPrFiles: () => ['scripts/x.mjs'], readComments: vi.fn(() => [gate]) };
+    return { provider, args: { ...input, evidence, comments: [gate], live, provider, standingRuling: null, gh: ghFor([]) } };
+  };
+  it.each(['head', 'labels', 'thread'])('rechecks live %s before writing gate clearance', kind => {
+    const { provider, args } = setup();
+    const fresh = { readPrState: () => kind === 'head' ? { headRefOid: old } :
+      { headRefOid: head, labels: kind === 'labels' ? ['red-team:pending', 'red-team:blocked'] : ['red-team:pending'] },
+      readComments: () => kind === 'thread' ? [] : [gate] };
+    syncRedTeamStatusLabels({ ...args, recheckProvider: fresh });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it.each(['missing', 'throw', 'malformed', 'hold'])('refuses %s remote publication evidence', kind => {
+    const { provider, args } = setup();
+    const gh = kind === 'missing' ? undefined : kind === 'throw' ? () => { throw Error('offline'); } :
+      kind === 'malformed' ? () => 'invalid' : ghFor([], { statuses: [
+        { id: 5, context: 'red-team/publication #42', state: 'pending', creator: { login: 'x' } },
+      ] });
+    syncRedTeamStatusLabels({ ...args, gh });
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('refuses the carried-check outbox marker', () => {
+    const root = mkdtempSync(join(tmpdir(), 'gate-outbox-'));
+    try {
+      const { provider, args } = setup();
+      const env = { ...input.env, WE_SHARED_RUNS_DIR: join(root, 'runs') };
+      const dir = redTeamStatusDir(env);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${encodeURIComponent('o/n')}-42-${head}.json.carried-check-unpublished`), '{}');
+      syncRedTeamStatusLabels({ ...args, env });
+      expect(provider.setLabels).not.toHaveBeenCalled();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('refuses a publication hold arriving during the settle recheck', () => {
+    const { provider, args } = setup();
+    let reads = 0;
+    const gh = argv => ++reads === 1 ? ghFor([])(argv) : ghFor([], { statuses: [
+      { id: 6, context: 'red-team/publication #42', state: 'pending', creator: { login: 'x' } },
+    ] })(argv);
+    syncRedTeamStatusLabels({ ...args, gh });
+    expect(reads).toBeGreaterThan(1);
+    expect(provider.setLabels).not.toHaveBeenCalled();
+  });
+  it('settles with complete quiet bounds and fresh no-hold evidence', () => {
+    const { provider, args } = setup();
+    syncRedTeamStatusLabels(args);
+    expect(provider.setLabels).toHaveBeenCalledWith('o/n', 42, { add: 'red-team:clear', remove: ['red-team:pending'] });
   });
 });

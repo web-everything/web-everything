@@ -3,9 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
+import { ABANDONED_REVIEW_AFTER_MS, readDrainRedTeamEvidence, recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 import { planRedTeamStatusLabels, syncRedTeamStatusLabels } from '../red-team-status-labels.mjs';
-import { resolveRedTeamProbes } from '../red-team-gate.mjs';
+import { parseRedTeamComment, redTeamResultId, redTeamClearGateCommentForHead, resolveRedTeamProbes } from '../red-team-gate.mjs';
 const head = 'a'.repeat(40);
 const result = (findings = '') => ({ author: { login: 'web-everything' }, body: `<!-- we:red-team-advisory pr=42 rev=${head} -->\n${findings}` });
 const broken = '1. [**confirmed**] (edge-case, broken) `scripts/x.mjs:1` — break';
@@ -75,12 +75,53 @@ it('a pending label with no result and nothing owed is kept, never planned for r
 
 describe('terminal gate comments with unreadable run evidence', () => {
   const gate = (rev = head, outcome = 'card-queued', login = 'web-everything', pr = 42) => ({
-    author: { login }, body: `<!-- we:red-team-gate pr=${pr} rev=${rev} outcome=${outcome} -->`,
+    createdAt: '2026-01-02T00:00:00Z', author: { login }, body: `<!-- we:red-team-gate pr=${pr} rev=${rev} outcome=${outcome} -->`,
   });
   const plan = (comments, evidence = {}, extra = {}) => planRedTeamStatusLabels({ ...input,
-    labels: ['red-team:pending'], comments, evidence: { ok: false, reason: 'review-unfinished', ...evidence }, ...extra });
+    labels: ['red-team:pending'], comments, gateClear: true, evidence: { ok: false, reason: 'review-unfinished',
+      settleBounds: { unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
+        evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead: () => ({ complete: true, blocked: false }) }, ...evidence }, ...extra });
   const pending = { add: null, remove: [] };
 
+  it.each(['run-start-missing', 'scan-capped', 'status-unreadable'])('refuses non-stuck reason %s', reason => {
+    expect(plan([gate()], { reason })).toEqual(pending);
+  });
+  it.each([undefined, { unfinishedUndecided: false }, { unfinishedActiveAt: ABANDONED_REVIEW_AFTER_MS },
+    { completeHeadRead: () => ({ complete: true, blocked: true }) }, { completeHeadRead: () => ({ complete: false }) }])('refuses missing, active or newer-decided settle bounds %j', bound => {
+    const base = { unfinishedStartedAt: 0, unfinishedUndecided: true, unfinishedActiveAt: 0,
+      evaluatedAt: ABANDONED_REVIEW_AFTER_MS, completeHeadRead: () => ({ complete: true, blocked: false }) };
+    expect(plan([gate()], { settleBounds: bound && { ...base, ...bound } })).toEqual(pending);
+  });
+  it.each(['sent-back', 'round-cap', 'unknown'])('a later %s gate vetoes historical clearance', outcome => {
+    expect(plan([gate(), gate(head, outcome)])).toEqual(pending);
+  });
+  it('never uses an older result marker after a later restrictive result marker', () => {
+    const named = (outcome, id) => ({ ...gate(head, outcome), body: gate(head, outcome).body.replace(' -->', ` result=${id} -->`) });
+    expect(plan([named('clear', '1'.repeat(16)), named('sent-back', '2'.repeat(16))])).toEqual(pending);
+  });
+  it('binds the latest gate result id to the latest result, never a historical marker', () => {
+    const first = result();
+    const second = result(broken);
+    expect(redTeamResultId(parseRedTeamComment(first.body))).not.toBe(redTeamResultId(parseRedTeamComment(second.body)));
+    const named = c => ({ ...gate(head, 'clear'), body: gate(head, 'clear').body.replace(' -->',
+      ` result=${redTeamResultId(parseRedTeamComment(c.body))} -->`) });
+    expect(redTeamClearGateCommentForHead([first, second, named(first)], 42, head)).toBe(false);
+    expect(redTeamClearGateCommentForHead([first, second, named(second)], 42, head)).toBe(true);
+  });
+  it('refuses a judge actor clearance', () => {
+    const c = gate();
+    expect(plan([{ ...c, body: c.body.replace(' -->', ' actor=judge:r1 -->') }])).toEqual(pending);
+  });
+  it('blocked vetoes clearance and removes a coexisting clear', () => {
+    expect(plan([gate()], {}, { labels: ['red-team:pending', 'red-team:blocked', 'red-team:clear'] }))
+      .toEqual({ add: null, remove: ['red-team:clear'] });
+  });
+  it('refuses an unverified head', () => {
+    expect(plan([gate()], {}, { headVerified: false })).toEqual(pending);
+  });
+  it('requires a readable no-publication-hold fact', () => {
+    expect(plan([gate()], {}, { gateClear: false })).toEqual(pending);
+  });
   it('keeps pending for an older gate head', () => {
     expect(plan([gate('b'.repeat(40))])).toEqual(pending);
   });

@@ -366,17 +366,25 @@ export function parseRedTeamGateMarker(body) {
 }
 
 /** PURE: a terminal gate comment can settle unreadable run evidence only for this exact head and a trusted bot. */
-export function redTeamClearGateCommentForHead(comments, pr, head) {
+export function redTeamClearGateCommentForHead(comments, pr, head, accepts = () => true) {
   const live = String(head ?? '').toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(live)) return false;
-  return (Array.isArray(comments) ? comments : []).some(c => {
-    const login = c?.author?.login ?? c?.user?.login;
-    // Viewer ownership alone, and the shared trust check's human-operator path, are insufficient here.
-    if (!isTrustedMarkerAuthor(c) || typeof login !== 'string' || !AUTOMATION_LOGINS.includes(login.toLowerCase())) return false;
-    const marker = parseRedTeamGateMarker(c?.body);
-    return marker?.pr === Number(pr) && marker.rev === live
-      && (marker.outcome === 'clear' || marker.outcome === GATE_OUTCOMES.CARD_QUEUED);
-  });
+  const records = indexedRecords(comments);
+  const latest = records.filter(r => {
+    const marker = parseRedTeamGateMarker(recordBody(r));
+    return marker?.pr === Number(pr) && marker.rev === live;
+  }).sort(threadOrder).at(-1);
+  if (!latest) return false;
+  const c = latest.c;
+  const login = c?.author?.login ?? c?.user?.login;
+  const marker = parseRedTeamGateMarker(recordBody(latest));
+  // Judge records can only add holds; viewer ownership and human authorship cannot grant this clearance.
+  if (marker.actor !== undefined || !AUTOMATION_LOGINS.includes(String(login).toLowerCase())) return false;
+  if (!gateOutcomesForHead([c], pr, live).has(marker.outcome)
+    || !['clear', GATE_OUTCOMES.CARD_QUEUED].includes(marker.outcome)) return false;
+  const hit = latestResult(records, pr, live);
+  if (marker.result && (!hit || marker.result !== redTeamResultId(hit.parsed))) return false;
+  return accepts(c) === true;
 }
 
 /** Every outcome the gate recorded for this head (trusted authors only). PURE. */

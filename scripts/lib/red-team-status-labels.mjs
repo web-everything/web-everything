@@ -6,8 +6,9 @@ import { RED_TEAM_SETTINGS_FILE, readRedTeamDisposition, readRedTeamProbes, redT
 import { createGhProvider } from './review-label-provider.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync, WE_GH_READ_MEMO_DIR } from './gh-throttle.mjs';
-import { carriedCheckMarkerPresent } from './drain-red-team-evidence.mjs';
+import { ABANDONED_REVIEW_AFTER_MS, UNREAD_SETTLE_MARGIN_MS, carriedCheckMarkerPresent } from './drain-red-team-evidence.mjs';
 import { redTeamCheckRunIsEvidence, readRedTeamPublicationHoldFact, readRedTeamRecoveryFact, resolveWeAppId } from './red-team-check-run.mjs';
+import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { standingRulingScope } from '../conveyor/standing-ruling-io.mjs';
 
 import { RED_TEAM_STATUS_LABELS, RED_TEAM_STATUS_LABEL_META } from './red-team-status-label-meta.mjs';
@@ -18,7 +19,7 @@ function settingsReadable(path) {
   try { JSON.parse(readFileSync(path, 'utf8')); return true; } catch { return false; }
 }
 
-export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE, checkClear = false } = {}) {
+export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head, evidence = {}, env = {}, standingRuling = null, headFiles = null, headVerified = true, settingsPath = RED_TEAM_SETTINGS_FILE, checkClear = false, gateClear = false } = {}) {
   // The shared hold decision (PR #6622): the sealed stored evidence holds the head unless the posted comment shows the same
   // confirmed breaks. The PERSISTED status is read fresh (never the caller's snapshot, which may predate a publish), so one
   // pass never plans clear for a conflict it just recorded.
@@ -50,8 +51,10 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
   // Unknown run evidence holds, but after the break check: a recorded break still marks the PR blocked.
   if (evidence.ok === false && !broken) {
     const names = labels.map(label => typeof label === 'string' ? label : label?.name);
-    if (!pendingOnly && !evidence.carryConflict && !evidence.inFlight && !evidence.scheduled
-      && redTeamClearGateCommentForHead(comments, pr, head)) {
+    if (evidence.reason === 'review-unfinished' && headVerified !== false && gateClear === true
+      && names.includes('red-team:pending') && !names.includes('red-team:blocked')
+      && !pendingOnly && !evidence.carryConflict && !evidence.inFlight && !evidence.scheduled
+      && redTeamClearGateCommentForHead(comments, pr, head, c => gateSettleBoundsAllow(evidence, c, pr, head))) {
       return { add: names.includes('red-team:clear') ? null : 'red-team:clear',
         remove: names.filter(name => name === 'red-team:pending') };
     }
@@ -93,6 +96,27 @@ export function planRedTeamStatusLabels({ labels = [], comments, repo, pr, head,
       && !(desired === null && (l === 'red-team:blocked' || (l === 'red-team:pending' && !cardOnlyBypass)))) };
 }
 
+/** Same quiet/complete bounds as result-comment settlement; unknown bounds retain pending. */
+function gateSettleBoundsAllow(evidence, comment, pr, head) {
+  const bounds = evidence.settleBounds ?? {};
+  const at = Date.parse(commentCreatedAt(comment));
+  if (!Number.isFinite(at) || bounds.unfinishedUndecided !== true
+    || !(bounds.evaluatedAt - bounds.unfinishedActiveAt >= ABANDONED_REVIEW_AFTER_MS)
+    || !(at > bounds.unfinishedStartedAt)
+    || ('unreadBoundaryAt' in bounds && !(at > bounds.unreadBoundaryAt + UNREAD_SETTLE_MARGIN_MS))) return false;
+  try {
+    const complete = bounds.completeHeadRead?.({ pr, head, at });
+    return complete?.complete === true && complete.blocked === false;
+  } catch { return false; }
+}
+
+function readPublicationClearFact({ repo, pr, head, env, gh }) {
+  try {
+    if (typeof gh !== 'function' || carriedCheckMarkerPresent({ repo, pr, head, env: { ...process.env, ...env } })) return false;
+    return readRedTeamPublicationHoldFact({ repo, pr, headSha: head, gh, strictSummary: true }).ok === true;
+  } catch { return false; }
+}
+
 /** A gh runner that never serves the read memo: a label swap is decided on fresh data only. */
 export function createFreshGh(run = runGhSync, baseEnv = process.env) {
   return (args, opts = {}) => {
@@ -116,8 +140,7 @@ export function readCheckClearFact({ repo, pr, head, env = process.env, gh = cre
     const options = { repo, pr, headSha: head, appId: app.appId, gh };
     // An unconfirmed carried-check publish (its outbox marker, which may own a live hold) is no proof either.
     // A partial env inherits the process env, so the marker directory is never a different one (a missed hold).
-    if (carriedCheckMarkerPresent({ repo, pr, head, env: { ...process.env, ...env } })) return false;
-    return readRedTeamRecoveryFact(options).ok === true && readRedTeamPublicationHoldFact({ ...options, strictSummary: true }).ok === true;
+    return readPublicationClearFact({ repo, pr, head, env, gh }) && readRedTeamRecoveryFact(options).ok === true;
   } catch { return false; }
 }
 
@@ -159,25 +182,31 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
   let checkClear = false;
   const liveNames = (state.labels ?? []).map(l => typeof l === 'string' ? l : l?.name);
   // The check run is evidence only when the configured gate source says so (the `drain-scan` rollback disables it).
-  if (liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked') && redTeamCheckRunIsEvidence({ env })) {
+  if (evidence.ok !== false && liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked') && redTeamCheckRunIsEvidence({ env })) {
     try { checkClear = readCheckClear({ repo, pr, head }) === true; } catch { checkClear = false; }
   }
-  const planWith = (threadNow, clear) => planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: threadNow, standingRuling: scope, headFiles, headVerified, checkClear: clear });
+  const gateSettle = evidence.ok === false && evidence.reason === 'review-unfinished';
+  const readClear = gateSettle ? args => readPublicationClearFact({ ...args, env, gh }) : readCheckClear;
+  if (gateSettle && headVerified !== false && liveNames.includes('red-team:pending') && !liveNames.includes('red-team:blocked'))
+    checkClear = readClear({ repo, pr, head });
+  const planWith = (threadNow, clear) => planRedTeamStatusLabels({ ...state, repo, pr, head, evidence, env, comments: threadNow, standingRuling: scope, headFiles, headVerified, checkClear: gateSettle ? false : clear, gateClear: gateSettle && clear });
   let plan = planWith(thread, checkClear);
-  // A check-derived settle only ever moves pending to clear. It re-verifies the head and re-reads the check and the thread
+  // A check- or gate-derived settle only moves pending to clear. Re-verify the head, clearance fact and thread
   // right before writing; a block always wins: a recorded break found on that re-read is written as blocked, never skipped.
   if (checkClear && plan.add !== 'red-team:blocked' && plan.add !== 'red-team:pending' && (plan.add || plan.remove.length) && !dryRun) {
     let again = null;
     try { again = recheck.readPrState(repo, pr)?.headRefOid; } catch { again = null; }
     if (again !== head) return { add: null, remove: [], skipped: 'head-moved' };
     let still = false;
-    try { still = readCheckClear({ repo, pr, head }) === true; } catch { still = false; }
+    try { still = readClear({ repo, pr, head }) === true; } catch { still = false; }
     let threadNow = null;
     try { threadNow = recheck.readComments(repo, pr); } catch { threadNow = null; }
     if (!Array.isArray(threadNow)) return { add: null, remove: [], skipped: 'thread-unreadable' };
     const next = planWith(threadNow, still);
     if (next.add === 'red-team:blocked') plan = next;
     else if (!still) return { add: null, remove: [], skipped: 'check-changed' };
+    else if (gateSettle && (next.add === 'red-team:pending' || !next.remove.includes('red-team:pending')))
+      return { add: null, remove: [], skipped: 'gate-changed' };
     else plan = next;
     // Last head guard, after every read and right before the write.
     let last = null, lastLabels = null;
@@ -191,7 +220,7 @@ export function syncRedTeamStatusLabels({ repo, pr, head, evidence = {}, env = p
     if (plan.add === 'red-team:clear') {
       if (!lastLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'red-team:pending')) return { add: null, remove: [], skipped: 'pending-gone' };
       let lastClear = false;
-      try { lastClear = readCheckClear({ repo, pr, head }) === true; } catch { lastClear = false; }
+      try { lastClear = readClear({ repo, pr, head }) === true; } catch { lastClear = false; }
       if (!lastClear) return { add: null, remove: [], skipped: 'check-changed' };
     }
   }
