@@ -5,10 +5,12 @@
  * Non-claims: secrets split across lines; token formats absent from secretText;
  * base64/UTF-16 wrapped tokens; keys inside archives or in untouched files;
  * secrets added then removed across commits (only the net PR diff is scanned).
- * Bootstrap non-claim: when the base has no scanner (first merge), the job runs
- * the PR copy. After this merges, the base copy runs, so a PR cannot swap the scanner.
- * The workflow covers pull_request, not push or merge_group. This script cannot
- * establish whether secret-scan is a required ruleset check; operators must verify.
+ * CI's pull_request job is feedback only: its workflow and bootstrap copy are PR-controlled.
+ * Enforcement lives in merge-gate.yml: base-controlled pull_request_target YAML invokes
+ * the main scanner on fetched commit objects without checking out PR code; merge_group
+ * is scanned there too. Missing trusted scanner fails closed. This must first land on
+ * main, and operators must enforce the pinned required workflow (a job name alone can
+ * be spoofed). This script cannot establish that repository ruleset configuration.
  */
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';

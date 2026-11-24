@@ -69,6 +69,8 @@ permissions:
   contents: read
 
 jobs:
+  # Fast PR feedback only: a contributor can edit this pull_request workflow. The independently
+  # enforced scan lives in merge-gate.yml's base-controlled pull_request_target execution.
   secret-scan:
     name: secret-scan
     if: ${{ github.event_name == 'pull_request' }}

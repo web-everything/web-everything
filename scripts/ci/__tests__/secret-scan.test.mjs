@@ -220,6 +220,58 @@ test('strict NUL records and hunk counts refuse incomplete or unknown data', () 
 });
 
 const workflow = yaml.safeLoad(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
+const mergeWorkflow = yaml.safeLoad(readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8'));
+test('base-controlled merge gate invokes scanning independently of PR-controlled CI', () => {
+  assert.ok(mergeWorkflow.on.pull_request_target);
+  assert.ok(!mergeWorkflow.on.pull_request);
+  const job = mergeWorkflow.jobs['merge-gate'];
+  const step = job.steps.find(s => s.name === 'Scan pinned changes with the trusted scanner');
+  assert.ok(step, 'required merge gate must invoke scanning independently of PR-controlled CI');
+  assert.equal(step.if, "${{ github.event_name == 'pull_request_target' || github.event_name == 'merge_group' }}");
+  assert.equal(step['continue-on-error'], undefined);
+  assert.equal(job['continue-on-error'], undefined);
+  assert.deepEqual(step.env, {
+    SCAN_BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+    SCAN_HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}',
+  });
+  assert.ok(job.steps.indexOf(step) < job.steps.findIndex(s => s.name === 'Evaluate the drain\'s merge gates'));
+  assert.equal(job.steps.find(s => s.uses === 'actions/checkout@v4').with.ref, 'main');
+  assert.doesNotMatch(step.run, /checkout|--allowlist|continue-on-error|bootstrap/);
+});
+for (const variant of ['clean', 'tampered', 'deleted', 'missing-base', 'missing-head', 'invalid-head', 'unfetchable-head', 'missing-scanner']) {
+  test(`trusted merge-gate scan: ${variant}`, () => {
+    const step = mergeWorkflow.jobs['merge-gate'].steps.find(s => s.name === 'Scan pinned changes with the trusted scanner');
+    assert.ok(step, 'required merge gate must invoke scanning independently of PR-controlled CI');
+    const r = repo({ '.github/workflows/ci.yml': 'jobs:\n  secret-scan:\n    steps:\n      - run: node scripts/ci/secret-scan.mjs\n' });
+    // Trusted worktree stays at base: PR files enter only Git's object database.
+    mkdirSync(join(r.dir, 'scripts/ci'), { recursive: true });
+    mkdirSync(join(r.dir, 'scripts/readiness'), { recursive: true });
+    for (const name of ['secret-scan.mjs', 'secret-scan-allowlist.json']) copyFileSync(new URL('../' + name, import.meta.url), join(r.dir, 'scripts/ci', name));
+    for (const name of ['forge-exec-manifest.mjs', 'forge-key-structure.mjs']) copyFileSync(new URL('../../readiness/' + name, import.meta.url), join(r.dir, 'scripts/readiness', name));
+    const trusted = r.commit();
+    r.put('.github/workflows/ci.yml', 'jobs:\n  secret-scan:\n    steps:\n      - run: true\n');
+    r.put('scripts/ci/secret-scan.mjs', 'process.exit(0);');
+    r.put('scripts/ci/secret-scan-allowlist.json', JSON.stringify({ entries: [exemption('docs/probe-fake-jwk.json', 'private-key-structure', privateJwk)] }));
+    if (variant !== 'clean') r.put('docs/probe-fake-jwk.json', privateJwk);
+    if (variant === 'deleted') rmSync(join(r.dir, '.github/workflows/ci.yml'));
+    const head = r.commit();
+    const work = join(temporary(), 'trusted');
+    execFileSync('git', ['clone', '--quiet', '--no-checkout', r.dir, work]);
+    execFileSync('git', ['-C', work, '-c', 'core.hooksPath=/dev/null', 'checkout', '--quiet', trusted]);
+    if (variant === 'missing-scanner') rmSync(join(work, 'scripts/ci/secret-scan.mjs'));
+    const result = spawnSync('bash', ['-e', '-c', step.run], {
+      cwd: work, encoding: 'utf8', timeout: 15_000,
+      env: { ...process.env,
+        SCAN_BASE_SHA: variant === 'missing-base' ? '' : trusted,
+        SCAN_HEAD_SHA: variant === 'missing-head' ? '' : variant === 'invalid-head' ? '--upload-pack=touch marker' : variant === 'unfetchable-head' ? 'f'.repeat(40) : head,
+      },
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, variant === 'clean' ? 0 : 1, variant + ': ' + result.stdout + result.stderr);
+    if (['tampered', 'deleted'].includes(variant)) assert.match(result.stdout, /docs\/probe-fake-jwk.json:0 private-key-structure/);
+    assert.doesNotMatch(result.stdout + result.stderr, /FAKE_TEST_ONLY/);
+  });
+}
 test('isolated read-only PR workflow keeps existing pins, trusted scanner and bootstrap', () => {
   const job = workflow.jobs['secret-scan'];
   assert.equal(job.name, 'secret-scan'); assert.deepEqual(job.permissions, { contents: 'read' });

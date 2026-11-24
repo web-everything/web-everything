@@ -123,6 +123,23 @@ jobs:
           node-version: 22
           # no `cache:` — a pull_request_target run must not write the base branch's cache scope
 
+      # Enforce scanning inside the base-controlled gate, independently of ci.yml's PR-controlled
+      # secret-scan job. Fetch commits as data only; never check out or execute the PR's tree.
+      # This step is outside the evaluator's shadow mode: a finding always fails the job.
+      # Rollout: main must contain this invocation AND the scanner, and operators must enforce
+      # this workflow via the pinned required-workflow ruleset described above. A same-name
+      # PR check alone is not enforcement. Missing trusted scanner fails closed (no PR fallback).
+      - name: Scan pinned changes with the trusted scanner
+        if: ${{ github.event_name == 'pull_request_target' || github.event_name == 'merge_group' }}
+        timeout-minutes: 5
+        env:
+          SCAN_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          SCAN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          [[ "$SCAN_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$SCAN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::secret-scan: missing or invalid pinned commits' >&2; exit 1; }
+          git fetch --no-tags origin "$SCAN_BASE_SHA" "$SCAN_HEAD_SHA" || { echo '::error::secret-scan: could not fetch pinned commits' >&2; exit 1; }
+          node scripts/ci/secret-scan.mjs --base "$SCAN_BASE_SHA" --head "$SCAN_HEAD_SHA"
+
       - name: Install
         run: npm ci --ignore-scripts
 
