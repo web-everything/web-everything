@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   selectProvider,
+  selectReviewSeatProvider,
   selectProbationWorker,
   selectSupervisionLevel,
   isStatuteTierPath,
@@ -1531,5 +1532,44 @@ describe('the critical-work gate opens per taskType for non-critical work only (
       const gateEntry = res.auditTrail.find((a) => a.criterion === 'critical-work-gate');
       expect(gateEntry.result).toBe('open-non-critical');
     }
+  });
+});
+
+describe('AGY-AUTH-WATCH routing', () => {
+  it.each([null, { state: 'off' }, { state: 'on', lastProbeAt: 1 }])('holds unavailable agy workers and review seats: %j', agyAuth => {
+    const options = { agyAuth, now: 3000000, agyAuthPeriodMs: 100 };
+    const picked = selectProbationWorker({ taskType: 'doc-fix', ...options });
+    expect(picked.worker?.id).toBe('codex');
+    expect(picked.auditTrail).toContainEqual(expect.objectContaining({ result: 'auth-off' }));
+    expect(selectReviewSeatProvider({ lens: 'security', available: ['agy-claude', 'agy-gemini'], ...options }).provider).toBeNull();
+  });
+  it('fresh on and omitted auth preserve agy candidates', () => {
+    for (const agyAuth of [undefined, { state: 'on', lastProbeAt: 1000 }]) {
+      const options = { agyAuth, now: 1001 };
+      expect(selectProbationWorker({ taskType: 'doc-fix', ...options }).worker.id).toBe('antigravity-claude');
+      expect(selectReviewSeatProvider({ lens: 'security', available: ['agy-claude'], ...options }).provider).toBe('agy-claude');
+    }
+  });
+});
+it('fresh auth works when callers pass only the record', () => {
+  const agyAuth = { state: 'on', lastProbeAt: Date.now() };
+  expect(selectProvider({ taskType: 'doc-fix' }, { agyAuth }).agyAlternateResult).toBe('offered');
+});
+
+describe('selectProvider auth-off early routes', () => {
+  it.each(['gemini', 'antigravity'])('skips earned %s and falls through to earned Codex', provider => {
+    const context = { filesTouched: ['scripts/lib/example.mjs'], estimatedSize: 30,
+      scorecards: [makeRecord({ provider, model: 'gemini-3.1-pro' }), makeRecord()] };
+    expect(selectProvider({ taskType: 'bugfix' }, context).recommendation).toBe('gemini');
+    expect(selectProvider({ taskType: 'bugfix' }, { ...context, agyAuth: { state: 'off' } }).recommendation).toBe('codex');
+  });
+  it.each(['high-stakes', 'thin-history'])('skips %s dual dispatch when auth is off', branch => {
+    const context = branch === 'high-stakes'
+      ? { filesTouched: ['scripts/conveyor/drain.mjs', 'scripts/conveyor/__tests__/drain.test.mjs'] }
+      : { filesTouched: ['scripts/lib/example.mjs'], estimatedSize: 320, scorecards: [makeRecord()] };
+    expect(selectProvider({ taskType: 'bugfix' }, context).recommendation).toBe('both');
+    const result = selectProvider({ taskType: 'bugfix' }, { ...context, agyAuth: { state: 'off' } });
+    expect(result.recommendation).toBe('claude');
+    expect(result.alternateBackend).toBeNull();
   });
 });

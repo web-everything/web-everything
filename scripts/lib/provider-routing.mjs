@@ -15,7 +15,8 @@
  *   • Callers explicitly load and pass in scorecard records (from the shared scorecard store — `run-scorecard-store.mjs#readStore`, #4155
  *     or in-memory fixtures) and backdown thresholds.
  *   • Fully deterministic: identical arguments produce byte-identical return objects every time.
- *   • No Date.now(), Math.random(), or implicit time reads. Timestamps in scorecards are treated as
+ *   • Auth freshness uses the clock unless context.now is supplied; other routing remains pure.
+ *     Timestamps in scorecards are treated as
  *     deterministic ISO-8601 strings.
  *
  * `explorationHint` is an ADDITIONAL, purely advisory field sourced from caller-loaded
@@ -66,6 +67,7 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
+import { agyAuthOff } from '../operations/agy-auth-probe.mjs';
 import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
@@ -388,7 +390,7 @@ export function probationWorkerForRoute({ provider, model, effort }, taskType) {
  * @returns {{worker: object|null, auditTrail: Array<object>, reason: string}}
  */
 // @test-only-export-ok: Shared library exported for the probation launcher (agy-launcher-probation) and its own test
-export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, simple = false, filesTouched = [], estimatedSize = 0, scorecards = [], vetoes = [], availability = {}, argonSettings = BUILD_ARGON_SETTINGS } = {}) {
+export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, simple = false, filesTouched = [], estimatedSize = 0, scorecards = [], vetoes = [], availability = {}, argonSettings = BUILD_ARGON_SETTINGS, agyAuth, agyAuthPeriodMs, now } = {}) {
   availability ??= {};
   argonSettings ??= BUILD_ARGON_SETTINGS;
   const auditTrail = [];
@@ -410,6 +412,10 @@ export function selectProbationWorker({ taskType, tier = CLAUDE_TIERS.SONNET, si
   const candidates = [];
   roster.forEach((id, order) => {
     const def = PROBATION_WORKERS[id];
+    if (id.startsWith('antigravity-') && agyAuth !== undefined && agyAuthOff(agyAuth, now, agyAuthPeriodMs)) {
+      auditTrail.push({ criterion: `probation-candidate:${id}`, result: 'auth-off', reasoning: 'agy authentication is off, unreadable or stale; sign in on the Studio' });
+      return;
+    }
     if (id === 'antigravity-argon') {
       const value = argonSettings.value ?? {};
       const sources = argonSettings.sources ?? {};
@@ -760,6 +766,7 @@ export function selectProvider(task, context) {
   const kind = typeof context?.kind === 'string' ? context.kind : '';
   const tags = Array.isArray(context?.tags) ? context.tags : [];
 
+  const authOff = context?.agyAuth !== undefined && agyAuthOff(context.agyAuth, context.now, context.agyAuthPeriodMs);
   const auditTrail = [];
   const statuteFiles = filesTouched.filter(isStatuteTierPath);
   const hasStatuteFile = statuteFiles.length > 0;
@@ -789,7 +796,7 @@ export function selectProvider(task, context) {
   // ──────────────────────────────────────────────────────────────────────────
   // Step 1: Gemini / Antigravity Fitness Check
   // ──────────────────────────────────────────────────────────────────────────
-  const geminiCheck = gated ? gatedFit : evaluateProviderFitness(
+  const geminiCheck = authOff ? { fit: false, fitModel: null, reason: 'agy authentication is off, unreadable or stale; sign in on the Studio.' } : gated ? gatedFit : evaluateProviderFitness(
     ['gemini', 'antigravity'],
     taskType,
     filesTouched,
@@ -854,7 +861,10 @@ export function selectProvider(task, context) {
   let bothFit = false;
   let bothReason = '';
 
-  if (gated) {
+  if (authOff) {
+    bothFit = false;
+    bothReason = 'agy authentication is off, unreadable or stale; sign in on the Studio.';
+  } else if (gated) {
     bothFit = false;
     bothReason = gatedFit.reason;
   } else if (gatedKindOpen) {
@@ -936,7 +946,8 @@ export function selectProvider(task, context) {
   const cliModel = AGY_CLAUDE_MODEL_BY_TIER[claudeTier];
   const forcedNativeIdentity = hasStatuteFile || taskType === 'architectural-decision' || taskType === 'triage-research';
   const latestAntigravityTrial = getSortedRecordsForProviderAndTask(scorecards, ['antigravity'], taskType)[0];
-  const agyAlternateResult = !cliModel ? 'not-applicable'
+  const agyAlternateResult = authOff ? 'auth-off'
+    : !cliModel ? 'not-applicable'
     : forcedNativeIdentity ? 'forced-native'
       : latestAntigravityTrial && !isCleanRecord(latestAntigravityTrial) ? 'recent-failure'
         : 'offered';
@@ -950,7 +961,9 @@ export function selectProvider(task, context) {
     criterion: 'agy-alternate-backend',
     result: agyAlternateResult,
     dataConsulted: `claudeTier='${claudeTier}', taskType='${taskType}', statute=${hasStatuteFile}, latestAntigravityTrial=${latestAntigravityTrial ? (latestAntigravityTrial.scoredAt || 'unscored') : 'none'}`,
-    reasoning: agyAlternateResult === 'not-applicable'
+    reasoning: agyAlternateResult === 'auth-off'
+      ? 'agy authentication is off, unreadable or stale; sign in on the Studio.'
+      : agyAlternateResult === 'not-applicable'
       ? 'Haiku has no agy-hosted equivalent, so no alternate backend applies.'
       : agyAlternateResult === 'forced-native'
         ? 'Statute-tier paths, architectural decisions and triage research require native Claude session identity and tool access.'
@@ -963,6 +976,7 @@ export function selectProvider(task, context) {
   if (probationTask) {
     const picked = selectProbationWorker({
       taskType, tier: claudeTier, simple: context?.simple === true, filesTouched, estimatedSize, scorecards, vetoes,
+      agyAuth: context?.agyAuth, agyAuthPeriodMs: context?.agyAuthPeriodMs, now: context?.now,
       availability: context?.availability ?? {}, argonSettings: context?.argonSettings ?? BUILD_ARGON_SETTINGS,
     });
     auditTrail.push(...picked.auditTrail);
@@ -978,6 +992,7 @@ export function selectProvider(task, context) {
     recommendation: RECOMMENDATIONS.CLAUDE,
     claudeTier,
     alternateBackend,
+    ...(context?.agyAuth !== undefined ? { agyAlternateResult } : {}),
     // agy-launcher-probation — the roster pick for an opened, non-critical taskType, or null. See PROBATION_ROSTER.
     probationWorker,
     auditTrail,
@@ -1256,11 +1271,12 @@ function stableLensHash(text) {
  * @param {Record<string, number>} [o.plannedLoad] - seats already assigned per provider in THIS review.
  * @returns {{provider: (string|null), auditTrail: Array<{criterion:string,result:string,reasoning:string}>, reasoning: string}}
  */
-export function selectReviewSeatProvider({ lens, available = REVIEW_SEAT_PROVIDERS, scorecards = [], plannedLoad = {} } = {}) {
+export function selectReviewSeatProvider({ lens, available = REVIEW_SEAT_PROVIDERS, scorecards = [], plannedLoad = {}, agyAuth, agyAuthPeriodMs, now } = {}) {
   const records = Array.isArray(scorecards) ? scorecards : (Array.isArray(scorecards?.records) ? scorecards.records : []);
   const taskType = reviewSeatTaskType(lens);
   const auditTrail = [];
-  const candidates = REVIEW_SEAT_PROVIDERS.filter((p) => Array.isArray(available) && available.includes(p));
+  const candidates = REVIEW_SEAT_PROVIDERS.filter((p) => Array.isArray(available) && available.includes(p)
+    && !(agyAuth !== undefined && agyAuthOff(agyAuth, now, agyAuthPeriodMs) && ['agy-claude', 'agy-gemini'].includes(p)));
   auditTrail.push({
     criterion: 'available',
     result: candidates.join(',') || 'none',
