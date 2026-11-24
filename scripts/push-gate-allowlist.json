@@ -42,7 +42,7 @@
     "scripts/operations/build-dispatch-hold-route-land.mjs": {"status":"pending-migration","reason":"S4: publish the hold-route repair branch before verification.","sites":8},
     "scripts/operations/card-batch-io.mjs": {"status":"pending-migration","reason":"S5: publish a leased card batch with fast-forward rejection handling.","sites":18},
     "scripts/operations/file-item-io.mjs": {"status":"pending-migration","reason":"S5: publish filed card commits with porcelain output and no followed tags.","sites":4},
-    "scripts/operations/fix-run.mjs": {"status":"pending-migration","reason":"S3: publish a lease-owned fixer commit before evidence posting and rearming.","sites":25},
+    "scripts/operations/fix-run.mjs": {"status":"pending-migration","reason":"S3: publish a lease-owned fixer commit before evidence posting and rearming; includes the upstream evidence-removal Git call.","sites":26},
     "scripts/operations/health-file-request-land.mjs": {"status":"pending-migration","reason":"S5: publish the health-request card branch before landing.","sites":3},
     "scripts/operations/migrate-raised-by.mjs": {"status":"pending-migration","reason":"S6: lease-publish raised-by migrations and roll back when approval cannot carry.","sites":12},
     "scripts/operations/record-verdict-io.mjs": {"status":"pending-migration","reason":"S5: synchronize the fetched source ref onto the verdict transport branch.","sites":2},
