@@ -18,7 +18,7 @@ export default {
     // Replay this harness against the requested tree, including rebuild's actual wiring.
     const probe = `
       const { scenario } = await import(process.argv[1]);
-      const reports = await Promise.all([0, 600001].map(ageMs => scenario({ sourceRoot: process.argv[2], ageMs })));
+      const reports = await Promise.all([{}, {ageMs: 600001}, {behind: 4}].map(opts => scenario({ sourceRoot: process.argv[2], ...opts })));
       process.exit(reports.every(r => r.violations.length === 0) ? 0 : 1);`;
     try {
       return spawnSync(process.execPath, ['--input-type=module', '-e', probe,
@@ -29,12 +29,13 @@ export default {
   async run({ sourceRoot } = {}) {
     const fresh = await scenario({ sourceRoot });
     const aged = await scenario({ sourceRoot, ageMs: 10 * 60_000 + 1 });
-    return { violations: [...fresh.violations, ...aged.violations] };
+    const routine = await scenario({ sourceRoot, behind: 4 });
+    return { violations: [...fresh.violations, ...aged.violations, ...routine.violations] };
   },
   judge(report) { return report.violations; },
 };
 
-export async function scenario({ sourceRoot, ageMs = 0 } = {}) {
+export async function scenario({ sourceRoot, ageMs = 0, behind = 5, forceRequest = null } = {}) {
   const root = sourceRoot ?? resolve(fileURLToPath(import.meta.url), '../../../../..');
   const { acquireSmokeSlot, behindMainPriority } = await import(pathToFileURL(join(root, 'scripts/lib/daemon-smoke-slots.mjs')).href);
   const source = readFileSync(join(root, 'scripts/lib/daemon-rebuild/rebuild.mjs'), 'utf8');
@@ -43,13 +44,13 @@ export async function scenario({ sourceRoot, ageMs = 0 } = {}) {
   if (start < 0 || end < 0) throw new Error('missing rebuild queue wiring');
   // Execute the production probe through its real acquisition call; only surrounding IO is stubbed.
   const rebuildQueue = new Function('io', `return (async () => {
-    const {root, stEnv, now, sleep, log, run, acquireSmokeSlot, behindMainPriority} = io;
+    const {root, stEnv, now, sleep, log, run, acquireSmokeSlot, behindMainPriority, forceRequest} = io;
     const prevHead = 'a'.repeat(40), plan = {mainSha: 'b'.repeat(40)};
-    const readForceAdopt = () => null, lease = {token: 'test'}, finalLockOpts = {};
+    const readForceAdopt = () => forceRequest, lease = {token: 'test'}, finalLockOpts = {};
     const readRebuildState = () => ({}), writeRebuildState = () => {};
     const withWriteLock = async (_root, action) => ({ok: true, value: await action()});
     ${source.slice(start, end)}
-    return slot;
+    return {...slot, forcedValid};
   })()`);
   const stateDir = mkdtempSync(join(tmpdir(), 'soak-smoke-queue-behind-priority-'));
   let time = 1_000;
@@ -70,8 +71,8 @@ export async function scenario({ sourceRoot, ageMs = 0 } = {}) {
       reached();
       return pause;
     } };
-    const result = (rebuild ? rebuildQueue({ ...options, root, stEnv: common.env, behindMainPriority,
-      run: args => ({ status: 0, stdout: args.join(' ') === `rev-list --count ${'a'.repeat(40)}..${'b'.repeat(40)}` ? '5' : '' }),
+    const result = (rebuild ? rebuildQueue({ ...options, root, stEnv: common.env, behindMainPriority, forceRequest,
+      run: args => ({ status: 0, stdout: args.join(' ') === `rev-list --count ${'a'.repeat(40)}..${'b'.repeat(40)}` ? String(behind) : '' }),
       acquireSmokeSlot: opts => acquireSmokeSlot({ ...options, ...opts }),
     }) : acquireSmokeSlot(options)).then(slot => ({ slot }), error => ({ error }));
     waiters.push({ pid, result, resume: () => resume?.(), stop: () => stop?.() });
@@ -86,7 +87,7 @@ export async function scenario({ sourceRoot, ageMs = 0 } = {}) {
     await enqueue(13, true);
     const state = JSON.parse(readFileSync(join(stateDir, 'smoke-slots.json'), 'utf8'));
     const violations = [];
-    const expected = ageMs > 10 * 60_000 ? [12, 13] : [13, 12];
+    const expected = behind < 5 || ageMs > 10 * 60_000 ? [12, 13] : [13, 12];
     if (JSON.stringify(state.waiters.map(e => e.pid)) !== JSON.stringify(expected)) {
       violations.push(`${ageMs ? 'aged' : 'fresh'} routine: persisted queue must be ${expected.join(',')}`);
     }
@@ -108,6 +109,7 @@ export async function scenario({ sourceRoot, ageMs = 0 } = {}) {
       const holders = JSON.parse(readFileSync(join(stateDir, 'smoke-slots.json'), 'utf8')).holders;
       if (holders.length !== 1 || holders[0].pid !== pid) violations.push('incorrect admission order');
       if (!outcome.slot?.acquired) throw outcome.error ?? new Error('waiter was not admitted');
+      if (pid === 13 && outcome.slot.forcedValid !== false) violations.push('invalid force request authorized');
       await outcome.slot.release();
     }
     return { violations };

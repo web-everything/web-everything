@@ -456,6 +456,8 @@ async function rebuildCloneInternal({
     // A valid pending force-adopt request for this clone (full 40-hex sha, ruling and quote present, unexpired) goes to the
     // FRONT of the host smoke queue; the queue timeout is unchanged and a holder is never preempted.
     const forced = readForceAdopt(root, stEnv, now);
+    const forcedValid = !!forced && /^[0-9a-f]{40}$/.test(String(forced.sha ?? '').toLowerCase())
+      && typeof forced.ruling === 'string' && forced.ruling.trim() !== '' && typeof forced.quote === 'string' && forced.quote.trim() !== '';
     let behind;
     // Probe only when opted in; use main, excluding candidate-only overlay commits.
     if (behindMainPriority({ behind: Number.MAX_SAFE_INTEGER, env: stEnv })) {
@@ -471,8 +473,7 @@ async function rebuildCloneInternal({
     const behindPriority = behindMainPriority({ behind, env: stEnv });
     const threshold = stEnv.WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD;
     log.error?.(`daemon-live-smoke: behindPriority=${behindPriority} (threshold=${JSON.stringify(threshold ?? 'off')}, source=${threshold === undefined ? 'default' : 'environment'}; behind=${behind ?? 'unreadable'})`);
-    const priority = behindPriority || (!!forced && /^[0-9a-f]{40}$/.test(String(forced.sha ?? '').toLowerCase())
-      && typeof forced.ruling === 'string' && forced.ruling.trim() !== '' && typeof forced.quote === 'string' && forced.quote.trim() !== '');
+    const priority = forcedValid || behindPriority;
     const smokeSlotStartedMs = now();
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep, priority,
       onWait: async () => {

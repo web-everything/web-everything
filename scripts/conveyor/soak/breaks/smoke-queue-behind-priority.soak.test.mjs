@@ -16,7 +16,11 @@ it.each([0, 600001])('behind priority preserves holder and routine aging at age 
   expect((await scenario({ ageMs })).violations).toEqual([]);
 });
 
-it('fix detection fails closed on absent, incomplete, and always-priority helpers', () => {
+it.each([null, {sha: 'bad', ruling: 'R1', quote: 'operator'}, {sha: 'c'.repeat(40), quote: 'operator'}, {sha: 'c'.repeat(40), ruling: 'R1'}])('behind priority never validates a missing or invalid force request: %j', async forceRequest => {
+  expect((await scenario({ forceRequest })).violations).toEqual([]);
+});
+
+it('fix detection fails closed on absent and incomplete helpers', () => {
   const root = mkdtempSync(join(tmpdir(), 'soak-behind-missing-'));
   try {
     expect(b.fixPresent(root)).toBe(false);
@@ -24,24 +28,23 @@ it('fix detection fails closed on absent, incomplete, and always-priority helper
     const path = join(root, 'scripts/lib/daemon-smoke-slots.mjs');
     writeFileSync(path, 'export const priority = false;');
     expect(b.fixPresent(root)).toBe(false);
-    writeFileSync(path, 'export const behindMainPriority = () => true;');
-    expect(b.fixPresent(root)).toBe(false);
     writeFileSync(path, 'export const behindMainPriority = () => false;');
     expect(b.fixPresent(root)).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-it.each(['probe', 'wiring'])('removing rebuild %s makes both detection and replay fail', async mutation => {
+it.each(['probe', 'wiring', 'always'])('removing rebuild %s makes both detection and replay fail', async mutation => {
   const root = mkdtempSync(join(tmpdir(), 'soak-behind-wiring-'));
   try {
     mkdirSync(join(root, 'scripts/lib/daemon-rebuild'), { recursive: true });
     writeFileSync(join(root, 'scripts/lib/daemon-smoke-slots.mjs'),
-      `export * from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-smoke-slots.mjs')).href)};`);
+      `export * from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/daemon-smoke-slots.mjs')).href)};
+       ${mutation === 'always' ? 'export const behindMainPriority = () => true;' : ''}`);
     const source = readFileSync('scripts/lib/daemon-rebuild/rebuild.mjs', 'utf8');
     writeFileSync(join(root, 'scripts/lib/daemon-rebuild/rebuild.mjs'), mutation === 'probe'
       ? source.replace("behind = Number(raw)", "behind = undefined")
-      : source.replace('now, sleep, priority,', 'now, sleep, priority: false,'));
+      : mutation === 'wiring' ? source.replace('now, sleep, priority,', 'now, sleep, priority: false,') : source);
     expect(b.fixPresent(root)).toBe(false);
-    expect((await scenario({ sourceRoot: root })).violations).not.toEqual([]);
+    expect((await scenario({ sourceRoot: root, behind: mutation === 'always' ? 4 : 5 })).violations).not.toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

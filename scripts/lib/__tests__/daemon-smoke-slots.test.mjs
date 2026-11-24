@@ -10,6 +10,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acquireSmokeSlot, behindMainPriority } from '../daemon-smoke-slots.mjs';
 import { rebuildClone } from '../daemon-rebuild/rebuild.mjs';
+import * as forceAdopt from '../daemon-force-adopt.mjs';
 import * as cloneLocks from '../daemon-clone-lock.mjs';
 import * as smoke from '../daemon-rebuild/smoke.mjs';
 import * as rebuildState from '../daemon-rebuild/state.mjs';
@@ -55,6 +56,13 @@ describe('daemon smoke slots', () => {
     expect(behindMainPriority({ behind: 5, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: wait } })).toBe(expected);
   });
 
+  it('behind priority uses the policy wait capped by the rebuild lease', () => {
+    const env = { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5', WE_DAEMON_REBUILD_LEASE_STALE_MS: '180000', WE_DAEMON_SMOKE_QUEUE_MAX_WAIT_MS: '900000' };
+    expect(behindMainPriority({ behind: 5, env })).toBe(false);
+    settings.value.smokeQueueMaxWaitMs = 600000;
+    expect(behindMainPriority({ behind: 5, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' } })).toBe(false);
+  });
+
   it.each([undefined, '', '0', '-1', '1.5', 'NaN', 'Infinity', '5x', '5\n', ' 5 ', '9007199254740992'])('behind priority is off for setting %s', value => {
     expect(behindMainPriority({ behind: 10, env: { WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: value } })).toBe(false);
   });
@@ -79,7 +87,8 @@ describe('daemon smoke slots', () => {
     await (await routine).release();
   });
 
-  it.each(['5', '4', '', 'garbage', 'Infinity', 'failed', 'throws', 'off'])('rebuild uses HEAD-to-main count and fails closed: %s', async count => {
+  it.each(['5', '4', '', 'garbage', 'Infinity', 'failed', 'throws', 'off'].flatMap(count => [null, { sha: 'bad', ruling: 'R1', quote: 'operator' }].map(forced => [count, forced])))('rebuild count %s with invalid/missing force %j only changes queue priority, never adoption', async (count, forced) => {
+    vi.spyOn(forceAdopt, 'readForceAdopt').mockReturnValue(forced);
     const prevHead = 'a'.repeat(40), mainSha = 'b'.repeat(40);
     const lease = { token: 'behind-build' }, persisted = { building: lease };
     const env = { WE_DAEMON_SMOKE_STATE_DIR: stateDir, WE_DAEMON_STATE_DIR: stateDir,
@@ -106,30 +115,12 @@ describe('daemon smoke slots', () => {
         expect(state().waiters[0].priority === true).toBe(count === '5');
         time += 900000;
       } });
-    expect(result.reason).toBe('smoke-queue-timeout');
+    expect(result).toMatchObject({ reason: 'smoke-queue-timeout', moved: false, adopted: false });
+    expect(smoke.smokeAndAdopt).not.toHaveBeenCalled();
     expect(time).toBe(900000);
     expect(state().waiters).toEqual([]);
     expect(run).toHaveBeenCalledTimes(count === 'off' ? 0 : 1);
     await holder.release();
-  });
-
-  it('many behind daemons do not starve an aged routine waiter', async () => {
-    const env = { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1', WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD: '5' };
-    let time = 1000;
-    const now = () => time;
-    const holder = await acquire(11, { env, now });
-    const routine = acquire(12, { env, now });
-    await wake();
-    const behind = [13, 14, 15, 16].map(pid => acquire(pid, { env, now, priority: behindMainPriority({ behind: 5, env }) }));
-    await wake();
-    time += 600001;
-    await holder.release();
-    sleepers.reverse(); await wake();
-    const first = await routine;
-    expect(state().holders.map(e => e.pid)).toEqual([12]);
-    await first.release();
-    for (const waiting of behind) { await wake(); await (await waiting).release(); }
-    expect(state().waiters).toEqual([]);
   });
 
   it.each(['unreadable', 'unparseable'])('fails closed to cap 1 when bundled settings are %s', async failure => {
