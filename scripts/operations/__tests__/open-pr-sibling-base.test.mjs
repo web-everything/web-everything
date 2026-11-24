@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { checkSiblingBase } from '../../lib/sibling-base-check.mjs';
 import { createGitReader } from '../../lib/pr-size-admission.mjs';
 import { createPrLandRunner, readSiblingBase } from '../open-pr-io.mjs';
+import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
@@ -100,7 +101,7 @@ describe('sibling base admission', () => {
     expect(readSiblingBase({ cwd: f.dir, env, branch: 'lane/child', git: createGitReader(f.dir), base: 'main', sha: 'HEAD' }, gh))
       .toEqual([{ number: 236, headRefName: 'lane/sibling-236', count: 1 }]);
     expect(gh).toHaveBeenCalledOnce();
-    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid'],
+    expect(gh).toHaveBeenCalledWith(['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '1000', '--json', 'number,headRefName,headRefOid'],
       expect.objectContaining({ cwd: f.dir, env, timeout: 30000, maxBuffer: 8 * 1024 * 1024 }));
   });
 
