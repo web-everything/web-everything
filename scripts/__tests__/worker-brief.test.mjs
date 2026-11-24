@@ -758,3 +758,52 @@ describe('brief red-team prep reading is gated and bounded (blocking-read hang)'
     });
   });
 });
+
+describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
+  const routes = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'scripts/settings/delivery-routes.json'), 'utf8'));
+  const base = { purpose: 'hdr-test', files: 'scripts/x.mjs', owner: 'abc123' };
+  const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: '/h/designs/prt-pin-probe-prep.md' };
+
+  it('renders Kind, Mode, Step, Prep, Slot header lines from the plan step', () => {
+    const out = renderWorkerBrief({ ...base, ...header });
+    expect(out).toMatch(/^Kind: daemon-tooling$/m);
+    expect(out).toMatch(/^Mode: fast$/m);
+    expect(out).toMatch(/^Step: PRT-PIN-PROBE$/m);
+    expect(out).toMatch(/^Prep: \/h\/designs\/prt-pin-probe-prep\.md$/m);
+    expect(out).toMatch(/^Slot: plan:PRT-PIN-PROBE$/m);
+    expect(out.indexOf('Kind:')).toBeLessThan(out.indexOf('## Standard worker rules'));
+  });
+
+  it('Mode matches the route for the Kind and a merge-path step adds the checklist reference', () => {
+    for (const [kind, mode] of Object.entries(routes.routes)) {
+      expect(renderWorkerBrief({ ...base, ...header, kind })).toMatch(new RegExp(`^Mode: ${mode}$`, 'm'));
+    }
+    const out = renderWorkerBrief({ ...base, ...header, step: 'RED-TEAM-GATE' });
+    expect(out).toMatch(/merge-path-checklist/);
+    expect(out).toMatch(/negative test per applicable line BEFORE/);
+  });
+
+  it('a blocker slot routes to debug like the dispatch hook does', () => {
+    const out = renderWorkerBrief({ ...base, ...header, slot: 'blocker:merge queue stuck' });
+    expect(out).toMatch(/^Mode: debug$/m);
+    expect(out).toMatch(/^Slot: blocker:merge queue stuck$/m);
+  });
+
+  it('refuses a missing or unknown Kind, and a step without a prep path', () => {
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: undefined })).toThrow(/--kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, kind: 'nope' })).toThrow(/Unknown kind/);
+    expect(() => renderWorkerBrief({ ...base, ...header, prepPath: undefined })).toThrow(/prep/i);
+  });
+
+  it('prints no header lines when no step is given (existing behaviour)', () => {
+    expect(renderWorkerBrief(base)).not.toMatch(/^Kind:/m);
+  });
+
+  it('CLI exits 2 when the prep file does not exist', async () => {
+    const err = [];
+    const code = await main(['--purpose=hdr-test', '--files=scripts/x.mjs', '--step=S1', '--kind=settings', '--prep-file=/nonexistent/prep.md'],
+      { stdout: { write() {} }, stderr: { write: s => err.push(s) }, newOwner: () => 'abc123', readPolicy: () => ({ enabled: false }) });
+    expect(code).toBe(2);
+    expect(err.join('')).toMatch(/prep/i);
+  });
+});
