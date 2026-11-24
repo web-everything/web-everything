@@ -14,6 +14,11 @@ import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Like daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs, these cases drive real Git
+// through candidate, plain-main and last-good rebuilds. The 5s default can expire under CI shard load;
+// keep the same finite hang guard as those suites without making assertions depend on host speed.
+vi.setConfig({ testTimeout: 60_000 });
+
 const tempDirs = [];
 function mktemp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));

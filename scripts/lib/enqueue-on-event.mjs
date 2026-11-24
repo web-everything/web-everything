@@ -756,11 +756,36 @@ export function extractPassTimings(stderr) {
   return timings;
 }
 
+const STDERR_LINE_MAX = 200;
+const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
+const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
+// Allowlist: only printable ASCII survives; every other code point (controls, separators, bidi/zero-width marks) becomes a space.
+const UNSAFE_LOG_CHARS = /[^\x20-\x7e]/g;
+const URL_USERINFO =/:\/\/[^/\s]*@/;
+
+/** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
+ * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
+ * opaque credentials under unrecognised env names, values under 3 chars, or escaped/ANSI-interrupted values.
+ * The spec (DRAIN-POSTMERGE-PROBE) deliberately publishes one sanitised first line.
+ * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
+export function firstStderrErrorLine(stderr, env = {}) {
+  const raw = String(stderr ?? '');
+  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).find(Boolean);
+  if (!line) return '';
+  if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
+  // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (!SECRET_ENV_KEY.test(k) || typeof v !== 'string') continue;
+    for (const part of v.split(/\r?\n/)) if (part.trim().length >= 3 && raw.includes(part)) return '[redacted]';
+  }
+  return line.length > STDERR_LINE_MAX ? `${line.slice(0, STDERR_LINE_MAX)}...` : line;
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
     const output = () => ({
-      stdout, stderrBytes: stderr.length, errorClass: classifyChildFailure(stderr, { timedOut }),
+      stdout, stderrBytes: stderr.length, stderrFirstLine: firstStderrErrorLine(stderr, env), errorClass: classifyChildFailure(stderr, { timedOut }),
       passTimings: extractPassTimings(stderr), timedOut,
     });
     let child;
@@ -1203,7 +1228,7 @@ export function createEnqueueOnEvent({
         const exitFailed = !r.timedOut && r.code !== 0;
         // A failed child cannot supply success or permanent-decline evidence.
         const json = exitFailed ? null : lastJsonLine(r.stdout);
-        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}`;
+        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}${r.code !== 0 && r.stderrFirstLine ? `, first error: ${r.stderrFirstLine}` : ''}`;
         const spawnFailed = r.errorClass === 'spawn-error';
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : spawnFailed ? `could not run (${diagnostic})` : summarizeFastDrain(json, p.num);
         const summary = what;
