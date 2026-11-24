@@ -8,7 +8,7 @@ export default {
   card: 'REVIEW-SPEED-MEMO',
   fixedBy: { sha: '16c167cd20e995e5adc94985e3aa4549fcae2d6d', where: 'lane/review-speed-memo', paths: ['scripts/conveyor/reconcile-pass.mjs'] },
   fixPresent(root) {
-    return spawnSync('git', ['merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'],
+    return spawnSync('env', ['git', 'merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'],
       { cwd: root, stdio: 'ignore', timeout: 5000 }).status === 0;
   },
   async run() {
