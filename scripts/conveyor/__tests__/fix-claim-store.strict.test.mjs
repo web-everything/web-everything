@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { draftSidecarFor, readClaimEvidence } from '../../readiness/file-locks.mjs';
-import { listFixDispatchClaimsStrict } from '../fix-claim-store.mjs';
+import { listFixDispatchClaimsStrict, validateFixClaimMeta } from '../fix-claim-store.mjs';
 import { pushRefusal } from '../fix-procedure.mjs';
 
 const roots = [], restore = [];
@@ -60,6 +61,32 @@ describe('Design A test 7: strict claim-store evidence', () => {
 });
 
 describe('strict claim shape refusals', () => {
+  it.each(['lane/repair+tests', 'feature/repair', 'main', 'lane/topic@work', 'lane/équipe',
+    'lane/repair=tests', 'lane/repair;tests', 'lane/repair"tests', "lane/repair'tests", 'lane/repair`tests',
+    '@', 'lane/a]b', 'lane/a./b', 'lane/a\u2028b', 'lane/a\u200bb', 'lane/-topic',
+  ])('accepts Git-valid branch %s in live and expired neighboring claims', branch => {
+    expect(spawnSync('git', ['check-ref-format', '--branch', branch],
+      { timeout: 5000, maxBuffer: 4096, stdio: 'pipe' }).status).toBe(0);
+    const f = fixture();
+    const neighbor = join(f.lockRoot, 'neighbor.lock'); mkdirSync(neighbor);
+    const entry = { ...f.entry, meta: { ...f.entry.meta, kind: 'fixing', pr: 99, branch, sessionId: 'other' } };
+    expect.soft(validateFixClaimMeta(entry.meta)).toBe(true);
+    for (const heartbeatAt of [f.entry.heartbeatAt, '2020-01-01T00:00:00.000Z']) {
+      writeFileSync(join(neighbor, 'lock.json'), JSON.stringify({ ...entry, heartbeatAt }));
+      expect.soft(listFixDispatchClaimsStrict(f.lockRoot).unreadable).toBe(false);
+      expect.soft(pushRefusal({ repo: 'we', branch: 'lane/isolated', sessionId: 'mine',
+        lockRoot: f.lockRoot, strict: true })).toBeNull();
+    }
+  });
+  it.each(['lane/fix ', 'lane/a..b', 'lane/.hidden', 'lane/a.lock/topic', 'lane/a//b',
+    'lane/a@{b', 'lane/a\\b', 'lane/a?b', 'lane/a*b', 'lane/a[b', 'lane/a:b', 'lane/a~b', 'lane/a^b',
+    'lane/a\nb', 'lane/a\rb', 'lane/a\tb', 'lane/a\u0000b', 'lane/a\u007fb', '-topic', 'HEAD', 'refs/heads/lane/fix',
+    'lane/fix.', 'lane/fix/',
+  ])('rejects invalid or noncanonical branch %j', branch => {
+    const f = fixture(); f.entry.meta.branch = branch;
+    writeFileSync(f.file, JSON.stringify(f.entry));
+    expect(listFixDispatchClaimsStrict(f.lockRoot)).toMatchObject({ unreadable: true });
+  });
   it.each([1, 'garbage', '', null, 'not-a-date'])('refuses invalid heartbeat %j rather than expiring it', heartbeatAt => {
     const f = fixture(); f.entry.heartbeatAt = heartbeatAt;
     writeFileSync(f.file, JSON.stringify(f.entry));
@@ -68,7 +95,7 @@ describe('strict claim shape refusals', () => {
       .toMatchObject({ code: 'claim-store-unreadable' });
   });
   it.each([
-    ['repo', 'unknown'], ['kind', 'unknown'], ['branch', 'main'], ['branch', 'lane/'], ['repo', 1], ['repo', ' '], ['repo', null], ['pr', '42'], ['pr', 0], ['pr', -1],
+    ['repo', 'unknown'], ['kind', 'unknown'], ['branch', 'lane/?'], ['branch', 'lane/'], ['repo', 1], ['repo', ' '], ['repo', null], ['pr', '42'], ['pr', 0], ['pr', -1],
     ['pr', 1.5], ['pr', Number.MAX_SAFE_INTEGER + 1], ['kind', 1], ['kind', ' '],
     ['branch', null], ['branch', ' '], ['branch', 7], ['branch', undefined],
   ])('refuses malformed held-claim %s=%j', (key, value) => {

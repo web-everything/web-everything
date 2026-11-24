@@ -109,6 +109,16 @@ export function listFixDispatchClaims(lockRoot = fixDispatchClaimRoot(), {
 /** Strip refs/heads/ and surrounding whitespace for branch comparisons. */
 export const normalizeBranch = ref => String(ref ?? '').trim().replace(/^refs\/heads\//, '');
 
+/** Canonical short branch metadata follows Git ref syntax, independent of the lane-only push policy.
+ * Keep this pure: claim scans also run in the pre-push hook and must not spawn git for each neighbor. */
+function isCanonicalClaimBranch(branch) {
+  return typeof branch === 'string' && branch === normalizeBranch(branch)
+    && branch !== 'HEAD' && !branch.startsWith('-') && !branch.endsWith('.')
+    && !/[\x00-\x20\x7f~^:?*\[\\]/.test(branch)
+    && !branch.includes('..') && !branch.includes('@{')
+    && branch.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.lock'));
+}
+
 /** Shared strict metadata contract for scans and the authorized-push claim reader. */
 export function validateFixClaimMeta(meta) {
   const validTtl = value => Number.isInteger(value) && value >= 1
@@ -118,9 +128,7 @@ export function validateFixClaimMeta(meta) {
     && (meta.kind !== 'fixing' || validTtl(meta.ttlMinutes))
     && (!('ttlMinutes' in meta) || validTtl(meta.ttlMinutes))
     && (!('leaseMinutes' in meta) || validTtl(meta.leaseMinutes))
-    && (!(meta.kind === 'fixing' || 'branch' in meta) || (typeof meta.branch === 'string'
-      && meta.branch === normalizeBranch(meta.branch) && /^lane\/[A-Za-z0-9._\/-]+$/.test(meta.branch)
-      && !meta.branch.includes('..') && !meta.branch.endsWith('/') && !meta.branch.endsWith('.lock'))));
+    && (!(meta.kind === 'fixing' || 'branch' in meta) || isCanonicalClaimBranch(meta.branch)));
 }
 
 /** Fail closed on incomplete claim evidence; confirm concurrent directory removal. */
