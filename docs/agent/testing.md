@@ -6422,6 +6422,11 @@ owns `scripts/ci/test-timings.json`. PR authors adding unit tests or soak breaks
 leave that file to the bot. Files without entries in that shared sharding map get their
 suite's median stored timing and still land in exactly one shard.
 
+When moving a test from unit to the blocking integration suite, leave its old unit
+timing to the bot too. Timing freshness checks require discovery in either blocking
+suite until the next refresh removes that unit entry; a deleted test or a file
+excluded from both suites still fails freshness validation.
+
 Added and renamed soak tests need neither a shared timing entry nor a timing sidecar
 for PR admission. The scheduled refresh currently updates unit timings and preserves
 existing soak timings; new soak tests use the median fallback until measured data
