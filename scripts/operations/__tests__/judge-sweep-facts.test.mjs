@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { URL as NodeURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import * as judgeSweepFacts from '../judge-sweep-facts.mjs';
@@ -344,7 +345,8 @@ describe('next responsible owner from existing facts', () => {
     expectNoConflictOwner(judgeSweepFacts.deriveNextOwner, mergeable);
   });
   it('the non-conflicting non-draft owner cases kill removal of the explicit CONFLICTING comparison', () => {
-    const source = readFileSync(new URL('../judge-sweep-facts.mjs', import.meta.url), 'utf8');
+    // Keep the file URL: Vitest rewrites new URL(..., import.meta.url) to use self.location.
+    const source = readFileSync(new NodeURL('../judge-sweep-facts.mjs', import.meta.url), 'utf8');
     // Evaluate only the pure classification functions; the working tree is never mutated.
     const start = source.indexOf('export const STALL_DEFAULTS');
     const end = source.indexOf('export function needsJudgment');
