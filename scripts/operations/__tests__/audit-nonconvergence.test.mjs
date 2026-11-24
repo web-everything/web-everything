@@ -9,11 +9,11 @@ import { createAuditDeps } from '../codex-audit-io.mjs';
 
 const ref = 'lane/audit', head = 'c'.repeat(40);
 const round = (letter, cls = 'B1', verdict = 'WEAKENED') => ({ head: letter.repeat(40), verdict,
-  findings: [`src/a.mjs:12 ${cls} missing guard`], ref, questionHash: QUESTION_HASH });
+  findings: verdict === 'WEAKENED' ? [`src/a.mjs:12 ${cls} missing guard`] : [], ref, questionHash: QUESTION_HASH });
 const prior = [round('a'), round('b', 'E1')];
 function fixture(verdict = 'WEAKENED') {
   const deps = { resolveSha: name => name === 'main' ? 'f'.repeat(40) : head,
-    runCodex: () => `${verdict}\nsrc/a.mjs:12 D1 missing check`, readRecords: () => prior,
+    runCodex: () => verdict === 'WEAKENED' ? `${verdict}\nsrc/a.mjs:12 D1 missing check` : verdict, readRecords: () => prior,
     findBranch: () => ref, appendRecord: vi.fn(), escalate: vi.fn(), now: () => '2026-11-24T00:00:00Z',
     stdout: vi.fn(), stderr: vi.fn() };
   return { deps, run: () => main(['--base=main', `--head=${head}`, '--now'], deps) };
@@ -39,29 +39,54 @@ it('a NOT WEAKENED round or a round with no new key resets the streak', () => {
     expect(assessLineage([...prior, last])).toMatchObject({ streak: 0, escalate: false });
     expect(assessLineage([...prior, last, round('d', 'X2')])).toMatchObject({ streak: 1, escalate: false });
   }
-  expect(assessLineage([round('a', 'B1', 'NOT WEAKENED'), round('b')]).streak).toBe(0);
+  expect(assessLineage([round('a', 'B1', 'NOT WEAKENED'), round('b')]).streak).toBe(1);
 });
 
 it('an unreadable lineage fails closed (escalates, never passes)', async () => {
-  for (const bad of [{ ...round('a'), verdict: 'UNKNOWN' }, { ...round('a'), findings: null }]) {
+  for (const bad of [null, 'invalid', { ...round('a'), head: 'bad' }, { ...round('a'), head: 123 },
+    { ...round('a'), verdict: 'UNKNOWN' }, { ...round('a'), findings: null }, { ...round('a'), findings: [123] },
+    { ...round('a'), findings: [] }, { ...round('a'), verdict: 'NOT WEAKENED' }]) {
     expect(assessLineage([bad])).toEqual({ escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: 1 });
   }
-  const { deps, run } = fixture();
-  deps.readRecords = () => { throw new Error('unreadable'); };
-  expect(await run()).toBe(1);
-  expect(deps.appendRecord.mock.calls[0][0].nonconverge).toEqual({ streak: 0, rounds: 1, reason: 'unreadable-lineage' });
-  expect(deps.escalate).toHaveBeenCalledOnce();
-  expect(deps.stderr.mock.calls[0][0]).toContain(NONCONVERGENCE_SIGNATURE);
+  for (const verdict of ['WEAKENED', 'NOT WEAKENED']) {
+    const { deps, run } = fixture(verdict);
+    deps.readRecords = () => { throw new Error('unreadable'); };
+    expect(await run()).toBe(verdict === 'WEAKENED' ? 1 : 3);
+    if (verdict === 'WEAKENED') {
+      expect(deps.appendRecord.mock.calls[0][0].nonconverge).toEqual({ streak: 0, rounds: 1, reason: 'unreadable-lineage' });
+    } else {
+      expect(deps.appendRecord).not.toHaveBeenCalled();
+      expect(deps.stdout).not.toHaveBeenCalled();
+      expect(deps.stderr.mock.calls[1][0]).toContain('UNPARSEABLE audit (unreadable-lineage)');
+    }
+    expect(deps.escalate).toHaveBeenCalledOnce();
+    expect(deps.stderr.mock.calls[0][0]).toContain(NONCONVERGENCE_SIGNATURE);
+  }
+});
+
+it('an invalid verdict followed by a valid round for the same head remains unreadable', () => {
+  const records = [{ ...round('a'), verdict: 'UNKNOWN' }, round('a')];
+  expect(assessLineage(lineageRounds(records, ref, QUESTION_HASH)))
+    .toEqual({ escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: 2 });
+});
+
+it('a WEAKENED round with empty findings escalates as unreadable', () => {
+  expect(assessLineage([{ ...round('a'), findings: [] }]))
+    .toMatchObject({ escalate: true, reason: 'unreadable-lineage' });
 });
 
 it('escalation never changes the verdict word or exit code', async () => {
   for (const verdict of ['WEAKENED', 'NOT WEAKENED']) {
     const { deps, run } = fixture(verdict);
-    deps.escalate.mockRejectedValue(new Error('routing failed'));
+    deps.escalate.mockRejectedValue(new Error('routing\n\r\u2028\u2029\u001b[31m failed\u0000'));
     expect(await run()).toBe(verdict === 'WEAKENED' ? 1 : 0);
-    expect(deps.stdout).toHaveBeenCalledWith(`${verdict}\nsrc/a.mjs:12 D1 missing check\n`);
+    expect(deps.stdout).toHaveBeenCalledWith(verdict === 'WEAKENED' ? `${verdict}\nsrc/a.mjs:12 D1 missing check\n` : `${verdict}\n`);
     expect(deps.appendRecord.mock.calls[0][0].verdict).toBe(verdict);
     expect(deps.escalate).toHaveBeenCalledTimes(verdict === 'WEAKENED' ? 1 : 0);
+    if (verdict === 'WEAKENED') {
+      expect(deps.stderr.mock.calls[1][0]).toBe('audit-nonconvergence: design-pass request failed to record (routing failed)\n');
+      expect(deps.stderr).toHaveBeenCalledTimes(2);
+    }
   }
 });
 
@@ -100,10 +125,11 @@ it('the replay CLI prints rounds and the signature at round 3', () => scratch(di
   ]);
 }));
 
-it('keeps last-head ledger order and excludes other refs and records without questionHash', () => {
+it('keeps raw ledger order and includes only the canonical question hash on this ref', () => {
   const last = round('a', 'X2');
-  expect(lineageRounds([...prior, { ...round('d'), ref: 'other' }, { ...round('e'), questionHash: null }, last], ref))
-    .toEqual([prior[1], last]);
+  expect(lineageRounds([...prior, { ...round('d'), ref: 'other' }, { ...round('e'), questionHash: null },
+    { ...round('f'), questionHash: 'old-question-hash' }, last], ref, QUESTION_HASH))
+    .toEqual([...prior, last]);
   expect(assessLineage([...prior, last])).toMatchObject({ rounds: 2, streak: 2, escalate: false });
   expect(assessLineage([])).toEqual({ streak: 0, rounds: 0, escalate: false, newKeys: [] });
 });

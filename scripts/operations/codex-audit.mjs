@@ -251,13 +251,17 @@ export async function main(argv, deps, { loadDeps = async () => (await import('.
     let nonconverge;
     if (ref && deps.readRecords) {
       let assessment;
-      try { assessment = assessLineage([...lineageRounds(await deps.readRecords(), ref), { head, verdict, findings }]); }
+      try { assessment = assessLineage([...lineageRounds(await deps.readRecords(), ref, QUESTION_HASH), { head, verdict, findings }]); }
       catch { assessment = { escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: 1 }; }
       if (assessment.escalate) {
         const { streak, rounds, reason } = assessment;
         nonconverge = { streak, rounds, ...(reason ? { reason } : {}) };
         deps.stderr(`${NONCONVERGENCE_SIGNATURE} ref=${clean(String(ref)).replace(/[\r\n\u2028\u2029]/g, '')} head=${head} streak=${streak}: stop patching, a design pass is required\n`);
-        try { await deps.escalate?.({ ref, head, streak, questionHash: QUESTION_HASH }); } catch { /* Routing cannot change the verdict or exit code. */ }
+        try { await deps.escalate?.({ ref, head, streak, questionHash: QUESTION_HASH }); }
+        catch (error) {
+          deps.stderr(`${NONCONVERGENCE_SIGNATURE}: design-pass request failed to record (${clean(String(error?.message ?? error)).replace(/[\r\n\u2028\u2029]/g, '')})\n`);
+        }
+        if (reason === 'unreadable-lineage' && verdict === 'NOT WEAKENED') throw new Error('unreadable-lineage');
       }
     }
     try {

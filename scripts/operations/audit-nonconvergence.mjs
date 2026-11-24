@@ -21,17 +21,19 @@ export function findingKeysOf(findings) {
 
 const distinctHeads = rounds => rounds.filter((round, index) => !rounds.slice(index + 1).some(later => later?.head === round?.head));
 
-export function lineageRounds(records, ref) {
-  return distinctHeads(records.filter(record => record?.ref === ref && record.questionHash));
+export function lineageRounds(records, ref, questionHash) {
+  return records.filter(record => record?.ref === ref && record.questionHash === questionHash);
 }
 
 export function assessLineage(rounds) {
+  if (rounds.some(round => !round || typeof round !== 'object' || typeof round.head !== 'string'
+    || !/^[a-f0-9]{40}$/i.test(round.head) || !['WEAKENED', 'NOT WEAKENED'].includes(round.verdict)
+    || !Array.isArray(round.findings) || round.findings.some(text => typeof text !== 'string')
+    || (round.verdict === 'WEAKENED' ? !round.findings.length : round.findings.length > 0))) {
+    return { escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: rounds.length };
+  }
   rounds = distinctHeads(rounds);
   const n = rounds.length;
-  if (rounds.some(round => !round || !['WEAKENED', 'NOT WEAKENED'].includes(round.verdict)
-    || !Array.isArray(round.findings) || round.findings.some(text => typeof text !== 'string'))) {
-    return { escalate: true, reason: 'unreadable-lineage', streak: 0, rounds: n };
-  }
   const seen = new Set();
   let streak = 0, newKeys = [];
   for (const round of rounds) {
@@ -47,8 +49,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const flags = Object.fromEntries(process.argv.slice(2).map(arg => arg.replace(/^--/, '').split('=')));
   const { readFileSync } = await import('node:fs');
   const heads = new Set((flags.heads ?? '').split(','));
-  const rounds = distinctHeads(readFileSync(flags.replay, 'utf8').split(/\r?\n/).filter(line => line.trim())
-    .map(line => JSON.parse(line)).filter(record => heads.has(record.head)));
+  const rounds = readFileSync(flags.replay, 'utf8').split(/\r?\n/).filter(line => line.trim())
+    .map(line => JSON.parse(line)).filter(record => heads.has(record.head));
   rounds.forEach((round, index) => {
     const result = assessLineage(rounds.slice(0, index + 1));
     const head = String(round.head).replace(/[^a-fA-F0-9]/g, '').slice(0, 8);
