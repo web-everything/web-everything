@@ -13,7 +13,9 @@ const SPAWNS = new Set(['spawn', 'spawnSync', 'exec', 'execSync', 'execFile', 'e
 const GLOBAL_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env',
   '--exec-path', '--bare', '--no-pager', '--paginate', '--no-replace-objects', '--literal-pathspecs',
   '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-optional-locks']);
-const SHELL_PUSH = /\bgit\s+(?:-\S+\s+(?:\S+\s+)?)*push\b/g;
+// Treat hyphen-prefixed tokens as flags, never optional values: letting both
+// consume them creates exponentially many partitions. A bare '-' remains a value.
+const SHELL_PUSH = /\bgit\s+(?:-\S+\s+(?:(?:[^\s-]\S*|-)\s+)?)*push\b/g;
 const CHILD_PROCESS = new Set(['node:child_process', 'child_process']);
 
 /** Paths come from git ls-files; reject paths outside the tracked scripts shape. */

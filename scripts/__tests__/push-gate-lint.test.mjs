@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { findRawPushes, isLintedScript } from '../lib/push-gate-lint.mjs';
 import { REPO_SCAN_TESTS } from '../lib/repo-scan-tests.mjs';
 
@@ -84,6 +85,34 @@ it('counts every push in one shell string and resets matching between strings an
   const source = "sh('git push && git -C repo push; git push'); sh('git status'); sh('git push');";
   expect(findRawPushes(source)).toEqual(Array.from({ length: 4 }, () => ({ line: 1, kind: 'shell' })));
   expect(findRawPushes(source)).toHaveLength(4);
+});
+
+it('bounds shell scanning on repeated hyphen-prefixed tokens, with and without a push', () => {
+  // A subprocess timeout bounds the old exponential match without blocking Vitest's event loop.
+  const repeated = '-!\t-!\t'.repeat(1024);
+  const sources = ['status', 'push'].map(verb => `sh(${JSON.stringify(`git ${repeated}${verb}`)});`);
+  const probe = `
+    import { findRawPushes } from ${JSON.stringify(new URL('../lib/push-gate-lint.mjs', import.meta.url).href)};
+    process.stdout.write(JSON.stringify(JSON.parse(process.argv[1]).map(source => findRawPushes(source))));
+  `;
+  const output = execFileSync(process.execPath, ['--input-type=module', '-e', probe, JSON.stringify(sources)], {
+    encoding: 'utf8', timeout: 5000, maxBuffer: 1 << 20,
+  });
+  expect(JSON.parse(output)).toEqual([[], [{ line: 1, kind: 'shell' }]]);
+}, 8000);
+
+it.each([
+  'git -a -b push',
+  'git -C repo -c key=value push',
+  'git -a - push',
+  'git -a -- push',
+  'git -a push -b push',
+])('preserves shell flag and value matching: %s', command => {
+  expect(findRawPushes(`sh(${JSON.stringify(command)});`)).toEqual([{ line: 1, kind: 'shell' }]);
+});
+
+it.each(['git -a - status', 'git -a value extra push', 'git -a value pushing'])('ignores non-push shell commands: %s', command => {
+  expect(findRawPushes(`sh(${JSON.stringify(command)});`)).toEqual([]);
 });
 
 it.each(['--git-dir=/x', '--work-tree=/x', '-C/x'])('detects push directly after attached global option %s', flag => {
