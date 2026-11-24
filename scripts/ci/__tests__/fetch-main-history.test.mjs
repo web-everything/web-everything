@@ -109,7 +109,7 @@ function runCached({ catFileOk, withCache = true }) {
 printf '%s\\n' "$*" >> "$FETCH_TEST_CALLS"
 case "$1" in
   rev-parse) echo "$FETCH_TEST_PACKS"; exit 0;;
-  cat-file) [ "$FETCH_TEST_CATFILE" = ok ] && exit 0; exit 1;;
+  rev-list) [ "$FETCH_TEST_CATFILE" = ok ] && exit 0; exit 1;;
   *) exit 0;;
 esac
 `, { mode: 0o755 });
@@ -158,5 +158,77 @@ describe('CI main history mirror cache', () => {
     expect(saves[0].if).toContain("github.event_name == 'push'");
     const restores = Object.values(jobs).flatMap((j) => j.steps.filter((s) => String(s.uses ?? '').startsWith('actions/cache/restore') && String(s.with?.key).startsWith('main-history-v1-')));
     expect(restores.length).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// Real git, local file:// remote: save then restore round trip, and rejection of a damaged cache.
+describe('CI main history mirror cache with real git', () => {
+  const git = (cwd, ...args) => {
+    const r = spawnSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+    if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+    return r.stdout.trim();
+  };
+  const setup = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-fetch-real-'));
+    const origin = join(dir, 'origin');
+    mkdirSync(origin);
+    git(origin, 'init', '-q', '-b', 'main');
+    git(origin, 'config', 'uploadpack.allowFilter', 'true');
+    for (const n of ['a', 'b', 'c']) {
+      writeFileSync(join(origin, n), n);
+      git(origin, 'add', n);
+      git(origin, 'commit', '-q', '-m', n);
+    }
+    const clone = (name) => {
+      const d = join(dir, name);
+      mkdirSync(d);
+      git(d, 'init', '-q', '-b', 'work');
+      git(d, 'remote', 'add', 'origin', `file://${origin}`);
+      return d;
+    };
+    return { dir, origin, clone };
+  };
+  const run = (cwd, cache, ...args) => spawnSync('sh', [script, ...args], { cwd, encoding: 'utf8', env: { ...process.env, MAIN_HISTORY_CACHE_DIR: cache } });
+
+  it('saves a blobless mirror from a fetched repo and a fresh repo seeds from it', () => {
+    const { dir, origin, clone } = setup();
+    try {
+      const a = clone('a');
+      expect(run(a, join(dir, 'cache')).status).toBe(0);
+      expect(run(a, join(dir, 'cache'), 'save').status).toBe(0);
+      const tip = git(origin, 'rev-parse', 'main');
+      expect(readFileSync(join(dir, 'cache', 'sha'), 'utf8').trim()).toBe(tip);
+      const b = clone('b');
+      const r = run(b, join(dir, 'cache'));
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('seeded main history from cache');
+      expect(git(b, 'rev-parse', 'refs/remotes/origin/main')).toBe(tip);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejects a cache whose pack lacks the recorded tip and still ends with the live tip', () => {
+    const { dir, origin, clone } = setup();
+    try {
+      const a = clone('a');
+      run(a, join(dir, 'cache'));
+      run(a, join(dir, 'cache'), 'save');
+      writeFileSync(join(dir, 'cache', 'sha'), `${git(origin, 'rev-parse', 'main~1')}\n`);
+      writeFileSync(join(dir, 'cache', 'sha'), `${'1'.repeat(40)}\n`);
+      const b = clone('b');
+      const r = run(b, join(dir, 'cache'));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('cached main history unusable');
+      expect(git(b, 'rev-parse', 'refs/remotes/origin/main')).toBe(git(origin, 'rev-parse', 'main'));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('save fails closed and publishes nothing when the export fails', () => {
+    const { dir, clone } = setup();
+    try {
+      const a = clone('a');
+      const r = run(a, join(dir, 'cache'), 'save');
+      expect(r.status).not.toBe(0);
+      expect(readdirSync(dir)).not.toContain('cache');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
