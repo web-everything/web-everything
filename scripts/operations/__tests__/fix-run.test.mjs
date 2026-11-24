@@ -816,11 +816,54 @@ describe('runFixCli', () => {
   it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
     expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
   });
-  it('never stages the lane-root .fix-evidence.md (sibling repos do not gitignore it) but still stages other files', () => {
+  it.each([' D', 'D ', 'MD', 'AD'])('allows removal of tracked lane-root evidence (%s)', code => {
+    const porcelain = `${code} .fix-evidence.md\0 M .gitignore\0`;
+    expect(changedPaths(porcelain)).toEqual(['.fix-evidence.md', '.gitignore']);
+    expect(unstagedPaths(porcelain)).toEqual(code[1] === 'D' ? ['.fix-evidence.md', '.gitignore'] : ['.gitignore']);
+    expect(changedPaths(`${code} .fix-evidence.md\0`)).toEqual(['.fix-evidence.md']);
+  });
+  it('allows removal of evidence renamed away while blocking evidence as a rename destination', () => {
+    expect(changedPaths('R  archived.md\0.fix-evidence.md\0')).toEqual(['archived.md', '.fix-evidence.md']);
+    expect(changedPaths('R  .fix-evidence.md\0old.md\0')).toEqual(['old.md']);
+    expect(unstagedPaths('R  archived.md\0.fix-evidence.md\0')).toEqual([]);
+    expect(changedPaths('C  archived.md\0.fix-evidence.md\0')).toEqual(['archived.md']);
+    expect(changedPaths('C  .fix-evidence.md\0old.md\0')).toEqual(['old.md']);
+  });
+  it('never stages additions or modifications of lane-root .fix-evidence.md (sibling repos do not gitignore it) but still stages other files', () => {
     const porcelain = '?? .fix-evidence.md\0 M src/a.ts\0?? docs/.fix-evidence.md\0A  .fix-evidence.md\0';
     expect(changedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
     expect(unstagedPaths(porcelain)).toEqual(['src/a.ts', 'docs/.fix-evidence.md']);
     expect(changedPaths('?? .fix-evidence.md.bak\0?? my.fix-evidence.md\0')).toEqual(['.fix-evidence.md.bak', 'my.fix-evidence.md']);
+  });
+  it.each(['??', 'A ', ' M', 'M ', 'AM', 'MM', 'UU', 'AA'])('excludes evidence writes (%s) from both helpers', code => {
+    expect(changedPaths(`${code} .fix-evidence.md\0`)).toEqual([]);
+    expect(unstagedPaths(`${code} .fix-evidence.md\0`)).toEqual([]);
+  });
+  it.each([false, true])('stages evidence removal without reading a recreated evidence file (conflicted merge=%s)', async merging => {
+    const m = mk(['aaa', 'bbb']);
+    let inMerge = false;
+    let added = false;
+    const removals = [];
+    const stageEntry = vi.fn((_lane, path) => ({ mode: '100644', data: Buffer.from(path === '.fix-evidence.md' ? 'new private evidence\n' : 'resolved\n') }));
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { inMerge = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return merging ? 'UU file.txt\0 D .fix-evidence.md\0' : ' D .fix-evidence.md\0';
+      if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
+      if (args.includes('--index-info')) removals.push(opts.input);
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files') && added) return `100644 ${'c'.repeat(40)} 0\tfile.txt\0`;
+      if (args.includes('cat-file')) return 'resolved\n';
+      if (args.includes('commit') || args.includes('--abort')) inMerge = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli(merging ? [...argv, '--merge-onto=main'] : argv, { ...m.io, run, stageEntry,
+      fileExists: path => path.endsWith('MERGE_HEAD') ? inMerge : true, readFile: () => 'resolved\n' });
+    expect(out.code).toBe(0);
+    expect(removals).toEqual([`0 ${'0'.repeat(3)}\t.fix-evidence.md\0`]);
+    expect(stageEntry).not.toHaveBeenCalledWith('/lanes/lane-5', '.fix-evidence.md');
+    expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+    expect(m.calls.filter(c => c.includes('add')).flat()).not.toContain('.fix-evidence.md');
   });
   it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);

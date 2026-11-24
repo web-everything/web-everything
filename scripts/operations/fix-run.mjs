@@ -189,9 +189,9 @@ export class LeaseLostError extends LauncherError {}
 
 const SCRATCH_RE = /^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/;
 
-// The fixer's lane-root evidence file stays on disk (read after the run) but is never committed: web-everything
-// gitignores it, frontierui and plateau-app do not, so the launcher refuses to stage it in any repo.
-const isStageable = (p) => !!p && p !== '.fix-evidence.md' && !SCRATCH_RE.test(basename(p));
+// The fixer's lane-root evidence stays on disk for the later read. Only its removal may enter the index;
+// sibling repos do not all gitignore it, so additions and modifications must be refused in every repo.
+const isStageable = (p, removal = false) => !!p && (p !== '.fix-evidence.md' || removal) && !SCRATCH_RE.test(basename(p));
 
 /**
  * PURE. Paths a conflicted merge still needs `git add` for: unmerged rows plus anything whose WORKTREE column differs
@@ -206,9 +206,10 @@ export function unstagedPaths(porcelain) {
     if (!row) continue;
     const code = row.slice(0, 2);
     if (/[RC]/.test(code[0])) i++; // the rename/copy source is never staged on its own
-    if (code[1] !== ' ' || UNMERGED_CODES.has(code)) paths.push(row.slice(3));
+    const path = row.slice(3);
+    if ((code[1] !== ' ' || UNMERGED_CODES.has(code)) && isStageable(path, code[1] === 'D')) paths.push(path);
   }
-  return [...new Set(paths.filter(isStageable))];
+  return [...new Set(paths)];
 }
 
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
@@ -218,10 +219,15 @@ export function changedPaths(porcelain) {
   for (let i = 0; i < records.length; i++) {
     const row = records[i];
     if (!row) continue;
-    paths.push(row.slice(3));
-    if (/[RC]/.test(row.slice(0, 2))) paths.push(records[++i]);
+    const code = row.slice(0, 2);
+    const path = row.slice(3);
+    if (isStageable(path, code[1] === 'D' || code === 'D ')) paths.push(path);
+    if (/[RC]/.test(code)) {
+      const source = records[++i];
+      if (isStageable(source, code.includes('R'))) paths.push(source);
+    }
   }
-  return [...new Set(paths.filter(isStageable))];
+  return [...new Set(paths)];
 }
 
 /** `merge` attribute values that still produce in-file conflict markers (unspecified, set, or the built-in text/union drivers). */
@@ -890,6 +896,9 @@ export async function runFixCli(argv = [], {
         const files = [], links = [], removed = [], refused = [];
         let total = 0;
         for (const path of paths) {
+          // Evidence paths reach here only for removal. Do not read a copy recreated after status (or its rename):
+          // the index must lose the old blob even while the new evidence remains on disk for the later read.
+          if (path === '.fix-evidence.md') { removed.push(path); continue; }
           const dest = resolve(copy, path);
           const e = dest.startsWith(copy + sep) ? stageEntry(lanePath, path) : null;
           if (!e) refused.push(path);
@@ -1132,7 +1141,7 @@ export async function runFixCli(argv = [], {
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);
-      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])].filter(isStageable);
+      const stage = [...new Set([...unmerged.filter(path => isStageable(path)), ...unstagedPaths(statusAfterAgent)])];
       stageLaneFiles(stage);
       // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
