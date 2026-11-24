@@ -381,3 +381,79 @@ describe('rearm-review on an UNRESOLVED stand-down goes through the same guard w
     expect(decideEmptyFixRound({ comments: [fixBegin, stop, posted], liveHead: 'b'.repeat(40) }).empty).toBe(false);
   });
 });
+
+
+describe('explicit no-code-owed ceremony', () => {
+  const HEAD = 'b'.repeat(40);
+  const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin');
+  const rearm = (standDownId) => trusted(buildOperatorAnswer({ ...record, standDownId, disposition: 'rearm-review' }));
+  const comments = [begin, stop, rearm(stop.id), begin, { ...stop, id: 'IC_second' }, rearm('IC_second'),
+    begin, { ...stop, id: 'IC_third' }];
+  const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
+  const mock = (labels) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments, labels }) : 'posted');
+
+  it('refuses noCodeOwed without rearm-review or with a non-boolean value', () => {
+    for (const noCodeOwed of [true, false, 'true', null]) {
+      expect(() => buildOperatorAnswer({ ...record, noCodeOwed })).toThrow('noCodeOwed');
+    }
+    expect(() => buildOperatorAnswer({ ...record, disposition: 'close-superseded', noCodeOwed: true })).toThrow('noCodeOwed');
+    expect(() => buildOperatorAnswer({ ...record, disposition: 'rearm-review', noCodeOwed: 'true' })).toThrow('noCodeOwed');
+  });
+  it('rejects invalid, valued, duplicate, and unknown CLI flags before IO', () => {
+    for (const flags of [['--no-code-owed'], ['--disposition=close-superseded', '--no-code-owed'],
+      ['--disposition=rearm-review', '--no-code-owed=true'],
+      ['--disposition=rearm-review', '--no-code-owed', '--no-code-owed'], ['--unknown']]) {
+      const gh = vi.fn();
+      expect(() => runStandDownAnswer([...argv, ...flags], { gh })).toThrow();
+      expect(gh).not.toHaveBeenCalled();
+    }
+  });
+  it('refuses no-code-owed while red-team:blocked stands without writing', () => {
+    const gh = mock([{ name: 'red-team:blocked' }]);
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review --no-code-owed refused: red-team:blocked stands, a fix is owed');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([undefined, null, [{}]])('refuses no-code-owed with incomplete labels (%j)', labels => {
+    const gh = mock(labels);
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('labels');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('plain rearm still refuses the cap-blocked stand-down', () => {
+    const gh = mock([]);
+    expect(() => runStandDownAnswer(args.slice(0, -1), { gh })).toThrow('guard would ignore');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('no-code-owed still refuses a stand-down outside the guard window', () => {
+    const gh = vi.fn(() => JSON.stringify({ comments: [stop], labels: [] }));
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('guard would ignore');
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it.each([false, true])('round-trips noCodeOwed exactly (%s) and authenticates the body', noCodeOwed => {
+    const rec = { ...record, disposition: 'rearm-review', noCodeOwed };
+    const body = buildOperatorAnswer(rec);
+    expect(parseOperatorAnswer(trusted(body))).toEqual(rec);
+    expect(body).toContain(`**No code owed:** \`${noCodeOwed}\``);
+    expect(parseOperatorAnswer(trusted(body.replace('**No code owed:**', '**Changed:**')))).toBeNull();
+  });
+  it.each([undefined, 'rearm-review'])('supersedes a prior cap-ignored answer (%s) once', disposition => {
+    const prior = trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_third',
+      ...(disposition ? { disposition } : {}) }), 'IC_prior');
+    const snapshot = { comments: [...comments, prior].map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' })),
+      labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
+      commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
+    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    expect(runStandDownAnswer(args, { gh })).toBe('posted');
+    const posted = trusted(gh.mock.calls[1][0].at(-1));
+    expect(parseOperatorAnswer(posted)).toMatchObject({ noCodeOwed: true, supersedes: 'IC_prior' });
+    snapshot.comments.push(posted, begin);
+    expect(decideEmptyFixRound({ comments: snapshot.comments.slice(0, -1), liveHead: HEAD }).empty).toBe(false);
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('no unresolved');
+  });
+  it('posts the explicit ruling for the latest cap-blocked stand-down and the guard accepts it', () => {
+    const gh = mock([]);
+    expect(runStandDownAnswer(args, { gh })).toBe('posted');
+    const posted = trusted(gh.mock.calls[1][0].at(-1));
+    expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: 'IC_third', noCodeOwed: true });
+    expect(decideEmptyFixRound({ comments: [...comments, posted], liveHead: HEAD }).empty).toBe(false);
+  });
+});

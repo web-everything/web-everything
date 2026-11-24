@@ -10,7 +10,7 @@ import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, is
  * deadlocked the PR). Requires `status:answered-waiting-fixer` AND an unchanged head (no commit newer than the
  * stand-down). Fails closed on a missing label, id, or unreadable date. Returns {target, supersedes} or null.
  */
-function answeredStandDownToRearm(snapshot) {
+function answeredStandDownToRearm(snapshot, noCodeOwed) {
   const { comments, labels, commits } = snapshot;
   if (!Array.isArray(labels) || !labels.some((l) => l?.name === 'status:answered-waiting-fixer')) return null;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
@@ -18,14 +18,14 @@ function answeredStandDownToRearm(snapshot) {
     if (!isTerminalStandDown(c)) continue;
     // The guard (rearm-review.mjs#rearmWindow) honours only ITS window's latest stand-down: any other target is refused.
     const win = rearmWindow(comments);
-    if (win.rearmed || String(c.id) !== win.standDownId) return null; // only the latest unanswered rearm target
+    if ((win.rearmed && !(noCodeOwed && win.capBlocked)) || String(c.id) !== win.standDownId) return null; // only the latest unanswered rearm target
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
       if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins
     }
     if (!c.id || !prior) return null;
-    // Replay guard: a rearm-review answer already stands for this stand-down; never post a second.
-    if (parseOperatorAnswer(prior).disposition === 'rearm-review') return null;
+    // Replay guard: only a cap-ignored answer may be replaced by an explicit no-code ruling.
+    if (parseOperatorAnswer(prior).disposition === 'rearm-review' && !(noCodeOwed && win.capBlocked)) return null;
     // Same head: SHA identity when the stand-down names its head; else the head's commit must not post-date it
     // (and the last listed commit must be the live head).
     const named = /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1]; // the TRAILER only
@@ -48,6 +48,10 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   if (!/^[1-9]\d*$/.test(pr ?? '')) throw new Error('PR must be a positive integer');
   const flags = {};
   for (const arg of args) {
+    if (arg === '--no-code-owed' && !Object.hasOwn(flags, 'noCodeOwed')) {
+      flags.noCodeOwed = true;
+      continue;
+    }
     const m = arg.match(/^--(repo|reason|actor|channel|disposition)=([\s\S]*)$/);
     if (!m || Object.hasOwn(flags, m[1])) throw new Error(`unknown or duplicate argument: ${arg}`);
     flags[m[1]] = m[2];
@@ -64,14 +68,22 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   } catch (error) {
     throw new Error(`Could not read comments for ${flags.repo} PR #${pr}: ${String(error.message || error).split(/[\r\n]/)[0]}`);
   }
+  if (flags.noCodeOwed) {
+    if (!Array.isArray(snapshot.labels) || snapshot.labels.some(l => typeof l?.name !== 'string')) {
+      throw new Error('rearm-review --no-code-owed refused: PR labels were not returned completely');
+    }
+    if (snapshot.labels.some(l => l.name === 'red-team:blocked')) {
+      throw new Error('rearm-review --no-code-owed refused: red-team:blocked stands, a fix is owed');
+    }
+  }
   let target = latestUnresolvedStandDown(snapshot.comments);
   let supersedes;
-  if (!target && flags.disposition === 'rearm-review') ({ target, supersedes } = answeredStandDownToRearm(snapshot) ?? {});
+  if (!target && flags.disposition === 'rearm-review') ({ target, supersedes } = answeredStandDownToRearm(snapshot, flags.noCodeOwed) ?? {});
   if (!target) throw new Error('no unresolved stand-down on this PR');
   if (flags.disposition === 'rearm-review' && !supersedes) {
     // Every rearm-review answer is checked by the guard's own window (rearm-review.mjs#rearmWindow): refuse what it would ignore.
     const win = rearmWindow(snapshot.comments);
-    if (win.rearmed || String(target.id) !== win.standDownId) {
+    if ((win.rearmed && !(flags.noCodeOwed && win.capBlocked)) || String(target.id) !== win.standDownId) {
       throw new Error('rearm-review refused: the guard would ignore it (stand-down is outside the guard window, or a rearm-review already stands)');
     }
   }

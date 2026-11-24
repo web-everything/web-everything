@@ -29,6 +29,12 @@ Each stand-down can be rearmed only once, and a stale target cannot clear newer 
 Unrelated or nonexistent targets and other answers do not grant this exception.
 `--disposition=close-superseded` retains its existing close behavior.
 
+The bare `--no-code-owed` flag requires `--disposition=rearm-review` and records an explicit boolean
+ruling in the answer and its visible body. It closes the open fix round as no-change and re-arms review,
+even when two earlier plain rearm waivers exhausted the verdict window's cap. It must name the latest
+stand-down, consumes no waiver, and cannot be replayed to clear later fix claims. The CLI refuses it
+while `red-team:blocked` stands (a security fix is owed), or when labels cannot be read completely.
+
 The predicate in we:scripts/conveyor/stand-down-answer-core.mjs requires a trusted `author.login`, an
 exact versioned record, and a later answer targeting the specific stand-down. A quoted marker, unrelated
 comment ID, outsider's body, or `viewerDidAuthor` alone cannot clear the hold. Other unresolved stand-downs
