@@ -9,6 +9,7 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
@@ -488,7 +489,8 @@ describe('createEnqueueOnEvent', () => {
   });
 
   it('firstStderrErrorLine scans long assignment and JWT near-misses without blocking', () => {
-    const moduleUrl = new URL('../enqueue-on-event.mjs', import.meta.url).href;
+    // The browser test environment exposes an HTTP import.meta.url; the Node child needs a file URL.
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs')).href;
     const script = `import { firstStderrErrorLine } from ${JSON.stringify(moduleUrl)};
       const assignment = 'session'.repeat(100000);
       const jwt = 'eyJabcde-'.repeat(100000);
