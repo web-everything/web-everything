@@ -29,6 +29,42 @@ it('surfaces an ambiguous pending publication on every later probe', async () =>
   await expect(runProbe(f)).rejects.toThrow(/publication.*pending/i);
   expect(f.fileCard).not.toHaveBeenCalled();
 });
+it('keeps an ambiguous publication visible through recovery and a later auth failure', async () => {
+  const f = await fixture();
+  await writeFile(f.statePath, JSON.stringify({ state: 'off', goodStreak: 1, lastProbeAt: 1000,
+    outageId: 'old', cardNeeded: true, cardPending: true, cardFailed: true }));
+  await expect(runProbe(f)).rejects.toThrow(/publication.*pending/i);
+  expect(JSON.parse(await readFile(f.statePath, 'utf8'))).toMatchObject({
+    state: 'on', outageId: 'old', cardNeeded: true, cardPending: true, cardFailed: true,
+  });
+  await expect(runProbe(f)).rejects.toThrow(/publication.*pending/i);
+  f.spawn.mockImplementation(() => { throw new Error('unavailable again'); });
+  await expect(runProbe(f)).rejects.toThrow(/publication.*pending/i);
+  expect(JSON.parse(await readFile(f.statePath, 'utf8'))).toMatchObject({
+    state: 'off', outageId: 'old', cardPending: true, cardFailed: true,
+  });
+  expect(f.fileCard).not.toHaveBeenCalled();
+});
+it.each([
+  { cardPending: false, cardFailed: true },
+  {}, // Historical unfiled outage, before publication metadata existed.
+])('retries an unfiled card through recovery until success: %j', async metadata => {
+  const f = await fixture();
+  await writeFile(f.statePath, JSON.stringify({ state: 'off', goodStreak: 1, lastProbeAt: 1000,
+    outageId: 'old', cardNeeded: true, ...metadata }));
+  f.fileCard.mockRejectedValueOnce(Object.assign(new Error('cannot start'), { publicationFailed: true }));
+  await expect(runProbe(f)).rejects.toThrow('cannot start');
+  expect(JSON.parse(await readFile(f.statePath, 'utf8'))).toMatchObject({
+    state: 'on', outageId: 'old', cardNeeded: true, cardPending: false, cardFailed: true,
+  });
+  expect(await runProbe(f)).toMatchObject({ state: 'on', cardFiled: true, cardNeeded: false });
+  await runProbe(f);
+  expect(f.fileCard).toHaveBeenCalledTimes(2);
+  expect(f.fileCard.mock.calls.map(([card]) => card.outageId)).toEqual(['old', 'old']);
+  f.spawn.mockImplementation(() => { throw new Error('new outage'); });
+  expect(await runProbe(f)).toMatchObject({ state: 'off', outageId: '1000', cardFiled: true });
+  expect(f.fileCard).toHaveBeenCalledTimes(3);
+});
 async function fixture() {
   const dir = await mkdtemp(join(process.env.TMPDIR, 'agy-auth-')); dirs.push(dir);
   const statePath = join(dir, 'state.json'), lockDir = join(dir, 'lock');

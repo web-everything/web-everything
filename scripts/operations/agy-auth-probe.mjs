@@ -81,6 +81,12 @@ export async function runProbe({ spawn = nodeSpawn, statePath = join(homedir(), 
       } catch { stop({}); }
     });
     const record = reduceAuthState(prev, classifyAgyProbe(result), now());
+    // Auth recovery does not resolve an unfiled card. Keep its outage identity
+    // until publication succeeds or an operator reconciles an ambiguous outcome.
+    if (prev?.outageId && !prev?.cardFiled && (prev.cardPending || prev.cardFailed || prev.cardNeeded === true)) {
+      record.outageId = prev.outageId;
+      record.cardNeeded = true;
+    }
     const sameOutage = record.outageId && record.outageId === prev?.outageId;
     record.cardPending = Boolean(sameOutage && prev?.cardPending);
     record.cardFailed = Boolean(sameOutage && prev?.cardFailed);
