@@ -1,0 +1,35 @@
+name: Cache hygiene
+
+# Keeps the Actions cache under its 10 GB limit: deletes older CodeQL overlay
+# databases (keeps the newest per language) and caches of closed PRs.
+# Never deletes npm (node-cache-*) caches. See scripts/ci/prune-actions-caches.mjs.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: cache-hygiene
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prune caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node scripts/ci/prune-actions-caches.mjs --apply
