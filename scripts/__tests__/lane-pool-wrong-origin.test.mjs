@@ -29,6 +29,14 @@ describe('lane-pool wiring', () => {
   it('growth/recovery commands resolve --pool to the pool primary origin', () => {
     expect(src).toMatch(/needsOrigin && poolPrimaryExists/);
   });
+  it('a branch not yet on origin falls back to the pool base, in the probe and in acquire', () => {
+    expect(src).toMatch(/branchOnOrigin \? `origin\/\$\{branch\}` : 'refs\/remotes\/origin\/HEAD'/);
+    expect(src).toMatch(/laneStateSnapshot\(dir, integrationRef\)/);
+  });
+  it('the probe note names its real cause and is not worded as a failure verdict', () => {
+    expect(src).toMatch(/not eligible this scan \(local git probe unreadable: \$\{cause\}\)/);
+    expect(src).not.toMatch(/eligibility probe failed — growth\/recovery blocked; inspect/);
+  });
   it('a wrong-origin lane is never advertised as acquirable', () => {
     expect(src).toMatch(/laneIsWrongOrigin\(repo, dir\)[\s\S]{0,200}wrongOrigin: true/);
   });

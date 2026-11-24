@@ -1199,7 +1199,11 @@ function laneDirtyOrAhead(dir, branch) {
   const porcelain = probe(['status', '--porcelain']);
   const uncommitted = porcelain ? porcelain.split('\n').filter(Boolean).length : 0;
   const dirtyPaths = porcelain ? porcelainPaths(porcelain) : [];
-  const aheadRaw = probe(['rev-list', '--count', `origin/${branch}..HEAD`]);
+  // A branch not yet on origin (a new lane/* target) has no origin/<branch>: measure ahead against the pool's base
+  // (origin/HEAD) instead of failing the probe; the branch is then created from that base on first push.
+  const branchOnOrigin = retryGitProbe(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], dir, git).output !== null;
+  const aheadBase = branchOnOrigin ? `origin/${branch}` : 'refs/remotes/origin/HEAD';
+  const aheadRaw = probe(['rev-list', '--count', `${aheadBase}..HEAD`]);
   const ahead = aheadRaw !== null && /^\d+$/.test(aheadRaw) && Number.isSafeInteger(Number(aheadRaw)) ? Number(aheadRaw) : null;
   // #2452 review — this predicate reports the FACT only ("how many commits ahead of the local origin ref").
   // The Gap-1 relaxation used to live here, which silently changed reset/skip semantics for every caller
@@ -1820,7 +1824,9 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const dirtyOrAhead = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
   if (dirtyOrAhead.probeFailed) {
     laneEligibilityProbeFailed = true;
-    log(`  lane-${n}: eligibility probe failed — growth/recovery blocked; inspect local git status/history, then retry`);
+    // The probe note names its real cause and is a note, not a verdict: a later lane may still be acquired.
+    const cause = (dirtyOrAhead.probeErrors || []).map((p) => `${p.probe}: ${String(p.error || 'no output').split('\n')[0].slice(0, 160)}`).join('; ') || 'ahead count unreadable';
+    log(`  lane-${n}: not eligible this scan (local git probe unreadable: ${cause}); another lane may still be acquired`);
   }
   return { lane: n, exists: true, lease, dirtyOrAhead };
 }
@@ -2502,7 +2508,10 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
       // (live 2026-11-01: that line was all the rebuild smoke saw of a hold refusal on lane-33).
       reclaimAhead = ahead > 0;
     }
-    const baseRef = flags.base ? resolveBaseRef(dir, flags.base, chosen) : `origin/${repo.branch}`;
+    // A --branch not yet on origin is created from the pool's base (origin/HEAD) — it has no origin/<branch> yet.
+    const integrationRef = retryGitProbe(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${repo.branch}`], dir, git).output !== null
+      ? `origin/${repo.branch}` : 'refs/remotes/origin/HEAD';
+    const baseRef = flags.base ? resolveBaseRef(dir, flags.base, chosen) : integrationRef;
     // #2419 — `checkout -B <branch> <baseRef>`, NOT `reset --hard <baseRef>`. A bare reset moves whatever
     // branch HEAD happens to be attached to (it does not touch which branch that is), so a lane left
     // attached to a STRAY `lane/*` tip (a leftover from an earlier rebase-drop or a manual checkout — #2419's
@@ -2518,7 +2527,7 @@ function provisionClaimedLane(repo, chosen, targetWasReserved, { beforeDestructi
     // reset on tree cleanliness (unlike `refreshLane`'s explicit `laneDirtyOrAhead` guard) — it must
     // unconditionally reclaim a lane regardless of stray edits left by a prior crashed/interrupted session, so
     // `--force` restores that same never-refuses guarantee `reset --hard` always gave it.
-    const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
+    const before = laneStateSnapshot(dir, integrationRef);
     // xbdixjc — the hold rule, on the fresh pre-reset snapshot. THROWS like the containment re-check above, so
     // auto-pick restores the claim and moves to the next lane; `--force` does not override it.
     const held = laneHoldRefuses(dir, 'reset', { unpushed: before.unpushed ?? undefined });
