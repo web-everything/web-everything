@@ -62,6 +62,23 @@ describe('expected review head admission', () => {
     expect(runReviewJob(options, io)).toMatchObject(refused);
     expect(io.runRedTeam).not.toHaveBeenCalled();
   });
+  it('missing expected head refuses, no verdict written', () => {
+    const { io, options } = fixture();
+    delete options.expectedHead;
+    expect(dispatchReviewJob(options)).toMatchObject({ refused: true, outcome: 'refused-no-expected-head' });
+    expect(options.spawnJob).not.toHaveBeenCalled();
+    expect(io.claim).not.toHaveBeenCalled();
+    expect(io.runRedTeam).not.toHaveBeenCalled();
+  });
+  it('detached CLI without --expected-head refuses before running the job', () => {
+    const runJob = vi.fn(() => ({}));
+    const prior = process.exitCode;
+    try {
+      runReviewJobCli(['run', `--pr=${pr}`, `--repo=${repo}`], { runJob });
+      expect(runJob).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(75);
+    } finally { process.exitCode = prior; }
+  });
   it('detached CLI forwards the expected head into the queued job', () => {
     const runJob = vi.fn(() => ({ refused: true }));
     const prior = process.exitCode;

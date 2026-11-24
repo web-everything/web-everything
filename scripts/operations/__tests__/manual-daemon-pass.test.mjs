@@ -67,8 +67,8 @@ describe('manual-daemon-pass admission and audit', () => {
     expect(liveHead).toHaveBeenCalledWith({ repo: input.repo, pr: input.pr });
     expect(liveHead.mock.invocationCallOrder[0]).toBeLessThan(selected.mock.invocationCallOrder[0]);
     expect(selected).toHaveBeenCalledTimes(1);
-    expect(selected).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env,
-      ...(daemon === 'red-team' ? { redTeamOnly: true, expectedHead: sha } : {}) });
+    expect(selected).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env, expectedHead: sha,
+      ...(daemon === 'red-team' ? { redTeamOnly: true } : {}) });
     expect(daemon === 'red-team' ? dispatchReviewByMode : dispatchReviewJob).not.toHaveBeenCalled();
   });
   it.each(['throws', undefined, null, '', 'not-a-head', 'a'.repeat(39), 'g'.repeat(40)])(
@@ -148,15 +148,63 @@ describe('manual-daemon-pass admission and audit', () => {
       ...(daemon === 'red-team' ? { redTeamOnly: true } : {}) });
     expect(daemon === 'review' ? dispatchReviewJob : dispatchReviewByMode).not.toHaveBeenCalled();
   });
-  it.each(['job', 'session', 'red-team'])('does not comment when the real %s dispatcher refuses a lane checkout', async mode => {
+  it('records the manual job-mode review refusal without an expected head', async () => {
+    const spawnJob = vi.fn(), liveHead = vi.fn(() => sha), readHead = vi.fn(() => sha);
+    const dispatchJob = vi.fn(options => dispatchReviewByMode({ ...options, mode: 'job', spawnJob,
+      io: { liveHead }, stackCheck: () => ({ base: null }) }));
+    const f = fixture({ dispatch: value => dispatchManualPass(value, { env: {}, readHead, load: async () => ({
+      dispatchReviewByMode: dispatchJob,
+    }) }) });
+    const result = await f.run(input);
+    expect(readHead).not.toHaveBeenCalled();
+    expect(dispatchJob).toHaveBeenCalledTimes(1);
+    expect(dispatchJob).toHaveBeenCalledWith({ pr: input.pr, repo: input.repo, env: {} });
+    expect(result).toMatchObject({ status: 'returned', outcome: { refused: true, outcome: 'refused-no-expected-head' } });
+    expect(liveHead).not.toHaveBeenCalled();
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(f.postComment).toHaveBeenCalledTimes(1);
+    expect(f.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ result }));
+    expect(f.appendEvent).toHaveBeenCalledTimes(1);
+  });
+  it('dispatches an operator-pinned manual job-mode review with --expected-head', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'manual-review-head-'));
+    const pinned = { ...input, repo: 'web-everything/web-everything', expectedHead: sha };
+    const spawnJob = vi.fn(() => 4242), liveHead = vi.fn(() => sha), readHead = vi.fn(() => sha);
+    const dispatchJob = vi.fn(options => dispatchReviewByMode({ ...options, mode: 'job', root,
+      dir: join(root, 'jobs'), spawnJob, io: { liveHead }, stackCheck: () => ({ base: null }),
+      checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
+      ciGate: () => ({ allowed: true }), resolveSettingsEnv: () => ({}) }));
+    const f = fixture({ dispatch: value => dispatchManualPass(value, { env: {}, readHead, load: async () => ({
+      dispatchReviewByMode: dispatchJob,
+    }) }) });
+    try {
+      const result = await f.run(pinned);
+      expect(readHead).toHaveBeenCalledTimes(1);
+      expect(readHead).toHaveBeenCalledWith({ repo: pinned.repo, pr: pinned.pr });
+      expect(dispatchJob).toHaveBeenCalledTimes(1);
+      expect(dispatchJob).toHaveBeenCalledWith({ pr: pinned.pr, repo: pinned.repo, env: {}, expectedHead: sha });
+      expect(liveHead).toHaveBeenCalledTimes(1);
+      expect(liveHead).toHaveBeenCalledWith({ repo: pinned.repo, pr: pinned.pr });
+      expect(spawnJob).toHaveBeenCalledTimes(1);
+      expect(spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining([
+        'run', `--pr=${pinned.pr}`, `--repo=${pinned.repo}`, `--expected-head=${sha}`,
+      ]));
+      expect(result).toMatchObject({ status: 'returned', outcome: { mode: 'job', jobPid: 4242 } });
+      expect(f.postComment).toHaveBeenCalledTimes(1);
+      expect(f.appendEvent).toHaveBeenCalledTimes(1);
+      expect(f.appendEvent).toHaveBeenCalledWith(expect.objectContaining({ result }));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+  it.each(['session', 'red-team'])('does not comment when the real %s dispatcher refuses a lane checkout', async mode => {
     const root = join(tmpdir(), 'lane-999999');
-    const f = fixture({ dispatch: value => dispatchManualPass(value, { env: {}, load: async () => ({
-      dispatchReviewJob: options => dispatchReviewJob({ ...options, root }),
+    const f = fixture({ dispatch: value => dispatchManualPass(value, { env: {}, readHead: () => sha, load: async () => ({
+      dispatchReviewJob: options => dispatchReviewJob({ ...options, root, io: { liveHead: () => sha } }),
       dispatchReviewByMode: options => dispatchReviewByMode({ ...options, root, mode,
         stackCheck: () => ({ base: null }) }),
     }) }) });
     await expect(f.run({ ...input, repo: 'web-everything/web-everything',
-      daemon: mode === 'red-team' ? 'red-team' : 'review' })).rejects.toThrow(/refusing to start a delivery agent from the lane checkout/);
+      daemon: mode === 'red-team' ? 'red-team' : 'review',
+      ...(mode === 'red-team' ? { expectedHead: sha } : {}) })).rejects.toThrow(/refusing to start a delivery agent from the lane checkout/);
     expect(f.postComment).not.toHaveBeenCalled();
     expect(f.appendEvent).toHaveBeenCalledTimes(1);
   });

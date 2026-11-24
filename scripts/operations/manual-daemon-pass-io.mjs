@@ -61,9 +61,9 @@ export async function dispatchManualPass(input, { env, load = () => import('./re
     if (head.toLowerCase() !== input.expectedHead.toLowerCase()) {
       throw new Error('manual-daemon-pass: PR head changed; operator must inspect before retrying');
     }
+    options.expectedHead = input.expectedHead;
   }
   return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true,
-    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
     ...(input.redTeamMode === undefined ? {} : { redTeamMode: input.redTeamMode }) }) : dispatchReviewByMode(options);
 }
 

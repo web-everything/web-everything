@@ -24,6 +24,7 @@ vi.mock('../../lib/atomic-json-file.mjs', async importOriginal => {
 });
 
 const repo = 'web-everything/web-everything', head = 'a'.repeat(40), pr = 5762;
+const headFixture = () => ({ expectedHead: head, io: { liveHead: () => head } });
 const payload = () => ({ verdict: { verdict: 'accept' }, findings: { read: { netBasis: { rev: head } } } });
 
 // Migrate legacy normalized fixtures to raw witnesses; the production reader is exercised below
@@ -141,7 +142,7 @@ describe('review-job CLI --red-team-only', () => {
       process.stdout.write(JSON.stringify({ ratings }) + '\\n');
     `;
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,
-      'run', '--pr=5762', `--repo=${repo}`, ...flags], {
+      'run', `--expected-head=${head}`, '--pr=5762', `--repo=${repo}`, ...flags], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
     });
     const [result, { ratings }] = output.trim().split('\n').map(line => JSON.parse(line));
@@ -162,15 +163,16 @@ describe('review-job CLI --red-team-only', () => {
       runReviewJobCli(process.argv.slice(1), { runJob: options => options });
     `;
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', source,
-      'run', '--pr=5762', '--repo=web-everything/web-everything', '--prefer-lane=7', ...flags], {
+      'run', `--expected-head=${head}`, '--pr=5762', '--repo=web-everything/web-everything', '--prefer-lane=7', ...flags], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, env: { PATH: '' },
     });
-    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode });
+    expect(JSON.parse(output)).toEqual({ pr: '5762', repo, preferLane: 7, redTeamOnly, redTeamMode, expectedHead: head });
   });
 });
 
 function fakeIo(over = {}) {
   return { root: '/daemon', now: () => 1_000, newActorId: () => 'actor',
+    liveHead: () => head,
     readPrevCompletion: () => null, claim: vi.fn(() => ({ ok: true })),
     updateRecord: vi.fn(), unclaim: vi.fn(), acquireLane: vi.fn(() => ({ lanePath: '/lanes/lane-7' })),
     releaseLane: vi.fn(), log: vi.fn(), report: vi.fn(), runLoop: vi.fn(), runExtraSeats: vi.fn(),
@@ -1487,7 +1489,7 @@ describe('accepted head-move full review dispatch', () => {
         readEvidence: () => ({ inFlight: false, recorded: false, seatRecorded: false }), readStatus: () => null,
         setting: { enabled: true, retryCooldownMin: 30 }, lastDispatch: new Map(),
         capacity: { lanes: 1, budget: { left: 1 } },
-        dispatch: options => dispatchReviewJob({ ...options, root: '/daemon', dir,
+        dispatch: options => dispatchReviewJob({ ...options, ...headFixture(), root: '/daemon', dir,
           checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
           resolveSettingsEnv: () => ({}), ciGate: () => ({ allowed: true }), spawnJob }),
       });
@@ -1504,7 +1506,7 @@ describe('accepted head-move full review dispatch', () => {
 describe('red-team-only dispatch', () => {
   function withDispatch(run) {
     const dir = mkdtempSync(join(tmpdir(), 'review-red-team-only-'));
-    const options = { pr, repo, redTeamOnly: true, root: '/daemon', dir,
+    const options = { ...headFixture(), pr, repo, redTeamOnly: true, root: '/daemon', dir,
       checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
       resolveSettingsEnv: () => ({}), ciGate: vi.fn(() => ({ allowed: false })), spawnJob: vi.fn(() => 4242) };
     try { run(options); } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1512,7 +1514,7 @@ describe('red-team-only dispatch', () => {
   it.each(['fresh', 'resume'])('passes --red-team-only=%s and preferred lane, skipping CI admission', redTeamMode => withDispatch(options => {
     const out = dispatchReviewJob({ ...options, redTeamMode, preferLane: 7 });
     expect(out.jobPid).toBe(4242); expect(options.ciGate).not.toHaveBeenCalled();
-    expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7']));
+    expect(options.spawnJob.mock.calls[0][0].argv).toEqual(expect.arrayContaining(['run', `--pr=${pr}`, `--repo=${repo}`, `--red-team-only=${redTeamMode}`, '--prefer-lane=7', `--expected-head=${head}`]));
   }));
   it('still skips live-job with the same slug and record', () => withDispatch(options => {
     writeJobRecord({ slug: `review-${pr}`, pr, repo, pid: 99, cwd: '/daemon', startedAt: new Date().toISOString() }, options.dir);

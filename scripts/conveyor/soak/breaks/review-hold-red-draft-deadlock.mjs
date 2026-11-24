@@ -80,6 +80,7 @@ export default {
       for (const mode of ['session', 'job']) {
         let spawns = 0;
         const result = dispatchReviewByMode({ mode, pr: pr.number, repo, root: '/daemon', dir,
+          expectedHead: HEAD, io: { liveHead: () => HEAD },
           env: { WE_REVIEW_START_AFTER: 'fast-checks' },
           advisoryCiWaiver: review?.advisoryReview?.ciWaived === true ? { head: review.advisoryReview.head, reason: review.advisoryReview.reason } : null,
           ciGate: args => readReviewCiGate({ ...args, readHead: () => HEAD,

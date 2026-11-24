@@ -184,7 +184,7 @@ export default {
       let status = null, calls = 0, gateCalls = 0, capReset = false, fetchReady = false, headAvailable = false, job;
       const capHistory = new Map();
       const io = {
-        root: sourceRoot, now: () => at, newActorId: () => 'soak-cap',
+        liveHead: () => head, root: sourceRoot, now: () => at, newActorId: () => 'soak-cap',
         readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: () => {},
         unclaim: () => {}, acquireLane: () => ({ lanePath: sourceRoot }), releaseLane: () => {}, log: () => {},
         readRedTeamOnlyPayload: () => ({ head, loopPayload: cappedPayload }),
