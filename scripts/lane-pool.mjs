@@ -78,6 +78,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  * `release --lane=N --release-reserved`. (NOTE: this script only PROVISIONS the reserved lane; the live repoint
  * of the machine-global `~/.claude/…/memory` symlink at it is the SUPERVISED, human-gated half of #2350.)
  */
+import { originsDiffer } from './lib/lane-pool-origin.mjs';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, lstatSync, statSync, renameSync, readdirSync, linkSync, realpathSync, openSync, closeSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createLaneDepsRuntime, ensureLaneDeps, depsReady as laneDepsReady, resolvePnpmStoreDir } from './lib/lane-deps-installer.mjs';
@@ -469,7 +470,10 @@ function resolveRepo(repoFlags = flags) {
   // --pool changes the target, not the authority for its remote. Resolve that
   // primary before any recovery caller can reuse the caller checkout's origin.
   // Explicit --origin / --reference remain authoritative, even when unresolved.
-  if ((cmd === 'gc' || cmd === 'release') && explicitPool && !repoFlags.origin && !repoFlags.reference
+  // LANE-POOL-WRONG-REPO: growth/recovery commands (acquire/provision/refresh/...) must ALSO take the pool's own
+  // primary origin, never the caller checkout's — else `--pool=plateau-app` run from web-everything cloned WE.
+  const poolPrimaryExists = explicitPool && existsSync(join(dirname(topLevel), explicitPool, '.git'));
+  if (((cmd === 'gc' || cmd === 'release') || (needsOrigin && poolPrimaryExists)) && explicitPool && !repoFlags.origin && !repoFlags.reference
     && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
     const selectedRepo = resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
     // Origin authority comes from the selected primary; release still cleans the caller's registry.
@@ -1774,6 +1778,10 @@ function laneStatus(repo, n, { leasedOnly = false, statusCache = null } = {}) {
 // dirtyOrAhead shape in lane-lease.test.mjs) — and it is where the cost was: on the real pool most lanes are
 // leased, yet every scan ran `status --porcelain` + `rev-list` (+ a second porcelain for litter) in each one.
 // `nowMs`/`ttlMs` must be the SAME values the caller hands `isLaneAcquirable`, so both reads agree on staleness.
+function laneIsWrongOrigin(repo, dir) {
+  const actual = tryGit(['remote', 'get-url', 'origin'], dir, { timeout: LOCAL_GIT_TIMEOUT_MS });
+  return originsDiffer(actual, repo.originUrl);
+}
 let laneEligibilityProbeFailed = false; // Sticky: local inspection failure never proves capacity exhaustion.
 function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), ttlMs = ttlMsFromFlags()) {
   const dir = laneDir(repo, n);
@@ -1786,6 +1794,11 @@ function laneAcquirableInfo(repo, n, remoteShasBox = null, nowMs = Date.now(), t
   const lease = readLease(dir);
   // A history-quarantined lane is never acquirable (acquire would refuse it), so it must not be advertised either.
   if (isHistoryQuarantined(repo, n)) return { lane: n, exists: false, quarantined: true };
+  // LANE-POOL-WRONG-REPO: a lane whose origin is not the pool's configured origin is never handed out.
+  if (laneIsWrongOrigin(repo, dir)) {
+    log(`  lane-${n}: wrong-origin (lane origin differs from pool origin) — never handed out; remove and re-provision it`);
+    return { lane: n, exists: false, wrongOrigin: true };
+  }
   if (leaseDisqualifiesAcquire(lease, nowMs, ttlMs)) return { lane: n, exists: true, lease, dirtyOrAhead: null };
   const getRemoteShas = () => {
     if (!remoteShasBox) return new Set();
