@@ -14,6 +14,11 @@ import { alertsFilePath } from '../daemon-rebuild/state.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
+// Like daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs, these cases run real Git fixtures and
+// candidate worktrees; boot failures also exercise the plain-main and last-good controls. CI shard 9 timed
+// out the boot-failure case at Vitest's default 5s. Keep a finite hang guard without depending on host speed.
+vi.setConfig({ testTimeout: 60_000 });
+
 const tempDirs = [];
 function mktemp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
