@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { resolveHumanReviewSurfaces } from '../../lib/human-review-surfaces.mjs';
 import * as judgeSweepFacts from '../judge-sweep-facts.mjs';
 import * as judgeSweepFactsIo from '../judge-sweep-facts-io.mjs';
@@ -281,6 +283,8 @@ describe('stall threshold policy cascade (injected IO only)', () => {
 });
 
 describe('next responsible owner from existing facts', () => {
+  const expectNoConflictOwner = (derive, mergeable) =>
+    expect(derive(facts({ mergeable, isDraft: false }))).toMatchObject({ nextOwner: 'nobody' });
   const ownerCases = [
     ['fixer', { fixerRunning: true }],
     ...['status:answered-waiting-fixer', 'review:changes'].flatMap(label => [
@@ -305,8 +309,8 @@ describe('next responsible owner from existing facts', () => {
     ['orchestrator', { labels: ['status:needs-human'] }],
     ['orchestrator', { labels: ['review-status:needs-human'] }],
     ['nobody', {}],
-    ['nobody', { mergeable: 'UNKNOWN' }],
-    ['nobody', { mergeable: 'MERGEABLE' }],
+    ['nobody', { mergeable: 'UNKNOWN', isDraft: false }],
+    ['nobody', { mergeable: 'MERGEABLE', isDraft: false }],
     ['fixer', { mergeable: 'CONFLICTING', isDraft: false }],
     ['fixer', { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: true }],
     // The conflict branch is the empty-owner fallback only: every existing guard keeps its precedence.
@@ -336,9 +340,37 @@ describe('next responsible owner from existing facts', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', isDraft: false, fixerRunning: false })))
       .toEqual({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
   });
+  it.each(['UNKNOWN', 'MERGEABLE', null, undefined])('non-conflicting non-draft PRs do not acquire a fixer owner (%s)', mergeable => {
+    expectNoConflictOwner(judgeSweepFacts.deriveNextOwner, mergeable);
+  });
+  it('the non-conflicting non-draft owner cases kill removal of the explicit CONFLICTING comparison', () => {
+    const source = readFileSync(new URL('../judge-sweep-facts.mjs', import.meta.url), 'utf8');
+    // Evaluate only the pure classification functions; the working tree is never mutated.
+    const start = source.indexOf('export const STALL_DEFAULTS');
+    const end = source.indexOf('export function needsJudgment');
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const classification = source.slice(start, end).replace(/^export /gm, '');
+    const comparison = "pr.mergeable === 'CONFLICTING' && ";
+    expect(classification.split(comparison)).toHaveLength(2);
+    const mutant = runInNewContext(`${classification.replace(comparison, '')}\nderiveNextOwner;`, {}, { timeout: 1000 });
+    for (const mergeable of ['UNKNOWN', 'MERGEABLE']) {
+      expect(() => expectNoConflictOwner(mutant, mergeable)).toThrowError(/nextOwner/);
+    }
+  });
+  it.each(['status:answered-waiting-fixer', 'review:changes'].flatMap(label => [0, 45, 120].map(minutesSinceFixDispatch =>
+    [label, minutesSinceFixDispatch])))('a conflicting PR with recent %s dispatch (%s minutes) does not trigger the unowned guard',
+    (label, minutesSinceFixDispatch) => {
+      const input = facts({ mergeable: 'CONFLICTING', isDraft: false, fixerRunning: false, owner: null,
+        labels: [label], minutesSinceFixDispatch, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 });
+      const thresholds = { waitingFixerMinutes: 120, unownedMinutes: 45 };
+      expect(buildJudgeSweepBundle({ prs: [input], thresholds }).prs[0])
+        .toMatchObject({ needsJudgment: false, nextOwner: 'fixer', nextStep: 'Complete the dispatched repair.' });
+    });
   it('a conflicting PR with no fixer still escalates when unattended past the unowned age', () => {
     const stale = { mergeable: 'CONFLICTING', isDraft: false, fixerRunning: false, owner: null, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
-    expect(judgeSweepFacts.needsJudgment(facts(stale))).toMatchObject({ needsJudgment: true });
+    expect(judgeSweepFacts.needsJudgment(facts(stale)))
+      .toMatchObject({ needsJudgment: true, reason: expect.stringMatching(/^unowned:/) });
     expect(judgeSweepFacts.needsJudgment(facts({ ...stale, fixerRunning: true }))).toMatchObject({ needsJudgment: false });
   });
   it('keeps a running fixer responsible for a needs-human PR', () => {

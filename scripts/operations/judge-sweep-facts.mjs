@@ -59,7 +59,7 @@ function existingJudgment(pr, thresholds = STALL_DEFAULTS) {
 const ownerAge = pr => Number.isFinite(pr.minutesSinceFixLoop) ? pr.minutesSinceFixLoop : pr.minutesSinceUpdate;
 
 /** Responsibility is independent of stall classification: an absent dispatch has no active fixer. */
-export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
+function deriveResponsibility(pr, thresholds) {
   const judgment = existingJudgment(pr, thresholds);
   const labels = Array.isArray(pr.labels) ? pr.labels : [];
   const result = (nextOwner, nextStep) => ({ nextOwner, nextStep });
@@ -88,19 +88,25 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
   }
   // Empty-owner fallback only, after every guard above. Only an explicit CONFLICTING on a known non-draft PR counts.
   if (pr.mergeable === 'CONFLICTING' && pr.isDraft === false && !labels.includes('hold:fix')) {
-    return result('fixer', 'Resolve the conflict.');
+    return { ...result('fixer', 'Resolve the conflict.'), conflictFallback: true };
   }
   return result('nobody', 'Inspect the PR and assign its next responsible worker.');
+}
+
+export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
+  const { nextOwner, nextStep } = deriveResponsibility(pr, thresholds);
+  return { nextOwner, nextStep };
 }
 
 export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
   const judgment = existingJudgment(pr, thresholds);
   if (judgment.reason === 'waiting on review' && !pr.owner && !pr.inCi
-    && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)
-    && (['nobody', 'orchestrator'].includes(deriveNextOwner(pr, thresholds).nextOwner)
-      // The conflict fallback names a fixer that may never have been dispatched: keep the stall guard.
-      || (pr.mergeable === 'CONFLICTING' && deriveNextOwner(pr, thresholds).nextOwner === 'fixer' && !pr.fixerRunning))) {
-    return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
+    && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)) {
+    const responsibility = deriveResponsibility(pr, thresholds);
+    // Only the conflict fallback may name a fixer that was never dispatched.
+    if (['nobody', 'orchestrator'].includes(responsibility.nextOwner) || responsibility.conflictFallback) {
+      return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
+    }
   }
   return judgment;
 }

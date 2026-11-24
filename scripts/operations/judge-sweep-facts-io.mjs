@@ -265,7 +265,10 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
       const evidenceErrors = [...errors];
-      if (!['MERGEABLE', 'CONFLICTING'].includes(p.mergeable)) evidenceErrors.push('merge state unavailable; inspect PR mergeability');
+      // GitHub may still be computing mergeability; only malformed states are evidence errors.
+      if (p.mergeable != null && !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable)) {
+        evidenceErrors.push('merge state unavailable; inspect PR mergeability');
+      }
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
       const round = errors.includes('verdict ledger unreadable') ? null
