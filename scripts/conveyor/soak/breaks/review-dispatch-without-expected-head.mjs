@@ -6,7 +6,9 @@
  * SCENARIO (real modules from `sourceRoot`, injected spawn/io, no gh):
  *   A. `dispatchReviewJob` with NO expectedHead must refuse and spawn nothing;
  *   B. `dispatchReviewJob` with the matching head must spawn;
- *   C. the review daemon's tick must hand `expectedHead` (the planned head) to its dispatcher.
+ *   C. the review daemon's tick must hand `expectedHead` (the planned head) to its dispatcher;
+ *   D. the conveyor runner must carry its planned head through CLI argv into job admission;
+ *   E. the manual-pass CLI declaration must project the operator's pin into its effect payload.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -23,7 +25,11 @@ const src = process.env.SOAK_SOURCE_ROOT;
 const head = 'd'.repeat(40);
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/review-daemon.mjs')).href);
-const out = { noHead: null, withHead: null, daemonHead: null };
+const runner = await import(pathToFileURL(join(src, 'skills-src/conveyor/runner.mjs')).href);
+const manual = await import(pathToFileURL(join(src, 'scripts/operations/manual-daemon-pass.mjs')).href);
+const { parseOperationArgv } = await import(pathToFileURL(join(src, 'scripts/operations/cli-adapter.mjs')).href);
+const { projectReads } = await import(pathToFileURL(join(src, 'scripts/operations/engine.mjs')).href);
+const out = { noHead: null, withHead: null, daemonHead: null, runner: null, manual: null };
 const SLUG = ['web-everything', 'web-everything'].join('/'); // built so the repo-literal scan sees no slug
 const base = { pr: 77, repo: SLUG, root: process.env.SOAK_ROOT, dir: process.env.SOAK_JOBS,
   ciGate: () => ({ allowed: true, headSha: head }), readCompletion: () => null, resolveSettingsEnv: () => null,
@@ -44,6 +50,36 @@ try {
     holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [], acquirableLanes: () => 40 });
 } catch (e) { seen = 'threw: ' + String(e.message).split('\\n')[0]; }
 out.daemonHead = seen;
+try {
+  await runner.makeCliMechanicalPasses({ scriptsDir: join(src, 'scripts'), repo: SLUG,
+    skipPasses: new Set(runner.MECHANICAL_PASS_NAMES.filter(name => name !== 'reconcile-pass')),
+    runPass: async ({ entry }) => {
+      if (entry.script.endsWith('reconcile-pass.mjs')) return { code: 0, output: JSON.stringify({
+        dispatch: [{ kind: 'review', prNumber: 77, headRefOid: head }], refusals: [] }) };
+      if (entry.script.endsWith('review-dispatch.mjs')) {
+        const flag = name => entry.args.find(arg => arg.startsWith('--' + name + '='))?.slice(name.length + 3);
+        let spawned = false;
+        const r = job.dispatchReviewJob({ ...base, pr: Number(flag('pr')), repo: flag('repo'),
+          dir: join(process.env.SOAK_JOBS, 'runner'), expectedHead: flag('expected-head'), io,
+          spawnJob: () => { spawned = true; return 4243; } });
+        out.runner = { expectedHead: flag('expected-head') ?? null, spawned, jobPid: r.jobPid ?? null };
+        return { code: r.refused ? 75 : 0, output: '' };
+      }
+      return { code: 0, output: '' };
+    } })();
+} catch (e) { out.runner = { threw: String(e.message).split('\\n')[0] }; }
+try {
+  const declaration = manual.manualDaemonPassOperation();
+  const parsed = parseOperationArgv(declaration, ['--daemon=review', '--pr=77', '--repo=' + SLUG,
+    '--reason=retry', '--expected-head=' + head]);
+  if (parsed.errors.length) out.manual = { errors: parsed.errors };
+  else {
+    const plan = declaration.steps.find(row => row.name === 'plan').step;
+    const verdict = plan.fn(projectReads({ input: parsed.input }, plan.reads));
+    const run = declaration.steps.find(row => row.name === 'run').step;
+    out.manual = run.effects(projectReads({ verdict }, run.reads))[0].payload.expectedHead ?? null;
+  }
+} catch (e) { out.manual = { threw: String(e.message).split('\\n')[0] }; }
 process.stdout.write(JSON.stringify(out));
 `;
 
@@ -86,6 +122,12 @@ export default {
       }
       if (out.daemonHead !== 'd'.repeat(40)) {
         violations.push({ invariant: 'daemon-passes-planned-head', detail: `the review daemon's dispatch did not pass the planned head: ${JSON.stringify(out.daemonHead)}` });
+      }
+      if (out.runner?.expectedHead !== 'd'.repeat(40) || out.runner?.jobPid !== 4243 || !out.runner?.spawned) {
+        violations.push({ invariant: 'runner-passes-planned-head', detail: `the runner's planned review did not reach job admission: ${JSON.stringify(out.runner)}` });
+      }
+      if (out.manual !== 'd'.repeat(40)) {
+        violations.push({ invariant: 'manual-cli-projects-expected-head', detail: `the manual CLI did not project its pinned head: ${JSON.stringify(out.manual)}` });
       }
       return { violations };
     } finally {

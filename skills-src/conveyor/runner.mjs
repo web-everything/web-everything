@@ -469,7 +469,9 @@ export function makeCliMechanicalPasses({
               const ciHeals = (plan.dispatch ?? []).filter((d) => d?.kind === 'ci-heal');
               const unsupported = [];
               for (const d of reviews) {
-                const dispatched = await runRepo('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`], key, slug);
+                const expectedHead = d.headRefOid ?? d.headSha ?? d.head;
+                const dispatched = await runRepo('operations/review-dispatch.mjs', [`--pr=${d.prNumber}`,
+                  ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`])], key, slug);
                 if (!dispatched.ok) {
                   const why = String(dispatched.error.stderr || dispatched.error.message || dispatched.error).trim().replace(/\s+/g, ' ');
                   if (key !== 'we' && why.includes('unsupported-repo')) {

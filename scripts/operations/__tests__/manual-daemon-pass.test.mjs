@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { manualDaemonPassOperation, validateManualPass, MANUAL_DAEMON_PASS_EFFECT } from '../manual-daemon-pass.mjs';
 import { createManualDaemonPassSinks, writeManualPassEvent, readManualDaemonStatus, dispatchManualPass } from '../manual-daemon-pass-io.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
+import { projectReads } from '../engine.mjs';
 import { assertOperatorCliFresh } from '../../lib/main-staleness.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../review-job.mjs';
@@ -40,6 +41,13 @@ describe('manual-daemon-pass arguments', () => {
       expect(parsed.errors).toEqual([]);
       expect(validateManualPass(parsed.input)).toMatchObject({ daemon, 'force-while-healthy': true });
     }
+  });
+  it.each(['review', 'red-team'])('parses a pinned %s head through the generated CLI', daemon => {
+    const parsed = parseOperationArgv(manualDaemonPassOperation(), [
+      ...argv.slice(1), `--daemon=${daemon}`, `--expected-head=${sha}`,
+    ]);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.input['expected-head']).toBe(sha);
   });
 });
 
@@ -169,7 +177,16 @@ describe('manual-daemon-pass admission and audit', () => {
   });
   it('dispatches an operator-pinned manual job-mode review with --expected-head', async () => {
     const root = await mkdtemp(join(tmpdir(), 'manual-review-head-'));
-    const pinned = { ...input, repo: 'web-everything/web-everything', expectedHead: sha };
+    const parsed = parseOperationArgv(manualDaemonPassOperation(), [
+      '--daemon=review', `--pr=${input.pr}`, '--repo=web-everything/web-everything',
+      `--reason=${input.reason}`, `--expected-head=${sha}`,
+    ]);
+    expect(parsed.errors).toEqual([]);
+    const declaration = manualDaemonPassOperation();
+    const plan = declaration.steps.find(row => row.name === 'plan').step;
+    const verdict = plan.fn(projectReads({ input: parsed.input }, plan.reads));
+    const run = declaration.steps.find(row => row.name === 'run').step;
+    const [{ payload: pinned }] = run.effects(projectReads({ verdict }, run.reads));
     const spawnJob = vi.fn(() => 4242), liveHead = vi.fn(() => sha), readHead = vi.fn(() => sha);
     const dispatchJob = vi.fn(options => dispatchReviewByMode({ ...options, mode: 'job', root,
       dir: join(root, 'jobs'), spawnJob, io: { liveHead }, stackCheck: () => ({ base: null }),
