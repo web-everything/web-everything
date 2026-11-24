@@ -760,7 +760,7 @@ const STDERR_LINE_MAX = 200;
 const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
 // Controls, line/paragraph separators, zero-width and bidi format characters (built from escapes so the source stays plain ASCII).
-const UNSAFE_LOG_CHARS = new RegExp('[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\ufeff]', 'g');
+const UNSAFE_LOG_CHARS = new RegExp('[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]', 'g');
 const URL_USERINFO =/:\/\/[^/\s]*@/;
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
