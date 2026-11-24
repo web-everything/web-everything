@@ -27,7 +27,9 @@ export function grantDecision({ budget, held, queuedDemand = {}, class: priority
   const free = budget - held.reduce((n, h) => n + h.size, 0);
   const higher = Object.entries(queuedDemand).filter(([c]) => Number(c) < priority).reduce((n, [, d]) => n + d, 0);
   const available = free - higher + (priority === 1 ? class1Overdraw : 0);
-  if (priority !== 4 && available - size < Math.max(0, builderFloor - used(4))) return result('hold', 'builder floor');
+  // The floor is judged on real free capacity: class-1 overdraw must never be credited against builders.
+  const floorNeed = builderFloor - used(4);
+  if (priority !== 4 && floorNeed > 0 && free - higher - size < floorNeed) return result('hold', 'builder floor');
   return available >= size ? result('grant', 'capacity available') : result('hold', 'capacity or higher-class demand');
 }
 const MAX_SNAPSHOT_AGE_MS = 5 * 60 * 1000;
