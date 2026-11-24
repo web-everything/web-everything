@@ -54,7 +54,10 @@ const jobSetupRuns = {
   'coverage-merge': ['npm ci'],
 };
 const mirroredRuns = {
-  changes: ["FRESH_MAIN_SHA=\"\"\nif [ \"$EVENT_NAME\" = \"merge_group\" ]; then\n  BASE_SHA=\"$MG_BASE_SHA\"\nfi\nif [ \"$BASE_REF\" = \"main\" ]; then\n  if sh scripts/ci/fetch-main-history.sh; then\n    FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=\"\"\n  else\n    echo \"ci-card-only: main fetch failed; full suite\" >&2\n  fi\nfi\nnode scripts/ci-card-only.mjs --event=\"$EVENT_NAME\" --base=\"$BASE_SHA\" --base-ref=\"$BASE_REF\" --fresh-main-sha=\"$FRESH_MAIN_SHA\" --head=HEAD >> \"$GITHUB_OUTPUT\""],
+  changes: ["FRESH_MAIN_SHA=\"\"\nif [ \"$EVENT_NAME\" = \"merge_group\" ]; then\n  BASE_SHA=\"$MG_BASE_SHA\"\nfi\nif [ \"$BASE_REF\" = \"main\" ]; then\n  if sh scripts/ci/fetch-main-history.sh; then\n    FRESH_MAIN_SHA=$(git rev-parse --verify --end-of-options 'refs/remotes/origin/main^{commit}') || FRESH_MAIN_SHA=\"\"\n  else\n    echo \"ci-card-only: main fetch failed; full suite\" >&2\n  fi\nfi\nnode scripts/ci-card-only.mjs --event=\"$EVENT_NAME\" --base=\"$BASE_SHA\" --base-ref=\"$BASE_REF\" --fresh-main-sha=\"$FRESH_MAIN_SHA\" --head=HEAD >> \"$GITHUB_OUTPUT\"",
+    // PR ownership admission is checked by GitHub; local urgent runs have no PR event.
+    "node scripts/ci/check-timings-bot-only.mjs",
+  ],
   'test-shard': [
     "echo \"Card-only change; no unit tests required by the changes classifier.\"",
     `
@@ -274,10 +277,15 @@ function mirroredRunContext(job, text) {
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
     "${{ always() && needs.changes.outputs.light != 'true' }}",
     fullUnit,
-  ][index]) : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
+  ][index]) : job === 'changes' && index === 1 ? "github.event_name == 'pull_request'" : job === 'integration-part' && (setup || index === 1) ? fullIntegration : undefined;
   return {
     'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && [3, 4].includes(index) ? true : undefined,
-    env: job === 'changes' ? {
+    env: job === 'changes' && index === 1 ? {
+      GITHUB_EVENT_NAME: '${{ github.event_name }}', GH_TOKEN: '${{ github.token }}',
+      REPO: '${{ github.repository }}', PR_NUMBER: '${{ github.event.pull_request.number }}',
+      HEAD_REF: '${{ github.event.pull_request.head.ref }}', HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
+      AUTHOR: '${{ github.event.pull_request.user.login }}', HEAD_REPO: '${{ github.event.pull_request.head.repo.full_name }}',
+    } : job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
     } : job === 'integration-part' && index === 1 ? { WE_INTEGRATION_GROUP: '${{ matrix.group }}' } : undefined,

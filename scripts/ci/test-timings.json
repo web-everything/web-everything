@@ -413,6 +413,7 @@
   "scripts/conveyor/__tests__/advisory-fix-mark.test.mjs": 0.04,
   "scripts/conveyor/__tests__/advisory-label-sweep.test.mjs": 0.16,
   "scripts/conveyor/__tests__/advisory-round-count.test.mjs": 0.05,
+  "scripts/conveyor/__tests__/audit-on-ready.test.mjs": 0.1,
   "scripts/conveyor/__tests__/ai-routing-fix-sites.test.mjs": 0.03,
   "scripts/conveyor/__tests__/already-landed-watch.test.mjs": 0.02,
   "scripts/conveyor/__tests__/archive-retention-tick.test.mjs": 0.02,
@@ -1755,6 +1756,7 @@
   "scripts/operations/__tests__/render-outcome-effect-refusal.test.mjs": 0.02,
   "scripts/operations/__tests__/repair-routing-dry-run.test.mjs": 1.49,
   "scripts/operations/__tests__/resolve.test.mjs": 0.15,
+  "scripts/lib/__tests__/resource-pool.test.mjs": 0.1,
   "scripts/operations/__tests__/resource-status.test.mjs": 0.04,
   "scripts/operations/__tests__/restart-runner-io-real.test.mjs": 1.85,
   "scripts/operations/__tests__/restart-runner.test.mjs": 0.28,
@@ -1895,6 +1897,7 @@
   "scripts/readiness/__tests__/forge-slot-markers-idle-failure.test.mjs": 0.02,
   "scripts/readiness/__tests__/forge-slot-markers-per-run.test.mjs": 0.31,
   "scripts/readiness/__tests__/forge-slot-markers.test.mjs": 1,
+  "scripts/readiness/__tests__/forge-slots-operator-layer.test.mjs": 0.5,
   "scripts/readiness/__tests__/forge-slots.test.mjs": 5.14,
   "scripts/readiness/__tests__/forge-telemetry.test.mjs": 0.18,
   "scripts/readiness/__tests__/forge-test-selection.test.mjs": 4.66,
@@ -2051,6 +2054,7 @@
   "scripts/lib/__tests__/daemon-rebuild-recovery.test.mjs": 1
  },
  "soak": {
+  "scripts/conveyor/soak/breaks/graphql-owner-fields-route-to-sibling-app.soak.test.mjs": 2,
     "scripts/conveyor/soak/breaks/verify-related-cap-ceiling.soak.test.mjs": 2,
   "scripts/conveyor/soak/breaks/lane-pool-release-unpushed-guard.soak.test.mjs": 315.93,
   "scripts/conveyor/soak/breaks/lane-pool-git-diet.soak.test.mjs": 354.59,
