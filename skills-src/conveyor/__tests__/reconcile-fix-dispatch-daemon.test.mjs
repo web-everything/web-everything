@@ -429,6 +429,29 @@ const noopNotesTick = () => ({ notes: [], prsByNumber: new Map() });
 // tests never expected.
 const noopPromoteDraftTick = () => ({ dispatched: [], refusals: [] });
 
+describe('supersede dispatch gate', () => {
+  const options = result => ({
+    repos: ['repo-a'], supersedeTick: () => ({ repo: 'repo-a', holds: [], applied: [], ...result }),
+    fixTick: vi.fn(() => ({ dispatched: [{ pr: 7 }], refusals: [] })),
+    ciHealTick: async () => ({ dispatched: [], refusals: [] }),
+    hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+    missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick: noopPromoteDraftTick,
+  });
+  it('a failed body-edit read or one failed apply does not block dispatch for the repo', async () => {
+    for (const result of [{ bodyEditFailures: 1 }, { applied: [{ pr: 8, ok: false, error: 'denied' }] }]) {
+      const opts = options(result);
+      const out = await runTickAllRepos(opts);
+      expect(opts.fixTick).toHaveBeenCalledTimes(1);
+      expect(out.dispatched).toContainEqual(expect.objectContaining({ pr: 7, repo: 'repo-a' }));
+    }
+  });
+  it('blocks dispatch on unreadable supersede lists', async () => {
+    const opts = options({ error: 'list unavailable', blocked: true });
+    await expect(runTickAllRepos(opts)).rejects.toThrow('list unavailable');
+    expect(opts.fixTick).not.toHaveBeenCalled();
+  });
+});
+
 describe('runTickAllRepos — R242 shared snapshot and empty-work skips', () => {
   afterEach(() => vi.restoreAllMocks());
 
