@@ -17,12 +17,20 @@ export const FIX_EXECUTOR_RUNGS = Object.freeze({
   argon: rung('argon', 'antigravity', { provider: 'antigravity', model: 'gemini-4-argon-high' }),
   claude: rung('claude', 'claude'),
 });
-const defaults = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../settings/fix-executor.json'), 'utf8')).fixExecutor;
+const defaults = (() => {
+  try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../settings/fix-executor.json'), 'utf8'))?.fixExecutor ?? {}; }
+  catch { return {}; }
+})();
 const normalize = value => Array.isArray(value) ? value.map(id => id === 'gemini' ? 'argon' : id) : value;
 const valid = value => Array.isArray(value) && value.length > 0 && value.at(-1) === 'claude'
-  && new Set(value).size === value.length && value.every(id => Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
+  && new Set(value).size === value.length && value.every(id => typeof id === 'string' && Object.hasOwn(FIX_EXECUTOR_RUNGS, id));
 const fallbackSeatMix = Object.freeze(['codex', 'codex-alt', 'gemini', 'claude']);
 export const FIX_EXECUTOR_CHAIN_DEFAULT = Object.freeze(normalize(valid(normalize(defaults.fixSeatMix)) ? defaults.fixSeatMix : fallbackSeatMix));
+const validCriticalGlobs = value => Array.isArray(value) && value.length > 0
+  && value.every(glob => typeof glob === 'string' && !!glob.trim());
+// Unavailable policy must still require review: conservatively treat every path as critical.
+const fallbackCriticalGlobs = Object.freeze(['**']);
+const defaultCriticalGlobs = validCriticalGlobs(defaults.criticalGlobs) ? defaults.criticalGlobs : fallbackCriticalGlobs;
 const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
   catch { return {}; }
@@ -40,8 +48,8 @@ export function resolveFixExecutionMode({ env = process.env, platform = platform
   return { mode:role.value, modeSource:role.sources[''] === 'standard' ? base.sources[''] : role.sources[''] };
 }
 export function resolveFixCriticalGlobs({ env = process.env, platform = platformPreferences(), repo = readDeclaredSettings().settings } = {}) {
-  return cascadePolicy('fixExecutor.criticalGlobs', repo?.fixExecutor?.criticalGlobs, { standard:defaults.criticalGlobs, platform:platform?.fixExecutor?.criticalGlobs, env,
-    valid:value=>Array.isArray(value) && value.length > 0 && value.every(glob=>typeof glob === 'string' && !!glob.trim()) }).value;
+  return cascadePolicy('fixExecutor.criticalGlobs', repo?.fixExecutor?.criticalGlobs, { standard:defaultCriticalGlobs, platform:platform?.fixExecutor?.criticalGlobs, env,
+    valid:validCriticalGlobs }).value;
 }
 
 export function resolveFixExecutorChain({ env = process.env, platform = platformPreferences(), repo, aiRouting, kind = 'fix', capacity, now = Date.now(), quota, records, record } = {}) {
