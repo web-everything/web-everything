@@ -8,7 +8,8 @@
  *   B. `dispatchReviewJob` with the matching head must spawn;
  *   C. the review daemon's tick must hand `expectedHead` (the planned head) to its dispatcher;
  *   D. the conveyor runner must carry its planned head through CLI argv into job admission;
- *   E. the manual-pass CLI declaration must project the operator's pin into its effect payload.
+ *   E. the manual-pass CLI declaration must project the operator's pin into its effect payload;
+ *   F. session mode must refuse missing or moved heads before spawning and admit a matching head.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -29,7 +30,7 @@ const runner = await import(pathToFileURL(join(src, 'skills-src/conveyor/runner.
 const manual = await import(pathToFileURL(join(src, 'scripts/operations/manual-daemon-pass.mjs')).href);
 const { parseOperationArgv } = await import(pathToFileURL(join(src, 'scripts/operations/cli-adapter.mjs')).href);
 const { projectReads } = await import(pathToFileURL(join(src, 'scripts/operations/engine.mjs')).href);
-const out = { noHead: null, withHead: null, daemonHead: null, runner: null, manual: null };
+const out = { noHead: null, withHead: null, daemonHead: null, runner: null, manual: null, sessions: [] };
 const SLUG = ['web-everything', 'web-everything'].join('/'); // built so the repo-literal scan sees no slug
 const base = { pr: 77, repo: SLUG, root: process.env.SOAK_ROOT, dir: process.env.SOAK_JOBS,
   ciGate: () => ({ allowed: true, headSha: head }), readCompletion: () => null, resolveSettingsEnv: () => null,
@@ -41,6 +42,17 @@ catch (e) { out.noHead = { threw: String(e.message).split('\\n')[0] }; }
 spawns = 0;
 try { const r = job.dispatchReviewJob({ ...base, expectedHead: head, io, spawnJob: () => { spawns++; return 4242; } }); out.withHead = { spawns, jobPid: r.jobPid ?? null }; }
 catch (e) { out.withHead = { threw: String(e.message).split('\\n')[0] }; }
+for (const [name, expectedHead, live] of [['missing', undefined, head], ['moved', head, 'e'.repeat(40)], ['matching', head, head]]) {
+  let sessionSpawns = 0, headReads = 0;
+  try {
+    const r = job.dispatchReviewByMode({ ...base, mode: 'session', expectedHead,
+      stackCheck: () => ({ base: null }), io: { liveHead: () => { headReads++; return live; } },
+      readBrief: () => 'review', wrapReview: false, resolveSettingsEnv: () => ({}),
+      ensureSessionCwd: () => process.env.SOAK_ROOT, isolateSession: () => ({}),
+      spawnAgent: () => { sessionSpawns++; return ''; } });
+    out.sessions.push({ name, spawns: sessionSpawns, headReads, refused: r.refused === true, outcome: r.outcome });
+  } catch (e) { out.sessions.push({ name, threw: String(e.message).split('\\n')[0] }); }
+}
 let seen = null;
 try {
   daemon.runReviewTickAllRepos({ startIndex: 0, repos: [SLUG],
@@ -129,6 +141,15 @@ export default {
       if (out.manual !== 'd'.repeat(40)) {
         violations.push({ invariant: 'manual-cli-projects-expected-head', detail: `the manual CLI did not project its pinned head: ${JSON.stringify(out.manual)}` });
       }
+      for (const session of out.sessions ?? []) {
+        const matching = session.name === 'matching';
+        const outcome = session.name === 'missing' ? 'refused-no-expected-head' : 'refused-head-moved';
+        if (matching ? session.spawns !== 1 || session.headReads !== 1 || session.refused
+          : session.spawns !== 0 || !session.refused || session.outcome !== outcome) {
+          violations.push({ invariant: 'session-head-admission', detail: JSON.stringify(session) });
+        }
+      }
+      if (out.sessions?.length !== 3) violations.push({ invariant: 'session-scenarios-ran', detail: JSON.stringify(out.sessions) });
       return { violations };
     } finally {
       rmSync(dir, { recursive: true, force: true });

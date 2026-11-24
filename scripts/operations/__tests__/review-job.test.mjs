@@ -682,9 +682,9 @@ describe('preferred review lanes', () => {
   it('dispatchReviewByMode session mode never forwards preferLane to dispatchReview', () => {
     const dispatch = vi.spyOn(reviewDispatch, 'dispatchReview').mockReturnValue({ agentId: 'session' });
     try {
-      dispatchReviewByMode({ mode: 'session', pr: 10, repo: REPO, preferLane: 7 });
+      dispatchReviewByMode({ mode: 'session', pr: 10, repo: REPO, preferLane: 7, ...headFixture() });
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: REPO });
+      expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: REPO, expectedHead: HEAD, io: expect.objectContaining({ liveHead: expect.any(Function) }) });
     } finally { dispatch.mockRestore(); }
   });
 });

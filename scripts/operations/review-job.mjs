@@ -1708,6 +1708,12 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spaw
  */
 // Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
 export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+  // Session mode has no dispatchReviewJob admission gate: apply the same check before any stack or launch effects.
+  if (mode === 'session') {
+    const refusal = expectedHeadRefusal(opts.expectedHead, { pr: opts.pr, repo: opts.repo },
+      opts.io ?? createReviewJobIo({ root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }), { required: true });
+    if (refusal) return { mode, pr: opts.pr, repo: opts.repo, ...refusal };
+  }
   // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
   // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
   let stack = null;

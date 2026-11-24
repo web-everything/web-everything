@@ -749,7 +749,7 @@ if (IS_CLI) {
   // review-job.mjs's static import of it waits for this module to finish evaluating, which waits on the import —
   // a cycle node reports as "unsettled top-level await" (exit 13, nothing dispatched; reproduced live on main
   // 0cb0bf39f and later). `.then` lets this module finish evaluating first.
-  import('./review-job.mjs').then(({ resolveReviewDispatchMode, dispatchReviewJob }) => {
+  import('./review-job.mjs').then(({ resolveReviewDispatchMode, dispatchReviewJob, dispatchReviewByMode }) => {
     const mode = flag('mode') === 'session' || flag('mode') === 'job' ? flag('mode') : resolveReviewDispatchMode();
     if (mode === 'job') {
       try {
@@ -771,9 +771,11 @@ if (IS_CLI) {
       // #xqa9ttq — `--judge-provider` is OPTIONAL; `dispatchReview`'s own `judgeProvider = 'claude'` default
       // applies when the flag is omitted, so `flag('judge-provider')` returning `undefined` here is the ordinary
       // case, not a gap.
-      const result = dispatchReview({
+      const result = dispatchReviewByMode({
+        mode: 'session', expectedHead: flag('expected-head'),
         pr: flag('pr'), repo: flag('repo'), extraArgs: agentArgsFromEnv(), judgeProvider: flag('judge-provider'), careLevel: flag('care-level'),
       });
+      if (result.refused) { writeLineSync(2, `dispatch-review: refused (${result.outcome}) — ${result.reason}`); process.exitCode = 75; return; }
       writeAllSync(1, formatSessionDispatchResult(result));
     } catch (e) {
       writeLineSync(2, `error: ${String(e?.message ?? e)}`);
