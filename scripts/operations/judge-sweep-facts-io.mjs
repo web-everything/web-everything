@@ -265,6 +265,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
       const evidenceErrors = [...errors];
+      if (!['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable)) evidenceErrors.push('merge state unavailable; inspect PR mergeability');
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
       const round = errors.includes('verdict ledger unreadable') ? null
@@ -283,7 +284,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
         infraFailStreak: errors.includes('fix-loop ledger unreadable') ? null : infraFailStreak,
         isDraft: typeof p.isDraft === 'boolean' ? p.isDraft : null,
-        mergeable: typeof p.mergeable === 'string' ? p.mergeable : null,
+        mergeable: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable) ? p.mergeable : null,
         minutesSinceHeadChange: null,
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,

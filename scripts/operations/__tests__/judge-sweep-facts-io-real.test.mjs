@@ -16,7 +16,7 @@ it('runs the real shape child and reuses its head-and-base result from an owner-
       baseCap: 5,
       gh: args => { const value = { number: 1, title: 'cache fixture', headRefOid: head, baseRefOid: head,
         labels: [{ name: 'review:human' }], assignees: [], updatedAt: '2026-10-22T13:00:00Z',
-        body: '', createdAt: '2026-10-22T13:00:00Z', statusCheckRollup: [], commits: [],
+        body: '', createdAt: '2026-10-22T13:00:00Z', statusCheckRollup: [], commits: [], mergeable: 'MERGEABLE',
         files: [{ path: 'README.md' }], changedFiles: 1 };
         return JSON.stringify(args[1] === 'list' ? [value] : value); },
       now: () => Date.parse('2026-10-22T13:01:00Z'), readLedgerRows: () => ['b', 'c'].map(h => ({

@@ -26,7 +26,7 @@ const facts = overrides => ({ number: 1, title: 'fixture', labels: [], headSha: 
   minutesSinceUpdate: 1, fixerRunning: false, inCi: false, owner: null, evidenceErrors: [], ...overrides });
 const pr = overrides => ({ number: 1, title: 'fixture $(touch sentinel)', headRefOid: SHA, baseRefOid: BASE, labels: [],
   updatedAt: at(1), createdAt: at(120), body: '<!-- authored-by-actor: author -->', author: { login: 'author' },
-  assignees: [], commits: [], files: [{ path: 'scripts/x.mjs' }], changedFiles: 1, statusCheckRollup: [], ...overrides });
+  assignees: [], commits: [], files: [{ path: 'scripts/x.mjs' }], changedFiles: 1, statusCheckRollup: [], mergeable: 'MERGEABLE', ...overrides });
 const comment = (body, minutes = 1, login = 'chalbert') => ({ body, createdAt: at(minutes), author: { login } });
 const advisory = ({ head = SHA, findings = [], minutes = 1, outcome = 'changes', login } = {}) => comment([
   renderPanelComment({ findings, verdict: outcome === 'accept' ? 'accept' : 'changes',
@@ -309,7 +309,9 @@ describe('next responsible owner from existing facts', () => {
     ['nobody', { mergeable: 'MERGEABLE' }],
     ['fixer', { mergeable: 'CONFLICTING' }],
     ['fixer', { mergeable: 'CONFLICTING', fixerRunning: true }],
-    ['drain', { mergeable: 'CONFLICTING', labels: ['ready-to-merge'] }],
+    ['fixer', { mergeable: 'CONFLICTING', labels: ['ready-to-merge'] }],
+    ['fixer', { mergeable: 'CONFLICTING', labels: ['review:pending'] }],
+    ['fixer', { mergeable: 'CONFLICTING', owner: 'someone' }],
     ['orchestrator', { mergeable: 'CONFLICTING', isDraft: true }],
   ];
   it.each(ownerCases)('derives %s with a nonempty one-line next step from %j', (nextOwner, patch) => {
@@ -330,6 +332,17 @@ describe('next responsible owner from existing facts', () => {
     const stale = { mergeable: 'CONFLICTING', fixerRunning: false, owner: null, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
     expect(judgeSweepFacts.needsJudgment(facts(stale))).toMatchObject({ needsJudgment: true });
     expect(judgeSweepFacts.needsJudgment(facts({ ...stale, fixerRunning: true }))).toMatchObject({ needsJudgment: false });
+  });
+  it.each([['ready-to-merge'], ['review:pending']])('an aged conflict labelled %s still needs judgment', label => {
+    const aged = { mergeable: 'CONFLICTING', labels: [label], minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
+    expect(judgeSweepFacts.needsJudgment(facts(aged))).toMatchObject({ needsJudgment: true });
+    expect(judgeSweepFacts.needsJudgment(facts({ ...aged, mergeable: 'MERGEABLE' }))).toMatchObject({ needsJudgment: false });
+  });
+  it('an assignee does not count as activity for an aged conflict', () => {
+    const aged = { mergeable: 'CONFLICTING', owner: 'someone', minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
+    expect(judgeSweepFacts.needsJudgment(facts(aged))).toMatchObject({ needsJudgment: true });
+    expect(judgeSweepFacts.needsJudgment(facts({ ...aged, mergeable: 'MERGEABLE' })))
+      .toMatchObject({ needsJudgment: false, reason: 'owner present' });
   });
   it('keeps a running fixer responsible for a needs-human PR', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))
