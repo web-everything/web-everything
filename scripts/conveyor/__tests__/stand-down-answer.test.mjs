@@ -13,6 +13,13 @@ import { countUnresolvedStandDowns, planReconcile } from '../reconcile-core.mjs'
 import { buildAuthorActorMarker } from '../../lib/review-independence.mjs';
 import { dispatchFix, planFixesFromReconcile, tryResumeFix } from '../reconcile-fix-dispatch.mjs';
 
+const ceremonyGh = snapshot => {
+  const posted = [];
+  return vi.fn(a => {
+    if (a[1] === 'view') return JSON.stringify({ headRefOid: 'b'.repeat(40), ...snapshot, comments: [...snapshot.comments, ...posted] });
+    posted.push(trusted(a.at(-1), 'IC_posted')); return 'posted';
+  });
+};
 const reason = 'Scope correction is fine but must be careful to going against goal and decision and escalate if needed';
 const record = { standDownId: 'IC_stopped', reason, actor: 'chalbert', channel: 'Codex chat' };
 const trusted = (body, id = 'IC_answer') => ({ id, body, author: { login: 'web-everything' }, viewerDidAuthor: false });
@@ -64,9 +71,9 @@ describe('operator answer trust and targeting', () => {
 describe('operator ceremony CLI', () => {
   it('accepts --disposition=rearm-review and posts an exact, honest answer', () => {
     const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'b'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin0');
-    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments: [begin, stop] }) : 'posted');
+    const gh = ceremonyGh({ comments: [begin, stop] });
     expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
-    const args = gh.mock.calls[1][0];
+    const args = gh.mock.calls.find(([a]) => a[1] === 'comment')[0];
     const body = args[args.indexOf('--body') + 1];
     expect(parseOperatorAnswer(trusted(body))).toEqual({ ...record, disposition: 'rearm-review' });
     expect(body).toContain('**Disposition:** `rearm-review` — operator ruled no code is owed; review may be re-armed on the unchanged head');
@@ -242,7 +249,7 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
     ...over,
   });
   const run = (snapshot, extra = ['--disposition=rearm-review']) => {
-    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     return { gh, call: () => runStandDownAnswer([...argv, ...extra], { gh }) };
   };
   it.each([
@@ -273,7 +280,7 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
   it('succeeds on an answered stand-down at answered-waiting-fixer on the same head and records the supersede', () => {
     const { gh, call } = run(view());
     expect(call()).toBe('posted');
-    const args = gh.mock.calls[1][0];
+    const args = gh.mock.calls.find(([a]) => a[1] === 'comment')[0];
     const body = args[args.indexOf('--body') + 1];
     expect(parseOperatorAnswer(trusted(body))).toMatchObject({ standDownId: record.standDownId, disposition: 'rearm-review', supersedes: 'IC_answer' });
     expect(body).toContain('IC_answer');
@@ -312,19 +319,19 @@ describe('#6748 real sequence at the CLI: 106 -> answer 108 -> fix-begin 110 -> 
     commits: [{ oid: HEAD, committedDate: '2026-11-14T17:41:22Z' }],
   });
   const post = (snapshot) => {
-    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     return { gh, call: () => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh }) };
   };
   it('posts a rearm-review answer that targets 106 and supersedes 108', () => {
     const { gh, call } = post(snap());
     expect(call()).toBe('posted');
-    const args = gh.mock.calls[1][0];
+    const args = gh.mock.calls.find(([a]) => a[1] === 'comment')[0];
     expect(parseOperatorAnswer(trusted(args[args.indexOf('--body') + 1]))).toMatchObject({ standDownId: 'IC_106', supersedes: 'IC_108', disposition: 'rearm-review' });
   });
   it('the guard accepts exactly the answer the CLI posts', () => {
     const { gh, call } = post(snap());
     call();
-    const args = gh.mock.calls[1][0];
+    const args = gh.mock.calls.find(([a]) => a[1] === 'comment')[0];
     const posted = { ...trusted(args[args.indexOf('--body') + 1], 'IC_new'), author: { login: 'chalbert' } };
     expect(decideEmptyFixRound({ comments: [...snap().comments, posted], liveHead: HEAD }).empty).toBe(false);
   });
@@ -339,7 +346,7 @@ describe('#6748 real sequence at the CLI: 106 -> answer 108 -> fix-begin 110 -> 
 describe('rearm-review on an UNRESOLVED stand-down goes through the same guard window', () => {
   const fixBegin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'b'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_begin');
   const run = (comments) => {
-    const gh = vi.fn((args) => args[1] === 'view' ? JSON.stringify({ comments }) : 'posted');
+    const gh = ceremonyGh({ comments });
     return { gh, call: () => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh }) };
   };
   it('refuses an unresolved stand-down the guard would ignore (no fix-begin before it)', () => {
@@ -350,10 +357,11 @@ describe('rearm-review on an UNRESOLVED stand-down goes through the same guard w
   const done = trusted(buildOperatorAnswer({ ...record, disposition: 'rearm-review' }), 'IC_done');
   const later = { ...stop, id: 'IC_later' };
   const renewed = [fixBegin, stop, done, fixBegin, later];
-  it('refuses a stale unresolved id outside the latest verdict window without writing', () => {
+  it('answers the latest unresolved id after the verdict window lapses', () => {
     const { gh, call } = run([...renewed, trusted('🔁 review — changes requested'), fixBegin]);
-    expect(call).toThrow(/guard|window/);
-    expect(gh).toHaveBeenCalledTimes(1);
+    expect(call()).toBe('posted');
+    const posted = trusted(gh.mock.calls.find(([a]) => a[1] === 'comment')[0].at(-1));
+    expect(parseOperatorAnswer(posted).standDownId).toBe(later.id);
   });
   it('refuses answering the same rearmed stand-down twice after a later fix-begin', () => {
     const { gh, call } = run([fixBegin, stop, done, fixBegin]);
@@ -366,9 +374,9 @@ describe('rearm-review on an UNRESOLVED stand-down goes through the same guard w
     const snapshot = { comments, labels: [{ name: 'status:answered-waiting-fixer' }],
       headRefOid: 'b'.repeat(40), commits: [{ oid: 'b'.repeat(40), committedDate: '2026-11-14T09:00:00Z' }] };
     snapshot.comments = comments.map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' }));
-    const gh = vi.fn(args => args[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     expect(runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh })).toBe('posted');
-    const posted = trusted(gh.mock.calls[1][0].at(-1), 'IC_new');
+    const posted = trusted(gh.mock.calls.find(([a]) => a[1] === 'comment')[0].at(-1), 'IC_new');
     expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: later.id, disposition: 'rearm-review',
       ...(alreadyAnswered ? { supersedes: 'IC_non_rearm' } : {}) });
     expect(decideEmptyFixRound({ comments: [...comments, posted], liveHead: 'b'.repeat(40) }).empty).toBe(false);
@@ -378,7 +386,7 @@ describe('rearm-review on an UNRESOLVED stand-down goes through the same guard w
   it('posts for an unresolved stand-down inside the window, and the guard accepts that answer', () => {
     const { gh, call } = run([fixBegin, stop]);
     expect(call()).toBe('posted');
-    const args = gh.mock.calls[1][0];
+    const args = gh.mock.calls.find(([a]) => a[1] === 'comment')[0];
     const posted = { ...trusted(args[args.indexOf('--body') + 1], 'IC_new'), author: { login: 'chalbert' } };
     expect(decideEmptyFixRound({ comments: [fixBegin, stop, posted], liveHead: 'b'.repeat(40) }).empty).toBe(false);
   });
@@ -392,7 +400,7 @@ describe('explicit no-code-owed ceremony', () => {
   const comments = [begin, stop, rearm(stop.id), begin, { ...stop, id: 'IC_second' }, rearm('IC_second'),
     begin, { ...stop, id: 'IC_third' }];
   const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
-  const mock = (labels) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments, labels, headRefOid: HEAD }) : 'posted');
+  const mock = (labels) => ceremonyGh({ comments, labels, headRefOid: HEAD });
 
   it('refuses noCodeOwed without rearm-review or with a non-boolean value', () => {
     for (const noCodeOwed of [true, false, 'true', null]) {
@@ -424,8 +432,8 @@ describe('explicit no-code-owed ceremony', () => {
     const target = { ...comments.at(-1), body: comments.at(-1).body.replace(/ -->$/, ` head=${'a'.repeat(40)} -->`) };
     const snapshot = { comments: [...comments.slice(0, -1), target, ...(answered ? [rearm(target.id)] : [])],
       labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD };
-    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
-    expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review --no-code-owed refused: head moved since the stand-down');
+    const gh = ceremonyGh(snapshot);
+    expect(() => runStandDownAnswer(args, { gh })).toThrow('rearm-review refused: head moved since the stand-down');
     expect(gh).toHaveBeenCalledTimes(1);
   });
   it.each([undefined, '', 'b'.repeat(39), 'g'.repeat(40)])('refuses an unreadable live head without a named head (%s)', headRefOid => {
@@ -438,7 +446,7 @@ describe('explicit no-code-owed ceremony', () => {
     const prior = { ...rearm(target.id), id: undefined };
     const snapshot = { comments: [...comments.slice(0, -1), target, prior],
       labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD };
-    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     expect(() => runStandDownAnswer(args, { gh })).toThrow('no unresolved stand-down');
     expect(gh).toHaveBeenCalledTimes(1);
   });
@@ -463,7 +471,7 @@ describe('explicit no-code-owed ceremony', () => {
       labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
       commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
     expect(decideEmptyFixRound({ comments: snapshot.comments, liveHead: HEAD }).empty).toBe(true);
-    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     expect(() => runStandDownAnswer(args, { gh })).toThrow(retry ? 'no unresolved stand-down' : 'guard would ignore');
     expect(gh).toHaveBeenCalledTimes(1);
   });
@@ -491,12 +499,12 @@ describe('explicit no-code-owed ceremony', () => {
       return 'posted';
     });
     expect(runStandDownAnswer(args, { gh })).toBe('posted');
-    expect(gh).toHaveBeenCalledTimes(2);
+    expect(gh).toHaveBeenCalledTimes(4);
     expect(decideEmptyFixRound({ comments: snapshot.comments, liveHead: HEAD }).empty).toBe(false);
   });
   it.each([
     ['no claim', [stop]],
-    ['a newer verdict', [...comments, trusted('🔁 review — changes requested', 'IC_verdict')]],
+    ['a newer stop outside the claim window', [...comments, trusted('🔁 review — changes requested', 'IC_verdict'), { ...stop, id: 'IC_new' }]],
     ['an already honoured answer', [begin, stop, rearm(stop.id)]],
     ['a malformed claim', [{ ...begin, body: begin.body.replace(HEAD.slice(0, 9), 'unreadable') }, stop]],
     ['an untrusted stand-down', [begin, { ...stop, author: { login: 'outsider' }, viewerDidAuthor: true }]],
@@ -527,9 +535,9 @@ describe('explicit no-code-owed ceremony', () => {
     const snapshot = { comments: [...comments, prior].map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' })),
       labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
       commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
-    const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
+    const gh = ceremonyGh(snapshot);
     expect(runStandDownAnswer(args, { gh })).toBe('posted');
-    const posted = trusted(gh.mock.calls[1][0].at(-1));
+    const posted = trusted(gh.mock.calls.find(([a]) => a[1] === 'comment')[0].at(-1));
     expect(parseOperatorAnswer(posted)).toMatchObject({ noCodeOwed: true, supersedes: 'IC_prior' });
     snapshot.comments.push(posted, begin);
     expect(decideEmptyFixRound({ comments: snapshot.comments.slice(0, -1), liveHead: HEAD }).empty).toBe(false);
@@ -538,7 +546,7 @@ describe('explicit no-code-owed ceremony', () => {
   it('posts the explicit ruling for the latest cap-blocked stand-down and the guard accepts it', () => {
     const gh = mock([]);
     expect(runStandDownAnswer(args, { gh })).toBe('posted');
-    const posted = trusted(gh.mock.calls[1][0].at(-1));
+    const posted = trusted(gh.mock.calls.find(([a]) => a[1] === 'comment')[0].at(-1));
     expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: 'IC_third', noCodeOwed: true });
     expect(decideEmptyFixRound({ comments: [...comments, posted], liveHead: HEAD }).empty).toBe(false);
   });
@@ -591,7 +599,7 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
         return 'posted';
       });
       expect(runStandDownAnswer(args, { gh })).toBe('posted');
-      expect(gh).toHaveBeenCalledTimes(2);
+      expect(gh).toHaveBeenCalledTimes(4);
       const after = rearm();
       expect(after.status, after.stderr + after.stdout).toBe(0);
       expect(JSON.parse(after.stdout.trim().split('\n').at(-1))).toMatchObject({ ok: true, rearmed: true });
@@ -604,4 +612,66 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
       rmSync(dir, { recursive: true, force: true });
     }
   }, 120000);
+});
+
+
+describe('lapsed stand-down head binding', () => {
+  const head = 'b'.repeat(40);
+  const dated = (c, createdAt) => ({ ...c, createdAt });
+  const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${'a'.repeat(9)}\`\n<!-- fix-claim who=fix-1 -->`, 'IC_old_begin');
+  const verdict = trusted('🔁 review — changes requested', 'IC_verdict');
+  const thread = [begin, stop, verdict, begin];
+  const candidate = { ...record, disposition: 'rearm-review' };
+  const run = (comments = thread, mutate = () => {}, headRefOid = head) => {
+    let reads = 0;
+    const snapshot = { comments, headRefOid };
+    const gh = vi.fn(a => {
+      if (a[1] === 'view') { if (++reads > 1) mutate(snapshot, reads); return JSON.stringify(snapshot); }
+      snapshot.comments.push(trusted(a.at(-1), 'IC_posted')); return 'posted';
+    });
+    return { gh, call: () => runStandDownAnswer([...argv, '--disposition=rearm-review'], { gh }) };
+  };
+  it('answers the latest stand-down on the current head after the head moved', () => {
+    const comments = [...thread];
+    const { call } = run(comments);
+    expect(call()).toBe('posted');
+    expect(parseOperatorAnswer(comments.at(-1))).toEqual(candidate);
+    expect(rearmWindow(comments).claims).toEqual([]);
+    expect(rearmWindow(comments).wouldHonour(candidate)).toBe(false);
+  });
+  it.each(['a'.repeat(40), 'a'.repeat(9), 'unreadable', ''])('refuses a stand-down bound to an older head', named => {
+    const bound = { ...stop, body: stop.body.replace(/ -->$/, ` head=${named} -->`) };
+    const { gh, call } = run([begin, bound]);
+    expect(call).toThrow(/head/);
+    expect(gh.mock.calls.some(([a]) => a[1] === 'comment')).toBe(false);
+  });
+  it('refuses when two stand-downs share the head and the latest is not the target', () => {
+    const bound = { ...stop, body: stop.body.replace(/ -->$/, ` head=${head} -->`) };
+    for (const prefix of [[begin, bound], [begin, bound, verdict]]) {
+      expect(rearmWindow([...prefix, { ...bound, id: 'IC_new' }]).wouldHonour(candidate)).toBe(false);
+      expect(rearmWindow(prefix).wouldHonour({ ...candidate, standDownId: undefined })).toBe(false);
+      expect(run([...prefix, { ...bound, id: 'IC_new' }, trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_new' }))]).call).toThrow(/latest|no unresolved/);
+    }
+  });
+  it.each([2, 3])('refuses when the head moves between read and write', read => {
+    const { call } = run([...thread], (s, n) => { if (n === read) s.headRefOid = 'c'.repeat(40); });
+    expect(call).toThrow(/changed|head/);
+  });
+  it.each([2, 3])('refuses concurrent comments or a newer stand-down (read %s)', read => {
+    const { call } = run([...thread], (s, n) => { if (n === read) s.comments.push({ ...stop, id: 'IC_new' }); });
+    expect(call).toThrow(/changed/);
+  });
+  it.each([2, 3])('refuses unreadable snapshot re-reads', read => { expect(run([...thread], (_s, n) => { if (n === read) throw new Error('unreadable'); }).call).toThrow('unreadable'); });
+  it('refuses with no stand-down at all', () => { expect(run([begin, verdict]).call).toThrow(/no unresolved/); });
+  it.each([null, {}, 'unreadable'])('refuses unreadable comments/head: %j', value => {
+    expect(run(value).call).toThrow();
+    expect(run([...thread], () => {}, value).call).toThrow();
+    expect(run([...thread], s => { s.comments = value; }).call).toThrow();
+  });
+  it.each([undefined, 'same', '2026-11-14T10:00:00Z'])('orders by array position with missing/invalid/equal timestamps: %s', at => {
+    const comments = [...thread, { ...stop, id: 'IC_latest' }].map(c => dated(c, at));
+    expect(rearmWindow(comments).wouldHonour(candidate)).toBe(false);
+    expect(run(comments).call()).toBe('posted');
+    expect(parseOperatorAnswer(comments.at(-1)).standDownId).toBe('IC_latest');
+  });
 });

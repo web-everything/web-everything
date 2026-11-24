@@ -5,12 +5,12 @@ import { pathToFileURL } from 'node:url';
 import { rearmWindow } from './rearm-review.mjs';
 import { buildOperatorAnswer, latestUnresolvedStandDown, parseOperatorAnswer, isTerminalStandDown } from './stand-down-answer-core.mjs';
 
-const namedStandDownHead = c => /\n<!-- stand-down [^>\n]*\bhead=([0-9a-f]{7,40})\b[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1];
+const namedStandDownHead = c => /\n<!-- stand-down [^>\n]*\bhead=([^\s>]*)[^>\n]* -->\s*$/.exec(c.body ?? '')?.[1];
 function requireNoCodeHead(snapshot, target) {
   const live = String(snapshot.headRefOid ?? '').toLowerCase();
   const named = namedStandDownHead(target);
-  if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
-  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+  if (named !== undefined && named !== live) throw new Error('rearm-review refused: head moved since the stand-down');
+  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review refused: live head is not a 40-hex SHA');
 }
 
 /**
@@ -26,6 +26,7 @@ function answeredStandDownToRearm(snapshot, noCodeOwed) {
     if (!isTerminalStandDown(c)) continue;
     // The guard (rearm-review.mjs#rearmWindow) honours only ITS window's latest stand-down: any other target is refused.
     const win = rearmWindow(comments);
+    if (win.standDownId !== String(c.id)) return null; // Already-answered lapsed stops stay closed.
     if (!win.wouldHonour({ standDownId: String(c.id), disposition: 'rearm-review', noCodeOwed })) return null;
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
@@ -99,12 +100,24 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
       throw new Error('rearm-review refused: the guard would ignore it (stand-down is outside the guard window, or a rearm-review already stands)');
     }
   }
+  if (flags.disposition === 'rearm-review' && target !== snapshot.comments.findLast(isTerminalStandDown)) throw new Error('rearm-review refused: only the latest stand-down is a target');
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
-  if (flags.noCodeOwed) requireNoCodeHead(snapshot, target);
+  if (flags.disposition === 'rearm-review') requireNoCodeHead(snapshot, target);
   const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
+  const verify = (posted = false) => {
+    const fresh = JSON.parse(gh(['pr', 'view', pr, `--repo=${flags.repo}`, '--json', 'comments,labels,commits,headRefOid']));
+    if (!Array.isArray(fresh.comments) || fresh.headRefOid !== snapshot.headRefOid
+      || fresh.comments.length !== snapshot.comments.length + Number(posted)
+      || String(fresh.comments.findLast(isTerminalStandDown)?.id) !== String(target.id)) {
+      throw new Error('rearm-review refused: head or comments changed; inspect the thread and retry on a fresh snapshot');
+    }
+  };
+  if (flags.disposition === 'rearm-review') verify();
   // ONE durable write; no label swap, deletion, or automatic retry after an ambiguous write failure.
-  return gh(['pr', 'comment', pr, `--repo=${flags.repo}`, '--body', body]);
+  const result = gh(['pr', 'comment', pr, `--repo=${flags.repo}`, '--body', body]);
+  if (flags.disposition === 'rearm-review') verify(true);
+  return result;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

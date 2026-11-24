@@ -210,13 +210,16 @@ export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
   let standDownIds = [];
+  let lapsedStandDownId = null;
+  let latestStandDownId = null;
   let rearmed = false;
   let capBlockedId = null;
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
   let overrides = 0;
   const overrideAvailable = () => overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
   const wouldHonour = answer => answer?.disposition === 'rearm-review'
-    && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
+    && answer.standDownId != null && answer.standDownId === latestStandDownId
+    && (answer.standDownId === standDownIds.at(-1) || answer.standDownId === lapsedStandDownId)
     && (!rearmed || (answer.noCodeOwed === true && overrideAvailable()));
   for (const raw of comments) {
     const c = normaliseComment(raw);
@@ -231,6 +234,7 @@ export function rearmWindow(comments) {
       claims = [];
       reviewedHead = null;
       standDownIds = [];
+      lapsedStandDownId = null;
       rearmed = true;
       capBlockedId = null;
       // An explicit no-code ruling closes the round without spending a bounded waiver.
@@ -241,9 +245,11 @@ export function rearmWindow(comments) {
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
+    if (standDownComments([c]).length && isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })) latestStandDownId = String(c.id);
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
       reviewedHead = verdictReviewedHead(c);
+      lapsedStandDownId = standDownIds.at(-1) ?? lapsedStandDownId;
       standDownIds = [];
       rearmed = false;
       waivers = 0;
