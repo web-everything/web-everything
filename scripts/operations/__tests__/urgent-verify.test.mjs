@@ -938,6 +938,12 @@ describe('urgent-verify signing isolation', () => {
     expect(spawnSync.mock.calls[0][1][0]).toBe('/runner/scripts/readiness/heavy-admission.mjs');
     expect(spawnSync.mock.calls[0][2].cwd).toBe('/checkout');
   });
+  it('refuses to isolate when the runner admission wrapper has uncommitted changes', () => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? ' M scripts/readiness/heavy-admission.mjs\n' : '' }));
+    const fs = { accessSync: () => {}, statSync: () => ({ isFile: () => true }), readdirSync: () => [], mkdtempSync: () => '/tmp/x', rmSync: () => {} };
+    const d = createUrgentDeps({ cwd: '/repo', env: { PATH: '/bin' }, fs, spawnSync, isolated: true });
+    expect(() => d.isolate('a'.repeat(40))).toThrow(/uncommitted changes/);
+  });
   it('hides the host lane pool from the command admission runs, and still lets a real failure fail', async () => {
     const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-strip-')));
     tempParents.push(root);

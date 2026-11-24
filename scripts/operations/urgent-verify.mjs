@@ -97,6 +97,8 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     };
     try {
       const origin = run('git', ['remote', 'get-url', 'origin']).trim();
+      // The runner's own admission wrapper executes the isolated checkout's steps, so it must be committed code.
+      if (String(run('git', ['status', '--porcelain', '--', 'scripts/readiness', 'scripts/lib'])).trim() !== '') throw new Error('runner admission wrapper has uncommitted changes; refusing to run it');
       const objects = join(run('git', ['rev-parse', '--path-format=absolute', '--git-common-dir']).trim(), 'objects');
       resetCheckout();
       run('git', ['init', '-q', dir]);
