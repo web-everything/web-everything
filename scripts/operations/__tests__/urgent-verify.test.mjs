@@ -148,7 +148,8 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
       const d = createUrgentDeps({ cwd: '/repo', home: '/home/test', fs, spawnSync });
       const standards = d.standards;
       d.standards = () => { standards(); finished = true; };
-      expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false, marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo } });
+      expect(await urgentVerify({ sha }, d)).toMatchObject({ ok: false,
+        marker: { result: 'red', fuiSha: sha, fuiRepo: urgentFuiRepo }, failure: { step: 'verify-fui-final' } });
       expect(finished).toBe(true);
       expect(spawnSync.mock.calls.filter(([, args]) => args[0] === 'fetch')).toHaveLength(1);
       expect(fs.appendFileSync).toHaveBeenCalledTimes(1);
@@ -247,6 +248,38 @@ describe('CI gate mirroring fails closed', () => {
     ]);
   });
   const real = yaml.safeLoad(workflow);
+  it.each(['standards', 'test-shard', 'integration-part'])(
+    'pins the main-history cache payload and fetch environment in %s', job => {
+      for (const mutate of [
+        steps => { steps.find(s => s.name === 'Restore main history mirror').with.path = 'frontierui'; },
+        steps => { steps.find(s => s.name === 'Restore main history mirror').with.key = 'unreviewed-key'; },
+        steps => { steps.find(s => s.name === 'Restore main history mirror').with['restore-keys'] = 'unreviewed-'; },
+        steps => { delete steps.find(s => s.name === 'Fetch main history (blobless)').env; },
+      ]) {
+        const changed = yaml.safeLoad(workflow);
+        mutate(changed.jobs[job].steps);
+        expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+      }
+    });
+  it.each(['Save main history mirror', 'Upload main history mirror cache'])(
+    'refuses a missing or broadened main-push condition on %s', name => {
+      for (const condition of [undefined, "${{ github.event_name == 'pull_request' }}", "${{ github.event_name == 'push' }}"]) {
+        const changed = yaml.safeLoad(workflow);
+        const step = changed.jobs.standards.steps.find(s => s.name === name);
+        if (condition === undefined) delete step.if;
+        else step.if = condition;
+        expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+      }
+    });
+  it('refuses a missing cache export or its cache environment', () => {
+    for (const removeStep of [false, true]) {
+      const changed = yaml.safeLoad(workflow), steps = changed.jobs.standards.steps;
+      const index = steps.findIndex(s => s.name === 'Save main history mirror');
+      if (removeStep) steps.splice(index, 1);
+      else delete steps[index].env;
+      expect(() => ciGatePlan(yaml.safeDump(changed))).toThrow('update the urgent verification mirror');
+    }
+  });
   it.each(['Enforce bot-owned test timings', 'Record shard start', 'Measure shard resources'])(
     'refuses changed or missing %s commands rather than trusting workflow text', name => {
       const changed = yaml.safeLoad(workflow);
