@@ -574,6 +574,25 @@ export function staleRequiredBaseRepair({ pr, requiredChecks, defaultBranch }) {
 
 /** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
 export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
+/** A requested re-run needs this long to show up as a live run before "no live run" means the request was lost. */
+export const RERUN_START_GRACE_MS = 3 * 60 * 1000;
+/**
+ * THE one predicate behind every `ci-timeout-rerun-in-flight` hold (complete mediation; RERUN-PENDING-EXPIRY, live we#7431:
+ * a lost pending marker held a PR forever). A pending re-run is in flight only while younger than the window AND, once
+ * past the start grace, a run is live on the head; otherwise it is LOST and the PR re-plans (the dispatcher expires the
+ * marker). An unreadable state or an unstamped marker holds (callers escalate). `liveOnly` asks just "is a run live?".
+ */
+export function rerunInFlight(pr, { budget, requiredChecks, now, liveOnly } = {}) {
+  if (liveOnly) return hasLiveCheck(pr, { requiredChecks, now });
+  if (!budget?.pending) return false;
+  const sinceMs = Date.parse(budget.pendingSince);
+  if (budget.reason || !Number.isFinite(sinceMs) || !(now > 0)) return true;
+  const windowMs = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
+  // A live (or unknown: incomplete rollup) run on the head always holds, whatever the marker's age.
+  if (hasLiveCheck(pr, { requiredChecks, now })) return true;
+  const age = now - sinceMs;
+  return age < RERUN_START_GRACE_MS && age < windowMs;
+}
 /** Max mechanical re-runs per head for a queued PR GitHub holds BLOCKED on a cancelled required check (PR #4651). */
 export const BLOCKED_CANCELLED_RERUN_CAP = 2;
 
@@ -3161,7 +3180,7 @@ export function planReconcile({
         && pr?.timeoutRetry?.eligible && pr.timeoutRetry.infraCancelled
         && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
       const budget = pr.timeoutRetryBudget;
-      if (budget?.pending) {
+      if (rerunInFlight(pr, { budget, requiredChecks, now })) {
         refuse('ci-timeout-rerun-in-flight', { ...withPhase,
           why: `PR #${prNumber}: GitHub holds it BLOCKED on a cancelled required check; a re-run was already requested and its result is not observed yet` });
         continue;
@@ -3325,7 +3344,7 @@ export function planReconcile({
             });
           };
           const budget = pr.timeoutRetryBudget;
-          if (budget?.pending) {
+          if (rerunInFlight(pr, { budget, requiredChecks, now })) {
             refuse('ci-timeout-rerun-in-flight', { ...withPhase,
               why: 're-run of the failed required jobs already requested on this head; result not observed yet' });
             foldReview(refusals[refusals.length - 1]);
@@ -3473,20 +3492,22 @@ export function planReconcile({
       const retryBudget = pr.timeoutRetryBudget;
       if (retryBudget?.pending) {
         // A re-run this system itself just requested, whose result is not observed yet, is IN FLIGHT, not a
-        // decision for the operator (live, PR #4235 2026-10-07: a re-run reserved at 19:35 escalated at 19:37 as
-        // "needs your decision"). Hold quietly while it is younger than the window; escalate only when it stays
-        // unresolved past it, or when the state itself is unreadable (`reason` set) or carries no timestamp.
+        // decision for the operator (live, PR #4235). Hold while rerunInFlight(); a LOST marker (past the window, or
+        // no live run after the start grace) falls through and re-plans (the dispatcher expires it, RERUN-PENDING-EXPIRY).
+        // Only an unreadable state (`reason`) or an unstamped marker escalates, with that reason.
         const sinceMs = Date.parse(retryBudget.pendingSince);
-        const windowMs = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
-        if (!retryBudget.reason && Number.isFinite(sinceMs) && now > 0 && now - sinceMs < windowMs) {
+        const stamped = !retryBudget.reason && Number.isFinite(sinceMs) && now > 0;
+        if (stamped && rerunInFlight(pr, { budget: retryBudget, requiredChecks, now })) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
-            why: `PR #${prNumber}: a CI re-run was requested ${Math.round((now - sinceMs) / 1000)}s ago and its result is not observed yet — waiting (escalates to the operator after ${Math.round(windowMs / 60000)} min)` });
+            why: `PR #${prNumber}: a CI re-run was requested ${Math.round((now - sinceMs) / 1000)}s ago and its result is not observed yet — waiting (treated as lost if no run starts)` });
           continue;
         }
-        const why = `PR #${prNumber}: timeout retry needs your decision — ${retryBudget.reason ?? 'request outcome remains unresolved'}; no further rerun or heal is safe`;
-        refuse('ci-heal-escalated', { ...withPhase, why });
-        notes.push({ kind: 'timeout-retry-needs-human', prNumber, text: why });
-        continue;
+        if (!stamped) {
+          const why = `PR #${prNumber}: timeout retry needs your decision — ${retryBudget.reason ?? 'request outcome remains unresolved'}; no further rerun or heal is safe`;
+          refuse('ci-heal-escalated', { ...withPhase, why });
+          notes.push({ kind: 'timeout-retry-needs-human', prNumber, text: why });
+          continue;
+        }
       }
       // xng7q1p: same-head mechanical retries never consume or rewrite heal markers.
       // All main-red, escalation and live-owner guards above retain precedence.
@@ -3514,7 +3535,7 @@ export function planReconcile({
       if (staleRerunActive) {
         const staleSpent = retryBudget?.confirmed === undefined ? undefined : retryBudget.confirmed + (retryBudget.rejected ?? 0);
         const staleCap = incompleteFailureInventory ? 1 : staleRetry.jobs.length;
-        if (staleSpent < staleCap && hasLiveCheck(pr, { requiredChecks, now })) {
+        if (staleSpent < staleCap && rerunInFlight(pr, { requiredChecks, now, liveOnly: true })) {
           // The owed re-run is deferred, not skipped: hold (never fall through to a heal that spends heal budget on a
           // head whose fresh result is still on its way) and re-plan next tick.
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
@@ -3555,7 +3576,7 @@ export function planReconcile({
       }
       if (partialFailureInventory && pr.mainGreenNow?.red !== true && staleRetry?.eligible
           && staleRetry.head === pr.headRefOid && staleRetry.pr === prNumber) {
-        if (hasLiveCheck(pr, { requiredChecks, now })) {
+        if (rerunInFlight(pr, { requiredChecks, now, liveOnly: true })) {
           refuse('ci-timeout-rerun-in-flight', { ...withPhase,
             why: 'another check on this head is still running — the incomplete inventory recovery rerun waits until it completes' + liveWhy(pr, { requiredChecks, now }) });
           continue;
