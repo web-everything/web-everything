@@ -253,6 +253,7 @@ export async function main(argv, deps, { loadDeps = async () => (await import('.
         catch (error) {
           deps.stderr(`${NONCONVERGENCE_SIGNATURE}: design-pass request failed to record (${clean(String(error?.message ?? error)).replace(/[\r\n\u2028\u2029]/g, '')})\n`);
         }
+        // Unreadable history refuses a passing result with exit 3; routing preserves exits only for readable lineage.
         if (reason === 'unreadable-lineage' && verdict === 'NOT WEAKENED') throw new Error('unreadable-lineage');
       }
     }

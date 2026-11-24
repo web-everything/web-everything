@@ -39,13 +39,46 @@ it.each(['WEAKENED', ' \tWEAKENED\t ', '\x1b[31mWEAKENED\x1b[0m', 'ＷＥＡＫ�
   expect(assessLineage([record])).toMatchObject({ escalate: true, reason: 'unreadable-lineage' });
 });
 
-it('unclassified same-file findings use the first three description words', () => {
+const unclassifiedFormats = [
+  ['without separators', (line, text) => `src/a.mjs:${line} ${text}`],
+  ['with a dash', (line, text) => `src/a.mjs:${line} - ${text}`],
+  ['with an em dash', (line, text) => `src/a.mjs:${line} — ${text}`],
+  ['with a quoted normalized location', (line, text) => `- \`./src/a.mjs:${line}\` ${text}`],
+  ['with a parenthesized location', (line, text) => `- (src/a.mjs:${line}) ${text}`],
+  ['with a trailing location', (line, text) => `${text} (src/a.mjs:${line})`],
+];
+
+it.each(unclassifiedFormats)('unclassified canonical findings %s escalate on the third new description', (_name, format) => {
   const descriptions = ['missing authorization check before save', 'removed input validation before save', 'disabled output escaping before render'];
-  const rounds = descriptions.map((text, index) => ({ ...round('abc'[index]), findings: [`src/a.mjs:12 - ${text}`] }));
+  const rounds = descriptions.map((text, index) => ({ ...round('abc'[index]), findings: [format(12, text)] }));
   const keys = rounds.map(record => findingKeysOf(record.findings)[0]);
   expect(new Set(keys).size).toBe(3);
-  expect(findingKeysOf(['src/a.mjs:99 - missing authorization check after rename'])).toEqual([keys[0]]);
+  expect(keys[0]).toBe('src/a.mjs|<top>|X1|missing-authorization-check');
+  expect(findingKeysOf([format(99, 'missing authorization check after rename')])).toEqual([keys[0]]);
+  expect(assessLineage(rounds.slice(0, 2))).toMatchObject({ streak: 2, escalate: false });
   expect(assessLineage(rounds)).toMatchObject({ streak: 3, escalate: true });
+});
+
+it.each(unclassifiedFormats)('live audit routes the third new unclassified finding %s', async (_name, format) => {
+  const { deps, run } = fixture();
+  deps.readRecords = () => [
+    { ...round('a'), findings: [format(12, 'missing authorization check before save')] },
+    { ...round('b'), findings: [format(20, 'removed input validation before save')] },
+  ];
+  deps.runCodex = () => `WEAKENED\n${format(30, 'disabled output escaping before render')}`;
+  expect(await run()).toBe(1);
+  expect(deps.appendRecord.mock.calls[0][0]).toMatchObject({ verdict: 'WEAKENED', nonconverge: { streak: 3, rounds: 3 } });
+  expect(deps.escalate).toHaveBeenCalledOnce();
+  expect(deps.escalate).toHaveBeenCalledWith({ ref, head, streak: 3, questionHash: QUESTION_HASH });
+});
+
+it('unclassified finding identity survives separator, wrapper, case and line changes', () => {
+  const keys = unclassifiedFormats.map(([, format], index) =>
+    findingKeysOf([format(index + 1, 'MISSING authorization check after rename')])[0]);
+  expect(new Set(keys)).toEqual(new Set(['src/a.mjs|<top>|X1|missing-authorization-check']));
+  const rounds = keys.map((_, index) => ({ ...round('abcdef'[index]),
+    findings: [unclassifiedFormats[index][1](index + 1, 'missing authorization check')] }));
+  expect(assessLineage(rounds)).toMatchObject({ streak: 0, escalate: false, newKeys: [] });
 });
 
 it.each(['ref', 'routing error'])('sanitises user-controlled %s in nonconvergence stderr', async field => {
@@ -119,12 +152,14 @@ it('a failed queue append releases the lock so a retry can enqueue', () => scrat
   expect(fs.readdirSync(dir).filter(name => name.includes('ledger-append-'))).toEqual([]);
 }));
 
-it('concurrent same-key escalations enqueue exactly one request', async () => {
+it.each([false, true])('concurrent same-key escalations enqueue exactly one request (directory alias: %s)', async alias => {
   const dir = fs.mkdtempSync(join(tmpdir(), 'audit-concurrent-'));
+  const aliasPath = join(dir, 'alias');
+  if (alias) fs.symlinkSync(dir, aliasPath, 'dir');
   const gate = new SharedArrayBuffer(4);
   const workers = [];
   const adapterUrl = pathToFileURL(resolve('scripts/operations/codex-audit-io.mjs')).href;
-  const start = first => {
+  const start = (first, workerDir = dir) => {
     const worker = new Worker(`
       const { parentPort, workerData } = require('node:worker_threads');
       const fs = require('node:fs');
@@ -151,7 +186,7 @@ it('concurrent same-key escalations enqueue exactly one request', async () => {
         }};
         createAuditDeps({ cwd: workerData.dir, home: workerData.dir, fs: injectedFs }).escalate(workerData.request);
       }).catch(error => { throw error; });
-    `, { eval: true, execArgv: [], workerData: { first, dir, gate, adapterUrl,
+    `, { eval: true, execArgv: [], workerData: { first, dir: workerDir, gate, adapterUrl,
       request: { ref, head, streak: 3, questionHash: QUESTION_HASH } } });
     workers.push(worker);
     const done = new Promise((resolve, reject) => { worker.on('error', reject); worker.on('exit', code => code ? reject(new Error(`worker exit ${code}`)) : resolve()); });
@@ -164,7 +199,7 @@ it('concurrent same-key escalations enqueue exactly one request', async () => {
   try {
     const first = start(true);
     await signal(first.worker, ['read']);
-    const second = start(false);
+    const second = start(false, alias ? aliasPath : dir);
     // With a lock the second writer contends before reading; without it both hold an empty snapshot.
     await signal(second.worker, ['contending', 'read']);
     Atomics.store(new Int32Array(gate), 0, 1);
@@ -230,7 +265,7 @@ it('a WEAKENED round with empty findings escalates as unreadable', () => {
     .toMatchObject({ escalate: true, reason: 'unreadable-lineage' });
 });
 
-it('escalation never changes the verdict word or exit code', async () => {
+it('readable-lineage escalation preserves the verdict word and exit code', async () => {
   for (const verdict of ['WEAKENED', 'NOT WEAKENED']) {
     const { deps, run } = fixture(verdict);
     deps.escalate.mockRejectedValue(new Error('routing\n\r\u2028\u2029\u001b[31m failed\u0000'));
@@ -267,8 +302,10 @@ it('escalate dedupes per ref', () => scratch(dir => {
   expect(fs.statSync(path).mode & 0o777).toBe(0o600);
 }));
 
-it('the replay CLI prints rounds and the signature at round 3', () => scratch(dir => {
-  const rounds = [...prior, { ...round('c', 'D1'), ref: 'ignored' }];
+it.each(['classified', 'unclassified without separators'])('the replay CLI prints rounds and the signature at round 3 (%s)', shape => scratch(dir => {
+  const rounds = shape === 'classified' ? [...prior, { ...round('c', 'D1'), ref: 'ignored' }]
+    : ['missing authorization check', 'removed input validation', 'disabled output escaping']
+      .map((text, index) => ({ ...round('abc'[index]), findings: [`src/a.mjs:12 ${text}`] }));
   const ledger = join(dir, 'ledger.jsonl');
   fs.writeFileSync(ledger, [...rounds, round('d', 'X2')].map(record => JSON.stringify(record)).join('\n'));
   const output = execFileSync(process.execPath, [resolve('scripts/operations/audit-nonconvergence.mjs'),
@@ -293,7 +330,7 @@ it('hashes unlocated or invalid paths and defaults an unclassified finding to X1
   const hash = createHash('sha256').update('no location here').digest('hex').slice(0, 16);
   expect(findingKeysOf(['  NO  location\nHere  ', 'no location here'])).toEqual([`text|${hash}`, `text|${hash}`]);
   expect(findingKeysOf(['../escape.mjs:1 B1 bad'])[0]).toMatch(/^text\|[a-f0-9]{16}$/);
-  expect(findingKeysOf(['src/a.mjs:1 check'])).toEqual(['src/a.mjs|<top>|X1']);
+  expect(findingKeysOf(['src/a.mjs:1 check'])).toEqual(['src/a.mjs|<top>|X1|check']);
   expect(assessLineage([{ ...round('a'), findings: ['first text'] }, { ...round('b'), findings: ['changed text'] }]).streak).toBe(2);
 });
 

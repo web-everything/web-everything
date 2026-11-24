@@ -19,11 +19,14 @@ export function hasConflictingVerdict(verdict, findings) {
 export function findingKeysOf(findings) {
   return findings.map(text => {
     try {
-      const { file } = parseFindingLocation(text) ?? {};
+      const { file, description } = parseFindingLocation(text, { includeDescription: true }) ?? {};
       if (!file) throw new Error('invalid finding location');
+      const explicitClass = text.match(/\b(B[1-7]|E[12]|D[1-3]|X[12])\b/)?.[0];
       // The ledger text carries no class, so the first three content words stand in for it (file-only keys collapse real rounds).
-      const words = (text.split(/\s[—-]\s/)[1] ?? '').toLowerCase().match(/[a-z]{5,}/g)?.slice(0, 3).join('-') ?? '';
-      const cls = text.match(/\b(B[1-7]|E[12]|D[1-3]|X[12])\b/)?.[0] ?? 'X1';
+      // Keep existing classified keys; classless canonical output needs no dash separator.
+      const content = explicitClass ? (text.split(/\s[—-]\s/)[1] ?? '') : description;
+      const words = content.toLowerCase().match(/[a-z]{5,}/g)?.slice(0, 3).join('-') ?? '';
+      const cls = explicitClass ?? 'X1';
       return `${file}|<top>|${cls}${words ? `|${words}` : ''}`;
     } catch {
       return `text|${createHash('sha256').update(String(text).toLowerCase().replace(/\s+/g, ' ').trim()).digest('hex').slice(0, 16)}`;
