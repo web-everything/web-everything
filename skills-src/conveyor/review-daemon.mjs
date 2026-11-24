@@ -93,7 +93,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // x26lw6u — the review is dispatched as a deterministic JOB (`review-job.mjs`: acquire → review-loop-cli →
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
-import { parseEscalationReason } from '../../scripts/review-detail.mjs';
+import { reviewDispatchContext } from '../../scripts/lib/review-dispatch-context.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
 import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
@@ -151,6 +151,7 @@ import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '..
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
 import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
+import { saveFastPlan, runFastPassCli, readRemoteMainSha } from '../../scripts/lib/review-fast-pass-cli.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -452,6 +453,7 @@ export function runReviewTick({
   rearmStaleAccepts = null,
   noteRearms = null,
   onPlan = null,
+  readMainSha = () => null,
   executeOwedReruns = executeOwedCiReruns,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -509,6 +511,8 @@ export function runReviewTick({
   // Shared PRs were read before the hold sweep; agent discovery and any captured PR-read failure
   // are isolated with reconcile here. Its injected readers reuse those same snapshots.
   let plan;
+  const readPlanMain = () => { try { return readMainSha({ repo }); } catch { return null; } };
+  const planMainSha = onPlan ? readPlanMain() : null;
   let rawAgents = null;
   try {
     if (sharedReads) {
@@ -612,7 +616,8 @@ export function runReviewTick({
     replanError = replanError ?? out.replanError ?? null;
     if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
-  try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
+  try { onPlan?.({ repo, plan, rawPrs,
+    mainSha: planMainSha === readPlanMain() ? planMainSha : null }); } catch { /* observation never breaks a tick */ }
   // Keep the synchronous tick API; the daemon awaits this mechanical work before its next pass.
   const rerunRows = replanError ? [] : (plan.dispatch ?? []).filter(row => row.kind === 'ci-timeout-rerun');
   let owedCiReruns;
@@ -841,8 +846,7 @@ export function runReviewTick({
       const result = dispatch({ pr: d.prNumber, repo,
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
-        escalationReason: parseEscalationReason(subject?.body ?? ''),
-        scopePaths: (subject?.files ?? []).map(f => typeof f === 'string' ? f : f.path),
+        ...reviewDispatchContext(subject),
       });
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
@@ -1551,6 +1555,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    readMainSha: ({ repo }) => readRemoteMainSha(repo),
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
@@ -2089,7 +2094,10 @@ export function buildCliDaemonEffects({
       factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
-      const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
+      const onPlan = snapshot => {
+        if (sharing.reusePlan) plans.set(snapshot.repo, { plan: snapshot.plan, rawPrs: snapshot.rawPrs });
+        try { saveFastPlan(snapshot); } catch (error) { log.error(`review-fast-pass: plan save failed: ${error.message}`); }
+      };
       let phaseStarted = Date.now();
       const phaseMs = {};
       // Live-caught 2026-09-26: the reap runs BEFORE discovery, not after. A hung fix/ci-heal session bound to a
@@ -2242,6 +2250,10 @@ export function buildCliDaemonEffects({
 
 async function main() {
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
+  if (process.argv.includes('--fast-pass')) return runFastPassCli({
+    repos: REVIEW_DAEMON_REPOS, cliReviewTickOpts, sharedHostBudget, runDaemonLoop,
+    selfSyncOptions: { root: resolve(fileURLToPath(import.meta.url), '..', '..', '..'), onRestart: () => process.exit(0), hasStaleRefusal: hasStaleMainRefusal },
+  });
   const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });

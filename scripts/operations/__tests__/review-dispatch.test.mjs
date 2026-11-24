@@ -887,3 +887,22 @@ it('dispatchReview refuses capability-off before spawning any agent', () => {
     .toThrow(/not a constellation repo/);
   expect(spawnAgent).not.toHaveBeenCalled();
 });
+
+describe('session expectedHead binding immediately before spawn', () => {
+  it.each([false, true])('refuses changed or unreadable heads for wrapped=%s', wrapReview => {
+    for (const readExpectedHead of [() => 'b'.repeat(40), () => { throw Error('head unreadable'); }]) {
+      const spawnAgent = vi.fn(), launchWrapped = vi.fn();
+      const out = dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+        readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead,
+        wrapReview, spawnAgent, launchWrapped });
+      expect(out).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
+      expect(spawnAgent).not.toHaveBeenCalled(); expect(launchWrapped).not.toHaveBeenCalled();
+    }
+  });
+  it('allows an unchanged pinned session head', () => {
+    const spawnAgent = vi.fn();
+    dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, expectedHead: 'a'.repeat(40), readExpectedHead: () => 'a'.repeat(40), wrapReview: false, spawnAgent });
+    expect(spawnAgent).toHaveBeenCalledOnce();
+  });
+});
