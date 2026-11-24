@@ -112,57 +112,62 @@ describe('xhiqxz3 — dispatch smoke inside the tick rebuild', () => {
   };
   const expectAbsent = (sinks, words) => { for (const w of words) for (const s of sinks) expect(s).not.toContain(w); };
 
-  it('a boot failure reaches held state and self-sync alerts as its summary only; the tail is a 0600 file under the state dir', async () => {
-    const f = makeFixture();
-    addDispatchOverlay(f);
-    const frames = Array.from({ length: 30 }, (_, i) => `native stack frame${i}x`);
-    const stderr = ['warning alphaword1x', 'TypeError: load failed for "password: bravoword2x', 'charlieword3x"', ...frames].join('\n');
-    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
-      // No diagnosticsDir: the default, `<WE_DAEMON_STATE_DIR>/smoke-diagnostics`.
-      env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
-      runChild: async () => { throw Object.assign(new Error('exited null: warning alphaword1x'), { signal: 'SIGTRAP', status: null, stderr }); },
+  describe('boot-failure diagnostic propagation', () => {
+    let f;
+    beforeEach(() => {
+      // Bound real-git setup with the hook deadline, independently of the 5s behavior checks.
+      f = makeFixture();
+      addDispatchOverlay(f);
     });
-    const result = await rebuildClone({ root: f.cloneDir,
-      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
-      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
-      runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
-    });
-    expect(result.adopted).toBeFalsy();
-    const held = readRebuildState(f.cloneDir, f.env).held;
-    expect(held.details[0].detail).toContain('fixture.mjs: child failed (signal=SIGTRAP, exitCode=null, attempts=2');
-    expect(held.details[0].detail).toContain('class=TypeError: load failed for <…>');
-    const file = boot.entries[0].stderrFile;
-    expect(dirname(file)).toBe(join(f.env.WE_DAEMON_STATE_DIR, 'smoke-diagnostics'));
-    expect(held.details[0].detail).toContain(`stderr=${file}`);
-    expect(statSync(file).mode & 0o777).toBe(0o600);
-    expect(readFileSync(file, 'utf8')).toBe(`${stderr.split('\n').slice(-30).join('\n')}\n`);
-    const alert = result.alerts.find((a) => a.kind === 'daemon-held-on-last-good');
-    expect(alert.detail.details).toEqual(held.details);
-    const stale = result.alerts.find((a) => a.kind === 'clone-held-stale');
-    expect(stale.detail.broken.details).toEqual(held.details);
-    expectAbsent(sinksOf(f, result), ['alphaword1x', 'bravoword2x', 'charlieword3x', 'native stack', 'frame29x']);
-  });
 
-  it('six failed boot entries each keep name, signal, exit code and class within the boot detail cap', async () => {
-    const f = makeFixture();
-    addDispatchOverlay(f);
-    const entries = ['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `skills-src/conveyor/some-long-daemon-entry-name-${x}.mjs`);
-    const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
-      env: { [DAEMON_ENTRIES_ENV]: entries.join(','), WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
-      runChild: async () => { throw Object.assign(new Error(`exited 1: ${'m'.repeat(900)}`), {
-        signal: null, status: 1, stderr: `RangeError: ${'q'.repeat(200)}\n${'cr\r'.repeat(5_000)}\nkiloword4x`,
-      }); },
+    it('a boot failure reaches held state and self-sync alerts as its summary only; the tail is a 0600 file under the state dir', async () => {
+      const frames = Array.from({ length: 30 }, (_, i) => `native stack frame${i}x`);
+      const stderr = ['warning alphaword1x', 'TypeError: load failed for "password: bravoword2x', 'charlieword3x"', ...frames].join('\n');
+      const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
+        // No diagnosticsDir: the default, `<WE_DAEMON_STATE_DIR>/smoke-diagnostics`.
+        env: { [DAEMON_ENTRIES_ENV]: 'fixture.mjs', WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
+        runChild: async () => { throw Object.assign(new Error('exited null: warning alphaword1x'), { signal: 'SIGTRAP', status: null, stderr }); },
+      });
+      const result = await rebuildClone({ root: f.cloneDir,
+        env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+        prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+        runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+      });
+      expect(result.adopted).toBeFalsy();
+      const held = readRebuildState(f.cloneDir, f.env).held;
+      expect(held.details[0].detail).toContain('fixture.mjs: child failed (signal=SIGTRAP, exitCode=null, attempts=2');
+      expect(held.details[0].detail).toContain('class=TypeError: load failed for <…>');
+      const file = boot.entries[0].stderrFile;
+      expect(dirname(file)).toBe(join(f.env.WE_DAEMON_STATE_DIR, 'smoke-diagnostics'));
+      expect(held.details[0].detail).toContain(`stderr=${file}`);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      expect(readFileSync(file, 'utf8')).toBe(`${stderr.split('\n').slice(-30).join('\n')}\n`);
+      const alert = result.alerts.find((a) => a.kind === 'daemon-held-on-last-good');
+      expect(alert.detail.details).toEqual(held.details);
+      const stale = result.alerts.find((a) => a.kind === 'clone-held-stale');
+      expect(stale.detail.broken.details).toEqual(held.details);
+      expectAbsent(sinksOf(f, result), ['alphaword1x', 'bravoword2x', 'charlieword3x', 'native stack', 'frame29x']);
     });
-    const result = await rebuildClone({ root: f.cloneDir,
-      env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
-      prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
-      runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+
+    it('six failed boot entries each keep name, signal, exit code and class within the boot detail cap', async () => {
+      const entries = ['a', 'b', 'c', 'd', 'e', 'f'].map((x) => `skills-src/conveyor/some-long-daemon-entry-name-${x}.mjs`);
+      const boot = await checkDaemonEntriesBoot({ root: f.cloneDir, log: { error() {} },
+        env: { [DAEMON_ENTRIES_ENV]: entries.join(','), WE_DAEMON_STATE_DIR: f.env.WE_DAEMON_STATE_DIR },
+        runChild: async () => { throw Object.assign(new Error(`exited 1: ${'m'.repeat(900)}`), {
+          signal: null, status: 1, stderr: `RangeError: ${'q'.repeat(200)}\n${'cr\r'.repeat(5_000)}\nkiloword4x`,
+        }); },
+      });
+      const result = await rebuildClone({ root: f.cloneDir,
+        env: { ...f.env, WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' },
+        prState: async () => null, lockOpts: LOCK_OPTS, log: { error() {} },
+        runSmoke: async () => ({ verdict: 'code', smoke: { results: [{ name: 'daemon-entries-boot', ...boot }] } }),
+      });
+      const text = readRebuildState(f.cloneDir, f.env).held.details[0].detail;
+      for (const entry of entries) expect(text).toContain(`${entry}: child failed (signal=null, exitCode=1, attempts=1`);
+      expect(text.match(/ stderr=\S+ class=RangeError: q{68}$/gm)).toHaveLength(6);
+      expect(text.length).toBeLessThanOrEqual(4_000);
+      expectAbsent(sinksOf(f, result), ['kiloword4x', 'mmmmmmmm', 'q'.repeat(69)]);
     });
-    const text = readRebuildState(f.cloneDir, f.env).held.details[0].detail;
-    for (const entry of entries) expect(text).toContain(`${entry}: child failed (signal=null, exitCode=1, attempts=1`);
-    expect(text.match(/ stderr=\S+ class=RangeError: q{68}$/gm)).toHaveLength(6);
-    expect(text.length).toBeLessThanOrEqual(4_000);
-    expectAbsent(sinksOf(f, result), ['kiloword4x', 'mmmmmmmm', 'q'.repeat(69)]);
   });
 
   it('a boot failure still names its culprit files: typed paths read from the raw text in-process, not from the summary', async () => {
