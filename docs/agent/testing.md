@@ -6413,6 +6413,20 @@ Merge-path checklist answers (this slice observes seat selection and has no gate
 | 13 Liveness | No agent process is launched and no verdict is recorded by the observer; thrown-draw tests preserve the completed run. |
 | 14 Simplicity | One stateless append hook and one append-only sidecar; no retry machinery, markers or second scorecard rewrite. Byte comparisons and one-line-per-run assertions enforce the boundary. |
 - [Testing topic notes and authoring guidance](testing/README.md)
+## Hotpatch admission fixtures
+
+`hotpatch-guards.test.mjs` exercises the shared receipt/audit guards and bounded production readers.
+The shard plan comes from `origin/main` and shards must share the selected test check's suite.
+`daemon-overlay.test.mjs` also exercises the real add lock and store: a green preflight cannot
+authorize add after CI turns red. Keep the production readers independent of lifecycle effects.
+
+## Hotpatch flow recovery (P8)
+
+Hotpatch tests import only `scripts/lib/flow-engine/index.mjs`. Journal intent rows
+carry non-advancing unknown Transitions and are excluded from completion replay.
+Exercise both crash windows: before add, change ready evidence to red; after add,
+retain the registration and require a fresh list read without a second add. Guard
+reader exceptions must escalate, including live evidence: unknown never removes.
 
 
 ## Test timing ownership

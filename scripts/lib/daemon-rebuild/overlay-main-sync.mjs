@@ -370,7 +370,7 @@ function mainRedKnown(state, ref, main, tip, env, now = () => new Date().toISOSt
 }
 export function selectSyncTargets(state) {
   if (state?.corrupt || !Array.isArray(state?.overlays)) throw new Error('overlay state unavailable; operator repair required');
-  return state.overlays.filter(o => !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
+  return state.overlays.filter(o => !o.ref?.startsWith('hotpatch/') && !state.overlays.some(other => other !== o && other.stackBases?.includes(o.ref))).map(o => o.ref);
 }
 function openJobLog(root, env) {
   const file = `${overlayFilePath(root, env)}.main-sync.log`;
@@ -797,6 +797,7 @@ function coveredWithMultiplicity(needed, supplied) {
   return true;
 }
 export async function runOverlayMainSync({ root, ref, token, env = process.env, deps = {} }) {
+  if (ref?.startsWith('hotpatch/')) return { ok: false, reason: 'hotpatch-main-sync-forbidden' };
   const io = deps.io ?? fs, event = deps.appendOverlayEvent ?? appendOverlayEvent;
   const now = deps.now ?? (() => new Date().toISOString());
   let step = 'state';
