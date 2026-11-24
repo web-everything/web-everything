@@ -1197,6 +1197,7 @@ export function runRedTeamOnSkip({ repo, plan, rawPrs, capacity, dispatch, log =
           try {
             if (row.staleRecovery && !abandon({ repo, pr: row.prNumber, head: row.head }).ok) throw new PreStartDispatchRefusalError('stale abandonment refused');
             const result = dispatch({ pr: row.prNumber, repo,
+              ...(row.head ? { expectedHead: row.head } : {}),
               ...(row.action === 'dispatch' ? { redTeamOnly: true, redTeamMode: row.mode } : {}),
               ...(preferLane != null ? { preferLane } : {}) });
             if (result?.skipped || !Number.isInteger(result?.jobPid)) {

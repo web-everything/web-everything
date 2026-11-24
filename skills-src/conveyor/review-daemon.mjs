@@ -838,7 +838,10 @@ export function runReviewTick({
         notStarted.push({ prNumber: d.prNumber, reason: refusal.why });
         continue;
       }
+      // The head this review was planned against: the job refuses (no verdict) unless live head still matches it.
+      const plannedHead = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(plannedHead ? { expectedHead: plannedHead } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),

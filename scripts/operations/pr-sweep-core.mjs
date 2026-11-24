@@ -210,7 +210,7 @@ export function nextActions(pr) {
     release: { summary: 'release the draft-withdrawn hold (re-open for review) or close the PR',
       command: `gh pr ready ${n} --repo ${r} && gh pr edit ${n} --repo ${r} --remove-label review-status:draft-withdrawn   # or: gh pr close ${n} --repo ${r}` },
     rerunReview: { summary: 'start the review / red-team job that nobody is running',
-      command: `node scripts/operations/review-job.mjs run --pr=${n} --repo=${r}` },
+      command: `node scripts/operations/review-job.mjs run --pr=${n} --repo=${r} --expected-head=${pr.headRefOid ?? pr.headSha ?? '<full head sha>'}` },
     why: { summary: 'nothing is running it: find the dispatch hold, then fix the tooling (file a card), not the PR by hand',
       command: `node scripts/operations/run.mjs why --pr=${n} --repo=${r}` },
   };

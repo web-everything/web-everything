@@ -276,12 +276,12 @@ it('CAS refuses a changed raw digest without changing either file', () => {
 });
 it('A1 / matrix 11: --pr --repo --prefer-lane --red-team-only round-trip; removed --red-team-plan refuses', () => {
   const f = fixture(), spawnJob = vi.fn(() => 123);
-  dispatchReviewJob({ pr, repo, root: f.dir, dir: join(f.dir, 'jobs'), redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7,
+  dispatchReviewJob({ expectedHead: head, io: { liveHead: () => head }, pr, repo, root: f.dir, dir: join(f.dir, 'jobs'), redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7,
     spawnJob, checkStaleness: () => ({ stale: false }), readCompletion: () => null, resolveSettingsEnv: () => ({}), checkoutExists: () => true });
   const argv = spawnJob.mock.calls[0][0].argv.slice(1), runJob = vi.fn(() => ({}));
   expect(argv.some(a => a.startsWith('--red-team-plan'))).toBe(false);
   runReviewJobCli(argv, { runJob });
-  expect(runJob).toHaveBeenCalledWith({ pr: String(pr), repo, preferLane: 7, redTeamOnly: true, redTeamMode: 'fresh' });
+  expect(runJob).toHaveBeenCalledWith({ pr: String(pr), repo, preferLane: 7, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head });
   runJob.mockClear(); runReviewJobCli([...argv, '--red-team-plan={}'], { runJob });
   expect(runJob).not.toHaveBeenCalled(); process.exitCode = 0;
 });
@@ -299,7 +299,7 @@ it.each([1, 2, 3, 4, 5, 6, 7, 8, 9])('A3 / matrix %s: persisted dead job settles
     comments.push({ body: redTeamMarker(pr, head), author: { login: 'web-everything' } });
     return { status: input.redTeamMode === 'resume' ? 'resumed' : 'ran', findings: [], comment: { status: 'posted' } };
   });
-  const io = { root: f.dir, now: Date.now, newActorId: () => 'fixture', readPrevCompletion: () => null,
+  const io = { root: f.dir, liveHead: () => head, now: Date.now, newActorId: () => 'fixture', readPrevCompletion: () => null,
     claim: () => ({ ok: true }), updateRecord: vi.fn(), unclaim: vi.fn(), acquireLane: () => ({ lanePath: f.dir }),
     releaseLane: vi.fn(), report: vi.fn(), log: vi.fn(), prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
     readRedTeamOnlyPayload: f.io.readRedTeamOnlyPayload, redTeamStatus: f.io.redTeamStatus,
@@ -672,7 +672,7 @@ it.each(['stale-recovery', 'failed-seat-retry'].flatMap(kind => [false, true].ma
   const before = readFileSync(f.path, 'utf8'), gate = vi.fn(), settle = vi.fn();
   let winner;
   const status = vi.fn(f.io.redTeamStatus);
-  const io = { root: f.dir, now: Date.now, newActorId: () => 'fixture', readPrevCompletion: () => null,
+  const io = { root: f.dir, liveHead: () => head, now: Date.now, newActorId: () => 'fixture', readPrevCompletion: () => null,
     claim: () => ({ ok: true }), updateRecord: vi.fn(), unclaim: vi.fn(), acquireLane: () => ({ lanePath: f.dir }),
     releaseLane: vi.fn(), report: vi.fn(), log: vi.fn(), prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
     readRedTeamOnlyPayload: f.io.readRedTeamOnlyPayload, redTeamStatus: status,

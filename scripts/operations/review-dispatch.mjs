@@ -753,7 +753,8 @@ if (IS_CLI) {
     const mode = flag('mode') === 'session' || flag('mode') === 'job' ? flag('mode') : resolveReviewDispatchMode();
     if (mode === 'job') {
       try {
-        const r = dispatchReviewJob({ pr: flag('pr'), repo: flag('repo') });
+        const r = dispatchReviewJob({ pr: flag('pr'), repo: flag('repo'), ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }) });
+        if (r.refused) { writeLineSync(2, `dispatch-review: refused (${r.outcome}) — ${r.reason}`); process.exitCode = 75; return; }
         writeAllSync(1, r.skipped
           ? `dispatch-review: ${r.repo}#${r.pr} not started — ${r.skipped}${r.jobPid ? ` (job pid ${r.jobPid})` : ''}\n`
           : `dispatch-review: started review job pid ${r.jobPid} (slug ${r.sessionSlug}) for ${r.repo}#${r.pr} — no Claude wrapper session\n`

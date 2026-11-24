@@ -123,6 +123,19 @@ describe('live review cap with Node configuration options', () => {
     expect(dispatch).toHaveBeenCalledTimes(3);
   });
 
+  it('daemon dispatch passes the planned head as expectedHead (an unpinned job would refuse)', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '' });
+    const head = 'c'.repeat(40);
+    const dispatch = vi.fn(() => ({ agentId: 'started-review' }));
+    runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, headRefOid: head }], refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 1, expectedHead: head }));
+  });
+
   it.each([
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs --files=changed.mjs',
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs run --files=changed.mjs',
