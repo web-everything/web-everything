@@ -759,7 +759,9 @@ export function extractPassTimings(stderr) {
 const STDERR_LINE_MAX = 200;
 /** Node warning preamble lines that would otherwise hide the real first error. */
 const NODE_WARNING_NOISE = /^(?:\(node:\d+\) (?:Deprecation|Experimental)Warning:|\(Use `node --trace-deprecation)/;
-const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
+const KNOWN_ERROR_SHAPE = /^(?:\w*Error\b|error:|npm ERR!|ERR!|ERR_\w+|FAIL\b|fatal:|✗|×)/i;
+const UNCLASSIFIED_STDERR = '[unclassified stderr; see local log]';
+const SECRET_LINE =/gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert|session/i;
 // Env-style KEY=value / KEY: value whose key names a secret, and JWT-shaped tokens.
 const SECRET_ASSIGNMENT = /\b[\w.-]*(?:session|token|secret|key|pass|auth)[\w.-]*\s*[=:]\s*\S|\beyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]*/i;
@@ -774,9 +776,11 @@ const URL_USERINFO =/:\/\/[^/\s]*@/;
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
   const raw = String(stderr ?? '');
-  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim())
-    .find(l => l && !NODE_WARNING_NOISE.test(l));
+  const lines = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).filter(Boolean);
+  const line = lines.find(l => !NODE_WARNING_NOISE.test(l));
   if (!line) return '';
+  // After skipping warning noise the picked line is not the formerly protected first line: allowlist known error shapes only.
+  if (lines[0] !== line && !KNOWN_ERROR_SHAPE.test(line)) return UNCLASSIFIED_STDERR;
   if (SECRET_LINE.test(line) || SECRET_ASSIGNMENT.test(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
   for (const [k, v] of Object.entries(env ?? {})) {

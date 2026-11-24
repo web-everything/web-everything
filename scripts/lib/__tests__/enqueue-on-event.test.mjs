@@ -474,10 +474,15 @@ describe('createEnqueueOnEvent', () => {
 
   it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {
     const noise = '(node:1) DeprecationWarning: The `punycode` module is deprecated.\n(Use `node --trace-deprecation ...` to show where)\n(node:1) ExperimentalWarning: x\n';
-    expect(enqueueModule.firstStderrErrorLine(`${noise}real failure`)).toBe('real failure');
+    expect(enqueueModule.firstStderrErrorLine(`${noise}TypeError: x`)).toBe('TypeError: x');
+    expect(enqueueModule.firstStderrErrorLine(`${noise}opaque-value-123`)).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: secret follows\nopaque-value-123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('plain first line')).toBe('plain first line');
     expect(enqueueModule.firstStderrErrorLine(noise)).toBe('');
     expect(enqueueModule.firstStderrErrorLine('Error: DeprecationWarning is fatal')).toBe('Error: DeprecationWarning is fatal');
-    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nSESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nSESSION=opaque123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nError: SESSION=opaque123')).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('SESSION: opaque123')).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('jwt eyJhbGciOi.eyJzdWIiOi.sig123')).toBe('[redacted]');
   });
