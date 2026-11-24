@@ -854,6 +854,11 @@ jobs:
               fi ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
+          # The matrix comes from a separate `shards` output: it must agree with `run`, or the coverage is unproven.
+          case "${{ needs.daemon-soak-scope.outputs.run }}/${{ needs.daemon-soak-scope.outputs.shards }}" in
+            true/\[1,2,3,4,5,6,7,8\]|false/\[1\]) ;;
+            *) echo "daemon-soak-scope run/shards outputs disagree (run/shards: '${{ needs.daemon-soak-scope.outputs.run }}/${{ needs.daemon-soak-scope.outputs.shards }}')."; exit 1 ;;
+          esac
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1

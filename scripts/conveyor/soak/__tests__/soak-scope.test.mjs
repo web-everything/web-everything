@@ -533,8 +533,11 @@ describe('ci.yml daemon-soak scope step wiring', () => {
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
     const lines = readFileSync(output, 'utf8').trim().split('\n');
-    lastShards = lines.find((l) => l.startsWith('shards=')) ?? '';
-    return lines.find((l) => l.startsWith('run=')) ?? '';
+    // Exactly one assignment of each: GitHub consumes the last one, so duplicates are a failure.
+    expect(lines.filter((l) => l.startsWith('run=')).length).toBe(1);
+    expect(lines.filter((l) => l.startsWith('shards=')).length).toBe(1);
+    lastShards = lines.find((l) => l.startsWith('shards='));
+    return lines.find((l) => l.startsWith('run='));
   }
 
   // CI-SOAK-SCOPE-MQ: merge-queue runs use the same scope decision but always keep shard 1.

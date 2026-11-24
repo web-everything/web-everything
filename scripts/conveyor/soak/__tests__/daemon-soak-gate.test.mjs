@@ -32,11 +32,12 @@ function gateScript() {
   return body.join('\n');
 }
 
-function runGate({ scopeResult, run, shardResult, event = 'merge_group' }) {
+function runGate({ scopeResult, run, shardResult, event = 'merge_group', shards }) {
   const values = {
     'github.event_name': event,
     'needs.daemon-soak-scope.result': scopeResult,
     'needs.daemon-soak-scope.outputs.run': run,
+    'needs.daemon-soak-scope.outputs.shards': shards ?? (run === 'false' ? '[1]' : '[1,2,3,4,5,6,7,8]'),
     'needs.soak-shard.result': shardResult,
   };
   const script = gateScript().replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, expr) => {
@@ -68,6 +69,12 @@ describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
     for (const shardResult of ['skipped', 'failure', 'cancelled', '']) {
       expect(runGate({ event: 'merge_group', scopeResult: 'success', run: 'false', shardResult }), shardResult).not.toBe(0);
     }
+  });
+
+  it('fails when the shards output disagrees with run (run=true with [1], run=false with other shards)', () => {
+    expect(runGate({ scopeResult: 'success', run: 'true', shards: '[1]', shardResult: 'success' })).not.toBe(0);
+    expect(runGate({ scopeResult: 'success', run: 'false', shards: '[2]', shardResult: 'success' })).not.toBe(0);
+    expect(runGate({ scopeResult: 'success', run: 'false', shards: '', shardResult: 'success' })).not.toBe(0);
   });
 
   it('the shard matrix is decided by the scope job: shard 1 always, shards 2-8 only on run=true or any error', () => {
