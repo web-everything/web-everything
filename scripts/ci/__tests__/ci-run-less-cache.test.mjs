@@ -10,6 +10,10 @@ const fuiJobs = ['standards', 'test-shard', 'integration-part', 'smoke'];
 const lightGuard = "needs.changes.outputs.light != 'true'";
 const integrationGuard = "steps.gate.outputs.run == 'true'";
 const paths = (value) => String(value ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+const mainHistoryPath = '${{ runner.temp }}/main-history';
+const mainHistoryKey = 'main-history-v1-${{ github.run_id }}';
+const mainPushGuard = "${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}";
+const mainHistoryJobs = ['standards', 'test-shard', 'integration-part', 'daemon-soak-scope', 'soak-shard'];
 
 function step(name, predicate) {
   const matches = jobs[name].steps.filter(predicate);
@@ -72,12 +76,48 @@ describe('ci.yml caches beyond the npm download cache', () => {
         const cachedPaths = paths(cache.with?.path);
         expect(cachedPaths.length, `${name}: cache paths must be explicit`).toBeGreaterThan(0);
         for (const path of cachedPaths) {
-          // The browser bundle is the only reviewed public payload. An allowlist also rejects
-          // renamed private directories, workspace parents, expressions and wildcard paths.
-          expect(path, `${name}: unreviewed cache payload`).toBe('~/.cache/ms-playwright');
+          // Only browser bundles and the public main commit/tree pack are reviewed payloads.
+          // Exact entries reject private directories, parents, other expressions and globs.
+          expect(['~/.cache/ms-playwright', mainHistoryPath], `${name}: unreviewed cache payload`).toContain(path);
         }
       }
     }
+  });
+
+  it('limits main history caching to five restores and one main-push-only export and upload', () => {
+    const mirrors = Object.entries(jobs).flatMap(([name, job]) =>
+      (job.steps ?? []).filter((s) => s.uses?.startsWith('actions/cache') && paths(s.with?.path).includes(mainHistoryPath))
+        .map((cache) => ({ name, cache })),
+    );
+    const restores = mirrors.filter(({ cache }) => cache.uses === 'actions/cache/restore@v4');
+    const uploads = mirrors.filter(({ cache }) => cache.uses === 'actions/cache/save@v4');
+    expect(mirrors).toHaveLength(6);
+    expect(restores.map(({ name }) => name).sort()).toEqual([...mainHistoryJobs].sort());
+    expect(uploads.map(({ name }) => name)).toEqual(['standards']);
+    for (const { cache } of mirrors) {
+      expect(paths(cache.with.path)).toEqual([mainHistoryPath]);
+      expect(cache.with.key).toBe(mainHistoryKey);
+    }
+    for (const { name, cache } of restores) {
+      expect(cache.with['restore-keys']).toBe('main-history-v1-');
+      const steps = jobs[name].steps;
+      const checkout = steps[steps.indexOf(cache) + 1];
+      const fetch = steps[steps.indexOf(cache) + 2];
+      expect(checkout.uses).toBe('actions/checkout@v4');
+      expect(checkout.with['fetch-depth']).toBe(50);
+      expect(cache.if).toBe(checkout.if);
+      expect(fetch.name).toBe('Fetch main history (blobless)');
+      expect(fetch.env.MAIN_HISTORY_CACHE_DIR).toBe(mainHistoryPath);
+    }
+    const exportStep = step('standards', (s) => s.name === 'Save main history mirror');
+    const upload = uploads[0].cache;
+    expect(exportStep.run).toBe('sh scripts/ci/fetch-main-history.sh save');
+    expect(exportStep['working-directory']).toBe('web-everything');
+    expect(exportStep.env.MAIN_HISTORY_CACHE_DIR).toBe(mainHistoryPath);
+    expect(exportStep.if).toBe(mainPushGuard);
+    expect(exportStep).not.toHaveProperty('continue-on-error');
+    expect(upload.if).toBe(mainPushGuard);
+    expect(jobs.standards.steps.indexOf(upload)).toBe(jobs.standards.steps.indexOf(exportStep) + 1);
   });
 
   it('smoke no longer caches Playwright browsers: the pinned container ships them', () => {
