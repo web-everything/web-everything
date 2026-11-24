@@ -32,4 +32,11 @@ describe('review fast path fails closed', () => {
     expect(reviewDispatchContext({ body: '' })).toMatchObject({ careLevel: 'high', scopePaths: [] });
     expect(reviewDispatchContext({ body: '', files: [{ path: 'a' }] }).careLevel).toBeUndefined();
   });
+  it('a failed file read refuses the PR; a present file list keeps normal routing', async () => {
+    const o = base(); o.readPr = ({ pending }) => { if (pending) return []; throw Error('files read failed'); };
+    await runFastPass(o);
+    expect(o.dispatch).not.toHaveBeenCalled();
+    const ok = base(); await runFastPass({ ...ok, readPr: ({ pending }) => pending ? [] : { ...pr, files: [{ path: 'docs/a.md' }] } });
+    expect(ok.dispatch.mock.calls[0][0].careLevel).toBeUndefined();
+  });
 });

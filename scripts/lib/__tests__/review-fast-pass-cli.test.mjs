@@ -114,3 +114,13 @@ it.each(['writer', 'unreadable', 'quarantine', 'ordinary', 'reserve', 'lanes', '
   const { exerciseFastCli } = await import('./fixtures/review-fast-cli-integration.mjs');
   expect(await exerciseFastCli([kind])).toEqual({ violations: [] });
 });
+
+it('forces job mode and refuses an explicit session-mode dispatch', () => {
+  const dispatch = vi.fn(() => ({ mode: 'job' }));
+  const io = { readLivePr: () => ({ headRefOid: 'a'.repeat(40) }) };
+  const o = fastPassOptions({ repo: 'fixture/repo', options: { dispatch }, io });
+  expect(() => o.dispatch({ pr: 1, expectedHead: 'a'.repeat(40), mode: 'session' })).toThrow('job mode only');
+  expect(dispatch).not.toHaveBeenCalled();
+  o.dispatch({ pr: 1, expectedHead: 'a'.repeat(40) });
+  expect(dispatch.mock.calls[0][0].mode).toBe('job');
+});

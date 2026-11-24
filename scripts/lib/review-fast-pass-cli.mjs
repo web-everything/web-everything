@@ -66,10 +66,11 @@ export function fastPassOptions({ repo, options, budget = options.liveReviewBudg
     },
     hostAdmission: options.hostAdmission,
     dispatch: args => {
-      // This read is immediately adjacent to dispatch, including the session mode that lacks a head pin.
+      // JOB mode only: expectedHead is enforced in code there. Session mode is refused with a reason.
+      if (args.mode !== undefined && args.mode !== 'job') throw Error('fast pass dispatches in job mode only; session mode refused');
       const live = readLivePr({ repo, pr: args.pr });
       if (live?.headRefOid !== args.expectedHead) throw Error('head moved or unreadable before spawn');
-      return options.dispatch({ ...args, strictStackEvidence: true, checkStaleness: checkout => {
+      return options.dispatch({ ...args, mode: 'job', strictStackEvidence: true, checkStaleness: checkout => {
         const evidence = staleness({ autoFf: false, cleanOnly: true, strict: true,
           run: argv => runIn(argv, { cwd: checkout }) });
         if (!evidence || evidence.offline || (!evidence.fresh && evidence.action !== 'warn')) throw Error('main freshness unknown');
