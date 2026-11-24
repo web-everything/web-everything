@@ -477,6 +477,9 @@ describe('createEnqueueOnEvent', () => {
     expect(enqueueModule.firstStderrErrorLine(`${noise}real failure`)).toBe('real failure');
     expect(enqueueModule.firstStderrErrorLine(noise)).toBe('');
     expect(enqueueModule.firstStderrErrorLine('Error: DeprecationWarning is fatal')).toBe('Error: DeprecationWarning is fatal');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nSESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION: opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJhbGciOi.eyJzdWIiOi.sig123')).toBe('[redacted]');
   });
 
   it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {

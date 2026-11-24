@@ -57,6 +57,7 @@ function fixture(mode = 'real') {
     }
     if (endpoint?.endsWith('/actions/jobs/901/logs')) {
       if (mode === 'expired log') throw new Error('410 expired');
+      if (mode === 'ansi log') return `\u001b[31m${failureLog.replace('\n', '\u001b[0m\n\u001b[31m')}\u001b[0m`;
       return mode === 'infra' ? 'The runner has lost communication with the server.'
         : mode === 'incomplete test paths' ? `${failureLog}\nFAIL unidentified failing test\nAssertionError: expected false`
         : mode === 'oversized log' ? failureLog + 'x'.repeat(300000) : failureLog;
@@ -88,11 +89,14 @@ describe('drain MQ failure production adapter', () => {
     expect(f.exec.mock.calls.every(([, , opts]) => Number.isFinite(opts.timeout) && Number.isFinite(opts.maxBuffer))).toBe(true);
   });
 
-  it('job-log reads pass --allow-escape-sequences so ANSI logs stay readable', async () => {
-    const f = fixture();
-    await routeMqFailureOnHold(f.options);
+  it('job-log reads pass --allow-escape-sequences and an ANSI-colored log still routes with evidence', async () => {
+    const f = fixture('ansi log');
+    expect(await routeMqFailureOnHold(f.options)).toMatchObject({ routed: true });
     const logCall = f.exec.mock.calls.find(([, args]) => args.some(arg => String(arg).endsWith('/actions/jobs/901/logs')));
     expect(logCall[1]).toContain('--allow-escape-sequences');
+    const comment = f.writes().find(([, args]) => args[0] === 'pr' && args[1] === 'comment');
+    expect(parseMqFailureRoute({ comment: { body: comment[2].input, author: { login: 'chalbert' } }, expected: identity }))
+      .toMatchObject({ failedJobs: ['unit'], testFiles: ['tests/widget.test.mjs'], complete: true });
   });
 
   it.each(['infra', 'unreadable', 'wrong parent', 'wrong reason', 'missing merge commit', 'wrong run commit',
