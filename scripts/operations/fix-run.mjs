@@ -950,6 +950,13 @@ export async function runFixCli(argv = [], {
       .map(entry => /^(\d+) ([0-9a-f]+) ([0-3])\t([\s\S]*)$/.exec(entry))
       .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
       .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
+    const removeMergeEvidence = () => {
+      // Drop every index stage, even for clean tracked evidence absent from porcelain. Never touch its worktree bytes.
+      run('git', [...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info'], {
+        cwd: lanePath, env: gitEnv, input: `0 ${'0'.repeat(before.length)}\t.fix-evidence.md\0`,
+      });
+      if (indexEntries('.fix-evidence.md').length) throw new LauncherError('conflict unresolved in .fix-evidence.md: index removal failed');
+    };
     let preparedHead = before;
     // Keep Git's marker allocation bounded (2.43 overflows its int parser on e.g. 99999999999).
     // Oversized attributes use the normal width 7; preserve the tracked attributes and restore local overrides.
@@ -1015,8 +1022,10 @@ export async function runFixCli(argv = [], {
       checkLane(before, false);
       try { mergeWithBoundedMarkers(target); }
       catch (e) {
-        const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
+        let conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
         if (!inMerge() || !conflicts.length) throw e;
+        // Root evidence is removed from the merge index, never resolved as content. All conflict consumers inherit this.
+        conflicts = conflicts.filter(c => c.path !== '.fix-evidence.md');
         // Only a text both-modified/both-added conflict can be resolved by editing one file. Anything else (binary,
         // modify/delete, rename) is aborted BEFORE the agent runs and recorded as failed; after ROUTED_CODEX_MAX_UNPRODUCTIVE such
         // consecutive unproductive runs on the same head, the next repair falls back to Claude.
@@ -1029,6 +1038,7 @@ export async function runFixCli(argv = [], {
         unmerged = conflicts.map(c => c.path);
       }
       if (!unmerged.length && inMerge()) {
+        removeMergeEvidence();
         preparedHead = commitMerge();
       }
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
@@ -1141,14 +1151,14 @@ export async function runFixCli(argv = [], {
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);
-      // Conflicted evidence must lose its unmerged index stages; stageLaneFiles removes it without reading the worktree.
-      const stage = [...new Set([...unmerged.filter(path => isStageable(path, path === '.fix-evidence.md')), ...unstagedPaths(statusAfterAgent)])];
+      const stage = [...new Set([...unmerged.filter(path => isStageable(path)), ...unstagedPaths(statusAfterAgent)])]
+        .filter(path => path !== '.fix-evidence.md');
       stageLaneFiles(stage);
+      removeMergeEvidence();
       // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
       const unresolvedStaged = unmerged.filter(path => {
         const entries = indexEntries(path);
-        if (path === '.fix-evidence.md') return entries.length !== 0;
         if (entries.length !== 1 || entries[0].stage !== '0' || !REGULAR_MODES.has(entries[0].mode)) return true;
         const { sizes, allowance } = markerSizes.get(path);
         return hasLeftoverMarkers(blob(entries[0].oid), sizes, allowance);

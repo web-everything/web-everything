@@ -876,7 +876,8 @@ describe('runFixCli', () => {
       let added = false;
       const path = '.fix-evidence.md';
       const evidence = 'private fix evidence\n';
-      writeFileSync(join(lane, path), '<<<<<<< HEAD\nold evidence\n=======\nother evidence\n>>>>>>> origin/main\n');
+      const markers = '<<<<<<< HEAD\nold evidence\n=======\nother evidence\n>>>>>>> origin/main\n';
+      writeFileSync(join(lane, path), markers);
       m.spawn.mockImplementation(async () => { writeFileSync(join(lane, path), evidence); });
       if (companion) {
         mkdirSync(dirname(join(lane, companion)), { recursive: true });
@@ -903,7 +904,8 @@ describe('runFixCli', () => {
         if (args.includes('add')) added = true;
         if (args.includes('commit')) {
           expect(removed).toBe(true);
-          expect(readFileSync(join(lane, path), 'utf8')).toBe(evidence);
+          // Evidence-only conflicts now finalize before the agent: no content needs resolving.
+          expect(readFileSync(join(lane, path), 'utf8')).toBe(companion ? evidence : markers);
           merging = false;
         }
         if (args.includes('--abort')) merging = false;
@@ -920,6 +922,35 @@ describe('runFixCli', () => {
       expect(persistEvidence).toHaveBeenCalledWith({ repoKey: 'o_r', pr: '7', text: evidence });
       expect(readFileSync(join(lane, path), 'utf8')).toBe(evidence);
     } finally { rmSync(lane, { recursive: true, force: true }); }
+  });
+  it.each(['markers left', 'deleted', 'rewritten', 'tracked-clean', 'absent'])('finalizes a companion conflict with root evidence %s', async state => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    let added = false;
+    const removals = [];
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UU file.txt\0' + (['tracked-clean', 'absent'].includes(state) ? '' : 'UU .fix-evidence.md\0');
+      if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
+      if (args.includes('--index-info')) removals.push(opts.input);
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files') && args.at(-1) === 'file.txt' && added) return `100644 ${'c'.repeat(40)} 0\tfile.txt\0`;
+      if (args.includes('cat-file')) return 'resolved\n';
+      if (args.includes('commit') || args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run,
+      stageEntry: () => ({ mode: '100644', data: Buffer.from('resolved\n') }),
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : !(p.endsWith('.fix-evidence.md') && state === 'deleted' && m.spawn.mock.calls.length),
+      readFile: p => p.endsWith('.fix-evidence.md') && state === 'markers left'
+        ? '<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> origin/main\n' : 'resolved\n',
+    });
+    expect(out.code).toBe(0);
+    expect(removals).toEqual([`0 ${'0'.repeat(3)}\t.fix-evidence.md\0`]);
+    expect(m.calls.some(c => c.includes('commit'))).toBe(true);
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+    expect(m.calls.filter(c => c.includes('check-attr')).flat()).not.toContain('.fix-evidence.md');
   });
   it.each(['unmerged', 'stage0', 'throw'])('refuses to commit when conflicted evidence removal fails (%s)', async failure => {
     const m = mk(['aaa', 'bbb']);
@@ -1180,6 +1211,58 @@ describe('runFixCli', () => {
       await check({ out, m, git, dir, recordOutcome });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
+  it.each([
+    ['UU', 'rewritten', true], ['UU', 'markers left', true], ['UU', 'deleted', true], ['UU', 'untouched', true],
+    ['AA', 'rewritten', true], ['UD', 'rewritten', true],
+    ['tracked-clean', 'untouched', true], ['deleted', 'rewritten', true], ['absent', 'rewritten', true],
+    ['UU', 'untouched', false], ['tracked-clean', 'untouched', false],
+  ])('real git merge excludes %s root evidence (%s, companion conflict=%s) from the commit tree', async (indexState, worktree, companion) => {
+    const evidencePath = '.fix-evidence.md';
+    const otherEvidence = ['docs/.fix-evidence.md', '.fix-evidence.md.bak', 'my.fix-evidence.md'];
+    const conflictingEvidence = ['UU', 'AA', 'UD'].includes(indexState);
+    let expectedEvidence;
+    await withRealMerge({
+      base: ({ dir }) => {
+        writeFileSync(join(dir, 'file.txt'), 'base\n');
+        mkdirSync(join(dir, 'docs'));
+        otherEvidence.forEach(path => writeFileSync(join(dir, path), 'keep this tracked file\n'));
+        if (!['AA', 'absent'].includes(indexState)) writeFileSync(join(dir, evidencePath), 'base evidence\n');
+      },
+      theirs: ({ dir }) => {
+        writeFileSync(join(dir, 'theirs.txt'), 'theirs\n');
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'theirs\n');
+        if (['UU', 'AA'].includes(indexState)) writeFileSync(join(dir, evidencePath), 'theirs evidence\n');
+        if (['UD', 'deleted'].includes(indexState)) rmSync(join(dir, evidencePath));
+      },
+      ours: ({ dir }) => {
+        writeFileSync(join(dir, 'ours.txt'), 'ours\n');
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'ours\n');
+        if (conflictingEvidence) writeFileSync(join(dir, evidencePath), 'ours evidence\n');
+        if (indexState === 'deleted') rmSync(join(dir, evidencePath));
+      },
+    }, {
+      agent: ({ dir }) => {
+        if (companion) writeFileSync(join(dir, 'file.txt'), 'resolved companion\n');
+        const evidence = join(dir, evidencePath);
+        if (indexState === 'UU' || indexState === 'AA') expect(readFileSync(evidence, 'utf8')).toContain('<<<<<<< HEAD');
+        if (worktree === 'rewritten') writeFileSync(evidence, 'private fix evidence\n');
+        if (worktree === 'deleted') rmSync(evidence);
+        expectedEvidence = existsSync(evidence) ? readFileSync(evidence, 'utf8') : null;
+      },
+    }, ({ out, m, git, dir, recordOutcome }) => {
+      expect(out.code, JSON.stringify(recordOutcome.mock.calls)).toBe(0);
+      expect(m.spawn).toHaveBeenCalledOnce();
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(false);
+      expect(m.calls.filter(c => c.includes('commit'))).toHaveLength(1);
+      expect(git('rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ')).toHaveLength(3);
+      expect(git('ls-tree', '-r', '--name-only', '-z', 'HEAD').split('\0')).not.toContain(evidencePath);
+      expect(git('ls-files', '-s', '--', evidencePath)).toBe('');
+      expect(git('show', 'HEAD:file.txt')).toBe(companion ? 'resolved companion\n' : 'base\n');
+      otherEvidence.forEach(path => expect(git('show', `HEAD:${path}`)).toBe('keep this tracked file\n'));
+      expect(existsSync(join(dir, evidencePath))).toBe(expectedEvidence !== null);
+      if (expectedEvidence !== null) expect(readFileSync(join(dir, evidencePath), 'utf8')).toBe(expectedEvidence);
+    });
+  });
   it.each(['hardlink', 'symlink', 'directory'])('refuses a %s marker override before writes or merge', async (kind) => {
     const root = mkdtempSync(join(tmpdir(), 'fix-marker-link-'));
     const outside = join(root, 'outside');
