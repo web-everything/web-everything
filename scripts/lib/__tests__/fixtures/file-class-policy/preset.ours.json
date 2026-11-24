@@ -1,0 +1,31 @@
+{
+ "presetType": "https://everstandards.dev/ship/file-class-preset/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/file-class-presets/ours",
+ "name": "ours",
+ "description": "what every repo of ours shares; repo rows add the hotspot fixes",
+ "classes": {
+  "x-generated-committed": {
+   "extends": "generated",
+   "committed": true,
+   "pr": "any",
+   "writers": "builder",
+   "unit": "file",
+   "description": "a committed generated file (a lockfile): any change must equal the rebuilt output"
+  }
+ },
+ "rows": [
+  {
+   "glob": "**/package-lock.json",
+   "class": "x-generated-committed",
+   "params": {
+    "builder": {
+     "from": [
+      "**/package.json"
+     ],
+     "command": "npm install --package-lock-only"
+    }
+   },
+   "why": "lockfile: committed, but only as the package manager writes it"
+  }
+ ]
+}

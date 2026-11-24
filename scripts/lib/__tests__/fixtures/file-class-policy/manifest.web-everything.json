@@ -1,0 +1,102 @@
+{
+ "policyType": "https://everstandards.dev/ship/file-class-policy/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+ "level": "repo",
+ "parent": {
+  "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+  "digest": {
+   "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+  }
+ },
+ "repo": "https://github.com/web-everything/web-everything",
+ "rows": [
+  {
+   "glob": "docs/agent/testing.d/*.md",
+   "class": "fragment",
+   "params": {
+    "name": "^[a-z0-9][a-z0-9-]*\\.md$",
+    "item": "md-h2",
+    "joinedInto": "docs/agent/testing.md"
+   },
+   "why": "TESTING-NOTES-SPLIT: one topic per file"
+  },
+  {
+   "glob": "docs/agent/testing.md",
+   "class": "generated",
+   "params": {
+    "builder": {
+     "from": [
+      "docs/agent/testing.d/*.md"
+     ],
+     "command": "node scripts/docs/join-testing-notes.mjs",
+     "onRead": true
+    }
+   },
+   "why": "TESTING-NOTES-SPLIT: the joined view, built on read"
+  },
+  {
+   "glob": "docs/agent/settings-registry.md",
+   "class": "generated",
+   "params": {
+    "builder": {
+     "from": [
+      "scripts/lib/settings-registry-metadata.d/**",
+      "scripts/lib/settings-registry.mjs"
+     ],
+     "command": "npm run settings:registry",
+     "onRead": true
+    }
+   },
+   "why": "GEN-OUT-REGISTRY"
+  },
+  {
+   "glob": "scripts/lib/settings-registry-metadata.json",
+   "class": "generated",
+   "params": {
+    "builder": {
+     "from": [
+      "scripts/lib/settings-registry-metadata.d/**"
+     ],
+     "command": "npm run settings:registry",
+     "onRead": true
+    }
+   },
+   "why": "GEN-OUT-REGISTRY"
+  },
+  {
+   "glob": "scripts/lib/settings-registry-metadata.d/**",
+   "class": "fragment",
+   "params": {
+    "name": "^[A-Za-z0-9._-]+\\.json$",
+    "item": "json-object",
+    "joinedInto": "scripts/lib/settings-registry-metadata.json"
+   },
+   "why": "per-key metadata (hotspot slice 2, 58ae4f2873)"
+  },
+  {
+   "glob": "scripts/ci/test-timings.json",
+   "class": "bot-owned",
+   "params": {
+    "writers": [
+     {
+      "kind": "github-app",
+      "app": "web-everything",
+      "workflow": ".github/workflows/ci-timings-refresh.yml",
+      "ref": "refs/heads/ci/refresh-test-timings",
+      "owner": "@web-everything/ci-bots"
+     }
+    ]
+   },
+   "why": "TIMINGS-BOT-ONLY: ci-timings-refresh is the only writer"
+  },
+  {
+   "glob": "backlog/*.md",
+   "class": "fragment",
+   "params": {
+    "name": "^[0-9a-z]+-[a-z0-9-]+\\.md$",
+    "item": "whole-file"
+   },
+   "why": "one card per file (already the practice)"
+  }
+ ]
+}

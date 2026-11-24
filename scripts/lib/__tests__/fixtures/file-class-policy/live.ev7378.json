@@ -1,0 +1,1014 @@
+{
+ "evaluationType": "https://everstandards.dev/ship/file-class-evaluation/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/file-class-evaluations/we-7378-today",
+ "change": "https://github.com/web-everything/web-everything/pull/7378",
+ "head": "866d48d1d0e061c811fcd898365419beb5a3f897",
+ "base": "f83d40a65e4ca7967879e35d7525a9dd0d6311c4",
+ "policy": [
+  {
+   "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+   "digest": {
+    "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+   }
+  },
+  {
+   "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+   "digest": {
+    "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+   }
+  }
+ ],
+ "files": [
+  {
+   "path": "docs/agent/settings-registry.md",
+   "status": "modified",
+   "class": "generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 2
+   }
+  },
+  {
+   "path": "docs/agent/testing.md",
+   "status": "modified",
+   "class": "generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "scripts/__tests__/daemon-overlay.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/ci/test-timings.json",
+   "status": "modified",
+   "class": "bot-owned",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 5
+   }
+  },
+  {
+   "path": "scripts/conveyor/flows/hotpatch/flow.json",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/daemon-overlay.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/hot-patch.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/daemon-overlays.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/daemon-rebuild-audited-tip.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/daemon-rebuild-events.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/fixtures/hotpatch.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/flow-engine.contract.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/hot-patch-cli.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/hotpatch-guards.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/hotpatch-round1.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/__tests__/hotpatch-withdrawal.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-load-overlay.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-overlays.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/adopt.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/audited-tip.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/auto-rebase.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/overlay-main-sync.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/overlay-strategies.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/plan.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/prepare.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/daemon-rebuild/preview.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/README.md",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/adapters/hotpatch.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/index.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/reference/definition-rules.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/reference/legacy-rules.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/reference/schemas.json",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-engine/shadow.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-v0-interim/index.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-v0-interim/load.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/flow-v0-interim/plan.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/hotpatch-guards.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/hotpatch-readers.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.d/settings/auditBar.json",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 4
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.d/settings/liveWhen.json",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 4
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.d/settings/parallel.json",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 4
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.d/settings/receiptSource.json",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 4
+   }
+  },
+  {
+   "path": "scripts/lib/we-only-checks.json",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/__tests__/codex-audit.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/__tests__/prototype-load.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/codex-audit.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/prototype-load-io.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/review-job-envelope.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/settings/hotpatch.json",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  }
+ ],
+ "findings": [
+  {
+   "path": "docs/agent/settings-registry.md",
+   "kind": "committed-generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 2
+   }
+  },
+  {
+   "path": "docs/agent/testing.md",
+   "kind": "committed-generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "scripts/ci/test-timings.json",
+   "kind": "not-writer",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 5
+   }
+  },
+  {
+   "path": "docs/agent/settings-registry.md",
+   "kind": "build-missing",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 2
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.json",
+   "kind": "build-missing",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 3
+   }
+  },
+  {
+   "path": "docs/agent/testing.md",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "docs/agent/settings-registry.md",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 2
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.json",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 3
+   }
+  }
+ ],
+ "verdict": {
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+   {
+    "name": "https://github.com/web-everything/web-everything@866d48d1d0e061c811fcd898365419beb5a3f897",
+    "digest": {
+     "gitCommit": "866d48d1d0e061c811fcd898365419beb5a3f897"
+    }
+   }
+  ],
+  "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+  "predicate": {
+   "verdict": "fail",
+   "policy": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+    "digest": {
+     "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+    }
+   },
+   "evidence": [
+    {
+     "kind": "x-ship-change-diff",
+     "uri": "https://github.com/web-everything/web-everything/pull/7378/files",
+     "digest": {
+      "sha256": "db187b544da038f05d63598c9aacd9baf57a50bb00656b8cdead89277bb3ef23"
+     },
+     "provenanceTier": "probe"
+    }
+   ],
+   "evaluatedAt": "2026-11-23T14:31:00Z",
+   "examined": {
+    "count": 52,
+    "unit": "changed-file"
+   }
+  }
+ },
+ "at": "2026-11-23T14:31:00Z"
+}

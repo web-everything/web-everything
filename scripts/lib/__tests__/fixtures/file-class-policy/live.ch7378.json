@@ -1,0 +1,297 @@
+{
+ "change": "https://github.com/web-everything/web-everything/pull/7378",
+ "head": "866d48d1d0e061c811fcd898365419beb5a3f897",
+ "base": "f83d40a65e4ca7967879e35d7525a9dd0d6311c4",
+ "files": [
+  {
+   "status": "modified",
+   "path": "docs/agent/settings-registry.md"
+  },
+  {
+   "status": "modified",
+   "path": "docs/agent/testing.md"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/__tests__/daemon-overlay.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/ci/test-timings.json"
+  },
+  {
+   "status": "added",
+   "path": "scripts/conveyor/flows/hotpatch/flow.json"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/daemon-overlay.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/hot-patch.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/__tests__/daemon-load-overlay-guard.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/__tests__/daemon-overlays.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/__tests__/daemon-rebuild-audited-tip.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/__tests__/daemon-rebuild-auto-rebase.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/__tests__/daemon-rebuild-events.test.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/fixtures/hotpatch.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/flow-engine.contract.test.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/hot-patch-cli.test.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/hotpatch-guards.test.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/hotpatch-round1.test.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/__tests__/hotpatch-withdrawal.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-load-overlay.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-overlays.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/__tests__/overlay-stale.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/adopt.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/audited-tip.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/auto-rebase.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/overlay-main-sync.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/overlay-strategies.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/plan.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/prepare.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/daemon-rebuild/preview.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/README.md"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/adapters/hotpatch.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/index.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/reference/definition-rules.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/reference/legacy-rules.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/reference/schemas.json"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-engine/shadow.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-v0-interim/index.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-v0-interim/load.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/flow-v0-interim/plan.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/hotpatch-guards.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/hotpatch-readers.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/settings-registry-metadata.d/settings/auditBar.json",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/settings-registry-metadata.d/settings/liveWhen.json",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/settings-registry-metadata.d/settings/parallel.json",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "scripts/lib/settings-registry-metadata.d/settings/receiptSource.json",
+   "items": 1
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/we-only-checks.json"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/__tests__/codex-audit.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/__tests__/prototype-load.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/codex-audit.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/prototype-load-io.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/review-job-envelope.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/settings/hotpatch.json"
+  }
+ ],
+ "writer": {
+  "identity": null,
+  "note": "PR author is the operator user account (agent sessions); not a named writer"
+ },
+ "builds": [],
+ "ignore": [
+  "node_modules/",
+  "_site/",
+  "_site-visual-fixtures/",
+  "dist/",
+  "coverage/",
+  "coverage-shards/",
+  "playwright-report/",
+  "test-results/",
+  ".DS_Store",
+  ".env",
+  ".env.local",
+  ".env.*.local",
+  ".cloudflare.env",
+  ".browser-selection.json",
+  ".claude/settings.local.json",
+  "reports/progress-board.html",
+  "reports/.progress-board-cache.json",
+  "reports/.required-status-checks-cache.json",
+  "reports/decision-docket.html",
+  ".parcel-cache/",
+  "*.js.map",
+  "*.d.ts.map",
+  "contracts/**/*.js",
+  "contracts/**/*.d.ts",
+  "capability-manifest/**/*.js",
+  "capability-manifest/**/*.d.ts",
+  "error-summary/**/*.js",
+  "error-summary/**/*.d.ts",
+  "commitment-policy/**/*.js",
+  "commitment-policy/**/*.d.ts",
+  ".claude/lane-ports.json",
+  ".conveyor/",
+  ".conveyor/learnings/",
+  ".conveyor/*.log",
+  ".conveyor/queue.json",
+  ".conveyor/dispatch-log.json",
+  ".conveyor/infra-blocked.json",
+  ".conveyor/infra-blocked-alert.json",
+  ".conveyor/infra-blocked.log",
+  ".conveyor/unsupported-repo.json",
+  ".conveyor/ci-queue-history.json",
+  ".conveyor/false-green-log.json",
+  ".conveyor/red-main-freeze.json",
+  ".conveyor/dispatch-pause.json",
+  ".conveyor/queue-scope.json",
+  ".conveyor/last-known-good.json",
+  ".conveyor/watchdog-alert.json",
+  ".conveyor/watchdog.log",
+  ".conveyor/driver-mode.json",
+  ".conveyor/promote.log",
+  ".conveyor/*.lock",
+  ".conveyor/jury/",
+  ".conveyor/driver-status.json",
+  ".conveyor/decision-trace/",
+  ".conveyor/driver-verbose.json",
+  ".conveyor/micro-decisions/",
+  "skills-src/batch-backlog-items/claims.json",
+  "skills-src/batch-backlog-items/queued.json",
+  "skills-src/batch-backlog-items/reservations.json",
+  "skills-src/batch-backlog-items/prepare-hold.json",
+  "skills-src/batch-backlog-items/id-ledger.json",
+  ".claude/skills/drain/review-park-state.json",
+  "skills-src/drain/review-park-state.json",
+  ".claude/skills/drain/review-baseline-state.json",
+  "skills-src/drain/review-baseline-state.json",
+  ".operations/",
+  "audits/backlog-health-audit.md",
+  "scripts/conveyor/run-scorecards.json",
+  ".conveyor/health/",
+  "/.fix-evidence*.md",
+  "/.fix-*-evidence*.md"
+ ]
+}

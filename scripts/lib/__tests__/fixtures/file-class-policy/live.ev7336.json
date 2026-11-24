@@ -1,0 +1,505 @@
+{
+ "evaluationType": "https://everstandards.dev/ship/file-class-evaluation/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/file-class-evaluations/we-7336-today",
+ "change": "https://github.com/web-everything/web-everything/pull/7336",
+ "head": "f2d52697fba1bb9ad955496f1dddaf44d604b083",
+ "base": "f83d40a65e4ca7967879e35d7525a9dd0d6311c4",
+ "policy": [
+  {
+   "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+   "digest": {
+    "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+   }
+  },
+  {
+   "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+   "digest": {
+    "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+   }
+  }
+ ],
+ "files": [
+  {
+   "path": "backlog/xo73av1-reconcile-owed-fix-reservations-with-completed-sessions.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "backlog/xo73ca1-test-owed-fix-ledger-competing-writers.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "backlog/xo73hd1-audit-owed-fix-recovery-hardening-waivers.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "backlog/xo73io1-verify-owed-fix-default-io-and-live-acceptance.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "backlog/xo73mt1-require-multiple-ticks-for-retry-guarantee-tests.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "backlog/xo73so1-make-owed-fix-negative-soak-probes-reach-the-regression.md",
+   "status": "added",
+   "class": "fragment",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 6
+   }
+  },
+  {
+   "path": "docs/agent/testing.md",
+   "status": "modified",
+   "class": "generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "scripts/ci/test-timings.json",
+   "status": "modified",
+   "class": "bot-owned",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 5
+   }
+  },
+  {
+   "path": "scripts/conveyor/__tests__/owed-fix-default-io.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/__tests__/pr-file-test-helpers.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/claude-auth-health.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/fix-dispatch-claim.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/owed-fix-recovery.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/reconcile-fix-dispatch.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/reconcile-pass.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/soak/breaks/owed-fix-no-live-fixer-recovery.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/conveyor/soak/breaks/owed-fix-no-live-fixer-recovery.soak.test.mjs",
+   "status": "added",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/protected-path-floor.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/lib/repo-scan-tests.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/operations/ci-heal-pr-dispatch.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  },
+  {
+   "path": "scripts/readiness/file-locks.mjs",
+   "status": "modified",
+   "class": "source",
+   "via": "unmatched",
+   "source": {
+    "level": "company",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+     "digest": {
+      "sha256": "7f01b36b8efcc4d596387f276dd2c40442a4a687f001b6e6c6dfdafb65d37fbe"
+     }
+    },
+    "via": "unmatched"
+   }
+  }
+ ],
+ "findings": [
+  {
+   "path": "docs/agent/testing.md",
+   "kind": "committed-generated",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "scripts/ci/test-timings.json",
+   "kind": "not-writer",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 5
+   }
+  },
+  {
+   "path": "docs/agent/testing.md",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 1
+   }
+  },
+  {
+   "path": "docs/agent/settings-registry.md",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 2
+   }
+  },
+  {
+   "path": "scripts/lib/settings-registry-metadata.json",
+   "kind": "not-ignored",
+   "source": {
+    "level": "repo",
+    "policy": {
+     "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+     "digest": {
+      "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+     }
+    },
+    "via": "row",
+    "row": 3
+   }
+  }
+ ],
+ "verdict": {
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+   {
+    "name": "https://github.com/web-everything/web-everything@f2d52697fba1bb9ad955496f1dddaf44d604b083",
+    "digest": {
+     "gitCommit": "f2d52697fba1bb9ad955496f1dddaf44d604b083"
+    }
+   }
+  ],
+  "predicateType": "https://everstandards.dev/core/verdict/v0.1",
+  "predicate": {
+   "verdict": "fail",
+   "policy": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/web-everything",
+    "digest": {
+     "sha256": "c23aeabe8dabeb9d323c13a5a9460a54c9f619996eda8eb6a703e194538cf5fa"
+    }
+   },
+   "evidence": [
+    {
+     "kind": "x-ship-change-diff",
+     "uri": "https://github.com/web-everything/web-everything/pull/7336/files",
+     "digest": {
+      "sha256": "3f2defc05948b3b00a7c8b491e223680220f3c83e1eed17d958fb4b446770870"
+     },
+     "provenanceTier": "probe"
+    }
+   ],
+   "evaluatedAt": "2026-11-23T14:31:00Z",
+   "examined": {
+    "count": 23,
+    "unit": "changed-file"
+   }
+  }
+ },
+ "at": "2026-11-23T14:31:00Z"
+}

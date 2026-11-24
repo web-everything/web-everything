@@ -1,0 +1,183 @@
+{
+ "change": "https://github.com/web-everything/web-everything/pull/7336",
+ "head": "f2d52697fba1bb9ad955496f1dddaf44d604b083",
+ "base": "f83d40a65e4ca7967879e35d7525a9dd0d6311c4",
+ "files": [
+  {
+   "status": "added",
+   "path": "backlog/xo73av1-reconcile-owed-fix-reservations-with-completed-sessions.md",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "backlog/xo73ca1-test-owed-fix-ledger-competing-writers.md",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "backlog/xo73hd1-audit-owed-fix-recovery-hardening-waivers.md",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "backlog/xo73io1-verify-owed-fix-default-io-and-live-acceptance.md",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "backlog/xo73mt1-require-multiple-ticks-for-retry-guarantee-tests.md",
+   "items": 1
+  },
+  {
+   "status": "added",
+   "path": "backlog/xo73so1-make-owed-fix-negative-soak-probes-reach-the-regression.md",
+   "items": 1
+  },
+  {
+   "status": "modified",
+   "path": "docs/agent/testing.md"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/ci/test-timings.json"
+  },
+  {
+   "status": "added",
+   "path": "scripts/conveyor/__tests__/owed-fix-default-io.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/__tests__/pr-file-test-helpers.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/__tests__/reconcile-fix-dispatch.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/__tests__/reconcile-pass-read-only.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/claude-auth-health.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/fix-dispatch-claim.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/conveyor/owed-fix-recovery.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/reconcile-fix-dispatch.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/conveyor/reconcile-pass.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/conveyor/soak/breaks/owed-fix-no-live-fixer-recovery.mjs"
+  },
+  {
+   "status": "added",
+   "path": "scripts/conveyor/soak/breaks/owed-fix-no-live-fixer-recovery.soak.test.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/protected-path-floor.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/lib/repo-scan-tests.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/operations/ci-heal-pr-dispatch.mjs"
+  },
+  {
+   "status": "modified",
+   "path": "scripts/readiness/file-locks.mjs"
+  }
+ ],
+ "writer": {
+  "identity": null,
+  "note": "PR author is the operator user account (agent sessions); not a named writer"
+ },
+ "builds": [],
+ "ignore": [
+  "node_modules/",
+  "_site/",
+  "_site-visual-fixtures/",
+  "dist/",
+  "coverage/",
+  "coverage-shards/",
+  "playwright-report/",
+  "test-results/",
+  ".DS_Store",
+  ".env",
+  ".env.local",
+  ".env.*.local",
+  ".cloudflare.env",
+  ".browser-selection.json",
+  ".claude/settings.local.json",
+  "reports/progress-board.html",
+  "reports/.progress-board-cache.json",
+  "reports/.required-status-checks-cache.json",
+  "reports/decision-docket.html",
+  ".parcel-cache/",
+  "*.js.map",
+  "*.d.ts.map",
+  "contracts/**/*.js",
+  "contracts/**/*.d.ts",
+  "capability-manifest/**/*.js",
+  "capability-manifest/**/*.d.ts",
+  "error-summary/**/*.js",
+  "error-summary/**/*.d.ts",
+  "commitment-policy/**/*.js",
+  "commitment-policy/**/*.d.ts",
+  ".claude/lane-ports.json",
+  ".conveyor/",
+  ".conveyor/learnings/",
+  ".conveyor/*.log",
+  ".conveyor/queue.json",
+  ".conveyor/dispatch-log.json",
+  ".conveyor/infra-blocked.json",
+  ".conveyor/infra-blocked-alert.json",
+  ".conveyor/infra-blocked.log",
+  ".conveyor/unsupported-repo.json",
+  ".conveyor/ci-queue-history.json",
+  ".conveyor/false-green-log.json",
+  ".conveyor/red-main-freeze.json",
+  ".conveyor/dispatch-pause.json",
+  ".conveyor/queue-scope.json",
+  ".conveyor/last-known-good.json",
+  ".conveyor/watchdog-alert.json",
+  ".conveyor/watchdog.log",
+  ".conveyor/driver-mode.json",
+  ".conveyor/promote.log",
+  ".conveyor/*.lock",
+  ".conveyor/jury/",
+  ".conveyor/driver-status.json",
+  ".conveyor/decision-trace/",
+  ".conveyor/driver-verbose.json",
+  ".conveyor/micro-decisions/",
+  "skills-src/batch-backlog-items/claims.json",
+  "skills-src/batch-backlog-items/queued.json",
+  "skills-src/batch-backlog-items/reservations.json",
+  "skills-src/batch-backlog-items/prepare-hold.json",
+  "skills-src/batch-backlog-items/id-ledger.json",
+  ".claude/skills/drain/review-park-state.json",
+  "skills-src/drain/review-park-state.json",
+  ".claude/skills/drain/review-baseline-state.json",
+  "skills-src/drain/review-baseline-state.json",
+  ".operations/",
+  "audits/backlog-health-audit.md",
+  "scripts/conveyor/run-scorecards.json",
+  ".conveyor/health/",
+  "/.fix-evidence*.md",
+  "/.fix-*-evidence*.md"
+ ]
+}
