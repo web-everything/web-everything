@@ -815,22 +815,26 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     for (const pr of rows) {
       let cachedLabels = shared != null;
       let pendingLabels = pr.labels;
+      let isDraft = !!pr.isDraft;
       // A snapshot's missing label is not proof of a clear. Fresh confirmation shares
-      // the timeline deadline; failed/deferred reads leave cachedLabels set for carry-forward.
+      // the timeline deadline; labels and draft status must be refreshed together so a stale
+      // cached draft cannot clear live pending. Failed/partial reads keep cachedLabels set.
       if (cachedLabels && confirmOpen.has(`${slug}#${pr.number}`) && !pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
         const remaining = pendingDeadline - clock();
         if (remaining > 0) try {
-          const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels'],
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels,isDraft'],
             { timeoutMs: Math.min(15_000, remaining) }));
-          if (Array.isArray(live?.labels) && live.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0)) {
+          if (typeof live?.isDraft === 'boolean' && Array.isArray(live.labels)
+            && live.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0)) {
             pendingLabels = live.labels;
+            isDraft = live.isDraft;
             cachedLabels = false;
           }
         } catch { /* Unknown labels carry forward; only fresh evidence can clear. */ }
       }
       let redTeamPendingSince = null;
       let redTeamPendingPartial = false;
-      if (!pr.isDraft && pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+      if (!isDraft && pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
         redTeamPendingPartial = true;
         const [owner, name] = slug.split('/');
         const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr.number)}) {
@@ -871,7 +875,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       out.push({
         reviewObservation, redTeamPendingSince, redTeamPendingPartial, redTeamPendingMaxMin, inventoryComplete, cachedLabels,
         repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
-        isDraft: !!pr.isDraft,
+        isDraft,
         mergeable: pr.mergeable ?? null,
         // Only what the marker readers need (leading line, time, trusted author) — never the whole comment record.
         comments: (pr.comments || []).map((c) => ({

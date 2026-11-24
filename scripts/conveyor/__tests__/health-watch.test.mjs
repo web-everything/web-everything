@@ -21,6 +21,8 @@ import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mj
 import { replay, unacknowledged, publishAttention, diffFeed, sidecarsOf, REPORT_KINDS, GATE_KINDS } from '../../operations/needs-you-feed.mjs';
 import { sweepReviewTmp, probeDiskSpace } from '../review-tmp-health.mjs';
 import diskSpaceSmell from '../health-smells/disk-space.mjs';
+import redTeamPendingSmell from '../health-smells/red-team-pending-overdue.mjs';
+import { emptyHealthState, stepEpisodes } from '../health-watch-core.mjs';
 
 vi.mock('../review-tmp-health.mjs', async original => {
   const real = await original();
@@ -1941,6 +1943,42 @@ describe('REDTEAM-STUCK-PENDING audit regressions', () => {
   const timeline = JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: [
     { createdAt: '2026-11-24T00:00:00Z', label: { name: 'red-team:pending' } },
   ] } } } } });
+  it.each([false, true, undefined, null, 'false'])(
+    'fresh pending labels with cached draft status use validated live draft evidence: %j', liveDraft => {
+      const now = Date.parse('2026-11-24T12:00:00Z');
+      const pr = { repo: 'web-everything/web-everything', number: 1, headRefOid: 'abcdef123456',
+        labels, isDraft: false, redTeamPendingSince: '2026-11-24T00:00:00Z', redTeamPendingMaxMin: 23 };
+      const step = (state, prs) => stepEpisodes(state, [{ smell: redTeamPendingSmell,
+        results: redTeamPendingSmell.evaluate({ prs }, { now }) }], now);
+      const opened = step(emptyHealthState(), [pr]).state;
+      expect(Object.keys(opened.episodes)).toHaveLength(1);
+      const reads = [];
+      const rows = probePrs({ drainOptions, now, clock: () => now,
+        openRedTeamPrs: ['web-everything/web-everything#1'],
+        readSnapshot: ({ repo }) => repo === pr.repo ? [{ ...pr, labels: [labels[0]], isDraft: true }] : [],
+        exec: (_bin, args) => {
+          reads.push(args);
+          if (args[0] === 'api') return timeline;
+          return JSON.stringify({ labels, isDraft: liveDraft });
+        } });
+      const next = step(opened, rows);
+      expect(next.transitions.some(t => t.type === 'closed')).toBe(liveDraft === true);
+      expect(Object.keys(next.state.episodes)).toHaveLength(liveDraft === true ? 0 : 1);
+      if (typeof liveDraft === 'boolean') {
+        expect(rows[0]).toMatchObject({ cachedLabels: false, isDraft: liveDraft, labels });
+        expect(reads.some(args => args[0] === 'api')).toBe(!liveDraft);
+        if (!liveDraft) expect(rows[0]).toMatchObject({ redTeamPendingPartial: false,
+          redTeamPendingSince: '2026-11-24T00:00:00Z' });
+      } else expect(rows[0].cachedLabels).toBe(true);
+    });
+  it('fresh draft evidence replaces cached non-draft status', () => {
+    const rows = probePrs({ drainOptions, openRedTeamPrs: ['web-everything/web-everything#1'],
+      readSnapshot: ({ repo }) => repo === 'web-everything/web-everything'
+        ? [{ number: 1, isDraft: false, labels: [labels[0]] }] : [],
+      exec: () => JSON.stringify({ labels, isDraft: true }) });
+    expect(rows[0]).toMatchObject({ cachedLabels: false, isDraft: true });
+    expect(redTeamPendingSmell.evaluate({ prs: rows }, { now: Date.now() })[0]?.breach).toBe(false);
+  });
   it('retains all 500 shared snapshot rows including pending beyond row 100', () => {
     const snapshot = Array.from({ length: 500 }, (_, i) => ({ number: i + 1, labels }));
     const rows = probePrs({ readSnapshot: () => snapshot, exec: () => timeline, drainOptions });
@@ -1979,11 +2017,11 @@ describe('REDTEAM-STUCK-PENDING audit regressions', () => {
     const snapshot = Array.from({ length: 40 }, (_, i) => ({ number: i + 1, labels: [{ name: 'review:pending' }] }));
     const rows = probePrs({ drainOptions, clock: () => elapsed, readSnapshot: ({ repo }) => (repo.endsWith('web-everything') ? snapshot : []),
       openRedTeamPrs: ['web-everything/web-everything#3', 'web-everything/web-everything#9'],
-      exec: (_bin, args) => { reads.push(args); elapsed += 1000; return JSON.stringify({ labels: [] }); } });
+      exec: (_bin, args) => { reads.push(args); elapsed += 1000; return JSON.stringify({ labels: [], isDraft: false }); } });
     expect(reads.map(a => a[2])).toEqual(['3', '9']);
     expect(rows.filter(pr => pr.cachedLabels === false).map(pr => pr.number)).toEqual([3, 9]);
   });
-  it.each(['fresh-clear', 'fresh-pending', 'failed', 'deferred', 'budget'])('cached clear requires bounded fresh labels: %s', mode => {
+  it.each(['fresh-clear', 'fresh-pending', 'failed', 'deferred', 'budget', 'invalid-labels'])('cached clear requires bounded fresh labels: %s', mode => {
     let elapsed = 0;
     const reads = [];
     const rows = probePrs({ clock: () => elapsed, drainOptions, openRedTeamPrs: ['web-everything/web-everything#1'],
@@ -1993,10 +2031,10 @@ describe('REDTEAM-STUCK-PENDING audit regressions', () => {
         if (mode === 'failed') throw new Error('unreadable');
         if (mode === 'deferred') return JSON.stringify({ deferred: true });
         if (args[0] === 'api') return timeline;
-        return JSON.stringify({ labels: mode === 'fresh-pending' ? labels : [] });
+        return JSON.stringify({ labels: mode === 'invalid-labels' ? [null] : mode === 'fresh-pending' ? labels : [], isDraft: false });
       } });
     if (mode === 'budget') expect(reads).toEqual([]);
-    else expect(reads[0]).toMatchObject({ args: ['pr', 'view', '1', '--repo', rows[0].repo, '--json', 'labels'], options: { timeoutMs: 15000 } });
+    else expect(reads[0]).toMatchObject({ args: ['pr', 'view', '1', '--repo', rows[0].repo, '--json', 'labels,isDraft'], options: { timeoutMs: 15000 } });
     if (mode.startsWith('fresh-')) {
       expect(rows[0].cachedLabels).toBe(false);
       expect(rows[0].labels).toEqual(mode === 'fresh-pending' ? labels : []);

@@ -667,7 +667,7 @@ describe('health-watch destructive lane action call-site contract', () => {
       "exec('gh', budgetProbeArgs('graphql'))",
       "exec('gh', budgetProbeArgs('core'))",
       "exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields])",
-      "exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels'])",
+      "exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels,isDraft'])",
       "exec('gh', ['api', 'graphql', '-f', `query=${query}`])",
       "exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'state,labels,headRefOid,headRefName,baseRefName'])",
       "exec('gh', args)",

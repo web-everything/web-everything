@@ -8,7 +8,7 @@ export default {
   id: 'red-team-pending-overdue',
   title: 'pending age follows label additions and unknown evidence preserves the alert',
   card: 'REDTEAM-STUCK-PENDING',
-  fixedBy: { sha: 'working-tree', where: 'current tree', paths: [PATH] },
+  fixedBy: { sha: 'working-tree', where: 'current tree', paths: [PATH, 'scripts/conveyor/health-watch.mjs'] },
   // The smell ships in the same tree as this break, so there is no tree where its absence is a legitimate
   // expected-fail. A missing file, wrong id, broken import or broken behaviour must all fail visibly: a probe that
   // reads "wrong id" as "capability absent" would let a behavioural regression satisfy it.fails.
@@ -35,6 +35,26 @@ export default {
         if (next.transitions.some(t => t.type === 'closed') || Object.keys(next.state.episodes).length !== 1)
           violations.push('unknown labels or partial inventory cleared the alert');
       }
+      // Replay a promoted PR whose shared snapshot still says draft and lacks pending.
+      // A fresh pending label must never borrow that cached draft status to close its episode.
+      const { probePrs } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/health-watch.mjs')).href);
+      const promoted = { ...pr, repo: 'web-everything/web-everything' };
+      const promotedOpened = stepEpisodes(emptyHealthState(), [{ smell, results: evaluate([promoted]) }], now).state;
+      const rows = probePrs({ now, clock: () => now,
+        drainOptions: { env: {}, tool: { redTeamPendingMaxMin: 20 }, platform: {} },
+        openRedTeamPrs: [`${promoted.repo}#1`],
+        readSnapshot: ({ repo }) => repo === promoted.repo
+          ? [{ ...promoted, isDraft: true, labels: [{ name: 'review:pending' }] }] : [],
+        exec: (_bin, args) => args[0] === 'api'
+          ? JSON.stringify({ data: { repository: { pullRequest: { timelineItems: { nodes: [
+            { createdAt: pr.redTeamPendingSince, label: { name: 'red-team:pending' } },
+          ] } } } } })
+          : JSON.stringify({ labels: pr.labels, isDraft: false }),
+      });
+      const promotedNext = stepEpisodes(promotedOpened, [{ smell, results: evaluate(rows) }], now + 1);
+      if (rows[0]?.isDraft !== false || promotedNext.transitions.some(t => t.type === 'closed')
+        || Object.keys(promotedNext.state.episodes).length !== 1)
+        violations.push('fresh pending labels with cached draft status cleared the alert');
     } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }
     return { violations };
   },
