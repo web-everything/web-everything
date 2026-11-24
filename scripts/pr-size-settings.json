@@ -1,3 +1,9 @@
 {
-  "$comment": "R125: prSize tool overrides. Built-in dataExtensions/dataDirs classify pure data; dataPaths adds exact repo paths. Data remains subject to review."
+  "$comment": "R125: prSize tool overrides. Built-in dataExtensions/dataDirs classify pure data; dataPaths adds exact repo paths or globs (* within a segment, ** across segments). Ruling delivery.sizeDataPaths: protocol schema.json still counts. Data remains subject to review.",
+  "dataPaths": [
+    "src/**/__fixtures__/*.json",
+    "protocols/**/vectors/*.json",
+    "protocols/**/fixtures/*.json",
+    "protocols/**/v*/traceability.json"
+  ]
 }

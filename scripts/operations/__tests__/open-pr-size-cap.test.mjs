@@ -205,7 +205,9 @@ describe('PR size settings cascade', () => {
   it('loads the production default settings file as a filesystem path', async () => {
     const { loadPrSizeSettingsFile } = await import('../../lib/pr-size-settings.mjs');
     expect(loadPrSizeSettingsFile(undefined, { platform: {}, env: {} })).toEqual({
-      dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'], dataPaths: [],
+      dataExtensions: ['.json', '.yaml', '.yml', '.csv'], dataDirs: ['config', 'data'],
+      dataPaths: ['src/**/__fixtures__/*.json', 'protocols/**/vectors/*.json', 'protocols/**/fixtures/*.json',
+        'protocols/**/v*/traceability.json'],
     });
   });
 
