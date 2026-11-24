@@ -1,5 +1,7 @@
 /** Head-bound scheduler inputs and liveness shared by the review job and drain. */
 import { redTeamCheckRunPayload, postRedTeamCheckRun, postRedTeamPublicationHold, withRedTeamCheckLock, createLiveCheckPublisher, requireRedTeamAppWriter } from './red-team-check-run.mjs';
+import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
+import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 import { redTeamEnqueueHold } from './drain-queue-safety.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
@@ -303,8 +305,13 @@ const awaitingHumanConfirm = (run, head) => {
     && Array.isArray(run.stepTimings) && run.stepTimings.some(t => t?.step === 'advise' && typeof t.finishedAt === 'string' && Number.isFinite(Date.parse(t.finishedAt)))
     && Array.isArray(run.effects) && run.effects.every(effect => effect?.status === 'applied')
     && ['review.advisory-note', 'review.advisory-label'].every(type => run.effects.some(effect => effect?.type === type))
-    && rev !== null && live !== null && rev === live;
+    && rev !== null && live !== null && rev === live
+    // A rejecting advisory or lens always holds: only an accepting or neutral panel waits on the human.
+    && advisoryLabelOutcome({ read: run.findings?.read, verdict: run.verdict }) !== ADVISORY_OUTCOMES.CHANGES
+    && !Object.values(run.verdict.lensVerdicts ?? {}).some(v => v === 'changes' || v?.verdict === 'changes');
 };
+// Same head, ignoring sha case (the exact-head slots used a case-sensitive compare).
+const sameHead = (rev, head) => rev === head || (cleanRev(rev) !== null && cleanRev(rev) === cleanRev(head));
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
 // "needs a human" hold awaiting its confirm, and no label effect still pending or in flight. A run that already
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
@@ -442,7 +449,7 @@ const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'se
 // unread record was written at least the mtime slack before that time and the newest run reviewed `newestHead`
 // (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now(), parkedBefore }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
   // A run with a read start outranks a start-less one; start-less runs are ordered by the checks below.
   const newerBy = order => (candidate, selected) => {
@@ -541,10 +548,13 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           if (!Number.isFinite(reviewStartedAt(hit))) startless.push({ id, at });
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
-            if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
-            if (unfinishedReview(run) && !supersededUnfinished(run, head) && !awaitingHumanConfirm(run, head)) {
+            if (sameHead(run.findings?.read?.netBasis?.rev, head) && slot.newer(hit, slot.exact)) slot.exact = hit;
+            // The parked-confirm exclusion applies only for the drain read (recovery keeps its stricter path) and
+            // only when a status for this exact head was written after this run's last write.
+            const parked = Number.isFinite(parkedBefore) && Number.isFinite(at) && at < parkedBefore && awaitingHumanConfirm(run, head);
+            if (unfinishedReview(run) && !supersededUnfinished(run, head) && !parked) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
-              if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
+              if (sameHead(run.findings?.read?.netBasis?.rev, head) &&slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
               const since = unfinishedSince(run);
               slot.since = Number.isNaN(slot.since) || Number.isNaN(since) ? NaN : Math.max(slot.since, since);
@@ -1122,16 +1132,18 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
   // The parse cap covers historical and recovery fallbacks too.
-  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
-  // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
-  // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
-  // never-scheduled deadline still applies when no job ever picks it up.
-  const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
   let status, statusAt = 0;
   try {
     status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
     statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  // A parked human confirm is excluded only on this drain read, and only behind a status for this exact head.
+  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now,
+    parkedBefore: status !== undefined && statusAt > 0 ? statusAt : undefined });
+  // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
+  // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
+  // never-scheduled deadline still applies when no job ever picks it up.
+  const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
   // Every path below checks its own scan query first, so unknown evidence always holds; a carried
   // head needs only the any-head query, and a head with a status only runs written after it.
   const carry = readRedTeamCarry({ repo, pr, head, env });

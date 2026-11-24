@@ -1089,7 +1089,7 @@ it.each([['unparseable', 1, false], ['error', 1, false], ['ok', 0, true]])(
 import { readRecoveryWitness, RUN_MTIME_SLACK_MS, ABANDONED_REVIEW_AFTER_MS } from '../drain-red-team-evidence.mjs';
 import { MAX_RUN_RECORDS_PARSED } from '../stream-filter-runs.mjs';
 describe('awaiting human confirm', () => {
-  function parked(change = () => {}, newer = false) {
+  function parked(change = () => {}, newer = false, { noStatus = false, recovery = false, status = 'finished' } = {}) {
     const f = fixture(), at = Date.parse('2026-11-24T08:22:00Z');
     const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
       verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
@@ -1099,14 +1099,35 @@ describe('awaiting human confirm', () => {
     const older = { ...run, effects: [{ type: 'review.advisory-note', status: 'failed' }],
       stepTimings: [{ step: 'read', startedAt: new Date(at - 60_000).toISOString() }] };
     change(run);
-    recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status: 'finished',
-      result: { status: 'ran', foldedVerdict: 'accept', findings: [] } }, f);
     const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
-    utimesSync(path, (at + (newer ? -60_000 : 60_000)) / 1000, (at + (newer ? -60_000 : 60_000)) / 1000);
-    return { run, evidence: readDrainRedTeamEvidence({ ...f, list: () => ['review-pr-new', 'review-pr-old'],
-      read: id => id === 'review-pr-new' ? run : older,
-      stat: path => ({ mtimeMs: path.endsWith('review-pr-new.json') ? at : at - 60_000 }) }) };
+    if (!noStatus) {
+      recordRedTeamStatus({ ...f, loopPayload: payload(f.head), status,
+        result: status === 'finished' ? { status: 'ran', foldedVerdict: 'accept', findings: [] } : undefined }, f);
+      utimesSync(path, (at + (newer ? -60_000 : 60_000)) / 1000, (at + (newer ? -60_000 : 60_000)) / 1000);
+    }
+    const io = { list: () => ['review-pr-new', 'review-pr-old'], read: id => id === 'review-pr-new' ? run : older,
+      stat: path => ({ mtimeMs: path.endsWith('review-pr-new.json') ? at : at - 60_000 }) };
+    if (recovery) return { run, witness: readRecoveryWitness({ ...f, ...io, now: at + 3 * ABANDONED_REVIEW_AFTER_MS }) };
+    return { run, evidence: readDrainRedTeamEvidence({ ...f, ...io }) };
   }
+  it('keeps the hold when no status exists for the exact head', () => {
+    expect(parked(() => {}, false, { noStatus: true }).evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it.each([
+    ['a changes lens verdict', r => { r.verdict.lensVerdicts.security = 'changes'; }],
+    ['a blocked referral', r => { r.verdict.blockedReferrals = [{ id: 'x' }]; }],
+  ])('keeps the hold for %s', (_name, change) => {
+    expect(parked(change).evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+  });
+  it('matches an upper-case review sha to the live head', () => {
+    const { evidence } = parked(r => { r.findings.read.netBasis.rev = r.findings.read.netBasis.rev.toUpperCase(); });
+    expect(evidence.ok).not.toBe(false);
+    expect(evidence.loopPayload ?? evidence.status).toBeTruthy();
+  });
+  it('does not exclude the parked run from the recovery witness', () => {
+    const { witness } = parked(() => {}, false, { recovery: true, status: 'running' });
+    expect(witness.unfinishedReviewException).toBe(true);
+  });
   it('releases the #7385 parked panel despite an older failed advisory-note effect', () => {
     const { evidence } = parked();
     expect(evidence.ok).not.toBe(false);
@@ -1135,11 +1156,10 @@ describe('awaiting human confirm', () => {
   ])('fails closed for %s', (_name, change) => {
     expect(parked(change).evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
-  it('still schedules a pass owed by a run written after the finished status', () => {
+  it('keeps the hold for a run written after the finished status (never clears)', () => {
     const { run, evidence } = parked(() => {}, true);
     expect(redTeamOwedFor(run)).toBe(true);
-    expect(evidence).toMatchObject({ scheduled: true, recorded: false });
-    expect(evidence.status).toBeUndefined();
+    expect(evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
   });
 });
 
