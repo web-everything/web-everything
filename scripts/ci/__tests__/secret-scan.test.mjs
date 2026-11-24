@@ -62,14 +62,16 @@ const privateJwk = jwk([['d', 'FAKE_TEST_ONLY']]);
 // Build source strings at runtime so this file itself contains no private JWK.
 const templateJwk = (key, members) => 'export default {' + Object.entries(key).map(([name, value]) =>
   JSON.stringify(name) + ':' + (members.includes(name) ? '`' + value + '`' : JSON.stringify(value))).join(',') + '};';
-test('usable String.raw and expression-tagged JWK values fail the whole-file scan', async () => {
-  const key = Object.fromEntries([['kty', 'oct'], ['k', Buffer.alloc(16, 97).toString('base64url')]]);
-  const algorithm = { name: 'HMAC', hash: 'SHA-256' };
-  for (const tag of ['String.raw', 'String["raw"]', '(String.raw)', '(0, String.raw)',
+// Each real-Git/CLI probe gets its own test deadline and fixture cleanup.
+for (const tag of ['String.raw', 'String["raw"]', '(String.raw)', '(0, String.raw)',
     'String /* tag */ . raw\n', 'String\r.raw', 'String\u2028.\u2029raw', 'String["r" + "aw"]',
     '(() => String.raw)()', '(chunks => chunks[0])', 'Str\\u0069ng.raw',
     '((Str\u200cing) => Str\u200cing.raw)(String)', '((Ｓ) => Ｓ.raw)(String)']) {
-    for (const members of [['k'], ['kty'], ['kty', 'k']]) {
+  for (const members of [['k'], ['kty'], ['kty', 'k']]) {
+    test('usable String.raw and expression-tagged JWK values fail the whole-file scan: '
+      + JSON.stringify(tag) + ' members=' + members.join(','), async () => {
+      const key = Object.fromEntries([['kty', 'oct'], ['k', Buffer.alloc(16, 97).toString('base64url')]]);
+      const algorithm = { name: 'HMAC', hash: 'SHA-256' };
       const source = templateJwk(key, members).replaceAll(':`', ':' + tag + '`');
       const actual = runInNewContext('(' + source.slice('export default '.length, -1) + ')');
       const imported = await webcrypto.subtle.importKey('jwk', actual, algorithm, false, ['sign']);
@@ -79,9 +81,9 @@ test('usable String.raw and expression-tagged JWK values fail the whole-file sca
       assert.equal(result.status, 1, tag);
       assert.equal(result.stdout, 'tagged.mjs:0 private-key-structure\n', tag);
       assert.ok(!result.output.includes(key.k));
-    }
+    });
   }
-});
+}
 test('value-only tagged edits in nested objects fail while ordinary tags pass', () => {
   const key = Object.fromEntries([['kty', 'oct'], ['k', 'FAKE']]);
   const before = templateJwk(key, []);
