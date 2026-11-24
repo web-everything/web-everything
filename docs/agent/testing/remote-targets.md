@@ -4,15 +4,18 @@
 platform preferences. It follows the existing admission settings cascade and
 shared-pool restrictions on tool overrides; policy logs include its value and source.
 The default is `[{"alias":"forge","root":"/srv/forge-exec"}]` and adds no discovery probe.
-For Mesa first, configure `[{"alias":"mesa-01","root":"/srv/mesa-exec"},
-{"alias":"forge","root":"/srv/forge-exec"}]` with roots matching each installed runner.
+For Mesa first, configure `[{"alias":"mesa-01","root":"/srv/forge-exec"},
+{"alias":"forge","root":"/srv/forge-exec"}]`. Both runners currently require exactly `/srv/forge-exec`.
 
-Lists must contain 1–32 entries. Aliases match `^[A-Za-z0-9_.@-]+$`;
-roots are absolute paths containing only letters, digits, underscore, dot, slash,
-and hyphen. Invalid settings retain the lower-layer value (the standard default when no valid
-override exists) and appear in policy diagnostics.
-Custom targets are probed in order with noninteractive SSH and a five-second
-connection timeout. A missing executable is `runner-missing`; other SSH failures
+Lists must contain 1–32 entries. Aliases use the run-finisher's strict pattern:
+a letter or digit first, followed only by letters, digits, dots, underscores, or
+hyphens, with no trailing newline. User@host forms and leading hyphens are rejected.
+Roots must be exactly `/srv/forge-exec`; other paths, including `/` and traversal,
+are rejected. An invalid explicit list disables remote dispatch, runs locally,
+and logs `location=local reason=invalid-remote-hosts` with its settings source.
+Custom targets are probed in order with noninteractive SSH, a five-second
+connection timeout, and a ten-second execution deadline that kills the child.
+A missing executable is `runner-missing`; other SSH failures
 are `ssh-unreachable`. No healthy target means local admission with
 `location=local reason=no-healthy-remote`, without remote dispatch.
 Discovery does not cache results. Execution keeps the existing ops sudo and SSH

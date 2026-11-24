@@ -389,6 +389,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   let invalidPlatformManifest = false;
+  let invalidRemoteHostsSource;
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
     let value = admissionLeaf(settings, leaf);
     sources[leaf] = 'standard';
@@ -396,7 +397,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       let v;
       try { v = admissionLeaf(block, leaf); }
       catch (error) {
-        if (leaf !== 'remote.clientPath' && leaf !== 'remote.manifest' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
+        if (leaf !== 'remote.hosts' && leaf !== 'remote.clientPath' && leaf !== 'remote.manifest' && !leaf.startsWith('remote.slotUnits') && !leaf.startsWith('remote.elasticSlots') && leaf !== 'remote.autoSlotUnits') throw error;
         v = Symbol('unreadable admission setting'); // invalid even in the trusted platform layer
       }
       if (v === undefined) continue;
@@ -420,6 +421,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       else {
         invalid.push(`${layer}.${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(v) : oneLine(JSON.stringify(v))}`);
         if (layer === 'platform' && leaf === 'remote.manifest') invalidPlatformManifest = true;
+        if (leaf === 'remote.hosts') { value = []; sources[leaf] = layer; invalidRemoteHostsSource = layer; }
         if (leaf === 'remote.slotUnitsByKind') { value = {}; sources[leaf] = layer; }
         if (leaf === 'remote.elasticSlots.enabled') { value = false; sources[leaf] = layer; }
         if (leaf === 'remote.autoSlotUnits') { value = 1; sources[leaf] = layer; }
@@ -443,6 +445,10 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
   if (invalidPlatformManifest) {
     settings.remote.enabled = false;
     sources['remote.enabled'] = 'platform (invalid remote.manifest; local execution required)';
+  }
+  if (invalidRemoteHostsSource) {
+    settings.remote.enabled = false;
+    sources['remote.enabled'] = `${invalidRemoteHostsSource} (invalid remote.hosts; local execution required)`;
   }
   return { settings, sources, invalid, ignored, ...(invalidPlatformManifest ? { manifestFailClosed: true } : {}) };
 }
@@ -1296,6 +1302,10 @@ export async function runWithRemoteDecision({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
+  if (!validRemoteHosts(policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS)) {
+    log(`heavy-admission: location=local reason=invalid-remote-hosts (${policy.sources['remote.hosts'] ?? 'standard'})\n`);
+    return {handled:false};
+  }
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite

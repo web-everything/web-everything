@@ -210,10 +210,10 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal, timeout }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
-      cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
+      cwd, env, timeout, killSignal: 'SIGKILL', stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
     });
     const stdout = [];
     let bytes = 0;
@@ -235,7 +235,8 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
     const stop = () => { child.kill('SIGTERM'); };
     if (signal) { if (signal.aborted) stop(); else { signal.addEventListener('abort', stop, { once: true }); child.once('close', () => signal.removeEventListener('abort', stop)); } }
     child.on('error', reject);
-    child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
+    child.on('close', (code, exitSignal) => exceeded ? reject(new Error('Captured output limit exceeded'))
+      : timeout && exitSignal ? reject(new Error(`Execution terminated: ${exitSignal}`))
       : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
@@ -1322,7 +1323,7 @@ export async function presync({cwd=process.cwd(),host='forge',root='/srv/forge-e
   const key=previous?.host===host?previous.key:randomBytes(16).toString('hex');
   const record=state=>writeJsonAtomic(join(gitDir,PRESYNC_STATE),{v:1,host,key,atET:easternTimestamp(clock()),...state},{mode:0o600});
   try {
-    const ssh=(command,request)=>exec({file:'ssh',args:[host,`sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],input:JSON.stringify(request),cwd,sshOptions});
+    const ssh=(command,request)=>exec({file:'ssh',args:['--',host,`sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],input:JSON.stringify(request),cwd,sshOptions});
     const delta=await discoverDelta({cwd,exec,fs,env,host,discovery:await ssh('bases',{}),fetchBaseManifest:sha=>ssh('base-manifest',{sha})});
     // Never ship a full tree or coverage in the background. Sibling trees are
     // left to the run's own transfer (a Follow-up).
@@ -1336,7 +1337,7 @@ export async function presync({cwd=process.cwd(),host='forge',root='/srv/forge-e
     const files={};
     await stageSnapshot({fs,stageDirectory:stageDirectoryIn(fs,staging,0o711,0o711),source:cwd,destination:staging,entries,
       onStaged:(entry,destination,content)=>{files[entry.path.toString('hex')]={sha256:entry.sha256,size:content.length};}});
-    const ready=await exec({file:'ssh',args:[host,`umask 077 && mkdir -p -m 0711 ${root}/presync && test -d ${root}/presync && test ! -L ${root}/presync && test -O ${root}/presync`],cwd,sshOptions});
+    const ready=await exec({file:'ssh',args:['--',host,`umask 077 && mkdir -p -m 0711 ${root}/presync && test -d ${root}/presync && test ! -L ${root}/presync && test -O ${root}/presync`],cwd,sshOptions});
     if(ready.code!==0)throw new Error('Presync cache unavailable');
     const copied=await exec({file:'rsync',args:['-a','--delete','--no-links','--safe-links','-e',`ssh ${sshOptions.map(quote).join(' ')}`,
       './',`${host}:${root}/presync/${key}/`],cwd:staging});
@@ -1467,9 +1468,9 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   sshOptions ??= connectionOptions();
   const start=work=>Promise.resolve().then(work);
   const initial=await Promise.allSettled([
-    start(()=>exec({file:'ssh',args:[host,'true'],cwd,sshOptions})),
+    start(()=>exec({file:'ssh',args:['--',host,'true'],cwd,sshOptions})),
     start(()=>needsGit?exec({file:'git',args:['rev-parse','HEAD'],cwd}):undefined),
-    start(()=>disableDelta?undefined:exec({file:'ssh',args:[host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
+    start(()=>disableDelta?undefined:exec({file:'ssh',args:['--',host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
   ]);
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
@@ -1519,7 +1520,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     }
   };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
-    args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
+    args:['--',host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
     ...(command === 'run' ? {signal: cancel.signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {}),
@@ -1860,14 +1861,24 @@ export function parseArgs(args) {
   return options;
 }
 
+export function parsePresyncArgs(args) {
+  const options = {host:'forge', root:'/srv/forge-exec'}, seen = new Set();
+  for (const arg of args) {
+    const key = arg.startsWith('--host=') ? 'host' : arg.startsWith('--root=') ? 'root' : null;
+    if (!key) throw new Error('Unknown presync option');
+    if (seen.has(key)) throw new Error('Duplicate presync option');
+    seen.add(key);
+    options[key] = arg.slice(arg.indexOf('=') + 1);
+  }
+  return options;
+}
+
 const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
 if (process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   (async () => {
   try {
     if(process.argv[2]==='presync'){
-      const extra=process.argv.slice(3),host=extra.find(arg=>arg.startsWith('--host='))?.slice(7)??'forge';
-      const root=extra.find(arg=>arg.startsWith('--root='))?.slice(7)??'/srv/forge-exec';
-      if(extra.some(arg=>!arg.startsWith('--host=')&&!arg.startsWith('--root=')))throw new Error('Unknown presync option');
+      const {host,root}=parsePresyncArgs(process.argv.slice(3));
       const result=await presync({host,root});
       process.stderr.write(`presync: ${JSON.stringify(result)}\n`);
       process.exitCode=result.status==='failed'?1:0;

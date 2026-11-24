@@ -4,10 +4,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { pickRemoteTarget, probeRemoteHosts } from '../remote-target.mjs';
 import { resolveAdmissionPolicy, runWithRemoteDecision, formatAdmissionPolicy } from '../heavy-admission.mjs';
-import { runRemote } from '../remote-exec.mjs';
+import { runRemote, defaultExec } from '../remote-exec.mjs';
+import {keepAliveScript} from '../../lib/test-keepalive.mjs';
 import { bindingEvidence, gitArgs } from './fixtures/forge-bound-git.mjs';
 
-const hosts = [{alias:'mesa-01',root:'/srv/mesa-exec'}, {alias:'forge',root:'/srv/forge-exec'}];
+const hosts = [{alias:'mesa-01',root:'/srv/forge-exec'}, {alias:'forge',root:'/srv/forge-exec'}];
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root,{recursive:true,force:true}); });
 function admission(remote = {}) {
@@ -54,7 +55,7 @@ describe('ordered remote targets', () => {
   it.each([hosts,[hosts[0]]].map(targets=>[targets]))('dispatches the selected host and root from %j', async targets => {
     const f=admission({hosts:targets}), targetExec=vi.fn(async()=>({code:0}));
     expect(await runWithRemoteDecision({...f,targetExec})).toEqual({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
-    expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({host:'mesa-01',root:'/srv/mesa-exec'}));
+    expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({host:'mesa-01',root:'/srv/forge-exec'}));
   });
   it('explicit default ignores object key order and adds no probe', async () => {
     const f=admission({hosts:[{root:'/srv/forge-exec',alias:'forge'}]}), targetExec=vi.fn();
@@ -67,17 +68,32 @@ describe('ordered remote targets', () => {
     expect(await probeRemoteHosts({hosts,exec})).toEqual({...hosts[0],skipped:[]});
     expect(exec).toHaveBeenCalledTimes(1);
   });
-  it.each([[],null,[{alias:'',root:'/srv/x'}],[{alias:'bad;host',root:'/srv/x'}],
-    [{alias:'mesa',root:'relative'}],[{alias:'mesa',root:'/srv/a b'}],
-    [{alias:'mesa',root:'/srv/$(id)'}],[{alias:'mesa',root:'/srv/x;id'}]])('rejects invalid hosts %j to default', value => {
-    const policy=resolveAdmissionPolicy({platform:{remote:{hosts:value}}});
-    expect(policy.settings.remote.hosts).toEqual([hosts[1]]);
-    expect(policy.invalid).toHaveLength(1);
+  it.each([[],null,[{alias:'',root:'/srv/forge-exec'}],
+    ...['-V','user@mesa','@mesa','_mesa','.mesa','mesa\n','bad;host'].map(alias=>[{alias,root:'/srv/forge-exec'}]),
+    ...['/srv/mesa-exec','/','/srv/../srv/forge-exec','/srv/forge-exec/','relative','/srv/a b','/srv/$(id)','/srv/x;id'].map(root=>[{alias:'mesa',root}]),
+    Array(33).fill(hosts[0])].map(value=>[value]))('invalid hosts %j disable remote dispatch and log local fallback', async value => {
+    const f=admission({hosts:value}), targetExec=vi.fn();
+    expect(f.policy.settings.remote.hosts).toEqual([]);
+    expect(f.policy.settings.remote.enabled).toBe(false);
+    expect(f.policy.invalid).toHaveLength(1);
+    expect(formatAdmissionPolicy(f.policy)).toContain('invalid: platform.remote.hosts=');
+    expect(await runWithRemoteDecision({...f,targetExec})).toEqual({handled:false});
+    expect(targetExec).not.toHaveBeenCalled();
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.flat().join('')).toContain('location=local reason=invalid-remote-hosts (platform)');
+    expect(await pickRemoteTarget({hosts:value,exec:targetExec})).toBeNull();
+    expect(targetExec).not.toHaveBeenCalled();
   });
-  it('rejects oversized host lists with a visible default fallback', () => {
-    const policy=resolveAdmissionPolicy({platform:{remote:{hosts:Array(33).fill(hosts[0])}}});
-    expect(policy.settings.remote.hosts).toEqual([hosts[1]]);
-    expect(formatAdmissionPolicy(policy)).toContain('invalid: platform.remote.hosts=');
+  it('kills a hung probe at its execution deadline and treats it as ssh-unreachable', async () => {
+    const exec=vi.fn(async call => {
+      expect(call.timeout).toBe(10_000);
+      if (call.args[1] === 'forge') return {code:0};
+      // Exercise the production exec adapter with a child that ignores SIGTERM.
+      return defaultExec({...call, file:process.execPath,
+        args:['-e', keepAliveScript({prelude:"process.on('SIGTERM',()=>{});",maxLifetimeMs:5000})], timeout:100});
+    });
+    expect(await pickRemoteTarget({hosts,exec})).toEqual({...hosts[1],skipped:[{alias:'mesa-01',reason:'ssh-unreachable'}]});
+    expect(exec).toHaveBeenCalledTimes(2);
   });
   it('logs host configuration and its source', () => {
     const policy=resolveAdmissionPolicy({platform:{remote:{hosts}}});
