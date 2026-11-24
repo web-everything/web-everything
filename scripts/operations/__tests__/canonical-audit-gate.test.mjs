@@ -68,15 +68,14 @@ describe('canonical audit before opening a PR', () => {
   describe('test-only waiver carry', () => {
     const waivedSha = other;
     const audited = { ...weak, head: waivedSha };
-    const files = ['scripts/operations/__tests__/example.test.ts', 'scripts/example.test.mjs'];
-    const git = ({ delta = files.map(p => `M\0${p}\0`).join(''), fail, imported = '', needle, numstat = '1\t0\t' } = {}) => (args, resolved) => {
+    const boundary = 'scripts/operations/__tests__/test-path-boundary.test.mjs';
+    const files = ['scripts/operations/__tests__/example.test.ts', 'scripts/conveyor/soak/breaks/example.test.mjs'];
+    const git = ({ delta = files.map(p => `A\0${p}\0`).join(''), fail } = {}) => (args, resolved) => {
       if (args.includes(fail)) throw new Error('git failed');
-      if (args.includes('--numstat')) return numstat + args.at(-1) + '\0';
+      if (args.includes('grep')) throw Object.assign(new Error('no matches'), { status: 1 });
+      if (args.includes('--numstat')) return `1\t0\t${args.at(-1)}\0`;
+      if (args.includes('--quiet')) return '';
       if (args.includes('diff')) return delta;
-      if (args.includes('grep')) {
-        if (imported && (!needle || args.includes(needle))) return `${sha}:${imported}\0`;
-        throw Object.assign(new Error('no matches'), { status: 1 });
-      }
       return resolved;
     };
     const run = (options = {}, over = {}) => fixture({ records: [audited],
@@ -86,39 +85,40 @@ describe('canonical audit before opening a PR', () => {
       expect(result).toMatchObject({ ok: true, record: audited, carry: { waivedSha, head: sha, files } });
       const [, args, options] = calls.find(([, args]) => args.includes('diff'));
       expect(args).toEqual(expect.arrayContaining(['-z', '-M', '--no-renames']));
-      expect(calls.some(([, args]) => args.includes('--all-match') && args.includes('__tests__')
-        && args.includes('readdirSync'))).toBe(true);
+      expect(calls.some(([, args]) => args.includes('cat-file') && args.includes(`${sha}:${boundary}`))).toBe(true);
+      expect(calls.some(([, args]) => args.includes('--quiet') && args.includes('origin/main')
+        && args.includes(sha) && args.at(-1) === boundary)).toBe(true);
+      expect(calls.some(([, args]) => args.includes('grep') || args.includes('--numstat'))).toBe(false);
       expect(options.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_DIR: sha });
     });
     it.each([
-      ['refuses carry when the delta adds a line to a test helper imported by code', { imported: 'src/main.mjs' }],
-      ['refuses carry when a test file is renamed into src', { delta: 'D\0scripts/a.test.mjs\0A\0src/a.mjs\0' }],
-      ['refuses when the delta cannot be read', { fail: 'diff' }],
-      ['refuses a delta with any non-test file', { delta: 'M\0scripts/foo.mjs\0' }],
-      ['refuses audit settings changes', { delta: 'M\0scripts/settings/codex-audit.json\0' }],
-      ['refuses changes to the gate itself', { delta: 'M\0scripts/operations/canonical-audit-gate.mjs\0' }],
-      ['refuses unreadable import evidence', { fail: 'grep' }],
-      ['refuses deleting a carried test', { delta: 'D\0scripts/a.test.mjs\0' }],
-      ['refuses modified tests with deleted lines', { numstat: '1\t1\t' }],
-      ['refuses unreadable line counts', { fail: '--numstat' }],
-      ['refuses malformed line counts', { numstat: 'unknown\t0\t' }],
-      ['refuses a non-test helper under __tests__', { delta: 'A\0scripts/__tests__/helper.mjs\0' }],
-      ['refuses extensionless imports from production', { imported: 'src/main.mjs', needle: 'example.test' }],
-      ['refuses import.meta.glob directory loaders', { imported: 'src/main.mjs', needle: 'import.meta.glob' }],
-      ['refuses readdirSync directory loaders', { imported: 'src/main.mjs', needle: 'readdirSync' }],
-      ['refuses malformed diff output', { delta: 'M\0scripts/a.test.mjs' }],
-      ['refuses more than 128 changed paths', { delta: Array.from({ length: 129 }, (_, i) => `M\0scripts/${i}.test.mjs\0`).join('') }],
-      ['refuses oversized diff output', { delta: 'M\0scripts/a.test.mjs\0'.repeat(60000) }],
+      ['refuses modified test files, even additions only', { delta: 'M\0scripts/__tests__/a.test.mjs\0' }],
+      ['refuses deleted test files', { delta: 'D\0scripts/__tests__/a.test.mjs\0' }],
+      ['refuses renamed test files', { delta: 'R100\0scripts/__tests__/a.mjs\0scripts/__tests__/b.mjs\0' }],
+      ['refuses unknown status', { delta: 'T\0scripts/__tests__/a.mjs\0' }],
+      ['refuses a test filename outside the allowlist', { delta: 'A\0scripts/foo.test.mjs\0' }],
+      ['refuses new production files', { delta: 'A\0src/x.mjs\0' }],
+      ['refuses a similar directory name', { delta: 'A\0scripts/not__tests__/x.mjs\0' }],
+      ['refuses nested soak lookalikes', { delta: 'A\0src/scripts/conveyor/soak/breaks/x.mjs\0' }],
+      ['refuses an empty delta', { delta: '' }],
+      ['refuses when the delta cannot be read', { fail: '--name-status' }],
+      ['refuses missing boundary test at head', { fail: 'cat-file' }],
+      ['refuses modified boundary test versus origin/main', { fail: '--quiet' }],
+      ['refuses malformed diff output', { delta: 'A\0scripts/__tests__/a.mjs' }],
+      ['refuses more than 128 changed paths', { delta: Array.from({ length: 129 }, (_, i) => `A\0scripts/__tests__/${i}.mjs\0`).join('') }],
+      ['refuses oversized diff output', { delta: 'A\0scripts/__tests__/a.mjs\0'.repeat(60000) }],
     ])('%s', (_name, options) => {
       const { result, calls } = run(options);
       expect(result.ok).toBe(false);
       expect(result.message).toContain('codex-audit --base=origin/main');
-      expect(calls.some(([, args]) => args.includes('diff'))).toBe(true);
     });
     it('refuses when the waived sha is not an ancestor of the head', () => {
       const { result, calls } = run({ fail: 'merge-base' });
       expect(result.ok).toBe(false);
       expect(calls.some(([, args]) => args.includes('merge-base') && args.includes('--is-ancestor'))).toBe(true);
+    });
+    it('allows new helpers under the test directory regardless of filename', () => {
+      expect(run({ delta: 'A\0__tests__/helper.mjs\0' }).result.ok).toBe(true);
     });
     it('carry never chains: always diffs back to the original waived sha', () => {
       const { result, calls } = run();

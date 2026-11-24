@@ -19,6 +19,8 @@ function probe(gate, questionHash, { mkdtempSync, mkdirSync, writeFileSync, rmSy
   try {
     git('init', '-q');
     writeFileSync(join(repo, 'main.mjs'), 'export const value = 1;');
+    mkdirSync(join(repo, 'scripts/operations/__tests__'), { recursive: true });
+    writeFileSync(join(repo, 'scripts/operations/__tests__/test-path-boundary.test.mjs'), '// CI boundary fixture');
     const base = commit();
     writeFileSync(join(repo, 'main.mjs'), 'export const value = 2;');
     const waivedSha = commit(base);

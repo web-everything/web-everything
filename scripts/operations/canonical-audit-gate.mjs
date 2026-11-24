@@ -9,7 +9,8 @@ import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs'
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
-const isTestOnlyPath = path => /\.test\.(?:mjs|js|ts)$/.test(path);
+const isTestOnlyPath = path => /(?:^|\/)__tests__\//.test(path)
+  || path.startsWith('scripts/conveyor/soak/breaks/');
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -127,24 +128,16 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       if (parts.length % 2 || parts.length > 256) return null;
       for (let i = 0; i < parts.length; i += 2) {
         const path = parts[i + 1];
-        if (!/^[AM]$/.test(parts[i]) || !isTestOnlyPath(path)) return null;
-        if (parts[i] === 'M') {
-          const stat = run('diff', '--numstat', '-z', '--no-renames', '--no-ext-diff', '--no-textconv',
-            '--ignore-submodules=none', '--no-relative', `${waivedSha}..${fullSha}`, '--', path).split('\t');
-          if (stat.length !== 3 || !/^\d+$/.test(stat[0]) || stat[1] !== '0' || stat[2] !== `${path}\0`) return null;
-        }
+        if (parts[i] !== 'A' || !isTestOnlyPath(path)) return null;
         files.push(path);
-        const segments = path.split('/'), name = segments.pop(), dir = segments.pop() || '.';
-        const queries = [['-e', name, '-e', name.replace(/\.[^.]+$/, '')],
-          ...['import.meta.glob', 'readdirSync'].map(loader => ['--all-match', '-e', dir, '-e', loader])];
-        for (const query of queries) {
-          let hits;
-          try { hits = run('grep', '-l', '-z', '-F', ...query, fullSha, '--'); }
-          catch (error) { if (error.status === 1) continue; throw error; }
-          if (hits.length > 1024 * 1024 || !hits.endsWith('\0') || hits.slice(0, -1).split('\0').some(hit =>
-            !hit.startsWith(`${fullSha}:`) || !isTestOnlyPath(hit.slice(41)))) return null;
-        }
       }
+      if (!files.length) return null;
+      // CI runs the repository boundary test. The gate executes no head code: require
+      // the test on head and byte-for-byte unchanged from origin/main's CI-governed copy.
+      // Missing/unreadable main or boundary evidence refuses; audit the current head instead.
+      const boundary = 'scripts/operations/__tests__/test-path-boundary.test.mjs';
+      run('cat-file', '-e', `${fullSha}:${boundary}`);
+      run('diff', '--quiet', '--no-ext-diff', '--no-textconv', 'origin/main', fullSha, '--', boundary);
       return { waivedSha, head: fullSha, files };
     } catch { return null; }
   };
