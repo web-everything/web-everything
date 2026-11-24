@@ -6,8 +6,7 @@ export default {
   id: 'review-speed-main-red-reads-not-memoized',
   title: 'unchanged main-red evidence is reused across review ticks',
   card: 'REVIEW-SPEED-MEMO',
-  // Replace with the eventual fix commit; an unresolved SHA deliberately fails ancestry.
-  fixedBy: { sha: 'PENDING-FILL-AT-LAND', where: 'main', paths: ['scripts/conveyor/reconcile-pass.mjs'] },
+  fixedBy: { sha: '16c167cd20e995e5adc94985e3aa4549fcae2d6d', where: 'lane/review-speed-memo', paths: ['scripts/conveyor/reconcile-pass.mjs'] },
   fixPresent(root) {
     return spawnSync('git', ['merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'],
       { cwd: root, stdio: 'ignore', timeout: 5000 }).status === 0;
