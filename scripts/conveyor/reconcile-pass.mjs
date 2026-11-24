@@ -876,8 +876,24 @@ export function defaultReadAheadBy(headSha, { exec = execFileSyncThrottled, repo
     const out = exec('gh', ['api', '--method', 'GET', endpoint, '--jq', '.ahead_by'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
-    const n = Number(String(out || '').trim());
+    const value = String(out || '').trim();
+    if (!value) return null;
+    const n = Number(value);
     return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the live branch tip independently of CI run history; unknown tips cannot key a memo. */
+export function defaultReadMainTip({ exec = execFileSyncThrottled, repo = null, branch = 'main' } = {}) {
+  try {
+    const out = exec('gh', ['api', '--method', 'GET',
+      `repos/${repo || '{owner}/{repo}'}/commits/${branch}`, '--jq', '.sha'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    const sha = String(out || '').trim();
+    return /^[a-f0-9]{40}$/i.test(sha) ? sha : null;
   } catch {
     return null;
   }
@@ -974,6 +990,25 @@ function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
   }
 }
 
+const mainRedAheadMemo = new Map();
+const mainRedGreenMemo = new Map();
+
+/** Test isolation for the long-lived daemon's per-PR evidence memo. */
+export function resetMainRedMemo() {
+  for (const memo of [mainRedAheadMemo, mainRedGreenMemo]) memo.clear();
+}
+
+function mainRedMemoRead(memo, key, read, cacheable) {
+  if (key !== null && memo.has(key)) return memo.get(key);
+  const value = read();
+  if (key !== null && cacheable(value)) {
+    memo.set(key, value);
+    // FIFO eviction only costs another read; it never substitutes unknown evidence.
+    if (memo.size > 500) memo.delete(memo.keys().next().value);
+  }
+  return value;
+}
+
 /**
  * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithMainRedFacts — we:backlog/x5uqim1-*.md (#4075/#3383):
  * attach `requiredCheckCompletedAt` / `aheadByOnMain` to every PR whose required check is currently FAILING, and
@@ -983,8 +1018,8 @@ function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
  * PAYS THE EXTRA `gh run list --branch main` READ ONLY WHEN AT LEAST ONE PR NEEDS IT — a pass with nothing
  * currently `ci:failed` (the common case) costs nothing beyond the `latestRequiredCheck` scan it already had
  * every field for. `requiredCheckCompletedAt` comes off the ALREADY-FETCHED `statusCheckRollup` (no extra call);
- * only `aheadByOnMain` needs a fresh `gh api .../compare` read per failing PR, keyed off `headRefOid`
- * (already fetched by `defaultReadPrs`'s own `PR_LIST_JSON_FIELDS`).
+ * Per-PR graph reads reuse stable evidence across ticks, bounded to 500 entries each.
+ * Main tip, runs, signatures and job attempts remain live; partial evidence is retried next tick.
  * @param {Array<object>} prs
  * soak-main-red (2026-09-26): judged across EVERY required check (`requiredChecks`, default
  * `DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS` = test/smoke/daemon-soak), not `test` alone — a PR red only on
@@ -998,7 +1033,7 @@ function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
  * PR #2793 review: `main`'s run list is read ONCE and handed to `readMainLatestCheckRuns` (no second `gh run
  * list`), and a failing PR whose check IS green on main's latest run also gets `prContainsMainGreenSha` /
  * `mergeBaseCheckRuns` ({@link defaultReadMainGreenFixFacts}) — the evidence that main, not the PR, was at fault.
- * @param {{readMainRuns?:Function, readAheadBy?:Function, readMainLatestCheckRuns?:Function,
+ * @param {{readMainRuns?:Function, readMainTip?:Function, readAheadBy?:Function, readMainLatestCheckRuns?:Function,
  *   readMainGreenFixFacts?:Function, requiredCheck?:string, requiredChecks?:string[], defaultBranch?:string,
  *   repo?:string|null}} [o]
  * @returns {{prs:Array<object>, mainRedWindows:Array<object>, mainLatestCheckRuns:Array<object>}}
@@ -1006,6 +1041,8 @@ function owedCiRerunEvidence(pr, { repo, checks, readJobAttempt }) {
 export function enrichPrsWithMainRedFacts(prs, {
   readJobAttempt = defaultReadJobAttempt, readBudget = readTimeoutBudget,
   readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
+  // A caller that injects its own ahead-by reader gets no memo unless it also supplies a tip reader.
+  readMainTip = readAheadBy === defaultReadAheadBy ? defaultReadMainTip : () => null,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   requiredCheck = null, requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, defaultBranch = 'main', repo = null,
@@ -1016,6 +1053,7 @@ export function enrichPrsWithMainRedFacts(prs, {
   if (!failing.length) return { prs: list, mainRedWindows: [], mainLatestCheckRuns: [] };
 
   const mainRuns = readMainRuns({ repo, branch: defaultBranch });
+  const tip = readMainTip({ repo, branch: defaultBranch });
   const mainRedWindows = computeMainRedWindows(mainRuns);
   const mainGreenNow = currentMainGreen(mainRuns);
   const mainLatestCheckRuns = readMainLatestCheckRuns({ repo, branch: defaultBranch, mainRuns });
@@ -1023,15 +1061,23 @@ export function enrichPrsWithMainRedFacts(prs, {
   const enriched = list.map((pr) => {
     if (!failingSet.has(pr)) return pr;
     const check = failingRequiredCheckForAttribution(pr, { requiredChecks: checks, mainRedWindows });
-    const aheadBy = pr?.headRefOid ? readAheadBy(pr.headRefOid, { repo, base: defaultBranch }) : null;
+    const aheadBy = pr?.headRefOid ? mainRedMemoRead(mainRedAheadMemo,
+      tip ? JSON.stringify([repo, defaultBranch, pr.headRefOid, tip]) : null,
+      () => readAheadBy(pr.headRefOid, { repo, base: defaultBranch }), Number.isFinite) : null;
     const greenSha = mainLatestGreenShaForCheck({ failingCheckName: check?.name ?? null, mainLatestCheckRuns });
     const greenFix = greenSha && aheadBy !== 0
-      ? readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name })
+      ? mainRedMemoRead(mainRedGreenMemo, JSON.stringify([repo, defaultBranch, pr.headRefOid, greenSha, check.name]),
+        () => readMainGreenFixFacts(pr.headRefOid, { repo, greenSha, checkName: check.name }),
+        facts => facts?.prContainsMainGreenSha === true || (Array.isArray(facts?.mergeBaseCheckRuns)
+          && facts.mergeBaseCheckRuns.length > 0 && facts.mergeBaseRunConclusion != null
+          && facts.mergeBaseCheckRuns.every(row => String(row?.status).toLowerCase() === 'completed'
+            && String(row?.conclusion).toLowerCase() === 'success')))
       : null;
+    const detailsUrl = latestRequiredCheck(pr, check?.name)?.detailsUrl;
     const mainFixedSignature = aheadBy > 0 && !isPrCiFailureOwedRerun({
       requiredCheckCompletedAt: check?.completedAt, failingCheckName: check?.name, aheadBy,
       mainRedWindows, mainLatestCheckRuns, ...greenFix, comments: pr.comments, headSha: pr.headRefOid,
-    }) ? readMainFixedSignatureFacts({ repo, detailsUrl: latestRequiredCheck(pr, check?.name)?.detailsUrl,
+    }) ? readMainFixedSignatureFacts({ repo, detailsUrl,
       failureCompletedAt: check?.completedAt, defaultBranch }) : null;
     const owedCiRerunRetry = mainGreenNow?.red === false ? readWithTimeoutRetry(() => owedCiRerunEvidence(pr, { repo, checks, readJobAttempt })) : undefined;
     let timeoutRetryBudget = pr.timeoutRetryBudget;
