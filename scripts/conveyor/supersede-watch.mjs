@@ -37,7 +37,9 @@ function readPullPages({ repo, state, exec, since }) {
   for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
     const batch = ghJson(['api', `repos/${slugOf(repo)}/pulls?state=${state}&sort=updated&direction=desc&per_page=${PAGE_SIZE}&page=${page}`], exec);
     if (!Array.isArray(batch) || batch.some(p => !Number.isInteger(p?.number) || (since !== undefined
-      && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && !Number.isFinite(Date.parse(p.merged_at))))))) {
+      && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && (
+        !Number.isFinite(Date.parse(p.merged_at)) || (p.body !== null && typeof p.body !== 'string')
+        || typeof p.user?.login !== 'string' || !p.user.login.trim())))))) {
       throw new Error(`unreadable ${state} PR list in ${slugOf(repo)}`);
     }
     rows.push(...batch);
@@ -130,7 +132,11 @@ export function runSupersedeWatch({
       repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit });
     const candidates = supersedeCandidates({ mergedPrs, openNumbers });
     // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
-    const openPrs = candidates.map((pr) => readPr({ repo, pr })).filter((p) => String(p?.state ?? '').toUpperCase() === 'OPEN');
+    const openPrs = candidates.map((pr) => {
+      const p = readPr({ repo, pr });
+      if (typeof p?.state !== 'string') throw new Error(`unreadable candidate PR #${pr} state in ${slugOf(repo)}`);
+      return p;
+    }).filter((p) => p.state.toUpperCase() === 'OPEN');
     const holds = planSupersedeHolds({ mergedPrs, openPrs, settings });
     const applied = apply ? holds.map((hold) => {
       try { return { ...hold, ...postHold({ repo, hold }) }; }

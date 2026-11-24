@@ -28,8 +28,18 @@ describe('runSupersedeWatch', () => {
   it('rechecks whether the candidate is still open', () => {
     const opts = fakes();
     opts.readPr.mockReturnValue({ ...fixture.open, state: 'CLOSED' });
-    expect(runSupersedeWatch(opts).holds).toEqual([]);
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ holds: [], applied: [] });
     expect(opts.postHold).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty('blocked');
+  });
+  it.each([undefined, null, 42, {}])('blocks dispatch when a candidate state is unreadable: %j', state => {
+    const opts = fakes();
+    opts.readPr.mockReturnValue({ ...fixture.open, state });
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ blocked: true, error: expect.stringMatching(/unreadable/), holds: [], applied: [] });
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(formatSupersedeLines({ repos: [result] }).join('')).toContain('retried next tick');
   });
   // PR #4560 advisory (security): the marker is read only from a trusted author's merged PR.
   it('an untrusted merged PR author plans no hold, reads no candidate and posts nothing', () => {
@@ -116,9 +126,9 @@ describe('runSupersedeWatch', () => {
   it('stops merged pagination at an old updated page, not an old merge updated recently', () => {
     const recent = '2026-10-09T00:00:00Z', old = '2026-01-01T00:00:00Z';
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
-      number: i + 1, merged_at: i === 0 ? old : recent, updated_at: recent, user: { login: 'bot' },
+      number: i + 1, body: null, state: 'closed', merged_at: i === 0 ? old : recent, updated_at: recent, user: { login: 'bot' },
     })))).mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
-      number: i + 101, merged_at: old, updated_at: old, user: { login: 'bot' },
+      number: i + 101, body: '', state: 'closed', merged_at: old, updated_at: old, user: { login: 'bot' },
     }))));
     const rows = defaultReadMergedPrs({ repo, lookbackDays: 14,
       now: Date.parse('2026-10-10T00:00:00Z'), exec });
@@ -127,11 +137,21 @@ describe('runSupersedeWatch', () => {
   });
   it.each([defaultReadOpenNumbers, defaultReadMergedPrs])('refuses incomplete lists at the page cap with an operator fallback (%s)', read => {
     const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
-      number: i + 1, merged_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z',
+      number: i + 1, body: '', state: 'closed', user: { login: 'bot' }, merged_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z',
     }))));
     expect(() => read({ repo, exec, lookbackDays: 14, now: Date.parse('2026-10-10T00:00:00Z') }))
       .toThrow(/page cap.*operator/i);
     expect(exec.mock.calls.length).toBeLessThanOrEqual(100);
+  });
+  it.each([{ body: undefined }, { body: 42 }, { user: undefined }, { user: {} }])('rejects incomplete merged evidence and blocks dispatch: %j', fields => {
+    const row = { number: 4532, body: '', state: 'closed', user: { login: 'bot' },
+      merged_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', ...fields };
+    const readMergedPrs = () => defaultReadMergedPrs({ repo, lookbackDays: 14,
+      now: Date.parse('2026-10-10T00:00:00Z'), exec: () => JSON.stringify([row]) });
+    expect(readMergedPrs).toThrow(/unreadable/);
+    const opts = { ...fakes(), readMergedPrs };
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, error: expect.stringMatching(/unreadable/), holds: [] });
+    expect(opts.postHold).not.toHaveBeenCalled();
   });
   it.each([null, { message: 'not a list' }])('rejects an unreadable list: %j', answer => {
     for (const read of [defaultReadOpenNumbers, defaultReadMergedPrs]) {
