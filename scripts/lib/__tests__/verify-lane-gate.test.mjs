@@ -122,6 +122,23 @@ describe('broad selection host policy', () => {
     expect(gate.decision).toMatchObject({ mode: 'full', standards: { run: true, scoped: false } });
   });
 
+  it('sibling checkout without check-standards.mjs never runs that path; uses own script or skips with a reason', () => {
+    const noWe = (p) => p !== 'scripts/check-standards.mjs';
+    const own = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+      saturation: idle, scripts: ['test', 'check:standards'], fileExists: noWe });
+    expect(own.command).toBe('npx vitest run && npm run check:standards');
+    const none = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+      saturation: idle, scripts: ['test'], fileExists: noWe });
+    expect(none.command).toBe('npx vitest run');
+    expect(none.command).not.toContain('check-standards.mjs');
+    expect(none.standardsCommand).toBeNull();
+    expect(none.decision.standards).toMatchObject({ run: false });
+    expect(none.gateReasons.join(' ')).toContain('standards step SKIPPED');
+    const we = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+      saturation: idle, scripts: ['test'], fileExists: () => true });
+    expect(we.command).toBe(FALLBACK_GATE);
+  });
+
   it('oversized targets still refuse on an idle host with an explicit gate fallback', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, saturation: idle,
       runGit: fakeGit(Array.from({ length: MAX_RELATED_TARGETS + 1 }, (_, i) => `scripts/m${i}.mjs`)) });

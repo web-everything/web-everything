@@ -499,12 +499,19 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     if (!optOut && host?.saturated === false && host.known === true) {
       // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
       const testCommand = 'npx vitest run';
-      const standardsCommand = 'node scripts/check-standards.mjs';
-      const reason = 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission';
-      return { command: `${testCommand} && ${standardsCommand}`, testCommand, standardsCommand, scanCommands: [],
+      // Sibling repos (plateau-app, frontierui) do not contain WE's check-standards script: when the caller can
+      // tell the file is absent, use the checkout's own `check:standards` script, else skip with a logged reason.
+      // Callers that cannot tell (no fileExists) keep the WE-shaped mandatory command.
+      const hasWeStandards = typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
+      const ownScript = !hasWeStandards && scripts != null && [...scripts].includes('check:standards');
+      const standardsCommand = hasWeStandards ? 'node scripts/check-standards.mjs' : ownScript ? 'npm run check:standards' : null;
+      const reason = standardsCommand
+        ? 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission'
+        : 'broad selection on an unsaturated host — full suite; standards step SKIPPED: this checkout has no scripts/check-standards.mjs and no check:standards script';
+      return { command: standardsCommand ? `${testCommand} && ${standardsCommand}` : testCommand, testCommand, standardsCommand, scanCommands: [],
         gateReasons: [reason], decision: {
           ...local, reasons: [...local.reasons, reason], changedFiles, settingsSource, relatedMode,
-          standards: { ...standards, run: true, scoped: false, reason },
+          standards: { ...standards, run: Boolean(standardsCommand), scoped: false, reason },
         } };
     }
     return blocked([
