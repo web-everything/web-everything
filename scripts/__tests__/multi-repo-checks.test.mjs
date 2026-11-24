@@ -142,3 +142,10 @@ it('the no-code-owed soak uses a repository-neutral fixture and still refuses ex
   const { default: scenario } = await import('../conveyor/soak/breaks/no-code-owed-exhausted-override.mjs');
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000);
+
+it('the pending-overdue soak resolves its registered repository and preserves the cached-draft replay', async () => {
+  const file = 'scripts/conveyor/soak/breaks/red-team-pending-overdue.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/red-team-pending-overdue.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);

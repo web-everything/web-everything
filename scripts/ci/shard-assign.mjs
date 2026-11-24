@@ -119,6 +119,11 @@ export function parseShardArg(argv) {
 
 /** Every unit-suite test file, repo-relative with posix separators, resolved by vitest itself from vitest.config.ts. */
 export async function listUnitTestFiles(repoRoot = REPO_ROOT) {
+  return listTestFiles(repoRoot);
+}
+
+/** Discover a configured suite without executing tests or setup hooks. */
+export async function listTestFiles(repoRoot = REPO_ROOT, configFile = 'vitest.config.ts') {
   const { createVitest } = await import('vitest/node');
   // An ESM wrapper uses Vite's native ESM config loading. Its CommonJS loader
   // realpaths the config via ancestor-by-ancestor lstat, crossing host lane roots
@@ -129,7 +134,7 @@ export async function listUnitTestFiles(repoRoot = REPO_ROOT) {
     const config = join(scratch, 'vitest.config.mts');
     symlinkSync(join(repoRoot, 'node_modules'), join(scratch, 'node_modules'), 'dir');
     writeFileSync(join(scratch, 'package.json'), JSON.stringify({ type: 'module', workspaces: [] }));
-    writeFileSync(config, `export { default } from ${JSON.stringify(join(repoRoot, 'vitest.config.ts'))};\n`);
+    writeFileSync(config, `export { default } from ${JSON.stringify(join(repoRoot, configFile))};\n`);
     // Isolate Vite's workspace/config searches in scratch; glob the real repo via
     // test.dir using its unchanged include/exclude rules. No tests execute here.
     ctx = await createVitest('test', { watch: false, run: true, root: scratch, dir: repoRoot, config, setupFiles: [], globalSetup: [], reporters: [] }, {

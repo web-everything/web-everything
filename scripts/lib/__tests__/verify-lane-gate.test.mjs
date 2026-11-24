@@ -17,9 +17,14 @@ import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSyn
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
+import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUTO_PREFIXES, standardsRelevantPath, decideStandardsHalf, verifyPhaseAdmissionEnabled, verifyFastTargets, phaseAdmissionKind, verifyRelatedMode, buildPhaseOutcome, firstStandardsErrorId, verifyTestTimeoutFactor, scaledTimeoutFlags, buildVerifyPhases, formatVerifyPhases, explicitGateRefusal, resolveDefaultGate as resolveGate, resolvePushDefaultGate, matchRequestedDefaultGate, canScopeCheckStandards, composeGate, describeGate, laneRelevantChangeSince, computeWorkingTreeHash, stableTreeHash, FULL_GATE, MAX_RELATED_TARGETS, CARD_ONLY_SKIP_GATE, localDiffIsCardOnly } from '../verify-lane-gate.mjs';
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 import { localChangedSet } from '../verify-lane-gate.mjs';
+
+import { ciOnlyDecision, hostSaturation } from '../verify-ci-only.mjs';
+
+// Historical refusal cases model a saturated host; never sample this test runner's host.
+const resolveDefaultGate = options => resolveGate({ saturation: () => ({ saturated: true }), ...options });
 
 /** A synthetic git runner for the xpnhz4o working-tree changed set: `merge-base` resolves to a fixed sha;
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
@@ -46,6 +51,110 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 
 /** Factor 1 = vitest's own timeouts, i.e. the exact pre-WE_VERIFY_TEST_TIMEOUT_FACTOR command. */
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
+
+describe('broad selection host policy', () => {
+  const FALLBACK_GATE = 'npx vitest run && node scripts/check-standards.mjs';
+  const idle = () => ({ saturated: false, known: true, reason: 'idle host' });
+  it('negative: removed standards script cannot bypass mandatory unscoped standards', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
+      runGit: fakeGit(['package.json']), saturation: idle, scripts: ['test:unit'] });
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+    expect(gate.command).toBe('npx vitest run && node scripts/check-standards.mjs');
+  });
+
+  it('negative: neutered or absent npm test scripts cannot bypass the repo Vitest config', () => {
+    for (const scripts of [[], ['test'], ['test:unit'], ['test', 'test:unit', 'check:standards']]) {
+      const gate = resolveDefaultGate({ fileConfig: null, env: TODAY,
+        runGit: fakeGit(['package.json']), saturation: idle, scripts });
+      expect(gate.testCommand).toBe('npx vitest run');
+      expect(gate.command).toBe('npx vitest run && node scripts/check-standards.mjs');
+    }
+  });
+
+  it('package.json change on an idle host selects the full suite, not a refusal', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation: idle });
+    expect(gate.decision.mode).toBe('full');
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.testCommand).toBe('npx vitest run');
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(phaseAdmissionKind({ phase: 'vitest', decision: gate.decision, env: TODAY, fileConfig: null })).toEqual({ kind: 'other', lane: 'slow' });
+  });
+
+  const kinds = [
+    ['package.json', () => fakeGit(['package.json'])],
+    ['fixture', () => fakeGit(['scripts/__tests__/fixtures/shared.json'])],
+    ['unknown diff', () => () => { throw Error('unreadable diff'); }],
+    ['empty diff', () => fakeGit([])],
+    ['deletion', () => fakeGit(['scripts/gone.mjs'], { deleted: ['scripts/gone.mjs'] })],
+  ];
+  it.each(kinds.flatMap(([kind, git]) => [false, true].map(saturated => ({ kind, git, saturated }))))(
+    '$kind × saturated=$saturated has a runnable command or allows ci-only', ({ git, saturated }) => {
+      const saturation = () => ({ saturated, known: true, reason: 'test host' });
+      const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: git(), saturation });
+      const deferred = ciOnlyDecision({ verify: 'ci-only', mode: 'park', saturation });
+      expect(Boolean(gate.command?.trim()) || deferred.ok).toBe(true);
+      if (saturated && gate.decision.mode !== 'shrink') {
+        expect(gate.decision.mode).toBe('blocked');
+        expect(gate.command).toBeNull();
+        expect(deferred.ok).toBe(true);
+      }
+      if (!saturated && gate.decision.mode !== 'shrink') expect(gate.command).toBe(FALLBACK_GATE);
+    });
+
+  it.each([['test'], ['test:unit'], ['test', 'test:unit', 'check:standards']])(
+    'idle full fallback bypasses checkout script names %s', (...scripts) => {
+      expect(resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+        saturation: idle, scripts }).command).toBe(FALLBACK_GATE);
+    });
+
+  it('idle full fallback keeps unscoped standards even when selected policy skips them', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
+      runGit: fakeGit(['package.json']), saturation: idle });
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+  });
+
+  it('missing full test script still runs direct tests and mandatory standards', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+      saturation: idle, scripts: ['check:standards'] });
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.decision).toMatchObject({ mode: 'full', standards: { run: true, scoped: false } });
+  });
+
+  it('oversized targets still refuse on an idle host with an explicit gate fallback', () => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, saturation: idle,
+      runGit: fakeGit(Array.from({ length: MAX_RELATED_TARGETS + 1 }, (_, i) => `scripts/m${i}.mjs`)) });
+    expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
+    expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
+  });
+
+  it('push default still refuses the idle-host full fallback', () => {
+    expect(resolvePushDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation: idle }))
+      .toMatchObject({ command: null, exitCode: 2 });
+  });
+
+  it('opt-out still refuses on an idle host', () => {
+    expect(resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_DIFF_TEST_SELECTION: '0' },
+      runGit: fakeGit(['package.json']), saturation: idle })).toMatchObject({ command: null, decision: { mode: 'blocked' } });
+  });
+
+  it('unreadable saturation refuses with an operator fallback', () => {
+    for (const saturation of [() => null, () => ({}), () => ({ saturated: false }), () => { throw Error('probe failed'); }]) {
+      const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation });
+      expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
+      expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
+    }
+  });
+
+  it('unknown CPU evidence with a package.json change stays blocked', () => {
+    const saturation = () => hostSaturation({ collect: () => ({}), admission: () => ({ admitted: true }) });
+    expect(saturation()).toMatchObject({ saturated: false, known: false });
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation });
+    expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
+    expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
+  });
+});
 
 it('R984 preserves whitespace in tracked, deleted and untracked changed-file names', () => {
   const result = localChangedSet({ runGit: fakeGit(['notes.md ', ' leading.md'],

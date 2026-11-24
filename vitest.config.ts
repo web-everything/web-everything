@@ -206,6 +206,8 @@ export default defineConfig({
       'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
       // Fallback's harness-backoff case also drives three real-git rebuilds and timed out in unit shard 7.
       'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
+      // Dispatch smoke also rebuilds real-git candidates; three cases hit 5s in unit shard 9.
+      'scripts/lib/__tests__/daemon-rebuild-smoke.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',

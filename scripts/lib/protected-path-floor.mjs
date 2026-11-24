@@ -159,6 +159,8 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The record-only file-class writer reserves its evaluation output with an exclusive `wx` create.
+  'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
@@ -246,6 +248,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
 export const LOCK_USERS = Object.freeze([
   // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
   'scripts/lib/review-fast-pass-cli.mjs',
+  // Remote discovery imports the remote-exec lock holder for its execution adapter.
+  'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a

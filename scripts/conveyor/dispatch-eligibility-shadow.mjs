@@ -2,6 +2,14 @@
 import * as nodeFs from 'node:fs';
 import { dirname, join } from 'node:path';
 import { eligibility } from './dispatch-eligibility.mjs';
+import { GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
+
+// An explicit flag always wins; with the flag unset, a listed thread strictly below the list cap is complete.
+function threadComplete(pr) {
+  if (pr.commentsComplete === true) return true;
+  if (pr.commentsComplete === false) return false;
+  return Array.isArray(pr.comments) && pr.comments.length < GH_LIST_COMMENT_CAP;
+}
 import { buildEligibilityFacts } from './dispatch-eligibility-facts.mjs';
 import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
@@ -80,8 +88,9 @@ export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow',
     if (!['fix', 'ci-heal'].includes(entry.kind)) continue;
     result.checked++;
     try {
-      const pr = prs.find(p => p.number === entry.prNumber) ?? {};
-      const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete === true,
+      const listed = prs.find(p => p.number === entry.prNumber) ?? {};
+      const pr = { ...listed, commentsComplete: threadComplete(listed) }; // copy: the listed PR is never modified
+      const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete,
         population: entry.kind, locals: readLocals(entry, pr) });
       const gate = eligibility(pr, facts);
       if (gate.dispatch === true) continue;
