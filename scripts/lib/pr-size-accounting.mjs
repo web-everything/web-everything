@@ -37,6 +37,19 @@ export function parseNumstat(numstatText) {
 
 export const isTestPath = (path) => /(^|\/)__tests__\//.test(path) || /(^|\/)[^/]*\.(test|spec)\.[^/]+$/.test(path);
 
+// Glob match on path segments: `**` spans zero or more segments, `*` matches within one segment.
+function matchSegments(pattern, parts) {
+  if (!pattern.length) return !parts.length;
+  const [head, ...rest] = pattern;
+  if (head === '**') return parts.some((_, i) => matchSegments(rest, parts.slice(i))) || matchSegments(rest, []);
+  if (!parts.length) return false;
+  // `[0-9]` is the only supported class (version dirs); everything else is literal.
+  const re = new RegExp(`^${head.split('*').map(s => s.split('[0-9]')
+    .map(t => t.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('[0-9]')).join('[^/]*')}$`);
+  return re.test(parts[0]) && matchSegments(rest, parts.slice(1));
+}
+const matchesDataPath = (glob, path) => glob === path || (glob.includes('*') && matchSegments(glob.split('/'), path.split('/')));
+
 // Both sides of a rename must be data. Unsafe paths, code and markdown always count.
 function isDataPath(path, settings) {
   const segments = path.split('/');
@@ -44,7 +57,7 @@ function isDataPath(path, settings) {
   const filename = segments.pop();
   const dot = filename.lastIndexOf('.');
   if (dot === -1 || !BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.includes(filename.slice(dot))) return false;
-  if (settings.dataPaths.includes(path)) return true;
+  if (settings.dataPaths.some(glob => matchesDataPath(glob, path))) return true;
   return settings.dataExtensions.includes(filename.slice(dot))
     && segments.some(segment => settings.dataDirs.includes(segment));
 }
