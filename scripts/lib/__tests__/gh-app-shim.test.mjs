@@ -1705,3 +1705,40 @@ require(${JSON.stringify(shim)});
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 });
+
+
+describe('GraphQL field targets in the rendered shim', () => {
+  it.each([
+    ['sibling owner', ['-Fowner=plateauapp', '-Fname=plateau-app'], 'sibling'],
+    ['file-backed owner refuses', ['-Fowner=@owner.txt', '-Fname=plateau-app'], null],
+    ['conflicting owners refuse', ['-fowner=plateauapp', '-fowner=frontier-ui', '-fname=plateau-app'], null],
+    ['conflicting name and repo refuse', ['-fowner=plateauapp', '-fname=plateau-app', '-Frepo=other'], null],
+    ['unparseable owner refuses', ['-fowner=', '-fname=plateau-app'], null],
+    ['no-owner graphql keeps GH_REPO', ['-fquery=query { viewer { login } }'], 'checkout'],
+  ])('%s', (_label, fields, expected) => {
+    const dir = mkdtempSync(join(tmpdir(), 'graphql-shim-'));
+    try {
+      const realGh = join(dir, 'real-gh');
+      writeFileSync(realGh, '#!/usr/bin/env node\nconsole.log(process.env.GH_TOKEN);\n', { mode: 0o755 });
+      const cachePath = join(dir, 'cache.json');
+      for (const [id, token] of [['167639975', 'sibling'], ['167640002', 'checkout']]) {
+        writeFileSync(join(dir, 'cache.' + id + '.json'), JSON.stringify({ v: 2, installationId: id, token,
+          expiresAt: new Date(Date.now() + 3600e3).toISOString() }));
+      }
+      const shim = join(dir, 'shim.cjs');
+      writeFileSync(shim, renderGhShimScript({ realGhPath: realGh, cachePath,
+        ghThrottleCliPath: join(dir, 'missing-throttle.mjs') }));
+      const result = spawnSync(process.execPath, [shim, 'api', 'graphql', ...fields], {
+        cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
+        env: { ...process.env, ...NOT_A_DAEMON, GH_REPO: 'web-everything/web-everything', GH_TOKEN: 'personal', HOME: dir },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(expected ? 0 : 1);
+      if (expected) expect(result.stdout.trim()).toBe(expected);
+      else {
+        expect(result.stdout).toBe('');
+        expect(result.stderr).toContain('REFUSING personal-auth fallback: unresolved GraphQL');
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

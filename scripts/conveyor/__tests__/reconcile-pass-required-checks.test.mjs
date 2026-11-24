@@ -15,6 +15,9 @@ vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
 });
 vi.mock('../../lib/write-all-sync.mjs', () => ({ writeAllSync: vi.fn(), writeLineSync: vi.fn() }));
 
+// Load the cyclic reconcile/drain graph during collection, before timed tests run.
+import { runReconcilePass, defaultReadChecks } from '../reconcile-pass.mjs';
+
 const XX_REQUIRED = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'];
 const XX_HEAD = '4ecb5deb362c81aa28de162db4616bb4c2009347';
 const xxPr = () => ({ number: 3336, headRefOid: XX_HEAD, headRefName: 'lane/3336-replay', isDraft: true,
@@ -29,7 +32,6 @@ const xxOptions = () => ({ repo: 'we', readPrs: () => [xxPr()], readAgents: () =
 it.each([{}, { rowsComplete: null, rowsHead: null }].flatMap(provenance =>
   ['complete', 'unreadable', 'duplicate', 'short'].map(shape => ({ provenance, shape }))))(
   'hydrates short legacy rollups before review admission: %j', async ({ provenance, shape }) => {
-  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const row = { id: 1, name: 'test', status: 'completed', conclusion: 'success', head_sha: XX_HEAD };
   const pr = { ...xxPr(), ...provenance, isDraft: false, labels: ['review:pending'], statusCheckRollup: [row] };
   const exec = vi.fn((_file, args) => {
@@ -51,7 +53,6 @@ it.each([{}, { rowsComplete: null, rowsHead: null }].flatMap(provenance =>
 });
 
 it.each([100, 101])('preserves complete current-head %s-row snapshots without rereading', async count => {
-  const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const pr = { ...xxPr(), isDraft: false, labels: ['review:pending'], rowsComplete: true, rowsHead: XX_HEAD,
     statusCheckRollup: Array.from({ length: count }, (_, i) => ({
       name: i ? `optional-${i}` : 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: XX_HEAD,
@@ -65,7 +66,6 @@ it.each([100, 101])('preserves complete current-head %s-row snapshots without re
 });
 
 it.each(['complete', 'short-incomplete', 'status-failure', 'status-error', 'status-pending', 'status-unreadable', 'check-unreadable'])('restores truncated evidence only after both REST feeds complete: %s', async shape => {
-  const { runReconcilePass, defaultReadChecks } = await import('../reconcile-pass.mjs');
   const runs = Array.from({ length: 101 }, (_, i) => ({ id: i + 1, name: i ? `optional-${i}` : 'test',
     status: 'completed', conclusion: 'success', head_sha: XX_HEAD }));
   const exec = vi.fn((_file, args) => {
@@ -102,7 +102,6 @@ it.each([false, true])('Plateau #198 green checks promote with repo-local 403 fa
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { getRequiredStatusChecks } = await import('../../lib/required-status-checks.mjs');
-  const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const dir = mkdtempSync(join(tmpdir(), 'plateau-required-checks-'));
   try {
     // Reported #198 check list, 2026-10-02. IDs are fixture IDs; deployment skips are intentional.
@@ -131,7 +130,6 @@ it.each([
   ['pending', [{ name: 'test', status: 'in_progress', conclusion: null }]],
   ['unchecked', []],
 ])('an unavailable required set never promotes %s observed checks', async (_, rows) => {
-  const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const plan = runReconcilePass({ ...xxOptions(), repo: 'plateau-app',
     readPrs: () => [{ ...xxPr(), statusCheckRollup: rows }],
     readRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });
@@ -140,7 +138,6 @@ it.each([
 
 
 it.each(['live', 'cache', 'unavailable'])('attaches rosterSource %s after hydration and logs exact evidence coverage once', async source => {
-  const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const complete = { ...xxPr(), statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
     rowsHead: XX_HEAD, rowsComplete: true };
   const prs = [complete,
@@ -168,7 +165,6 @@ it.each(['live', 'cache', 'unavailable'])('attaches rosterSource %s after hydrat
 
 it.each([{}, { rowsComplete: false, rowsHead: XX_HEAD }, { rowsComplete: true, rowsHead: 'b'.repeat(40) }])(
   'replacement rows without complete current-head provenance clear the old claim: %j', async provenance => {
-  const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const stale = { ...xxPr(), statusCheckRollup: [], rowsHead: XX_HEAD, rowsComplete: true };
   let observed;
   const log = vi.spyOn(console, 'error').mockImplementation(() => {});

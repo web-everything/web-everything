@@ -22,12 +22,37 @@ export function resolveForgeSlots(settings, {env = {}, host = ''} = {}) {
   return Object.hasOwn(config.hosts, name) ? config.hosts[name] : config.default;
 }
 
+/** Overlay the operator layer's per-host sizes (policy-cascade platform preference `forgeSlots`) on the repo settings. */
+export function mergeOperatorHosts(settings, operator) {
+  if (operator === undefined) return settings;
+  const own = settings?.forgeSlots?.hosts;
+  if (own !== undefined && (!own || typeof own !== 'object' || Array.isArray(own))) throw new Error('forgeSlots.hosts must be an object');
+  for (const [name, value] of Object.entries(own ?? {})) checked(value, 'forgeSlots.hosts.' + name);
+  if (operator === null || typeof operator !== 'object' || Array.isArray(operator)) throw new Error('forgeSlots operator hosts must be an object');
+  const hosts = operator.hosts;
+  if (hosts === undefined) return settings;
+  if (!hosts || typeof hosts !== 'object' || Array.isArray(hosts)) throw new Error('forgeSlots operator hosts must be an object');
+  return {...settings, forgeSlots: {...settings?.forgeSlots, hosts: {...settings?.forgeSlots?.hosts, ...hosts}}};
+}
+
+async function operatorLayer() {
+  let cascade;
+  try { cascade = await import('../lib/policy-cascade.mjs'); } catch (error) {
+    if (error?.code === 'ERR_MODULE_NOT_FOUND' && String(error.message).includes('policy-cascade')) return undefined; // flat Forge deployment: no cascade module
+    throw error;
+  }
+  const {prefs, errors} = cascade.readPlatformPreferences({warn: () => {}});
+  if (errors.length) throw new Error('operator layer unreadable');
+  return prefs.forgeSlots;
+}
+
 const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
 if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   try {
     const beside = new URL('./forge-slots.json', import.meta.url);
     const path = existsSync(beside) ? beside : new URL('../settings/forge-slots.json', import.meta.url);
-    const settings = process.env.FORGE_EXEC_SLOTS === undefined ? JSON.parse(readFileSync(path, 'utf8')) : null;
+    const base = process.env.FORGE_EXEC_SLOTS === undefined ? JSON.parse(readFileSync(path, 'utf8')) : null;
+    const settings = base ? mergeOperatorHosts(base, await operatorLayer()) : null;
     console.log(resolveForgeSlots(settings, {env: process.env, host: hostname()}));
   } catch (error) {
     console.error('forge-slots: ' + String(error.message).replace(/[\x00-\x1f\x7f]/g, ' '));

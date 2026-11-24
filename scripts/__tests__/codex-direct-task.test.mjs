@@ -1843,7 +1843,10 @@ describe('detached jobs', () => {
       expect(result).toEqual({ status: 'wait-error', exitCode: null, resultPath: record.resultPath });
       worker.kill('SIGKILL');
       await exited;
-      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 1000 }))
+      // Real process, real fs: on a loaded coverage shard (main run 45229037519, shard 3) a 1000 ms budget
+      // was spent before the wait observed the exit and wrote the failed record, so it returned 'running'.
+      // The assertion still demands failed/exit 1; only the host-load headroom grew.
+      expect(await waitForJob({ jobId: record.id, jobsDir, maxMs: 8000 }))
         .toMatchObject({ status: 'failed', exitCode: 1, code: 1 });
       expect(readJobRecord(record.id, { jobsDir })).toMatchObject({ status: 'failed', exitCode: 1 });
     } finally {

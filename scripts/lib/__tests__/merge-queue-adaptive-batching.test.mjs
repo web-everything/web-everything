@@ -294,6 +294,12 @@ describe('intermediate cancellation selection', () => {
 // C/D: injectable IO, drain seam, and deterministic replay.
 import { createAdaptiveBatching, readQueueFacts, readGroupingStrategy, replayBatching } from '../merge-queue-adaptive-batching.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
+import { redTeamMarker } from '../red-team-gate.mjs';
+// RL A0: enqueue needs head-bound red-team proof. Serve a trusted policy-clear for the PR in the comments path.
+const proofPages = (args, head) => {
+  const num = Number(/issues\/(\d+)\/comments/.exec(args.join(' '))?.[1]);
+  return JSON.stringify([[{ author: { login: 'web-everything' }, body: `${redTeamMarker(num, head)}\nRed team not required on this head: card-only diff.` }]]);
+};
 
 function ioHarness({ state = empty(), queue = [], dryRun = false, failQueue = false, strategy = 'HEADGREEN', runs = [], dequeue = () => {} } = {}) {
   let stored = structuredClone(state);
@@ -590,7 +596,7 @@ describe('batching IO shell and drain hook', () => {
         if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
         if (args[0] === 'pr' && args[1] === 'comment') return '';
         if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'pr-1', headRefOid: head, baseRefName: 'main', labels: ['ready-to-merge'] });
-        if (args.includes('--slurp')) return '[[]]';
+        if (args.includes('--slurp')) return proofPages(args, head);
         if (args.some(a => a.includes('isInMergeQueue'))) return JSON.stringify({ data: { repository: { pullRequest: { isInMergeQueue: order.some(o => o[0] === 'enqueue'), headRefOid: head } } } });
         if (args.includes('graphql')) {
           order.push(['enqueue', 1]);
@@ -633,16 +639,18 @@ describe('batching IO shell and drain hook', () => {
       exec: (cmd, args) => {
         calls.push([cmd, args]);
         if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: head, labels: ['ready-to-merge'] });
-        if (cmd === 'gh' && args[0] === 'api' && args.includes('--slurp')) return '[[]]';
+        if (cmd === 'gh' && args[0] === 'api' && args.includes('--slurp')) return proofPages(args, head);
         throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
       },
     });
     expect(drain.enqueue({ num: 4 }, head)).toEqual({ enqueued: false, deferred: true, reason: 'queue holds 1 group(s) (max 1)' });
-    // Live admission reads the complete thread for recorded breaks before batching, even with no owed red team.
-    // Deferral still makes no enqueue or clearance mutation.
+    // Live admission reads the complete thread for head-bound red-team proof before batching (RL A0), and syncs the
+    // red-team:clear status label that proof earns. Deferral still makes no enqueue or clearance-stamp mutation.
     expect(calls).toEqual([
       ['gh', ['pr', 'view', '4', '--repo', 'owner/repo', '--json', 'headRefOid,labels,reviews']],
       ['gh', ['api', '--paginate', '--slurp', 'repos/owner/repo/issues/4/comments']],
+      ['gh', ['label', 'create', 'red-team:clear', '--repo', 'owner/repo', '--color', '0e8a16',
+        '--description', 'Red team completed without an unresolved blocking break on the current head', '--force']],
     ]);
   });
   it('dry run performs neither state writes, dequeue, nor cancel', () => {

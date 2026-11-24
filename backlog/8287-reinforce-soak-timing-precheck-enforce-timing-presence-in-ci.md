@@ -2,9 +2,11 @@
 bornAs: xaqm796
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/soak-precheck-at-open.mjs", "we:scripts/lib/soak-replay-gate.mjs"]
 dateOpened: "2026-11-14"
+dateResolved: "2026-11-21"
+graduatedTo: none
 tags: []
 ---
 

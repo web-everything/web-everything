@@ -1,10 +1,16 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
+
+beforeEach(() => {
+  vi.stubEnv('GITHUB_ACTIONS', 'true');
+  vi.stubEnv('GITHUB_WORKFLOW', 'Refresh CI test timings');
+});
+afterEach(() => vi.unstubAllEnvs());
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -27,11 +33,15 @@ describe('shard-assign — balance by measured time (card 11)', () => {
     expect(assignByTime([...files].reverse(), timings, 3)).toEqual(assignByTime(files, timings, 3));
   });
 
-  it('a file with no stored timing gets the median of the known ones', () => {
-    expect(median([1, 5, 9])).toBe(5);
-    const shards = assignByTime(['a', 'b', 'new'], { a: 10, b: 10 }, 3);
-    expect(shards.flat().sort()).toEqual(['a', 'b', 'new']);
-    expect(shards.every((s) => s.length === 1)).toBe(true);
+  it('assigns an unknown file exactly once using its suite median', () => {
+    const timings = { a: 9, b: 5, c: 1 };
+    const files = ['a', 'b', 'c', 'new'];
+    const shards = assignByTime(files, timings, 2);
+    expect(median(Object.values(timings))).toBe(5);
+    expect(shards).toEqual([['a', 'c'], ['b', 'new']]);
+    expect(shards).toEqual(assignByTime(files, { ...timings, new: 5 }, 2));
+    expect(shards.flat().filter(file => file === 'new')).toHaveLength(1);
+    expect(shards.flat().sort()).toEqual([...files].sort());
   });
 
   it('more shards than files leaves extra shards empty, not erroring', () => {
@@ -135,6 +145,18 @@ describe('integration timing persistence', () => {
       writeFileSync(file, JSON.stringify(original));
       // The copied CLI resolves its root two directories above its location.
       writeFileSync(report, JSON.stringify({ testResults: [{ name: join(dir, 'i.test.mjs'), startTime: 0, endTime: 2500 }] }));
+      for (const env of [
+        { GITHUB_ACTIONS: 'false', GITHUB_WORKFLOW: 'Refresh CI test timings' },
+        { GITHUB_ACTIONS: 'true', GITHUB_WORKFLOW: 'CI' },
+        { GITHUB_ACTIONS: '', GITHUB_WORKFLOW: '' },
+      ]) {
+        const denied = spawnSync(process.execPath, [script, '--suite=integration', `--update=${report}`], {
+          env: { ...process.env, ...env }, encoding: 'utf8', timeout: 5000,
+        });
+        expect(denied.status).toBe(2);
+        expect(denied.stderr).toMatch(/bot owns.*test-timings.json.*ci-timings-refresh/);
+        expect(loadTimings(file)).toEqual(original);
+      }
       execFileSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { timeout: 5000 });
       const updated = loadTimings(file);
       expect(updated.unit).toEqual(original.unit);
