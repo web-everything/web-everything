@@ -1,5 +1,5 @@
 {
-  "description": "Extra globs that classify as HIGH risk tier; can only add to the built-in must-stay list (observe-only, PRESET-S1).",
+  "description": "Required array of valid globs adding HIGH risk rules; malformed or duplicate-key settings refuse classification (observe-only).",
   "owner": "scripts/settings/delivery-tiers.json",
   "changeVia": "pr",
   "instant": false
