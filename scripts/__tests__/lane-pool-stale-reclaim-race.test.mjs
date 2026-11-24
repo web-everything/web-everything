@@ -64,7 +64,7 @@ beforeEach(() => {
   const provision = runPool(['provision', '--count=1', ...REPO()]);
   expect(provision.code).toBe(0);
   // Seed a long-TTL-stale lease on lane-1 — both reclaimers will judge it stale the same way.
-  const seed = runPool(['acquire', '--lane=1', ...REPO(), '--session=long-dead', '--ttl-minutes=0']);
+  const seed = runPool(['acquire', '--lane=1', ...REPO(), '--session=long-dead', '--ttl-minutes=0', '--exact-ttl']);
   expect(seed.code).toBe(0);
 });
 

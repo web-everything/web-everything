@@ -210,7 +210,7 @@ describe('list --acquirable: opt-in reuse of a clean lane verdict', () => {
 
   it('does not record an expired-lease lane as clean (info.lease), and a lane with a live lease is dropped at once', () => {
     extraEnv = ON;
-    expect(runPool(['acquire', '--lane=2', ...REPO(), '--no-reset', '--session=short-lived', '--ttl-minutes=0.001']).code).toBe(0);
+    expect(runPool(['acquire', '--lane=2', ...REPO(), '--no-reset', '--session=short-lived', '--ttl-minutes=0.001', '--exact-ttl']).code).toBe(0);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
     expect(list()).toEqual(referenceList());
     expect(list()).toContain(2); // stale lease ⇒ acquirable in the full scan too

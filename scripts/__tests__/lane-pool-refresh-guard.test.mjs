@@ -277,7 +277,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
@@ -303,7 +303,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
@@ -335,7 +335,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
@@ -359,7 +359,7 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );

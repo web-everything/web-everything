@@ -57,7 +57,7 @@ function trim(args = []) {
 }
 
 function leaseLane(n, { session = 'foreign-holder', ttlMinutes, reserve = false } = {}) {
-  const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`];
+  const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`, '--exact-ttl'];
   const reserveArgs = reserve ? ['--reserve'] : [];
   const r = runPool(['acquire', `--lane=${n}`, ...REPO(), '--no-reset', `--session=${session}`, ...ttl, ...reserveArgs], ENV());
   expect(r.code).toBe(0);

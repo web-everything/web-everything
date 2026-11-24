@@ -51,7 +51,7 @@ function provision(count, extra = []) {
 // Lease a specific lane as a FOREIGN session (leaves a live lease, no reset). `ttlMinutes` is stamped INTO the
 // lease (it overrides a reader's --ttl-minutes), so pass 0 to mint an already-stale lease.
 function leaseLane(n, { session = 'foreign-holder', ttlMinutes } = {}) {
-  const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`];
+  const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`, '--exact-ttl'];
   const r = runPool(['acquire', `--lane=${n}`, ...REPO(), '--no-reset', `--session=${session}`, ...ttl], ENV());
   expect(r.code).toBe(0);
   return join(poolRoot, 'acqtest', `lane-${n}`);
