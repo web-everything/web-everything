@@ -1029,6 +1029,8 @@ describe('runFixCli', () => {
       if (args.includes('add')) added = true;
       if (args.includes('ls-files')) {
         const path = args[args.length - 1];
+        // Only the declared conflicts exist in this fixture; evidence removal must observe an empty index entry.
+        if (!paths.includes(path)) return '';
         return added ? `100644 ${'c'.repeat(40)} 0\t${path}\0` : ['a', 'b', 'd'].map((x, i) => `100644 ${x.repeat(40)} ${i + 1}\t${path}\0`).join('');
       }
       if (args.includes('cat-file')) {
@@ -1194,10 +1196,12 @@ describe('runFixCli', () => {
       setup.ours({ dir, git });
       git('add', '-A'); setup.oursIndex?.({ dir, git }); git('commit', '-m', 'ours');
       const m = mk([]);
+      const indexWrites = [];
       m.spawn.mockImplementation(async () => { agent({ dir }); return { finalMessage: 'resolved' }; });
       const run = (cmd, args, opts) => {
         if (cmd === 'git') {
           m.calls.push([cmd, ...args]);
+          if (args.includes('update-index')) indexWrites.push(opts?.input);
           onGit?.(args, dir, opts);
           if (args.includes('fetch') || args.includes('push')) return '';
           return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: opts?.encoding === null ? null : 'utf8', stdio: 'pipe', input: opts?.input, maxBuffer: opts?.maxBuffer });
@@ -1208,7 +1212,7 @@ describe('runFixCli', () => {
       };
       const recordOutcome = vi.fn();
       const out = await runFixCli([...argv, '--merge-onto=target', ...extra], { ...m.io, run, recordOutcome, ...io });
-      await check({ out, m, git, dir, recordOutcome });
+      await check({ out, m, git, dir, recordOutcome, indexWrites });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
   it.each([
@@ -1536,14 +1540,23 @@ describe('runFixCli', () => {
     conflict: { base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'base\n'),
       theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'), ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n') },
   };
+  const expectNoContentStaged = (m, indexWrites, kind) => {
+    // A clean merge removes root evidence before the agent starts. Permit only that exact deletion,
+    // including its stdin: any git add, refresh, other removal or blob insertion still fails this assertion.
+    expect(m.calls.filter(staged)).toEqual(kind === 'clean merge'
+      ? [['git', ...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info']] : []);
+    expect(indexWrites).toEqual(kind === 'clean merge'
+      ? [`0 ${'0'.repeat(40)}\t.fix-evidence.md\0`] : []);
+    expect(m.calls.some(c => c.includes('push'))).toBe(false);
+  };
   it.each(Object.keys(stagingCases))('refuses to stage a lane file hardlinked to a file outside the lane (%s): nothing added, nothing pushed', async (kind) => {
     await withSecret(async (secret) => {
       await withRealMerge(stagingCases[kind], { agent: ({ dir }) => {
         writeFileSync(join(dir, 'file.txt'), 'resolved\n');
         linkSync(secret, join(dir, 'leak.txt'));
-      } }, async ({ out, m, git, recordOutcome }) => {
+      } }, async ({ out, m, git, recordOutcome, indexWrites }) => {
         expect(out.code).toBe(1);
-        expect(m.calls.some(c => staged(c) || c.includes('push'))).toBe(false);
+        expectNoContentStaged(m, indexWrites, kind);
         expect(() => git('cat-file', '-e', git('hash-object', secret).trim())).toThrow(); // the secret never entered the object store
         expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage .*leak\.txt/) }));
       });
@@ -1581,7 +1594,7 @@ describe('runFixCli', () => {
           if (state === 'armed' && swap === 'parent' && path === 'sub/f.txt') doSwap();
           return laneStageEntry(l, path, racingFs);
         } },
-      }, async ({ out, m, git, recordOutcome }) => {
+      }, async ({ out, m, git, recordOutcome, indexWrites }) => {
         expect(state).not.toBe('armed');
         expect(() => git('cat-file', '-e', git('hash-object', secret).trim())).toThrow();
         if (swap === 'file') {
@@ -1590,7 +1603,7 @@ describe('runFixCli', () => {
           expect(m.calls.some(c => c.includes('push'))).toBe(true);
         } else {
           expect(out.code).toBe(1);
-          expect(m.calls.some(c => staged(c) || c.includes('push'))).toBe(false);
+          expectNoContentStaged(m, indexWrites, kind);
           expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage sub\/f\.txt/) }));
         }
       });
