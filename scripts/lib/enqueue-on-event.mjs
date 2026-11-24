@@ -759,8 +759,8 @@ export function extractPassTimings(stderr) {
 const STDERR_LINE_MAX = 200;
 const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
-// Controls, line/paragraph separators, zero-width and bidi format characters (built from escapes so the source stays plain ASCII).
-const UNSAFE_LOG_CHARS = new RegExp('[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]', 'g');
+// Allowlist: only printable ASCII survives; every other code point (controls, separators, bidi/zero-width marks) becomes a space.
+const UNSAFE_LOG_CHARS = /[^\x20-\x7e]/g;
 const URL_USERINFO =/:\/\/[^/\s]*@/;
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
@@ -1228,7 +1228,7 @@ export function createEnqueueOnEvent({
         const exitFailed = !r.timedOut && r.code !== 0;
         // A failed child cannot supply success or permanent-decline evidence.
         const json = exitFailed ? null : lastJsonLine(r.stdout);
-        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}${r.stderrFirstLine ? `, first error: ${r.stderrFirstLine}` : ''}`;
+        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}${r.code !== 0 && r.stderrFirstLine ? `, first error: ${r.stderrFirstLine}` : ''}`;
         const spawnFailed = r.errorClass === 'spawn-error';
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : spawnFailed ? `could not run (${diagnostic})` : summarizeFastDrain(json, p.num);
         const summary = what;
