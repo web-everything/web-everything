@@ -22,7 +22,7 @@ function probe(root = process.env.SOAK_TREE_ROOT || fileURLToPath(new URL('../..
 export default { id: 'mq-timeout-same-head', title: 'pure Vitest timeout heals a held MQ head once across drain passes',
   card: 'same-head timeout recovery', fixedBy: { sha: '77885e4db6feec698e901b0a928a87e9f9120647', where: 'lane/drain-mq-flake-narrow', paths: ['scripts/lib/drain-mq-failure-recovery.mjs', 'scripts/lib/drain-mq-failure-recovery-io.mjs'] },
   fixPresent(root) {
-    return spawnSync('git', ['merge-base', '--is-ancestor', this.fixedBy.sha, 'HEAD'],
+    return spawnSync('git', ['merge-base', '--is-ancestor', '77885e4db6feec698e901b0a928a87e9f9120647', 'HEAD'],
       { cwd: root, stdio: 'ignore', timeout: 30000 }).status === 0;
   }, async run() { return probe(); }, judge: report => report.violations,
 };
