@@ -11,17 +11,19 @@ const fail = (code, reason) => ({ ok: false, code, reason });
 const hex = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const fields = 'labels,state,isDraft,headRefOid,headRefName,isCrossRepository';
 function git(gitDir, args, spawn = spawnSync) {
-  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
+  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' };
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_REPLACE_REF_BASE']) delete env[key];
-  return spawn('git', ['-C', gitDir, ...args], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_REPLACE_REF_BASE', 'GIT_COMMON_DIR',
+    'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) delete env[key];
+  return spawn('git', ['-c', 'core.commitGraph=false', '-C', gitDir, ...args], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
 }
 function defaults(io = {}) {
   return {
     readClaim: (repo, pr) => readLiveFixClaim({ repo, pr }), isClaimHolder,
     ghPrView: (repo, pr) => JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo',
-      CONSTELLATION_REPOS[repoKeyOf(repo)].slug, '--json', fields], {
+      `github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}`, '--json', fields], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+      env: { ...process.env, GH_HOST: 'github.com' },
       throttle: { noMemo: true },
     })),
     isAncestor: (dir, head, sha) => {
@@ -81,8 +83,9 @@ export function authorizedPush(options = {}) {
   if (!authority.ok) return authority;
   const { repo, pr, branch, expectedHead, sha, gitDir, purpose } = options;
   const ports = defaults(options.io);
+  let urls, entry;
   try {
-    const urls = ports.readPushUrls(gitDir);
+    urls = ports.readPushUrls(gitDir);
     const slug = CONSTELLATION_REPOS[repoKeyOf(repo)].slug.toLowerCase();
     const matches = url => typeof url === 'string'
       && /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^\s?#]+?)(?:\.git)?$/i.exec(url)?.[1].toLowerCase() === slug;
@@ -90,13 +93,20 @@ export function authorizedPush(options = {}) {
       return fail('destination-mismatch', 'Origin push destination must match the authorized repo; repair remote configuration');
   } catch { return fail('unreadable', 'Cannot read origin push destination; repair remote configuration before retrying'); }
   try {
-    const result = ports.gitPush(gitDir, ['push', '--porcelain', '--no-follow-tags',
-      `--force-with-lease=refs/heads/${branch}:${expectedHead}`, 'origin', `${sha}:refs/heads/${branch}`]);
+    entry = ports.readClaim(repo, pr);
+    if (!entry || !ports.isClaimHolder(entry, options.holder)) return fail('not-claim-holder', 'Live claim required');
+  } catch { return fail('unreadable', 'Cannot read push claim; restore evidence before retrying'); }
+  try {
+    const result = ports.gitPush(gitDir, ['push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
+      `--force-with-lease=refs/heads/${branch}:${expectedHead}`, urls[0], `${sha}:refs/heads/${branch}`]);
     if (result.status !== 0) return fail('push-rejected', 'Push rejected; re-read authority before retrying');
   } catch { return fail('push-rejected', 'Push failed; inspect remote before retrying'); }
   try {
-    const label = held(readView(ports, repo, pr));
-    if (label) return { ...fail('pushed-under-hold', label), pushed: true };
+    const view = readView(ports, repo, pr);
+    const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
+      : view.isDraft && !entry.meta?.draft ? 'PR drafted outside this claim'
+      : view.isCrossRepository ? 'Cross-repository PR' : null);
+    if (reason) return { ...fail('pushed-under-hold', reason), pushed: true };
   } catch { return { ...fail('pushed-under-hold', 'Post-push evidence unreadable; block hand-back'), pushed: true }; }
   return { ok: true, pushed: sha, purpose };
 }

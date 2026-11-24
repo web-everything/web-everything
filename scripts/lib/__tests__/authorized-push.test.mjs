@@ -20,8 +20,75 @@ function fixture() {
 }
 const throws = () => { throw new Error('unreadable'); };
 describe('authorized push', () => {
+  it('pins exactly the four push hold labels', () => {
+    expect(PUSH_HOLD_LABELS).toEqual(['review:human','red-team:blocked','red-team:pending','review:held-mechanical']);
+  });
   it.each([
-    ...PUSH_HOLD_LABELS.map(name => [name, { labels: [{ name }] }, 'hold-label']),
+    ['released or expired', null, 'not-claim-holder'],
+    ['reassigned', { meta: { sessionId: 'other' } }, 'not-claim-holder'],
+    ['unreadable', throws, 'unreadable'],
+  ])('refuses a claim %s after destination validation', (_name, entry, code) => {
+    const f = fixture();
+    f.io.readPushUrls.mockImplementation(() => {
+      f.io.readClaim.mockImplementation(typeof entry === 'function' ? entry : () => entry);
+      return ['https://github.com/web-everything/web-everything.git'];
+    });
+    expect(authorizedPush(f)).toMatchObject({ ok: false, code });
+    expect(f.io.readClaim).toHaveBeenCalledTimes(2);
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it('disables recursive submodule pushes', () => {
+    const f = fixture(); authorizedPush(f);
+    expect(f.io.gitPush.mock.calls[0][1]).toContain('--recurse-submodules=no');
+  });
+  it('pushes to the validated URL despite subsequent remote configuration changes', () => {
+    const f = fixture(); const url = 'git@github.com:web-everything/web-everything.git';
+    f.io.readPushUrls.mockReturnValueOnce([url]).mockReturnValue(['git@github.com:another/repo.git']);
+    expect(authorizedPush(f).ok).toBe(true);
+    expect(f.io.gitPush.mock.calls[0][1]).toContain(url);
+    expect(f.io.gitPush.mock.calls[0][1]).not.toContain('origin');
+  });
+  it.each([
+    ['closed', { state: 'CLOSED' }, 'PR is not open'],
+    ['merged', { state: 'MERGED' }, 'PR is not open'],
+    ['drafted', { isDraft: true }, 'PR drafted outside this claim'],
+    ['cross repo', { isCrossRepository: true }, 'Cross-repository PR'],
+  ])('blocks hand-back when PR is %s after push', (_name, patch, reason) => {
+    const f = fixture(); f.io.ghPrView.mockReturnValueOnce(view()).mockReturnValueOnce({ ...view(), ...patch });
+    expect(authorizedPush(f)).toEqual({ ok: false, code: 'pushed-under-hold', pushed: true, reason });
+    expect(f.io.gitPush).toHaveBeenCalledTimes(1);
+  });
+  it('default git calls ignore inherited grafts and repository context and disable commit graphs', () => {
+    const f = fixture(); delete f.io.isAncestor; delete f.io.readPushUrls; delete f.io.gitPush;
+    f.io.spawn = vi.fn(() => ({ status: 0, stdout: 'https://github.com/web-everything/web-everything.git\n' }));
+    const leaks = ['GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'];
+    try {
+      vi.stubEnv('GIT_GRAFT_FILE', 'untrusted-grafts');
+      for (const key of leaks) vi.stubEnv(key, 'untrusted');
+      expect(authorizedPush(f).ok).toBe(true);
+      expect(f.io.spawn).toHaveBeenCalledTimes(3);
+      for (const [, args, opts] of f.io.spawn.mock.calls) {
+        expect(args.slice(0, 4)).toEqual(['-c', 'core.commitGraph=false', '-C', 'checkout']);
+        expect(opts.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' });
+        for (const key of leaks) expect(opts.env).not.toHaveProperty(key);
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('default PR reader pins the GitHub host in repo and child environment', () => {
+    const f = fixture(); delete f.io.ghPrView;
+    runGhSync.mockReturnValue(JSON.stringify(view()));
+    try {
+      vi.stubEnv('GH_HOST', 'other.example');
+      expect(authorizedPush(f).ok).toBe(true);
+      expect(runGhSync).toHaveBeenCalledTimes(2);
+      for (const [args, opts] of runGhSync.mock.calls) {
+        expect(args).toContain('github.com/web-everything/web-everything');
+        expect(opts.env.GH_HOST).toBe('github.com');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it.each([
+    ...['review:human','red-team:blocked','red-team:pending','review:held-mechanical'].map(name => [name, { labels: [{ name }] }, 'hold-label']),
     ['closed', { state: 'CLOSED' }, 'pr-not-open'], ['merged', { state: 'MERGED' }, 'pr-not-open'],
     ['foreign draft', { isDraft: true }, 'draft'], ['moved head', { headRefOid: sha }, 'head-moved'],
     ['cross repo', { isCrossRepository: true }, 'cross-repo'],
@@ -71,8 +138,8 @@ describe('authorized push', () => {
     f.io.ghPrView.mockReturnValue({ ...view(), isDraft: draft });
     expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
-    expect(f.io.gitPush).toHaveBeenCalledWith('checkout', ['push', '--porcelain', '--no-follow-tags',
-      `--force-with-lease=refs/heads/lane/fix:${head}`, 'origin', `${sha}:refs/heads/lane/fix`]);
+    expect(f.io.gitPush).toHaveBeenCalledWith('checkout', ['push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
+      `--force-with-lease=refs/heads/lane/fix:${head}`, 'https://github.com/web-everything/web-everything.git', `${sha}:refs/heads/lane/fix`]);
     expect(f.io.ghPrView).toHaveBeenCalledTimes(2);
   });
   it('never retries a remote move during the leased push', () => {
@@ -90,8 +157,8 @@ describe('authorized push', () => {
       expect(f.io.spawn).toHaveBeenCalledTimes(1);
       const [bin, args, opts] = f.io.spawn.mock.calls[0];
       expect(bin).toBe('git');
-      expect(args).toEqual(['-C', 'checkout', 'push', '--porcelain', '--no-follow-tags',
-        `--force-with-lease=refs/heads/lane/fix:${head}`, 'origin', `${sha}:refs/heads/lane/fix`]);
+      expect(args).toEqual(['-c', 'core.commitGraph=false', '-C', 'checkout', 'push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
+        `--force-with-lease=refs/heads/lane/fix:${head}`, 'https://github.com/web-everything/web-everything.git', `${sha}:refs/heads/lane/fix`]);
       expect(opts.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'push.followTags', GIT_CONFIG_VALUE_0: 'true' });
     } finally { vi.unstubAllEnvs(); }
   });
@@ -116,7 +183,7 @@ describe('authorized push', () => {
     const spawn = f.io.spawn = vi.fn(() => ({ status: 0, stdout: 'git@github.com:another/repo.git\n' }));
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'destination-mismatch' });
     expect(spawn).toHaveBeenCalledTimes(1);
-    expect(spawn).toHaveBeenCalledWith('git', ['-C', 'checkout', 'remote', 'get-url', '--push', '--all', 'origin'],
+    expect(spawn).toHaveBeenCalledWith('git', ['-c', 'core.commitGraph=false', '-C', 'checkout', 'remote', 'get-url', '--push', '--all', 'origin'],
       expect.objectContaining({ timeout: 60_000, maxBuffer: 1024 * 1024 }));
     expect(f.io.gitPush).toHaveBeenCalledTimes(0);
   });
