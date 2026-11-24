@@ -46,13 +46,13 @@ export async function renewalRace(pool, renewedAt = new Date().toISOString()) {
   try {
     child = spawn(process.execPath, [pool.script, 'acquire', ...pool.args, '--lane=1', '--session=takeover', '--no-reap', '--no-reset'],
       { env: { ...pool.env, LANE_POOL_ACQUIRE_RECLAIM_TEST_BARRIER: barrier }, stdio: 'ignore' });
-    const done = new Promise((resolveDone, reject) => { child.once('error', reject); child.once('exit', resolveDone); });
+    const done = new Promise((resolveDone, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolveDone({ code, signal })); });
     await ready;
     const renewed = renewedLease(lease, renewedAt);
     writeFileSync(pool.marker, JSON.stringify(renewed));
     writeFileSync(`${barrier}.go`, '');
-    const code = await done;
-    return { code, expected: renewed, actual: JSON.parse(readFileSync(pool.marker, 'utf8')) };
+    const { code, signal } = await done;
+    return { code, signal, expected: renewed, actual: JSON.parse(readFileSync(pool.marker, 'utf8')) };
   } finally { clearTimeout(timer); observer?.destroy(); if (child?.exitCode === null) child.kill('SIGKILL'); }
 }
 
@@ -64,6 +64,6 @@ export default {
     const pool = leasePool();
     try { return await renewalRace(pool); } finally { pool.close(); }
   },
-  judge: ({ code, expected, actual }) => code !== 0 && JSON.stringify(expected) === JSON.stringify(actual)
+  judge: ({ code, signal, expected, actual }) => typeof code === 'number' && code !== 0 && signal === null && JSON.stringify(expected) === JSON.stringify(actual)
     ? [] : ['renewed lease was taken over'],
 };

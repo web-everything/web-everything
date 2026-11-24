@@ -2582,6 +2582,12 @@ async function cmdAcquire(repo) {
   if (flags.reserve && flags.lane === undefined) {
     fail('--reserve requires an explicit --lane=N (a permanent reserved lane is a specific, known slot — never auto-picked)');
   }
+  if (flags['exact-ttl']) {
+    const ttlMinutes = Number(flags['ttl-minutes'] ?? DEFAULT_LEASE_TTL_MINUTES);
+    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) {
+      fail('--exact-ttl requires --ttl-minutes to be a finite number greater than 0');
+    }
+  }
   if (!flags.reserve && !flags['exact-ttl'] && ttlMinutesFromFlags() < DEFAULT_LEASE_TTL_MINUTES) {
     log(`  WARNING acquire: --ttl-minutes=${ttlMinutesFromFlags()} raised to ${DEFAULT_LEASE_TTL_MINUTES}; use --exact-ttl for deliberate short leases`);
     flags['ttl-minutes'] = DEFAULT_LEASE_TTL_MINUTES;

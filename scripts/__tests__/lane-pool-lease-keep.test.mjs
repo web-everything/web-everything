@@ -18,6 +18,14 @@ it('exact-ttl preserves an explicitly requested 30 minutes', () => {
   expect(r.status, r.stderr).toBe(0);
   expect(lease().ttlMinutes).toBe(30);
 });
+it('exact-ttl rejects zero, negative, and non-finite TTLs before creating a lease', () => {
+  for (const ttl of ['0', '-1', 'NaN', 'Infinity', '-Infinity']) {
+    const r = acquire(`--ttl-minutes=${ttl}`, '--exact-ttl');
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stderr).toContain('--exact-ttl requires --ttl-minutes to be a finite number greater than 0');
+    expect(() => readFileSync(pool.marker)).toThrow();
+  }
+});
 it('reserved leases remain permanent with unchanged TTL metadata', () => {
   const r = acquire('--ttl-minutes=30', '--reserve');
   expect(r.status, r.stderr).toBe(0);
