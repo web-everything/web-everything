@@ -45,7 +45,7 @@ import { CARD_REF_RE } from './referral-card-readable.mjs';
 import { deriveSessionId, sessionSeed } from './judge-spawn.mjs';
 import { decideClearerIndependence, INDEPENDENCE, parseAuthorActorId } from './review-independence.mjs';
 import { CARE_LEVELS } from './review-escalation.mjs';
-import { AUTOMATION_LOGINS, OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isTrustedMarkerAuthor,
+import { AUTOMATION_LOGINS, OPERATOR_LOGINS, REFERRAL_RULER_ACTOR, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isTrustedMarkerAuthor,
   readJudgeActorPolicy } from './marker-authorship.mjs';
 // #2438's labelled data fence (#2967 moved it to a leaf so this module can reach it — `review-core.mjs`,
 // where it used to live, imports THIS module, so importing back would be a cycle).
@@ -3743,7 +3743,8 @@ export function carriedActor(carried, { operatorRulings = [] } = {}) {
   const backing = (Array.isArray(operatorRulings) ? operatorRulings : []).filter(o => o.head === carried.from.head
     && o.runId === carried.from.runId && o.key === carried.from.key).at(-1);
   if (!backing) return 'earlier';
-  return String(backing.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR ? 'automatic policy' : 'operator';
+  return backing.actor === REFERRAL_RULER_ACTOR ? 'referral delegate'
+    : String(backing.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR ? 'automatic policy' : 'operator';
 }
 
 /** The carry's reason as shown: the stored literal (kept so old records validate) with its actor corrected. */
@@ -3868,6 +3869,9 @@ export function validateOperatorRuling(r) {
     // `auto-policy` (review.referralDefault=auto-block) is NOT an operator. It may only HOLD: every ruling is `block`.
     if (r.actor.toLowerCase() === AUTO_POLICY_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
     else if (r.actor === JUDGE_ACTOR) { if (!Array.isArray(r.rulings) || r.rulings.some(x => x?.result !== 'block')) return false; }
+    else if (r.actor === REFERRAL_RULER_ACTOR) {
+      if (!Array.isArray(r.rulings) || r.rulings.some(x => !['card', 'block'].includes(x?.result) || x.supersedes?.length)) return false;
+    }
     else if (!OPERATOR_LOGINS.includes(r.actor.toLowerCase())) return false;
     // PR #6529: the optional `poster` binds who may author the comment. Only an operator ruling carries it, and it can
     // only name that same operator (lower-case, as the identity check returns it).
@@ -3906,8 +3910,8 @@ export function buildOperatorRulingComment(r) {
     return `${i + 1}. **${x.result}**${x.card ? ` → \`${inertProse(x.card)}\`` : ''} — ${inertProse(summary.replace(/\s+/g, ' ').slice(0, 300))} (run \`${inertProse(x.runId)}\`)`;
   });
   const auto = r.actor.toLowerCase() === AUTO_POLICY_ACTOR;
-  return `## ${auto ? 'Automatic policy ruling' : 'Operator ruling'} on mandatory referrals\n\n`
-    + (r.actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n` : auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
+  return `## ${r.actor === REFERRAL_RULER_ACTOR ? 'Referral delegate ruling' : auto ? 'Automatic policy ruling' : 'Operator ruling'} on mandatory referrals\n\n`
+    + (r.actor === REFERRAL_RULER_ACTOR ? `Recorded by referral delegate, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n` : r.actor === JUDGE_ACTOR ? `${JUDGE_ATTRIBUTION}: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n` : auto ? `Recorded by policy, not by the operator: ${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`. The operator can override it with a card or not-real ruling.\n`
       : `Recorded on the operator's explicit instruction: @${r.actor}, via ${inertProse(r.channel)}, at ${r.at}, for head \`${r.head}\`.\n`)
     + `This rules only on the findings listed; it applies to this head only and does not change review labels.\n\n`
     + `${quote}\n\n${lines.join('\n')}\n\n`
@@ -3971,6 +3975,7 @@ export function parseOperatorRulingComment(comment) {
   // automation (PR #5925: operator rulings posted under the App before the stamp existed) keeps it ONLY when GitHub
   // dated the comment, and its last edit, before poster stamping shipped. Omitting `poster` is otherwise a bypass (PR
   // #6529 red team, result 5acf690a8e9b87a6): a missing, unparseable or later date reads exactly like a poster mismatch.
+  if (record.actor === REFERRAL_RULER_ACTOR) return AUTOMATION_LOGINS.includes(login) ? { record } : null;
   const legacyAutomation = record.poster === undefined && !OPERATOR_LOGINS.includes(login)
     && !commentPredatesPosterStamp(comment);
   if (legacyAutomation || (record.poster !== undefined && login !== record.poster)) {

@@ -484,6 +484,8 @@ export function runReviewTick({
   try {
     // Both hold sweeps nominate candidates from number/labels; all mutations still use fresh live reads.
     holdReconcileResults = holdReconcile({ repo, restoreStamps: sweepAuthorStamps,
+      capacity: () => Number.isFinite(liveReviewBudget?.left)
+        && liveReviewBudget.left > (liveReviewBudget.reserve ?? 0) && hostAdmission()?.admitted === true,
       ...(sharedReads && !rawPrsFailed ? { listPrs: () => rawPrs } : {}) }) ?? [];
   } catch (e) {
     holdReconcileError = String((e && e.message) || e).split('\n')[0];

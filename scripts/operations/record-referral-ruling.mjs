@@ -59,7 +59,7 @@ import {
   validateOperatorRuling, OPERATOR_RULING_RESULTS, AUTO_POLICY_ACTOR, operatorRulingId, sameFindingForClearing,
   readReferralRecords, readOperatorRulings, carriedBackingHolds, sameReferralForPolicy, referralRecheck,
 } from '../lib/jury-core.mjs';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
+import { OPERATOR_LOGINS, REFERRAL_RULER_ACTOR, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, assertJudgeAuthority, isSecurityClass } from '../lib/marker-authorship.mjs';
 import { ignoredRulings } from '../lib/ruling-ledger.mjs';
 
 export const RECORD_REFERRAL_RULING_OP = 'record-referral-ruling';
@@ -299,8 +299,9 @@ export function planRulingFollowUp({ open, selected, ruling, reason, enabled, he
   if (!blocked.length) return { action: 'resume' };
   const prose = (s) => String(s ?? '').replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').replace(/\s+/g, ' ').trim();
   const byPolicy = actor === AUTO_POLICY_ACTOR;
-  const body = `### Blocked referral findings (${byPolicy ? 'automatic policy ruling' : 'operator ruling'})\n\n`
-    + `${byPolicy ? 'Policy (review.referralDefault=auto-block) ruled' : 'The operator ruled'} these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
+  const delegate = actor === REFERRAL_RULER_ACTOR;
+  const body = `### Blocked referral findings (${delegate ? 'referral delegate ruling' : byPolicy ? 'automatic policy ruling' : 'operator ruling'})\n\n`
+    + `${delegate ? 'The referral delegate ruled' : byPolicy ? 'Policy (review.referralDefault=auto-block) ruled' : 'The operator ruled'} these mandatory-referral findings \`block\` on head \`${head}\`. Fix each one, then push.\n\n`
     + blocked.map((o, i) => `${i + 1}. \`${findingLocation(o)}\` (${o.seat}) — ${prose(o.summary)}`
       + (prose(o.rationale) ? `\n   Rationale: ${prose(o.rationale)}` : '')).join('\n');
   return { action: 'send-back', blocked, body };
@@ -312,7 +313,7 @@ function validateReferralRulingInput(input) {
   if (input.cause !== undefined && (ruling !== 'not-real' || !FALSE_FINDING_CAUSES.includes(input.cause))) throw new Error('--cause requires not-real and a known false-finding cause');
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   if (byPolicy && ruling !== 'block') throw new Error(`--actor=${AUTO_POLICY_ACTOR} may only rule \`block\`; card and not-real are the operator's`);
-  if (!byPolicy && actor !== JUDGE_ACTOR && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
+  if (!byPolicy && actor !== REFERRAL_RULER_ACTOR && actor !== JUDGE_ACTOR && !OPERATOR_LOGINS.includes(String(actor ?? '').toLowerCase())) {
     throw new Error(`--actor must be a registered operator login (${OPERATOR_LOGINS.join(', ')}); this ruling is the operator's`);
   }
   if (!String(reason ?? '').trim()) throw new Error('--reason is required: the operator\'s words, verbatim');
@@ -322,6 +323,7 @@ function validateReferralRulingInput(input) {
 /** Shared selection for planning a ruling and filing its follow-up. PURE. */
 function selectOperatorRulingFindings(read, input) {
   const { repo, pr, finding, actor } = input;
+  if (actor === REFERRAL_RULER_ACTOR && (input.supersedes || !['card', 'block'].includes(input.ruling))) throw new Error('referral delegate cannot supersede or clear');
   const byPolicy = String(actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR;
   const supersedeIds = [...new Set(String(input.supersedes ?? '').split(',').map((x) => x.trim()).filter(Boolean))];
   if (byPolicy && supersedeIds.length) throw new Error('auto-policy cannot supersede rulings');
@@ -396,6 +398,11 @@ export function planOperatorRuling(read, input) {
   const selection = selectOperatorRulingFindings(read, input);
   if (selection.noop) return selection;
   const { selected, skipped, supersedesFor } = selection;
+  if (actor === REFERRAL_RULER_ACTOR) {
+    if (input.expectHead !== read.head) throw new Error('referral delegate requires the expected live head');
+    if (selected.some(o => supersedesFor(o).length || !(read.open ?? []).some(f => f.runId === o.runId && f.key === o.key)))
+      throw new Error('referral delegate may only rule pending findings');
+  }
   if (actor === JUDGE_ACTOR) {
     // The selection may DERIVE supersession (a disputed finding with no --supersedes): refuse it like an explicit one.
     for (const o of selected) assertJudgeAuthority(read, { actor, ruling, supersedes: supersedesFor(o) });
@@ -410,7 +417,7 @@ export function planOperatorRuling(read, input) {
     clearerId: read.clearerId,
     // PR #6529: bind the comment to the login the identity check passed, so the gate reader refuses any other author
     // (an App copy left by a credential split). A judge row is automation-authored and is checked by its own branch.
-    ...(checkedPoster && actor !== JUDGE_ACTOR ? { poster: checkedPoster } : {}),
+    ...(checkedPoster && actor !== REFERRAL_RULER_ACTOR && actor !== JUDGE_ACTOR ? { poster: checkedPoster } : {}),
   };
   if (!validateOperatorRuling(record)) throw new Error('the operator ruling record failed validation; nothing posted');
   const followUp = planRulingFollowUp({ open: [...read.open, ...selected.filter((o) => !read.open.some((p) => p.runId === o.runId && p.key === o.key))], selected, ruling, reason, head: read.head, actor: String(actor).toLowerCase(),
@@ -647,6 +654,7 @@ export function recordReferralRulingOperation({ readRulingContext, judgeConfirm 
       pr: 'number',
       repo: 'string',
       finding: 'string',
+      expectHead: { type: 'string', required: false },
       ruling: { type: 'string', enum: [...OPERATOR_RULING_RESULTS] },
       card: { type: 'string', required: false },
       fileCard: { type: 'boolean', required: false },
@@ -672,7 +680,7 @@ export function recordReferralRulingOperation({ readRulingContext, judgeConfirm 
     }),
     plan: compute({
       reads: ['input.repo', 'input.pr', 'input.finding', 'input.ruling', 'input.actor', 'input.channel',
-        'input.reason', 'input.notWorseThanMain', 'input.cause', 'input.sendBack', 'input.supersedes', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
+        'input.reason', 'input.expectHead', 'input.notWorseThanMain', 'input.cause', 'input.sendBack', 'input.supersedes', 'input.preview', 'findings.read', 'findings.reread', 'findings.cardPlan', 'findings.landCard'],
       fn: (view) => {
         const plan = cardFilingVerdict(view) ?? planOperatorRuling(view.findings.reread ?? view.findings.read, (landedRulingCard(view.findings)?.input ?? view.input));
         if (landedRulingCard(view.findings)?.judgeEvidence && plan.record) {

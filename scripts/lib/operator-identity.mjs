@@ -13,7 +13,7 @@
  *     itself (follow-up hook in `red-team-gate.mjs`); this module's callers apply it today.
  */
 import { spawnSync } from 'node:child_process';
-import { OPERATOR_LOGINS, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
+import { OPERATOR_LOGINS, REFERRAL_RULER_ACTOR, JUDGE_ACTOR, JUDGE_ATTRIBUTION, JUDGE_RESERVED_TOKEN_RE, isJudgeAuthored, readJudgeActorPolicy } from './marker-authorship.mjs';
 import { parseRedTeamGateMarker } from './red-team-gate.mjs';
 
 /** Gate-record outcomes only an operator may write. */
@@ -80,6 +80,10 @@ export function judgePolicyOnce(resolve = () => readJudgeActorPolicy()) {
 }
 
 export function assertRulingIdentity(identity, actor) {
+  if (actor === REFERRAL_RULER_ACTOR) {
+    if (!isJudgeAuthored({ author: identity })) throw new Error('referral delegate must be trusted automation');
+    return identity.login;
+  }
   if (actor !== JUDGE_ACTOR) return assertHumanOperator(identity, actor);
   if (!isJudgeAuthored({ author: identity })) throw new Error('judge posting identity must be trusted automation');
   return identity.login;

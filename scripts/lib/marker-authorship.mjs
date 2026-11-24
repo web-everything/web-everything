@@ -225,3 +225,6 @@ export function assertJudgeAuthority(read, input) {
 export function isJudgeAuthored(c) {
   return AUTOMATION_LOGINS.includes(loginOf(c));
 }
+
+/** R1035 referral classifier delegate: trusted automation, card/block only. */
+export const REFERRAL_RULER_ACTOR = 'referral-ruler';
