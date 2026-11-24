@@ -9,6 +9,8 @@ import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs'
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
+const isTestOnlyPath = path => /(?:^|\/)__tests__\/.*\.(?:mjs|js|ts)$/.test(path) || path.endsWith('.test.mjs');
+
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
 function wellFormedAudit(record) {
@@ -28,8 +30,10 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
+  const gitEnv = { ...env, GIT_DIR: undefined, GIT_COMMON_DIR: undefined, GIT_WORK_TREE: undefined,
+    GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' };
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
-    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    env: gitEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
   })).trim();
   let fullSha;
   try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }
@@ -79,14 +83,16 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   }
   const ancestor = ancestorOpt || ((base, head) => { git('merge-base', '--is-ancestor', base, head); return true; });
   const covers = base => { try { fetchMain(); return ancestor(base, 'origin/main'); } catch { return false; } };
-  const liveFingerprint = liveFingerprintOpt || (evidence => {
-    const same = value => typeof value === 'string' && value.toLowerCase() === fullSha;
+  const liveFingerprint = liveFingerprintOpt || ((evidence, head = fullSha) => {
+    const same = value => typeof value === 'string' && value.toLowerCase() === head;
     if (!evidence.some(r => r?.fingerprint && (r.head || r.sha) && !same(r.sha) && !same(r.head))) return null;
     try {
       fetchMain();
       // fullSha was resolved locally above. A new lane ref need not exist on
       // origin until pr-land publishes it after admission.
-      const fp = netDiffFingerprint(repo, 'origin/main', fullSha, { exec });
+      const fp = netDiffFingerprint(repo, 'origin/main', head, {
+        exec: (cmd, args, options) => exec(cmd, args, { ...options, env: gitEnv }),
+      });
       if (!fp) throw new Error('empty fingerprint');
       return fp;
     } catch (e) { throw Object.assign(new Error(`live diff fingerprint unavailable (${String(e?.message || e).slice(0, 120)})`), { fingerprintLookup: true }); }
@@ -102,20 +108,57 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
       return ancestor(parts[2], 'origin/main');
     } catch { return false; }
   };
+  // Carry reads immutable trees, with replacements/grafts disabled. Overflow or unreadable
+  // evidence refuses; the existing refusal tells the operator to audit the current head.
+  const testCarry = waivedSha => {
+    try {
+      const pinnedEnv = { ...gitEnv };
+      const run = (...args) => String(exec('git', ['-C', repo, ...args], {
+        env: pinnedEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, timeout: 5000,
+      }));
+      pinnedEnv.GIT_DIR = run('rev-parse', '--absolute-git-dir').trim();
+      if (!pinnedEnv.GIT_DIR) return null;
+      pinnedEnv.GIT_WORK_TREE = repo;
+      run('merge-base', '--is-ancestor', waivedSha, fullSha);
+      const delta = run('diff', '--name-status', '-z', '-M', '--no-renames', '--no-ext-diff',
+        '--no-textconv', '--ignore-submodules=none', '--no-relative', `${waivedSha}..${fullSha}`, '--');
+      if (delta.length > 1024 * 1024 || !delta.endsWith('\0')) return null;
+      const parts = delta.slice(0, -1).split('\0'), files = [];
+      if (parts.length % 2 || parts.length > 256) return null;
+      for (let i = 0; i < parts.length; i += 2) {
+        const path = parts[i + 1];
+        if (!/^[AMD]$/.test(parts[i]) || !isTestOnlyPath(path)) return null;
+        files.push(path);
+        let hits;
+        try { hits = run('grep', '-l', '-z', '-F', '-e', path.split('/').pop(), fullSha, '--'); }
+        catch (error) { if (error.status === 1) continue; throw error; }
+        if (hits.length > 1024 * 1024 || !hits.endsWith('\0') || hits.slice(0, -1).split('\0').some(hit =>
+          !hit.startsWith(`${fullSha}:`) || !isTestOnlyPath(hit.slice(41)))) return null;
+      }
+      return { waivedSha, head: fullSha, files };
+    } catch { return null; }
+  };
   let evidence;
   try {
     const fp = liveFingerprint(records);
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
-    if (!evidence.ok && evidence.reason === 'weakened') {
+    if (!evidence.ok) {
       for (const entry of config.ruledWeakened) {
-        // Waivers stay exact-head only: a carried head needs its own waiver.
-        if (entry.ref !== ref || !validSha(entry.sha) || entry.sha.toLowerCase() !== fullSha
+        if (entry.ref !== ref || !validSha(entry.sha)
           || !/^R\d+(?:\+R\d+)*$/.test(entry.ruling) || !Array.isArray(entry.findings)
           || !entry.findings.length || !entry.findings.every(f => typeof f === 'string' && f.trim())) continue;
-        const waived = canonicalAuditEvidence(records, fullSha, covers, fp, { ruledWeakened: {
-          ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: fullSha, fingerprint: null },
-        } });
-        if (waived.ok) { evidence = waived; break; }
+        const waivedSha = entry.sha.toLowerCase();
+        const carry = waivedSha === fullSha ? null : testCarry(waivedSha);
+        // A current-head audit always decides; an older waiver cannot supersede it.
+        if (waivedSha !== fullSha && (!carry || records.some(r => r.head.toLowerCase() === fullSha))) continue;
+        const waived = canonicalAuditEvidence(records, waivedSha, covers,
+          carry ? liveFingerprint(records, waivedSha) : fp, { ruledWeakened: {
+            ruledWeakened: { ruling: entry.ruling, findings: entry.findings }, record: { sha: waivedSha, fingerprint: null },
+          } });
+        if (waived.ok && carry && waived.record?.head.toLowerCase() === waivedSha) {
+          return { ok: true, reason: null, message: '', record: waived.record, sha: fullSha, carry };
+        }
+        if (waived.ok && !carry) { evidence = waived; break; }
       }
     }
   } catch (e) {
