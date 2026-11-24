@@ -593,8 +593,8 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
   const begin = (id) => ({ id, author: BOT, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->` });
   const verdict = { id: 'IC_99', author: BOT, body: '🔁 review — changes requested\n\nx\n<!-- reviewed-sha: ' + HEAD + ' -->' };
   const stop106 = { id: 'IC_106', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
-  const ans = (id, standDownId, disposition) => ({ id, author: { login: 'chalbert' },
-    body: buildOperatorAnswer({ standDownId, reason: 'ruled', actor: 'chalbert', channel: 'chat', ...(disposition ? { disposition } : {}) }) });
+  const ans = (id, standDownId, disposition, extra = {}) => ({ id, author: { login: 'chalbert' },
+    body: buildOperatorAnswer({ standDownId, reason: 'ruled', actor: 'chalbert', channel: 'chat', ...(disposition ? { disposition } : {}), ...extra }) });
   const seq = [verdict, begin('IC_105'), stop106, ans('IC_108', 'IC_106'), begin('IC_110'), begin('IC_113')];
 
   it('without a rearm answer the unchanged head is an empty round', () => {
@@ -626,11 +626,47 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
   it('does not reopen the rearm window for a forged post-rearm stand-down', () => {
     expect(rearmWindow([...renewed.slice(0, -1), { ...stop2, author: { login: 'outsider' }, viewerDidAuthor: true }]).rearmed).toBe(true);
   });
-  it('caps waivers per verdict window: a third stand-down + answer is refused', () => {
-    const stop3 = { ...stop106, id: 'IC_400' };
-    const third = [...renewed, ans('IC_320', 'IC_300', 'rearm-review'), begin('IC_330'), stop3];
-    expect(rearmWindow(third)).toMatchObject({ rearmed: true });
-    expect(decideEmptyFixRound({ comments: [...third, ans('IC_401', 'IC_400', 'rearm-review')], liveHead: HEAD }).empty).toBe(true);
+  const third = [...renewed, ans('IC_320', 'IC_300', 'rearm-review'), begin('IC_330'), { ...stop106, id: 'IC_400' }];
+  const noCode = (standDownId = 'IC_400') => ans('IC_401', standDownId, 'rearm-review', { noCodeOwed: true });
+  it('caps plain waivers: a third stand-down + plain answer is still ignored', () => {
+    const comments = [...third, ans('IC_401', 'IC_400', 'rearm-review')];
+    expect(rearmWindow(comments)).toMatchObject({ rearmed: true, capBlocked: true, standDownId: 'IC_400' });
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review' })).toBe(false);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
+  });
+  it('ignores noCodeOwed from an untrusted poster at the cap', () => {
+    const comments = [...third, { ...noCode(), author: { login: 'outsider' }, viewerDidAuthor: true }];
+    expect(rearmWindow(comments).capBlocked).toBe(true);
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+  });
+  it('ignores noCodeOwed naming an older stand-down at the cap', () => {
+    const comments = [...third, noCode('IC_300')];
+    expect(rearmWindow(comments).capBlocked).toBe(true);
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+  });
+  it('honours noCodeOwed on the cap-blocked latest stand-down and closes the empty round', () => {
+    const comments = [...third, noCode()];
+    expect(rearmWindow(comments)).toMatchObject({ claims: [], reviewedHead: null, rearmed: true, capBlocked: false, standDownId: null });
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(false);
+    expect(decideEmptyFixRound({ comments: [...comments, begin('IC_next'), noCode()], liveHead: HEAD }).empty).toBe(true);
+  });
+  it('noCodeOwed does not consume a waiver before the cap', () => {
+    const comments = [...seq, noCode('IC_106'), begin('IC_210'), stop2,
+      ans('IC_320', 'IC_300', 'rearm-review'), begin('IC_330'), { ...stop106, id: 'IC_400' }];
+    expect(rearmWindow(comments)).toMatchObject({ rearmed: false, capBlocked: false });
+    expect(decideEmptyFixRound({ comments: [...comments, ans('IC_401', 'IC_400', 'rearm-review')], liveHead: HEAD }).empty).toBe(false);
+  });
+  it('ignores a second cap override until a new verdict resets the window', () => {
+    const fourth = { ...stop106, id: 'IC_500' };
+    const comments = [...third, noCode(), begin('IC_490'), fourth, noCode('IC_500')];
+    expect(rearmWindow(comments)).toMatchObject({ capBlocked: true, standDownId: 'IC_500' });
+    expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_500', disposition: 'rearm-review', noCodeOwed: true })).toBe(false);
+    expect(rearmWindow([...comments, ...third]).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
+    const reset = [...comments, ...third, noCode()];
+    expect(rearmWindow(reset)).toMatchObject({ capBlocked: false, standDownId: null });
+    expect(decideEmptyFixRound({ comments: reset, liveHead: HEAD }).empty).toBe(false);
   });
   it('accepts the newest post-rearm stand-down even after another fix-begin, once', () => {
     expect(rearmWindow(renewed)).toMatchObject({ rearmed: false, standDownId: 'IC_300' });
