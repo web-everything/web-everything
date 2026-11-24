@@ -43,6 +43,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/__tests__/push-gate-boundary.test.mjs',
+    scope: 'files',
+    why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',
+    matches: (f) => /^scripts\/.*\.(mjs|js|cjs|ts)$/.test(f)
+      && !f.split('/').includes('__tests__') && !/\.(test|spec)\./.test(f)
+      && f !== 'scripts/lib/authorized-push.mjs',
+    inputs: ['scripts/lib/push-gate-lint.mjs', 'scripts/push-gate-allowlist.json', 'scripts/__tests__/push-gate-boundary.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/testing-notes-advisory.test.mjs',
     scope: 'full',
     why: 'validates incoming testing.md anchors across top-level agent docs and the complete topic directory; guide anchor changes can break unchanged callers, so the scan must keep both sides',
