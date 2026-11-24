@@ -709,7 +709,8 @@ describe('fixBegin / fixEnd — the IO shell', () => {
       reason: 'scope-change', gh, labels: fakeLabels(), lockRoot: root, nowMs: T0 };
     expect(await fixBegin(options)).toMatchObject({ ok: true });
     const entry = readLiveFixClaim({ repo: 'we', pr: 2899, lockRoot: root, nowMs: T0 });
-    expect(entry.meta.draftedByClaim).toBe(isDraft ? undefined : true);
+    expect(entry.sidecarAt).toBe(isDraft ? undefined : new Date(T0).toISOString());
+    expect(entry.meta).not.toHaveProperty('draftedByClaim');
     expect(calls.filter(a => a[1] === 'ready')).toHaveLength(isDraft ? 0 : 1);
   });
 

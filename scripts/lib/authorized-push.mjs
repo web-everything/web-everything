@@ -1,11 +1,17 @@
 /**
  * @file Claim-bound push authority: live PR evidence, ancestry, one leased push, then a hold recheck.
+ * Not claimed:
+ * (i) No defence against code running in the same process. The pre-push hook is the raw-push boundary.
+ * (ii) No detection of a human marking ready and then drafting again within one hold. Hold labels are the human signal.
+ * (iii) Tracker freshness is only as accurate as the hook's daysBetween.
+ * (iv) Legacy unbound claims are fail-closed in strict mode only.
  */
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readLiveFixClaim, isClaimHolder, pushRefusal, repoKeyOf } from '../conveyor/fix-procedure.mjs';
+import { validateFixClaimMeta } from '../conveyor/fix-claim-store.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { protectedBranchNames, staleTrackerPushDecision } from '../guard-prototype-tracker.mjs';
@@ -123,9 +129,9 @@ function claimRefusal(io, entry, holder, { repo, pr, branch }) {
   if (!entry || !io.isClaimHolder(entry, holder)) return fail('not-claim-holder', 'Live claim required');
   if (!entry.meta?.sessionId && !entry.meta?.tokenHash) return fail('not-claim-holder', 'Unbound claim');
   const meta = entry.meta;
-  if (![meta.repo, meta.kind, meta.branch].every(v => typeof v === 'string' && v.trim())
-    || !Number.isSafeInteger(meta.pr) || meta.pr <= 0
-    || ('draftedByClaim' in meta && typeof meta.draftedByClaim !== 'boolean')) throw new Error('Incomplete claim');
+  if (!validateFixClaimMeta(meta)
+    || ('sidecarAt' in entry && (typeof entry.sidecarAt !== 'string'
+      || new Date(entry.sidecarAt).toISOString() !== entry.sidecarAt))) throw new Error('Incomplete claim');
   if (meta.repo !== repoKeyOf(repo) || meta.pr !== pr || meta.kind !== 'fixing' || meta.branch !== branch)
     return fail('not-claim-holder', 'Claim does not match requested push');
   return null;
@@ -152,7 +158,7 @@ function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir, holder
     if (branchRefusal) return fail(branchRefusal.code || 'foreign-claim', branchRefusal.message || 'Branch has a foreign claim; coordinate with its holder');
     const view = readView(ports, repo, pr);
     if (view.state !== 'OPEN') return fail('pr-not-open', 'PR is not open');
-    if (view.isDraft && entry.meta?.draftedByClaim !== true) return fail('draft', 'PR drafted outside this claim');
+    if (view.isDraft && !entry.sidecarAt) return fail('draft', 'PR drafted outside this claim');
     const label = held(view);
     if (label) return fail('hold-label', label);
     if (view.isCrossRepository) return fail('cross-repo', 'Cross-repository PR');
@@ -212,7 +218,7 @@ function authorizedPush(options = {}) {
         return { ...fail('pushed-under-hold', 'Branch has a foreign claim; coordinate with its holder'), pushed: true };
       const view = readView(post, repo, pr);
       const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
-        : view.isDraft && entry.meta?.draftedByClaim !== true ? 'PR drafted outside this claim'
+        : view.isDraft && !entry.sidecarAt ? 'PR drafted outside this claim'
         : view.isCrossRepository ? 'Cross-repository PR'
         : view.headRefOid !== sha ? 'Post-push PR head differs'
         : view.headRefName !== branch ? 'Post-push PR branch differs' : null);
@@ -225,10 +231,24 @@ function authorizedPush(options = {}) {
   return { authorizedPush, readPushAuthority };
 }
 const publicKeys = new Set(['repo', 'pr', 'branch', 'expectedHead', 'sha', 'gitDir', 'holder', 'purpose']);
+function snapshotOptions(options) {
+  const data = (value, keys) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid push option');
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (Reflect.ownKeys(descriptors).some(key => !keys.has(key) || !('value' in descriptors[key])))
+      throw new Error('Push options must be data properties');
+    return Object.fromEntries(Reflect.ownKeys(descriptors).map(key => [key, descriptors[key].value]));
+  };
+  if (['io', 'remoteUrl', 'protocolAllow'].some(key => key in options)) throw new Error('Unknown push option');
+  const snapshot = data(options, publicKeys);
+  const holder = data(snapshot.holder ?? {}, new Set(['sessionId', 'who', 'token']));
+  return Object.freeze({ ...snapshot, holder: Object.freeze({ sessionId: holder.sessionId, who: holder.who, token: holder.token }) });
+}
 function publicCall(method, options = {}) {
-  if (!options || typeof options !== 'object' || Reflect.ownKeys(options).some(key => !publicKeys.has(key))
-    || ['io', 'remoteUrl', 'protocolAllow'].some(key => key in options)) return fail('bad-input', 'Unknown push option');
-  return createAuthorizedPush()[method](options);
+  let snapshot;
+  try { snapshot = snapshotOptions(options);
+  } catch { return fail('bad-input', 'Invalid push options; use plain data properties'); }
+  return createAuthorizedPush()[method](snapshot);
 }
 export const authorizedPush = options => publicCall('authorizedPush', options);
 export const readPushAuthority = options => publicCall('readPushAuthority', options);

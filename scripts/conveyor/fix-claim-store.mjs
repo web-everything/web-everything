@@ -10,7 +10,7 @@
 import { join } from 'node:path';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readLockEntry, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
+import { readLockEntry, parseLockEntry, isLeaseExpired, readClaimEvidence } from '../readiness/file-locks.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 
@@ -105,6 +105,23 @@ export function listFixDispatchClaims(lockRoot = fixDispatchClaimRoot(), {
   return out;
 }
 
+/** Strip refs/heads/ and surrounding whitespace for branch comparisons. */
+export const normalizeBranch = ref => String(ref ?? '').trim().replace(/^refs\/heads\//, '');
+
+/** Shared strict metadata contract for scans and the authorized-push claim reader. */
+export function validateFixClaimMeta(meta) {
+  const validTtl = value => Number.isInteger(value) && value >= 1
+    && value <= MAX_FIX_DISPATCH_CLAIM_REFRESH_MS / 60_000;
+  return Boolean(meta && typeof meta.repo === 'string' && Object.hasOwn(CONSTELLATION_REPOS, meta.repo)
+    && Number.isSafeInteger(meta.pr) && meta.pr > 0 && ['fix', 'ci-heal', 'fixing'].includes(meta.kind)
+    && (meta.kind !== 'fixing' || validTtl(meta.ttlMinutes))
+    && (!('ttlMinutes' in meta) || validTtl(meta.ttlMinutes))
+    && (!('leaseMinutes' in meta) || validTtl(meta.leaseMinutes))
+    && (!(meta.kind === 'fixing' || 'branch' in meta) || (typeof meta.branch === 'string'
+      && meta.branch === normalizeBranch(meta.branch) && /^lane\/[A-Za-z0-9._\/-]+$/.test(meta.branch)
+      && !meta.branch.includes('..') && !meta.branch.endsWith('/') && !meta.branch.endsWith('.lock'))));
+}
+
 /** Fail closed on incomplete claim evidence; confirm concurrent directory removal. */
 export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
   const entries = [];
@@ -112,23 +129,12 @@ export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
   try { names = readdirSync(lockRoot); } catch { return { entries, unreadable: true }; }
   for (const name of names) {
     try {
-      const raw = readFileSync(join(lockRoot, name, 'lock.json'), 'utf8');
-      const entry = JSON.parse(raw);
-      const meta = entry?.meta;
-      const validTtl = value => Number.isInteger(value) && value >= 1
-        && value <= MAX_FIX_DISPATCH_CLAIM_REFRESH_MS / 60_000;
+      const { entry, sidecarAt } = readClaimEvidence(join(lockRoot, name));
       if (!entry || typeof entry.owner !== 'string' || !entry.owner.trim()
         || typeof entry.heartbeatAt !== 'string'
         || new Date(entry.heartbeatAt).toISOString() !== entry.heartbeatAt
-        || !meta || typeof meta.repo !== 'string' || !Object.hasOwn(CONSTELLATION_REPOS, meta.repo)
-        || !Number.isSafeInteger(meta.pr) || meta.pr <= 0
-        || !['fix', 'ci-heal', 'fixing'].includes(meta.kind)
-        || (meta.kind === 'fixing' && !validTtl(meta.ttlMinutes))
-        || ('ttlMinutes' in meta && !validTtl(meta.ttlMinutes))
-        || ('leaseMinutes' in meta && !validTtl(meta.leaseMinutes))
-        || ((meta.kind === 'fixing' || 'branch' in meta)
-          && (typeof meta.branch !== 'string' || !/^lane\/.+/.test(meta.branch)))) unreadable = true;
-      else entries.push(parseLockEntry(raw));
+        || !validateFixClaimMeta(entry.meta)) unreadable = true;
+      else entries.push({ ...parseLockEntry(JSON.stringify(entry)), ...(sidecarAt ? { sidecarAt } : {}) });
     } catch (error) {
       if (error.code === 'ENOENT') {
         try { if (!readdirSync(lockRoot).includes(name)) continue; } catch { /* unreadable root */ }

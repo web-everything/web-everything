@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { createAuthorizedPushForTesting } from '../authorized-push-testing.mjs';
+import { createAuthorizedPushForTesting } from './helpers/authorized-push-factory.mjs';
 const authorizedPush = options => createAuthorizedPushForTesting(options.io).authorizedPush(options);
 const readPushAuthority = options => createAuthorizedPushForTesting(options.io).readPushAuthority(options);
 import { LEASE_FILENAME } from '../lane-lease.mjs';
@@ -37,7 +37,7 @@ function fixture() {
   const calls = [], temps = new Set();
   const remoteHead = () => git(remote, 'rev-parse', `refs/heads/${branch}`);
   const io = { stat: () => ({ isFile: () => true, uid: process.getuid(), mode: 0o755 }),
-    readClaim: () => ({ meta: { repo: 'we', pr: 42, kind: 'fixing', branch, sessionId: 'mine' } }), isClaimHolder: () => true,
+    readClaim: () => ({ meta: { repo: 'we', pr: 42, kind: 'fixing', ttlMinutes: 20, branch, sessionId: 'mine' } }), isClaimHolder: () => true,
     branchClaimRefusal: () => null,
     ghPrView: () => ({ labels: [], state: 'OPEN', isDraft: false, isCrossRepository: false,
       headRefName: branch, headRefOid: remoteHead() }),
