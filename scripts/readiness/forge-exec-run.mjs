@@ -1803,6 +1803,14 @@ const cliPath = (()=>{try{return realpathSync(process.argv[1]);}catch{return '';
 if(process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   (async()=>{
   try {
+    if(process.argv[2]==='egress-self-check') {
+      // forge-setup runs this against the INSTALLED bundle: every given slot uid must be covered by the egress table.
+      const uids=process.argv.slice(3);
+      if(!uids.length||!uids.every(uid=>/^[1-9]\d*$/.test(uid)))throw new Error('Invalid egress-self-check uids');
+      const runner=createRunner();
+      for(const uid of uids)await runner.egressReady(Number(uid));
+      return;
+    }
     if(process.argv.length!==3 || !['prepare','run','finish','bases','base-manifest','telemetry','warm-install'].includes(process.argv[2])) throw new Error('Invalid subcommand');
     // Pool roots are deliberately 0700 worker-owned. Only this installed,
     // root-owned fixed wrapper may cross identities for metadata operations.

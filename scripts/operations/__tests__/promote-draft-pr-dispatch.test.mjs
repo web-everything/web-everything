@@ -584,7 +584,7 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
 
 it('capability-off refuses promotion while a withdrawn draft remains held', () => {
   const ready = vi.fn();
-  const options = {
+  const options = { readComments: () => [],
     root: '/repo', resolveProfile: () => ({ capabilities: { review: false } }),
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: 'a'.repeat(40) }], refusals: [] }),
     provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
@@ -633,4 +633,48 @@ describe('fresh operator park guard', () => {
       expect(ready).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('fresh review-status:draft-withdrawn label guard', () => {
+  const entry = { kind: 'promote-draft', prNumber: 3432, headRefOid: 'a'.repeat(40) };
+  const run = (readPrLabels, ready) => runReconcilePromoteDraftDispatch({
+    root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
+    reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
+    readComments: () => [], readPrLabels, provider: { ready }, clearAwaitingCi: NOOP_STATUS,
+  });
+  it.each(['review-status:draft-withdrawn', { name: 'review-status:draft-withdrawn' }])('refuses a fresh parked label %j and promotes only after removal', label => {
+    const ready = vi.fn();
+    let labels = [label];
+    const read = vi.fn(() => labels);
+    expect(run(read, ready).refusals).toEqual([expect.objectContaining({ kind: 'draft-withdrawn' })]);
+    expect(read).toHaveBeenCalledWith({ repoSlug: 'plateauapp/plateau-app', prNumber: 3432 });
+    expect(ready).not.toHaveBeenCalled();
+    labels = [];
+    expect(run(read, ready).dispatched).toEqual([expect.objectContaining({ kind: 'promote-draft' })]);
+    expect(ready).toHaveBeenCalledOnce();
+  });
+  it('refuses a park comment posted during the label read', () => {
+    const ready = vi.fn();
+    let comments = [];
+    const calls = [];
+    const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
+      readComments: () => { calls.push('comments'); return comments; },
+      readPrLabels: () => {
+        calls.push('labels');
+        comments = [{ author: { login: 'web-everything' }, body: '<!-- operator-park -->' }];
+        return [];
+      },
+      provider: { ready }, clearAwaitingCi: NOOP_STATUS,
+    });
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: 'operator-parked' })]);
+    expect(calls).toEqual(['labels', 'comments']);
+    expect(ready).not.toHaveBeenCalled();
+  });
+  it.each([undefined, null, {}, [null], new Error('label read failed')])('unreadable labels fail closed: %j', labels => {
+    const ready = vi.fn();
+    const result = run(() => { if (labels instanceof Error) throw labels; return labels; }, ready);
+    expect(result.refusals).toEqual([expect.objectContaining({ kind: 'draft-state-unreadable' })]);
+    expect(ready).not.toHaveBeenCalled();
+  });
 });

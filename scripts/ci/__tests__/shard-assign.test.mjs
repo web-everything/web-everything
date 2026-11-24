@@ -1,10 +1,16 @@
 // @vitest-environment node
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
+
+beforeEach(() => {
+  vi.stubEnv('GITHUB_ACTIONS', 'true');
+  vi.stubEnv('GITHUB_WORKFLOW', 'Refresh CI test timings');
+});
+afterEach(() => vi.unstubAllEnvs());
 
 describe('shard-assign — balance by measured time (card 11)', () => {
   const files = ['a', 'b', 'c', 'd', 'e', 'f'];
@@ -139,6 +145,18 @@ describe('integration timing persistence', () => {
       writeFileSync(file, JSON.stringify(original));
       // The copied CLI resolves its root two directories above its location.
       writeFileSync(report, JSON.stringify({ testResults: [{ name: join(dir, 'i.test.mjs'), startTime: 0, endTime: 2500 }] }));
+      for (const env of [
+        { GITHUB_ACTIONS: 'false', GITHUB_WORKFLOW: 'Refresh CI test timings' },
+        { GITHUB_ACTIONS: 'true', GITHUB_WORKFLOW: 'CI' },
+        { GITHUB_ACTIONS: '', GITHUB_WORKFLOW: '' },
+      ]) {
+        const denied = spawnSync(process.execPath, [script, '--suite=integration', `--update=${report}`], {
+          env: { ...process.env, ...env }, encoding: 'utf8', timeout: 5000,
+        });
+        expect(denied.status).toBe(2);
+        expect(denied.stderr).toMatch(/bot owns.*test-timings.json.*ci-timings-refresh/);
+        expect(loadTimings(file)).toEqual(original);
+      }
       execFileSync(process.execPath, [script, '--suite=integration', `--update=${report}`], { timeout: 5000 });
       const updated = loadTimings(file);
       expect(updated.unit).toEqual(original.unit);

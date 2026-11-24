@@ -88,14 +88,14 @@ describe.each(jobs)('affirmative dependency-failure evidence for %s', (name, dep
 
   it('skips aggregate logs with an affirmative dependency-only failed step', () => {
     const { decision, logReads } = probe(name, [{ name: dependencyStep, conclusion: 'failure' }]);
-    expect(decision.hold).toBe(false);
+    expect(decision.hold).toBe(true);
     expect(decision.mainRunId).toBe(102);
     expect(logReads).toEqual([`repos/${repo}/actions/jobs/9021/logs`]);
   });
 
-  it('allows ordinary infrastructure log evidence when aggregate steps are empty', () => {
+  it('holds printed infrastructure signatures when aggregate steps are empty', () => {
     const { decision, logReads } = probe(name, [], infraLog);
-    expect(decision.hold).toBe(false);
+    expect(decision.hold).toBe(true);
     expect(logReads).toContain(`repos/${repo}/actions/jobs/9022/logs`);
   });
 });

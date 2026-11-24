@@ -68,7 +68,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
-import { isOperatorParked } from '../conveyor/draft-promotion-rule.mjs';
+import { WITHDRAWN_LABEL, isOperatorParked, validatePrLabels } from '../conveyor/draft-promotion-rule.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { reviewHoldOnlyRed } from '../conveyor/reconcile-core.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -138,14 +138,6 @@ export function defaultReadHeadCheckState({
     : requiredChecks;
   const result = reduceCheckState(rows, promotionChecks);
   return { ...result, reviewHoldOnly: result.state === 'red' && reviewHoldOnlyRed(rows, promotionChecks) };
-}
-
-function validatePrLabels(labels) {
-  if (!Array.isArray(labels) || labels.some(label => {
-    const name = typeof label === 'string' ? label : label?.name;
-    return typeof name !== 'string' || name.trim().length === 0;
-  })) throw new Error('PR labels must be an array of label names or {name} records');
-  return labels;
 }
 
 /** Fresh draft hold labels, scoped to the target PR and repository; fail closed on unreadable data. */
@@ -388,18 +380,18 @@ export function runReconcilePromoteDraftDispatch({
       });
       continue;
     }
-    // Final read closes the stale-plan gap; GitHub does not offer an atomic label-check/ready write.
+    // Re-read labels before comments; GitHub does not offer an atomic label-check/ready write.
     let labels;
     try {
       labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }));
     } catch (e) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read draft hold labels before promoting: ${String(e?.message ?? e).split('\n')[0]}`,
+        why: `could not read draft hold labels before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
       });
       continue;
     }
-    if (labels.some(label => (typeof label === 'string' ? label : label.name) === 'review-status:draft-withdrawn')) {
+    if (labels.some(label => (typeof label === 'string' ? label : label.name) === WITHDRAWN_LABEL)) {
       refusals.push({
         pr: entry.prNumber, kind: 'draft-withdrawn', headSha: sha,
         why: 'draft PR is withdrawn — explicit release is required before promotion',

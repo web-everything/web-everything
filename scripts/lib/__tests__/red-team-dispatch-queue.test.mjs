@@ -717,6 +717,38 @@ describe('FIFO red-team dispatch queue (R752/R785)', () => {
     expect(numbers(f.open().entries())).toEqual([1, 2]);
   });
 
+  it('persists planner reasons across restart, logs only changes, and clears on unblock', () => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1]));
+    const skip = why => {
+      f.queue.admit(repo, 1);
+      f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why }] });
+    };
+    skip(undefined);
+    expect(f.queue.entries()[0].blockedReason).toBeUndefined();
+    const why = 'later verdict or hold supersedes acceptance';
+    skip(why); skip(why);
+    expect(f.open().entries()[0]).toMatchObject({ blocked: 'planner-skip', blockedReason: why });
+    expect(f.logs.filter(line => line.includes('blocked ') && line.includes(why))).toHaveLength(1);
+    skip('PR reviews unreadable');
+    expect(f.open().entries()[0].blockedReason).toBe('PR reviews unreadable');
+    f.queue.admit(repo, 1);
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'review' }],
+      notStarted: [{ prNumber: 1, reason: 'no review capacity left' }] });
+    expect(f.open().entries()[0].blocked).toBeUndefined();
+    expect(f.open().entries()[0].blockedReason).toBeUndefined();
+  });
+
+  it('bounds oversized planner reasons with an operator-visible fallback', () => {
+    const f = fixture();
+    f.queue.sync(repo, candidates([1])); f.queue.admit(repo, 1);
+    f.queue.settle(repo, { rows: [{ prNumber: 1, action: 'skip', why: 'x'.repeat(1000) + '\x1b' }] });
+    const reason = f.open().entries()[0].blockedReason;
+    expect(reason.length).toBeLessThanOrEqual(500);
+    expect(reason).toContain('[truncated; inspect planner logs]');
+    expect(reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+  });
+
   it('planner skip rows (not in notStarted) count as attempts, rotate, and no longer starve the next PR', async () => {
     const f = fixture({ maxAttempts: 2 });
     const reason = 'stale re-dispatch already spent';
