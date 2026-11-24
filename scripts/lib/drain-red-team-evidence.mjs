@@ -5,7 +5,7 @@ import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { daemonEventsPath } from './daemon-events.mjs';
 import { dirname, join } from 'node:path';
 import { hostname } from 'node:os';
@@ -34,6 +34,9 @@ import { commentCreatedAt } from '../conveyor/round-extension-mark.mjs';
 import { completedRedTeamSeat } from './red-team-run-result.mjs';
 import { latestAcceptRecord } from './accept-carry-forward.mjs';
 import { readRedTeamCarry } from './red-team-carry-machine.mjs';
+import { MANDATORY_LENSES } from './jury-core.mjs';
+import { advisoryLabelOutcome } from './review-advisory-outcome.mjs';
+import { ADVISORY_OUTCOMES } from './advisory-labels.mjs';
 
 export const redTeamStatusDir = (env = process.env) => join(dirname(sharedRunsDir(env)), 'red-team-status');
 /** How `redTeamEnqueueHold` names a hold that is only "result not sealed yet" (PR #6622); a test pins it to that text. */
@@ -296,6 +299,42 @@ const supersededUnfinished = (run, head) => {
 // recorded any other verdict (a rejection above all) is only waiting on its effects: a clean result comment that
 // is newer than its start must not release it, because those effects can still apply a send-back.
 const verdictOf = run => (typeof run.verdict === 'string' ? run.verdict : run.verdict?.verdict);
+// A completed accepting advisory may remain parked at the human gate. Every proof is required;
+// an applied effect alone does not prove that its external write actually happened.
+const awaitingHumanConfirm = (run, head) => {
+  const v = run?.verdict, read = run?.findings?.read;
+  const empty = value => value === undefined || (Array.isArray(value) && value.length === 0);
+  if (run?.pending?.kind !== 'confirm' || run.pending.step !== 'confirm' || run.pending.of !== 'human'
+    || run.outcome != null || run.findings?.confirm != null || run.resumeOf != null || run.resumedAt != null
+    || verdictOf(run) !== 'needs-human' || v.humanRequired !== true
+    || !Array.isArray(v.referrals) || v.referrals.length || !empty(v.pendingReferrals) || !empty(v.blockedReferrals)
+    || !Array.isArray(v.lenses) || !v.lenses.length || !MANDATORY_LENSES.every(lens => v.lenses.includes(lens))
+    || !v.lensVerdicts || typeof v.lensVerdicts !== 'object' || Array.isArray(v.lensVerdicts)
+    || !empty(v.skippedSeats) || v.nonClaudeSeatShortfall != null
+    || read?.degraded || !empty(read?.openOperatorSendBacks) || read?.netBasis?.rev !== head) return false;
+  const lenses = new Set(v.lenses), keys = Object.keys(v.lensVerdicts);
+  if (keys.length !== lenses.size || !keys.every(lens => lenses.has(lens) && v.lensVerdicts[lens] === 'accept')
+    || advisoryLabelOutcome({ read, verdict: v }) !== ADVISORY_OUTCOMES.ACCEPT
+    || !run.stepTimings?.some(t => t?.step === 'advise' && typeof t.finishedAt === 'string' && Number.isFinite(Date.parse(t.finishedAt)))
+    || !Array.isArray(run.effects)) return false;
+  const posted = e => e.result?.posted === true;
+  const labelled = e => (e.result?.applied === true && e.result.added === 'advisory:accepted')
+    || e.result?.reason === 'already-current';
+  return run.effects.every(e => e?.status === 'applied'
+    && (e.type !== 'review.advisory-note' || posted(e)) && (e.type !== 'review.advisory-label' || labelled(e)))
+    && run.effects.some(e => e.type === 'review.advisory-note')
+    && run.effects.some(e => e.type === 'review.advisory-label');
+};
+
+// Identity, lifecycle and head bind a pass to this run; filesystem timestamps never prove a pass ran.
+const statusAnswersRun = (status, run, { repo, pr, head }) => {
+  if (!status || Object.getPrototypeOf(status) !== Object.prototype || status.repo !== repo
+    || Number(status.pr) !== Number(pr) || status.head !== head || status.status !== 'finished' || !isRanResult(status.result)) return false;
+  const lp = status.loopPayload;
+  const id = typeof lp?.runId === 'string' ? lp.runId : lp?.op === 'review-pr' ? lp.id : undefined;
+  return typeof id === 'string' && id === run.id && lp?.findings?.read?.netBasis?.rev === head
+    && lp.carriedFrom == null && lp.pending?.kind === 'confirm';
+};
 // A verdict is PRESENT when it is anything but undefined or null: false, 0 and '' are malformed present verdicts, not absent ones.
 const hasVerdict = run => run.verdict !== undefined && run.verdict !== null;
 const abandonableReview = run => !hasVerdict(run) && run.resumeOf == null && run.resumedAt == null && isRunRecordTerminal(run);
@@ -428,7 +467,7 @@ const withSettleBounds = (failure, bounds) => Object.defineProperty(failure, 'se
 // unread record was written at least the mtime slack before that time and the newest run reviewed `newestHead`
 // (a carried head's source). Anything else holds as `scan-capped`.
 // One scan serves both tie orders, so a caller's fallback shares this scan's parse budget.
-function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, now = Date.now() }) {
+function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak = 'id-asc', scanSettings, warn, parkedStatus, now = Date.now() }) {
   if (!TIE_ORDERS.includes(tieBreak)) throw new TypeError('unknown run tieBreak');
   // A run with a read start outranks a start-less one; start-less runs are ordered by the checks below.
   const newerBy = order => (candidate, selected) => {
@@ -528,7 +567,9 @@ function reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, tieBreak =
           for (const slot of Object.values(slots)) {
             if (slot.newer(hit, slot.newest)) slot.newest = hit;
             if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.exact)) slot.exact = hit;
-            if (unfinishedReview(run) && !supersededUnfinished(run, head)) {
+            const parked = parkedStatus !== undefined && awaitingHumanConfirm(run, head)
+              && statusAnswersRun(parkedStatus, run, { repo, pr, head });
+            if (unfinishedReview(run) && !supersededUnfinished(run, head) && !parked) {
               if (slot.newer(hit, slot.unfinished)) slot.unfinished = hit;
               if (run.findings?.read?.netBasis?.rev === head && slot.newer(hit, slot.unfinishedExact)) slot.unfinishedExact = hit;
               // R622: the settle bound covers EVERY unfinished run of this PR (any may be resumed later), NaN if any is unreadable.
@@ -1107,17 +1148,20 @@ export function readDrainRedTeamEvidence({ repo, pr, head, env = process.env,
   const recorded = seats.length > 0;
   const seatEvidence = { seatRecorded: recorded, completedRecorded: seats.some(completedRedTeamSeat),
     failedSeatCount: seats.filter(row => !completedRedTeamSeat(row)).length };
-  // The parse cap covers historical and recovery fallbacks too.
-  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now });
   // The review loop applies the accept labels before the job can write a status, so a persisted accepting run that
   // owes a pass holds until the job's status supersedes it. It is not a live queue entry: the drain's
   // never-scheduled deadline still applies when no job ever picks it up.
   const owes = run => redTeamEnabled(env) && redTeamOwedFor(run);
   let status, statusAt = 0;
   try {
-    status = JSON.parse(readFileSync(statusPath({ repo, pr, head }, env), 'utf8'));
-    statusAt = statSync(statusPath({ repo, pr, head }, env)).mtimeMs;
+    const fd = openSync(statusPath({ repo, pr, head }, env), 'r');
+    try {
+      statusAt = fstatSync(fd).mtimeMs;
+      status = JSON.parse(readFileSync(fd, 'utf8'));
+    } finally { closeSync(fd); }
   } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  // The parse cap covers historical and recovery fallbacks too.
+  const latestRun = lookup ?? reviewRunLookup({ repo, pr, head, runsDir, list, read, stat, scanSettings, warn, now, parkedStatus: status });
   // Every path below checks its own scan query first, so unknown evidence always holds; a carried
   // head needs only the any-head query, and a head with a status only runs written after it.
   const carry = readRedTeamCarry({ repo, pr, head, env });

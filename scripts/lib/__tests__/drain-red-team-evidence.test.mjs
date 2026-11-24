@@ -1,5 +1,13 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'node:fs';
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, openSync: vi.fn(actual.openSync), fstatSync: vi.fn(actual.fstatSync),
+    readFileSync: vi.fn(actual.readFileSync), closeSync: vi.fn(actual.closeSync) };
+});
+import { MANDATORY_LENSES } from '../jury-core.mjs';
+import { planRedTeamStatusLabels } from '../red-team-status-labels.mjs';
 import * as ghThrottle from '../gh-throttle.mjs';
 import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1822,7 +1830,7 @@ describe('recovery while a quiet review awaits human confirm', () => {
     return { f, run, runPath, before, witness, decide };
   }
 
-  it.each(['queued', 'running'])('redispatches a dead %s owner without settling the pending review', status => {
+  it.each(['queued', 'running'])('awaiting human confirm redispatches a dead %s owner without settling the pending review', status => {
     const p = parked({ status });
     expect(redTeamOwedFor(p.run)).toBe(true);
     expect(p.witness().newest).toEqual(p.run);
@@ -1930,5 +1938,122 @@ describe('recovery while a quiet review awaits human confirm', () => {
     expect(result).toEqual({ ok: false, reason: 'review-unfinished' });
     expect(result.settleBounds.unreadBoundaryAt).toBeDefined();
     expect(planRedTeamRecovery(result)).toMatchObject({ mode: 'skip', why: 'review-unfinished' });
+  });
+});
+
+
+describe('awaiting human confirm', () => {
+  const now = Date.parse('2026-11-24T16:00:00Z');
+  function parked(changeRun = () => {}, changeStatus = s => s, offset = 5000) {
+    const f = fixture();
+    const run = { ...newRunRecord({ id: 'review-pr-pr7385-confirm', op: 'review-pr', input: { repo: f.repo, pr: f.pr } }),
+      pending: { kind: 'confirm', step: 'confirm', of: 'human', stepIndex: 2 },
+      findings: { read: { netBasis: { rev: f.head }, openOperatorSendBacks: [] } },
+      verdict: { verdict: 'needs-human', humanRequired: true, referrals: [], lenses: [...MANDATORY_LENSES],
+        lensVerdicts: Object.fromEntries(MANDATORY_LENSES.map(l => [l, 'accept'])), findings: [] },
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now - 10000).toISOString() },
+        { step: 'advise', stepIndex: 1, startedAt: new Date(now - 2000).toISOString(), durationMs: 1000, finishedAt: new Date(now - 1000).toISOString() }],
+      effects: [{ key: 'note', stepIndex: 1, index: 0, type: 'review.advisory-note', status: 'applied', result: { posted: true } },
+        { key: 'label', stepIndex: 1, index: 1, type: 'review.advisory-label', status: 'applied', result: { applied: true, added: 'advisory:accepted' } }] };
+    writeRun(run, f.runsDir);
+    changeRun(run);
+    writeFileSync(join(f.runsDir, `${run.id}.json`), JSON.stringify(run));
+    utimesSync(join(f.runsDir, `${run.id}.json`), now / 1000, now / 1000);
+    recordRedTeamStatus({ ...f, loopPayload: { ...run, runId: run.id }, status: 'finished',
+      result: { status: 'ran', foldedVerdict: 'accept', findings: [] } }, f);
+    const path = join(redTeamStatusDir(f.env), `${encodeURIComponent(f.repo)}-${f.pr}-${f.head}.json`);
+    writeFileSync(path, JSON.stringify(changeStatus(JSON.parse(readFileSync(path, 'utf8')))));
+    utimesSync(path, (now + offset) / 1000, (now + offset) / 1000);
+    return { f, run, path, read: () => readDrainRedTeamEvidence({ ...f, now: now + 20000 }) };
+  }
+  function holds(p) {
+    const evidence = p.read();
+    expect(evidence).toMatchObject({ ok: false, reason: 'review-unfinished' });
+    expect(planRedTeamStatusLabels({ ...p.f, labels: ['red-team:pending'], comments: [], evidence }).add).not.toBe('red-team:clear');
+  }
+  it('releases #7385 with a finished pass bound to the parked run and plans clear', () => {
+    const p = parked(), evidence = p.read();
+    expect(evidence.ok).not.toBe(false);
+    expect(planRedTeamStatusLabels({ ...p.f, labels: ['red-team:pending'], comments: [], evidence }).add).toBe('red-team:clear');
+  });
+  const runFailures = {
+    'missing mandatory verdict': r => { delete r.verdict.lensVerdicts[MANDATORY_LENSES[0]]; },
+    'extra verdict key': r => { r.verdict.lensVerdicts.extra = 'accept'; },
+    'prevention outstanding': r => { r.verdict.lensVerdicts[MANDATORY_LENSES[0]] = 'prevention-outstanding'; },
+    'object verdict': r => { r.verdict.lensVerdicts[MANDATORY_LENSES[0]] = { verdict: 'accept' }; },
+    'pending referrals': r => { r.verdict.pendingReferrals = ['open']; },
+    'blocked referrals': r => { r.verdict.blockedReferrals = ['blocked']; },
+    'referrals': r => { r.verdict.referrals = ['open']; },
+    'missing referrals': r => { delete r.verdict.referrals; },
+    'degraded read and null advisory': r => { r.findings.read.degraded = true; },
+    'skipped seats': r => { r.verdict.skippedSeats = ['security']; },
+    'seat shortfall': r => { r.verdict.nonClaudeSeatShortfall = 1; },
+    'operator send back': r => { r.findings.read.openOperatorSendBacks = [{}]; },
+    'wrong pending owner': r => { r.pending.of = 'agent'; },
+    'resumed': r => { r.resumeOf = 'older'; },
+    'resumedAt': r => { r.resumedAt = new Date(now).toISOString(); },
+    'outcome': r => { r.outcome = 'refused'; },
+    'confirmed': r => { r.findings.confirm = 'accept'; },
+    'missing advise timing': r => { r.stepTimings.pop(); },
+    'missing mandatory lens': r => { r.verdict.lenses.pop(); },
+    'not human required': r => { r.verdict.humanRequired = false; },
+    'unapplied effect': r => { r.effects[0].status = 'pending'; },
+    'label not human gated': r => { r.effects[1].result = { applied: false, reason: 'not-human-gated' }; },
+    'label head moved': r => { r.effects[1].result = { applied: false, reason: 'head-moved' }; },
+    'note not posted': r => { r.effects[0].result = {}; },
+    'duplicate unposted note': r => { r.effects.push({ ...r.effects[0], key: 'retry-note', index: 2, result: {} }); },
+    'duplicate unapplied label': r => { r.effects.push({ ...r.effects[1], key: 'retry-label', index: 2, result: { applied: false, reason: 'head-moved' } }); },
+  };
+  it.each(Object.entries(runFailures))('holds %s', (_name, change) => holds(parked(change)));
+  const statusFailures = {
+    null: () => null, array: () => [],
+    'no payload': s => { delete s.loopPayload; return s; },
+    'foreign repo': s => ({ ...s, repo: 'other/repo' }),
+    'foreign pr': s => ({ ...s, pr: 1 }),
+    'foreign head': s => ({ ...s, head: 'c'.repeat(40) }),
+    'foreign payload head': s => { s.loopPayload.findings.read.netBasis.rev = 'c'.repeat(40); return s; },
+    queued: s => ({ ...s, status: 'queued' }), running: s => ({ ...s, status: 'running' }),
+    error: s => ({ ...s, result: 'error' }), skipped: s => ({ ...s, result: 'skipped' }),
+    'not owed': s => ({ ...s, result: 'not-owed' }),
+    carried: s => { s.loopPayload.carriedFrom = 'c'.repeat(40); return s; },
+    'older id touched now': s => { s.loopPayload.runId = 'review-pr-older'; return s; },
+    legacy: s => { delete s.loopPayload.runId; delete s.loopPayload.id; return s; },
+    'not confirm': s => { s.loopPayload.pending = { kind: 'judge' }; return s; },
+  };
+  it.each(Object.entries(statusFailures))('holds status %s', (_name, change) => holds(parked(undefined, change)));
+  it.each([-5000, 1000, 5000])('binds independently of mtime offset %s and holds an unbound status', offset => {
+    expect(parked(undefined, s => s, offset).read().ok).not.toBe(false);
+    holds(parked(undefined, statusFailures.legacy, offset));
+  });
+  it('holds a newer unfinished run behind a status bound to the older run', () => {
+    const p = parked();
+    const newer = { ...p.run, id: 'review-pr-newer', verdict: null,
+      stepTimings: [{ step: 'read', stepIndex: 0, startedAt: new Date(now + 1000).toISOString() }] };
+    writeRun(newer, p.f.runsDir);
+    utimesSync(join(p.f.runsDir, `${newer.id}.json`), (now + 2000) / 1000, (now + 2000) / 1000);
+    holds(p);
+  });
+  it('accepts a recovery payload bound by op and id', () => {
+    expect(parked(undefined, s => { delete s.loopPayload.runId; return s; }).read().ok).not.toBe(false);
+  });
+  it('accepts an already-current advisory label', () => {
+    expect(parked(r => { r.effects[1].result = { applied: false, reason: 'already-current' }; }).read().ok).not.toBe(false);
+  });
+  it('opens status once and stats and reads that fd, closing it on parse failure', () => {
+    const p = parked();
+    const { openSync: open, fstatSync: stat, readFileSync: read, closeSync: close } = fs;
+    for (const mock of [open, stat, read, close]) mock.mockClear();
+    try {
+      p.read();
+      const index = open.mock.calls.findIndex(args => args[0] === p.path);
+      expect(open.mock.calls.filter(args => args[0] === p.path)).toHaveLength(1);
+      const fd = open.mock.results[index].value;
+      expect(stat).toHaveBeenCalledWith(fd);
+      expect(read).toHaveBeenCalledWith(fd, 'utf8');
+      expect(close).toHaveBeenCalledWith(fd);
+      writeFileSync(p.path, '{');
+      expect(p.read).toThrow();
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally { vi.restoreAllMocks(); }
   });
 });

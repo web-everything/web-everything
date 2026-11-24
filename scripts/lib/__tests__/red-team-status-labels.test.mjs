@@ -219,3 +219,12 @@ describe('card-only head that bypasses the red-team pass loses a stale pending l
     expect(plan(['red-team:pending', 'red-team:clear'], { loopPayload: card }).remove.sort()).toEqual(['red-team:clear', 'red-team:pending']);
   });
 });
+
+
+describe('awaiting human confirm label safety', () => {
+  it('never clears unknown review evidence even with a stored accepting result', () => {
+    expect(planRedTeamStatusLabels({ ...input, labels: ['red-team:pending'], comments: [],
+      evidence: { ok: false, reason: 'review-unfinished', scheduled: true,
+        status: { status: 'finished', result: { status: 'ran', foldedVerdict: 'accept' } } } }).add).not.toBe('red-team:clear');
+  });
+});
