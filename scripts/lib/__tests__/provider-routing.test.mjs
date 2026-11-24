@@ -1555,3 +1555,21 @@ it('fresh auth works when callers pass only the record', () => {
   const agyAuth = { state: 'on', lastProbeAt: Date.now() };
   expect(selectProvider({ taskType: 'doc-fix' }, { agyAuth }).agyAlternateResult).toBe('offered');
 });
+
+describe('selectProvider auth-off early routes', () => {
+  it.each(['gemini', 'antigravity'])('skips earned %s and falls through to earned Codex', provider => {
+    const context = { filesTouched: ['scripts/lib/example.mjs'], estimatedSize: 30,
+      scorecards: [makeRecord({ provider, model: 'gemini-3.1-pro' }), makeRecord()] };
+    expect(selectProvider({ taskType: 'bugfix' }, context).recommendation).toBe('gemini');
+    expect(selectProvider({ taskType: 'bugfix' }, { ...context, agyAuth: { state: 'off' } }).recommendation).toBe('codex');
+  });
+  it.each(['high-stakes', 'thin-history'])('skips %s dual dispatch when auth is off', branch => {
+    const context = branch === 'high-stakes'
+      ? { filesTouched: ['scripts/conveyor/drain.mjs', 'scripts/conveyor/__tests__/drain.test.mjs'] }
+      : { filesTouched: ['scripts/lib/example.mjs'], estimatedSize: 320, scorecards: [makeRecord()] };
+    expect(selectProvider({ taskType: 'bugfix' }, context).recommendation).toBe('both');
+    const result = selectProvider({ taskType: 'bugfix' }, { ...context, agyAuth: { state: 'off' } });
+    expect(result.recommendation).toBe('claude');
+    expect(result.alternateBackend).toBeNull();
+  });
+});

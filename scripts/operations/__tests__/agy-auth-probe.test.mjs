@@ -29,10 +29,13 @@ it('an unreadable probe result counts as unavailable, not available', () => {
   expect(agyAuthOff(reduceAuthState(on, 'unreadable', 1001), 1001, 100)).toBe(true);
 });
 it.each([
-  [reply(), 'signed-in'], [reply('Hello from agy!'), 'signed-in'], [reply('', 1, 'Authentication required'), 'signed-out'],
+  [reply(), 'signed-in'], [reply('Hello from agy!'), 'unreadable'], [reply('', 1, 'Authentication required'), 'signed-out'],
   [reply('https://accounts.google.com/o/oauth2/auth?secret=x'), 'signed-out'],
-  [{ timedOut: true }, 'signed-out'], [reply(''), 'unreadable'], [reply('ok', 1), 'unreadable'],
-  [reply('garbage'), 'unreadable'],
+  [{ timedOut: true }, 'unreadable'], [reply(''), 'unreadable'], [reply('ok', 1), 'unreadable'],
+  [reply('garbage'), 'unreadable'], [reply(' OK! Ready.'), 'signed-in'],
+  [reply('okay'), 'unreadable'], [reply('Please sign in to continue'), 'signed-out'],
+  [reply('ok', 0, 'Not logged in'), 'signed-out'], [reply('ok', 0, 'auth required'), 'signed-out'],
+  [{ ...reply(), timedOut: true }, 'unreadable'],
 ])('classifies probe fixture %j', (input, expected) => expect(classifyAgyProbe(input)).toBe(expected));
 it('stale and malformed state fail closed', () => {
   for (const record of [null, '{', {}, { state: 'on' }, { ...on, lastProbeAt: 'bad' }, on])
@@ -45,6 +48,16 @@ it('requires 2-good-probes flapping guard and resets on failure', () => {
   expect(first).toMatchObject({ state: 'off', goodStreak: 1, outageId: off.outageId, cardNeeded: false });
   expect(reduceAuthState(first, 'signed-in', 1003)).toMatchObject({ state: 'on', outageId: null });
   expect(reduceAuthState(first, 'unreadable', 1003).goodStreak).toBe(0);
+});
+it.each([undefined, 'bad', 0, 1001])('restarts recovery with stale or unreadable lastProbeAt: %j', lastProbeAt => {
+  const prev = { state: 'on', goodStreak: 2, lastProbeAt, outageId: 'old' };
+  const first = reduceAuthState(prev, 'signed-in', 2000, 100);
+  expect(first).toMatchObject({ state: 'off', goodStreak: 1 });
+  expect(reduceAuthState(first, 'signed-in', 2200, 100).state).toBe('on');
+});
+it('uses the default fifteen minute recovery period', () => {
+  expect(reduceAuthState(on, 'signed-in', 1000 + 30 * 60000).state).toBe('on');
+  expect(reduceAuthState(on, 'signed-in', 1001 + 30 * 60000)).toMatchObject({ state: 'off', goodStreak: 1 });
 });
 it('one action card per outage', async () => {
   const f = await fixture(); f.spawn.mockImplementation(() => { throw new Error('secret URL'); });
@@ -59,8 +72,26 @@ it('one action card per outage', async () => {
 });
 it('lock held skips without probing or changing previous state', async () => {
   const f = await fixture(); await writeFile(f.statePath, JSON.stringify(on)); await mkdir(f.lockDir);
+  await writeFile(join(f.lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, timestamp: 1000 }));
   expect(await runProbe(f)).toMatchObject({ skipped: true }); expect(f.spawn).not.toHaveBeenCalled();
   expect(JSON.parse(await readFile(f.statePath, 'utf8'))).toEqual(on);
+});
+it.each([
+  { pid: process.pid, timestamp: 1000 - 300001 },
+  { pid: 2147483647, timestamp: 1000 },
+])('steals an abandoned lock: %j', async owner => {
+  const f = await fixture(); await mkdir(f.lockDir);
+  await writeFile(join(f.lockDir, 'owner.json'), JSON.stringify(owner));
+  await runProbe(f); expect(f.spawn).toHaveBeenCalledTimes(1);
+});
+it('writes the lock owner before probing', async () => {
+  const f = await fixture();
+  f.fileCard.mockImplementation(async () => {
+    expect(JSON.parse(await readFile(join(f.lockDir, 'owner.json'), 'utf8')))
+      .toEqual({ pid: process.pid, timestamp: 1000 });
+  });
+  f.spawn.mockImplementation(() => { throw new Error('unavailable'); });
+  await runProbe(f); expect(f.fileCard).toHaveBeenCalledOnce();
 });
 it('runs with ignored stdin, bounded output, and persists probe state', async () => {
   const f = await fixture(); await runProbe(f);
@@ -81,14 +112,28 @@ it('oversized output fails closed with one operator card', async () => {
   });
   expect(await runProbe(f)).toMatchObject({ state: 'off' }); expect(f.fileCard).toHaveBeenCalledTimes(1);
 });
-it('retries a failed card publication without losing the outage', async () => {
+it('persists pending publication and never repeats an ambiguous publish after a crash', async () => {
   const f = await fixture(); f.spawn.mockImplementation(() => { throw new Error('unavailable'); });
-  f.fileCard.mockRejectedValueOnce(new Error('filing unavailable'));
-  await expect(runProbe(f)).rejects.toThrow('filing unavailable');
+  f.fileCard.mockImplementationOnce(async ({ outageId }) => {
+    expect(JSON.parse(await readFile(f.statePath, 'utf8')))
+      .toMatchObject({ outageId, cardPending: true, cardFiled: false });
+    throw new Error('crash after publication');
+  });
+  await expect(runProbe(f)).rejects.toThrow('crash after publication');
   const previous = JSON.parse(await readFile(f.statePath, 'utf8'));
-  expect(previous).toMatchObject({ state: 'off', cardNeeded: true });
-  expect(await runProbe(f)).toMatchObject({ outageId: previous.outageId, cardNeeded: false });
-  expect(f.fileCard).toHaveBeenCalledTimes(2);
+  expect(await runProbe(f)).toMatchObject({ outageId: previous.outageId, cardPending: true, cardFiled: false });
+  expect(f.fileCard).toHaveBeenCalledTimes(1);
+});
+it('records successful publication and preserves it on subsequent probes', async () => {
+  const f = await fixture(); f.spawn.mockImplementation(() => { throw new Error('unavailable'); });
+  expect(await runProbe(f)).toMatchObject({ cardPending: false, cardFiled: true });
+  expect(await runProbe(f)).toMatchObject({ cardPending: false, cardFiled: true });
+  expect(f.fileCard).toHaveBeenCalledTimes(1);
+});
+it('does not republish historical outages without card metadata', async () => {
+  const f = await fixture(); f.spawn.mockImplementation(() => { throw new Error('unavailable'); });
+  await writeFile(f.statePath, JSON.stringify({ state: 'off', outageId: 'old', cardNeeded: false }));
+  await runProbe(f); expect(f.fileCard).not.toHaveBeenCalled();
 });
 it('files through file-item with a distinct outage reason and no captured agy output', async () => {
   const f = await fixture(); const exec = vi.fn();

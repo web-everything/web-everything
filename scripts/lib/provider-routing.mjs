@@ -766,6 +766,7 @@ export function selectProvider(task, context) {
   const kind = typeof context?.kind === 'string' ? context.kind : '';
   const tags = Array.isArray(context?.tags) ? context.tags : [];
 
+  const authOff = context?.agyAuth !== undefined && agyAuthOff(context.agyAuth, context.now, context.agyAuthPeriodMs);
   const auditTrail = [];
   const statuteFiles = filesTouched.filter(isStatuteTierPath);
   const hasStatuteFile = statuteFiles.length > 0;
@@ -795,7 +796,7 @@ export function selectProvider(task, context) {
   // ──────────────────────────────────────────────────────────────────────────
   // Step 1: Gemini / Antigravity Fitness Check
   // ──────────────────────────────────────────────────────────────────────────
-  const geminiCheck = gated ? gatedFit : evaluateProviderFitness(
+  const geminiCheck = authOff ? { fit: false, fitModel: null, reason: 'agy authentication is off, unreadable or stale; sign in on the Studio.' } : gated ? gatedFit : evaluateProviderFitness(
     ['gemini', 'antigravity'],
     taskType,
     filesTouched,
@@ -860,7 +861,10 @@ export function selectProvider(task, context) {
   let bothFit = false;
   let bothReason = '';
 
-  if (gated) {
+  if (authOff) {
+    bothFit = false;
+    bothReason = 'agy authentication is off, unreadable or stale; sign in on the Studio.';
+  } else if (gated) {
     bothFit = false;
     bothReason = gatedFit.reason;
   } else if (gatedKindOpen) {
@@ -942,7 +946,7 @@ export function selectProvider(task, context) {
   const cliModel = AGY_CLAUDE_MODEL_BY_TIER[claudeTier];
   const forcedNativeIdentity = hasStatuteFile || taskType === 'architectural-decision' || taskType === 'triage-research';
   const latestAntigravityTrial = getSortedRecordsForProviderAndTask(scorecards, ['antigravity'], taskType)[0];
-  const agyAlternateResult = context?.agyAuth !== undefined && agyAuthOff(context.agyAuth, context.now, context.agyAuthPeriodMs) ? 'auth-off'
+  const agyAlternateResult = authOff ? 'auth-off'
     : !cliModel ? 'not-applicable'
     : forcedNativeIdentity ? 'forced-native'
       : latestAntigravityTrial && !isCleanRecord(latestAntigravityTrial) ? 'recent-failure'
