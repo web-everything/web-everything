@@ -59,7 +59,7 @@ describe('shared protected-path floor', () => {
   });
 });
 
-it.each(['scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs',
+it.each(['scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs', 'scripts/lib/strict-utc-timestamp.mjs',
   'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
   'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
   'scripts/guard-git-push.mjs', 'scripts/lib/lane-lease.mjs',
