@@ -117,6 +117,14 @@ function fixture({ probeCode = 0, copyCode = 0, prepareCode = 0, runCode = 0, re
   writeFileSync(join(cwd, 'a.test.mjs'), 'fixture');
   return {exec, local, listFiles, argv:[...argv], cwd, lockRoot:join(cwd,'heavy'), env:{...allowedEnv,...forbiddenEnv}, runId};
 }
+describe('configured remote execution root', () => {
+  it.each(['/srv/forge-exec','/srv/mesa-exec'])('copies the snapshot under %s', async root => {
+    const f=fixture();
+    expect(await runRemote({...f,root})).toMatchObject({mode:'remote',code:0});
+    const copies=callsOf(f.exec).filter(call=>call.file==='rsync');
+    expect(copies.some(call=>call.args.at(-1).startsWith(`forge:${root}/`))).toBe(true);
+  });
+});
 // Simulate umask 077 without changing the test worker's process-wide umask.
 describe('R1017 advisory run identity', () => {
   it.each([undefined, 'forge-exec', 'forge-exec-2'])('passes the prepare nonce and raw slot %s with onRun before dispatch and finish', async slot => {
