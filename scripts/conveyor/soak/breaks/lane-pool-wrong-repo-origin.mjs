@@ -3,10 +3,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const PATHS = ['scripts/lane-pool.mjs'];
+const PATHS = ['scripts/lane-pool.mjs', 'scripts/lib/lane-pool-origin.mjs'];
 
 /** Replays the live case; returns the origin URL of the lane the pool grew for pool "project". */
 export function replayPoolOrigin(root = ROOT) {
@@ -14,7 +14,10 @@ export function replayPoolOrigin(root = ROOT) {
   const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   try {
     const seed = (name) => {
-      const bare = join(base, `${name}.git`), work = join(base, name);
+      const remoteDir = join(base, `${name}-remote`);
+      mkdirSync(remoteDir);
+      // Ordinary forks share a basename; it cannot identify the selected pool's authority.
+      const bare = join(remoteDir, 'project.git'), work = join(base, name);
       git(['init', '--quiet', '--bare', '--initial-branch=main', bare]);
       git(['clone', '--quiet', bare, work]);
       writeFileSync(join(work, 'f.txt'), `${name}\n`);
@@ -51,9 +54,15 @@ export default {
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const r = replayPoolOrigin(sourceRoot);
+    const { originsDiffer } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/lane-pool-origin.mjs')).href);
+    r.homeRelativeDistinct = originsDiffer('alice@host:repo.git', 'bob@host:repo.git')
+      && originsDiffer('ssh://alice@host/~/repo.git', 'ssh://bob@host/~/repo.git');
     log?.(`pool=project lane origin=${r.lane} expected=${r.poolOrigin} exit=${r.exit}\n`);
     return r;
   },
-  judge: (r) => (r.exit === 0 && r.lane === r.poolOrigin ? []
-    : [`pool "project" provision exit=${r.exit}, lane origin=${r.lane}; expected exit 0 and the pool origin ${r.poolOrigin}`]),
+  judge: (r) => [
+    ...(r.exit === 0 && r.lane === r.poolOrigin ? []
+      : [`pool "project" provision exit=${r.exit}, lane origin=${r.lane}; expected exit 0 and the pool origin ${r.poolOrigin}`]),
+    ...(r.homeRelativeDistinct ? [] : ['different SSH accounts must not identify the same home-relative repository']),
+  ],
 };

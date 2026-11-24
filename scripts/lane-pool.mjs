@@ -474,12 +474,10 @@ function resolveRepo(repoFlags = flags) {
   // primary origin, never the caller checkout's — else `--pool=plateau-app` run from web-everything cloned WE.
   const poolPrimaryExists = explicitPool && existsSync(join(dirname(topLevel), explicitPool, '.git'));
   // Fail closed: growth with --pool whose primary checkout is absent must not fall back to the caller's origin.
-  if (explicitPool && needsOrigin && !poolPrimaryExists && !repoFlags.origin && !repoFlags.reference
-    && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
+  if (explicitPool && needsOrigin && !poolPrimaryExists && !repoFlags.origin && !repoFlags.reference) {
     fail(`${cmd} --pool=${explicitPool}: no primary checkout at ${join(dirname(topLevel), explicitPool)} — pass --origin=<url> or --reference=<checkout>; refusing to use the caller's origin`);
   }
-  if (((cmd === 'gc' || cmd === 'release') || (needsOrigin && poolPrimaryExists)) && explicitPool && !repoFlags.origin && !repoFlags.reference
-    && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
+  if (((cmd === 'gc' || cmd === 'release') || (needsOrigin && poolPrimaryExists)) && explicitPool && !repoFlags.origin && !repoFlags.reference) {
     const selectedRepo = resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
     // Origin authority comes from the selected primary; release still cleans the caller's registry.
     return cmd === 'release' ? { ...selectedRepo, registryReferencePath: topLevel } : selectedRepo;

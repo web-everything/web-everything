@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { originsDiffer } from '../lib/lane-pool-origin.mjs';
@@ -76,6 +76,43 @@ describe('lane-pool wrong-origin / new-branch / missing-primary (behavioural)', 
     expect(r.code).not.toBe(0);
     expect(r.err + r.out).toMatch(/no primary checkout/);
   });
+
+  function sameNamedForks(withPrimary) {
+    mkdirSync(join(base, 'company'));
+    mkdirSync(join(base, 'fork'));
+    const canonical = join(base, 'company', 'project.git');
+    const fork = join(base, 'fork', 'project.git');
+    const caller = join(base, 'caller');
+    git(['clone', '--quiet', '--bare', originDir, canonical]);
+    git(['clone', '--quiet', '--bare', otherDir, fork]);
+    git(['clone', '--quiet', fork, caller]);
+    if (withPrimary) git(['clone', '--quiet', canonical, join(base, 'project')]);
+    return { canonical, fork, caller };
+  }
+
+  it.each(['provision', 'acquire'])('%s uses the selected primary even when the caller origin has the same basename', (command) => {
+    const { canonical, caller } = sameNamedForks(true);
+    if (command === 'acquire') {
+      const provision = runPool(['provision', '--origin=' + canonical, '--pool=project', '--count=1', '--no-install'], { LANE_POOL_ROOT: poolRoot }, caller);
+      expect(provision.code, provision.err + provision.out).toBe(0);
+    }
+    const r = runPool([command, '--pool=project', '--count=1', '--no-install', '--session=t', '--purpose=t'], { LANE_POOL_ROOT: poolRoot }, caller);
+    expect(r.code, r.err + r.out).toBe(0);
+    expect(git(['remote', 'get-url', 'origin'], join(poolRoot, 'project', 'lane-1'))).toBe(canonical);
+  });
+
+  it.each(['provision', 'acquire'])('%s refuses a missing primary even when the caller origin has the pool basename', (command) => {
+    const { caller } = sameNamedForks(false);
+    const r = runPool([command, '--pool=project', '--count=1', '--no-install', '--session=t', '--purpose=t'], { LANE_POOL_ROOT: poolRoot }, caller);
+    expect(r.code, r.err + r.out).not.toBe(0);
+    expect(r.err + r.out).toMatch(/no primary checkout/);
+  });
+
+  it.each(['origin', 'reference'])('honours explicit --%s when the selected primary is absent', (option) => {
+    const r = runPool(['provision', '--pool=project', '--count=1', '--no-install', `--${option}=${option === 'origin' ? originDir : referenceDir}`], { LANE_POOL_ROOT: poolRoot }, referenceDir);
+    expect(r.code, r.err + r.out).toBe(0);
+    expect(git(['remote', 'get-url', 'origin'], join(poolRoot, 'project', 'lane-1'))).toBe(originDir);
+  });
 });
 
 describe('originsDiffer', () => {
@@ -88,6 +125,25 @@ describe('originsDiffer', () => {
   it('keeps path case and ports distinct', () => {
     expect(originsDiffer('git@github.com:Org/Repo.git', 'git@github.com:org/repo.git')).toBe(true);
     expect(originsDiffer('ssh://git@host:2222/org/repo', 'git@host:2222/org/repo')).toBe(true);
+  });
+  it.each([
+    ['alice@host:repo.git', 'bob@host:repo.git'],
+    ['alice@host:team/repo.git', 'bob@host:team/repo.git'],
+    ['ssh://alice@host/~/repo.git', 'ssh://bob@host/~/repo.git'],
+    ['ssh://alice@host/~alice/repo.git', 'ssh://alice@host/~bob/repo.git'],
+    ['alice@host:repo.git', 'https://host/repo.git'],
+    ['alice@host:repo.git', 'ssh://alice@host/repo.git'],
+    ['Alice@host:repo.git', 'alice@host:repo.git'],
+    ['host:repo.git', 'alice@host:repo.git'],
+    ['alice@[::1]:repo.git', 'bob@[::1]:repo.git'],
+    ['ssh://alice@host:2222/~/repo.git', 'ssh://bob@host:2222/~/repo.git'],
+    ['git@host:repo.git', 'https://host/repo.git'],
+  ])('keeps distinct home-relative repositories apart: %s / %s', (a, b) => {
+    expect(originsDiffer(a, b)).toBe(true);
+  });
+  it('normalizes equivalent home-relative and absolute SSH spellings', () => {
+    expect(originsDiffer('alice@HOST:repo.git', 'ssh://alice@host/~/repo')).toBe(false);
+    expect(originsDiffer('alice@host:/srv/repo.git', 'ssh://bob@host/srv/repo')).toBe(false);
   });
   it('never marks a lane wrong when an origin is unknown', () => {
     expect(originsDiffer(null, 'git@github.com:a/b.git')).toBe(false);
