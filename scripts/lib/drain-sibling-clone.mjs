@@ -41,9 +41,13 @@ export function siblingCloneUrl(localOrigin, slug) {
  * @param {{slug:string, name:string, parentDir:string, localOrigin:string|null, exec?:Function, exists?:Function,
  *   rename?:Function, now?:()=>number}} o
  */
-export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = execFileSync, exists = existsSync, rename = renameSync, now = Date.now } = {}) {
+export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = execFileSync, exists = existsSync, rename = renameSync, now = Date.now, env = process.env } = {}) {
   const dir = resolve(parentDir, name);
   if (exists(join(dir, '.git'))) return dir;
+  // `WE_DRAIN_SIBLING_CLONE=off` disables provisioning; under a test runner it is off unless explicitly `on`
+  // (no suite may reach the network by accident).
+  const mode = env.WE_DRAIN_SIBLING_CLONE;
+  if (mode === 'off' || (env.VITEST && mode !== 'on')) return null;
   const key = `${dir}\0${slug}`;
   const failedAt = failures.get(key);
   if (failedAt !== undefined && now() - failedAt < CLONE_RETRY_COOLDOWN_MS) return null;
@@ -52,7 +56,8 @@ export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = 
   const tmp = `${dir}.clone-${process.pid}-${now()}`;
   try {
     exec('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', '-c', 'gc.auto=0', url, tmp],
-      { stdio: ['ignore', 'ignore', 'pipe'], timeout: CLONE_TIMEOUT_MS, killSignal: 'SIGKILL' });
+      { stdio: ['ignore', 'ignore', 'pipe'], timeout: CLONE_TIMEOUT_MS, killSignal: 'SIGKILL',
+        env: { ...env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' } }); // never block on a prompt
     rename(tmp, dir);
     failures.delete(key);
     return exists(join(dir, '.git')) ? dir : null;

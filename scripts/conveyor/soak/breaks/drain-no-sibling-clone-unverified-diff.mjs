@@ -22,7 +22,7 @@ function scenario(root) {
       exists: () => false, exec: () => { throw new Error('auth'); } });
     const a = calls[0] || [];
     process.stdout.write(JSON.stringify({ ok, bad, blobless: a.includes('--filter=blob:none') && a.includes('--no-checkout'), url: a.find((x) => /frontierui/.test(x)) }));`;
-  return execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  return execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, WE_DRAIN_SIBLING_CLONE: 'on' } }).trim();
 }
 
 export default {

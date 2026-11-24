@@ -14,6 +14,8 @@ import { ensureSiblingClone, siblingCloneUrl, resetSiblingCloneFailures, describ
 import { computeNetDiffSignals } from '../../merge-ai-prs.mjs';
 import { scanTestTampering } from '../pr-merge-gate.mjs';
 
+process.env.WE_DRAIN_SIBLING_CLONE = 'on'; // provisioning is off under vitest unless explicit; every exec below is injected or a local file:// origin
+
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 /** A real origin repo (main + one PR branch) served over file:// with partial-clone filters allowed. */
@@ -64,6 +66,13 @@ describe('ensureSiblingClone fails closed', () => {
     let calls = 0;
     expect(ensureSiblingClone({ ...base, localOrigin: null, exists: () => false, exec: () => { calls++; } })).toBeNull();
     expect(ensureSiblingClone({ ...base, exists: (p) => !p.endsWith('.git'), exec: () => { calls++; } })).toBeNull();
+    expect(calls).toBe(0);
+  });
+  it('provisioning is off when disabled, and off under a test runner unless explicit', () => {
+    let calls = 0;
+    const o = { ...base, exists: () => false, exec: () => { calls++; } };
+    expect(ensureSiblingClone({ ...o, env: { WE_DRAIN_SIBLING_CLONE: 'off' } })).toBeNull();
+    expect(ensureSiblingClone({ ...o, env: { VITEST: 'true' } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('an existing clone is used as is', () => {
