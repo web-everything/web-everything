@@ -32,12 +32,14 @@ function gateScript() {
   return body.join('\n');
 }
 
-function runGate({ scopeResult, run, shardResult, event = 'merge_group' }) {
+function runGate({ scopeResult, run, shardResult, event = 'merge_group', changesResult = 'success', reuse = 'false' }) {
   const values = {
     'github.event_name': event,
     'needs.daemon-soak-scope.result': scopeResult,
     'needs.daemon-soak-scope.outputs.run': run,
     'needs.soak-shard.result': shardResult,
+    'needs.changes.result': changesResult,
+    'needs.changes.outputs.reuse': reuse,
   };
   const script = gateScript().replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, expr) => {
     if (!(expr in values)) throw new Error(`gate script reads an unmodelled expression: ${expr}`);
@@ -74,6 +76,25 @@ describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
 
   it('passes when scope said run and every shard succeeded', () => {
     expect(runGate({ scopeResult: 'success', run: 'true', shardResult: 'success' })).toBe(0);
+  });
+
+  it('passes on main push with skipped shards when successful changes explicitly proves reuse', () => {
+    expect(runGate({ event: 'push', scopeResult: 'success', run: 'true', shardResult: 'skipped', reuse: 'true' })).toBe(0);
+  });
+
+  it.each(['failure', 'cancelled', 'skipped', ''])('rejects reuse from a non-success changes result: %s', changesResult => {
+    expect(runGate({ event: 'push', scopeResult: 'success', run: 'true', shardResult: 'skipped', changesResult, reuse: 'true' })).not.toBe(0);
+  });
+
+  it.each(['false', '', 'TRUE', 'unknown'])('rejects skipped shards without an explicit reuse=true: %s', reuse => {
+    expect(runGate({ event: 'push', scopeResult: 'success', run: 'true', shardResult: 'skipped', reuse })).not.toBe(0);
+  });
+
+  it.each([
+    ['failure', 'true'], ['cancelled', 'true'], ['skipped', 'true'], ['', 'true'],
+    ['success', 'false'], ['success', ''], ['success', 'unknown'],
+  ])('reuse cannot bypass invalid scope evidence: %s/%s', (scopeResult, run) => {
+    expect(runGate({ event: 'push', scopeResult, run, shardResult: 'skipped', reuse: 'true' })).not.toBe(0);
   });
 
   it('fails when scope said run and a shard failed, was skipped, or was cancelled', () => {
