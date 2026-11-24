@@ -94,14 +94,14 @@ else process.stdout.write('${pullFiles}');
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('a truncated 300-file compare falls back to the timings blob at merge-base vs head', () => {
+  it('fails closed on a truncated 300-file compare and says to split the PR', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     const many = Array.from({ length: 300 }, (_, i) => `f${i}.txt\\0\\n`).join('');
     try {
-      fakeGh(dir, { compare: many, blobs: ['x', 'x'] });
-      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(0);
-      fakeGh(dir, { compare: many, blobs: ['x', 'y'] });
-      expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+      fakeGh(dir, { compare: many });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/over 300 files.*split the PR/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed at the API file cap', () => {

@@ -52,18 +52,13 @@ function main() {
       '--jq', '.files[] | (.filename, (.previous_filename // empty)) + "\\u0000"'], {
       encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let changedFiles = out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean);
+    const changedFiles = out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean);
     // A PR always changes something: empty output is not evidence.
     if (changedFiles.length === 0) throw new Error('Empty compare answer');
+    // The compare API truncates its file list at 300: past that the list is not complete evidence.
     if (changedFiles.length >= COMPARE_FILE_CAP) {
-      // The compare file list truncates at 300; prove the one file directly: its blob at the merge-base vs at the head.
-      const gh = args => execFileSync('gh', ['api', ...args], { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-      const mergeBase = gh([`repos/${REPO}/compare/${baseRef}...${HEAD_SHA}`, '--jq', '.merge_base_commit.sha']);
-      if (!/^[a-f0-9]{40,64}$/i.test(mergeBase)) throw new Error('Unreadable merge-base');
-      const blob = ref => gh([`repos/${REPO}/contents/${FILE}?ref=${ref}`, '--jq', '.sha']);
-      const [atBase, atHead] = [blob(mergeBase), blob(HEAD_SHA)];
-      if (!atBase || !atHead) throw new Error('Unreadable timings blob');
-      changedFiles = atBase === atHead ? ['(truncated compare; timings unchanged)'] : [FILE];
+      console.error(`Cannot verify ${FILE}: the PR changes over ${COMPARE_FILE_CAP} files, more than the compare API can prove; split the PR. Only ${OWNER} owns it.`);
+      return 1;
     }
     const result = checkTimingsBotOnly({ changedFiles, headRef: HEAD_REF, author: AUTHOR, headRepo: HEAD_REPO, repo: REPO });
     process[result.ok ? 'stdout' : 'stderr'].write(`${result.message}\n`);
