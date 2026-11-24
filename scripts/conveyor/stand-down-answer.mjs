@@ -26,7 +26,7 @@ function answeredStandDownToRearm(snapshot, noCodeOwed) {
     if (!isTerminalStandDown(c)) continue;
     // The guard (rearm-review.mjs#rearmWindow) honours only ITS window's latest stand-down: any other target is refused.
     const win = rearmWindow(comments);
-    if ((win.rearmed && !(noCodeOwed && win.capBlocked)) || String(c.id) !== win.standDownId) return null; // only the latest unanswered rearm target
+    if (!win.wouldHonour({ standDownId: String(c.id), disposition: 'rearm-review', noCodeOwed })) return null;
     let prior = null;
     for (let j = i + 1; j < comments.length; j += 1) {
       if (parseOperatorAnswer(comments[j])?.standDownId === String(c.id)) prior = comments[j]; // LAST answer wins
@@ -95,7 +95,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   if (flags.disposition === 'rearm-review' && !supersedes) {
     // Every rearm-review answer is checked by the guard's own window (rearm-review.mjs#rearmWindow): refuse what it would ignore.
     const win = rearmWindow(snapshot.comments);
-    if ((win.rearmed && !(flags.noCodeOwed && win.capBlocked)) || String(target.id) !== win.standDownId) {
+    if (!win.wouldHonour({ ...flags, standDownId: String(target.id) })) {
       throw new Error('rearm-review refused: the guard would ignore it (stand-down is outside the guard window, or a rearm-review already stands)');
     }
   }

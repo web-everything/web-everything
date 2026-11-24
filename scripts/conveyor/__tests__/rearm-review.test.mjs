@@ -632,6 +632,8 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
     const comments = [...third, ans('IC_401', 'IC_400', 'rearm-review')];
     expect(rearmWindow(comments)).toMatchObject({ rearmed: true, capBlocked: true, standDownId: 'IC_400' });
     expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review' })).toBe(false);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
   });
   it('ignores noCodeOwed from an untrusted poster at the cap', () => {
     const comments = [...third, { ...noCode(), author: { login: 'outsider' }, viewerDidAuthor: true }];
@@ -660,6 +662,8 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
     const comments = [...third, noCode(), begin('IC_490'), fourth, noCode('IC_500')];
     expect(rearmWindow(comments)).toMatchObject({ capBlocked: true, standDownId: 'IC_500' });
     expect(decideEmptyFixRound({ comments, liveHead: HEAD }).empty).toBe(true);
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_500', disposition: 'rearm-review', noCodeOwed: true })).toBe(false);
+    expect(rearmWindow([...comments, ...third]).wouldHonour({ standDownId: 'IC_400', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
     const reset = [...comments, ...third, noCode()];
     expect(rearmWindow(reset)).toMatchObject({ capBlocked: false, standDownId: null });
     expect(decideEmptyFixRound({ comments: reset, liveHead: HEAD }).empty).toBe(false);

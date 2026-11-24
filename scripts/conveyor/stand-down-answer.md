@@ -34,6 +34,13 @@ ruling in the answer and its visible body. It closes the open fix round as no-ch
 even when two earlier plain rearm waivers exhausted the verdict window's cap. It must name the latest
 stand-down, consumes no waiver, and cannot be replayed to clear later fix claims. The CLI refuses it
 while `red-team:blocked` stands (a security fix is owed), or when labels cannot be read completely.
+Only one cap override is available per changes-verdict window. After it is spent, both a fresh answer
+and a retry superseding an ignored answer refuse before posting; a new changes verdict resets it.
+The CLI uses the reader's `rearmWindow().wouldHonour(answer)` for both paths.
+The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
+we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-command workflow,
+including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.
+This test does not replace the post-load live proof owed on #7321.
 
 The predicate in we:scripts/conveyor/stand-down-answer-core.mjs requires a trusted `author.login`, an
 exact versioned record, and a later answer targeting the specific stand-down. A quoted marker, unrelated
