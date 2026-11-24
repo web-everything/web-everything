@@ -72,7 +72,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
   {
     test: 'scripts/operations/__tests__/test-path-boundary.test.mjs',
     scope: 'full',
-    why: 'no tracked non-test source may load __tests__ or soak/breaks paths; the waiver carry depends on that boundary',
+    why: 'no tracked non-test source may load isolated test paths; the audit waiver carry depends on that boundary',
     matches: (f) => /\.(mjs|cjs|js|ts)$/.test(f),
     inputs: ['scripts/operations/__tests__/test-path-boundary.test.mjs'],
   },

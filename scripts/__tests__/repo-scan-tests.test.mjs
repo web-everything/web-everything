@@ -68,6 +68,7 @@ describe('selectScanTests', () => {
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
     // The ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
     expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/operations/__tests__/test-path-boundary.test.mjs', 'full'],
       ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],
