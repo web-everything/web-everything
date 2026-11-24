@@ -2,6 +2,10 @@
  * @file Claim-bound push authority: live PR evidence, ancestry, one leased push, then a hold recheck.
  */
 import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { resolveRealGhBinary } from './gh-app-shim.mjs';
 import { readLiveFixClaim, isClaimHolder, pushRefusal, repoKeyOf } from '../conveyor/fix-procedure.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { runGhSync } from './gh-throttle.mjs';
@@ -10,43 +14,60 @@ import { PUSH_HOLD_LABELS } from './review-hold-model.mjs';
 const fail = (code, reason) => ({ ok: false, code, reason });
 const hex = value => typeof value === 'string' && /^[a-f0-9]{40}$/.test(value);
 const fields = 'labels,state,isDraft,headRefOid,headRefName,isCrossRepository';
-function git(gitDir, args, spawn = spawnSync) {
-  const env = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
-    GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-  for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
-    'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_REPLACE_REF_BASE', 'GIT_COMMON_DIR',
-    'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES']) delete env[key];
-  return spawn('git', ['-c', 'core.commitGraph=false', '-C', gitDir, ...args], { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+function isolatedGit(gitDir, io, use) {
+  const temp = mkdtempSync(join(tmpdir(), 'we-push-'));
+  try {
+    chmodSync(temp, 0o700);
+    const gh = resolveRealGhBinary();
+    if (!gh) throw new Error('GitHub CLI unavailable');
+    const env = { PATH: '/usr/bin:/bin', HOME: temp, XDG_CONFIG_HOME: temp,
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_NO_REPLACE_OBJECTS: '1', GIT_TERMINAL_PROMPT: '0', LC_ALL: 'C',
+      GH_CONFIG_DIR: process.env.GH_CONFIG_DIR || join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'gh'),
+      GH_HOST: 'github.com' };
+    for (const key of ['GH_TOKEN', 'GITHUB_TOKEN']) {
+      if (process.env[key] !== undefined) env[key] = process.env[key];
+    }
+    const config = ['core.hooksPath=/dev/null', 'core.commitGraph=false', 'core.fsmonitor=false',
+      'gc.auto=0', 'maintenance.auto=false', 'protocol.allow=never',
+      `protocol.${io.protocolAllow || 'https'}.allow=always`, 'http.followRedirects=false', 'http.proxy=',
+      'credential.helper=', `credential.helper=!'${gh.replaceAll("'", "'\\''")}' auth git-credential`,
+      'credential.interactive=never', 'push.gpgSign=false', 'push.followTags=false', 'push.recurseSubmodules=no']
+      .flatMap(value => ['-c', value]);
+    const git = (dir, args) => (io.spawn || spawnSync)('/usr/bin/git', [...config, '-C', dir, ...args],
+      { env, encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
+    const checked = (dir, args) => {
+      const result = git(dir, args);
+      if (result.error || result.status !== 0) throw new Error('Git evidence unreadable');
+      return result.stdout;
+    };
+    checked(temp, ['init', '--bare', '-q', '--template=', temp]);
+    const common = resolve(gitDir, checked(gitDir, ['rev-parse', '--git-common-dir']).trim());
+    try { if (readFileSync(join(common, 'shallow'), 'utf8').trim()) throw new Error('Shallow repository'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    writeFileSync(join(temp, 'objects/info/alternates'), `${join(common, 'objects')}\n`);
+    const ancestor = (head, sha) => {
+      checked(temp, ['cat-file', '-e', `${sha}^{commit}`]);
+      const result = git(temp, ['merge-base', '--is-ancestor', head, sha]);
+      if (result.error || ![0, 1].includes(result.status)) throw new Error('Ancestry unreadable');
+      return result.status === 0;
+    };
+    return use(temp, git, ancestor);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 function defaults(io = {}) {
   return {
     readClaim: (repo, pr) => readLiveFixClaim({ repo, pr }), isClaimHolder,
     branchClaimRefusal: (repo, branch, holder) => pushRefusal({ repo, branch,
-      sessionId: holder?.sessionId, who: holder?.who, token: holder?.token }),
+      sessionId: holder?.sessionId, who: holder?.who, token: holder?.token, strict: true }),
     ghPrView: (repo, pr) => JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo',
       `github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}`, '--json', fields], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
       env: { ...process.env, GH_HOST: 'github.com' },
       throttle: { noMemo: true },
     })),
-    isAncestor: (dir, head, sha) => {
-      const result = git(dir, ['merge-base', '--is-ancestor', head, sha], io.spawn);
-      if (result.error || ![0, 1].includes(result.status)) throw new Error('Ancestry unreadable');
-      return result.status === 0;
-    },
-    readPushUrls: dir => {
-      // --push includes pushurl and Git's URL rewrite rules; --all exposes multi-destination pushes.
-      const result = git(dir, ['remote', 'get-url', '--push', '--all', 'origin'], io.spawn);
-      if (result.error || result.status !== 0 || typeof result.stdout !== 'string') throw new Error('Destination unreadable');
-      return result.stdout.trim().split('\n');
-    },
-    readUrlRewrites: dir => {
-      const result = git(dir, ['config', '--get-regexp', '^url\\..*\\.(insteadof|pushinsteadof)$'], io.spawn);
-      if (result.error || ![0, 1].includes(result.status) || typeof result.stdout !== 'string'
-        || (result.status === 1 && result.stdout.trim())) throw new Error('URL rewrites unreadable');
-      return result.stdout.trim() ? result.stdout.trim().split('\n') : [];
-    },
-    gitPush: (dir, args) => git(dir, args, io.spawn), ...io,
+    isAncestor: (dir, head, sha) => isolatedGit(dir, io, (_temp, _git, ancestor) => ancestor(head, sha)),
+    ...io,
   };
 }
 function readView(io, repo, pr) {
@@ -80,7 +101,8 @@ export function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir,
     const entry = ports.readClaim(repo, pr);
     const refusal = claimRefusal(ports, entry, holder);
     if (refusal) return refusal;
-    if (ports.branchClaimRefusal(repo, branch, holder)) return fail('foreign-claim', 'Branch has a foreign claim; coordinate with its holder');
+    const branchRefusal = ports.branchClaimRefusal(repo, branch, holder);
+    if (branchRefusal) return fail(branchRefusal.code || 'foreign-claim', branchRefusal.message || 'Branch has a foreign claim; coordinate with its holder');
     const view = readView(ports, repo, pr);
     if (view.state !== 'OPEN') return fail('pr-not-open', 'PR is not open');
     if (view.isDraft && !entry.meta?.draft) return fail('draft', 'PR drafted outside this claim');
@@ -96,46 +118,44 @@ export function readPushAuthority({ repo, pr, branch, expectedHead, sha, gitDir,
 
 /** The push boundary: a rejected lease is never retried. */
 export function authorizedPush(options = {}) {
-  const authority = readPushAuthority(options);
-  if (!authority.ok) return authority;
   const { repo, pr, branch, expectedHead, sha, gitDir, purpose } = options;
   const ports = defaults(options.io);
-  let urls, entry;
-  try {
-    const rewrites = ports.readUrlRewrites(gitDir);
-    if (!Array.isArray(rewrites)) throw new Error('URL rewrites unreadable');
-    if (rewrites.length) return fail('destination-mismatch', 'URL rewrite config present; repair remote configuration');
-    urls = ports.readPushUrls(gitDir);
-    const slug = CONSTELLATION_REPOS[repoKeyOf(repo)].slug.toLowerCase();
-    const matches = url => typeof url === 'string'
-      && /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^\s?#]+?)(?:\.git)?$/i.exec(url)?.[1].toLowerCase() === slug;
-    if (!Array.isArray(urls) || urls.length !== 1 || !matches(urls[0]))
-      return fail('destination-mismatch', 'Origin push destination must match the authorized repo; repair remote configuration');
-  } catch { return fail('unreadable', 'Cannot read origin push destination; repair remote configuration before retrying'); }
-  try {
-    entry = ports.readClaim(repo, pr);
-    const refusal = claimRefusal(ports, entry, options.holder);
-    if (refusal) return refusal;
-    if (ports.branchClaimRefusal(repo, branch, options.holder)) return fail('foreign-claim', 'Branch has a foreign claim; coordinate with its holder');
-  } catch { return fail('unreadable', 'Cannot read push claim; restore evidence before retrying'); }
-  try {
-    const result = ports.gitPush(gitDir, ['push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
-      `--force-with-lease=refs/heads/${branch}:${expectedHead}`, urls[0], `${sha}:refs/heads/${branch}`]);
-    if (result.status !== 0) return fail('push-rejected', 'Push rejected; re-read authority before retrying');
-  } catch { return fail('push-rejected', 'Push failed; inspect remote before retrying'); }
-  try {
-    entry = ports.readClaim(repo, pr);
-    const refusal = claimRefusal(ports, entry, options.holder);
-    if (refusal) return { ...fail('pushed-under-hold', refusal.reason), pushed: true };
-    if (ports.branchClaimRefusal(repo, branch, options.holder))
-      return { ...fail('pushed-under-hold', 'Branch has a foreign claim; coordinate with its holder'), pushed: true };
-    const view = readView(ports, repo, pr);
-    const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
-      : view.isDraft && !entry.meta?.draft ? 'PR drafted outside this claim'
-      : view.isCrossRepository ? 'Cross-repository PR'
-      : view.headRefOid !== sha ? 'Post-push PR head differs'
-      : view.headRefName !== branch ? 'Post-push PR branch differs' : null);
-    if (reason) return { ...fail('pushed-under-hold', reason), pushed: true };
-  } catch { return { ...fail('pushed-under-hold', 'Post-push evidence unreadable; block hand-back'), pushed: true }; }
-  return { ok: true, pushed: sha, purpose };
+  // Validate and read initial evidence before constructing the isolated transport.
+  const authority = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
+  if (!authority.ok) return authority;
+  try { return isolatedGit(gitDir, options.io || {}, (temp, git, ancestor) => {
+    if ((options.io?.isAncestor || ((_dir, head, next) => ancestor(head, next)))(temp, expectedHead, sha) !== true)
+      return fail('not-descendant', 'Push must descend from expected head');
+    const url = options.io?.remoteUrl || `https://github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}.git`;
+    const args = ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--no-recurse-submodules',
+      `--force-with-lease=refs/heads/${branch}:${expectedHead}`, url, `${sha}:refs/heads/${branch}`];
+    const final = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
+    if (!final.ok) return final;
+    try {
+      const result = ports.gitPush ? ports.gitPush(temp, args) : git(temp, args);
+      const lines = result.stdout?.split('\n');
+      if (lines?.at(-1) === '') lines.pop();
+      const ref = lines?.[1]?.split('\t');
+      if (result.error || result.status !== 0 || lines?.length !== 3 || lines[0] !== `To ${url}`
+        || lines[2] !== 'Done' || ref?.length !== 3 || ref[0] !== ' '
+        || ref[1] !== `${sha}:refs/heads/${branch}` || !/^[a-f0-9]+\.\.[a-f0-9]+$/.test(ref[2]))
+        return fail('push-rejected', 'Push rejected; inspect remote and re-read authority before retrying');
+    } catch { return fail('push-rejected', 'Push failed; inspect remote before retrying'); }
+    const post = defaults(options.io);
+    try {
+      const entry = post.readClaim(repo, pr);
+      const refusal = claimRefusal(post, entry, options.holder);
+      if (refusal) return { ...fail('pushed-under-hold', refusal.reason), pushed: true };
+      if (post.branchClaimRefusal(repo, branch, options.holder))
+        return { ...fail('pushed-under-hold', 'Branch has a foreign claim; coordinate with its holder'), pushed: true };
+      const view = readView(post, repo, pr);
+      const reason = held(view) || (view.state !== 'OPEN' ? 'PR is not open'
+        : view.isDraft && !entry.meta?.draft ? 'PR drafted outside this claim'
+        : view.isCrossRepository ? 'Cross-repository PR'
+        : view.headRefOid !== sha ? 'Post-push PR head differs'
+        : view.headRefName !== branch ? 'Post-push PR branch differs' : null);
+      if (reason) return { ...fail('pushed-under-hold', reason), pushed: true };
+    } catch { return { ...fail('pushed-under-hold', 'Post-push evidence unreadable; block hand-back'), pushed: true }; }
+    return { ok: true, pushed: sha, purpose };
+  }); } catch { return fail('unreadable', 'Cannot read isolated push evidence; restore evidence before retrying'); }
 }

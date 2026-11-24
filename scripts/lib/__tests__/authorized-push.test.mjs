@@ -1,38 +1,39 @@
 /** @file Hermetic authorized-push refusals, live reads and lease boundary. */
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { authorizedPush, readPushAuthority } from '../authorized-push.mjs';
 import { PUSH_HOLD_LABELS } from '../review-hold-model.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
+import { resolveRealGhBinary } from '../gh-app-shim.mjs';
 
+vi.mock('../gh-app-shim.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, resolveRealGhBinary: vi.fn(actual.resolveRealGhBinary) };
+});
 vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...await importOriginal(), runGhSync: vi.fn() }));
 vi.mock('../../conveyor/fix-procedure.mjs', async importOriginal => ({ ...await importOriginal(), pushRefusal: vi.fn(() => null) }));
 afterEach(() => { vi.clearAllMocks(); pushRefusal.mockReturnValue(null); });
 const head = 'a'.repeat(40), sha = 'b'.repeat(40);
+const url = 'https://github.com/web-everything/web-everything.git';
+const pushed = () => ({ status: 0, stdout: `To ${url}\n \t${sha}:refs/heads/lane/fix\taaaa..bbbb\nDone\n` });
 const view = () => ({ labels: [], state: 'OPEN', isDraft: false, headRefOid: head,
   headRefName: 'lane/fix', isCrossRepository: false });
 function fixture() {
   const io = { readClaim: vi.fn(() => ({ meta: { sessionId: 'mine' } })),
     isClaimHolder: vi.fn((entry, holder) => entry.meta.sessionId === holder?.sessionId),
     ghPrView: vi.fn(() => ({ ...view(), headRefOid: (io.gitPush?.mock.calls.length || io.spawn?.mock.calls.some(([, args]) => args.includes('push'))) ? sha : head })), isAncestor: vi.fn(() => true),
-    branchClaimRefusal: vi.fn(() => null), readUrlRewrites: vi.fn(() => []),
-    readPushUrls: vi.fn(() => ['https://github.com/web-everything/web-everything.git']),
-    gitPush: vi.fn(() => ({ status: 0 })) };
+    branchClaimRefusal: vi.fn(() => null),
+    spawn: vi.fn((bin, args, opts) => args.includes('init') ? spawnSync(bin, args, opts)
+      : args.includes('rev-parse') ? { status: 0, stdout: '.git\n' } : pushed()),
+    gitPush: vi.fn(pushed) };
   return { repo: 'we', pr: 42, branch: 'lane/fix', expectedHead: head, sha, gitDir: 'checkout',
     holder: { sessionId: 'mine' }, purpose: 'repair', io };
 }
 const throws = () => { throw new Error('unreadable'); };
 describe('authorized push', () => {
-  it.each(['insteadof', 'pushinsteadof'])('refuses URL %s rewrites before pushing', key => {
-    const f = fixture(); f.io.readUrlRewrites.mockReturnValue([`url.https://other.example/.${key}`]);
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'destination-mismatch', reason: expect.stringMatching(/rewrite.*repair remote configuration/i) });
-    expect(f.io.gitPush).not.toHaveBeenCalled();
-  });
-  it('refuses unreadable URL rewrites', () => {
-    const f = fixture(); f.io.readUrlRewrites.mockImplementation(throws);
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'unreadable' });
-    expect(f.io.gitPush).not.toHaveBeenCalled();
-  });
   it.each(['initial', 'pre-push', 'post-push'])('refuses an unbound who-only claim at %s', phase => {
     const f = fixture(); f.io.isClaimHolder.mockReturnValue(true);
     const bound = { meta: { sessionId: 'mine' } }, unbound = { meta: { who: 'worker' } };
@@ -65,7 +66,7 @@ describe('authorized push', () => {
     ['head', { headRefOid: head }], ['branch', { headRefName: 'lane/other' }],
   ])('blocks hand-back if post-push %s differs', (_name, patch) => {
     const f = fixture(); f.io.ghPrView.mockReturnValueOnce(view())
-      .mockReturnValueOnce({ ...view(), headRefOid: sha, ...patch });
+      .mockReturnValueOnce(view()).mockReturnValueOnce({ ...view(), headRefOid: sha, ...patch });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'pushed-under-hold', pushed: true });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
   });
@@ -74,32 +75,11 @@ describe('authorized push', () => {
   ])('blocks hand-back when post-push claim is %s', (_name, entry) => {
     const f = fixture(); f.io.gitPush.mockImplementation(() => {
       f.io.readClaim.mockImplementation(typeof entry === 'function' ? entry : () => entry);
-      return { status: 0 };
+      return pushed();
     });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'pushed-under-hold', pushed: true });
     expect(f.io.readClaim).toHaveBeenCalledTimes(3);
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
-  });
-  it.each([
-    ['rewrite key', { status: 0, stdout: 'url.https://other.example/.insteadof https://github.com/\n' }, 'destination-mismatch'],
-    ['read error', { status: 2, stdout: '' }, 'unreadable'],
-    ['spawn error', { status: 1, stdout: '', error: new Error('failed') }, 'unreadable'],
-    ['missing output', { status: 0 }, 'unreadable'],
-    ['inconsistent absence', { status: 1, stdout: 'url.example.insteadof x' }, 'unreadable'],
-  ])('default rewrite reader refuses %s', (_name, result, code) => {
-    const f = fixture(); delete f.io.readUrlRewrites;
-    f.io.spawn = vi.fn(() => result);
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code });
-    expect(f.io.spawn).toHaveBeenCalledWith('git', ['-c', 'core.commitGraph=false', '-C', 'checkout',
-      'config', '--get-regexp', '^url\\..*\\.(insteadof|pushinsteadof)$'], expect.objectContaining({
-      env: expect.objectContaining({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }),
-    }));
-    expect(f.io.gitPush).not.toHaveBeenCalled();
-  });
-  it('default rewrite reader accepts no matching keys', () => {
-    const f = fixture(); delete f.io.readUrlRewrites;
-    f.io.spawn = vi.fn(() => ({ status: 1, stdout: '' }));
-    expect(authorizedPush(f)).toMatchObject({ ok: true, pushed: sha });
   });
   it('allows a token-bound sessionless holder', () => {
     const f = fixture(); f.io.readClaim.mockReturnValue({ meta: { who: 'worker', tokenHash: 'hash' } });
@@ -112,7 +92,7 @@ describe('authorized push', () => {
     f.holder = { sessionId: 'mine', who: 'worker', token: 'secret' };
     pushRefusal.mockReturnValue({ refused: true, pr: 99 });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'foreign-claim' });
-    expect(pushRefusal).toHaveBeenCalledWith({ repo: 'we', branch: 'lane/fix', ...f.holder });
+    expect(pushRefusal).toHaveBeenCalledWith({ repo: 'we', branch: 'lane/fix', ...f.holder, strict: true });
     expect(f.io.gitPush).not.toHaveBeenCalled();
   });
   it('pins exactly the four push hold labels', () => {
@@ -122,26 +102,17 @@ describe('authorized push', () => {
     ['released or expired', null, 'not-claim-holder'],
     ['reassigned', { meta: { sessionId: 'other' } }, 'not-claim-holder'],
     ['unreadable', throws, 'unreadable'],
-  ])('refuses a claim %s after destination validation', (_name, entry, code) => {
+  ])('refuses a claim %s at the final gate', (_name, entry, code) => {
     const f = fixture();
-    f.io.readPushUrls.mockImplementation(() => {
-      f.io.readClaim.mockImplementation(typeof entry === 'function' ? entry : () => entry);
-      return ['https://github.com/web-everything/web-everything.git'];
-    });
+    f.io.readClaim.mockReturnValueOnce({ meta: { sessionId: 'mine' } })
+      .mockImplementation(typeof entry === 'function' ? entry : () => entry);
     expect(authorizedPush(f)).toMatchObject({ ok: false, code });
     expect(f.io.readClaim).toHaveBeenCalledTimes(2);
     expect(f.io.gitPush).not.toHaveBeenCalled();
   });
   it('disables recursive submodule pushes', () => {
     const f = fixture(); authorizedPush(f);
-    expect(f.io.gitPush.mock.calls[0][1]).toContain('--recurse-submodules=no');
-  });
-  it('pushes to the validated URL despite subsequent remote configuration changes', () => {
-    const f = fixture(); const url = 'git@github.com:web-everything/web-everything.git';
-    f.io.readPushUrls.mockReturnValueOnce([url]).mockReturnValue(['git@github.com:another/repo.git']);
-    expect(authorizedPush(f).ok).toBe(true);
-    expect(f.io.gitPush.mock.calls[0][1]).toContain(url);
-    expect(f.io.gitPush.mock.calls[0][1]).not.toContain('origin');
+    expect(f.io.gitPush.mock.calls[0][1]).toContain('--no-recurse-submodules');
   });
   it.each([
     ['closed', { state: 'CLOSED' }, 'PR is not open'],
@@ -149,34 +120,82 @@ describe('authorized push', () => {
     ['drafted', { isDraft: true }, 'PR drafted outside this claim'],
     ['cross repo', { isCrossRepository: true }, 'Cross-repository PR'],
   ])('blocks hand-back when PR is %s after push', (_name, patch, reason) => {
-    const f = fixture(); f.io.ghPrView.mockReturnValueOnce(view()).mockReturnValueOnce({ ...view(), ...patch });
+    const f = fixture(); f.io.ghPrView.mockReturnValueOnce(view()).mockReturnValueOnce(view()).mockReturnValueOnce({ ...view(), ...patch });
     expect(authorizedPush(f)).toEqual({ ok: false, code: 'pushed-under-hold', pushed: true, reason });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
   });
-  it('default git calls ignore inherited grafts and repository context and disable commit graphs', () => {
-    const f = fixture(); delete f.io.isAncestor; delete f.io.readPushUrls; delete f.io.gitPush;
-    f.io.spawn = vi.fn(() => ({ status: 0, stdout: 'https://github.com/web-everything/web-everything.git\n' }));
-    const leaks = ['GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'];
+  it('default git calls allowlist the environment and disable commit graphs', () => {
+    const f = fixture(); delete f.io.isAncestor; delete f.io.gitPush;
+    const leaks = ['GIT_GRAFT_FILE', 'GIT_COMMON_DIR', 'GIT_NAMESPACE', 'GIT_CEILING_DIRECTORIES'];
     try {
-      vi.stubEnv('GIT_GRAFT_FILE', 'untrusted-grafts');
       for (const key of leaks) vi.stubEnv(key, 'untrusted');
       expect(authorizedPush(f).ok).toBe(true);
-      expect(f.io.spawn).toHaveBeenCalledTimes(3);
-      for (const [, args, opts] of f.io.spawn.mock.calls) {
-        expect(args.slice(0, 4)).toEqual(['-c', 'core.commitGraph=false', '-C', 'checkout']);
-        expect(opts.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null',
+      expect(f.io.spawn.mock.calls.filter(([, args]) => args.includes('merge-base'))).toHaveLength(1);
+      for (const [bin, args, opts] of f.io.spawn.mock.calls) {
+        expect(bin).toBe('/usr/bin/git');
+        expect(args).toContain('core.commitGraph=false');
+        expect(opts.env).toMatchObject({ GIT_NO_REPLACE_OBJECTS: '1',
           GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' });
         for (const key of leaks) expect(opts.env).not.toHaveProperty(key);
       }
     } finally { vi.unstubAllEnvs(); }
   });
+  it.each(['GH_TOKEN', 'GITHUB_TOKEN'])('credential helper receives token-only authentication via %s', key => {
+    const root = mkdtempSync(join(process.env.TMPDIR, 'push-token-auth-'));
+    try {
+      const config = join(root, 'empty-gh-config'), helper = join(root, 'gh');
+      mkdirSync(config);
+      // A local gh stand-in exercises Git's real helper invocation without network or stored credentials.
+      writeFileSync(helper, `#!/bin/sh
+[ "$1" = auth ] && [ "$2" = git-credential ] && [ "$3" = get ] || exit 1
+[ -n "\${GH_TOKEN:-$GITHUB_TOKEN}" ] || exit 1
+printf 'username=x-access-token\\npassword=%s\\n' "\${GH_TOKEN:-$GITHUB_TOKEN}"
+`, { mode: 0o700 });
+      vi.stubEnv('GH_TOKEN', ''); vi.stubEnv('GITHUB_TOKEN', '');
+      delete process.env.GH_TOKEN; delete process.env.GITHUB_TOKEN;
+      vi.stubEnv(key, 'fixture-token-only'); vi.stubEnv('GH_CONFIG_DIR', config);
+      vi.stubEnv('GIT_CONFIG_COUNT', '1'); vi.stubEnv('GIT_CONFIG_KEY_0', 'credential.helper');
+      vi.stubEnv('GIT_CONFIG_VALUE_0', '!false');
+      resolveRealGhBinary.mockReturnValueOnce(helper);
+      const f = fixture(), spawn = f.io.spawn; delete f.io.gitPush;
+      let credentials;
+      f.io.spawn = vi.fn((bin, args, opts) => {
+        if (!args.includes('push')) return spawn(bin, args, opts);
+        expect(opts.env.GIT_CONFIG_COUNT).toBeUndefined();
+        expect(opts.env[key === 'GH_TOKEN' ? 'GITHUB_TOKEN' : 'GH_TOKEN']).toBeUndefined();
+        credentials = spawnSync(bin, [...args.slice(0, args.indexOf('push')), 'credential', 'fill'], {
+          ...opts, input: 'protocol=https\nhost=github.com\n\n',
+        });
+        return pushed();
+      });
+      expect(authorizedPush(f)).toMatchObject({ ok: true, pushed: sha });
+      expect(credentials.status).toBe(0);
+      expect(credentials.stdout).toContain('password=fixture-token-only');
+    } finally { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('default transport overrides push.followTags=true to prevent publishing reachable tags', () => {
+    const f = fixture(); delete f.io.gitPush;
+    try {
+      vi.stubEnv('GIT_CONFIG_COUNT', '1'); vi.stubEnv('GIT_CONFIG_KEY_0', 'push.followTags');
+      vi.stubEnv('GIT_CONFIG_VALUE_0', 'true');
+      expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
+      const pushes = f.io.spawn.mock.calls.filter(([, args]) => args.includes('push'));
+      expect(pushes).toHaveLength(1);
+      const [, args, opts] = pushes[0];
+      expect(args).toContain('push.followTags=false');
+      expect(args).toContain('--no-follow-tags');
+      expect(args).toContain(url);
+      for (const key of ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'])
+        expect(opts.env).not.toHaveProperty(key);
+    } finally { vi.unstubAllEnvs(); }
+  });
   it('default PR reader pins the GitHub host in repo and child environment', () => {
     const f = fixture(); delete f.io.ghPrView;
-    runGhSync.mockReturnValueOnce(JSON.stringify(view())).mockReturnValue(JSON.stringify({ ...view(), headRefOid: sha }));
+    runGhSync.mockReturnValueOnce(JSON.stringify(view())).mockReturnValueOnce(JSON.stringify(view())).mockReturnValue(JSON.stringify({ ...view(), headRefOid: sha }));
     try {
       vi.stubEnv('GH_HOST', 'other.example');
       expect(authorizedPush(f).ok).toBe(true);
-      expect(runGhSync).toHaveBeenCalledTimes(2);
+      expect(runGhSync).toHaveBeenCalledTimes(3);
       for (const [args, opts] of runGhSync.mock.calls) {
         expect(args).toContain('github.com/web-everything/web-everything');
         expect(opts.env.GH_HOST).toBe('github.com');
@@ -234,67 +253,22 @@ describe('authorized push', () => {
     f.io.ghPrView.mockImplementation(() => ({ ...view(), isDraft: draft, headRefOid: f.io.gitPush.mock.calls.length ? sha : head }));
     expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
     expect(f.io.gitPush).toHaveBeenCalledTimes(1);
-    expect(f.io.gitPush).toHaveBeenCalledWith('checkout', ['push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
+    expect(f.io.gitPush).toHaveBeenCalledWith(expect.any(String), ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--no-recurse-submodules',
       `--force-with-lease=refs/heads/lane/fix:${head}`, 'https://github.com/web-everything/web-everything.git', `${sha}:refs/heads/lane/fix`]);
-    expect(f.io.ghPrView).toHaveBeenCalledTimes(2);
+    expect(f.io.ghPrView).toHaveBeenCalledTimes(3);
   });
   it('never retries a remote move during the leased push', () => {
     const f = fixture(); f.io.gitPush.mockReturnValue({ status: 1, stderr: 'stale info' });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'push-rejected' });
-    expect(f.io.gitPush).toHaveBeenCalledTimes(1); expect(f.io.ghPrView).toHaveBeenCalledTimes(1);
-  });
-  it('default transport overrides push.followTags=true to prevent publishing reachable tags', () => {
-    const f = fixture(); delete f.io.gitPush;
-    f.io.spawn = vi.fn(() => ({ status: 0 }));
-    try {
-      vi.stubEnv('GIT_CONFIG_COUNT', '1'); vi.stubEnv('GIT_CONFIG_KEY_0', 'push.followTags');
-      vi.stubEnv('GIT_CONFIG_VALUE_0', 'true');
-      expect(authorizedPush(f)).toEqual({ ok: true, pushed: sha, purpose: 'repair' });
-      expect(f.io.spawn).toHaveBeenCalledTimes(1);
-      const [bin, args, opts] = f.io.spawn.mock.calls[0];
-      expect(bin).toBe('git');
-      expect(args).toEqual(['-c', 'core.commitGraph=false', '-C', 'checkout', 'push', '--porcelain', '--no-follow-tags', '--recurse-submodules=no',
-        `--force-with-lease=refs/heads/lane/fix:${head}`, 'https://github.com/web-everything/web-everything.git', `${sha}:refs/heads/lane/fix`]);
-      expect(opts.env).toMatchObject({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'push.followTags', GIT_CONFIG_VALUE_0: 'true' });
-    } finally { vi.unstubAllEnvs(); }
-  });
-  it.each([
-    ['mismatched origin', ['https://github.com/another/repo.git']],
-    ['mismatched pushurl', ['git@github.com:another/repo.git']],
-    ['additional pushurl', ['https://github.com/web-everything/web-everything.git', 'git@github.com:another/repo.git']],
-    ['missing destination', []], ['malformed destination', ['not-a-url']],
-    ['unreadable shape', null], ['credentialed URL', ['https://user@github.com/web-everything/web-everything.git']],
-  ])('rejects %s with zero pushes', (_name, urls) => {
-    const f = fixture(); f.io.readPushUrls.mockReturnValue(urls);
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'destination-mismatch' });
-    expect(f.io.readPushUrls).toHaveBeenCalledWith('checkout'); expect(f.io.gitPush).toHaveBeenCalledTimes(0);
-  });
-  it('refuses unreadable origin push configuration with zero pushes', () => {
-    const f = fixture(); f.io.readPushUrls.mockImplementation(throws);
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'unreadable' });
-    expect(f.io.gitPush).toHaveBeenCalledTimes(0);
-  });
-  it('default destination reader checks effective pushurls and refuses a foreign pushurl', () => {
-    const f = fixture(); delete f.io.readPushUrls;
-    const spawn = f.io.spawn = vi.fn(() => ({ status: 0, stdout: 'git@github.com:another/repo.git\n' }));
-    expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'destination-mismatch' });
-    expect(spawn).toHaveBeenCalledTimes(1);
-    expect(spawn).toHaveBeenCalledWith('git', ['-c', 'core.commitGraph=false', '-C', 'checkout', 'remote', 'get-url', '--push', '--all', 'origin'],
-      expect.objectContaining({ timeout: 60_000, maxBuffer: 1024 * 1024 }));
-    expect(f.io.gitPush).toHaveBeenCalledTimes(0);
-  });
-  it.each(['git@github.com:web-everything/web-everything.git', 'ssh://git@github.com/web-everything/web-everything',
-    'https://github.com/web-everything/web-everything'])('accepts authorized destination %s', url => {
-    const f = fixture(); f.io.readPushUrls.mockReturnValue([url]);
-    expect(authorizedPush(f).ok).toBe(true); expect(f.io.gitPush).toHaveBeenCalledTimes(1);
+    expect(f.io.gitPush).toHaveBeenCalledTimes(1); expect(f.io.ghPrView).toHaveBeenCalledTimes(2);
   });
   it.each(['hold', 'unreadable'])('blocks hand-back after post-push %s', mode => {
-    const f = fixture(); f.io.ghPrView.mockImplementationOnce(view).mockImplementationOnce(() => {
+    const f = fixture(); f.io.ghPrView.mockImplementationOnce(view).mockImplementationOnce(view).mockImplementationOnce(() => {
       if (mode === 'unreadable') throws();
       return { ...view(), labels: [{ name: 'red-team:pending' }] };
     });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'pushed-under-hold', pushed: true });
-    expect(f.io.gitPush).toHaveBeenCalledTimes(1); expect(f.io.ghPrView).toHaveBeenCalledTimes(2);
+    expect(f.io.gitPush).toHaveBeenCalledTimes(1); expect(f.io.ghPrView).toHaveBeenCalledTimes(3);
   });
   it('read-only authority checks ancestry without pushing', () => {
     const f = fixture(); expect(readPushAuthority(f)).toEqual({ ok: true, purpose: 'repair' });

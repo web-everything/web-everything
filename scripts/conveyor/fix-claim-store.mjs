@@ -101,3 +101,23 @@ export function listFixDispatchClaims(lockRoot = fixDispatchClaimRoot(), {
   }
   return out;
 }
+
+/** Fail closed on incomplete claim evidence; confirm concurrent directory removal. */
+export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
+  const entries = [];
+  let names, unreadable = false;
+  try { names = readdirSync(lockRoot); } catch { return { entries, unreadable: true }; }
+  for (const name of names) {
+    try {
+      const entry = parseLockEntry(readFileSync(join(lockRoot, name, 'lock.json'), 'utf8'));
+      if (!entry?.meta?.repo || !entry.meta.pr || !entry.meta.kind) unreadable = true;
+      else entries.push(entry);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        try { if (!readdirSync(lockRoot).includes(name)) continue; } catch { /* unreadable root */ }
+      }
+      unreadable = true;
+    }
+  }
+  return { entries, unreadable };
+}
