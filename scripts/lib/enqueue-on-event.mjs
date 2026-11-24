@@ -763,11 +763,31 @@ const KNOWN_ERROR_SHAPE = /^(?:\w*Error\b|error:|npm ERR!|ERR!|ERR_\w+|FAIL\b|fa
 const UNCLASSIFIED_STDERR = '[unclassified stderr; see local log]';
 const SECRET_LINE =/gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert|session/i;
-// Env-style KEY=value / KEY: value whose key names a secret, and JWT-shaped tokens.
-const SECRET_ASSIGNMENT = /\b[\w.-]*(?:session|token|secret|key|pass|auth)[\w.-]*\s*[=:]\s*\S|\beyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]*/i;
+const SECRET_ASSIGNMENT_KEY = /session|token|secret|key|pass|auth/i;
 // Allowlist: only printable ASCII survives; every other code point (controls, separators, bidi/zero-width marks) becomes a space.
 const UNSAFE_LOG_CHARS = /[^\x20-\x7e]/g;
 const URL_USERINFO =/:\/\/[^/\s]*@/;
+
+/** Scan each key/token once: overlapping wildcard regexes can stall on long untrusted stderr. */
+function hasSecretAssignmentOrJwt(line) {
+  for (const match of line.matchAll(/[\w.-]+/g)) {
+    const parts = match[0].split('.');
+    if (parts.some((part, index) => {
+      const prefix = part.search(/\beyJ/i);
+      return prefix >= 0 && part.length - prefix >= 8 && index + 2 < parts.length
+        && /^[\w-]{5,}$/.test(parts[index + 1]);
+    })) return true;
+    if (!SECRET_ASSIGNMENT_KEY.test(match[0])) continue;
+    let index = match.index + match[0].length;
+    // The caller has already converted all non-printable characters to ASCII spaces.
+    while (line[index] === ' ') index += 1;
+    if (line[index] !== '=' && line[index] !== ':') continue;
+    index += 1;
+    while (line[index] === ' ') index += 1;
+    if (index < line.length) return true;
+  }
+  return false;
+}
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
  * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
@@ -781,7 +801,7 @@ export function firstStderrErrorLine(stderr, env = {}) {
   if (!line) return '';
   // After skipping warning noise the picked line is not the formerly protected first line: allowlist known error shapes only.
   if (lines[0] !== line && !KNOWN_ERROR_SHAPE.test(line)) return UNCLASSIFIED_STDERR;
-  if (SECRET_LINE.test(line) || SECRET_ASSIGNMENT.test(line) || URL_USERINFO.test(line)) return '[redacted]';
+  if (SECRET_LINE.test(line) || hasSecretAssignmentOrJwt(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
   for (const [k, v] of Object.entries(env ?? {})) {
     if (!SECRET_ENV_KEY.test(k) || typeof v !== 'string') continue;

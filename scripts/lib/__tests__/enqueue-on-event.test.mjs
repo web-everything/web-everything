@@ -487,6 +487,28 @@ describe('createEnqueueOnEvent', () => {
     expect(enqueueModule.firstStderrErrorLine('jwt eyJhbGciOi.eyJzdWIiOi.sig123')).toBe('[redacted]');
   });
 
+  it('firstStderrErrorLine scans long assignment and JWT near-misses without blocking', () => {
+    const moduleUrl = new URL('../enqueue-on-event.mjs', import.meta.url).href;
+    const script = `import { firstStderrErrorLine } from ${JSON.stringify(moduleUrl)};
+      const assignment = 'session'.repeat(100000);
+      const jwt = 'eyJabcde-'.repeat(100000);
+      if (firstStderrErrorLine(assignment) !== assignment.slice(0, 200) + '...') throw new Error('assignment changed');
+      if (firstStderrErrorLine(jwt) !== jwt.slice(0, 200) + '...') throw new Error('JWT changed');`;
+    expect(() => execFileSync(process.execPath, ['--input-type=module', '--eval', script],
+      { timeout: 5000, maxBuffer: 64 * 1024, stdio: 'pipe' })).not.toThrow();
+  });
+
+  it('firstStderrErrorLine preserves assignment and JWT redaction boundaries', () => {
+    expect(enqueueModule.firstStderrErrorLine('MY_SESSION.id-1 : value')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('session =   ')).toBe('session =');
+    expect(enqueueModule.firstStderrErrorLine('session! = value')).toBe('session! = value');
+    expect(enqueueModule.firstStderrErrorLine('jwt prefix-eyJabcde.abcde.')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt xeyJabcde.abcde.')).toBe('jwt xeyJabcde.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcd.abcde.')).toBe('jwt eyJabcd.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcd.')).toBe('jwt eyJabcde.abcd.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcde')).toBe('jwt eyJabcde.abcde');
+  });
+
   it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {
     expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
     expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
