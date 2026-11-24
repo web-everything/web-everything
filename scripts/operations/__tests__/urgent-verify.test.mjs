@@ -931,6 +931,13 @@ describe('urgent-verify signing isolation', () => {
     expect(existsSync(marker)).toBe(expectedExit === 0);
     if (expectedExit === 126) expect(r.stderr).toMatch(/require-admission refused.*timed out.*NOT run/);
   });
+  it('runs the checkout steps under the runner\'s own admission wrapper when given a wrapperRoot', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    const d = createUrgentDeps({ cwd: '/checkout', wrapperRoot: '/runner', env: { PATH: '/bin' }, spawnSync });
+    d.standards();
+    expect(spawnSync.mock.calls[0][1][0]).toBe('/runner/scripts/readiness/heavy-admission.mjs');
+    expect(spawnSync.mock.calls[0][2].cwd).toBe('/checkout');
+  });
   it('hides the host lane pool from the command admission runs, and still lets a real failure fail', async () => {
     const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-strip-')));
     tempParents.push(root);
