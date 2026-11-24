@@ -10,9 +10,63 @@ import { ciUnitPlan, ciGatePlan, urgentLedger, urgentKeyPath, urgentSignature, n
 const worktreePrefix = '.urgent-verify-';
 const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
+// spawnSync blocks JS signal handlers. Keep a responsive supervisor in the caller's
+// terminal group, owning the detached command group and its deadline even if the
+// verifier exits. This function is serialized into a standalone Node process.
+function superviseCommand({ cmd, args, expires, parent }) {
+  const { spawn } = require('node:child_process');
+  const { writeFileSync } = require('node:fs');
+  let child, timer, parentWatch, finished = false;
+  const killGroup = () => {
+    if (Number.isInteger(child?.pid) && child.pid > 1) {
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  };
+  const finish = (result) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    clearInterval(parentWatch);
+    // Only the supervisor has fd 3; command output cannot forge its result.
+    try { writeFileSync(3, JSON.stringify({ pid: child?.pid, ...result })); }
+    finally { process.exit(0); }
+  };
+  const cancel = () => { killGroup(); finish({ status: null, signal: 'SIGTERM' }); };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, cancel);
+  // Also handle cancellation directed only at the verifier's pid, and abrupt exit.
+  parentWatch = setInterval(() => { if (process.ppid !== parent) cancel(); }, 100);
+  if (process.ppid !== parent) return cancel();
+  const expire = () => {
+    killGroup();
+    finish({ status: null, error: { code: 'ETIMEDOUT', message: 'urgent-verify subprocess deadline expired' } });
+  };
+  if (Date.now() >= expires) return expire();
+  timer = setTimeout(expire, expires - Date.now());
+  child = spawn(cmd, args, { detached: true, stdio: ['ignore', 1, 2] });
+  child.on('error', error => { killGroup(); finish({ status: null, error: { code: error.code, message: error.message } }); });
+  // A command may exit while descendants still hold its inherited output pipes.
+  // Finish the owned group before dropping the watchdog or spawnSync can hang.
+  child.on('exit', (status, signal) => { killGroup(); finish({ status, signal }); });
+}
+
+function supervisedSpawnSync(cmd, args, options) {
+  const config = { cmd, args, expires: Date.now() + options.timeout, parent: process.pid };
+  const result = realSpawn(process.execPath, ['--input-type=commonjs', '-e', `(${superviseCommand.toString()})(${JSON.stringify(config)})`], {
+    ...options, detached: false, stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
+    // TERM lets the supervisor clean its group on an outer timeout or buffer error.
+    // Its own deadline expires first; the extra second bounds cleanup overhead.
+    timeout: options.timeout + 1000, killSignal: 'SIGTERM',
+  });
+  let owned;
+  try { owned = JSON.parse(String(result.output?.[3])); } catch { /* fail closed below */ }
+  const error = result.error ?? (owned?.error ? Object.assign(new Error(owned.error.message), owned.error) : undefined);
+  return { ...result, ...owned, pid: owned?.pid, status: result.error ? null : (owned?.status ?? null),
+    error: error ?? (!owned ? new Error('urgent-verify supervisor exited without a result') : undefined) };
+}
+
 // `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
 // `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
-export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
+export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = supervisedSpawnSync, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
   // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 40).
   // Scoped (worktree) deps inherit the parent's deadline so the limit covers the run, not each child.
   const limitMin = Math.min(240, Math.max(0.01, Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 40));

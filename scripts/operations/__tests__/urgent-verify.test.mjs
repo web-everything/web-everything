@@ -1001,6 +1001,87 @@ describe('urgent-verify wall-clock limit', () => {
 });
 
 describe('urgent-verify real process-tree expiry', () => {
+  it.each([['SIGINT', true], ['SIGTERM', false], ['SIGHUP', true]])('cleans up its verification group on %s cancellation (group=%s)', async (signal, group) => {
+    const { spawn } = await import('node:child_process');
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-cancel-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'verification.json');
+    // Anchor fixtures to the test runner so cancellation cannot masquerade as cleanup.
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 20_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, g.pid]));
+      ${sleeper}`);
+    const source = `import { createUrgentDeps } from ${JSON.stringify(pathToFileURL(pjoin(process.cwd(), 'scripts/operations/urgent-verify.mjs')).href)};
+      createUrgentDeps({ cwd: ${JSON.stringify(dir)}, env: { PATH: process.env.PATH, HOME: ${JSON.stringify(dir)} } }).standards();`;
+    const unrelated = spawn(process.execPath, ['-e', sleeper], { stdio: 'ignore' });
+    const runner = spawn(process.execPath, ['--input-type=module', '-e', source], { detached: true, stdio: 'ignore' });
+    const exited = new Promise(resolve => runner.once('exit', (code, sig) => resolve({ code, sig })));
+    let pids = [];
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 5000 });
+      pids = JSON.parse(readFileSync(pidFile, 'utf8'));
+      process.kill(group ? -runner.pid : runner.pid, signal);
+      await vi.waitFor(() => expect(runner.exitCode !== null || runner.signalCode !== null).toBe(true), { timeout: 3000 });
+      expect(await exited).toMatchObject({ sig: signal });
+      await vi.waitFor(() => expect(pids.map(alive)).toEqual([false, false]), { timeout: 3000 });
+      expect(alive(unrelated.pid)).toBe(true);
+    } finally {
+      try { process.kill(-runner.pid, 'SIGTERM'); } catch { /* exited */ }
+      if (pids[0]) { try { process.kill(-pids[0], 'SIGKILL'); } catch { /* exited */ } }
+      unrelated.kill('SIGTERM');
+      await exited;
+    }
+  }, 15000);
+  it.each([0, 7])('preserves output and exit %s while cleaning descendants holding output pipes', async status => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-supervisor-result-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'descendant.pid');
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 15_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'inherit' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+      process.stdout.write('output ✓'); process.stderr.write('diagnostic ✓'); process.exit(${status});`);
+    const deps = createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 });
+    try {
+      if (status === 0) expect(deps.standards()).toBe('output ✓');
+      else expect(() => deps.standards()).toThrow(expect.objectContaining({
+        stdout: 'output ✓', failure: expect.objectContaining({ exit: status, stderrTail: 'diagnostic ✓' }),
+      }));
+      const gpid = Number(readFileSync(pidFile, 'utf8'));
+      await vi.waitFor(() => expect(() => process.kill(gpid, 0)).toThrow(), { timeout: 3000 });
+    } finally {
+      if (existsSync(pidFile)) { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* gone */ } }
+    }
+  });
+  it('cleans the owned group when captured output exceeds maxBuffer', async () => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-supervisor-buffer-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'verification.json');
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 15_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, g.pid]));
+      process.stdout.write('x'.repeat(17 * 1024 * 1024)); ${sleeper}`);
+    try {
+      expect(() => createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 }).standards())
+        .toThrow(/ENOBUFS/);
+      const pids = JSON.parse(readFileSync(pidFile, 'utf8'));
+      await vi.waitFor(() => pids.forEach(pid => expect(() => process.kill(pid, 0)).toThrow()), { timeout: 3000 });
+    } finally {
+      if (existsSync(pidFile)) {
+        const [pid] = JSON.parse(readFileSync(pidFile, 'utf8'));
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+    }
+  });
   it('SIGKILLs a TERM-trapping child and its grandchild, and refuses later commands', async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
