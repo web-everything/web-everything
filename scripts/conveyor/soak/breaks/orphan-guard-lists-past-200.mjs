@@ -3,13 +3,14 @@
  * `gh pr list --limit 200` and never paged, so a `review:changes` PR beyond the 200 newest was never seen and
  * never re-armed.
  *
- * Fix: `defaultListBounced` pages the open-PR list (newest first, 100 per page, capped at 5 pages per
- * pass) so a bounced PR at position 201 is returned. Every pass starts at page one.
+ * Fix: `defaultListBounced` pages the open-PR list (newest first, 100 per page, capped at 5 data pages
+ * plus one lookahead per pass) so a bounced PR at position 201 is returned. Every pass starts at page one.
  *
  * SCENARIO: a fake `gh` returning 3 pages (100, 100, 1 PR); the lone PR on page 3 (position 201) carries
  * `review:changes`. Pre-fix the single capped call never reaches it.
  * Also replay a page-2 HTTP 503 hiding a capped orphan: the pass must report a repo-level error, then
  * escalate that orphan after a complete retry, without another redispatch.
+ * Boundary replay: exactly 500 open PRs is complete after an empty lookahead page; 501 must hold fixes.
  */
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -90,6 +91,32 @@ export default {
       violations.push({ invariant: 'capped-orphan-escalated', detail: `complete retry must escalate the oldest orphan, got ${JSON.stringify(effects)}` });
     }
     log?.(`page-2 failure: errors=${failed.rows.filter(row => row.decision === 'error').length}; retry effects=${effects.join(',')}`);
+    for (const count of [499, 500, 501]) {
+      const boundaryPrs = Array.from({ length: count }, (_, i) => pr(count - i, i === 0));
+      let boundaryCalls = 0;
+      let commentReads = 0;
+      effects.length = 0;
+      const boundary = await runOrphanFixRoundPass({ ...options,
+        readComments: async () => { commentReads++; return comments; },
+        listBounced: repo => defaultListBounced(repo, { exec: (_cmd, args) => {
+          boundaryCalls++;
+          const page = Number(/[&?]page=(\d+)/.exec(String(args[1]))?.[1] ?? 1);
+          return JSON.stringify(boundaryPrs.slice((page - 1) * 100, page * 100));
+        } }),
+      });
+      const errors = boundary.rows.filter(row => row.pr == null && row.decision === 'error').length;
+      if (count <= 500) {
+        if (errors || commentReads !== 1 || effects.join(',') !== `escalate:${count}` || boundary.rows[0]?.result !== 'escalated') {
+          violations.push({ invariant: 'complete-boundary-processed', detail: `${count} PRs: errors=${errors}, commentReads=${commentReads}, effects=${effects.join(',')}` });
+        }
+      } else if (errors !== 1 || commentReads || effects.length) {
+        violations.push({ invariant: 'overflow-boundary-held', detail: `${count} PRs: incomplete listing must hold fixes without reading comments or acting` });
+      }
+      if (boundaryCalls !== (count < 500 ? 5 : 6)) {
+        violations.push({ invariant: 'bounded-lookahead', detail: `${count} PRs: expected ${count < 500 ? 5 : 6} calls, got ${boundaryCalls}` });
+      }
+      log?.(`boundary ${count}: calls=${boundaryCalls} errors=${errors} commentReads=${commentReads} effects=${effects.join(',')}`);
+    }
     return { violations, got };
   },
   judge(report) {

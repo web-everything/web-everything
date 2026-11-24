@@ -188,7 +188,8 @@ const MAX_PAGES = 5;
 export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Infinity } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
   const perPage = 100, bounced = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
+  // A full last page does not prove overflow: allow one bounded, deadline-checked lookahead.
+  for (let page = 1; page <= MAX_PAGES + 1; page++) {
     if (page > 1 && Date.now() >= deadlineAt) {
       const reason = 'orphan-guard: listing deadline reached; older PRs not scanned this pass';
       console.error(reason);
@@ -197,6 +198,11 @@ export function defaultListBounced(slug, { exec = execFileSync, deadlineAt = Inf
     // Partial discovery cannot certify the repo: let the pass emit a repo-level error so the daemon holds fixes.
     const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=desc&per_page=${perPage}&page=${page}`], ghOpts());
     const prs = JSON.parse(String(out));
+    if (!Array.isArray(prs)) throw new Error('orphan-guard: invalid pulls listing (expected an array)');
+    if (page > MAX_PAGES) {
+      if (prs.length === 0) return bounced;
+      break; // Nonempty lookahead proves the 500-PR listing is incomplete; do not process it.
+    }
     bounced.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
       number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
     })));
