@@ -7,7 +7,8 @@ const unknown = (reason) => ({ status: 'unknown', reason });
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = (value) => typeof value === 'string' && value.length > 0;
 
-export function evaluateMergeGatePin(rulesJson) {
+export function evaluateMergeGatePin(rulesJson, expectedRepositoryId) {
+  if (!Number.isFinite(expectedRepositoryId)) return unknown('Repository ID unavailable; verify API access and retry.');
   if (!Array.isArray(rulesJson)) return unknown('Expected a branch-rules array; inspect the ruleset response.');
   let pinned = false;
   for (const rule of rulesJson) {
@@ -17,7 +18,8 @@ export function evaluateMergeGatePin(rulesJson) {
     if (!object(rule.parameters) || !Array.isArray(entries)) return unknown('Malformed workflows rule; inspect the ruleset response.');
     for (const entry of entries) {
       if (!object(entry) || !text(entry.path) || !text(entry.ref)) return unknown('Malformed workflow entry; inspect the ruleset response.');
-      if (entry.path.endsWith('.github/workflows/merge-gate.yml') && entry.ref === 'refs/heads/main') pinned = true;
+      if (entry.path === '.github/workflows/merge-gate.yml' && entry.ref === 'refs/heads/main'
+        && entry.repository_id === expectedRepositoryId) pinned = true;
     }
   }
   return pinned
@@ -27,7 +29,9 @@ export function evaluateMergeGatePin(rulesJson) {
 
 export async function probeMergeGatePin({ ghApi, repo }) {
   try {
-    return evaluateMergeGatePin(JSON.parse(await ghApi(`repos/${repo}/rules/branches/main`)));
+    const repositoryId = JSON.parse(await ghApi(`repos/${repo}`))?.id;
+    if (!Number.isFinite(repositoryId)) return unknown('Repository ID unavailable; verify API access and retry.');
+    return evaluateMergeGatePin(JSON.parse(await ghApi(`repos/${repo}/rules/branches/main`)), repositoryId);
   } catch {
     return unknown('Ruleset response unavailable or unreadable; verify API access and retry.');
   }
@@ -41,8 +45,10 @@ export function mergeGatePinFails(result) {
 export async function main({ argv = process.argv.slice(2), env = process.env, exec = execFileSync } = {}) {
   const options = { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 };
   try {
-    let repo = argv[0] === '--repo' ? argv[1] : argv[0]?.replace(/^--repo=/, '');
-    repo ||= env.GH_REPO || JSON.parse(exec('gh', ['repo', 'view', '--json', 'nameWithOwner'], options)).nameWithOwner;
+    const repoFlag = argv.findIndex((arg) => arg === '--repo' || arg.startsWith('--repo='));
+    let repo = repoFlag < 0 ? argv[0]
+      : argv[repoFlag] === '--repo' ? argv[repoFlag + 1] : argv[repoFlag].slice('--repo='.length);
+    if (repoFlag < 0) repo ||= env.GH_REPO || JSON.parse(exec('gh', ['repo', 'view', '--json', 'nameWithOwner'], options)).nameWithOwner;
     if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) return unknown('Repository unavailable; pass --repo=owner/name.');
     return await probeMergeGatePin({ repo, ghApi: (endpoint) => exec('gh', ['api', endpoint], options) });
   } catch {
