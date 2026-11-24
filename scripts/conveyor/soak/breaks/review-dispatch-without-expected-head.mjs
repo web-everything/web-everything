@@ -9,7 +9,7 @@
  *   C. the review daemon's tick must hand `expectedHead` (the planned head) to its dispatcher.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,10 +56,12 @@ export default {
     where: 'lane/review-head-evidence',
     paths: ['scripts/operations/review-job.mjs', 'skills-src/conveyor/review-daemon.mjs', 'scripts/lib/review-red-team-on-skip.mjs'],
   },
-  // Decided by the export existing, not by running the dispatch under test.
+  // Decided by git ancestry of the fix commit (a removable export marker would let a regression hide itself).
   fixPresent(root) {
-    const p = join(root, 'scripts/operations/review-job.mjs');
-    return existsSync(p) && /export const NO_EXPECTED_HEAD_OUTCOME\b/.test(readFileSync(p, 'utf8'));
+    try {
+      execFileSync('git', ['-C', root, 'merge-base', '--is-ancestor', 'fcc398bb1c', 'HEAD'], { stdio: 'ignore' });
+      return true;
+    } catch { return false; }
   },
   async run({ log, sourceRoot = REPO_ROOT } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-review-head-'));
