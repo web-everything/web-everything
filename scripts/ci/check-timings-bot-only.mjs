@@ -45,21 +45,27 @@ function main() {
     // API, three-dot), not the PR files list, which includes bot refreshes that landed in main after a stale base.
     const baseRef = execFileSync('gh', ['api', `repos/${REPO}/pulls/${PR_NUMBER}`, '--jq', '.base.ref'], {
       encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
-    }).trim();
-    if (!/^[\w./-]+$/.test(baseRef)) throw new Error('Unreadable PR base ref');
-    // Renames carry previous_filename; NUL separation keeps names literal. A failed or empty compare throws (fails closed).
-    const out = execFileSync('gh', ['api', `repos/${REPO}/compare/${baseRef}...${HEAD_SHA}`, '--paginate',
-      '--jq', '.files[] | (.filename, (.previous_filename // empty)) + "\\u0000"'], {
+    }).replace(/\r?\n$/, '');
+    if (!baseRef) throw new Error('Unreadable PR base ref');
+    // Encode the whole ref as one URL component, preserving valid punctuation and Unicode.
+    // Files are returned on the first compare page only; retain entries to count before expanding renames.
+    const out = execFileSync('gh', ['api', `repos/${REPO}/compare/${encodeURIComponent(baseRef)}...${HEAD_SHA}`,
+      '--jq', '.files'], {
       encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const changedFiles = out.split('\0').map(s => s.replace(/^\n/, '')).filter(Boolean);
-    // A PR always changes something: empty output is not evidence.
-    if (changedFiles.length === 0) throw new Error('Empty compare answer');
+    const files = JSON.parse(out);
+    // A PR always changes something: empty, missing or malformed entries are not evidence.
+    if (!Array.isArray(files) || files.length === 0 || !files.every(file => file &&
+      typeof file.filename === 'string' && file.filename.length > 0 &&
+      (file.previous_filename == null || (typeof file.previous_filename === 'string' && file.previous_filename.length > 0)))) {
+      throw new Error('Unreadable compare answer');
+    }
     // The compare API truncates its file list at 300: past that the list is not complete evidence.
-    if (changedFiles.length >= COMPARE_FILE_CAP) {
+    if (files.length >= COMPARE_FILE_CAP) {
       console.error(`Cannot verify ${FILE}: the PR changes over ${COMPARE_FILE_CAP} files, more than the compare API can prove; split the PR. Only ${OWNER} owns it.`);
       return 1;
     }
+    const changedFiles = files.flatMap(file => file.previous_filename == null ? [file.filename] : [file.filename, file.previous_filename]);
     const result = checkTimingsBotOnly({ changedFiles, headRef: HEAD_REF, author: AUTHOR, headRepo: HEAD_REPO, repo: REPO });
     process[result.ok ? 'stdout' : 'stderr'].write(`${result.message}\n`);
     return result.ok ? 0 : 1;

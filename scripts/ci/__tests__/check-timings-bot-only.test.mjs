@@ -43,7 +43,7 @@ describe('bot-owned timings', () => {
   it('CLI reads the file list from the API and rejects a non-bot edit', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      writeFileSync(join(dir, 'gh'), `#!${process.execPath}\nconst a = process.argv.join(' ');\nprocess.stdout.write(a.includes('.head.sha') ? '${SHA}\\n' : a.includes('.base.ref') ? 'main\\n' : 'a.txt\\0\\n${file}\\0\\n');\n`, { mode: 0o755 });
+      fakeGh(dir, { compare: [{ filename: 'a.txt' }, { filename: file }] });
       const env = { GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_SHA: SHA, HEAD_REPO: 'o/r', PATH: `${dir}:${process.env.PATH}` };
       expect(cli({ ...env, HEAD_REF: 'lane/test', AUTHOR: 'developer' }).status).toBe(1);
       // The bot branch name alone is not enough: a human author or a fork is refused.
@@ -56,52 +56,124 @@ describe('bot-owned timings', () => {
   });
   // Fake gh: the pulls/files answer is stale (carries a bot refresh already in main); the compare answer is the merge-base diff.
   const MB = 'c'.repeat(40);
-  const fakeGh = (dir, { compare, pullFiles = `a.txt\\0\\n${file}\\0\\n`, compareFails = false, blobs = ['x', 'x'] }) => writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+  const fakeGh = (dir, { compare, compareOutput, baseRef = 'main', pullFiles = `a.txt\\0\\n${file}\\0\\n`, compareFails = false, blobs = ['x', 'x'] }) => writeFileSync(join(dir, 'gh'), `#!${process.execPath}
 const a = process.argv.join(' ');
 if (a.includes('.head.sha')) process.stdout.write('${SHA}\\n');
-else if (a.includes('.base.ref')) process.stdout.write('main\\n');
+else if (a.includes('.base.ref')) process.stdout.write(${JSON.stringify(baseRef + '\n')});
 else if (a.includes('.merge_base_commit.sha')) process.stdout.write('${MB}\\n');
 else if (a.includes('/contents/')) process.stdout.write(a.includes('ref=${MB}') ? '${blobs[0]}\\n' : '${blobs[1]}\\n');
-else if (a.includes('/compare/')) { ${compareFails ? 'process.exit(1);' : `process.stdout.write('${compare}');`} }
+else if (a.includes('/compare/')) {
+  if (process.argv[3] !== ${JSON.stringify(`repos/o/r/compare/${encodeURIComponent(baseRef)}...${SHA}`)}) process.exit(2);
+  ${compareFails ? 'process.exit(1);' : compareOutput !== undefined ? `process.stdout.write(${JSON.stringify(compareOutput)});` : `
+  const files = ${JSON.stringify(compare)};
+  process.stdout.write(process.argv.includes('.files') ? JSON.stringify(files) : files.flatMap(f => [f.filename, f.previous_filename].filter(Boolean)).map(f => f + '\\0\\n').join(''));
+  `}
+}
 else process.stdout.write('${pullFiles}');
 `, { mode: 0o755 });
   const stale = { GITHUB_EVENT_NAME: 'pull_request', REPO: 'o/r', PR_NUMBER: '1', HEAD_SHA: SHA, HEAD_REPO: 'o/r', HEAD_REF: 'lane/test', AUTHOR: 'developer' };
   it('ignores a timings change that is only in main since the PR base (stale base after a bot refresh)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      fakeGh(dir, { compare: 'a.txt\\0\\n' });
+      fakeGh(dir, { compare: [{ filename: 'a.txt' }] });
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('still rejects a PR that itself edits the timings file (merge-base diff)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      fakeGh(dir, { compare: `a.txt\\0\\n${file}\\0\\n`, pullFiles: 'a.txt\\0\\n' });
+      fakeGh(dir, { compare: [{ filename: 'a.txt' }, { filename: file }], pullFiles: 'a.txt\\0\\n' });
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed when the merge-base compare is unavailable', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      fakeGh(dir, { compare: '', compareFails: true, pullFiles: 'a.txt\\0\\n' });
+      fakeGh(dir, { compare: [], compareFails: true, pullFiles: 'a.txt\\0\\n' });
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed on an empty compare answer', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
     try {
-      fakeGh(dir, { compare: '' });
+      fakeGh(dir, { compare: [] });
       expect(cli({ ...stale, PATH: `${dir}:${process.env.PATH}` }).status).toBe(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['', '{', 'null', '{}', '[null]', '[{}]', '[{"filename":42}]', '[{"filename":""}]', '[{"filename":"a.txt","previous_filename":42}]'])('fails closed on unreadable compare JSON %j', compareOutput => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compareOutput });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Cannot verify');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed on a truncated 300-file compare and says to split the PR', () => {
     const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
-    const many = Array.from({ length: 300 }, (_, i) => `f${i}.txt\\0\\n`).join('');
+    const many = Array.from({ length: 300 }, (_, i) => ({ filename: `f${i}.txt` }));
     try {
       fakeGh(dir, { compare: many });
       const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
       expect(result.status).toBe(1);
       expect(result.stderr).toMatch(/over 300 files.*split the PR/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([150, 299])('permits a complete compare of %i unrelated renamed files', count => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: Array.from({ length: count }, (_, i) => ({ filename: `new/f${i}.txt`, previous_filename: `old/f${i}.txt` })) });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed at 300 API entries even when every entry is a rename', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: Array.from({ length: 300 }, (_, i) => ({ filename: `new/f${i}.txt`, previous_filename: `old/f${i}.txt` })) });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(/over 300 files.*split the PR/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    { filename: 'renamed.json', previous_filename: file },
+    { filename: file, previous_filename: 'original.json' },
+  ])('rejects renames involving the timings path: %j', entry => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: [entry] });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('The weekly bot owns');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['lane/feature+fix', 'lane/hash#percent%', "lane/quote'backtick`", 'lane/café', 'lane/--name', 'lane/trailing\u2028'])('compares the encoded base ref %s', baseRef => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { baseRef, compare: [{ filename: 'a.txt' }] });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed on a missing base ref', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { baseRef: '', compare: [{ filename: 'a.txt' }] });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Cannot verify');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('preserves literal filenames containing newlines and Unicode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'timings-gh-'));
+    try {
+      fakeGh(dir, { compare: [{ filename: `\n${file}`, previous_filename: 'old/é\nname.txt' }] });
+      const result = cli({ ...stale, PATH: `${dir}:${process.env.PATH}` });
+      expect(result.stderr).toBe('');
+      expect(result.status).toBe(0);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails closed at the API file cap', () => {
