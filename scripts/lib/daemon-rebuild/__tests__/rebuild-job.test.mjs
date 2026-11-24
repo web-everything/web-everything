@@ -928,3 +928,61 @@ it.each([
   if (inFlight) expect(adopt).not.toHaveBeenCalled();
   if (expected === 'rebuild-job-started') expect(log.error).toHaveBeenCalledWith('daemon-rebuild-job: urgent launch — spacing bypassed');
 });
+
+
+it.each([false, true])('real rebuildClone forwards urgent=%s to job admission', async urgent => {
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir, { recursive: true });
+  const now = Date.now();
+  const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: now - 1000 });
+  store.update(old.id, r => markSucceeded(r, { at: new Date(now - 100).toISOString() }));
+  const actualJob = rebuildJob.rebuildCloneAsJob;
+  vi.spyOn(rebuildJob, 'rebuildCloneAsJob').mockImplementation(options => actualJob({ ...options,
+    store, adopt: async () => ({ reason: 'needs-build', plan: { finalSha: 'b'.repeat(40) } }),
+    now: () => now, codeSha: 'a'.repeat(40), reattach: async () => {}, evict() {},
+    settings: { minIntervalMs: 900000, minIntervalJitterPct: 0 } }));
+  const result = await rebuildClone({ root, env: { WE_DAEMON_STATE_DIR: join(root, 'state'),
+    WE_DAEMON_REBUILD_STRICT_EVIDENCE: '0' }, asJob: true, ...(urgent ? { urgent: true } : {}),
+    log: { error() {} }, emitEvent: vi.fn() });
+  expect(result.reason).toBe(urgent ? 'rebuild-job-started' : 'rebuild-job-spaced');
+  expect(store.list().records).toHaveLength(urgent ? 2 : 1);
+  if (urgent) expect(store.read(result.job.id).input).toMatchObject({ urgent: true, target: 'b'.repeat(40) });
+});
+
+it('urgent launches stay spaced after a terminal urgent job for the same target, but a new target can bypass', async () => {
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir, { recursive: true });
+  let now = Date.now();
+  let target = 'b'.repeat(40);
+  const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: now - 1000 });
+  store.update(old.id, r => markSucceeded(r, { at: new Date(now - 100).toISOString() }));
+  const options = { root, env: {}, store, urgent: true,
+    adopt: async () => ({ reason: 'needs-build', plan: { finalSha: target } }),
+    now: () => now, codeSha: 'a'.repeat(40), reattach: async () => {}, evict() {}, log: { error() {} },
+    settings: { minIntervalMs: 900000, minIntervalJitterPct: 0 } };
+  const first = await rebuildCloneAsJob(options);
+  expect(first.reason).toBe('rebuild-job-started');
+  expect(store.read(first.job.id).input).toMatchObject({ urgent: true, target });
+  store.update(first.job.id, r => markSucceeded(r, { at: new Date(now).toISOString() }));
+  now += 100;
+  expect(await rebuildCloneAsJob(options)).toMatchObject({ reason: 'rebuild-job-spaced', retryInMs: 899900 });
+  expect(store.list().records).toHaveLength(2);
+  target = 'c'.repeat(40);
+  expect((await rebuildCloneAsJob(options)).reason).toBe('rebuild-job-started');
+  expect(store.list().records).toHaveLength(3);
+});
+
+it('urgent cannot bypass the recovery cooldown', async () => {
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir, { recursive: true });
+  const now = Date.now();
+  const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: now - 1000 });
+  store.update(old.id, r => markSucceeded(r, { at: new Date(now - 100).toISOString() }));
+  const result = await rebuildCloneAsJob({ root, env: {}, store, urgent: true,
+    adopt: async () => ({ reason: 'needs-build', plan: { finalSha: 'b'.repeat(40) } }),
+    readState: () => ({ held: { reason: 'smoke-env-timeout', retryAt: new Date(now - 1).toISOString() } }),
+    now: () => now, codeSha: 'a'.repeat(40), reattach: async () => {}, evict() {}, log: { error() {} },
+    settings: { minIntervalMs: 900000, minIntervalJitterPct: 0 } });
+  expect(result).toMatchObject({ reason: 'rebuild-job-spaced', retryInMs: 899900 });
+  expect(store.list().records).toHaveLength(1);
+});

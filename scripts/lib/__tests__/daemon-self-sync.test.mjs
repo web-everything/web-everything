@@ -1486,26 +1486,32 @@ setTimeout(() => { writeFileSync(process.env.PACK_FALLBACK_FILE, 'reached'); pro
 
 
 describe('STALE refusal urgency', () => {
+  it('loads the shipped urgency threshold of 10', () => {
+    expect(loadStaleUrgentSettings()).toBe(10);
+  });
   const refusal = n => `STALE code from this checkout: ${n} commit(s) behind origin/main`;
   it('parses the max stale count across failed and repos, ignoring other errors and malformed counts', () => {
     expect(staleRefusalBehind({ failed: [{ error: refusal(12) }, { error: refusal(3) }],
       repos: [{ error: refusal(27) }, { error: '999 commit(s) behind origin/main' }] })).toBe(27);
-    for (const result of [undefined, {}, { failed: [{ error: refusal('?') }, { error: null }] }]) {
+    for (const result of [undefined, {}, { failed: [{ error: refusal('?') }, { error: null }] },
+      ...[-11, '0.11', '11.11', Number.MAX_SAFE_INTEGER + 1].map(n => ({ failed: [{ error: refusal(n) }] }))]) {
       expect(staleRefusalBehind(result)).toBe(0);
     }
   });
   it.each([undefined, -1, 1.5, '20', Number.MAX_SAFE_INTEGER + 1, 0, 20])(
-    'loads threshold %s with a fail-soft default and provenance', value => {
+    'loads threshold %s with fail-closed urgency and provenance', value => {
       const dir = mkdtempSync(join(tmpdir(), 'stale-settings-'));
       try {
         const path = join(dir, 'settings.json'), log = vi.fn();
         writeFileSync(path, JSON.stringify({ staleUrgent: { behindThreshold: value } }));
-        const expected = Number.isSafeInteger(value) && value >= 0 ? value : 10;
+        const expected = Number.isSafeInteger(value) && value >= 0 ? value : Infinity;
         expect(loadStaleUrgentSettings(path, { log })).toBe(expected);
         expect(log).toHaveBeenCalledWith(expect.stringContaining(`behindThreshold=${expected}`));
-        expect(loadStaleUrgentSettings(join(dir, 'missing'))).toBe(10);
+        expect(loadStaleUrgentSettings(join(dir, 'missing'), { log })).toBe(Infinity);
+        expect(99 > loadStaleUrgentSettings(dir, { log })).toBe(false);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('urgency disabled, ordinary spaced rebuilds remain available'));
         writeFileSync(path, '{');
-        expect(loadStaleUrgentSettings(path)).toBe(10);
+        expect(loadStaleUrgentSettings(path, { log })).toBe(Infinity);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
   it.each([[0, false, false], [10, false, false], [11, false, true], [99, true, false]])(

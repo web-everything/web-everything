@@ -118,6 +118,7 @@
  * gate would defeat the whole point of gating rebuilds in the first place).
  */
 
+import { fileURLToPath } from 'node:url';
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { daemonCloneRoots } from './daemon-clone-registry.mjs';
 import { gitRun, isCodePath, isStaleMainRefusalMessage } from './main-staleness.mjs';
@@ -235,21 +236,21 @@ export function staleRefusalBehind(tickResult) {
   for (const rows of [tickResult?.failed, tickResult?.repos]) {
     for (const row of Array.isArray(rows) ? rows : []) {
       if (!isStaleMainRefusalMessage(row?.error)) continue;
-      const count = Number(row.error.match(/(\d+) commit\(s\) behind origin\//)?.[1]);
+      const count = Number(row.error.match(/(?<![\d.\-])(\d+) commit\(s\) behind origin\//)?.[1]);
       if (Number.isSafeInteger(count)) behind = Math.max(behind, count);
     }
   }
   return behind;
 }
 
-/** Missing, unreadable or invalid tool settings retain the default threshold. */
-export function loadStaleUrgentSettings(path = new URL('./daemon-rebuild-settings.json', import.meta.url),
+/** Missing, unreadable or invalid tool settings disable urgency; ordinary spaced rebuilds remain available. */
+export function loadStaleUrgentSettings(path = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json'),
   { log = () => {} } = {}) {
   let value;
-  try { value = JSON.parse(readFileSync(path, 'utf8'))?.staleUrgent?.behindThreshold; } catch { /* fail soft */ }
+  try { value = JSON.parse(readFileSync(path, 'utf8'))?.staleUrgent?.behindThreshold; } catch { /* fail closed below */ }
   const valid = Number.isSafeInteger(value) && value >= 0;
-  const threshold = valid ? value : 10;
-  log(`daemon-self-sync: staleUrgent.behindThreshold=${threshold} (source ${valid ? 'tool' : 'default'})`);
+  const threshold = valid ? value : Infinity;
+  log(`daemon-self-sync: staleUrgent.behindThreshold=${threshold} (source ${valid ? 'tool' : 'invalid/missing tool settings; urgency disabled, ordinary spaced rebuilds remain available'})`);
   return threshold;
 }
 

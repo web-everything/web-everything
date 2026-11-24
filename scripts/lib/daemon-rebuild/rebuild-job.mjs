@@ -322,18 +322,20 @@ export async function rebuildCloneAsJob({
   } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (!urgent && last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
+  const sameUrgentTarget = last?.input?.urgent === true && last.input.target === (r.plan?.finalSha ?? null);
+  const urgentLaunch = urgent && !recover && !sameUrgentTarget;
+  if (!urgentLaunch && last && (recover || sameUrgentTarget || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
     };
   }
-  if (urgent) say('urgent launch — spacing bypassed');
+  if (urgentLaunch) say('urgent launch — spacing bypassed');
   let queued;
   try {
     queued = enqueueJob({
       store, kindDef: REBUILD_JOB_KIND, codeSha: codeSha ?? readHead(root), now: now(),
-      input: { root: resolve(root), entries, launchedBy: recover ? 'recovery' : launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
+      input: { root: resolve(root), entries, ...(urgentLaunch ? { urgent: true } : {}), launchedBy: recover ? 'recovery' : launchedBy, waitInFlightTickMs, mainOnly: !!mainOnly, target: r.plan?.finalSha ?? null,
         daemonReader: { root: resolve(root), owner: `${hostname()}:${process.pid}`, pid: process.pid, startedMs: processStartMs(process.pid) } },
     });
   } catch (e) {
