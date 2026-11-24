@@ -21,7 +21,7 @@ import { alwaysRunPlan, alwaysRunInventory, verifyStandardsPolicy, STANDARDS_AUT
 import { phaseAdmissionPlan, localPhaseReason } from '../verify-remote-routing.mjs';
 import { localChangedSet } from '../verify-lane-gate.mjs';
 
-import { ciOnlyDecision } from '../verify-ci-only.mjs';
+import { ciOnlyDecision, hostSaturation } from '../verify-ci-only.mjs';
 
 // Historical refusal cases model a saturated host; never sample this test runner's host.
 const resolveDefaultGate = options => resolveGate({ saturation: () => ({ saturated: true }), ...options });
@@ -53,7 +53,7 @@ function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } =
 const TODAY = Object.freeze({ WE_VERIFY_TEST_TIMEOUT_FACTOR: '1' });
 
 describe('broad selection host policy', () => {
-  const idle = () => ({ saturated: false, reason: 'idle host' });
+  const idle = () => ({ saturated: false, known: true, reason: 'idle host' });
   it('package.json change on an idle host selects the full suite, not a refusal', () => {
     const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation: idle });
     expect(gate.decision.mode).toBe('full');
@@ -72,7 +72,7 @@ describe('broad selection host policy', () => {
   ];
   it.each(kinds.flatMap(([kind, git]) => [false, true].map(saturated => ({ kind, git, saturated }))))(
     '$kind × saturated=$saturated has a runnable command or allows ci-only', ({ git, saturated }) => {
-      const saturation = () => ({ saturated, reason: 'test host' });
+      const saturation = () => ({ saturated, known: true, reason: 'test host' });
       const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: git(), saturation });
       const deferred = ciOnlyDecision({ verify: 'ci-only', mode: 'park', saturation });
       expect(Boolean(gate.command?.trim()) || deferred.ok).toBe(true);
@@ -125,11 +125,19 @@ describe('broad selection host policy', () => {
   });
 
   it('unreadable saturation refuses with an operator fallback', () => {
-    for (const saturation of [() => null, () => ({}), () => { throw Error('probe failed'); }]) {
+    for (const saturation of [() => null, () => ({}), () => ({ saturated: false }), () => { throw Error('probe failed'); }]) {
       const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation });
       expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
       expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
     }
+  });
+
+  it('unknown CPU evidence with a package.json change stays blocked', () => {
+    const saturation = () => hostSaturation({ collect: () => ({}), admission: () => ({ admitted: true }) });
+    expect(saturation()).toMatchObject({ saturated: false, known: false });
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']), saturation });
+    expect(gate).toMatchObject({ command: null, decision: { mode: 'blocked' } });
+    expect(gate.decision.reasons.join(' ')).toContain('explicit affected-test --gate');
   });
 });
 

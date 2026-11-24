@@ -1714,6 +1714,39 @@ process.exit(${standardsExit});
     expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
   });
 
+  it.each(['test:unit', 'test'])('idle-host full fallback runs standards after a red %s with retries off', script => {
+    const f = fixture({ standardsExit: 1 });
+    // Pin the evidence at the module boundary so this test never samples the test runner's host.
+    const target = pathToFileURL(resolve(process.cwd(), 'scripts/lib/verify-ci-only.mjs')).href;
+    const loader = join(dir, 'idle-host-loader.mjs');
+    writeFileSync(loader, `
+export async function load(url, context, nextLoad) {
+  const result = await nextLoad(url, context);
+  if (url !== ${JSON.stringify(target)}) return result;
+  return { ...result, source: String(result.source).replace('export function hostSaturation(', 'function originalHostSaturation(')
+    + '\\nexport const hostSaturation = () => ({ saturated: false, known: true, reason: "fixture idle" });' };
+}
+`);
+    const preload = 'data:text/javascript,' + encodeURIComponent(`import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)});`);
+    const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+    if (script === 'test') {
+      pkg.scripts.test = pkg.scripts['test:unit'];
+      delete pkg.scripts['test:unit'];
+      // The npm shim treats both full-test script names as the same red test phase.
+      const npm = join(dir, 'bin', 'npm');
+      writeFileSync(npm, readFileSync(npm, 'utf8').replace("(args[0] === 'run' && args[1] === 'test:unit')",
+        "((args[0] === 'run' && args[1] === 'test:unit') || args[0] === 'test')"));
+    }
+    writeFileSync(join(dir, 'package.json'), JSON.stringify(pkg) + '\n');
+    const r = f.invoke([], { NODE_OPTIONS: `--import=${preload}`, WE_VERIFY_RUN_ALL_PHASES: '1' });
+    expect(r.code, r.stderr).toBe(2);
+    expect(f.calls().map(call => call.args)).toEqual([
+      script === 'test' ? ['test'] : ['run', 'test:unit'], ['run', 'check:standards'],
+    ]);
+    expect(r.json.phases.outcomes).toMatchObject({ vitest: { result: 'fail' },
+      standards: { result: 'fail', reason: 'invisible-characters' } });
+  });
+
   it('retryFailed never clears a standards red after full-unit flake recovery', () => {
     const f = fixture({ standardsExit: 1 });
     const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_BUILD_FINAL_GATE: 'full' });

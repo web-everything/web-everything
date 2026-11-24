@@ -711,7 +711,9 @@ if (fullRetryGate) {
   resolvedGate.testCommand = 'npm run test:unit';
   resolvedGate.standardsCommand = resolvedGate.command.includes('check:standards') ? 'npm run check:standards' : null;
 }
-const phasedTestGate = retryableGate || fullRetryGate;
+// The idle-host fallback already supplies separate commands; runAllPhases applies even without retries.
+const fullFallbackGate = resolvedGate?.decision?.mode === 'full' && !!resolvedGate.testCommand;
+const phasedTestGate = retryableGate || fullRetryGate || fullFallbackGate;
 // The helper resolves environment overrides over the running checkout's cached settings file.
 const phaseAdmission = verifyPhaseAdmissionEnabled(process.env) && phasedTestGate;
 const admissionPhases = {};
@@ -1175,7 +1177,7 @@ try {
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
-  if (phasedTestGate && retryFailed > 0) result = await retryPhase(result, 'vitest');
+  if ((retryableGate || fullRetryGate) && retryFailed > 0) result = await retryPhase(result, 'vitest');
   phaseResults.push({ phase: 'vitest', result });
   // #3887 — the repo-scanning tests `vitest related` cannot select, scoped to the changed files (each command carries
   // its own VERIFY_SCAN_FILES). Before check:standards, so a scanner failure is reported with the tests.

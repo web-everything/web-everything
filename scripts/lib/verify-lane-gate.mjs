@@ -494,15 +494,15 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     if (!optOut) {
       try { host = saturation(); } catch { /* unreadable evidence keeps the refusal */ }
     }
-    if (!optOut && host?.saturated === false) {
+    if (!optOut && host?.saturated === false && host.known === true) {
       const have = new Set(scripts == null ? WE_SCRIPTS : scripts);
       const script = have.has('test:unit') ? 'test:unit' : have.has('test') ? 'test' : null;
       if (!script) return blocked(['No full test script in this checkout: supply an explicit affected-test --gate.']);
       const testCommand = script === 'test' ? 'npm test' : 'npm run test:unit';
       const standardsCommand = have.has('check:standards') ? 'npm run check:standards' : null;
       const reason = 'broad selection on an unsaturated host — full suite plus available standards through heavy admission';
-      return { command: [testCommand, standardsCommand].filter(Boolean).join(' && '),
-        testCommand, standardsCommand, gateReasons: [reason], decision: {
+      return { ...composeGate({ vitestCmd: testCommand, checkStandardsCmd: standardsCommand, scripts }),
+        gateReasons: [reason], decision: {
           ...local, reasons: [...local.reasons, reason], changedFiles, settingsSource, relatedMode,
           standards: { ...standards, run: !!standardsCommand, scoped: false, reason },
         } };
