@@ -13,8 +13,11 @@ const MAX_PREP_BYTES = 128 * 1024;
 export function routeMode(kind, slot = '', { cfg = loadDeliveryRoutes(readSettingsChecked), daemonDegraded = false } = {}) {
   if (typeof kind !== 'string' || !kind) throw new Error('--kind is required with --step (no default Kind: a wrong one routes the build to the wrong mode).');
   const want = modeForKind(cfg, kind, { daemonDegraded });
-  const mode = /\bblocker\b/i.test(slot) && want !== 'debug-to-merge' ? 'debug' : want;
-  return { mode, text: cfg.modes[mode] };
+  const forSlot = route => /\bblocker\b/i.test(slot) && route !== 'debug-to-merge' ? 'debug' : route;
+  const mode = forSlot(want);
+  // The dispatch hook reads normal routes only; R1075 authorizes the degraded daemon route.
+  const modeOverride = mode !== forSlot(modeForKind(cfg, kind)) ? 'Mode-override: R1075\n' : '';
+  return { mode, text: cfg.modes[mode], modeOverride };
 }
 
 /** True for an existing regular, non-oversized file. */
@@ -32,8 +35,8 @@ export function renderBriefHeader({ step, kind, slot, prepPath, daemonDegraded, 
   if (typeof slotText !== 'string' || /[\r\n\u2028\u2029]/.test(slotText) || !slotVerdict(`Slot: ${slotText}`).ok) {
     throw new Error('--slot must be a valid single-line placement (at least 8 non-whitespace characters; operator placement must be quoted). Supply --slot explicitly if plan:<step> is unusable.');
   }
-  const { mode, text } = routeMode(kind, slotText, { ...(cfg ? { cfg } : {}), daemonDegraded });
-  return `Kind: ${kind}\nMode: ${mode}\nStep: ${step}\nPrep: ${prepPath}\nSlot: ${slotText}\n${text}\n`;
+  const { mode, text, modeOverride } = routeMode(kind, slotText, { ...(cfg ? { cfg } : {}), daemonDegraded });
+  return `Kind: ${kind}\nMode: ${mode}\nStep: ${step}\nPrep: ${prepPath}\nSlot: ${slotText}\n${modeOverride}${text}\n`;
 }
 
 /** The merge-path line the hook demands when the brief text matches its merge-path pattern. */

@@ -816,6 +816,32 @@ describe('brief header lines (BRIEF-GUARD-TEMPLATE)', () => {
   });
   const header = { step: 'PRT-PIN-PROBE', kind: 'daemon-tooling', prepPath: prepFile };
 
+  it.each(Object.keys(routes.routes).flatMap(kind =>
+    [false, true].flatMap(daemonDegraded =>
+      ['plan:PRT-PIN-PROBE', 'blocker:merge queue stuck'].map(slot => ({ kind, daemonDegraded, slot }))),
+  ))('declares the dispatch override exactly when degradation changes routing: %j', async (input) => {
+    const normal = routes.routes[input.kind];
+    const dispatchMode = input.slot.startsWith('blocker:') && normal !== 'debug-to-merge' ? 'debug' : normal;
+    const selected = input.daemonDegraded ? (routes.daemonDegradedModes[input.kind] ?? normal) : normal;
+    const expectedMode = input.slot.startsWith('blocker:') && selected !== 'debug-to-merge' ? 'debug' : selected;
+    const outputs = [
+      renderBriefHeader({ ...header, ...input }),
+      renderWorkerBrief({ ...base, ...header, ...input }),
+    ];
+    const o = io();
+    expect(await main(['--purpose=hdr-test', '--files=scripts/x.mjs', `--step=${header.step}`,
+      `--kind=${input.kind}`, `--slot=${input.slot}`, `--daemon-degraded=${input.daemonDegraded}`,
+      `--prep-file=${prepFile}`], { ...o, readPolicy: () => ({ enabled: false }) })).toBe(0);
+    outputs.push(o.stdout.write.mock.calls.map(([text]) => text).join(''));
+    for (const out of outputs) {
+      expect(out).toMatch(new RegExp(`^Mode: ${expectedMode}$`, 'm'));
+      expect(out.includes('\nMode-override: R1075\n')).toBe(expectedMode !== dispatchMode);
+      // The configured dispatch hook requires this operator reference for a mode outside its normal route.
+      expect(expectedMode === dispatchMode || /^Mode-override:\s*R\d+/mi.test(out)).toBe(true);
+      expect(out).toContain(routes.modes[expectedMode]);
+    }
+  });
+
   it('audit hardening: inherited kinds, directory/missing prep, free-text slot are refused; degraded daemon-tooling routes to debug-to-merge', () => {
     expect(() => renderWorkerBrief({ ...base, ...header, kind: 'constructor' })).toThrow(/Unknown delivery kind/);
     expect(() => renderWorkerBrief({ ...base, ...header, kind: 'toString' })).toThrow(/Unknown delivery kind/);

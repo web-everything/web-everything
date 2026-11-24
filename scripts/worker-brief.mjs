@@ -62,7 +62,8 @@ const USAGE = `Usage: node scripts/worker-brief.mjs --purpose=<slug> --files=a,b
   --edge-clone=<path>     Include daemon overlay and adoption instructions
   --proof=<text>          Override the live before/after proof requirement
   --step=<id> --kind=<kind> [--slot=<text>] [--daemon-degraded=true]  Print the dispatch-hook header lines (Kind, Mode from delivery-routes.json, Step,
-                          Prep from --prep-file which must exist, Slot) plus the merge-path checklist line when needed
+                          Prep from --prep-file which must exist, Slot) plus the merge-path checklist line when needed.
+                          Degraded routing includes the R1075 Mode-override reference when it changes the mode.
   --prep-file=<path>      Red-team prep/acceptance file (regular file, max 128 KiB; pipes refused; fail open)
   --repo=we|plateau-app   Lane repository (default: we)
   --owner=<token>         Scope-registry owner token (default: fresh per brief, so two workers with one slug stay apart)
