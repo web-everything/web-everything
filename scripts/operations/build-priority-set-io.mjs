@@ -56,6 +56,7 @@ const GUARD_DEPENDENCY_BASENAMES = new Set([
   'resource-gate.mjs', 'resource-policy.mjs', 'scope-glob-overlap.cjs',
   'scope-lease.mjs', 'session-slug.mjs', 'settings-files.mjs',
   'settings-safe-direction.mjs', 'standards-cache.mjs', 'standards-sections.mjs',
+  'strict-utc-timestamp.mjs',
   'step-kinds.mjs', 'telemetry-machine.mjs', 'telemetry-store.mjs',
   'telemetry-summary-io.mjs', 'telemetry-summary.mjs', 'telemetry.mjs',
   'tools-root-guard.mjs', 'tools-root.mjs', 'under-test.mjs',

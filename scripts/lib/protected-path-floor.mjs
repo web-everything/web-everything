@@ -103,6 +103,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  // The invariant enforcer catalogue is also named by the protected POC registry module.
+  'scripts/lib/invariant-catalogue.json',
   'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
