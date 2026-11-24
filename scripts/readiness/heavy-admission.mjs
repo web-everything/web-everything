@@ -1396,20 +1396,44 @@ export async function runWithRemoteDecision({
   let healthAt = waitAt;
   let reapedAt = -Infinity;
   const stuck = policy.settings.remote;
-  const markerReaper = createMarkerReaper({root:remoteRoot,host,clock,log,finishRun:createRunFinisher({host}),
-    stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
-    signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host,...detail}});}});
+  const markerReapers = new Map();
+  const reapMarkers = async nowMs => {
+    // The pool is shared across targets. Persisted markers, including hosts removed from
+    // configuration, identify whose telemetry and finisher can prove their runs stopped.
+    // Keep the selected host's reaper for existing stuck-pool alarms on unbound markers.
+    const markerHosts = new Set([host]);
+    for (const name of readdirSync(remoteRoot)) {
+      if (!/^slot-\d+\.unconfirmed$/.test(name)) continue;
+      try {
+        const markerHost = JSON.parse(readFileSync(join(remoteRoot, name), 'utf8'))?.host;
+        if (validRemoteHosts([{alias:markerHost,root:'/srv/forge-exec'}])) markerHosts.add(markerHost);
+      } catch { /* Unknown markers retain their slots; they never select an SSH target. */ }
+    }
+    for (const markerHost of markerHosts) {
+      let reaper = markerReapers.get(markerHost);
+      if (!reaper) {
+        reaper = createMarkerReaper({root:remoteRoot,host:markerHost,clock,log,finishRun:createRunFinisher({host:markerHost}),
+          stuckMinSlots:stuck.stuckMinSlots,stuckAgeMs:stuck.stuckAgeMs,signalEveryMs:stuck.stuckSignalEveryMs,
+          signal:({kind,detail})=>{void appendEvent({kind:'forge-slots-stuck',daemon:'heavy-admission',detail:{reason:kind,host:markerHost,...detail}});}});
+        markerReapers.set(markerHost,reaper);
+      }
+      await reaper.step(async()=>{
+        const state = await checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:markerHost});
+        return state.ok ? peekRemoteTelemetry({root:remoteRoot,host:markerHost}) : null;
+      },nowMs).catch(()=>[]);
+    }
+  };
   let overloadWaitLogged = false;
   try {
     for (;;) {
       const nowMs = clock();
       // The extended overload wait never acquires a slot past the run's own timeout.
       if (overloadWaitLogged && nowMs - waitAt >= timeoutMs) return localFallback(units > 1 ? 'remote-units-unavailable' : `remote-full (host overloaded; ${Math.round((nowMs - waitAt) / 1000)}s wait exhausted)`);
-      // Dead clients' markers must not wall off the cap: reap by owner liveness plus Forge's own state for that run.
-      // Throttled and cheap (one readdir) when no marker is stale, so it runs on every pass, not only once the pool is full.
+      // Reap dead clients against each marker's own host, even after target selection changes.
+      // Throttled; telemetry is read only when a host-bound marker has a provably dead owner.
       if(nowMs-reapedAt>=2000){
         reapedAt=nowMs;
-        await markerReaper.step(async()=>{const state=await health();return state.ok?peekRemoteTelemetry({root:remoteRoot,host}):null;},nowMs).catch(()=>[]);
+        await reapMarkers(nowMs).catch(()=>[]);
       }
       // file-locks treats corrupt entries as reclaimable. Remote admission requires readable
       // evidence instead: an unknown holder could still have an outstanding Forge execution.

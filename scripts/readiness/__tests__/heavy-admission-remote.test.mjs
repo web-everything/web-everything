@@ -67,6 +67,103 @@ function expectLines(log, count, direction) {
   expect(log.mock.calls[0][0]).toMatch(new RegExp(direction, 'i'));
 }
 
+describe('remote slot recovery across target switches', () => {
+  it.each(['forge', 'retired-runner'])('reclaims all dead-client %s markers after Mesa becomes preferred', async previousHost => {
+    const {easternTimestamp} = await import('../forge-exec-run.mjs');
+    const f = fixture({remote: {mode: 'always', hosts: [{alias: 'mesa-01', root: '/srv/forge-exec'}]}});
+    const remoteRoot = join(f.lockRoot, '..', 'remote');
+    mkdirSync(remoteRoot, {recursive: true});
+    const base = Date.now();
+    let now = base;
+    f.clock = () => (now += 10_000);
+    f.targetExec = vi.fn(async () => ({code: 0}));
+    f.hostOverloaded = () => true;
+    f.sleep = vi.fn(async () => {});
+    f.timeoutMs = 600_000;
+    const reads = [];
+    f.readTelemetry = async ({host}) => {
+      reads.push(host);
+      return {sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1,
+        memFreePct: 90, activeRuns: 0, recent: []};
+    };
+    for (let slot = 0; slot < 8; slot++) {
+      const file = join(remoteRoot, `slot-${slot}.unconfirmed`);
+      writeFileSync(file, markerContent({owner: `dead-${slot}`, pid: 2147483647,
+        nowMs: base - 600_000, host: previousHost, run: 'r-' + String(slot).repeat(32)}));
+      utimesSync(file, (base - 600_000) / 1000, (base - 600_000) / 1000);
+    }
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    expect(reads).toContain(previousHost);
+    expect(f.remoteExec).toHaveBeenCalledTimes(1);
+    expect(f.remoteExec.mock.calls[0][0].host).toBe('mesa-01');
+    expect(readdirSync(remoteRoot).filter(name => name.endsWith('.unconfirmed'))).toEqual([]);
+  });
+
+  it.each(['live', 'running', 'unreachable', 'unbound', 'invalid-host', 'malformed'])(
+    'recovers a mixed pool while retaining %s markers despite idle Mesa telemetry', async protection => {
+      const {easternTimestamp} = await import('../forge-exec-run.mjs');
+      const f = fixture({remote: {mode: 'always', hosts: [{alias: 'mesa-01', root: '/srv/forge-exec'}]}});
+      const root = join(f.lockRoot, '..', 'remote'), now = Date.now();
+      mkdirSync(root, {recursive: true});
+      f.clock = () => now;
+      f.targetExec = vi.fn(async () => ({code: 0}));
+      const reads = [];
+      f.readTelemetry = async ({host}) => {
+        reads.push(host);
+        if (host === 'forge' && protection === 'unreachable') throw new Error('fixture unavailable');
+        const activeRunIds = host === 'forge' && protection === 'running'
+          ? Array.from({length: 4}, (_, slot) => 'r-' + String(slot).repeat(32)) : [];
+        return {sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1, memFreePct: 90,
+          activeRuns: activeRunIds.length, activeRunIds, recent: []};
+      };
+      for (let slot = 0; slot < 8; slot++) {
+        const file = join(root, `slot-${slot}.unconfirmed`), protectedSlot = slot < 4;
+        const host = protectedSlot ? protection === 'unbound' ? undefined
+          : protection === 'invalid-host' ? '--bad\nhost' : 'forge' : 'retired-runner';
+        writeFileSync(file, protectedSlot && protection === 'malformed' ? '{broken'
+          : markerContent({owner: `dead-${slot}`, pid: protectedSlot && protection === 'live' ? process.pid : 2147483647,
+            nowMs: now - 600_000, host, run: 'r-' + String(slot).repeat(32)}));
+        utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
+        const st = statSync(file);
+        writeFileSync(file + '.dead', JSON.stringify({key: `slot-${slot}.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
+      }
+      expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+      expect(f.remoteExec).toHaveBeenCalledTimes(1);
+      expect(readdirSync(root).filter(name => name.endsWith('.unconfirmed')).sort())
+        .toEqual([0, 1, 2, 3].map(slot => `slot-${slot}.unconfirmed`));
+      expect(reads).toContain('retired-runner');
+      expect(reads).not.toContain('--bad\nhost');
+      if (['live', 'unbound', 'invalid-host', 'malformed'].includes(protection)) expect(reads).not.toContain('forge');
+    },
+  );
+
+  it('finishes a settled Forge run on Forge when Mesa owns the new dispatch', async () => {
+    const {easternTimestamp} = await import('../forge-exec-run.mjs');
+    const f = fixture({remote: {mode: 'always', maxConcurrent: 1, hosts: [{alias: 'mesa-01', root: '/srv/forge-exec'}]}});
+    const root = join(f.lockRoot, '..', 'remote'), now = Date.now(), run = 'r-' + 'b'.repeat(32), nonce = 'e'.repeat(32);
+    mkdirSync(root, {recursive: true});
+    const file = join(root, 'slot-0.unconfirmed');
+    writeFileSync(file, markerContent({owner: 'dead', pid: 2147483647, nowMs: now - 600_000, host: 'forge', run}));
+    utimesSync(file, (now - 600_000) / 1000, (now - 600_000) / 1000);
+    const st = statSync(file);
+    writeFileSync(file + '.dead', JSON.stringify({key: `slot-0.unconfirmed:${st.ino}:${st.mtimeMs}`, at: now - 120_000}));
+    writeFileSync(file + '.run', JSON.stringify({owner: 'dead', run, nonce, slot: 'forge-exec-2'}));
+    f.clock = () => now;
+    f.targetExec = vi.fn(async () => ({code: 0}));
+    f.readTelemetry = async ({host}) => ({sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.1, memFreePct: 90,
+      activeRuns: host === 'forge' ? 1 : 0, activeRunIds: host === 'forge' ? [run] : [],
+      recent: host === 'forge' ? [{runId: run, code: 97, startedAtET: easternTimestamp(now - 500_000), stageMs: {install: 0, run: 0}}] : []});
+    const finish = vi.fn(async () => ({finished: true}));
+    const mesaFinish = vi.fn(async () => ({finished: true}));
+    vi.mocked(createRunFinisher).mockReturnValueOnce(mesaFinish).mockReturnValueOnce(finish);
+    expect(await runWithRemoteDecision(f)).toMatchObject({handled: true, exitCode: 0});
+    expect(createRunFinisher).toHaveBeenLastCalledWith({host: 'forge'});
+    expect(finish).toHaveBeenCalledWith({run, nonce});
+    expect(mesaFinish).not.toHaveBeenCalled();
+    expect(f.remoteExec.mock.calls[0][0].host).toBe('mesa-01');
+  });
+});
+
 function expectFallback(log, reason) {
   expectLines(log, 2, 'remote');
   expect(log.mock.calls[1][0]).toMatch(/fallback/i);

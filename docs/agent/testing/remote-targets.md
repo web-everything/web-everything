@@ -21,6 +21,13 @@ are `ssh-unreachable`. No healthy target means local admission with
 Discovery does not cache results. Execution keeps the existing ops sudo and SSH
 credential handling; configure aliases through the operator's existing SSH setup.
 
+Targets share the remote slot capacity limit. Cleanup uses each persisted marker's
+own validated host for telemetry and finishing, including targets removed from the
+current configuration. A recovered preferred target can therefore reclaim finished
+fallback-host jobs without relying on that fallback being selected again. Live owners,
+unreachable hosts, and unreadable or unbound markers retain their slots until cleanup
+is confirmed; another host's idle telemetry never proves their jobs stopped.
+
 Dry discovery uses the same settings without dispatching a job:
 
 ```sh
