@@ -757,6 +757,8 @@ export function extractPassTimings(stderr) {
 }
 
 const STDERR_LINE_MAX = 200;
+/** Node warning preamble lines that would otherwise hide the real first error. */
+const NODE_WARNING_NOISE = /^(?:\(node:\d+\) (?:Deprecation|Experimental)Warning:|\(Use `node --trace-deprecation)/;
 const SECRET_LINE = /gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert/i;
 // Allowlist: only printable ASCII survives; every other code point (controls, separators, bidi/zero-width marks) becomes a space.
@@ -770,7 +772,8 @@ const URL_USERINFO =/:\/\/[^/\s]*@/;
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
   const raw = String(stderr ?? '');
-  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).find(Boolean);
+  const line = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim())
+    .find(l => l && !NODE_WARNING_NOISE.test(l));
   if (!line) return '';
   if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.

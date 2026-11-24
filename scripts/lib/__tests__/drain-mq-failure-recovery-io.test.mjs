@@ -88,6 +88,13 @@ describe('drain MQ failure production adapter', () => {
     expect(f.exec.mock.calls.every(([, , opts]) => Number.isFinite(opts.timeout) && Number.isFinite(opts.maxBuffer))).toBe(true);
   });
 
+  it('job-log reads pass --allow-escape-sequences so ANSI logs stay readable', async () => {
+    const f = fixture();
+    await routeMqFailureOnHold(f.options);
+    const logCall = f.exec.mock.calls.find(([, args]) => args.some(arg => String(arg).endsWith('/actions/jobs/901/logs')));
+    expect(logCall[1]).toContain('--allow-escape-sequences');
+  });
+
   it.each(['infra', 'unreadable', 'wrong parent', 'wrong reason', 'missing merge commit', 'wrong run commit',
     'incomplete timeline', 'oversized timeline', 'retry exhausted', 'stale head', 'conflict',
     'unknown labels', 'expired log', 'oversized log', 'oversized runs'])('retains the hold without writes for %s', async mode => {

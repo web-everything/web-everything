@@ -472,6 +472,13 @@ describe('createEnqueueOnEvent', () => {
     expect(line).not.toContain('\u001b');
   });
 
+  it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {
+    const noise = '(node:1) DeprecationWarning: The `punycode` module is deprecated.\n(Use `node --trace-deprecation ...` to show where)\n(node:1) ExperimentalWarning: x\n';
+    expect(enqueueModule.firstStderrErrorLine(`${noise}real failure`)).toBe('real failure');
+    expect(enqueueModule.firstStderrErrorLine(noise)).toBe('');
+    expect(enqueueModule.firstStderrErrorLine('Error: DeprecationWarning is fatal')).toBe('Error: DeprecationWarning is fatal');
+  });
+
   it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {
     expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
     expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
