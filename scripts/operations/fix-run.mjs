@@ -1132,7 +1132,7 @@ export async function runFixCli(argv = [], {
         throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
       };
       if (unresolved.length) refuse(unresolved);
-      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
+      const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])].filter(isStageable);
       stageLaneFiles(stage);
       // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
