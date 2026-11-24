@@ -276,7 +276,7 @@
     "scripts/operations/audit-verdict.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/operations/await.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/build-priority-set-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
-    "scripts/operations/canonical-audit-gate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
+    "scripts/operations/canonical-audit-gate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
     "scripts/operations/card-batch-extract.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":18},
     "scripts/operations/card-batch-file.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/card-batch-seal-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":8},
