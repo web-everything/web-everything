@@ -1,5 +1,5 @@
 /** R986 I1: pure per-daemon probation transitions. Persistence and production wiring are separate.
- * See docs/agent/testing.md, "R986 I1 probation core" for the caller's evidence obligations.
+ * See docs/agent/testing.d/106-r986-i1-probation-core-production-wiring-pending.md#r986-i1-probation-core-production-wiring-pending for the caller's evidence obligations.
  */
 const shaOK = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value);
 const nameOK = value => typeof value === 'string' && value.trim().length > 0;

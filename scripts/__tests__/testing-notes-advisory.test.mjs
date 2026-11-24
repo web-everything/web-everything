@@ -11,15 +11,22 @@ const { extractAnchors } = createRequire(import.meta.url)('../lib/rules-loader.c
 const base = 'a'.repeat(40);
 const added = '@@ -1,0 +2 @@\n+new note\n';
 
+function legacyAnchorResolves(anchor, redirects, guide = readFileSync(resolve(root, TESTING_GUIDE), 'utf8')) {
+  if (extractAnchors(guide).anchors.has(anchor)) return true;
+  const target = redirects[anchor];
+  return typeof target === 'string' && target.startsWith('docs/agent/testing.d/')
+    && extractAnchors(readFileSync(resolve(root, target), 'utf8')).anchors.has(anchor);
+}
+
 describe('testing notes advisory', () => {
   it('warns for added lines in the legacy guide, with the per-topic destination', () => {
     expect(testingNotesAdvisory([TESTING_GUIDE])).toEqual([
-      expect.stringContaining('docs/agent/testing/ as separate topic files'),
+      expect.stringContaining('docs/agent/testing.d/ as separate topic files'),
     ]);
   });
 
-  it('is silent for a new per-topic file and unrelated additions', () => {
-    expect(testingNotesAdvisory(['docs/agent/testing/new-topic.md', 'AGENTS.md'])).toEqual([]);
+  it('is silent for new or changed per-topic files and unrelated additions', () => {
+    expect(testingNotesAdvisory(['docs/agent/testing.d/new-topic.md', 'AGENTS.md'])).toEqual([]);
     expect(testingNotesAdvisory([])).toEqual([]);
   });
 
@@ -60,27 +67,46 @@ describe('testing documentation links', () => {
     const baseline = JSON.parse(readFileSync(resolve(root, 'scripts/__tests__/fixtures/testing-notes-main-links.json'), 'utf8'));
     expect(baseline.commit).toMatch(/^[a-f0-9]{40}$/);
     expect(baseline.references.length).toBeGreaterThan(0);
-    const currentAnchors = extractAnchors(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).anchors;
+    const redirects = JSON.parse(readFileSync(resolve(import.meta.dirname, 'fixtures/legacy-anchor-map.json'), 'utf8'));
+    for (const anchor of Object.keys(redirects)) expect(legacyAnchorResolves(anchor, redirects), anchor).toBe(true);
     const files = ['AGENTS.md', ...readdirSync(resolve(root, 'docs/agent'))
       .filter((name) => name.endsWith('.md')).map((name) => `docs/agent/${name}`)];
     const sources = files.map((file) => [file, readFileSync(resolve(root, file), 'utf8')]);
+    for (const skill of readdirSync(resolve(root, 'skills-src'), { withFileTypes: true }).filter((entry) => entry.isDirectory())) {
+      const path = `skills-src/${skill.name}/SKILL.md`;
+      try { sources.push([path, readFileSync(resolve(root, path), 'utf8')]); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+    }
+    for (const [file, text] of sources) {
+      for (const match of text.matchAll(/\]\(([^\s)]*testing\.d\/[^\s)#]+\.md)#([^\s)]+)\)/g)) {
+        const target = readFileSync(resolve(root, dirname(file), match[1]), 'utf8');
+        expect(extractAnchors(target).anchors.has(decodeURIComponent(match[2])), `${file}: ${match[0]}`).toBe(true);
+      }
+    }
     sources.push(...baseline.references);
     let checked = 0;
     for (const [file, text] of sources) {
       for (const match of text.matchAll(/\]\(([^\s)]*testing\.md)#([^\s)]+)\)/g)) {
         if (resolve(root, dirname(file), match[1]) !== resolve(root, TESTING_GUIDE)) continue;
         const anchor = decodeURIComponent(match[2]);
-        expect(currentAnchors.has(anchor), `${file}: ${match[0]}`).toBe(true);
+        expect(legacyAnchorResolves(anchor, redirects), `${file}: ${match[0]}`).toBe(true);
         checked++;
       }
     }
     expect(checked).toBeGreaterThan(0);
   });
 
+  it('rejects unmapped legacy anchors and redirects whose target lacks the anchor', () => {
+    expect(legacyAnchorResolves('unmapped-anchor', {})).toBe(false);
+    expect(legacyAnchorResolves('unmapped-anchor', { 'unmapped-anchor': TESTING_GUIDE })).toBe(false);
+    expect(legacyAnchorResolves('unmapped-anchor', { 'unmapped-anchor': 'docs/agent/testing.d/README.md' })).toBe(false);
+    expect(legacyAnchorResolves('retained', {}, '# Guide\n## Retained\n')).toBe(true);
+  });
+
   it('keeps the static directory link valid and each topic headed and named consistently', () => {
-    expect(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).toContain('(testing/README.md)');
-    const directory = resolve(root, 'docs/agent/testing');
-    expect(readFileSync(resolve(directory, 'README.md'), 'utf8')).toContain('not appended');
+    expect(readFileSync(resolve(root, TESTING_GUIDE), 'utf8')).toContain('(testing.d/README.md)');
+    const directory = resolve(root, 'docs/agent/testing.d');
+    expect(readFileSync(resolve(directory, 'README.md'), 'utf8')).toContain('never edit testing.md');
     const topics = readdirSync(directory).filter((name) => name !== 'README.md');
     expect(topics.length).toBeGreaterThanOrEqual(4);
     for (const topic of topics) {
