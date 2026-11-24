@@ -1,5 +1,5 @@
 /** PUSH-GATE-S1: the claim-bound push gate must refuse a PR carrying review:human and push nothing. */
-import { spawnSync } from 'node:child_process';
+import { readGit } from '../../../lib/proc-read.mjs';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -14,7 +14,7 @@ export default {
   fixedBy: { sha: GATE_COMMIT, where: 'lane/push-gate-s1', paths: ['scripts/lib/authorized-push.mjs'] },
   // Decided by git ancestry of the gate commit, never by the behaviour under test.
   fixPresent(root) {
-    return spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', GATE_COMMIT, 'HEAD'], { encoding: 'utf8' }).status === 0;
+    try { readGit(['-C', root, 'merge-base', '--is-ancestor', GATE_COMMIT, 'HEAD']); return true; } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const violations = [];
