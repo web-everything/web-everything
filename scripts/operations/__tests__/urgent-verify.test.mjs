@@ -998,3 +998,36 @@ describe('urgent-verify wall-clock limit', () => {
     expect(err.failure).toMatchObject({ timedOut: true, hungFiles: ['hung.test.mjs'] });
   });
 });
+
+describe('urgent-verify real process-tree expiry', () => {
+  it('SIGKILLs a TERM-trapping child and its grandchild, and refuses later commands', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'uv-expiry-'));
+    mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = join(dir, 'grandchild.pid');
+    writeFileSync(join(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      process.on('SIGTERM', () => {});
+      const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+      setInterval(() => {}, 1000);`);
+    const deps = createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 });
+    const started = Date.now();
+    expect(() => deps.standards()).toThrow(/ETIMEDOUT|exit/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const gpid = Number(readFileSync(pidFile, 'utf8'));
+    await new Promise(r => setTimeout(r, 300));
+    expect(() => process.kill(gpid, 0)).toThrow();
+    expect(existsSync(pidFile)).toBe(true);
+    let late; try { deps.standards(); } catch (e) { late = e; }
+    expect(late.failure).toMatchObject({ timedOut: true });
+    expect(late.message).toMatch(/wall-clock limit/);
+  });
+  it('clamps the limit to 240 minutes', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env: { PATH: '/bin', HOME: '/h' }, spawnSync, maxMinutes: 10000 }).standards();
+    expect(spawnSync.mock.calls[0][2].timeout).toBeLessThanOrEqual(240 * 60_000);
+  });
+});

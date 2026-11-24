@@ -15,7 +15,7 @@ const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (e) {
 export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = realSpawn, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
   // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 40).
   // Scoped (worktree) deps inherit the parent's deadline so the limit covers the run, not each child.
-  const limitMin = Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 40;
+  const limitMin = Math.min(240, Math.max(0.01, Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 40));
   deadline ??= Date.now() + limitMin * 60_000;
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
     .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
@@ -53,9 +53,17 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
     const wrapper = String(args[0]).endsWith('heavy-admission.mjs');
     const env = wrapper ? { ...childEnv, LANE_POOL_ROOT: admissionPool, WE_STRIP_POOL_ROOT_FROM_CHILD: '1', ...(stepHome ? { HOME: stepHome, npm_config_cache: join(home, '.npm') } : {}) } : { ...childEnv, PATH: systemPath };
     // Own process group (detached) so an expired child's whole tree dies, and only that tree: -pid is our spawn's group.
-    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: Math.max(1000, deadline - Date.now()), maxBuffer: 16 * 1024 * 1024, detached: true });
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      const late = new Error(`urgent-verify wall-clock limit (${limitMin} min) expired before: ${cmd} ${args.join(' ')}`);
+      late.failure = { cmd: [cmd, ...args].join(' ').slice(0, 300), exit: null, timedOut: true, limitMinutes: limitMin, stderrTail: '' };
+      throw late;
+    }
+    // SIGKILL (not the SIGTERM default) so a child that traps TERM cannot delay the expiry.
+    const r = spawnSync(cmd, args, { cwd: dir, env, encoding: 'utf8', timeout: remaining, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, detached: true });
     const timedOut = r.error?.code === 'ETIMEDOUT';
-    if (timedOut && Number.isInteger(r.pid) && r.pid > 1) { try { process.kill(-r.pid, 'SIGKILL'); } catch { /* already gone */ } }
+    // Any spawn error (timeout, buffer overflow) may leave descendants: kill the group we created, nothing else.
+    if (r.error && Number.isInteger(r.pid) && r.pid > 1) { try { process.kill(-r.pid, 'SIGKILL'); } catch { /* already gone */ } }
     if (r.error || r.status !== 0) {
       const bytes = Buffer.from(String(r.stderr ?? '').split(/\r?\n/).filter(Boolean).slice(-20).join('\n'));
       let start = Math.max(0, bytes.length - 8192);
@@ -179,7 +187,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
           ...command.slice(2), ...(group ? files : [`--shard=${shard}`])]);
       } catch (e) {
         // Hung-file report: assigned files that never printed a result line before the limit expired.
-        if (e.failure?.timedOut && group) e.failure.hungFiles = files.filter(f => !e.stdout?.includes(f)).slice(0, 20);
+        if (e.failure?.timedOut && group) e.failure.hungFiles = files.filter(f => !String(e.stdout ?? '').split(/\r?\n/).some(l => /^\s*[✓✗×❯↓]/.test(l) && l.includes(f))).slice(0, 20);
         throw e;
       }
       if (group === 'covered') {
