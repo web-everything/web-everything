@@ -229,6 +229,11 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   };
   const queue = {
     entries: () => copy(entries),
+    holdCauses() {
+      const causes = new Map(entries.filter(entry => entry.blocked).map(entry => [entry.key, entry.blocked]));
+      for (const key of waiting) causes.set(key, 'evidence-unreadable');
+      return causes;
+    },
     // Incomplete discovery authorizes only a live, same-head probe of an existing blocked entry.
     // This read never evicts, re-keys, syncs or admits a new PR.
     confirmedBlocked({ repo, readLivePr: read = readLivePr } = {}) {
@@ -325,7 +330,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
         if (NON_RUNNABLE_REASONS.has(entry.blocked) && !probes.has(entry.key)) {
-          note(log, `hold ${entry.key}: ${allowProbes && validCount ? 'waiting for a probe turn' : 'probes disabled'}`);
+          note(log, `hold ${entry.key}: ${entry.blocked} (${allowProbes && validCount ? 'waiting for a probe turn' : 'probes disabled'})`);
           continue;
         }
         note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}; head=${entry.head}`);
@@ -523,8 +528,13 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       && !allowed.has(Number(row.prNumber)) && !bypassed.has(Number(row.prNumber))).map(row => Number(row.prNumber)));
-    const blocked = new Set(queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).map(entry => entry.pr));
-    for (const pr of held) note(log, `hold ${repo}#${pr}: ${blocked.has(pr) ? readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled' : 'capacity'}; waiting for a later tick`);
+    const causes = queue.holdCauses();
+    for (const pr of held) {
+      const cause = causes.get(`${repo}#${pr}`) ?? 'capacity';
+      const detail = NON_RUNNABLE_REASONS.has(cause)
+        ? ` (${readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled'})` : '';
+      note(log, `hold ${repo}#${pr}: ${cause}${detail}; waiting for a later tick`);
+    }
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
     const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];
