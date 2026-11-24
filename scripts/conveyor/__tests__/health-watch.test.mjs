@@ -225,6 +225,29 @@ describe('lane scan cache target isolation', () => {
       });
     } finally { sealTestRoot.path = null; }
   }, 30_000);
+
+  it('tick hands collectGh the PRs with an open red-team-pending-overdue episode', async () => {
+    sealTestRoot.path = dir;
+    const collectGh = vi.fn(() => ({ probes: {}, errors: {} }));
+    const budget = join(dir, 'budget.json');
+    writeFileSync(budget, '{}');
+    const stateRoot = join(dir, 'episode-state');
+    const hd = healthDir(stateRoot);
+    mkdirSync(hd, { recursive: true });
+    writeFileSync(join(hd, 'state.json'), JSON.stringify({ version: 1, episodes: {
+      a: { key: 'a', smell: 'red-team-pending-overdue', subject: 'web-everything/web-everything#7@abc1234', status: 'open' },
+      b: { key: 'b', smell: 'other-smell', subject: 'web-everything/web-everything#8@abc1234', status: 'open' },
+    } }));
+    const flags = {
+      'dry-run': true, 'force-gh': true, 'no-diagnose': true, 'no-investigate': true,
+      'logs-dir': join(dir, 'logs'), 'lock-root': join(dir, 'locks'), 'state-root': stateRoot,
+      'graphql-budget-fixture': budget, 'rest-budget-fixture': budget,
+    };
+    try {
+      await tick(flags, { collectGh, collectInventory: () => ({}), smells: [] });
+      expect(collectGh.mock.calls[0][0].openRedTeamPrs).toEqual(['web-everything/web-everything#7']);
+    } finally { sealTestRoot.path = null; }
+  }, 30_000);
 });
 
 // ── probeDaemonLogs ──────────────────────────────────────────────────────────────────────────────────────────
@@ -1942,10 +1965,28 @@ describe('REDTEAM-STUCK-PENDING audit regressions', () => {
     expect(timeouts).toEqual([15000, 15000, 15000, 15000, 4000]);
     expect(rows.at(-1)).toMatchObject({ redTeamPendingSince: null, redTeamPendingPartial: true });
   });
+  it('a shared snapshot of non-pending PRs costs zero live pr view calls when no episode is open', () => {
+    const reads = [];
+    const snapshot = Array.from({ length: 40 }, (_, i) => ({ number: i + 1, labels: [{ name: 'review:pending' }] }));
+    const rows = probePrs({ drainOptions, readSnapshot: () => snapshot, exec: (_bin, args) => { reads.push(args); return '{}'; } });
+    expect(reads).toEqual([]);
+    expect(rows.length).toBeGreaterThanOrEqual(40);
+    expect(rows.every(pr => pr.cachedLabels === true)).toBe(true);
+  });
+  it('refreshes live labels only for PRs with an open episode, capped by the shared deadline', () => {
+    let elapsed = 0;
+    const reads = [];
+    const snapshot = Array.from({ length: 40 }, (_, i) => ({ number: i + 1, labels: [{ name: 'review:pending' }] }));
+    const rows = probePrs({ drainOptions, clock: () => elapsed, readSnapshot: ({ repo }) => (repo.endsWith('web-everything') ? snapshot : []),
+      openRedTeamPrs: ['web-everything/web-everything#3', 'web-everything/web-everything#9'],
+      exec: (_bin, args) => { reads.push(args); elapsed += 1000; return JSON.stringify({ labels: [] }); } });
+    expect(reads.map(a => a[2])).toEqual(['3', '9']);
+    expect(rows.filter(pr => pr.cachedLabels === false).map(pr => pr.number)).toEqual([3, 9]);
+  });
   it.each(['fresh-clear', 'fresh-pending', 'failed', 'deferred', 'budget'])('cached clear requires bounded fresh labels: %s', mode => {
     let elapsed = 0;
     const reads = [];
-    const rows = probePrs({ clock: () => elapsed, drainOptions,
+    const rows = probePrs({ clock: () => elapsed, drainOptions, openRedTeamPrs: ['web-everything/web-everything#1'],
       readSnapshot: () => { if (mode === 'budget') elapsed = 60000; return [{ number: 1, labels: [{ name: 'review:pending' }] }]; },
       exec: (_bin, args, options) => {
         reads.push({ args, options });

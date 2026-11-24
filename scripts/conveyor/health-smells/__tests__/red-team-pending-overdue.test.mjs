@@ -40,6 +40,24 @@ it('uses twice the configured drain max', () => {
   expect(evaluate(row(41), 20)[0].breach).toBe(true);
   expect(evaluate(row(100), 60)[0].breach).toBe(false);
 });
+// Fail closed: an unreadable threshold can never read an old (or fresh) pending PR as clean.
+it.each([[undefined], [0], [-5], [NaN], [Infinity * 0], ['45'], [null]])('missing or invalid max (%s) alerts on both old and fresh pending rows', max => {
+  for (const minutes of [100, 1]) {
+    const config = max === undefined ? {} : { drain: { redTeamPendingMaxMin: max } };
+    expect(smell.evaluate({ prs: [row(minutes)] }, { now, config })[0]).toMatchObject({ breach: true });
+  }
+  expect(smell.evaluate({ prs: [row(100)] }, { now })[0]).toMatchObject({ breach: true });
+});
+it('a failed cached-clear refresh is unknown, never a clean observation', () => {
+  // Probe left cachedLabels set (refresh failed/deferred): no observation, so an open episode neither closes nor re-opens.
+  const cached = row(100, { labels: [], cachedLabels: true });
+  expect(smell.evaluate({ prs: [cached] }, { now, config: { drain: { redTeamPendingMaxMin: 45 } } })).toEqual([]);
+  const opened = stepEpisodes(emptyHealthState(), [{ smell, results: smell.evaluate({ prs: [row(100)] },
+    { now, config: { drain: { redTeamPendingMaxMin: 45 } } }) }], now).state;
+  const next = stepEpisodes(opened, [{ smell, results: smell.evaluate({ prs: [cached] }, { now, config: { drain: { redTeamPendingMaxMin: 45 } } }) }], now + 1);
+  expect(next.transitions.some(t => t.type === 'closed')).toBe(false);
+  expect(Object.values(next.state.episodes)).toHaveLength(1);
+});
 const step = (state, prs) => stepEpisodes(state, [{ smell, results: smell.evaluate({ prs },
   { now, config: { drain: { redTeamPendingMaxMin: 45 } } }) }], now);
 it('unknown labels do not clear an open episode', () => {

@@ -776,7 +776,21 @@ export function probeRestBudget({ exec = run } = {}) {
   return { limit: j?.limit ?? null, used: j?.used ?? null, remaining: j?.remaining ?? null, reset: j?.reset ?? null };
 }
 
-export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {}, clock = Date.now, readSnapshot = null } = {}) {
+/** `repo#number` of every PR holding an open (or pending) `red-team-pending-overdue` episode — the only rows whose
+ *  cached labels are worth a live confirmation, since only an open episode can close on fresh clear evidence. */
+export function openRedTeamPrs(episodes) {
+  const out = [];
+  for (const ep of Object.values(episodes || {})) {
+    if (ep?.smell !== 'red-team-pending-overdue' || typeof ep.subject !== 'string') continue;
+    out.push(ep.subject.split('@')[0]);
+  }
+  return out;
+}
+
+export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {}, clock = Date.now, readSnapshot = null, openRedTeamPrs: openPrs = [] } = {}) {
+  // Live label confirmation is bounded to PRs with an open episode: a cached non-pending row without one has nothing to
+  // close and stays unknown (cachedLabels), so the common case costs zero per-PR calls and the shared snapshot stays the budgeted path.
+  const confirmOpen = new Set(openPrs || []);
   // One deadline across every repo: exhaustion leaves evidence unknown, never clean.
   const pendingDeadline = clock() + 60_000;
   const out = [];
@@ -803,7 +817,7 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
       let pendingLabels = pr.labels;
       // A snapshot's missing label is not proof of a clear. Fresh confirmation shares
       // the timeline deadline; failed/deferred reads leave cachedLabels set for carry-forward.
-      if (cachedLabels && !pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+      if (cachedLabels && confirmOpen.has(`${slug}#${pr.number}`) && !pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
         const remaining = pendingDeadline - clock();
         if (remaining > 0) try {
           const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels'],
@@ -1107,13 +1121,13 @@ export { GH_GROUP_PROBE_NAMES };
  * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
  * @returns {{probes: object, errors: Record<string, string>}}
  */
-export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = null, laneScanWrite = false } = {}) {
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = null, laneScanWrite = false, openRedTeamPrs: openPrs = [] } = {}) {
   const probes = {};
   const errors = {};
   const attempt = (name, fn) => {
     try { return fn(); } catch (e) { errors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; }
   };
-  const prs = attempt('prs', () => probePrs({ now }));
+  const prs = attempt('prs', () => probePrs({ now, openRedTeamPrs: openPrs }));
   const agents = attempt('agents', () => probeAgents());
   // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
   // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
@@ -1435,7 +1449,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (ghJobsOn || reconcileOnly) {
     const out = await attempt('ghJob', () => runGhProbeJobs({
       ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
-      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite },
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite, openRedTeamPrs: openRedTeamPrs(prev.episodes) },
     }));
     if (out) {
       jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
@@ -1450,7 +1464,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     }
   }
   if (!ghJobsOn && ghDue && !ghFromJob) {
-    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite });
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite, openRedTeamPrs: openRedTeamPrs(prev.episodes) });
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
     if (got.probes.prs && got.probes.agents) ghCache.at = now;

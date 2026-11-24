@@ -1,5 +1,4 @@
 /** Read-only replay: label age survives unrelated PR activity and unknown evidence never clears it. */
-import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -10,19 +9,10 @@ export default {
   title: 'pending age follows label additions and unknown evidence preserves the alert',
   card: 'REDTEAM-STUCK-PENDING',
   fixedBy: { sha: 'working-tree', where: 'current tree', paths: [PATH] },
-  fixPresent(root) {
-    // Separate capability probe, deliberately with NO pending PR. Never use the replay's verdict to
-    // select it.fails: regressions in age, threshold or unknown evidence must still be required passes.
-    const probe = spawnSync(process.execPath, ['--input-type=module', '-e', `
-      import smell from ${JSON.stringify(pathToFileURL(join(root, PATH)).href)};
-      const result = smell.evaluate({ prs: [] }, { now: 0, config: { drain: { redTeamPendingMaxMin: 10 } } });
-      if (!Array.isArray(result)) throw new Error('unreadable capability result');
-      process.exit(smell.id === 'red-team-pending-overdue' && Array.isArray(result) && result.length === 0 ? 0 : 42);
-    `], { timeout: 15000, maxBuffer: 65536, encoding: 'utf8', env: { ...process.env, WE_UNDER_TEST: '1' } });
-    // Only the explicit, successfully evaluated absence selects expected-fail.
-    // Import/shape/runtime errors must use plain it so the replay fails visibly.
-    return Boolean(probe.error) || probe.status !== 42;
-  },
+  // The smell ships in the same tree as this break, so there is no tree where its absence is a legitimate
+  // expected-fail. A missing file, wrong id, broken import or broken behaviour must all fail visibly: a probe that
+  // reads "wrong id" as "capability absent" would let a behavioural regression satisfy it.fails.
+  fixPresent() { return true; },
   async run({ sourceRoot = ROOT } = {}) {
     const violations = [];
     try {

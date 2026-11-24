@@ -36,12 +36,14 @@ it.each(['missing', 'syntax', 'throws', 'capability', 'unreadable-result'])('fix
     expect(scenario.judge(await scenario.run({ sourceRoot: root })).length).toBeGreaterThan(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-it('fixPresent returns false only for a successfully evaluated absent capability', () => {
-  const root = mkdtempSync(join(tmpdir(), 'pending-absent-'));
+it.each(['never-alert', 'always-alert'])('wrong id cannot mask a behavioral regression: %s', async regression => {
+  const root = mkdtempSync(join(tmpdir(), 'pending-wrong-id-'));
   try {
     const dir = join(root, 'scripts/conveyor/health-smells');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'red-team-pending-overdue.mjs'), "export default { id: 'old-smell', evaluate() { return []; } };");
-    expect(scenario.fixPresent(root)).toBe(false);
+    writeFileSync(join(dir, 'red-team-pending-overdue.mjs'), `export default { id: 'old-smell',
+      evaluate({prs}) { return prs.map(() => ({subject: 'example/project#1@abcdef1', breach: ${regression === 'always-alert'}})); } };`);
+    expect(scenario.fixPresent(root)).toBe(true);
+    expect(scenario.judge(await scenario.run({ sourceRoot: root })).length).toBeGreaterThan(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
