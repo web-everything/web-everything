@@ -11,7 +11,8 @@ import { chmodSync, mkdtempSync, readFileSync, writeFileSync, rmSync, statSync }
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { readLiveFixClaim, isClaimHolder, pushRefusal, repoKeyOf } from '../conveyor/fix-procedure.mjs';
-import { validateFixClaimMeta } from '../conveyor/fix-claim-store.mjs';
+import { fixDispatchClaimRoot, validateFixClaimMeta } from '../conveyor/fix-claim-store.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { protectedBranchNames, staleTrackerPushDecision } from '../guard-prototype-tracker.mjs';
@@ -100,10 +101,11 @@ function isolatedGit(gitDir, io, use) {
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 function defaults(io = {}) {
+  const lockRoot = fixDispatchClaimRoot(resolveCoordinationRoot({ env: {} }));
   return {
-    readClaim: (repo, pr) => readLiveFixClaim({ repo, pr }), isClaimHolder,
+    readClaim: (repo, pr) => readLiveFixClaim({ repo, pr, lockRoot }), isClaimHolder,
     branchClaimRefusal: (repo, branch, holder) => pushRefusal({ repo, branch,
-      sessionId: holder?.sessionId, who: holder?.who, token: holder?.token, strict: true }),
+      sessionId: holder?.sessionId, who: holder?.who, token: holder?.token, strict: true, lockRoot }),
     ghPrView: (repo, pr) => JSON.parse((io.runGh || runGhSync)(['pr', 'view', String(pr), '--repo',
       `github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}`, '--json', fields], {
       encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
@@ -183,8 +185,6 @@ function authorizedPush(options = {}) {
     const url = testIo.remoteUrl || `https://github.com/${CONSTELLATION_REPOS[repoKeyOf(repo)].slug}.git`;
     const args = ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--no-recurse-submodules',
       `--force-with-lease=refs/heads/${branch}:${expectedHead}`, url, `${sha}:refs/heads/${branch}`];
-    const final = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
-    if (!final.ok) return final;
     try {
       const tracker = trackerRefusal(options, temp, git);
       if (tracker) return tracker;
@@ -199,6 +199,9 @@ function authorizedPush(options = {}) {
     } catch { leaseReadError = true; }
     const guardReason = pushGuardDecision(`${sha} ${sha} refs/heads/${branch} ${expectedHead}`, { lease, leaseReadError });
     if (guardReason) return fail(leaseReadError ? 'unreadable' : 'pinned-checkout', guardReason);
+    // Keep the live authority read adjacent to the push: all other probes must finish first.
+    const final = readPushAuthority({ ...options, io: { ...ports, isAncestor: () => true } });
+    if (!final.ok) return final;
     try {
       const result = ports.gitPush ? ports.gitPush(temp, args) : git(temp, args);
       const lines = result.stdout?.split('\n');

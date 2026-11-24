@@ -9,6 +9,8 @@ const readPushAuthority = options => createAuthorizedPushForTesting(options.io).
 import { PUSH_HOLD_LABELS } from '../review-hold-model.mjs';
 import { runGhSync } from '../gh-throttle.mjs';
 import { pushRefusal } from '../../conveyor/fix-procedure.mjs';
+import { fixDispatchClaimRoot } from '../../conveyor/fix-claim-store.mjs';
+import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { authorizedPush as publicPush, readPushAuthority as publicRead } from '../authorized-push.mjs';
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({ ...await importOriginal(), runGhSync: vi.fn() }));
@@ -90,7 +92,8 @@ describe('authorized push', () => {
     f.holder = { sessionId: 'mine', who: 'worker', token: 'secret' };
     pushRefusal.mockReturnValue({ refused: true, pr: 99 });
     expect(authorizedPush(f)).toMatchObject({ ok: false, code: 'foreign-claim' });
-    expect(pushRefusal).toHaveBeenCalledWith({ repo: 'we', branch: 'lane/fix', ...f.holder, strict: true });
+    expect(pushRefusal).toHaveBeenCalledWith({ repo: 'we', branch: 'lane/fix', ...f.holder, strict: true,
+      lockRoot: fixDispatchClaimRoot(resolveCoordinationRoot({ env: {} })) });
     expect(f.io.gitPush).not.toHaveBeenCalled();
   });
   it('pins exactly the four push hold labels', () => {

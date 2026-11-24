@@ -1,15 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { authorizedPush, readPushAuthority } from '../authorized-push.mjs';
 import { createAuthorizedPushForTesting, nonTestFactoryImports, snapshotOptionsForTesting } from './helpers/authorized-push-factory.mjs';
 import { acquireFixClaim, fixBegin, fixEnd, pushRefusal, readLiveFixClaim } from '../../conveyor/fix-procedure.mjs';
-import { listFixDispatchClaimsStrict } from '../../conveyor/fix-claim-store.mjs';
+import { fixDispatchClaimRoot, listFixDispatchClaimsStrict } from '../../conveyor/fix-claim-store.mjs';
+import { resolveCoordinationRoot } from '../../operations/coordination-root.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 
 vi.mock('node:child_process', async original => ({ ...await original(), spawnSync: vi.fn(() => { throw new Error('No git permitted'); }) }));
+vi.mock('../../operations/coordination-root.mjs', async original => {
+  const coordination = await original();
+  return { ...coordination, resolveCoordinationRoot: vi.fn(coordination.resolveCoordinationRoot) };
+});
+vi.mock('../../conveyor/fix-procedure.mjs', async original => {
+  const procedure = await original();
+  return { ...procedure, readLiveFixClaim: vi.fn(procedure.readLiveFixClaim), pushRefusal: vi.fn(procedure.pushRefusal) };
+});
 const roots = [], nowMs = Date.now(), head = 'a'.repeat(40);
 afterEach(() => { vi.clearAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function fixture() {
@@ -28,7 +37,82 @@ function fixture() {
     dir: () => lockDirFor(lockRoot, 'fix-dispatch:we:fixing:42') };
 }
 
+function pushFixture() {
+  const root = mkdtempSync(join(process.env.TMPDIR, 'push-s1c-order-')); roots.push(root);
+  const sha = 'b'.repeat(40), events = [];
+  let probed = false, pushed = false;
+  const entry = { meta: { repo: 'we', pr: 42, kind: 'fixing', ttlMinutes: 20, branch: 'lane/fix', sessionId: 'mine' } };
+  const io = { gh: 'fixture-gh', isAncestor: () => true,
+    readClaim: vi.fn(() => { events.push('claim'); return entry; }),
+    branchClaimRefusal: vi.fn(() => { events.push('branch'); return null; }),
+    ghPrView: vi.fn(() => {
+      events.push('view');
+      return { headRefName: 'lane/fix', headRefOid: pushed ? sha : head, labels: [],
+        state: 'OPEN', isDraft: false, isCrossRepository: false };
+    }),
+    spawn: vi.fn((_bin, args) => {
+      events.push(args.includes('--git-path') ? 'lease' : 'git');
+      if (args.includes('init')) mkdirSync(join(args.at(-1), 'objects/info'), { recursive: true });
+      if (args.includes('--git-path')) probed = true;
+      return { status: 0, stdout: args.includes('--git-common-dir') ? `${root}\n` : `${join(root, 'missing-lease')}\n` };
+    }),
+    gitPush: vi.fn(() => {
+      pushed = true; events.push('push');
+      return { status: 0, stdout: `To https://github.com/web-everything/web-everything.git\n \t${sha}:refs/heads/lane/fix\taaaa..bbbb\nDone\n` };
+    }),
+  };
+  const options = { repo: 'we', pr: 42, branch: 'lane/fix', expectedHead: head, sha, gitDir: root,
+    purpose: 'repair', holder: { sessionId: 'mine' } };
+  return { io, options, events, probed: () => probed, entry,
+    push: () => createAuthorizedPushForTesting(io).authorizedPush(options) };
+}
+
 describe('PUSH-GATE-S1C Tier-1 negatives', () => {
+  it('default ports ignore WE_COORDINATION_ROOT and see foreign claims under the fixed home layout at call time', () => {
+    const f = fixture(), home = join(f.options.lockRoot, 'home');
+    const originalResolve = vi.mocked(resolveCoordinationRoot).getMockImplementation();
+    const decoy = join(f.options.lockRoot, 'decoy');
+    const gate = createAuthorizedPushForTesting({ gh: 'fixture-gh', ghPrView: () => f.view, isAncestor: () => true });
+    try {
+      vi.mocked(resolveCoordinationRoot).mockImplementation(options => originalResolve({ ...options, home }));
+      vi.stubEnv('WE_COORDINATION_ROOT', decoy);
+      const fixed = join(home, 'workspace', '.operations', 'coordination', 'fix-dispatch-claims');
+      expect(fixDispatchClaimRoot(resolveCoordinationRoot({ env: {} }))).toBe(fixed);
+      for (const lockRoot of [fixed, fixDispatchClaimRoot(decoy)])
+        expect(acquireFixClaim({ ...f.options, lockRoot, branch: 'lane/fix' }).ok).toBe(true);
+      expect(acquireFixClaim({ ...f.options, lockRoot: fixed, pr: 99, sessionId: 'foreign', branch: 'lane/fix' }).ok).toBe(true);
+      vi.mocked(readLiveFixClaim).mockClear(); vi.mocked(pushRefusal).mockClear();
+      const result = gate.readPushAuthority({ repo: 'we', pr: 42, branch: 'lane/fix', expectedHead: head, sha: head,
+        gitDir: '.', purpose: 'repair', holder: { sessionId: 'mine' } });
+      expect.soft(readLiveFixClaim).toHaveBeenCalledWith({ repo: 'we', pr: 42, lockRoot: fixed });
+      expect.soft(pushRefusal).toHaveBeenCalledWith(expect.objectContaining({ lockRoot: fixed, strict: true }));
+      expect(result).toMatchObject({ ok: false, code: 'foreign-claim' });
+      expect(spawnSync).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(resolveCoordinationRoot).mockImplementation(originalResolve);
+      vi.unstubAllEnvs();
+    }
+  });
+  it('refuses a hold that appears only after the lease probe, with zero pushes', () => {
+    const f = pushFixture(), view = f.io.ghPrView;
+    f.io.ghPrView = () => ({ ...view(), labels: f.probed() ? [{ name: 'review:human' }] : [] });
+    expect.soft(f.push()).toMatchObject({ ok: false, code: 'hold-label' });
+    expect(f.probed()).toBe(true);
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it('refuses a claim released or expired only after the lease probe, with zero pushes', () => {
+    const f = pushFixture();
+    f.io.readClaim.mockImplementation(() => f.probed() ? null : f.entry);
+    expect.soft(f.push()).toMatchObject({ ok: false, code: 'not-claim-holder' });
+    expect(f.probed()).toBe(true);
+    expect(f.io.gitPush).not.toHaveBeenCalled();
+  });
+  it('reads final claim, strict branch scan and live PR immediately before the push port', () => {
+    const f = pushFixture();
+    expect(f.push()).toMatchObject({ ok: true });
+    const at = f.events.indexOf('push');
+    expect(f.events.slice(at - 4, at + 1)).toEqual(['lease', 'claim', 'branch', 'view', 'push']);
+  });
   it('freezes one data snapshot including holder, unaffected by later caller mutation', () => {
     const options = { branch: 'lane/fix', holder: { sessionId: 'mine', who: 'worker', token: 'secret' } };
     const snapshot = snapshotOptionsForTesting(options);
