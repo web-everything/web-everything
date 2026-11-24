@@ -130,7 +130,8 @@ describe('stale base fact reader', () => {
       mergeStateStatus: 'BLOCKED', isCrossRepository: false, comments: [],
       statusCheckRollup: f.failingChecks.map((c, i) => ({ name: c.name, conclusion: c.conclusion, workflowName: 'CI',
         detailsUrl: `https://github.com/repo/actions/runs/1/job/${i + 10}` })), ...changes };
-    const exec = vi.fn((cmd, args) => {
+    const exec = vi.fn((cmd, argv) => {
+      const args = argv[0] === 'api' ? ['api', ...argv.slice(1).filter(a => a !== '--allow-escape-sequences')] : argv; // job-log reads carry --allow-escape-sequences
       if (cmd === 'git') return '';
       if (args[0] === 'pr') return JSON.stringify(view);
       if (args[1].endsWith('/jobs/10/logs')) return log;
@@ -169,8 +170,7 @@ describe('stale base fact reader', () => {
     const result = readStaleBaseFacts(d.input);
     expect(result.decision).toMatchObject({ owed: true, via: 'main-green' });
     expect(d.exec.mock.calls.map(([cmd, args]) => [cmd, ...args.slice(0, 2)])).toEqual([
-      ['gh', 'pr', 'view'], ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/10/logs'],
-      ['gh', 'api', 'repos/web-everything/web-everything/actions/jobs/11/logs'],
+      ['gh', 'pr', 'view'], ['gh', 'api', '--allow-escape-sequences'], ['gh', 'api', '--allow-escape-sequences'],
       ['gh', 'api', `repos/web-everything/web-everything/compare/main...${facts().headRefOid}`],
       ['gh', 'api', `repos/web-everything/web-everything/compare/${'c'.repeat(40)}...${facts().headRefOid}`],
       ['gh', 'api', 'repos/web-everything/web-everything/pulls/5045/files'], ['git', '--literal-pathspecs', '-C'],
@@ -201,7 +201,7 @@ describe('stale base fact reader', () => {
   it('stops before compare on unreadable logs', () => {
     const d = fixture(); const original = d.exec.getMockImplementation();
     d.exec.mockImplementation((cmd, args, opts) => {
-      if (args[1]?.endsWith('/logs')) throw new Error('404');
+      if (args.filter(a => a !== '--allow-escape-sequences')[1]?.endsWith('/logs')) throw new Error('404');
       return original(cmd, args, opts);
     });
     expect(readStaleBaseFacts(d.input).decision.why).toMatch(/unreadable/);

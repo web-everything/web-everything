@@ -6,6 +6,7 @@
  *   Usage: node scripts/review-hold-probe.mjs --repo=owner/name --pr=123
  */
 import { readGh } from './lib/proc-read.mjs';
+import { ciJobLogApiArgs } from './lib/gh-ci-log.mjs';
 import { readReviewCiGate } from './lib/review-ci-gate-io.mjs';
 import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
 import { deriveReviewHold } from './lib/review-hold-model.mjs';
@@ -38,7 +39,7 @@ export function probe({ repo, pr, read = { gh, ghJson, freeze: readSharedFreeze 
   const mgRun = latest(runs, 'merge-gate');
   const rgRun = latest(runs, 'review-gate');
   const jobOf = (run) => (run ? read.ghJson(['api', `repos/${repo}/actions/jobs/${run.id}`]) : null);
-  const logOf = (run) => (run ? String(read.gh(['api', `repos/${repo}/actions/jobs/${run.id}/logs`])) : '');
+  const logOf = (run) => (run ? String(read.gh(ciJobLogApiArgs(`repos/${repo}/actions/jobs/${run.id}/logs`))) : '');
   const mergeGate = mgRun ? { state: mgRun.status === 'completed' ? 'completed' : 'pending', conclusion: mgRun.conclusion,
     ...ids(mgRun), jobHeadSha: mgRun.head_sha, latest: true, completedAt: mgRun.completed_at,
     logText: gateState(mgRun) === 'failure' ? logOf(mgRun) : '' } : null;

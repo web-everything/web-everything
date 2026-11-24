@@ -5,6 +5,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 import { readSettings } from './settings-files.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
@@ -126,7 +127,7 @@ export function readOwedMainRule(pr, { slug, exec = execFileSyncThrottled, cache
     const cached = readState(cache).verdicts?.[key];
     if (cached) return cached;
     const options = { encoding: 'utf8', stdio: 'pipe', timeout: 60_000, maxBuffer: 64 * 1024 * 1024 };
-    const logText = String(exec('gh', ['api', `repos/${slug}/actions/jobs/${job}/logs`], options));
+    const logText = String(exec('gh', ciJobLogApiArgs(`repos/${slug}/actions/jobs/${job}/logs`), options));
     const parsed = parseHandPickedOnlyFailure(logText);
     // Project each commit to its subject in jq: a commit BODY must never masquerade as a drain commit.
     const commits = parsed.only ? String(exec('gh', ['api', `repos/${slug}/pulls/${pr.number}/commits`, '--paginate', '--jq', '.[] | {subject: (.commit.message | split("\\n")[0]), author: .commit.author} | @json'], options)).split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)) : [];

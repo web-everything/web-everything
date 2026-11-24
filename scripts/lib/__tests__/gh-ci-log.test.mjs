@@ -92,6 +92,9 @@ function bypasses(source, name) {
   return errors;
 }
 
+// Remaining non-zero entries: reconcile-pass.mjs (lane/ci-log-read-deadline) and the drain-mq-* /
+// drain-queue-safety files (lane/drain-mq-flake-timeout) are fixed in those lanes; drop them when they merge.
+// ci-auth-diagnosis and credential-inventory use `gh run view --log`, not the jobs API.
 // Follow-up: finding-producing log readers on gh 2.104.
 // These readers retain origin/main's transport until their log matching is addressed.
 // Pin each existing bypass count so the allowlist grants no additional direct reads.
@@ -99,17 +102,17 @@ function bypasses(source, name) {
 const deferredFindingReaders = new Map([
   ['scripts/conveyor/ci-auth-diagnosis.mjs', 1],
   ['scripts/conveyor/credential-inventory.mjs', 1],
-  ['scripts/conveyor/ci-red-recovery-watch.mjs', 1],
+  ['scripts/conveyor/ci-red-recovery-watch.mjs', 0], // Swept to ciJobLogApiArgs (GH-LOG-ESCAPE-SWEEP).
   ['scripts/conveyor/main-ci-red-probe.mjs', 0], // Reads logs through ciJobLogApiArgs.
   ['scripts/conveyor/reconcile-pass.mjs', 1],
-  ['scripts/conveyor/stale-base-refresh.mjs', 1],
+  ['scripts/conveyor/stale-base-refresh.mjs', 0], // Swept.
   ['scripts/lib/drain-mq-failure-recovery-io.mjs', 1],
   ['scripts/lib/drain-queue-safety.mjs', 2],
   ['scripts/lib/finished-ci-cache.mjs', 0],
   ['scripts/lib/red-main-quarantine-io.mjs', 1], // Only the documented shell command remains; readJobFailures uses the helper.
-  ['scripts/lib/renamed-pr-refresh.mjs', 1],
-  ['scripts/operations/operator-queue.mjs', 1],
-  ['scripts/review-hold-probe.mjs', 1],
+  ['scripts/lib/renamed-pr-refresh.mjs', 0], // Swept.
+  ['scripts/operations/operator-queue.mjs', 0], // Swept.
+  ['scripts/review-hold-probe.mjs', 0], // Swept.
 ]);
 
 // Follow-up: timeout classifier on unfiltered logs: treat as unknown and retry, never eligible.
