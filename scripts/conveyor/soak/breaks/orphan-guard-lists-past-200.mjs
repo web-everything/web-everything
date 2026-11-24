@@ -14,6 +14,7 @@
 import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
+import { ghRepoSlug } from '../../../lib/constellation-repos.mjs';
 
 const PROBE = 'const { defaultListBounced } = await import(process.argv[1]);'
   + 'const seen = []; try { defaultListBounced("o/r", { exec: (...a) => { seen.push(a[1]); return "[]"; } }); } catch {}'
@@ -54,7 +55,7 @@ export default {
     if (queries.some(query => !query.includes('sort=created&direction=desc&per_page=100'))) {
       violations.push({ invariant: 'newest-first', detail: 'listing must request newest PRs first' });
     }
-    const slug = 'web-everything/web-everything';
+    const slug = ghRepoSlug('we');
     const comment = body => ({ body, createdAt: '2026-01-01T00:00:00Z', includesCreatedEdit: false,
       author: { login: 'web-everything' } });
     const comments = [comment(CHANGES_VERDICT_PREFIX),
