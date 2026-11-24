@@ -74,6 +74,7 @@ import {
 } from './health-watch-core.mjs';
 import { daemonJobsRoot } from '../operations/run-store.mjs';
 import { SMELLS } from './health-smells/index.mjs';
+import { parsePrepareTicks, parseDrainCatchupTicks } from './health-loop-ticks.mjs';
 import { readRecentSamples, appendSample, summarizeSample, findUngatedHeavyRuns } from './heavy-run-ungated.mjs';
 import { healthDir, healthSectionLines } from './health-watch-section.mjs';
 import { runDailyReadinessCheck, ledgerReadinessHistoryPath } from '../lib/ledger-readiness-daily.mjs';
@@ -1226,6 +1227,12 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // builder-starved — the build-dispatch daemon's JSON tick log lives in the coordination root, not `logsDir`.
   const builderLogs = attempt('builderLog', () => probeDaemonLogs(flags['builder-log-dir'] || defaultBuilderLogDir(), prev.builderCursors || {}, { only: ['build-dispatch-daemon'] }));
   if (builderLogs) probes.builderLog = builderLogs.samples[0] ?? { name: 'build-dispatch-daemon', text: '' };
+  // zero-success-alarm — per-loop success/failure records: prepare (the builder tick JSON, already read above) and
+  // drain catch-up (`daemon.log` lines). The review and fix daemon logs carry no per-tick success signal: unknown, not watched.
+  const drainLogs = attempt('loopTicksDrain', () => probeDaemonLogs(flags['drain-log-dir'] || join(homedir(), 'workspace', 'plateau-app', '.drain-daemon'), prev.loopCursors || {}, { only: ['daemon'] }));
+  if (builderLogs || drainLogs) {
+    probes.loopTicks = { records: [...parsePrepareTicks(probes.builderLog?.text), ...parseDrainCatchupTicks(drainLogs?.samples[0]?.text)] };
+  }
   // Daemon inventory: the declared daemon-status read (#4067) on a real host; the raw lease-dir scan only when a
   // test/fixture points --lock-root somewhere, or daemon-status itself fails (then that failure is a probe error).
   const leaseScan = () => probeLeases(flags['lock-root'] || RUNNER_LOCK_ROOT, new Set((logs?.samples || []).map((s) => s.name)));
@@ -1477,6 +1484,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   state.notifiedSilences = (result.state.silences || []).filter((x) => x.expiredNotified).map(silenceSig);
   delete state.silences;
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
+  state.loopCursors = drainLogs ? { ...(prev.loopCursors || {}), ...drainLogs.cursors } : prev.loopCursors;
   state.builderCursors = builderLogs ? { ...(prev.builderCursors || {}), ...builderLogs.cursors } : prev.builderCursors;
   state.ghCache = { at: ghCache.at ?? null };
   if (jobsState) state.jobs = jobsState;

@@ -2,6 +2,7 @@
 import {createPrivateKey,createPublicKey,generateKeyPairSync,sign,verify} from 'node:crypto';
 import {inspect} from 'node:util';
 import {runInNewContext} from 'node:vm';
+import {execFileSync} from 'node:child_process';
 import {describe,expect,it} from 'vitest';
 import {credentialBufferFinding,credentialContentFinding,manifestEntry} from '../forge-exec-manifest.mjs';
 import {keyStructureFinding} from '../forge-key-structure.mjs';
@@ -470,7 +471,6 @@ const timeOf=content=>{
   keyStructureFinding(content);
   return Number(process.hrtime.bigint()-start)/1e6;
 };
-const best=content=>Math.min(timeOf(content),timeOf(content),timeOf(content));
 
 describe('Forge key structure rescope: DSA and linear scan',()=>{
   it('blocks the red-team DSA layout in raw, base64 and hex form',()=>{
@@ -489,12 +489,33 @@ describe('Forge key structure rescope: DSA and linear scan',()=>{
     blocked(Buffer.from('['+[...realDsa].map(byte=>'0x'+byte.toString(16)).join(',')+']'));
   });
   it('scans repeated comment openers in linear time',()=>{
-    const cases=[n=>'/* '+keyType+' '+'{/*'.repeat(n)+'*/',n=>'{/* '.repeat(n)];
-    for(const make of cases) {
-      const small=best(Buffer.from(make(7500))),large=best(Buffer.from(make(15000)));
-      expect(large/Math.max(small,1)).toBeLessThan(3.2);
-    }
-  });
+    // Worker wall time includes scheduling pauses and other Vitest threads. Measure CPU
+    // in a dedicated child, after warming both sizes, while retaining the same growth limit.
+    const probe=`
+      import {keyStructureFinding} from ${JSON.stringify(new URL('../forge-key-structure.mjs',import.meta.url).href)};
+      const cases=[n=>'/* '+${JSON.stringify(keyType)}+' '+'{/*'.repeat(n)+'*/',n=>'{/* '.repeat(n)];
+      const cpuMs=content=>{
+        const start=process.cpuUsage();
+        keyStructureFinding(content);
+        const used=process.cpuUsage(start);
+        return (used.user+used.system)/1000;
+      };
+      const ratios=cases.map(make=>{
+        const small=Buffer.from(make(7500)),large=Buffer.from(make(15000));
+        cpuMs(small);cpuMs(large);
+        const smallTimes=[],largeTimes=[];
+        for(let i=0;i<3;i++){smallTimes.push(cpuMs(small));largeTimes.push(cpuMs(large));}
+        return Math.min(...largeTimes)/Math.max(Math.min(...smallTimes),1);
+      });
+      process.stdout.write(JSON.stringify(ratios));
+    `;
+    const output=execFileSync(process.execPath,['--input-type=module','-e',probe],{
+      encoding:'utf8',timeout:10000,maxBuffer:1024*1024,
+    });
+    const ratios=JSON.parse(output);
+    expect(ratios).toHaveLength(2);
+    for(const ratio of ratios)expect(ratio).toBeLessThan(3.2);
+  },12000);
   it('finishes 30,000 repetitions well under 4 s',()=>{
     for(const content of ['/* '+keyType+' '+'{/*'.repeat(30000)+'*/','{/* '.repeat(30000)])
       expect(timeOf(Buffer.from(content))).toBeLessThan(4000);

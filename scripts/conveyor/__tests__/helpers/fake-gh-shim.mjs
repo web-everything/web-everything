@@ -42,7 +42,8 @@
  *   - `label create NAME [--repo R] [--color C] [--description D] [--force]`
  *   - `api [--method M | -X M] [--paginate] [-F k=v]... PATH [--jq Q]` for:
  *       `user` (the same FAKE_GH_ACTOR that posts comments),
- *       `repos/{o}/{r}`, `repos/{o}/{r}/pulls/{n}`, `repos/{o}/{r}/pulls/{n}/files`,
+ *       `repos/{o}/{r}`, `repos/{o}/{r}/pulls` (state, created/updated sort, direction, per_page, page),
+ *       `repos/{o}/{r}/pulls/{n}`, `repos/{o}/{r}/pulls/{n}/files`,
  *       `repos/{o}/{r}/issues/{n}/events`, `repos/{o}/{r}/issues/{n}/timeline`,
  *       `repos/{o}/{r}/issues/{n}/comments`, `repos/{o}/{r}/compare/{a}...{b}`,
  *       `repos/{o}/{r}/contents/{path}?ref={sha}`,
@@ -507,6 +508,32 @@ function handleApi(store, rest) {
     if (path === 'graphql') return handleOpenPrPage(store, rest);
 
     let m;
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/pulls(?:\?(.*))?$/))) {
+      const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
+      const params = new URLSearchParams(m[3]);
+      const state = params.get('state') ?? 'open';
+      const sort = params.get('sort') ?? 'created';
+      const direction = params.get('direction') ?? 'desc';
+      const size = Number(params.get('per_page') ?? 30);
+      const page = Number(params.get('page') ?? 1);
+      if ([...params.keys()].some(k => !['state', 'sort', 'direction', 'per_page', 'page'].includes(k))
+        || !['open', 'closed', 'all'].includes(state) || !['created', 'updated'].includes(sort)
+        || !['asc', 'desc'].includes(direction) || !Number.isSafeInteger(size) || size < 1 || size > 100
+        || !Number.isSafeInteger(page) || page < 1) {
+        return { stderr: 'fake-gh: unsupported pulls pagination\n', exitCode: 1 };
+      }
+      // REST's closed list includes merged PRs; `gh pr list --state closed` does not.
+      const key = sort === 'updated' ? 'updatedAt' : 'createdAt';
+      const prs = filterPrs(repoState, { state: 'all' })
+        .filter(pr => state === 'all' || (state === 'open' ? pr.state === 'OPEN' : pr.state !== 'OPEN'))
+        .sort((a, b) => (a[key].localeCompare(b[key]) || a.number - b.number) * (direction === 'desc' ? -1 : 1));
+      return jsonResult(prs.slice((page - 1) * size, page * size).map(pr => ({
+        number: pr.number, title: pr.title, body: pr.body,
+        state: pr.state === 'OPEN' ? 'open' : 'closed', merged: pr.state === 'MERGED',
+        draft: pr.isDraft, user: pr.author,
+        created_at: pr.createdAt, updated_at: pr.updatedAt, closed_at: pr.closedAt, merged_at: pr.mergedAt,
+      })), jq);
+    }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)$/))) {
       const slug = `${m[1]}/${m[2]}`;
       const repoState = requireRepo(store, slug);
