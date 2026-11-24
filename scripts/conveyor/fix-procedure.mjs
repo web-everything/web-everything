@@ -62,7 +62,7 @@ import { resolve } from 'node:path';
 
 import { isLeaseExpired, readLockEntry, heartbeat, releaseLockDir, reserve, lockDirFor } from '../readiness/file-locks.mjs';
 import {
-  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, readFixDispatchClaim,
+  fixDispatchClaimRoot, fixDispatchResource, listFixDispatchClaims, listFixDispatchClaimsStrict, readFixDispatchClaim,
   fixDispatchSessionName, DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES,
 } from './fix-claim-store.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -267,6 +267,7 @@ export function acquireFixClaim({
     // The CURRENT hold's draft state — always the latest `fix-begin` call's own values, never merged forward
     // from a prior reentrant hold: a fixer may discover a scope-change mid-hold and re-`fix-begin --draft` the
     // SAME claim, and the newer call's intent must win.
+    ...(own && prior.meta?.draftedByClaim === true ? { draftedByClaim: true } : {}),
     draft: Boolean(draft), reason: draft ? (reason ?? null) : null,
     ttlMinutes, host,
   };
@@ -318,13 +319,17 @@ export function listLiveFixClaims({ repo = null, lockRoot = fixDispatchClaimRoot
  * @returns {null | {refused:true, pr:number, repo:string, holder:string, why:string, message:string}}
  */
 export function pushRefusal({
-  repo = null, branch, sessionId = null, who = null, token = null, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
+  repo = null, branch, sessionId = null, who = null, token = null, strict = false, lockRoot = fixDispatchClaimRoot(), nowMs = Date.now(),
 } = {}) {
   const b = normalizeBranch(branch);
   if (!b) return null;
   let repoKey = null;
   try { repoKey = repo == null ? null : repoKeyOf(repo); } catch { repoKey = null; }
-  const claims = listLiveFixClaims({ lockRoot, nowMs })
+  const scan = strict ? listFixDispatchClaimsStrict(lockRoot) : null;
+  if (scan?.unreadable) return { refused: true, code: 'claim-store-unreadable',
+    message: 'Claim store unreadable; restore claim evidence before retrying' };
+  const claims = (scan ? scan.entries.filter(e => e.meta?.kind === FIXING_KIND && isLiveFixClaim(e, nowMs))
+    : listLiveFixClaims({ lockRoot, nowMs }))
     .filter((e) => e.meta?.branch === b && (repoKey == null || e.meta.repo === repoKey));
   for (const entry of claims) {
     if (isClaimHolder(entry, { sessionId, who, token })) continue;
@@ -702,7 +707,14 @@ export async function fixBegin({
   const heldToken = claim.token ?? token;
   const steps = [];
   try {
-    if (draft && !view.isDraft) { await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']); steps.push('draft'); }
+    if (draft && view.isDraft === false) {
+      await gh(['pr', 'ready', String(pr), '--repo', slug, '--undo']);
+      const current = readLockEntry(lockRoot, claim.resource);
+      if (!current || !isClaimHolder(current, { who, sessionId, token: heldToken })) throw new Error('Claim changed while drafting');
+      heartbeat(lockRoot, claim.resource, current.owner, new Date(nowMs).toISOString(), null,
+        { ...current.meta, draftedByClaim: true });
+      steps.push('draft');
+    }
   } catch (e) {
     releaseFixClaim({ repo: repoKey, pr, who, sessionId, token: heldToken, lockRoot });
     return { ok: false, reason: 'draft-failed', detail: String(e?.message ?? e).split('\n')[0], pr: Number(pr) };
