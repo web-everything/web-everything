@@ -93,9 +93,12 @@ export function deriveNextOwner(pr, thresholds = STALL_DEFAULTS) {
 
 export function needsJudgment(pr, thresholds = STALL_DEFAULTS) {
   const judgment = existingJudgment(pr, thresholds);
+  const nextOwner = deriveNextOwner(pr, thresholds).nextOwner;
+  // A conflict-derived fixer with no live fixer is still unattended: keep the stall guard.
+  const unattended = ['nobody', 'orchestrator'].includes(nextOwner)
+    || (nextOwner === 'fixer' && pr.mergeable === 'CONFLICTING' && !pr.fixerRunning);
   if (judgment.reason === 'waiting on review' && !pr.owner && !pr.inCi
-    && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes)
-    && ['nobody', 'orchestrator'].includes(deriveNextOwner(pr, thresholds).nextOwner)) {
+    && ownerAge(pr) > (thresholds.unownedMinutes ?? STALL_DEFAULTS.unownedMinutes) && unattended) {
     return { needsJudgment: true, reason: 'unowned: inspect PR and assign the next responsible worker' };
   }
   return judgment;

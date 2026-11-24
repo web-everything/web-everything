@@ -326,6 +326,11 @@ describe('next responsible owner from existing facts', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ mergeable: 'CONFLICTING', fixerRunning: false })))
       .toEqual({ nextOwner: 'fixer', nextStep: 'Resolve the conflict.' });
   });
+  it('a conflicting PR with no fixer still escalates when unattended past the unowned age', () => {
+    const stale = { mergeable: 'CONFLICTING', fixerRunning: false, owner: null, minutesSinceUpdate: 1, minutesSinceFixLoop: 90 };
+    expect(judgeSweepFacts.needsJudgment(facts(stale))).toMatchObject({ needsJudgment: true });
+    expect(judgeSweepFacts.needsJudgment(facts({ ...stale, fixerRunning: true }))).toMatchObject({ needsJudgment: false });
+  });
   it('keeps a running fixer responsible for a needs-human PR', () => {
     expect(judgeSweepFacts.deriveNextOwner(facts({ fixerRunning: true, labels: ['status:needs-human'] })))
       .toMatchObject({ nextOwner: 'fixer' });
