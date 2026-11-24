@@ -4,12 +4,12 @@ import { resolve } from 'node:path';
 const SOURCE = 'scripts/lib/mq-failure-refresh.mjs';
 export async function probe(refreshMqFailureHead) {
   const head = 'a'.repeat(40), merged = 'b'.repeat(40), violations = [];
-  const run = async (labels, recorded, holdAfterMerge = false) => {
+  const run = async (labels, recorded, holdAfterMerge = '') => {
     const calls = [];
     const io = {
       readHead: () => head, readAuthorization: () => ({ labels, state: 'OPEN', isDraft: false }),
       createCheckout: () => ({ cwd: 'fixture/x', branch: 'lane/x' }),
-      git: ({ args }) => { calls.push(args[0]); if (args[0] === 'merge' && holdAfterMerge) labels = ['review:human']; return args[0] === 'merge' ? { ok: true, head: merged } : { ok: true }; },
+      git: ({ args }) => { calls.push(args[0]); if (args[0] === 'merge' && holdAfterMerge) labels = [{ name: holdAfterMerge }]; return args[0] === 'merge' ? { ok: true, head: merged } : { ok: true }; },
       removeCheckout: () => {},
     };
     const ledger = {
@@ -17,14 +17,18 @@ export async function probe(refreshMqFailureHead) {
       recordRefresh: () => ({ recorded }),
       recordFixFallback: () => ({ recorded: true }), readRefreshSuccessor: () => false,
     };
-    await refreshMqFailureHead({ repo: 'o/r', pr: 1, head, ledger, io }); return calls;
+    const result = await refreshMqFailureHead({ repo: 'o/r', pr: 1, head, ledger, io }); calls.result = result?.action; return calls;
   };
-  if (!(await run([], true)).includes('push')) violations.push('authorized control never pushed');
-  if ((await run([], true, true)).includes('push')) violations.push('hold added after merge did not block push');
-  const held = await run([{ name: 'review:human' }], true);
-  if (held.includes('claim') || held.includes('push')) violations.push('a review:human PR was claimed or pushed');
+  const control = await run([], true);
+  if (!control.includes('push') || control.result !== 'refreshed') violations.push('authorized control never pushed or did not report refreshed');
+  for (const label of ['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical']) {
+    const late = await run([], true, label);
+    if (late.includes('push') || late.result !== 'stop') violations.push(`${label} added after merge was not a stop without push`);
+    const held = await run([{ name: label }], true);
+    if (held.includes('claim') || held.includes('push') || held.result !== 'stop') violations.push(`a ${label} PR was claimed, pushed or not stopped`);
+  }
   const unconfirmed = await run([], false);
-  if (unconfirmed.includes('push')) violations.push('push happened without a confirmed successor reservation');
+  if (unconfirmed.includes('push') || unconfirmed.result === 'refreshed') violations.push('push happened without a confirmed successor reservation');
   return violations;
 }
 export default {

@@ -94,7 +94,11 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
     if (successor?.recorded !== true) return yield* fallback('Successor reservation unconfirmed; normal fix required');
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed after merge; refusing stale push');
     const pushHeld = yield* authorize();
-    if (pushHeld) { yield* fallback(pushHeld); return stop(pushHeld); }
+    if (pushHeld) {
+      // A detected hold always ends in stop, even when recording the fallback throws (never retried into fix).
+      try { yield* fallback(pushHeld); } catch { /* hold wins */ }
+      return stop(pushHeld);
+    }
     const pushed = yield () => io.git({ cwd: checkout.cwd, args: ['push', 'origin', `HEAD:refs/heads/${checkout.branch}`] });
     if (!pushed?.ok) return yield* fallback('Ordinary push rejected; normal fix required (no retry)');
     return { action: 'refreshed', head: merged.head };

@@ -324,6 +324,17 @@ describe('MQ refresh authorization and accounting', () => {
     expect(options.io.removeCheckout).toHaveBeenCalledWith(checkout);
     expect(await options.ledger.readFixFallback(identity)).toBe(true);
   });
+  it('a throwing fallback record after a detected hold stops; the retry never returns fix', async () => {
+    const options = fixture();
+    options.io.git.mockImplementation(async ({ args }) => {
+      if (args[0] === 'merge') options.io.readAuthorization.mockResolvedValue({ labels: [{ name: 'review:human' }], state: 'OPEN', isDraft: false });
+      return { ok: true, head: newHead };
+    });
+    const record = options.ledger.recordFixFallback.bind(options.ledger);
+    options.ledger = { ...options.ledger, recordFixFallback: vi.fn(async id => { if (options.ledger.recordFixFallback.mock.calls.length === 1) throw new Error('disk'); return record(id); }) };
+    const result = await refreshMqFailureHead(options);
+    expect(result.action).toBe('stop'); expect(pushes(options)).toHaveLength(0);
+  });
   it.each([undefined, [null]])('unreadable labels after merge stop publication (%j)', async labels => {
     const options = fixture(); options.io.readAuthorization.mockResolvedValueOnce({ labels: [], state: 'OPEN', isDraft: false }).mockResolvedValue({ labels, state: 'OPEN', isDraft: false });
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/labels unreadable/) });
