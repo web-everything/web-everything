@@ -54,7 +54,7 @@ export function assessDaemonState(entry, { observedAt, staleAfterMs, lastTick = 
  * Assess the raw `collectRunnerActivity` snapshot: each `runners[]` entry gets its own `state`/`stalled`/
  * `stalledReason` via {@link assessDaemonState}. The top-level `state`/`stalled`/`stalledReason`/`dispatching`
  * fields mirror the `dispatcher` entry specifically (the pre-existing "driver health" vocabulary the
- * `runner-status` skill and `docs/agent/testing.md` already document) — a consumer that only cares about the
+ * `runner-status` skill and `docs/agent/testing.d/036-runner-activity-report.md#runner-activity-report` already document) — a consumer that only cares about the
  * conveyor dispatcher, as every caller did before this operation reported on three daemons, reads exactly the
  * same top-level shape as before. A consumer that wants the fix-dispatch or review daemon's health reads
  * `runners[]` by `name`.

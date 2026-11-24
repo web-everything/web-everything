@@ -268,7 +268,7 @@ export async function probeLiveOwnerWatch({ dir, now = Date.now(), config = {}, 
  * after Node boot and imports, so it gets the kill timeout minus a fixed start-up margin; the probe skips a
  * tick too short to leave one. This keeps the budget checks from running past the kill. It does NOT bound
  * the work after an intent record: an action admitted near the end of the budget can still be killed
- * between intent and did (acting is off by default; disclosed in docs/agent/testing.md).
+ * between intent and did (acting is off by default; disclosed in docs/agent/testing.d/096-live-owner-watch-import-ordering.md#live-owner-watch-import-ordering).
  */
 export function liveOwnerChildEnv({ now, timeoutMs, env = process.env }) {
   return { ...env, WE_LIVE_OWNER_WATCH_NOW: String(now),

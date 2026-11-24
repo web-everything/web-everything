@@ -129,7 +129,7 @@ Before step 1 advances the cursor, run:
 node scripts/operations/coroner-false-findings.mjs --since=<ISO|last> --json > "$SCRATCH/false-findings.json"
 ```
 
-Confirm or correct the rule-guessed causes using *docs/agent/testing.md → False-finding coroner pass*.
+Confirm or correct the rule-guessed causes using [False-finding coroner pass](../../docs/agent/testing.d/057-false-finding-coroner-pass.md#false-finding-coroner-pass).
 Report counts by cause, lens/seat and PR type, with up to 3 examples each. Keep shadow findings apart.
 
 ## 3. Mark NEW vs COVERED

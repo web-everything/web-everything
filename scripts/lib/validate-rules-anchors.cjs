@@ -704,7 +704,7 @@ function runStatuteCheck() {
   // Reference corpus for the orphan rule: every backlog body + every docs/agent doc (the statute doc
   // itself included — in-doc `(#id)` links count; its `{#id}` definitions don't, per the lookbehind).
   const texts = [];
-  for (const dir of ['backlog', path.join('docs', 'agent')]) {
+  for (const dir of ['backlog', path.join('docs', 'agent'), path.join('docs', 'agent', 'testing.d')]) {
     for (const name of fs.readdirSync(path.join(ROOT, dir))) {
       if (name.endsWith('.md')) texts.push(fs.readFileSync(path.join(ROOT, dir, name), 'utf8'));
     }

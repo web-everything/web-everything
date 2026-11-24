@@ -16,7 +16,7 @@ node scripts/operations/run.mjs stale-state --json
 Read `verdict.records` and `verdict.gaps`. Each record carries observed PID evidence, age in
 milliseconds, `live` / `dead` / `unknown`, and best-effort `hasUnsafeWork` (`null` means unknown).
 The scope and evidence limits are described in
-[the testing guide](../../docs/agent/testing.md#stale-state-inventory).
+[the testing guide](../../docs/agent/testing.d/045-web-cases-protocol-conformance-fixtures.md#stale-state-inventory).
 
 ## The null-PID trap
 
