@@ -1695,7 +1695,7 @@ function operatorSendBackAfterReview(pr) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
-  advisoryReview = null, reviewAfterFix = null,
+  advisoryReview = null, reviewAfterFix = null, allowConversion = true,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1771,6 +1771,11 @@ function dispatchReviewRow({
       ? planConvertSupersededVerdict({ headSha, reviewedSha, comments: pr?.comments })
       : { convert: false };
     if (conversion.convert) {
+      if (!allowConversion) {
+        refuse('already-reviewed-head', { ...withPhase, ...extra, headSha, reviewedSha,
+          why: 'this head needs advisory conversion; the not-a-ci-break fold dispatches reviews only' });
+        return;
+      }
       // A targeted-check agent is a review emission too, so a required `review-gate` conflict still refuses it
       // (the early planner refusal no longer reaches a `needs-human` PR). Other required-check states are
       // deliberately NOT applied here: converting a superseded verdict never waited on CI (#xconv1).
@@ -3458,14 +3463,19 @@ export function planReconcile({
           });
           if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
           // Retain the escalation and fold the review prerequisite into the same row for every
-          // review phase, including accepted and re-review PRs. The shared dispatcher still owns
-          // head eligibility and CI: this verdict cannot override a required check's actual result.
+          // review phase, including accepted and re-review PRs. Newly admitted phases require
+          // strict CI evidence before the shared dispatcher can apply fast-check or conversion policy.
           if (isNotCiBreak) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'ciHealNotCiBreak');
+            if (!withPhase.labels.includes(REVIEW_LABELS.pending) && !reviewCi.allowed) {
+              foldRefusal('review-ci', { ci: reviewCi,
+                why: `${reviewCi.reason}: ${reviewCi.affected.map(row => `${row.name}=${row.reason}`).join(', ')}` });
+              continue;
+            }
             dispatchReviewRow({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
               refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
-              extra: { ciHealNotCiBreak: true },
+              extra: { ciHealNotCiBreak: true }, allowConversion: false,
             });
           }
           continue;

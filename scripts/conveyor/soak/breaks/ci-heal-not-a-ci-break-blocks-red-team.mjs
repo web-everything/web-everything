@@ -34,7 +34,7 @@ const pr = { rowsComplete: true, rowsHead: '${HEAD}', number: 2783, state: 'OPEN
   labels: [{ name: label }, { name: 'ci:failed' }], mergeStateStatus: 'CLEAN',
   statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
   comments: [{ author: { login: 'web-everything' }, body: buildCiHealEscalationComment({ headSha: '${HEAD}', outcome: 'not-a-ci-break', reason: 'review gate only' }) }] };
-const plan = planReconcile({ prs: [pr], agents: [], now: ${NOW} });
+const plan = planReconcile({ prs: [pr], agents: [], requiredChecks: ['gate'], now: ${NOW} });
 console.log(JSON.stringify(plan.dispatch.map((d) => d.kind)));
 `;
 
@@ -53,7 +53,7 @@ export default {
   fixedBy: { sha: 'lane/ci-heal-escalation-nonblock', where: 'lane/ci-heal-escalation-nonblock', paths: [CORE] },
   fixPresent(root) {
     if (!existsSync(join(root, CORE)) || !existsSync(join(root, MARK))) return false;
-    try { return planKinds(root, 'review:human').includes('review'); } catch { return false; }
+    return planKinds(root, 'review:human').includes('review');
   },
   async run({ log } = {}) {
     try {

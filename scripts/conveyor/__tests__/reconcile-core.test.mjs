@@ -1448,6 +1448,44 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
       expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 2783 })]);
     });
 
+    const defaultPolicyPlan = (label, checks, { requiredChecks = ['gate'], conversion = false } = {}) => planReconcileCore({
+      requiredChecks, prs: [pr2783({ labels: lbl(label, 'ci:failed'), statusCheckRollup: checks,
+        comments: [
+          ...(conversion ? [
+            { author: AUTOMATION, body: `✅ review — accepted\n\n${buildReviewedShaMarker(HEAD_2783)}` },
+            { author: AUTOMATION, body: '**`review:accepted` removed — mutual exclusivity (#2766/#2767).**' },
+          ] : []),
+          { author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: HEAD_2783, outcome: 'not-a-ci-break' }) },
+        ],
+      })], agents: [], now: NOW,
+    });
+    const fastGreen = ['standards', 'test-shard (1)'].map(name => ({ name, status: 'completed', conclusion: 'success' }));
+
+    it('default policy refuses an accepted PR with green fast checks but missing required integration', () => {
+      const plan = defaultPolicyPlan('review:accepted', [...fastGreen, ...greenRollup], { requiredChecks: ['gate', 'integration'] });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals[0].reviewRefusal).toMatchObject({ kind: 'review-ci',
+        ci: { affected: [{ name: 'integration', reason: 'missing' }] } });
+    });
+
+    it('default policy dispatches an accepted PR when every required check is green', () => {
+      const plan = defaultPolicyPlan('review:accepted', [...fastGreen, ...greenRollup,
+        { name: 'integration', status: 'completed', conclusion: 'success' }], { requiredChecks: ['gate', 'integration'] });
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', ciHealNotCiBreak: true })]);
+    });
+
+    it('default policy refuses review:human advisory conversion with a failed required gate', () => {
+      const plan = defaultPolicyPlan('review:human', [...fastGreen, ...redRollup], { conversion: true });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals[0].reviewRefusal).toMatchObject({ kind: 'review-ci',
+        ci: { affected: [{ name: 'gate', reason: 'failure' }] } });
+    });
+
+    it('default policy preserves review:pending fast-check admission with missing integration', () => {
+      const plan = defaultPolicyPlan('review:pending', [...fastGreen, ...greenRollup], { requiredChecks: ['gate', 'integration'] });
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', ciHealNotCiBreak: true })]);
+    });
+
     it('not-a-ci-break escalation folds the CI prerequisite for the re-review phase', () => {
       const plan = escalatedPlan(['review:human'], redRollup);
       expect(plan.dispatch).toEqual([]);
