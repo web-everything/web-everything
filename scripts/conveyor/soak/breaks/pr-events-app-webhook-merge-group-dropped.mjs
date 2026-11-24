@@ -32,9 +32,14 @@ export default {
       headers: { 'x-github-event': 'merge_group', 'x-github-delivery': 'soak-1', 'x-hub-signature-256': sig } }),
     { GITHUB_APP_WEBHOOK_SECRET: 'appsec' }, { getLog: () => log });
     if (res.status !== 202) violations.splice(0, 0, `app-signed merge_group answered ${res.status}, not 202`);
+    const stored = log.read(0).events;
+    if (stored.length !== 1 || stored[0].type !== 'merge_group' || stored[0].sha !== 'c'.repeat(40)) violations.splice(0, 0, 'the merge_group delivery was acknowledged but not stored');
     try {
-      const { detectSeqGap } = await import(pathToFileURL(join(root, 'scripts/lib/forge-adapter/change-events.mjs')).href);
-      if (!detectSeqGap(2, [{ seq: 4 }])) violations.splice(0, 0, 'a skipped seq was not flagged as a gap');
+      const { readChangeEvents } = await import(pathToFileURL(join(root, 'scripts/lib/forge-adapter/change-events.mjs')).href);
+      const feed = (events, cursor) => readChangeEvents(2, { url: 'http://x', token: 't', fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ cursor, events }) }) });
+      if (!(await feed([{ seq: 4 }], 4)).gap) violations.splice(0, 0, 'a skipped seq was not flagged as a gap by the feed read');
+      if (!(await feed([], 5)).gap) violations.splice(0, 0, 'a cursor moved past an empty page was not flagged as a gap');
+      if ((await feed([{ seq: 3 }], 3)).gap) violations.splice(0, 0, 'a contiguous page was flagged as a gap');
     } catch { violations.splice(0, 0, 'forge.change-events port missing'); }
     return { violations };
   },

@@ -6,7 +6,8 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readChangeEvents, detectSeqGap } from '../change-events.mjs';
-import { mapDelivery, readGithubChanges } from '../github/change-events.mjs';
+import { mapDelivery } from '../github/change-events.mjs';
+import { isRelevantEvent } from '../../pr-events.mjs';
 
 const REPO = { full_name: 'web-everything/web-everything' };
 const SHA = 'a'.repeat(40);
@@ -19,7 +20,7 @@ describe('forge.change-events', () => {
     const pr = mapDelivery('pull_request', { action: 'synchronize', number: 9, repository: REPO, pull_request: { head: { sha: SHA } } }, { deliveryId: 'd2', receivedAt: 2 });
     expect(pr).toMatchObject({ type: 'pull_request', prs: [9], sha: SHA });
     const body = { cursor: 5, events: [{ seq: 3, id: 'x' }, { seq: 5, id: 'y' }], more: false };
-    const r = await readGithubChanges(2, { url: 'http://x', token: 't', fetchImpl: fetchOf(body) });
+    const r = await readChangeEvents(2, { url: 'http://x', token: 't', fetchImpl: fetchOf(body) });
     expect(r.ok).toBe(true);
     expect(r.gap).toBe(true);
   });
@@ -28,6 +29,27 @@ describe('forge.change-events', () => {
     expect(detectSeqGap(2, [{ seq: 3, at: 'T' }, { seq: 4, at: 'T' }])).toBe(false);
     expect(detectSeqGap(2, [{ seq: 4 }])).toBe(true);
     expect(detectSeqGap(null, [{ seq: 9 }])).toBe(false);
+  });
+
+  it('unprovable feeds are gaps: invalid seq, and a cursor that moved past an empty page', async () => {
+    expect(detectSeqGap(2, [{ id: 'no-seq' }])).toBe(true);
+    expect(detectSeqGap(2, [{ seq: 3 }], 3)).toBe(false);
+    const r = await readChangeEvents(2, { url: 'http://x', token: 't', fetchImpl: fetchOf({ cursor: 5, events: [] }) });
+    expect(r).toMatchObject({ ok: true, gap: true });
+  });
+
+  it('an adapter declaring change-events unsupported routes to a person and is never read', async () => {
+    let read = 0;
+    const adapter = { capabilities: () => ({ 'change-events': { support: 'unsupported' } }), read: async () => { read += 1; return { ok: true, events: [] }; } };
+    const r = await readChangeEvents(1, { adapter });
+    expect(r).toMatchObject({ ok: false, route: 'person' });
+    expect(read).toBe(0);
+  });
+
+  it('merge_group events wake the review and drain roles', () => {
+    const e = { type: 'merge_group', action: 'checks_requested', repo: REPO.full_name, prs: [7], sha: SHA };
+    expect(isRelevantEvent(e, 'review')).toBe(true);
+    expect(isRelevantEvent(e, 'drain')).toBe(true);
   });
 
   it('an unknown event type is dropped from the wake set, never treated as all clear', () => {
