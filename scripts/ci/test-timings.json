@@ -2358,6 +2358,7 @@
   "scripts/conveyor/soak/breaks/pr-stall-digest-disable-and-path-collision.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/pr-sweep-unhealthy-owner-and-symlink-entry.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/prepare-batch-publication-boundaries.soak.test.mjs": 1.4,
+  "scripts/conveyor/soak/breaks/referral-comment-edit-unrouted-graphql.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/prepare-batch-window-and-failure-accounting.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/prepare-ended-open-pr-slot-and-title-write.soak.test.mjs": 1.4,
   "scripts/conveyor/soak/breaks/prepare-guard-recovery-and-capacity.soak.test.mjs": 1.4,
