@@ -4033,7 +4033,10 @@ describe('xng7q1p mechanical timeout precedence', () => {
     expect(rerunInFlight(live, { ...o, budget: b(8 * 60_000) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: b(60_000) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000) })).toBe(false);
-    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    expect(rerunInFlight(dead, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    // a live or unknown (incomplete rollup) run always holds, whatever the marker's age
+    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(true);
+    expect(rerunInFlight({ ...dead, rollupIncomplete: true }, { ...o, budget: b(2 * 3_600_000) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000, { reason: 'timeout-state-unreadable:x' }) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: { confirmed: 0, pending: false } })).toBe(false);
   });

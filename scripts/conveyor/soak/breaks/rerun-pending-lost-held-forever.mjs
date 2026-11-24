@@ -44,5 +44,24 @@ export async function scenario(sourceRoot) {
   const out = planReconcile({ prs: [pr], now, requiredChecks: ['test'], reviewTiming: { startAfter: 'ci-green' } });
   const heldForever = out.refusals.some((r) => r.kind === 'ci-timeout-rerun-in-flight');
   const replans = out.dispatch.some((d) => d.kind === 'ci-timeout-rerun' || d.kind === 'ci-heal');
-  return { replans, violations: heldForever ? ['lost pending marker holds the PR as ci-timeout-rerun-in-flight forever'] : [] };
+  const violations = [];
+  if (heldForever) violations.push('lost pending marker holds the PR as ci-timeout-rerun-in-flight forever');
+  if (!replans) violations.push('a lost pending marker produced no re-run or ci-heal dispatch');
+  // Durable cleanup: the dispatcher must be able to expire the marker (else the planned ci-heal is refused forever).
+  try {
+    const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const disp = await import(pathToFileURL(join(root, 'scripts/operations/ci-heal-pr-dispatch.mjs')).href);
+    const { timeoutKey } = await import(pathToFileURL(join(root, 'scripts/conveyor/timeout-retry-state.mjs')).href);
+    const dir = mkdtempSync(join(tmpdir(), 'rerun-lost-'));
+    mkdirSync(dir, { recursive: true });
+    const target = { run: 123, job: 456, attempt: 1 };
+    const evidence = { repo, pr: 7431, head };
+    writeFileSync(join(dir, `${timeoutKey(evidence)}.json`), JSON.stringify({ version: 1, evidence,
+      requests: [{ id: 0, target, status: 'pending', reservedAt: '2026-11-24T17:56:00Z' }] }));
+    const observe = () => ({ repo, head, runHead: head, open: true, run: 123, job: 456, jobRun: 123, attempt: 1, status: 'completed', conclusion: 'failure' });
+    await disp.expireLostPending({ repo, pr: 7431, head, dir, now: () => now, effects: { observe } });
+    if (disp.readTimeoutHold({ repo, pr: 7431, head, dir })) violations.push('ci-heal stays held by a lost pending marker the dispatcher cannot expire');
+  } catch (error) { violations.push(`dispatcher cannot expire a lost marker: ${error.message}`); }
+  return { replans, violations };
 }

@@ -446,6 +446,7 @@ export async function runReconcileCiHealDispatch({
   retryTimeout = dispatchTimeoutRetry,
   flushTimeouts = flushTimeoutFollowups,
   timeoutHold = readTimeoutHold,
+  expireLost = expireLostPending,
   salvage = defaultSalvage,
   fixLoop = defaultFixLoop,
   fixConfig = fixLoopConfig(),
@@ -580,7 +581,13 @@ export async function runReconcileCiHealDispatch({
       const unsettled =healObservations.find(row => row.pr === entry.prNumber && row.status !== 'resolved');
       if (unsettled) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-unsettled', why: unsettled.error ?? 'owned wrapper still running' }); continue; }
       if ((owedFlush.kept ?? []).some(row => row.pr === entry.prNumber)) { refusals.push({ prNumber: entry.prNumber, kind: 'heal-accounting-owed', why: 'durable heal accounting is not confirmed' }); continue; }
-      const hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
+      let hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
+      // RERUN-PENDING-EXPIRY: a pending marker the re-run path can no longer expire (budget spent, evidence ineligible)
+      // must not wedge ci-heal either: expire it here by the same evidence-based rule, then re-read the hold.
+      if (hold && hold.reason === 'retry-outcome-pending') {
+        try { await expireLost({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid }); } catch { /* keep the hold */ }
+        hold = timeoutHold({ repo: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber, head: entry.headRefOid });
+      }
       if (hold) { refusals.push({ pr: entry.prNumber, kind: 'ci-timeout-rerun', ...hold, why: hold.why ?? hold.reason }); continue; }
       if (salvageEnabled()) {
         let recovered = null;
@@ -880,10 +887,40 @@ export function timeoutGithubEffects({ exec = execFileSyncThrottled } = {}) {
   };
 }
 
-function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed' || r.status === 'expired').length; }
-/** A pending request must show a newer run attempt within this long; past it (or once its run is completed with no new attempt) it is lost. */
-const PENDING_START_GRACE_MS = 3 * 60 * 1000;
+function confirmedTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed').length; }
+/** Re-run attempts spent against the cap: confirmed plus expired (lost) requests. Filing a card still needs real confirmations. */
+function spentTimeouts(state) { return state.requests.filter((r) => r.status === 'confirmed' || r.status === 'expired').length; }
+/** A pending request is LOST only with evidence: past this window AND its job completed with no newer attempt. */
 const PENDING_LOST_WINDOW_MS = 30 * 60 * 1000;
+const pendingIsLost = (pending, observed, nowMs) => {
+  const age = nowMs - Date.parse(pending.reservedAt);
+  return Number.isFinite(age) && age >= PENDING_LOST_WINDOW_MS && observed.status === 'completed'
+    && observed.attempt <= pending.target.attempt;
+};
+const expirePending = (path, initial, id, nowMs) => timeoutTransaction(path, initial, (state) => {
+  const request = state.requests[id];
+  if (request?.status === 'pending') {
+    request.status = 'expired'; request.expiredAt = new Date(nowMs).toISOString();
+    request.expiredReason = 'no newer run attempt observed after the window and the evidenced job is completed; treated as lost';
+  }
+});
+/** The one writer that expires a lost pending marker outside dispatchTimeoutRetry (used by the ci-heal path). */
+export async function expireLostPending({ repo, pr, head, dir = timeoutStateDir(), effects = timeoutGithubEffects(), now = Date.now } = {}) {
+  if (!existsSync(dir)) return 0;
+  let expired = 0;
+  for (const name of readdirSync(dir).filter((n) => n.endsWith('.json'))) {
+    const path = join(dir, name);
+    const state = JSON.parse(readFileSync(path, 'utf8'));
+    if (state.evidence?.repo !== repo || state.evidence.pr !== pr || state.evidence.head !== head || state.retired) continue;
+    const pending = state.requests.find((r) => r.status === 'pending');
+    if (!pending?.reservedAt || now() - Date.parse(pending.reservedAt) < PENDING_LOST_WINDOW_MS) continue;
+    const observed = await effects.observe(state.evidence, pending.target);
+    const bound = observed.repo === repo && observed.runHead === head && observed.run === pending.target.run
+      && observed.job === pending.target.job && observed.open;
+    if (bound && pendingIsLost(pending, observed, now())) { expirePending(path, null, pending.id, now()); expired++; }
+  }
+  return expired;
+}
 
 /** An ambiguous request must not become an agent heal just because this tick's evidence read failed. */
 export function readTimeoutHold({ repo, pr, head, dir = timeoutStateDir() }) {
@@ -1002,7 +1039,7 @@ export async function dispatchTimeoutRetry(evidence, {
   };
   let reservation;
   const selected = timeoutTransaction(path, initial, (state) => {
-    if (confirmedTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
+    if (spentTimeouts(state) >= (evidence.infraCancelled ? (evidence.cap ?? 6) : 2)) return { exhausted: true, card: state.card?.payload.num };
     const pending = state.requests.find((r) => r.status === 'pending');
     if (pending) return { pending: structuredClone(pending) };
     const target = evidence.jobs.find((j) => !state.requests.some((r) => r.status === 'confirmed'
@@ -1038,18 +1075,10 @@ export async function dispatchTimeoutRetry(evidence, {
   if (!bound || !observed.open) { releaseFresh(); return refuse('stale-head-or-job'); }
   if (selected.pending) {
     if (observed.attempt <= target.attempt) {
-      // RERUN-PENDING-EXPIRY: the one writer that expires a lost marker (live we#7431). It counts toward the cap and the
-      // PR re-plans next tick (one mechanical re-run if under the cap, else ci-heal).
-      const age = now() - Date.parse(selected.pending.reservedAt);
-      const lost = Number.isFinite(age) && (age >= PENDING_LOST_WINDOW_MS || (age >= PENDING_START_GRACE_MS && observed.status === 'completed'));
-      if (!lost) return refuse('retry-outcome-pending');
-      timeoutTransaction(path, initial, (state) => {
-        const request = state.requests[selected.pending.id];
-        if (request.status === 'pending') {
-          request.status = 'expired'; request.expiredAt = new Date(now()).toISOString();
-          request.expiredReason = `no newer run attempt observed ${Math.round(age / 1000)}s after the request; treated as lost`;
-        }
-      });
+      // RERUN-PENDING-EXPIRY: expire a lost marker (live we#7431) only on evidence (window passed AND the evidenced job is
+      // completed with no newer attempt). It counts toward the cap; the PR re-plans next tick.
+      if (!pendingIsLost(selected.pending, observed, now())) return refuse('retry-outcome-pending');
+      expirePending(path, initial, selected.pending.id, now());
       return refuse('retry-expired-replan');
     }
     timeoutTransaction(path, initial, (state) => {
@@ -1073,7 +1102,7 @@ export async function dispatchTimeoutRetry(evidence, {
   timeoutTransaction(path, initial, (state) => {
     const request = state.requests[reservation.id];
     // A concurrent observer may have confirmed the pending request already; never demote it.
-    if (request.status !== 'confirmed') request.status = ['confirmed', 'rejected'].includes(outcome?.status) ? outcome.status : 'pending';
+    if (request.status !== 'confirmed' && request.status !== 'expired') request.status = ['confirmed', 'rejected'].includes(outcome?.status) ? outcome.status : 'pending';
     request.outcome = outcome?.status === 'confirmed' ? 'API accepted; retry result not yet observed' : (outcome?.reason ?? 'API outcome unknown');
   });
   await fileTimeoutFollowup(path, { root, fileFollowup });

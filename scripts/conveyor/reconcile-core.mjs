@@ -588,10 +588,10 @@ export function rerunInFlight(pr, { budget, requiredChecks, now, liveOnly } = {}
   const sinceMs = Date.parse(budget.pendingSince);
   if (budget.reason || !Number.isFinite(sinceMs) || !(now > 0)) return true;
   const windowMs = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
+  // A live (or unknown: incomplete rollup) run on the head always holds, whatever the marker's age.
+  if (hasLiveCheck(pr, { requiredChecks, now })) return true;
   const age = now - sinceMs;
-  if (age >= windowMs) return false;
-  if (age < RERUN_START_GRACE_MS) return true;
-  return hasLiveCheck(pr, { requiredChecks, now });
+  return age < RERUN_START_GRACE_MS && age < windowMs;
 }
 /** Max mechanical re-runs per head for a queued PR GitHub holds BLOCKED on a cancelled required check (PR #4651). */
 export const BLOCKED_CANCELLED_RERUN_CAP = 2;

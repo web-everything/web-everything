@@ -751,14 +751,35 @@ describe('xng7q1p retry reservation and restart soak', () => {
       effects: { observe, request: () => ({ status: 'ambiguous' }) } });
   }
   // RERUN-PENDING-EXPIRY: a lost pending marker is expired through the one writer, counts toward the cap, and never holds forever.
-  it('a lost pending request (run completed, no new attempt, past the start grace) is expired and counts toward the cap', async () => harness(async (dir) => {
+  it('a lost pending request (job completed, no new attempt, past the window) is expired and counts toward the cap', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
     const opts = { dir, repo: e.repo, effects: { observe, request: () => ({ status: 'ambiguous' }) } };
-    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 60_000 })).toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 20 * 60_000 })).toMatchObject({ reason: 'retry-outcome-pending' });
     expect(readState(dir, e).requests[0].status).toBe('pending');
-    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 20 * 60_000 })).toMatchObject({ reason: 'retry-expired-replan' });
+    // the evidenced job still running is not proof the request was lost, however old
+    const running = { ...opts, effects: { ...opts.effects, observe: (...a) => ({ ...observe(...a), status: 'in_progress' }) } };
+    expect(await dispatchTimeoutRetry(e, { ...running, now: () => t0 + 90 * 60_000 })).toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 40 * 60_000 })).toMatchObject({ reason: 'retry-expired-replan' });
     expect(readState(dir, e).requests[0]).toMatchObject({ status: 'expired', expiredReason: expect.any(String) });
     expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ confirmed: 1, expired: 1, pending: false });
+  }));
+  it('a delayed API response never overwrites an expired request; expired spends the cap but never files a card as confirmed', async () => harness(async (dir) => {
+    const e = evidence(); await reservePending(dir, e);
+    const path = join(dir, `${timeoutKey(e)}.json`);
+    const state = readState(dir, e); state.requests[0].status = 'expired'; writeFileSync(path, JSON.stringify(state));
+    state.requests.push({ id: 1, target: e.jobs[0], status: 'expired' }); writeFileSync(path, JSON.stringify(state));
+    const fileFollowup = vi.fn();
+    await flushTimeoutFollowups({ dir, repo: e.repo, effects: { observe }, fileFollowup, now: () => t0 });
+    expect(fileFollowup).not.toHaveBeenCalled();
+    expect(readState(dir, e).requests.map((r) => r.status)).toEqual(['expired', 'expired']);
+  }));
+  it('the ci-heal path expires a lost pending marker instead of being wedged by it (exhausted budget)', async () => harness(async (dir) => {
+    const e = evidence(); await reservePending(dir, e);
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    const args = { dir, repo: e.repo, pr: e.pr, head: e.head, effects: { observe } };
+    expect(await expireLostPending({ ...args, now: () => t0 + 60_000 })).toBe(0);
+    expect(await expireLostPending({ ...args, now: () => t0 + 40 * 60_000 })).toBe(1);
+    expect(readTimeoutHold({ ...e, dir })).toBeNull();
   }));
   it('a closed-PR pending reservation stops being polled after one observation', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
