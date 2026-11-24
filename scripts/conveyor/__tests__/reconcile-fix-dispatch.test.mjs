@@ -2809,51 +2809,55 @@ describe('bounced no-findings fresh evidence', () => {
 
 
 describe('MQ recovery live holds', () => {
-  function run(labels = ['review:human'], complete = true, fallback = true) {
-    const head = 'a'.repeat(40);
-    const dispatch = vi.fn(), refreshMqFailure = vi.fn(() => ({ action: 'fix' }));
-    const readLabels = vi.fn(() => labels);
+  function run(labels = ['review:human'], complete = true, fallback = true, extra = {}) {
+    const head = 'a'.repeat(40), dispatch = vi.fn(), refreshMqFailure = vi.fn(() => ({ action: 'fix' }));
+    const readAuthorization = vi.fn(() => ({ labels, state: 'OPEN', isDraft: false, ...extra.auth }));
     const claim = vi.fn(() => ({ claimed: true })), recordFixFallback = vi.fn(() => ({ recorded: true }));
     const result = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefOid: head,
         headRefName: 'lane/3438-wire-reconcile-pass', mqFailureRecovery: {
           repo: 'web-everything/web-everything', pr: 42, head, evidence: { complete },
         } }], refusals: [] }),
-      mqFailureIo: { readLabels, readHead: () => head },
-      mqFailureLedger: { readFixFallback: () => fallback, claim, recordFixFallback }, refreshMqFailure,
+      mqFailureIo: { readAuthorization, readHead: () => { if (extra.head === 'throw') throw Error('offline'); return extra.head ?? head; } },
+      mqFailureLedger: { readFixFallback: () => fallback, claim: extra.denied ? () => ({ claimed: false }) : claim, recordFixFallback, readRefreshSuccessor: () => extra.successor }, refreshMqFailure,
       findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [2],
       fetchItemlessDiffPaths: () => [], dispatch, tryResume: () => null,
       listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null,
     });
-    return { result, dispatch, refreshMqFailure, readLabels, claim, recordFixFallback };
+    return { result, dispatch, refreshMqFailure, readAuthorization, claim, recordFixFallback };
   }
   it('human-only hold blocks a live fix dispatch', () => {
-    const { result, dispatch, refreshMqFailure, readLabels } = run();
-    expect(readLabels).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42 });
+    const { result, dispatch, refreshMqFailure, readAuthorization } = run();
+    expect(readAuthorization).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42 });
     expect(result.refusals).toContainEqual(expect.objectContaining({ why: expect.stringContaining('held: human-only') }));
-    expect(refreshMqFailure).not.toHaveBeenCalled();
-    expect(dispatch).not.toHaveBeenCalled();
+    expect(refreshMqFailure).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
   });
   it.each(['red-team:blocked', 'red-team:pending', 'review:held-mechanical'])('live hold blocks incomplete recovery: %s', label => {
     const { dispatch, refreshMqFailure, claim } = run([{ name: label }], false, false);
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled(); expect(refreshMqFailure).not.toHaveBeenCalled();
     expect(claim).not.toHaveBeenCalled();
   });
   it('unreadable live labels block the fixer and refresh', () => {
     const { result, dispatch, refreshMqFailure } = run(null);
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled(); expect(refreshMqFailure).not.toHaveBeenCalled();
     expect(result.dispatched).toEqual([]);
   });
+  it('cleared hold permits a persisted fallback to reach the fixer', () => { expect(run([]).dispatch).toHaveBeenCalledTimes(1); });
   it('incomplete recovery consumes a refresh attempt before fixer dispatch', () => {
     const { dispatch, claim, recordFixFallback, refreshMqFailure } = run([], false, false);
     expect(claim).toHaveBeenCalledWith(expect.objectContaining({ kind: 'refresh', pr: 42 }));
-    expect(recordFixFallback).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(claim.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]);
+    expect(recordFixFallback).toHaveBeenCalledTimes(1); expect(dispatch).toHaveBeenCalledTimes(1);
     expect(recordFixFallback.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]);
     expect(refreshMqFailure).not.toHaveBeenCalled();
   });
-
+  it.each([false, true])('reserved successor retains incomplete fixer handoff (fallback=%s)', fallback => {
+    expect(run([], false, fallback, { denied: true, successor: true }).dispatch).toHaveBeenCalledTimes(1);
+    expect(run([], false, fallback, { denied: true, successor: false }).dispatch).toHaveBeenCalledTimes(fallback ? 1 : 0);
+  });
+  it.each([false, true])('stale/unreadable head blocks fixer (fallback=%s)', fallback => {
+    for (const head of ['b'.repeat(40), 'throw']) expect(run([], false, fallback, { head }).dispatch).not.toHaveBeenCalled();
+  });
+  it.each([{ state: 'CLOSED' }, { state: 'MERGED' }, { isDraft: true }, { isDraft: undefined }])('live state blocks fixer: %j', auth => {
+    expect(run([], false, true, { auth }).dispatch).not.toHaveBeenCalled();
+  });
 });

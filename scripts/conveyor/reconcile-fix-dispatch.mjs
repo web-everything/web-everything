@@ -2,7 +2,7 @@ import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
-import { refreshMqFailureHeadSync, mqFailureRefreshIo, mqFailureHoldReason } from '../lib/mq-failure-refresh.mjs';
+import { refreshMqFailureHeadSync, mqFailureRefreshIo, mqFailureAuthorizationReason } from '../lib/mq-failure-refresh.mjs';
 import { createMqFailureLedger } from '../lib/mq-failure-ledger.mjs';
 import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 /**
@@ -2108,13 +2108,13 @@ export function runReconcileFixDispatch({
       }
       if (typeof fallback !== 'boolean') throw new Error('Unreadable MQ fallback decision');
       const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
-      const held = mqFailureHoldReason(io.readLabels({ repo: identity.repo, pr: identity.pr }));
+      const held = mqFailureAuthorizationReason(io.readAuthorization({ repo: identity.repo, pr: identity.pr }));
       if (held) throw new Error(held);
       const useFix = note => {
         if (!dryRun) {
           const claim = ledger.claim({ ...identity, kind: 'refresh' });
           if (claim?.then) { claim.catch(() => {}); throw new Error('Async refresh claim; operator inspection required'); }
-          if (claim?.claimed !== true && !(fallback && claim?.claimed === false)) throw new Error('Refresh attempt already used; operator inspection required');
+          if (claim?.claimed !== true && !(claim?.claimed === false && (fallback || ledger.readRefreshSuccessor?.(identity) === true))) throw new Error('Refresh attempt already used; operator inspection required');
           const recorded = ledger.recordFixFallback(identity);
           if (recorded?.then) { recorded.catch(() => {}); throw new Error('Async fallback; operator inspection required'); }
           if (recorded?.recorded !== true) throw new Error('Fix fallback unconfirmed; operator inspection required');
@@ -2148,7 +2148,8 @@ export function runReconcileFixDispatch({
         ? useFix('Persisted MQ refresh failure; normal fix still required')
         : refreshMqFailure({ ...identity, dryRun, ledger, io });
       if (result?.action === 'fix') {
-        const fixHeld = mqFailureHoldReason(io.readLabels({ repo: identity.repo, pr: identity.pr }));
+        if (io.readHead({ repo: identity.repo, pr: identity.pr }) !== identity.head) throw new Error('Live head changed or unreadable; refusing stale fix');
+        const fixHeld = mqFailureAuthorizationReason(io.readAuthorization({ repo: identity.repo, pr: identity.pr }));
         if (fixHeld) result = { action: 'stop', note: fixHeld };
       }
     } catch (error) { result = { action: 'stop', note: error?.message ?? 'MQ refresh executor failed; operator inspection required' }; }

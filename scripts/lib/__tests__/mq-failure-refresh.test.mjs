@@ -19,7 +19,7 @@ function fixture() {
   }) };
   const io = {
     readHead: vi.fn(async () => identity.head),
-    readLabels: vi.fn(async () => []),
+    readAuthorization: vi.fn(async () => ({ labels: [], state: 'OPEN', isDraft: false })),
     createCheckout: vi.fn(async () => checkout),
     git: vi.fn(async ({ args }) => args[0] === 'merge' ? { ok: true, head: newHead } : { ok: true }),
     removeCheckout: vi.fn(async () => {}),
@@ -150,18 +150,18 @@ describe('mq failure refresh ordering', () => {
     expect(reservedAtPush).toBe(true); // the successor was already claimed (reserved) when the push ran
   });
 
-  it('a throwing successor reservation stops publication for operator inspection', async () => {
+  it('a throwing successor reservation preserves fixer handoff', async () => {
     const options = fixture();
     options.ledger = { ...options.ledger, recordRefresh: vi.fn(async () => { throw new Error('disk full'); }) };
-    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/operator inspection/) });
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix', note: expect.stringMatching(/reservation/) });
     expect(pushes(options)).toHaveLength(0);
     expect(options.io.removeCheckout).toHaveBeenCalledTimes(1);
-    expect(await options.ledger.readFixFallback(identity)).toBe(false);
+    expect(await options.ledger.readFixFallback(identity)).toBe(true);
   });
 });
 
 // Policy per yield point after the attempt is claimed: every failure records the fixer fallback (`fix`), except the
-// held/stale/unconfirmed publication stops. Other failures retain the fixer fallback.
+// held/stale publication stops. Holds and reservation failures retain the fixer fallback.
 describe('mq failure refresh post-claim failure policy', () => {
   const boom = () => { throw new Error('transient'); };
   it.each([
@@ -303,47 +303,53 @@ describe('MQ refresh authorization and accounting', () => {
     expect(await options.ledger.readFixFallback(identity)).toBe(true);
   });
   it('requires both authorization checks separately', async () => {
-    const options = fixture();
-    options.io.readLabels.mockResolvedValueOnce(['review:human']).mockResolvedValue([]);
+    const options = fixture(); options.io.readAuthorization.mockResolvedValueOnce({ labels: ['review:human'], state: 'OPEN', isDraft: false }).mockResolvedValue({ labels: [], state: 'OPEN', isDraft: false });
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: 'held: human-only' });
     expect(options.io.createCheckout).not.toHaveBeenCalled();
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'refreshed' });
-    expect(options.io.readLabels).toHaveBeenCalledTimes(3);
   });
-  it.each([undefined, { recorded: false }])('unconfirmed successor claim stops without push (%j)', async result => {
-    const options = fixture();
-    options.ledger.recordRefresh = vi.fn(async () => result);
-    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/unconfirmed/) });
-    expect(pushes(options)).toHaveLength(0);
+  it.each([undefined, { recorded: false }])('unconfirmed successor claim preserves fixer handoff without push (%j)', async result => {
+    const options = fixture(); options.ledger.recordRefresh = vi.fn(async () => result);
+    expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'fix', note: expect.stringMatching(/unconfirmed/) });
+    expect(pushes(options)).toHaveLength(0); expect(await options.ledger.readFixFallback(identity)).toBe(true);
   });
   it.each(['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical'])('hold added during merge blocks push: %s', async label => {
     const options = fixture();
     options.io.git.mockImplementation(async ({ args }) => {
-      if (args[0] === 'merge') options.io.readLabels.mockResolvedValue([{ name: label }]);
+      if (args[0] === 'merge') options.io.readAuthorization.mockResolvedValue({ labels: [{ name: label }], state: 'OPEN', isDraft: false });
       return { ok: true, head: newHead };
     });
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: 'held: human-only' });
     expect(pushes(options)).toHaveLength(0);
     expect(options.io.removeCheckout).toHaveBeenCalledWith(checkout);
+    expect(await options.ledger.readFixFallback(identity)).toBe(true);
   });
   it.each([undefined, [null]])('unreadable labels after merge stop publication (%j)', async labels => {
-    const options = fixture();
-    options.io.readLabels.mockResolvedValueOnce([]).mockResolvedValue(labels);
+    const options = fixture(); options.io.readAuthorization.mockResolvedValueOnce({ labels: [], state: 'OPEN', isDraft: false }).mockResolvedValue({ labels, state: 'OPEN', isDraft: false });
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/labels unreadable/) });
-    expect(pushes(options)).toHaveLength(0);
+    expect(pushes(options)).toHaveLength(0); expect(await options.ledger.readFixFallback(identity)).toBe(true);
+  });
+  it.each([{ state: 'CLOSED' }, { state: 'MERGED' }, { isDraft: true }, { isDraft: undefined }])('live state blocks refresh before claim and after merge: %j', auth => {
+    return Promise.all([0, 1].map(async afterMerge => {
+      const options = fixture(), open = { labels: [], state: 'OPEN', isDraft: false };
+      if (afterMerge) options.io.readAuthorization.mockResolvedValueOnce(open);
+      options.io.readAuthorization.mockResolvedValue({ ...open, ...auth });
+      expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop' });
+      expect(pushes(options)).toHaveLength(0);
+      expect(await options.ledger.readFixFallback(identity)).toBe(Boolean(afterMerge));
+    }));
   });
   it('failed initial label read refuses without consuming an attempt', async () => {
-    const options = fixture();
-    options.io.readLabels.mockRejectedValue(new Error('offline'));
+    const options = fixture(); options.io.readAuthorization.mockRejectedValue(new Error('offline'));
     expect(await refreshMqFailureHead(options)).toMatchObject({ action: 'stop', note: expect.stringMatching(/labels unreadable/) });
     expect(options.io.createCheckout).not.toHaveBeenCalled();
     expect(await options.ledger.claim({ ...identity, kind: 'refresh' })).toMatchObject({ claimed: true });
   });
 });
 
-it('live label reads bypass the gh memo', () => {
-  const throttled = vi.fn(() => JSON.stringify({ labels: [{ name: 'review:human' }] }));
-  expect(mqFailureRefreshIo('fixture/root', { throttled }).readLabels(identity)).toEqual([{ name: 'review:human' }]);
-  expect(throttled.mock.calls[0][1].at(-1)).toBe('labels');
+it('live authorization reads bypass the gh memo', () => {
+  const throttled = vi.fn(() => JSON.stringify({ labels: [{ name: 'review:human' }], state: 'OPEN', isDraft: false }));
+  expect(mqFailureRefreshIo('fixture/root', { throttled }).readAuthorization(identity)).toMatchObject({ state: 'OPEN', isDraft: false });
+  expect(throttled.mock.calls[0][1].at(-1)).toBe('labels,state,isDraft');
   expect(throttled.mock.calls[0][2].throttle).toMatchObject({ noMemo: true });
 });

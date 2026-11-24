@@ -10,7 +10,7 @@ export function mqFailureRefreshIo(root, { exec = execFileSync, throttled = exec
   const pr = (repo, number, fields) => JSON.parse(throttled('gh', ['pr', 'view', String(number), '--repo', repo, '--json', fields],
     { cwd: root, encoding: 'utf8', timeout: 30000, maxBuffer: 128 * 1024, throttle: { noMemo: true } }));
   return {
-    readLabels: ({ repo, pr: number }) => pr(repo, number, 'labels').labels,
+    readAuthorization: ({ repo, pr: number }) => pr(repo, number, 'labels,state,isDraft'),
     readHead: ({ repo, pr: number }) => pr(repo, number, 'headRefOid').headRefOid,
     createCheckout({ repo, pr: number, head }) {
       const data = pr(repo, number, 'headRefOid,headRefName,isCrossRepository');
@@ -46,6 +46,11 @@ export function mqFailureHoldReason(labels) {
     .includes(typeof label === 'string' ? label : label.name)) ? 'held: human-only' : null;
 }
 
+export function mqFailureAuthorizationReason(pr) {
+  return pr?.state !== 'OPEN' || pr.isDraft !== false
+    ? 'held: PR closed, draft or unreadable; operator inspection required' : mqFailureHoldReason(pr.labels);
+}
+
 // One state machine, driven asynchronously by hermetic callers and synchronously by the existing dispatcher.
 function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
   const stop = note => ({ action: 'stop', note });
@@ -53,13 +58,13 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
   if (!/^[a-f0-9]{40}$/.test(head ?? '')) return stop('Unknown head; operator inspection required');
   const identity = { repo, pr, head };
   let checkout, claimed = false;
-  // Attempts are never released. Held/stale/unconfirmed publication stops for operator inspection.
+  // Attempts are never released; post-claim holds preserve fixer ownership.
   const fallback = function* (note) {
     const recorded = yield () => ledger.recordFixFallback(identity);
     return recorded?.recorded === true ? { action: 'fix', note } : stop('Fix fallback unconfirmed; operator inspection required');
   };
   const authorize = function* () {
-    try { return mqFailureHoldReason(yield () => io.readLabels({ repo, pr })); }
+    try { return mqFailureAuthorizationReason(yield () => io.readAuthorization({ repo, pr })); }
     catch { return 'held: labels unreadable; operator inspection required'; }
   };
   try {
@@ -85,11 +90,11 @@ function* refresh({ repo, pr, head, ledger, io, dryRun = false }) {
     // Reserve the successor BEFORE publication: a crash after push cannot grant it another refresh.
     let successor;
     try { successor = yield () => ledger.recordRefresh({ ...identity, newHead: merged.head }); }
-    catch { return stop('Successor reservation unreadable; operator inspection required'); }
-    if (successor?.recorded !== true) return stop('Successor reservation unconfirmed; operator inspection required');
+    catch { return yield* fallback('Successor reservation unreadable; normal fix required'); }
+    if (successor?.recorded !== true) return yield* fallback('Successor reservation unconfirmed; normal fix required');
     if ((yield () => io.readHead({ repo, pr })) !== head) return stop('Head changed after merge; refusing stale push');
     const pushHeld = yield* authorize();
-    if (pushHeld) return stop(pushHeld);
+    if (pushHeld) { yield* fallback(pushHeld); return stop(pushHeld); }
     const pushed = yield () => io.git({ cwd: checkout.cwd, args: ['push', 'origin', `HEAD:refs/heads/${checkout.branch}`] });
     if (!pushed?.ok) return yield* fallback('Ordinary push rejected; normal fix required (no retry)');
     return { action: 'refreshed', head: merged.head };
