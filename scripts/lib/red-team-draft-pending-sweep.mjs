@@ -2,7 +2,9 @@ const hasPending = labels => Array.isArray(labels)
   && labels.some(label => (typeof label === 'string' ? label : label?.name) === 'red-team:pending');
 
 /** Remove stale pending only after a fresh, same-head draft observation. No verdict is granted. */
-export function sweepDraftPendingLabels({ repo, rawPrs, provider, skipKeys = new Set(), log = () => {}, max = 5 }) {
+export function sweepDraftPendingLabels({ repo, rawPrs, provider, skipKeys = new Set(), log = () => {}, max = 5,
+  // Any recorded red-team run for this head (running, scheduled or finished) keeps the label; unreadable evidence keeps it too.
+  hasRecordedRun = () => true }) {
   const result = { dropped: [], skipped: [], errors: [] };
   const cap = Number.isSafeInteger(max) && max >= 0 ? max : 0;
   let attempted = 0;
@@ -19,6 +21,7 @@ export function sweepDraftPendingLabels({ repo, rawPrs, provider, skipKeys = new
       else if (fresh.isDraft !== true) why = 'not confirmed draft';
       else if (!row.headRefOid || fresh.headRefOid !== row.headRefOid) why = 'head changed or unreadable';
       else if (!hasPending(fresh.labels)) why = 'pending absent or unreadable';
+      if (!why) { try { if (hasRecordedRun({ repo, pr, head: row.headRefOid }) !== false) why = 'red-team run recorded or unreadable'; } catch { why = 'red-team run recorded or unreadable'; } }
       if (why) { result.skipped.push({ pr, why }); continue; }
       provider.setLabels(repo, pr, { remove: ['red-team:pending'] });
       result.dropped.push(pr);

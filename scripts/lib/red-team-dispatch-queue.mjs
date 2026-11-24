@@ -12,6 +12,7 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { isUnderTest } from './under-test.mjs';
 import { createGhProvider } from './review-label-provider.mjs';
 import { sweepDraftPendingLabels } from './red-team-draft-pending-sweep.mjs';
+import { createFreshGh } from './red-team-status-labels.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { readRedTeamProbes, redTeamForHead, isPublishableRedTeamResult } from './red-team-gate.mjs';
 import { redTeamSkipNeedsSettlement } from './review-red-team-on-skip.mjs';
@@ -453,7 +454,11 @@ const readableCapacity = capacity => !!capacity && typeof capacity.lanes === 'nu
   && (capacity.budget == null || (typeof capacity.budget.left === 'number' && !Number.isNaN(capacity.budget.left)));
 
 export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCapacity, run, log = () => {},
-  sweepDraftPending = isUnderTest() ? () => null : args => sweepDraftPendingLabels({ ...args, provider: createGhProvider() }),
+  sweepDraftPending = isUnderTest() ? () => null : args => {
+    const fresh = createFreshGh(); // never the read memo: a draft/head observation that gates a write must be live
+    return sweepDraftPendingLabels({ ...args, hasRecordedRun: key => readRedTeamStatus(key) !== null,
+      provider: createGhProvider({ exec: (a, o) => fresh(a, { encoding: 'utf8', timeout: 60_000, maxBuffer: 32 * 1024 * 1024, ...o }) }) });
+  },
   floor, readCpuIdlePct, readLivePr, inventoryComplete = true, readSkipCardOnly = () => readRedTeamProbes().value.skipCardOnly, readNetFiles = args => isUnderTest() ? { ok: false } : readBacklogOnlyNetFiles(args), ...rest }) {
   const transaction = transactions.get(queue)?.();
   try {

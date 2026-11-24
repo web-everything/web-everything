@@ -5,8 +5,16 @@ const row = (extra = {}) => ({ number: 7, isDraft: true, headRefOid: 'abc', labe
 function fixture(fresh = row({ state: 'OPEN' })) {
   const provider = { readPrState: vi.fn(() => fresh), setLabels: vi.fn() };
   const log = vi.fn();
-  return { provider, log, sweep: (extra = {}) => sweepDraftPendingLabels({ repo, rawPrs: [row()], provider, log, ...extra }) };
+  return { provider, log, sweep: (extra = {}) => sweepDraftPendingLabels({ repo, rawPrs: [row()], provider, log, hasRecordedRun: () => false, ...extra }) };
 }
+describe('sweepDraftPendingLabels in-flight guard', () => {
+  it.each([['recorded run', () => true], ['unreadable run evidence', () => { throw new Error('x'); }], ['default (no evidence reader)', undefined]])('%s keeps the label', (_n, hasRecordedRun) => {
+    const f = fixture(); const extra = hasRecordedRun ? { hasRecordedRun } : {};
+    const args = { repo, rawPrs: [row()], provider: f.provider, log: f.log, ...extra };
+    expect(sweepDraftPendingLabels(args).dropped).toEqual([]);
+    expect(f.provider.setLabels).not.toHaveBeenCalled();
+  });
+});
 describe('sweepDraftPendingLabels', () => {
   it('removes only pending, never blocked or clear, and never adds any label', () => {
     const f = fixture(row({ state: 'OPEN', labels: [{ name: 'red-team:pending' }, 'red-team:blocked', 'red-team:clear'] }));

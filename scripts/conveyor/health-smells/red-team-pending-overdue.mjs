@@ -15,15 +15,17 @@ export default {
     for (const pr of prs || []) {
       const labels = (pr.labels || []).map(label => typeof label === 'string' ? label : label?.name);
       if (pr.isDraft === true || !labels.includes('red-team:pending')
-        || labels.includes('red-team:blocked') || labels.includes('red-team:clear')) continue;
+        || labels.includes('red-team:blocked')) continue;
+      // An unreadable timestamp is unknown age, which must alert rather than read as clean.
       const updated = Date.parse(pr.updatedAt || '');
-      const age = Number.isFinite(updated) ? Math.max(0, now - updated) : 0;
+      const known = Number.isFinite(updated);
+      const age = known ? Math.max(0, now - updated) : Infinity;
       const subject = `${pr.repo}#${pr.number}@${String(pr.headRefOid || '').slice(0, 7)}`;
       out.push({
         subject,
         breach: age >= 2 * this.maxPendingMs,
-        measure: { pendingForMin: Math.round(age / MINUTE), head: pr.headRefOid, title: String(pr.title || '').slice(0, 80) },
-        summary: `${subject} has red-team:pending after ${fmtAge(age)} without a PR update.`,
+        measure: { pendingForMin: known ? Math.round(age / MINUTE) : null, head: pr.headRefOid, title: String(pr.title || '').slice(0, 80) },
+        summary: `${subject} has red-team:pending ${known ? `after ${fmtAge(age)} without a PR update` : 'with an unreadable update time'}.`,
         recommendation: 'Investigate the red-team queue and review worker; obtain a result for this head before clearing pending.',
       });
     }

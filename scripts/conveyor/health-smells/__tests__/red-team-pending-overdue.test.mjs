@@ -15,11 +15,14 @@ describe('red-team-pending-overdue', () => {
     expect(evaluate(row(age, { labels: ['red-team:pending'] }))[0].breach).toBe(breach);
   });
   it('draft PR with pending has no row', () => expect(evaluate(row(100, { isDraft: true }))).toEqual([]));
-  it.each(['red-team:blocked', 'red-team:clear'])('%s label prevents breach', label => {
-    expect(evaluate(row(100, { labels: ['red-team:pending', { name: label }] })).some(r => r.breach)).toBe(false);
+  it('blocked label is another path and does not breach here', () => {
+    expect(evaluate(row(100, { labels: ['red-team:pending', 'red-team:blocked'] }))).toEqual([]);
   });
-  it.each([undefined, 'invalid'])('missing or unreadable updatedAt never breaches: %s', updatedAt => {
-    expect(evaluate(row(100, { updatedAt }))[0]).toMatchObject({ breach: false, measure: { pendingForMin: 0 } });
+  it('a contradictory clear label never hides an overdue pending', () => {
+    expect(evaluate(row(100, { labels: ['red-team:pending', 'red-team:clear'] }))[0].breach).toBe(true);
+  });
+  it.each([undefined, 'invalid'])('missing or unreadable updatedAt is unknown and alerts: %s', updatedAt => {
+    expect(evaluate(row(100, { updatedAt }))[0]).toMatchObject({ breach: true, measure: { pendingForMin: null } });
   });
   it('a new head has a new alert identity', () => {
     expect(evaluate(row(100))[0].subject).not.toBe(evaluate(row(100, { headRefOid: '1234567abcdef' }))[0].subject);

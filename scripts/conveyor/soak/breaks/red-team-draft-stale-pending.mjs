@@ -33,12 +33,17 @@ export default {
           labels: rows.find(row => row.number === pr).labels }),
         setLabels: (_repo, pr, change) => writes.push({ pr, change }),
       };
-      sweepDraftPendingLabels({ repo, rawPrs: rows, provider });
+      sweepDraftPendingLabels({ repo, rawPrs: rows, provider, hasRecordedRun: () => false });
       const prs = writes.map(write => write.pr);
-      if (!prs.includes(1)) violations.push('parked draft kept its stale pending label');
+      const only = write => !write.change.add && JSON.stringify(write.change.remove) === '["red-team:pending"]';
+      if (!writes.some(write => write.pr === 1 && only(write))) violations.push('parked draft kept its stale pending label');
       for (const pr of [2, 3]) if (prs.includes(pr)) violations.push(`PR ${pr} lost pending without a confirmed draft`);
-      if (writes.some(write => write.change.add)) violations.push('sweep added a label (clear must never be granted)');
-      if (writes.some(write => write.pr === 4 && write.change.remove?.some(name => name !== 'red-team:pending'))) violations.push('sweep removed a non-pending label');
+      if (writes.some(write => !only(write))) violations.push('sweep wrote something other than removing pending (clear must never be granted)');
+      // A draft with a recorded or unreadable red-team run keeps its label.
+      const kept = [];
+      sweepDraftPendingLabels({ repo, rawPrs: rows.slice(0, 1), hasRecordedRun: () => true,
+        provider: { ...provider, setLabels: (_r, pr) => kept.push(pr) } });
+      if (kept.length) violations.push('draft with a recorded red-team run lost pending');
     } catch (error) { violations.push(`scenario failed: ${error.stack ?? error}`); }
     return { violations };
   },
