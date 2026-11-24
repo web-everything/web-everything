@@ -33,12 +33,12 @@ export function parseLoopTicks(text) {
 
 export function zeroSuccessWindowMinutes(env = process.env) {
   const n = Number(env?.WE_ZERO_SUCCESS_MINUTES);
-  return Number.isFinite(n) && n > 0 ? n : 60;
+  return Number.isFinite(n) && n >= 1 && n <= 1440 ? n : 60;
 }
 
 export function zeroSuccessMinTicks(env = process.env) {
   const n = Number(env?.WE_ZERO_SUCCESS_MIN_TICKS);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+  return Number.isFinite(n) && n >= 1 && n <= 500 ? Math.floor(n) : 3;
 }
 
 /**
@@ -62,7 +62,7 @@ export function zeroSuccessVerdicts(records, { now, windowMs = 60 * MINUTE, minT
     const successes = inWin.reduce((s, t) => s + t.succeeded, 0);
     const failures = worked.reduce((s, t) => s + t.failed, 0);
     const span = worked.length ? worked[worked.length - 1].at - worked[0].at : 0;
-    const breach = successes === 0 && failures > 0 && worked.length >= minTicks && span >= windowMs - 5 * MINUTE;
+    const breach = successes === 0 && failures > 0 && worked.length >= minTicks && span >= windowMs - 15 * MINUTE;
     const counts = new Map();
     for (const t of worked) if (t.error) counts.set(t.error, (counts.get(t.error) || 0) + Math.max(1, t.failed));
     const dominantError = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
@@ -125,5 +125,13 @@ export function mergeLoopTicks(prev, fresh, { now, windowMs = 60 * MINUTE, max =
     if (seen.has(k)) continue;
     seen.add(k); uniq.push(r);
   }
-  return uniq.slice(-max);
+  // Cap per loop, so a busy loop cannot evict another loop's evidence.
+  const counts = new Map();
+  const kept = [];
+  for (const r of uniq.reverse()) {
+    const c = counts.get(r.loop) || 0;
+    if (c >= max) continue;
+    counts.set(r.loop, c + 1); kept.push(r);
+  }
+  return kept.reverse();
 }

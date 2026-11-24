@@ -33,7 +33,9 @@ it('the same loop raises one alarm, not one per tick, and clears on the first su
   const first = run(failing());
   const later = run([...failing(), tick(-10)], first.state, now + 10 * minute);
   expect(Object.keys(later.state.episodes)).toHaveLength(1);
-  const healed = run([tick(0, { succeeded: 5, failed: 0 })], later.state, now + 20 * minute);
+  const stillFailing = run([tick(-20)], later.state, now + 20 * minute);
+  expect(Object.values(stillFailing.state.episodes).some((e) => e.status === 'open')).toBe(true);
+  const healed = run([tick(-20, { succeeded: 5, failed: 0 })], later.state, now + 20 * minute);
   expect(Object.values(healed.state.episodes).every((e) => e.status !== 'open')).toBe(true);
 });
 

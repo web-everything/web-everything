@@ -935,7 +935,8 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   // leaves the memory as it is (the smell is then skipped, not evaluated as empty).
   const operatorHolds = probes.operatorHolds ? foldOperatorHolds(state.operatorHolds, probes.operatorHolds, now, { episodes: state.episodes }) : (state.operatorHolds ?? undefined);
   // zero-success-alarm — loop tick records folded across samples (new records in, an hour kept in state).
-  const loopTickRecords = probes.loopTicks?.records || state.loopTicks
+  // No probe this tick (collection failed): keep the memory, but do not evaluate, so nothing closes by aging.
+  const loopTickRecords = probes.loopTicks?.records
     ? mergeLoopTicks(state.loopTicks, probes.loopTicks?.records, { now, windowMs: zeroSuccessWindowMinutes(process.env) * 60_000 })
     : undefined;
   if (loopTickRecords) probes = { ...probes, loopTicks: { records: loopTickRecords } };
