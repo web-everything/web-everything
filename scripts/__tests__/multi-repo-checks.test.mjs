@@ -135,3 +135,10 @@ it('the red-team reserve soak uses a repository-neutral fixture and preserves fi
   const { default: scenario } = await import('../conveyor/soak/breaks/red-team-reserve-first-tick.mjs');
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000);
+
+it('the no-code-owed soak uses a repository-neutral fixture and still refuses exhausted overrides', async () => {
+  const file = 'scripts/conveyor/soak/breaks/no-code-owed-exhausted-override.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/no-code-owed-exhausted-override.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);

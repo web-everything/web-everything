@@ -163,7 +163,7 @@ describe('real adapter contract with injected filesystem and subprocesses', () =
     expect(spawnSync).toHaveBeenCalledTimes(2);
     for (const [, args, options] of spawnSync.mock.calls) {
       expect(args[0]).toBe('scripts/readiness/heavy-admission.mjs');
-      expect(options.env).toEqual({ PATH: '/bin:/repo/node_modules/.bin:/frontierui/node_modules/.bin', HOME: '/home/test', LANE_POOL_ROOT: '/.lanes' });
+      expect(options.env).toEqual({ PATH: '/bin:/repo/node_modules/.bin:/frontierui/node_modules/.bin', HOME: '/home/test', LANE_POOL_ROOT: '/.lanes', WE_STRIP_POOL_ROOT_FROM_CHILD: '1' });
       for (const marker of markers) expect(options.env).not.toHaveProperty(marker);
     }
     expect(env.CI).toBe('true');
@@ -871,7 +871,7 @@ describe('urgent-verify signing isolation', () => {
       expect(existsSync(options.env.HOME)).toBe(true);
       // Keep the real wrapper and semaphore; fixture only the host-load reading so this
       // wiring test cannot wait on the machine running it. --local also avoids remote policy.
-      const argv = [...args.slice(1, args.indexOf('--')), '--local', '--', process.execPath, cli, 'status', '--cap=1'];
+      const argv = [...args.slice(1, args.indexOf('--')), '--local', '--', '/usr/bin/env', `LANE_POOL_ROOT=${options.env.LANE_POOL_ROOT}`, process.execPath, cli, 'status', '--cap=1']; // the stripped child needs the pool handed back to inspect it
       const bootstrap = `import { main } from ${JSON.stringify(pathToFileURL(cli).href)}; await main(${JSON.stringify(argv)}, { hostAdmission: () => ({ admitted: true, reason: 'fixture host' }) });`;
       admitted = spawnSyncReal(cmd, ['--input-type=module', '-e', bootstrap],
         { ...options, timeout: 15000 });
@@ -930,6 +930,32 @@ describe('urgent-verify signing isolation', () => {
     expect(r.status, r.stderr).toBe(expectedExit);
     expect(existsSync(marker)).toBe(expectedExit === 0);
     if (expectedExit === 126) expect(r.stderr).toMatch(/require-admission refused.*timed out.*NOT run/);
+  });
+  it('runs the checkout steps under the runner\'s own admission wrapper when given a wrapperRoot', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    const d = createUrgentDeps({ cwd: '/checkout', wrapperRoot: '/runner', env: { PATH: '/bin' }, spawnSync });
+    d.standards();
+    expect(spawnSync.mock.calls[0][1][0]).toBe('/runner/scripts/readiness/heavy-admission.mjs');
+    expect(spawnSync.mock.calls[0][2].cwd).toBe('/checkout');
+  });
+  it('refuses to isolate when the runner admission wrapper has uncommitted changes', () => {
+    const spawnSync = vi.fn((cmd, args) => ({ status: 0, stdout: args[0] === 'status' ? ' M scripts/readiness/heavy-admission.mjs\n' : '' }));
+    const fs = { accessSync: () => {}, statSync: () => ({ isFile: () => true }), readdirSync: () => [], mkdtempSync: () => '/tmp/x', rmSync: () => {} };
+    const d = createUrgentDeps({ cwd: '/repo', env: { PATH: '/bin' }, fs, spawnSync, isolated: true });
+    expect(() => d.isolate('a'.repeat(40))).toThrow(/uncommitted changes/);
+  });
+  it('hides the host lane pool from the command admission runs, and still lets a real failure fail', async () => {
+    const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-strip-')));
+    tempParents.push(root);
+    const seen = [];
+    const env = { PATH: '/bin', LANE_POOL_ROOT: '/host/.lanes', WE_STRIP_POOL_ROOT_FROM_CHILD: '1' };
+    const run = (exec) => runUnderAdmission({ lockRoot: root, cap: 1, owner: 'strip-fixture', command: 'x', env, exec });
+    await run((_c, o) => { seen.push(o.env); });
+    expect(seen[0]).not.toHaveProperty('LANE_POOL_ROOT');
+    expect(seen[0]).not.toHaveProperty('WE_STRIP_POOL_ROOT_FROM_CHILD');
+    expect(seen[0].PATH).toBe('/bin');
+    const failed = await run(() => { throw Object.assign(new Error('fail'), { status: 1 }); });
+    expect(failed.exitCode).toBe(1);
   });
   it.each(['off', 'held', 'ci', 'no-pool', null])('required admission refuses runner bypass/disabled acquisition: %s', async bypass => {
     const root = realpathSync(mkdtempSync(pjoin(tmpdir(), 'uv-admission-')));
