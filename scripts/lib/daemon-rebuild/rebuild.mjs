@@ -15,7 +15,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { appendDaemonEvent } from '../daemon-events.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
-import { acquireSmokeSlot } from '../daemon-smoke-slots.mjs';
+import { acquireSmokeSlot, behindMainPriority } from '../daemon-smoke-slots.mjs';
 import { withWriteLock, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
@@ -456,8 +456,24 @@ async function rebuildCloneInternal({
     // A valid pending force-adopt request for this clone (full 40-hex sha, ruling and quote present, unexpired) goes to the
     // FRONT of the host smoke queue; the queue timeout is unchanged and a holder is never preempted.
     const forced = readForceAdopt(root, stEnv, now);
-    const priority = !!forced && /^[0-9a-f]{40}$/.test(String(forced.sha ?? '').toLowerCase())
+    const forcedValid = !!forced && /^[0-9a-f]{40}$/.test(String(forced.sha ?? '').toLowerCase())
       && typeof forced.ruling === 'string' && forced.ruling.trim() !== '' && typeof forced.quote === 'string' && forced.quote.trim() !== '';
+    let behind;
+    // Probe only when opted in; use main, excluding candidate-only overlay commits.
+    if (behindMainPriority({ behind: Number.MAX_SAFE_INTEGER, env: stEnv })) {
+      try {
+        if (/^[0-9a-f]{40}$/.test(prevHead) && /^[0-9a-f]{40}$/.test(plan.mainSha)) {
+          const count = run(['rev-list', '--count', `${prevHead}..${plan.mainSha}`],
+            { cwd: root, env: stEnv, timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 4096 });
+          const raw = String(count.stdout ?? '').trim();
+          if (count.status === 0 && /^\d+$/.test(raw)) behind = Number(raw);
+        }
+      } catch { /* Unreadable history retains routine priority; the next rebuild retries. */ }
+    }
+    const behindPriority = behindMainPriority({ behind, env: stEnv });
+    const threshold = stEnv.WE_DAEMON_SMOKE_BEHIND_PRIORITY_THRESHOLD;
+    log.error?.(`daemon-live-smoke: behindPriority=${behindPriority} (threshold=${JSON.stringify(threshold ?? 'off')}, source=${threshold === undefined ? 'default' : 'environment'}; behind=${behind ?? 'unreadable'})`);
+    const priority = forcedValid || behindPriority;
     const smokeSlotStartedMs = now();
     const slot = await acquireSmokeSlot({ env: stEnv, log, now, sleep, priority,
       onWait: async () => {

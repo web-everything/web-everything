@@ -8,7 +8,8 @@
  * `review-status:stood-down` and `superseded` labels). It never closes a PR: that is an operator decision.
  *
  * Setting off (`supersede-settings.json` / `WE_SUPERSEDE_HOLD`) = no read, no write. Every read is bounded; a failed
- * read skips the repo for this tick (reported, never thrown). Usage as a one-off: `node supersede-watch.mjs
+ * list/planning failure blocks dispatch; a body-edit failure skips only its PR. Apply failures are reported per hold.
+ * Usage as a one-off: `node supersede-watch.mjs
  * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
  */
 import { execFileSync } from 'node:child_process';
@@ -22,22 +23,39 @@ import { readCompletePrComments } from './pr-comments-complete.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STAND_DOWN_CLI = join(HERE, 'stand-down.mjs');
 export const SUPERSEDE_WATCH_ACTOR = 'supersede-watch (card xiqtf7w)';
-const LIST_LIMIT = 200;
+const PAGE_SIZE = 100;
+const MAX_LIST_PAGES = 100;
 
 const slugOf = (repo) => CONSTELLATION_REPOS[repo]?.slug ?? repo;
 const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
 }) || 'null'));
 
-/**
- * Merged PRs (number, body, state, mergedAt, author) merged within `lookbackDays` of `now`. `gh pr list` returns the newest
- * first; the window is applied here on `mergedAt` (a search qualifier would hide behind GitHub's search index).
- */
+/** Bounded REST pagination: exhausting the cap is unreadable evidence, never a truncated success. */
+function readPullPages({ repo, state, exec, since }) {
+  const rows = [];
+  for (let page = 1; page <= MAX_LIST_PAGES; page += 1) {
+    const batch = ghJson(['api', `repos/${slugOf(repo)}/pulls?state=${state}&sort=updated&direction=desc&per_page=${PAGE_SIZE}&page=${page}`], exec);
+    if (!Array.isArray(batch) || batch.some(p => !Number.isInteger(p?.number) || (since !== undefined
+      && (!Number.isFinite(Date.parse(p.updated_at)) || (p.merged_at !== null && (
+        !Number.isFinite(Date.parse(p.merged_at)) || (p.body !== null && typeof p.body !== 'string')
+        || typeof p.user?.login !== 'string' || !p.user.login.trim())))))) {
+      throw new Error(`unreadable ${state} PR list in ${slugOf(repo)}`);
+    }
+    rows.push(...batch);
+    // REST has no merged-time ordering. An old merge updated recently cannot end the scan:
+    // updated_at >= merged_at, so only an old *update* proves all subsequent merges are old.
+    if (batch.length < PAGE_SIZE || (since !== undefined && batch.every(p => Date.parse(p.updated_at) < since))) return rows;
+  }
+  throw new Error(`PR list page cap reached in ${slugOf(repo)}; operator must narrow the lookback or inspect the full list before dispatch; retry next tick`);
+}
+
+/** Merged PRs within the window, normalized from REST to the planner's gh PR shape. */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync }) {
   const since = now - lookbackDays * 86_400_000;
-  return (ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'merged',
-    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt,author'], exec) ?? [])
-    .filter((p) => (Date.parse(p?.mergedAt ?? '') || 0) >= since);
+  return readPullPages({ repo, state: 'closed', exec, since })
+    .filter(p => Date.parse(p.merged_at) >= since)
+    .map(p => ({ number: p.number, body: p.body, state: 'MERGED', mergedAt: p.merged_at, author: p.user }));
 }
 
 /**
@@ -48,9 +66,11 @@ export function defaultReadBodyEdit({ repo, pr, exec = execFileSync }) {
   const [owner, name] = slugOf(repo).split('/');
   const out = ghJson(['api', 'graphql', '-f', 'query=query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){lastEditedAt editor{login}}}}',
     '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `p=${Number(pr)}`], exec);
+  if (out?.errors?.length) throw new Error(`GraphQL body-edit read failed for #${pr}`);
   const node = out?.data?.repository?.pullRequest;
   if (!node) throw new Error(`no pull request #${pr} in ${slugOf(repo)}`);
-  return { lastEditedAt: node.lastEditedAt ?? null, editor: node.editor ? { login: node.editor.login } : null };
+  if (node.lastEditedAt === undefined || node.editor === undefined) throw new Error(`incomplete body-edit fields for #${pr}`);
+  return { lastEditedAt: node.lastEditedAt, editor: node.editor ? { login: node.editor.login } : null };
 }
 
 /**
@@ -72,8 +92,7 @@ export function withBodyEdits({ repo, mergedPrs, openNumbers, readBodyEdit = def
 
 /** Open PR numbers only (cheap); comments are read just for the candidates. */
 export function defaultReadOpenNumbers({ repo, exec = execFileSync }) {
-  return (ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'open', '--limit', String(LIST_LIMIT), '--json', 'number'], exec) ?? [])
-    .map((p) => p.number);
+  return readPullPages({ repo, state: 'open', exec }).map(p => p.number);
 }
 
 /** One candidate's state, read fresh, with its COMPLETE comment thread (paginated — a hold past comment 100 still counts). */
@@ -113,9 +132,16 @@ export function runSupersedeWatch({
       repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit });
     const candidates = supersedeCandidates({ mergedPrs, openNumbers });
     // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
-    const openPrs = candidates.map((pr) => readPr({ repo, pr })).filter((p) => String(p?.state ?? '').toUpperCase() === 'OPEN');
+    const openPrs = candidates.map((pr) => {
+      const p = readPr({ repo, pr });
+      if (typeof p?.state !== 'string') throw new Error(`unreadable candidate PR #${pr} state in ${slugOf(repo)}`);
+      return p;
+    }).filter((p) => p.state.toUpperCase() === 'OPEN');
     const holds = planSupersedeHolds({ mergedPrs, openPrs, settings });
-    const applied = apply ? holds.map((hold) => ({ ...hold, ...postHold({ repo, hold }) })) : [];
+    const applied = apply ? holds.map((hold) => {
+      try { return { ...hold, ...postHold({ repo, hold }) }; }
+      catch (e) { return { ...hold, ok: false, error: String(e?.message || e).split('\n')[0] }; }
+    }) : [];
     return { repo, holds, applied, ...(bodyEditFailures ? { bodyEditFailures } : {}) };
   } catch (e) {
     return { repo, holds: [], applied: [], blocked: true, error: String(e?.message || e).split('\n')[0] };

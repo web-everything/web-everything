@@ -159,6 +159,8 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The record-only file-class writer reserves its evaluation output with an exclusive `wx` create.
+  'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',

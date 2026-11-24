@@ -1,0 +1,13 @@
+{
+ "policyType": "https://everstandards.dev/ship/file-class-policy/v0.1",
+ "id": "https://everstandards.dev/ship/fixtures/ours/file-class-policy/company",
+ "level": "company",
+ "preset": {
+  "uri": "https://everstandards.dev/ship/fixtures/ours/file-class-presets/ours",
+  "digest": {
+   "sha256": "7dc873e408a0a1d979b34a9c5f6c8380a7e736a1041f710180976009b32b4f0e"
+  }
+ },
+ "unmatched": "source",
+ "note": "unmatched source is our explicit pick (recorded per file as via unmatched), not a default"
+}
