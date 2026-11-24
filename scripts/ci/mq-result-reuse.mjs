@@ -8,51 +8,62 @@ import { appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 export const CI_WORKFLOW_ID = 382175354;
-// A full run has at least one successful job in every one of these groups (a light/card-only or soak-scoped
-// merge-group run skips them, so it is partial and never reused).
-export const FULL_RUN_GROUPS = ['test-shard', 'integration-part', 'soak-shard'];
+// Interface forge.merge-queue: a queue result is reusable only for the exact same integration state (same sha).
+// FULL-RUN EVIDENCE: every matrix job of every heavy group ran and succeeded, and every aggregate/required job
+// succeeded (a light/card-only or soak-scoped merge-group run skips some of these, so it is never reused). The
+// expected names mirror the matrices in ci.yml (a test pins them to the workflow).
+export const EXPECTED_MATRIX_JOBS = [
+  ...Array.from({ length: 10 }, (_, i) => `test-shard (${i + 1})`),
+  ...['scan-chain', 'sim-scenarios', 'lane-pool-a', 'lane-pool-b', 'parallel'].map((g) => `integration-part (${g})`),
+  ...Array.from({ length: 8 }, (_, i) => `soak-shard (${i + 1})`),
+];
+export const REQUIRED_JOBS = ['changes', 'standards', 'coverage-merge', 'host-paths', 'integration', 'test', 'smoke', 'daemon-soak'];
 
-const groupOf = (name) => FULL_RUN_GROUPS.find((g) => name === g || name.startsWith(`${g} `) || name.startsWith(`${g} (`));
-
-/** Pure verdict over one merge_group run and its jobs. */
+/** Pure verdict over one merge_group run and its COMPLETE job list. */
 export function judgeRun(run, jobs, sha) {
   if (!run || run.event !== 'merge_group') return { reuse: false, why: 'not a merge_group run' };
   if (run.head_sha !== sha) return { reuse: false, why: 'different sha' };
   if (run.status !== 'completed' || run.conclusion !== 'success') return { reuse: false, why: `run ${run.status}/${run.conclusion}` };
-  const seen = new Map(FULL_RUN_GROUPS.map((g) => [g, 0]));
-  for (const job of jobs ?? []) {
-    const g = groupOf(String(job.name ?? ''));
-    if (g) {
-      if (job.conclusion !== 'success') return { reuse: false, why: `${job.name} was ${job.conclusion}` };
-      seen.set(g, seen.get(g) + 1);
-    } else if (job.conclusion === 'skipped' && /^(test|smoke|daemon-soak)$/.test(String(job.name))) {
-      return { reuse: false, why: `${job.name} skipped` };
-    }
+  const byName = new Map();
+  for (const job of jobs ?? []) byName.set(String(job.name ?? ''), job);
+  for (const name of [...EXPECTED_MATRIX_JOBS, ...REQUIRED_JOBS]) {
+    const job = byName.get(name);
+    if (!job) return { reuse: false, why: `partial run: no ${name} job` };
+    if (job.conclusion !== 'success') return { reuse: false, why: `${name} was ${job.conclusion}` };
   }
-  for (const [g, n] of seen) if (n === 0) return { reuse: false, why: `partial run: no ${g} job ran` };
   return { reuse: true, why: 'merge-queue run succeeded in full' };
 }
 
-/** Find the verdict via the GitHub API. `api(path)` returns parsed JSON. Any throw means reuse=false. */
-export async function decide({ api, repo, sha, event }) {
+/**
+ * Find the verdict via the GitHub API. `api(path)` returns parsed JSON. Any throw means reuse=false.
+ * `quarantineClear()` resolves true only when no red-main quarantine entry is active (the queue may have skipped
+ * quarantined tests; main runs every test).
+ */
+export async function decide({ api, repo, sha, event, quarantineClear = async () => false }) {
   if (event !== 'push') return { reuse: false, why: `event ${event} is not a main push` };
   if (!/^[0-9a-f]{40}$/.test(sha ?? '')) return { reuse: false, why: 'no full sha' };
   try {
     const runs = await api(`/repos/${repo}/actions/workflows/${CI_WORKFLOW_ID}/runs?event=merge_group&head_sha=${sha}&per_page=20`);
-    const candidates = (runs.workflow_runs ?? []).filter((r) => r.head_sha === sha && r.event === 'merge_group');
+    const candidates = (runs.workflow_runs ?? [])
+      .filter((r) => r.head_sha === sha && r.event === 'merge_group')
+      .sort((a, b) => Number(b.id) - Number(a.id));
     if (candidates.length === 0) return { reuse: false, why: 'no merge-queue run for this sha' };
-    let last = { reuse: false, why: 'no usable run' };
-    for (const run of candidates) {
-      const jobs = [];
-      for (let page = 1; page <= 5; page += 1) {
-        const res = await api(`/repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100&page=${page}`);
-        jobs.push(...(res.jobs ?? []));
-        if ((res.jobs ?? []).length < 100) break;
-      }
-      last = judgeRun(run, jobs, sha);
-      if (last.reuse) return { ...last, runId: run.id };
+    // Only the NEWEST run for the sha counts: a newer failed or unfinished run is contrary evidence.
+    const run = candidates[0];
+    const jobs = [];
+    let total = null;
+    for (let page = 1; page <= 10; page += 1) {
+      const res = await api(`/repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100&page=${page}`);
+      if (!Array.isArray(res.jobs) || !Number.isInteger(res.total_count)) return { reuse: false, why: 'incomplete jobs listing' };
+      total = res.total_count;
+      jobs.push(...res.jobs);
+      if (jobs.length >= total || res.jobs.length === 0) break;
     }
-    return last;
+    if (jobs.length !== total) return { reuse: false, why: 'jobs listing incomplete' };
+    const verdict = judgeRun(run, jobs, sha);
+    if (!verdict.reuse) return verdict;
+    if (!(await quarantineClear())) return { reuse: false, why: 'red-main quarantine active or unreadable' };
+    return { ...verdict, runId: run.id };
   } catch (err) {
     return { reuse: false, why: `error: ${err?.message ?? err}` };
   }
@@ -67,7 +78,13 @@ async function main() {
     if (!res.ok) throw new Error(`GitHub API ${res.status}`);
     return res.json();
   };
-  const v = await decide({ api, repo, sha, event });
+  const quarantineClear = async () => {
+    const { readQuarantine } = await import('../lib/red-main-quarantine-io.mjs');
+    const { activeEntries } = await import('../lib/red-main-quarantine.mjs');
+    const got = readQuarantine({});
+    return got.ok === true && activeEntries(got.list, { now: Date.now() }).length === 0;
+  };
+  const v = await decide({ api, repo, sha, event, quarantineClear });
   const line = v.reuse
     ? `mq-result-reuse: REUSING merge-queue run ${v.runId} for ${sha}; heavy jobs skipped (${v.why})`
     : `mq-result-reuse: full run (${v.why})`;

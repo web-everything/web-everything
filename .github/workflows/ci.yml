@@ -835,12 +835,6 @@ jobs:
             echo "### daemon-soak: soak deferred to merge queue (R1068)" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          # CI-MAIN-REUSE-MQ: only an explicit reuse=true from a successful `changes` job skips the soak.
-          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.reuse }}" = "true" ]; then
-            echo "soak reused from the merge-queue run of this exact sha"
-            echo "### daemon-soak: reused merge-queue result (CI-MAIN-REUSE-MQ)" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           # Fail CLOSED on the scope job itself: a crashed `daemon-soak-scope` leaves `outputs.run` empty, and an
           # empty value must never read as "no daemon code touched" (that would green the required check with the
           # soak never run). Only an explicit `run=false` from a SUCCESSFUL scope job skips the soak.
@@ -853,6 +847,13 @@ jobs:
             false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
           esac
+          # CI-MAIN-REUSE-MQ: after the scope checks above, only an explicit reuse=true from a successful
+          # `changes` job lets the (skipped) soak shards count as passed.
+          if [ "${{ needs.changes.result }}" = "success" ] && [ "${{ needs.changes.outputs.reuse }}" = "true" ]; then
+            echo "soak reused from the merge-queue run of this exact sha"
+            echo "### daemon-soak: reused merge-queue result (CI-MAIN-REUSE-MQ)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "${{ needs.soak-shard.result }}" != "success" ]; then
             echo "One or more soak shards did not succeed (soak-shard result: ${{ needs.soak-shard.result }})."
             exit 1
