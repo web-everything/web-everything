@@ -69,6 +69,39 @@ permissions:
   contents: read
 
 jobs:
+  secret-scan:
+    name: secret-scan
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Scan added lines
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          scanner=trusted/scripts/ci/secret-scan.mjs
+          if [ ! -f "$scanner" ]; then
+            echo 'secret-scan: bootstrap — base scanner absent; using PR copy for this run'
+            scanner=scripts/ci/secret-scan.mjs
+          fi
+          node "$scanner" --base "$BASE_SHA" --head "$HEAD_SHA"
+
   # CARD-ONLY LIGHT PATH (actions-queue-relief, 2026-10-03). A PR that changes only `backlog/**` runs the
   # independent `standards` job's `check:standards` (the backlog/card guards) but NOT the unit shards, coverage merge,
   # integration suite, docs build or Playwright lane. Detection is `scripts/ci-card-only.mjs` (tested):
