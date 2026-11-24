@@ -12,7 +12,7 @@ function fixture() {
     readAgents: vi.fn(() => []), readJobs: vi.fn(() => []),
     dispatch: vi.fn(() => ({ mode: 'job', jobPid: 123 })),
     hostAdmission: () => ({ admitted: true, maxPerTick: 2 }), liveCap: () => 2,
-    mainSha: () => 'main', log: vi.fn(), now: () => 10,
+    acquirableLanes: () => [1, 2], mainSha: () => 'main', log: vi.fn(), now: () => 10,
   };
 }
 describe('fast review admission negatives', () => {
@@ -126,4 +126,31 @@ it('rejects invalid PR numbers before a single-PR read', async () => {
   o.readLastPlan = () => ({ plan: { dispatch: [{ ...row, prNumber: -1 }] }, rawPrs: [], mainSha: 'main', savedAt: 1 });
   await runFastPass(o);
   expect(o.readPr).toHaveBeenCalledTimes(1); expect(o.dispatch).not.toHaveBeenCalled();
+});
+
+it.each([0, undefined, null, NaN])('refuses unknown or empty lane inventory %s', async lanes => {
+  const o = fixture(); o.acquirableLanes = () => lanes;
+  await runFastPass(o); expect(o.dispatch).not.toHaveBeenCalled();
+});
+it('refuses a throwing lane reader', async () => {
+  const o = fixture(); o.acquirableLanes = () => { throw Error('unreadable lanes'); };
+  await runFastPass(o); expect(o.dispatch).not.toHaveBeenCalled();
+});
+it('spends host and live start capacity before a post-spawn throw, across repositories', async () => {
+  const starts = { count: 0 }, budget = { left: 1, reserve: 0 };
+  const o = fixture(); o.starts = starts; o.budget = budget;
+  o.hostAdmission = () => ({ admitted: true, maxPerTick: 1 });
+  o.dispatch.mockImplementation(() => { throw Error('after spawn'); });
+  await runFastPass(o); await runFastPass({ ...o, repo: 'second/repo' });
+  expect(o.dispatch).toHaveBeenCalledTimes(1); expect(starts.count).toBe(1); expect(budget.left).toBe(0);
+});
+it('retains the red-team reserve', async () => {
+  const o = fixture(); o.budget = { left: 1, reserve: 1 };
+  await runFastPass(o); expect(o.dispatch).not.toHaveBeenCalled();
+});
+it('passes ordinary routing context and the acquirable lane', async () => {
+  const o = fixture(); const subject = { ...pr, files: ['docs/agent/platform-decisions.md', { path: 'scripts/a.mjs' }], body: '## Escalation reason\n- high risk' };
+  o.readPr.mockImplementation(({ pending }) => pending ? [] : subject);
+  await runFastPass(o);
+  expect(o.dispatch).toHaveBeenCalledWith(expect.objectContaining({ scopePaths: ['docs/agent/platform-decisions.md', 'scripts/a.mjs'], escalationReason: ['high risk'], preferLane: 1 }));
 });

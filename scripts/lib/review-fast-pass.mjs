@@ -1,9 +1,11 @@
+import { reviewDispatchContext } from './review-dispatch-context.mjs';
+
 /** IO-free orchestration. Readers throw or mark incomplete evidence; the normal tick is the fallback.
  * readPr({pending:true}) returns a bounded inventory of currently pending PRs. planOne must use the
  * same admission/planner gates as the tick. liveCap returns the total ceiling, never saved free slots.
  */
 export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAgents, readJobs,
-  dispatch, hostAdmission, liveCap, mainSha, log = () => {}, now = Date.now }) {
+  dispatch, hostAdmission, liveCap, mainSha, acquirableLanes, starts = { count: 0 }, budget, log = () => {}, now = Date.now }) {
   const result = { dispatched: [], failed: [] };
   const note = (pr, reason) => {
     result.failed.push({ prNumber: pr, reason });
@@ -33,7 +35,7 @@ export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAge
       }
     }
     if (candidates.size > 100) throw Error('candidate inventory over 100');
-    let starts = 0;
+    let occupiedLanes = 0;
     if (candidates.size > 8) note(null, 'fast pass limited to 8 candidates');
     const ordered = [...candidates].sort(([a], [b]) => Number(recent.has(b)) - Number(recent.has(a)));
     for (const [number, plannedHead] of ordered.slice(0, 8)) {
@@ -47,19 +49,27 @@ export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAge
         const jobs = await readJobs({ repo });
         if (!Array.isArray(agents) || agents.incomplete || !Array.isArray(jobs) || jobs.incomplete) throw Error('live inventory incomplete');
         const cap = await liveCap({ repo, jobs, agents });
-        if (!Number.isFinite(cap) || cap <= jobs.length + starts) throw Error('live-review cap exhausted');
+        if (!Number.isFinite(cap) || cap <= jobs.length + starts.count) throw Error('live-review cap exhausted');
         if (jobs.some(job => job.repo === repo && Number(job.pr) === number)) throw Error('live job slot');
         const plan = await planOne({ repo, pr, agents, now: now() });
         const row = plan?.dispatch?.find(r => r.kind === 'review' && r.prNumber === number);
         if (plan?.deferred || plan?.agentsIncomplete || !row || plan.refusals?.some(r => r.prNumber === number)) throw Error('fresh plan holds PR');
         if (await mainSha(repo) !== main) throw Error('main changed during plan');
+        const lanes = await acquirableLanes({ repo });
+        const available = Array.isArray(lanes) ? lanes.length : lanes;
+        if (!(available > occupiedLanes)) throw Error('lane inventory empty or unknown');
+        if (budget && !(budget.left > (budget.reserve ?? 0))) throw Error('live-review reserve exhausted');
         const host = await hostAdmission();
-        if (host?.admitted !== true || !(host.maxPerTick > starts)) throw Error('host admission refused');
+        if (host?.admitted !== true || !(host.maxPerTick > 0) || !((host.startBudget ?? host.maxPerTick) > starts.count)) throw Error('host admission refused');
+        starts.count++;
+        occupiedLanes++;
+        host.take?.(1);
+        if (budget) budget.left--;
         const out = await dispatch({ repo, pr: number, expectedHead: pr.headRefOid,
+          ...reviewDispatchContext(pr),
+          ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes - 1] } : {}),
           ...(row.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: row.advisoryReview } : {}) });
         if (!out || out.skipped || out.refused) throw Error(out?.skipped ?? out?.reason ?? out?.outcome ?? 'dispatch refused');
-        starts++;
-        host.take?.(1);
         result.dispatched.push({ prNumber: number, ...out });
         log(`review-fast-pass: ${repo}#${number} dispatched`);
       } catch (error) { note(number, String(error?.message ?? error)); }

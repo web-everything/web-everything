@@ -422,3 +422,13 @@ describe('staleRemedy', () => {
     expect(staleRemedy({}, 'main')).toMatch(/^Sync \(git pull --ff-only\)/);
   });
 });
+
+describe('strict freshness reads for fast review admission', () => {
+  it.each(['fetch', 'rev-parse', 'rev-list', 'status', 'symbolic-ref'])('refuses failed %s evidence', failed => {
+    const run = args => {
+      if (args[0] === failed) return { status: 1, stdout: '', stderr: 'unreadable' };
+      return { status: 0, stdout: args[0] === 'rev-parse' ? args[1] : args[0] === 'rev-list' ? '1' : args[0] === 'symbolic-ref' ? 'main' : '', stderr: '' };
+    };
+    expect(checkMainStaleness({ strict: true, cleanOnly: true, autoFf: false, run })).toEqual({ offline: true });
+  });
+});

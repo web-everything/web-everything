@@ -185,3 +185,16 @@ describe('review tick plan sharing', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+it('snapshot production passes the repository to both remote-main reads', () => {
+  const readMainSha = vi.fn(({ repo }) => repo === 'first/repo' ? 'a'.repeat(40) : 'b'.repeat(40));
+  const onPlan = vi.fn();
+  for (const repo of ['first/repo', 'second/repo']) runReviewTick({ ...reviewOpts, repo, readMainSha, onPlan, reconcile: empty });
+  expect(readMainSha.mock.calls.map(([args]) => args.repo)).toEqual(['first/repo', 'first/repo', 'second/repo', 'second/repo']);
+  expect(onPlan.mock.calls.map(([snapshot]) => snapshot.mainSha)).toEqual(['a'.repeat(40), 'b'.repeat(40)]);
+});
+it('failed remote-main reads leave no usable fast snapshot without breaking the ordinary tick', () => {
+  const onPlan = vi.fn();
+  expect(() => runReviewTick({ ...reviewOpts, repo, onPlan, reconcile: empty, readMainSha: () => { throw Error('remote unreadable'); } })).not.toThrow();
+  expect(onPlan).toHaveBeenCalledWith(expect.objectContaining({ mainSha: null }));
+});

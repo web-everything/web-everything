@@ -125,6 +125,7 @@ import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
@@ -592,6 +593,9 @@ export function dispatchReview({
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],
+  expectedHead,
+  readExpectedHead = ({ pr, repo }) => String(runGhSync(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid', '--jq', '.headRefOid'],
+    { encoding: 'utf8', timeout: 15000, maxBuffer: 65536, throttle: { maxAttempts: 1 } })).trim(),
   checkStaleness,
   judgeProvider = 'claude',
   careLevel = 'none', escalationReason = [], scopePaths = [],
@@ -684,6 +688,13 @@ export function dispatchReview({
   // concluded no session had started — while the real session (findable by its `-n` slug) was running the
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
+  if (expectedHead !== undefined) {
+    let live;
+    try { live = readExpectedHead({ pr: planned.pr, repo: planned.repo }); } catch { /* refuse unknown */ }
+    if (!/^[a-f0-9]{40}$/i.test(expectedHead) || live !== expectedHead) {
+      return { pr: planned.pr, repo: planned.repo, refused: true, outcome: 'refused-head-moved' };
+    }
+  }
   if (wrapReview) {
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,

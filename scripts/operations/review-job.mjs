@@ -1701,12 +1701,13 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spaw
  * {@link REVIEW_DISPATCH_MODE_ENV}`=session` asks for it.
  */
 // Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
-export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+export function dispatchReviewByMode({ strictStackEvidence = false, mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
   // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
   // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
   let stack = null;
-  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }); }
-  catch { stack = null; }
+  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env, strict: strictStackEvidence }); }
+  catch (error) { if (strictStackEvidence) throw error; stack = null; }
+  if (strictStackEvidence && (!stack || (!Object.hasOwn(stack, 'base') && !stack.skipped))) throw Error('stack evidence unknown');
   if (stack?.skipped) return { mode, pr: opts.pr, repo: opts.repo, skipped: stack.skipped };
   const named = (r) => (stack?.base && r && !r.skipped
     ? { ...r, mode: `${r.mode ?? mode} against stack base #${stack.base.pr} (${stack.base.ref}@${stack.base.contained.slice(0, 9)})` }
@@ -1726,8 +1727,8 @@ const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
  * FAILS OPEN: any read error dispatches the review as before. Only the Web Everything repo (the clone this runs in).
  * @returns {{skipped?:string, base?:object|null}}
  */
-export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
-  readStack = (n) => readStackBase({ pr: n, root, env }),
+export function checkStackBeforeReview({ pr, repo, strict = false, root = REPO_ROOT, env = process.env,
+  readStack = (n) => readStackBase({ pr: n, root, env, strict }),
   readThread = (n) => readStackThread(n, { repo, root }),
   stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
   mainText = (pin) => mainNetDiffText(pin, { root }),
@@ -1737,7 +1738,8 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
   const base = readStack(pr);
   let thread = null;
-  try { thread = readThread(pr); } catch { thread = null; }
+  try { thread = readThread(pr); } catch (error) { if (strict) throw error; thread = null; }
+  if (strict && !Array.isArray(thread?.comments)) throw Error('stack thread unreadable');
   const comments = Array.isArray(thread?.comments) ? thread.comments : [];
   if (base) log(`review-job: ${repo}#${pr} is stacked on #${base.pr} — its review reads the diff against ${base.ref}@${base.contained.slice(0, 9)} (the bottom's head), not main`);
   if (!liveStackMarkers(comments).some((m) => m.top === Number(pr))) return { base };
@@ -1749,6 +1751,7 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
     // below is bound to that same commit and fingerprint.
     try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
   }
+  if (strict && ((base && !stackFingerprint) || (!base && !mainFingerprint))) throw Error('stack fingerprint unreadable');
   // The bottom is read only for a PR that would otherwise carry (collapsed stack, identical own diff): a bottom that
   // moved after the accept must be reviewed again, whatever the top's own diff says.
   let bottomLanded = null;
@@ -1756,12 +1759,14 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   if (!base && latest && mainFingerprint && mainFingerprint === latest.fingerprint) {
     try { bottomLanded = readBottom(latest); } catch (e) { bottomLanded = { ok: false, why: `the landing could not be read (${String(e?.message ?? e).slice(0, 120)})` }; }
   }
+  if (strict && !base && latest && mainFingerprint === latest.fingerprint && bottomLanded?.ok !== true) throw Error('stack bottom evidence unreadable');
   const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint, bottomLanded });
   if (decision.action === 'review' && decision.why) log(`review-job: ${repo}#${pr} ${decision.why} — reviewing as usual`);
   if (decision.action === 'held') return { base, skipped: decision.why };
   if (decision.action === 'carry') {
     const done = carry(pr, { ...decision, head: thread.headRefOid, fingerprint: mainFingerprint });
     if (done?.ok) { log(`review-job: ${repo}#${pr} ${decision.why} — accept carried forward`); return { base, skipped: decision.why }; }
+    if (strict) throw Error('stack accept carry failed');
     log(`review-job: ${repo}#${pr} stack-accept carry failed (${done?.error ?? 'unknown'}) — reviewing as usual`);
   }
   return { base };
