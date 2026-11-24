@@ -6,14 +6,15 @@ import { tmpdir } from 'node:os';
 import * as q from '../../lib/red-main-quarantine.mjs';
 import { runSafetyNet } from '../../lib/red-main-quarantine-io.mjs';
 import smell from '../health-smells/main-ci-red.mjs';
-import * as core from '../main-ci-red-core.mjs';
 import { parseTimeouts } from '../../lib/test-timeout-policy.mjs';
 
 const file = 'scripts/conveyor/soak/daemon-soak.soak.test.mjs';
 const job = 'soak-shard (1)', now = Date.parse('2026-11-22T23:05:00Z');
 // Run 45080540441: timeout text from handoff events.live.json, line 304 of job 137404406023.
 // File reporter line reconstructed from the prep; this is not the complete archived job log.
-const log = `❯ ${file} (1 test | 1 failed)\n  → Test timed out in 1020000ms.`;
+const fragment = `❯ ${file} (1 test | 1 failed)\n  → Test timed out in 1020000ms.`;
+// Synthetic complete assertion log exercises repeat proof without timeout policy.
+const log = `FAIL ${file} > fails\nAssertionError: broken\nTest Files 1 failed`;
 const red = { databaseId: 45080540441, headSha: '70001b920c55f4423d028a2a18d3d79c8a8b2757', status: 'completed', conclusion: 'timed_out',
   createdAt: '2026-11-22T22:57:00Z', updatedAt: '2026-11-22T23:00:00Z', attempt: 1 };
 const failure = () => q.parseVitestFailures(log);
@@ -23,12 +24,13 @@ const plan = (overrides = {}) => q.planSafetyNet({ status: 'red', firstRedSha: r
 
 it.each([
   `FAIL ${file} > slow case\nError: Test timed out in 5000ms.`,
-  log,
+  fragment,
   `RUN ${file}\nError: The job has exceeded the maximum execution time`,
   `RUN ${file}\nError: There was an error during teardown`,
   `❯ ${file} (1 test | 1 failed)\nError: Test timed out in 5000ms.`,
-])('names timeout/teardown/soak failures without a summary: %s', text => {
-  expect(q.parseVitestFailures(text)).toMatchObject({ files: [file], complete: true });
+])('rejects summaryless timeout/teardown/soak fragments: %s', text => {
+  expect(q.parseVitestFailures(text).complete).toBe(false);
+  expect(plan({ jobFailures: { [job]: q.parseVitestFailures(text) } }).action).toBe('none');
 });
 
 it('never promotes a passing file, an ambiguous job timeout, or an incomplete ordinary failure', () => {
@@ -61,11 +63,48 @@ it.each([
     flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).action).toBe('none');
 });
 
-it('requests the proof rerun for a timeout-only soak log; a passing rerun still proves a flake', () => {
-  expect(core.classifyFlakeRun({ run: red, failures: core.parseVitestFailures(log) }).eligible).toBe(true);
-  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.`;
-  expect(plan({ jobFailures: { [job]: { ...q.parseVitestFailures(text), timeouts: parseTimeouts(text) } },
-    flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).tests).toEqual([file]);
+it('requires proof for complete assertions and classifies every accepted timeout', () => {
+  expect(plan().action).toBe('none');
+  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed`;
+  const timed = { ...q.parseVitestFailures(text), timeouts: parseTimeouts(text) };
+  const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
+  expect(timed.complete).toBe(true);
+  expect(timed.timeouts).toEqual([{ file, name: 'slow', runnerLimitMs: 5000, truncated: true }]);
+  const soft = { all: { soft: 'PT5S', hard: 'PT10M', runnerKillAtHard: false } };
+  expect(plan({ jobFailures: { [job]: timed }, flakeProof: proof, timeoutPolicy: soft }).tests).toEqual([file]);
+});
+
+it('still refuses to quarantine a hard or unconfigured timeout (early quarantine never widens what can be quarantined)', () => {
+  const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed`;
+  const timed = { ...q.parseVitestFailures(text), timeouts: parseTimeouts(text) };
+  const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
+  for (const timeoutPolicy of [{}, { all: { soft: 'PT1S', hard: 'PT2S' } }]) {
+    const p = plan({ jobFailures: { [job]: timed }, flakeProof: proof, timeoutPolicy });
+    expect(p.action).toBe('none');
+    expect(p.why).toMatch(/timeout policy/);
+  }
+});
+
+it.each([
+  ['same-file assertion then timeout', `FAIL ${file} > assertion\nAssertionError: broken\nFAIL ${file} > slow\nError: Test timed out in 5000ms.`],
+  ['RUN plus teardown', `RUN ${file}\nError: There was an error during teardown`],
+  ['zero failed reporter', `❯ ${file} (1 test | 0 failed)\nError: Test timed out in 5000ms.`],
+  ['unattributed extra timeout', `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nError: Test timed out in 5000ms.`],
+  ['extra worker error', `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nError: Worker exited unexpectedly`],
+  ['unsupported reporter arrow', fragment],
+  ['unsupported reporter Error', `❯ ${file} (1 test | 1 failed)\nError: Test timed out in 5000ms.`],
+])('escalates %s even with a summary and rerun proof', (_, text) => {
+  const parsed = { ...q.parseVitestFailures(`${text}\nTest Files 1 failed`), timeouts: parseTimeouts(text) };
+  expect(parsed.complete).toBe(false);
+  expect(plan({ jobFailures: { [job]: parsed }, flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).action).toBe('none');
+});
+
+it('reads touchedFiles for same-SHA repeats and refuses unknown evidence', () => {
+  let calls = 0;
+  const p = plan({ repeatRuns: [run({ attempt: 1 }), run({ attempt: 2, createdAt: '2026-11-22T23:01:00Z' })],
+    latestAttempt: 2, touchedFiles: (...shas) => { calls++; expect(shas).toEqual([red.headSha, red.headSha]); return null; } });
+  expect(calls).toBe(1);
+  expect(p).toMatchObject({ action: 'none', why: expect.stringContaining('touched files unknown') });
 });
 
 it('refuses missing owner/TTL, bounds lifetime, and never skips expired entries', () => {
@@ -80,7 +119,7 @@ it('refuses missing owner/TTL, bounds lifetime, and never skips expired entries'
   expect(q.testsToSkip({ list, now: now + q.QUARANTINE_MAX_TTL_MS })).toEqual([]);
 });
 
-it('replays 45080540441: one FAILED rerun publishes; unknown failures escalate immediately', () => {
+it('publishes synthetic complete repeat evidence; unknown failures escalate immediately', () => {
   const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
   let list = { version: 1, entries: [] }, logs = [];
   const invoke = (r, readLog = failure, live = true) => runSafetyNet({ dir, now, live,
@@ -96,7 +135,7 @@ it('replays 45080540441: one FAILED rerun publishes; unknown failures escalate i
     const retry = { ...red, attempt: 2, updatedAt: '2026-11-22T23:04:00Z' };
     const replay = invoke(retry, failure, false);
     expect(replay.plan.tests).toEqual([file]);
-    console.info('45080540441 reconstructed dry-run', JSON.stringify({ at: new Date(now).toISOString(), entries: replay.plan.entries }));
+    console.info('synthetic complete-log dry-run', JSON.stringify({ at: new Date(now).toISOString(), entries: replay.plan.entries }));
     const second = invoke(retry);
     expect(second.applied).toBe(true);
     expect(list.entries[0]).toMatchObject({ test: file, owner: 'red-main-safety-net', proof: { kind: 'repeat-failed', attempts: [1, 2] } });

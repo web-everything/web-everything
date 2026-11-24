@@ -20,7 +20,7 @@ const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs'
 const FIRST_RED = '2cb94418d3d95e9d64ca59ce6de789a319a6718c';
 const NOW = Date.parse('2026-10-10T19:05:00Z');
 const FIX_PR = 4980;
-const ADDED = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'red-main-safety-net', reason: 'main CI red since 2cb94418d', actor: 'red-main-safety-net', now: Date.parse('2026-10-10T18:56:00Z') }).list;
+const ADDED = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'red-main-safety-net', reason: 'main CI red since 2cb94418d', actor: 'red-main-safety-net', now: Date.parse('2026-10-10T18:56:00Z') }).list;
 const LIST = setFixPrs(ADDED, { fixPrs: [FIX_PR], actor: 'red-main-safety-net', now: NOW }).list;
 const READ = { ok: true, list: LIST };
 const Q = { value: 'quarantine', source: 'env' };
@@ -201,7 +201,7 @@ describe('list guards', () => {
     expect(validateQuarantineList({ ...LIST, fixPrs: ['4980; rm -rf'] }).ok).toBe(false);
   });
   it('a name-qualified entry is never turned into a file exclude', () => {
-    const l = addEntries(null, { tests: [`${TEST_FILE}::#4979 the sanctioned writer`], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: NOW - 1000 }).list;
+    const l = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [`${TEST_FILE}::#4979 the sanctioned writer`], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: NOW - 1000 }).list;
     const d = decideCiSkip({ mode: 'quarantine', read: { ok: true, list: l }, ctx: { known: true, onMain: false, prNumber: 1 }, changedFiles: [], now: NOW });
     expect(d.skip).toEqual([]);
     expect(d.unsupported).toHaveLength(1);
@@ -251,7 +251,7 @@ describe('ci.yml wiring', () => {
       failedJobs: [job], jobFailures: { [job]: { files: [TEST_FILE], tests: [], complete: true } }, flakeProof: { [job]: proof } });
     expect(plan.action).toBe('add');
     let list = null;
-    for (const entry of plan.entries) list = addEntries(list, { tests: [entry.test], job: entry.job, proof: entry.proof,
+    for (const entry of plan.entries) list = addEntries(list, { ttlMs: 6 * 60 * 60 * 1000, tests: [entry.test], job: entry.job, proof: entry.proof,
       brokenSha: FIRST_RED, owner: 'red-main-safety-net', reason: plan.why, actor: 'red-main-safety-net', now: NOW }).list;
     const read = { ok: true, list: { ...list, mode: 'quarantine' } };
     expect(run({ pr: 4990, event: prEvent(4990), mode: undefined, read }).line).toBe(`--exclude=${TEST_FILE}`);

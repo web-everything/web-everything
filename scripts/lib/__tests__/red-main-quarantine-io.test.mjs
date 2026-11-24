@@ -29,7 +29,7 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
   it('add creates ops/quarantine with the list + an audit event; prune on green empties it; nothing else is pushed', () => {
     const { board, origin } = repo();
     const now = Date.now();
-    writeQuarantineChange({ board, actor: 'red-main-safety-net', message: 'add', change: (cur) => addEntries(cur, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }) });
+    writeQuarantineChange({ board, actor: 'red-main-safety-net', message: 'add', change: (cur) => addEntries(cur, { ttlMs: 6 * 60 * 60 * 1000, tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }) });
     const r = readQuarantine({ board });
     expect(r.ok).toBe(true);
     expect(testsToSkip({ list: r.list, now, prNumber: 1, fixPrs: [2] })).toEqual([TEST]);
@@ -71,10 +71,10 @@ describe('quarantine IO — ops/quarantine branch (real git)', () => {
 
 describe('runAddCommand — the `add` CLI wiring triggers the rerun', () => {
   it('operator --job reaches the published entry', () => {
-    runAddCommand({ tests: 'a.test.mjs', 'broken-sha': SHA, actor: 'operator', owner: 'o', reason: 'r', job: 'soak-shard (1)' },
+    runAddCommand({ 'ttl-min': '360', tests: 'a.test.mjs', 'broken-sha': SHA, actor: 'operator', owner: 'o', reason: 'r', job: 'soak-shard (1)' },
       { rerun: () => null, write: ({ change }) => { expect(change(null).list.entries[0].job).toBe('soak-shard (1)'); return { ok: true }; } });
   });
-  const flags = { tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'operator' };
+  const flags = { 'ttl-min': '360', tests: 'a.test.mjs', 'broken-sha': SHA, owner: 'o', reason: 'r', actor: 'operator' };
   it('a successful add calls the rerun with the broken sha and --dir, and attaches `rerun` to the output', () => {
     const rerun = vi.fn(() => ({ rerun: true, runId: 42 }));
     const write = vi.fn(() => ({ ok: true, events: [] }));
@@ -231,7 +231,7 @@ describe('rerunRedMainFailedJobs — a quarantine add re-runs the failed jobs of
 
 
 describe('orchestrator CLI authority and transport', () => {
-  const flags = { actor: 'orchestrator', tests: TEST, 'broken-sha': SHA, owner: 'owner', reason: 'red' };
+  const flags = { 'ttl-min': '360', actor: 'orchestrator', tests: TEST, 'broken-sha': SHA, owner: 'owner', reason: 'red' };
   it.each([undefined, false, 'true'])('denies CLI add/remove/prune and direct writes with absent, false or invalid authority (%s)', value => {
     const options = { env: {}, platform: { authority: { redMainQuarantine: value } }, tool: {}, write: vi.fn(), rerun: vi.fn() };
     expect(() => runAddCommand(flags, options)).toThrow(/redMainQuarantine/);

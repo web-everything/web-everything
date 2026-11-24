@@ -23,7 +23,7 @@
  *   Audit trail (`events.jsonl`, same commit): quarantine changes and `card-owed` repair obligations.
  */
 
-import { timeoutOutcomes, allSoft } from './test-timeout-policy.mjs';
+import { parseTimeouts, timeoutOutcomes, allSoft } from './test-timeout-policy.mjs';
 
 export const QUARANTINE_BRANCH = 'ops/quarantine';
 export const QUARANTINE_REF = `refs/heads/${QUARANTINE_BRANCH}`;
@@ -199,46 +199,33 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 
 /**
- * Failing vitest tests from one CI job's log (untrusted text). `complete` only when the run's own summary line
- * (`Test Files  N failed | …`) matches the parsed files, or an explicit timeout/teardown error names failed files
- * or one launched test file. Ambiguous interrupted jobs remain unknown and must escalate. PURE.
- * @returns {{files:string[], tests:Array<{file:string,name:string|null}>, failedFiles:number|null, complete:boolean}}
+ * Failing vitest tests from one CI job's log (untrusted text). Completeness requires
+ * a matching failed-file summary. Interrupted logs additionally require a measured
+ * timeout for every individual failure; unsupported diagnostics must escalate. PURE.
  */
 export function parseVitestFailures(logText) {
   const tests = [];
-  const launched = new Set();
-  const interruptedFiles = new Set();
-  let currentFailure = null, ambiguousInterruption = false;
-  let failedFiles = null;
+  let failedFiles = null, interrupted = false, unknownError = false, timeoutLines = 0;
+  const timeouts = parseTimeouts(logText);
   for (const raw of String(logText ?? '').split('\n')) {
     const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
-    const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line); // `FAIL file > a > b`, or `FAIL file [ file ]` (a suite that failed to load)
-    const namedFailure = m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1]);
-    if (namedFailure) {
+    const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line);
+    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
       tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
-      currentFailure = m[1];
     }
-    const paths = line.match(/[\w./@-]+\.test\.[cm]?[jt]sx?\b/g) ?? [];
-    const safePaths = paths.filter(p => SAFE_TEST.test(p) && !p.includes('..'));
-    if (/^\s*(?:RUN\s|.*\bvitest\s+run\s)/.test(line)) for (const p of safePaths) launched.add(p);
-    const reporterFailure = /^\s*[❯×]\s/.test(line) && /\b\d+ failed\b/.test(line) && safePaths.length === 1;
-    if (reporterFailure) { tests.push({ file: safePaths[0], name: null }); currentFailure = safePaths[0]; }
-    const interruption = /^\s*(?:Error:|##\[error\]|→)\s*(Test timed out|.*job.*(?:timed out|exceeded.*(?:execution time|timeout))|.*(?:error during teardown|teardown.*(?:error|timed out)))/i.exec(line);
-    if (interruption) {
-      const culprit = /^Test timed out/i.test(interruption[1]) ? currentFailure : launched.size === 1 ? [...launched][0] : null;
-      if (culprit) interruptedFiles.add(culprit);
-      else ambiguousInterruption = true;
-    }
-    // Only the next nonblank diagnostic belongs to the preceding failure.
-    if (line.trim() && !namedFailure && !reporterFailure) currentFailure = null;
-    const s = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
-    if (s) failedFiles = Number(s[1]);
+    const timeoutLine = /^\s*Error: Test timed out in \d+ms\.\s*$/.test(line);
+    if (timeoutLine) timeoutLines++;
+    if (/timed out|exceeded.*(?:execution time|timeout)|teardown/i.test(line)) { interrupted = true; if (!timeoutLine) unknownError = true; }
+    // Only the existing named FAIL + measured Error format supplies timeout evidence.
+    if (/Error\b|Assertion\b|Unhandled|Uncaught|Worker.*(?:exit|fail)|##\[error\]|^\s*→|^\s*[❯×].*\b\d+ failed\b/i.test(line)
+      && !timeoutLine) unknownError = true;
+    const summary = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
+    if (summary) failedFiles = Number(summary[1]);
   }
-  // An interrupted single-file invocation names its culprit; a multi-file job timeout is ambiguous.
-  if (!ambiguousInterruption && interruptedFiles.size === 1 && !tests.length && launched.size === 1) tests.push({ file: [...launched][0], name: null });
-  const files = [...new Set(tests.map((t) => t.file))];
-  const attributable = !ambiguousInterruption && files.every(f => interruptedFiles.has(f)) && [...launched].every(f => files.includes(f));
-  return { files, tests, failedFiles, complete: files.length > 0 && (failedFiles === files.length || (failedFiles === null && attributable)) };
+  const files = [...new Set(tests.map(t => t.file))];
+  const measured = timeoutLines === timeouts.length && tests.length === timeouts.length && tests.every((t, i) => t.file === timeouts[i].file && t.name === timeouts[i].name);
+  return { files, tests, failedFiles, timeouts, complete: files.length > 0 && failedFiles === files.length
+    && (!interrupted || (!unknownError && measured)) };
 }
 
 /** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
@@ -307,7 +294,7 @@ function repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt = 1, touc
   if (!evidence.every((r) => validSha(r.headSha))) return no('repeat failing run sha missing');
   const shas = [evidence[0].headSha, latest.headSha];
   let touched;
-  try { touched = shas[0] === shas[1] ? [] : touchedFiles?.(...shas); } catch { touched = null; }
+  try { touched = touchedFiles?.(...shas); } catch { touched = null; }
   if (!Array.isArray(touched) || !touched.every((f) => typeof f === 'string')) return no('touched files unknown');
   if (touched.includes(file)) return no('failing test file touched between runs');
   const attempts = evidence.map((r) => r.attempt === undefined ? 1 : r.attempt);
@@ -357,6 +344,7 @@ export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, j
       const f = jobFailures?.[job];
       if (!f?.complete) return none(`failing tests of ${job} unknown (not a known-failing-test red)`);
       const outcomes = timeoutOutcomes(f, timeoutPolicy, job);
+      if (outcomes.some(o => ['hard', 'unconfigured'].includes(o.class))) return none(`timeout policy: ${job}: ${outcomes.map(o => o.class).join(', ')}; red-main process required`);
       const soft = allSoft(f, outcomes);
       for (const file of f.files) {
         let proof = validFlakeProof(flakeProof?.[job]) ? flakeProof[job] : undefined;

@@ -14,7 +14,7 @@ const otherFile = 'scripts/conveyor/soak/breaks/other.soak.test.mjs';
 const soakName = '50 real daemon ticks: every invariant holds after every tick';
 
 function skip(job, file, overrides = {}) {
-  const list = addEntries(null, { tests: [file], job, brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
+  const list = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [file], job, brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
     reason: 'repeat failures', actor: 'red-main-safety-net', now: now - 1000 }).list;
   return quarantineSkip({ env: {}, now, changed: [],
     read: { ok: true, list: { ...list, mode: 'quarantine', fixPrs: [6010] } },
@@ -113,7 +113,7 @@ describe('soak CLI quarantine consumption', () => {
     expect(process.stdout.write).toHaveBeenCalledWith(expect.stringContaining(soakFile));
   });
   it('an untagged or expired entry yields no quarantined flag, so the emptied shard FAILS', async () => {
-    const untagged = addEntries(null, { tests: [soakFile], brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
+    const untagged = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [soakFile], brokenSha: 'a'.repeat(40), owner: 'red-main-safety-net',
       reason: 'repeat failures', actor: 'red-main-safety-net', now: now - 1000 }).list;
     const read = { ok: true, list: { ...untagged, mode: 'quarantine', fixPrs: [6010] } };
     const flags = { job: 'soak-shard (1)', event: 'pull_request', ref: 'refs/pull/6014/merge' };
