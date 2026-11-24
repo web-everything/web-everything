@@ -78,3 +78,19 @@ it('a healthy prepare loop (launches) and idle ticks raise nothing', () => {
   expect(Object.keys(feed(ok, parsePrepareTicks).state.episodes)).toHaveLength(0);
   expect(parsePrepareTicks(idle)).toHaveLength(0);
 });
+
+it('counts whole-tick failures (tick-failed) as prepare failures and raises one alarm', () => {
+  const text = Array.from({ length: 8 }, (_, i) => JSON.stringify({ at: new Date(now - i * 10 * minute).toISOString(), event: 'tick-failed', timings: {} })).join('\n');
+  expect(parsePrepareTicks(text)).toHaveLength(8);
+  const r = feed(text, parsePrepareTicks);
+  expect(Object.values(r.state.episodes)).toHaveLength(1);
+  expect(Object.values(r.state.episodes)[0].subject).toBe('prepare');
+});
+
+it('counts the drain catch handler "could not finish (class=...)" lines as failures', () => {
+  const line = (ageMin) => `[drain-daemon] ${new Date(now - ageMin * minute).toISOString()} enqueue-on-event: catch-up #7395 — could not finish (class=unknown)`;
+  const text = Array.from({ length: 8 }, (_, i) => line(i * 10)).join('\n');
+  expect(parseDrainCatchupTicks(text)[0]).toMatchObject({ failed: 1, error: 'could not finish (class=unknown)' });
+  const r = feed(text, parseDrainCatchupTicks);
+  expect(Object.values(r.state.episodes)).toHaveLength(1);
+});

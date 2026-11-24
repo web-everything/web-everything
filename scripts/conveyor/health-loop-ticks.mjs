@@ -86,7 +86,10 @@ export function parsePrepareTicks(text) {
     if (!t.startsWith('{') || !t.includes('"timings"')) continue;
     let r; try { r = JSON.parse(t); } catch { continue; }
     const at = Date.parse(r?.at ?? '');
-    if (!Number.isFinite(at) || !r.prepare || typeof r.prepare !== 'object') continue;
+    if (!Number.isFinite(at)) continue;
+    // A whole-tick failure (`event: 'tick-failed'`, no `prepare` object) is a failure of the prepare loop too.
+    if (r.event === 'tick-failed') { out.push({ at, loop: 'prepare', attempted: 1, succeeded: 0, failed: 1, error: 'tick-failed' }); continue; }
+    if (!r.prepare || typeof r.prepare !== 'object') continue;
     const failures = Array.isArray(r.prepare.failures) ? r.prepare.failures : [];
     const launched = Array.isArray(r.prepare.launched) ? r.prepare.launched.length : 0;
     if (!failures.length && !launched) continue;
@@ -97,13 +100,22 @@ export function parsePrepareTicks(text) {
 }
 
 const DRAIN_OK = new Set(['enqueued', 'not-enqueued', 'skipped', 'not-listed']);
+const COULD_NOT_FINISH_RE = /^\[drain-daemon\] (\S+Z) .*?catch-up #\d+.*? — could not finish \(class=([a-z-]+)\)/;
 const DRAIN_RE2 = /^\[drain-daemon\] (\S+Z) enqueue-on-event: catch-up #\d+ fast drain exit (\S+?)[ ,].*? — (.*?) \[outcome=([a-z-]+)\]/;
 
 /** Drain catch-up: one line per fast drain; outcome error/timeout/other/refused is a failure, the rest reached a verdict. */
 export function parseDrainCatchupTicks(text) {
   const out = [];
   for (const line of String(text ?? '').split('\n')) {
-    if (!line.includes('fast drain exit') || !line.includes('catch-up #')) continue;
+    if (!line.includes('catch-up #')) continue;
+    // The catch handler's line when the fast drain itself threw: a failure with a class.
+    const cf = COULD_NOT_FINISH_RE.exec(line);
+    if (cf) {
+      const at = Date.parse(cf[1]);
+      if (Number.isFinite(at)) out.push({ at, loop: 'drain-catchup', attempted: 1, succeeded: 0, failed: 1, error: `could not finish (class=${cf[2]})` });
+      continue;
+    }
+    if (!line.includes('fast drain exit')) continue;
     const m = DRAIN_RE2.exec(line);
     if (!m) continue;
     const at = Date.parse(m[1]);
