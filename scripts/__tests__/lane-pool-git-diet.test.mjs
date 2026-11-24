@@ -7,7 +7,7 @@
 import { it, expect, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { runReclaimCase } from '../conveyor/soak/breaks/lane-reset-symbolic-ops-proof.mjs';
 import { laneGitHardeningEnv, laneGitConfigArgs, scrubGitRepoEnv } from '../lib/lane-git-hardening.mjs';
@@ -16,11 +16,12 @@ import { laneGitHardeningEnv, laneGitConfigArgs, scrubGitRepoEnv } from '../lib/
 const repoSource = /function resolveRepo\([^]*?\n\}/.exec(readFileSync(resolve('scripts/lane-pool.mjs'), 'utf8'))[0];
 function resolvePool(command, extra = {}) {
   return new Function('flags', 'cmd', 'resolve', 'expandHome', 'CWD_TOP_LEVEL', 'CHECKOUT_ROOT',
-    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT', 'resolveReal', 'sep', 'laneGitHardeningEnv', 'scrubGitRepoEnv',
+    'tryGit', 'LOCAL_GIT_TIMEOUT_MS', 'fail', 'basename', 'join', 'POOL_ROOT', 'resolveReal', 'sep', 'laneGitHardeningEnv', 'scrubGitRepoEnv', 'existsSync', 'dirname',
     `${repoSource}; return resolveRepo();`)(
     { pool: 'existing', reference: '/reference', ...extra }, command, resolve, p => p,
     null, '/reference', () => null, 1000, message => { throw Error(message); },
     p => p.split('/').at(-1), join, '/pool', resolve, sep, laneGitHardeningEnv, scrubGitRepoEnv,
+    () => false, dirname, // No sibling primary checkouts in this synthetic filesystem.
   );
 }
 it.each(['acquire', 'provision', 'refresh', 'remove', 'trim', 'reclaim', 'list'])(

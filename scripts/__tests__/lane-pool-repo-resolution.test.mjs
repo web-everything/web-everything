@@ -21,6 +21,7 @@ function resolveWith(branch, remoteHead) {
     LOCAL_GIT_TIMEOUT_MS: 1000,
     expandHome: (path) => path,
     resolve, basename, dirname, join, sep, resolveReal: resolve, laneGitHardeningEnv, scrubGitRepoEnv,
+    existsSync: () => false, // No sibling primary checkouts in this synthetic filesystem.
     fail: (message) => { throw new Error(message); },
     tryGit: (args) => {
       calls.push(args);
@@ -60,6 +61,7 @@ function resolveOrigin({ command = 'reclaim', cwd = '/pool/project/lane-1', flag
     process: { cwd: () => cwd, env }, CWD_TOP_LEVEL: cwd, CHECKOUT_ROOT: cwd, POOL_ROOT: '/pool',
     LOCAL_GIT_TIMEOUT_MS: 1000, expandHome: p => p,
     resolve, basename, dirname, join, sep, resolveReal: p => realPaths[p] || resolve(p), laneGitHardeningEnv, scrubGitRepoEnv,
+    existsSync: () => false, // No sibling primary checkouts in this synthetic filesystem.
     findPrimaryForPool, poolNameFromLanePath,
     fail: message => { throw new Error(message); },
     tryGit: (args, dir, options) => {

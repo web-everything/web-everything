@@ -153,6 +153,7 @@ it.each(['lane', 'linked lane worktree', 'unreadable owner', 'primary', 'explici
       resolveReal: value => value, POOL_ROOT: '/pool', CWD_TOP_LEVEL: true, CHECKOUT_ROOT: '/primary/project',
       process: { env: {} }, laneGitHardeningEnv: value => value, scrubGitRepoEnv: value => value,
       LOCAL_GIT_TIMEOUT_MS: 1000, tryGit, fail: message => { throw Error(message); },
+      existsSync: () => false, // No sibling primary checkouts in this synthetic filesystem.
       findPrimaryForPool, poolNameFromLanePath,
     })();
     expect(repo.poolDir).toBe('/pool/project');
