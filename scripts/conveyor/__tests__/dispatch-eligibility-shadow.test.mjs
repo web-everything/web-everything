@@ -8,6 +8,7 @@ import { resolveShadowMode, runEligibilityShadow, createBoundedShadowLog, eligib
 import { runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
 import { detectStacks, PR_STACK_DEFAULTS } from '../pr-stack.mjs';
 import { eligibility } from '../dispatch-eligibility.mjs';
+import { GH_LIST_COMMENT_CAP } from '../review-referral-hold.mjs';
 import { buildEligibilityFacts } from '../dispatch-eligibility-facts.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -81,6 +82,35 @@ describe('runEligibilityShadow observational contract', () => {
     const appendLine = vi.fn();
     expect(run({ dispatch: [entry(kind)], prs: [p], appendLine })).toEqual({ checked: 1, disagreements: 0 });
     expect(appendLine).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['minimal thread', 2],
+    ['thread of 99', 99],
+  ])('a listed thread below the comment cap counts as complete (%s)', (_name, count) => {
+    const appendLine = vi.fn();
+    const base = sentBackPr();
+    const filler = Array.from({ length: count - base.comments.length }, () => bot('chatter'));
+    const p = { ...base, comments: [...filler, ...base.comments], commentsComplete: undefined };
+    const onError = vi.fn();
+    expect(run({ dispatch: [entry()], prs: [p], appendLine, onError })).toEqual({ checked: 1, disagreements: 0 });
+    expect(onError).not.toHaveBeenCalled(); // an evaluation failure also logs nothing, so rule it out
+    expect(appendLine).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['at the cap', GH_LIST_COMMENT_CAP, undefined],
+    ['above the cap', GH_LIST_COMMENT_CAP + 1, undefined],
+    ['explicit false on a short thread', 3, false],
+  ])('a thread %s still logs unknown thread', (_name, count, flag) => {
+    const appendLine = vi.fn();
+    const comments = Array.from({ length: count }, () => bot('chatter'));
+    const onError = vi.fn();
+    expect(run({ dispatch: [entry()], prs: [pr(6001, { comments, commentsComplete: flag })], appendLine, onError }))
+      .toEqual({ checked: 1, disagreements: 1 });
+    expect(onError).not.toHaveBeenCalled();
+    expect(appendLine).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(appendLine.mock.calls[0][0])).toMatchObject({ gate: 'unknown', reasons: ['thread'] });
   });
 
   it.each([
