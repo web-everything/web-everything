@@ -70,7 +70,8 @@ describe('writeVerdict', () => {
       const args = fixture();
       args.io.readPr.mockResolvedValueOnce(live()).mockResolvedValueOnce(post);
       expect(await writeVerdict(args)).toMatchObject({
-        ok: true, written: true, result: 'verdict', verdictUnderMove: true, actualHead: post.headRefOid,
+        ok: true, written: true, result: 'verdict', verdictUnderMove: true,
+        incidentRecorded: true, actualHead: post.headRefOid,
       });
       expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
       expect(args.io.recordIncident).toHaveBeenCalledWith(incident(args, post.headRefOid));
@@ -100,7 +101,7 @@ describe('writeVerdict', () => {
     if (value === 'throws') args.io.readPr.mockRejectedValueOnce(new Error('offline'));
     else args.io.readPr.mockResolvedValueOnce(value);
     expect(await writeVerdict(args)).toMatchObject({
-      ok: true, written: true, result: 'verdict', verdictUnderMove: true,
+      ok: true, written: true, result: 'verdict', verdictUnderMove: true, incidentRecorded: true,
     });
     expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
     expect(args.io.recordIncident).toHaveBeenCalledWith(incident(args, undefined));
@@ -117,25 +118,83 @@ describe('writeVerdict', () => {
     expect(args.write).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['sync', 'async', 'absent'])('swallows incident recorder failure (%s)', async mode => {
+  it.each([undefined, null, 'recorder'])('refuses missing or invalid recorder %s before IO', async recorder => {
+    const args = fixture();
+    args.io.recordIncident = recorder;
+    expect(await writeVerdict(args)).toEqual({ ok: false, refused: 'refused-bad-input' });
+    expect(args.io.readPr).not.toHaveBeenCalled();
+    expect(args.write).not.toHaveBeenCalled();
+  });
+
+  it.each(['sync', 'async'])('surfaces incident recorder failure (%s)', async mode => {
     const args = fixture();
     args.io.readPr.mockResolvedValueOnce(live()).mockResolvedValueOnce(live(moved));
-    if (mode === 'absent') delete args.io.recordIncident;
-    else args.io.recordIncident.mockImplementation(() => {
+    args.io.recordIncident.mockImplementation(() => {
       if (mode === 'sync') throw new Error('incident failed');
       return Promise.reject(new Error('incident failed'));
     });
-    expect((await writeVerdict(args)).verdictUnderMove).toBe(true);
+    expect(await writeVerdict(args)).toEqual({
+      ok: false, written: true, verdictUnderMove: true, incidentRecorded: false,
+      incidentError: 'incident failed', result: 'verdict', actualHead: moved,
+    });
+    expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
     expect(args.write).toHaveBeenCalledTimes(1);
   });
 
-  it('propagates the write error without retries, post-read, or incident', async () => {
+  it.each([live(moved), live(head, 'CLOSED'), live(head, 'MERGED'), null, 'throws'])(
+    'records incident after throwing write and changed or unreadable post-read %j', async post => {
+      const args = fixture();
+      const error = new Error('lost ack');
+      args.write.mockImplementation(() => { throw error; });
+      args.io.readPr.mockResolvedValueOnce(live());
+      if (post === 'throws') args.io.readPr.mockRejectedValueOnce(new Error('offline'));
+      else args.io.readPr.mockResolvedValueOnce(post);
+      await expect(writeVerdict(args)).rejects.toBe(error);
+      expect(args.write).toHaveBeenCalledTimes(1);
+      expect(args.io.readPr).toHaveBeenCalledTimes(2);
+      expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
+      expect(args.io.recordIncident).toHaveBeenCalledWith({
+        ...incident(args, post?.headRefOid), writeThrew: true,
+      });
+    },
+  );
+
+  it.each(['sync', 'async'])('attaches recorder failure to original write error (%s)', async mode => {
+    const args = fixture();
+    const error = new Error('lost ack');
+    args.write.mockRejectedValue(error);
+    args.io.readPr.mockResolvedValueOnce(live()).mockResolvedValueOnce(live(moved));
+    args.io.recordIncident.mockImplementation(() => {
+      if (mode === 'sync') throw new Error('incident failed');
+      return Promise.reject(new Error('incident failed'));
+    });
+    await expect(writeVerdict(args)).rejects.toBe(error);
+    expect(error.incidentError).toBe('incident failed');
+    expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
+    expect(args.io.readPr).toHaveBeenCalledTimes(2);
+    expect(args.write).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([null, undefined, 'lost ack', 42, Object.freeze(new Error('frozen'))])(
+    'preserves primitive or frozen write failure %s when incident recording fails', async error => {
+      const args = fixture();
+      args.write.mockImplementation(() => { throw error; });
+      args.io.readPr.mockResolvedValueOnce(live()).mockResolvedValueOnce(live(moved));
+      args.io.recordIncident.mockRejectedValue(new Error('incident failed'));
+      await expect(writeVerdict(args)).rejects.toBe(error);
+      expect(args.write).toHaveBeenCalledTimes(1);
+      expect(args.io.readPr).toHaveBeenCalledTimes(2);
+      expect(args.io.recordIncident).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('rethrows original write error after unchanged post-read without incident or retry', async () => {
     const args = fixture();
     const error = new Error('write failed');
     args.write.mockRejectedValue(error);
     await expect(writeVerdict(args)).rejects.toBe(error);
     expect(args.write).toHaveBeenCalledTimes(1);
-    expect(args.io.readPr).toHaveBeenCalledTimes(1);
+    expect(args.io.readPr).toHaveBeenCalledTimes(2);
     expect(args.io.recordIncident).not.toHaveBeenCalled();
   });
 

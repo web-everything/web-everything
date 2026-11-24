@@ -21,7 +21,7 @@ async function readLive(reader, repo, pr) {
 }
 
 /** Fresh evidence on both sides of one write; post-write races are detected, never undone.
- * io.readPr overrides the reader; io.execFileImpl injects its callback-shaped subprocess port.
+ * io.recordIncident is required; io.readPr and io.execFileImpl override the reader ports.
  * Unreadable post-write evidence has actualHead undefined in the result and incident.
  */
 export async function writeVerdict({ repo, pr, expectedHead, kind, write, io = {} } = {}) {
@@ -30,7 +30,8 @@ export async function writeVerdict({ repo, pr, expectedHead, kind, write, io = {
   }
   if (typeof repo !== 'string' || !repo.trim() || !pr
     || !['string', 'number'].includes(typeof pr)
-    || typeof kind !== 'string' || !kind.trim() || typeof write !== 'function') {
+    || typeof kind !== 'string' || !kind.trim() || typeof write !== 'function'
+    || typeof io?.recordIncident !== 'function') {
     return { ok: false, refused: 'refused-bad-input' };
   }
   const reader = io?.readPr ?? (args => readPr(args, io?.execFileImpl));
@@ -41,17 +42,31 @@ export async function writeVerdict({ repo, pr, expectedHead, kind, write, io = {
     return { ok: false, refused: 'head-moved', actualHead: before.headRefOid };
   }
 
-  const result = await write();
+  let result, writeError, writeThrew = false;
+  try { result = await write(); }
+  catch (error) { writeError = error; writeThrew = true; }
   const after = await readLive(reader, repo, pr);
   const verdictUnderMove = !after || after.headRefOid !== expectedHead || after.state !== 'OPEN';
   if (verdictUnderMove) {
     const actualHead = after?.headRefOid;
     try {
-      await io?.recordIncident?.({
+      await io.recordIncident({
         kind: 'verdict-under-move', repo, pr, expectedHead, actualHead, writeKind: kind,
+        ...(writeThrew ? { writeThrew: true } : {}),
       });
-    } catch { /* Detection must not hide a completed write. */ }
-    return { ok: true, written: true, result, verdictUnderMove: true, actualHead };
+    } catch (error) {
+      const incidentError = String(error?.message ?? error);
+      if (writeThrew) {
+        try { writeError.incidentError = incidentError; }
+        catch { /* Annotation must never replace the original thrown value. */ }
+        throw writeError;
+      }
+      return { ok: false, written: true, verdictUnderMove: true, incidentRecorded: false,
+        incidentError, result, actualHead };
+    }
+    if (writeThrew) throw writeError;
+    return { ok: true, written: true, result, verdictUnderMove: true, incidentRecorded: true, actualHead };
   }
+  if (writeThrew) throw writeError;
   return { ok: true, written: true, result, verdictUnderMove: false };
 }
