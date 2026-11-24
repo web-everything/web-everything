@@ -20,7 +20,7 @@ function probe(root) {
         const open = openReferralFindings({ comments: live.comments, repo, pr: live.number, head: H1 });
         const plan = planOperatorRuling({ ...open, head: H1, identity: { login: 'web-everything', type: 'Bot' },
           now: '2026-11-24T12:00:00Z', clearerId: 'soak' }, input);
-        live.comments.push({ body: plan.body, author: { login: 'web-everything' } }); writes++;
+        live.comments = [...live.comments, { body: plan.body, author: { login: 'web-everything' } }]; writes++;
       } });
     if (spawns !== 1 || writes !== 1 || result[0]?.findings !== 1 || rulingNeeded(live)) process.exit(1);
   `;
