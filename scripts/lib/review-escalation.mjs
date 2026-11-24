@@ -2216,26 +2216,6 @@ export function shouldReparkForTestTampering({ tampered, netDiffScored, humanCle
 }
 
 /**
- * CLEAR-HUMAN-NOT-STICKY — does a recorded human clearance on the EXACT live head honour the drain's
- * "net diff unverified" hold? Live: frontierui #53/#54/#58 (2026-11-24). The drain has no sibling clone of
- * frontierui, so its net diff is unscored (`no-clone`); the hold at that site re-added `review:human` seconds
- * after every `--to=clear-human`, whatever the recorded clearance said (the clearance was only consulted for a
- * TAMPERED diff, never for an UNVERIFIED one). A human who cleared head H has looked at H's diff themselves, so
- * for an unverified diff (the only finding is the evidence marker) the clearance bound to the live head, and to
- * the head the pass pinned, suffices. Fails CLOSED: any real tamper finding, a missing/older/different clearance,
- * or a head that moved (a new head re-arms the hold) keeps the hold.
- * @param {{unverified?:boolean, findings?:Array<{kind:string}>, humanClearedSha?:string|null, headSha?:string|null, pinnedHeadSha?:string|null}} o
- * @returns {boolean} true = the drain must still park `review:human`
- */
-export function shouldReparkForUnverifiedDiff({ unverified = false, findings = [], humanClearedSha = null, headSha = null, pinnedHeadSha = null } = {}) {
-  if (!unverified) return false;
-  if ((Array.isArray(findings) ? findings : []).some((f) => f?.kind !== 'test-diff-unverified')) return true;
-  const norm = (s) => (typeof s === 'string' ? s.trim().toLowerCase() : '');
-  const cleared = norm(humanClearedSha);
-  return !(cleared && cleared === norm(headSha) && cleared === norm(pinnedHeadSha));
-}
-
-/**
  * we:scripts/lib/review-escalation.mjs#decideParkToHuman — THE AUTOMATED-ESCALATION LABEL SWAP (mutual-
  * exclusivity fix; live bug on web-everything/web-everything#2766/#2767, 2026-09-26): when the drain's own re-score
  * escalates a PR to `review:human` (test-gaming, manifest-tamper, …), it must not leave a prior `review:*`

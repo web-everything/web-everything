@@ -5,6 +5,7 @@ import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
+import { ensureSiblingClone, describeUnverifiedDiffHold } from './lib/drain-sibling-clone.mjs';
 import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -167,7 +168,7 @@ import { healNnnCollision } from './lib/nnn-collision-heal.mjs';
 // fingerprint reader (`parseReviewedDiff`), #2832/#984's hold-invariant helpers (`READY_TO_MERGE_LABEL`,
 // `isReviewHoldLabel`, `decideParkReadyStrip`), #2890's null-contract diff mapper (`diffHunksFrom`), and
 // #x9xqexm's contribution fingerprint reader (`parseReviewedContribution`). None supersedes another.
-import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewGate, acceptanceCoversHead, REVIEW_LABELS, REVIEW_LABEL_META, reconcileEscalationReasonBlock, decideDurableEscalationRecord, bodyHasEscalationReason, shouldApplyReviewLabel, hasUnclearedReviewLabel, hasReviewLabel, parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, parseLatestHumanClearedSha, shouldReparkForTestTampering, shouldReparkForUnverifiedDiff, buildClearanceRevocationComment, READY_TO_MERGE_LABEL, isReviewHoldLabel, decideParkReadyStrip, isEngineTierPath,
+import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewGate, acceptanceCoversHead, REVIEW_LABELS, REVIEW_LABEL_META, reconcileEscalationReasonBlock, decideDurableEscalationRecord, bodyHasEscalationReason, shouldApplyReviewLabel, hasUnclearedReviewLabel, hasReviewLabel, parseReviewedSha, parseReviewedDiff, parseReviewedContribution, parseOperatorClearance, parseLatestHumanClearedSha, shouldReparkForTestTampering, buildClearanceRevocationComment, READY_TO_MERGE_LABEL, isReviewHoldLabel, decideParkReadyStrip, isEngineTierPath,
   // #2766/#2767 — the mutual-exclusivity park decision (imported HERE, the leaf module, never from
   // `review-set-label.mjs`, which itself imports `computeNetDiffText` FROM this file — a back-import would
   // be a circular module cycle). `review-set-label.mjs` re-exports both for discoverability under the
@@ -5147,7 +5148,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const name = siblingCloneName(repo);
     if (!name) return null;
     const dir = resolve(process.cwd(), '..', name);
-    try { return existsSync(join(dir, '.git')) ? dir : null; } catch { return null; }
+    try { if (existsSync(join(dir, '.git'))) return dir; } catch { return null; }
+    // CLEAR-HUMAN-NOT-STICKY — the drain daemon's pool had no `frontierui` sibling, so every frontierui PR was
+    // "net diff unverified (no-clone)". Provision it (blobless, fail closed) instead of leaving the diff unread.
+    let localOrigin = null;
+    try { localOrigin = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* no origin → no clone */ }
+    return ensureSiblingClone({ slug: repo, name, parentDir: resolve(process.cwd(), '..'), localOrigin });
   };
 
   // #2313 — post (or skip, if already posted) a drain reason comment on a PR. Best-effort: a `gh` miss never
@@ -6896,31 +6902,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
       // R1105: incomplete/head-mismatched evidence is an additional hold, never
       // clearance evidence. Leave the existing human-clearance decision unchanged.
-      // CLEAR-HUMAN-NOT-STICKY — an UNVERIFIED net diff (no sibling clone, unscored, incomplete evidence) used to park
-      // `review:human` on every pass even beside a recorded `--to=clear-human` on this very head (live: frontierui #53).
-      // The recorded clearance bound to the EXACT live head (and the head this pass pinned) now honours it; a new head,
-      // an older clearance, a fetch miss or any real tamper finding keeps the hold (`shouldReparkForUnverifiedDiff`).
-      const unverifiedDiff = netDiffText.scored !== true || gaming.evidenceIncomplete === true;
-      let unverifiedCleared = false;
-      if (unverifiedDiff && !v.workflowHoldRepark && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
-        let liveHead = null;
-        let clearedAt = null;
-        try {
-          const ud = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
-          liveHead = typeof ud.headRefOid === 'string' ? ud.headRefOid : null;
-          // The COMPLETE thread (a truncated page could hide the latest clearance or a later hold marker).
-          clearedAt = parseLatestHumanClearedSha(readCompletePrComments(v.num, { repo: v.repo || localSlug, exec: execFileSync }));
-        } catch { /* fetch miss → both null → the hold stands (fails closed) */ }
-        unverifiedCleared = !shouldReparkForUnverifiedDiff({ unverified: true, findings: gaming.findings,
-          humanClearedSha: clearedAt, headSha: liveHead, pinnedHeadSha: v.listedHeadSha || v.headSha || null });
-        if (unverifiedCleared && !AS_JSON) process.stderr.write(`  ✔ ${repoTag(v.repo)}${v.num} unverified net diff — human clearance recorded on the live head honoured\n`);
-      }
-      if (!v.workflowHoldRepark && !unverifiedCleared && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
+      if (!v.workflowHoldRepark && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
         const tamperReasons = netDiffText.scored === true ? gaming.reasons
-          : [`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`];
+          : [describeUnverifiedDiffHold({ repo: v.repo || localSlug, reason: netDiffText.reason || 'unscored',
+            base: `net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff` })];
         v.escalateReasons = tamperReasons;
         // #2766/#2767 — is this PR's own tampering finding (at least partly) INHERITED from an already-
         // escalated stacked base (its own `baseRefName` IS another open PR's `headRef`, and that PR already

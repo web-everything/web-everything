@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
 import { resolveProducerReviewLabel } from '../pr-land.mjs';
-import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering, shouldReparkForUnverifiedDiff } from '../lib/review-escalation.mjs';
+import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
 import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
@@ -1313,7 +1313,7 @@ function tamperingMustHold(netDiffText) {
   const end = source.indexOf(' {', start);
   const expression = source.slice(start + '      if ('.length, end - 1);
   return new Function('netDiffText', 'shouldReparkForTestTampering',
-    'const v = {}, unverifiedCleared = false, gaming = { tampered: false }, humanClearedSha = "same", tamperHeadSha = "same"; return ' + expression)(netDiffText, shouldReparkForTestTampering);
+    'const v = {}, gaming = { tampered: false }, humanClearedSha = "same", tamperHeadSha = "same"; return ' + expression)(netDiffText, shouldReparkForTestTampering);
 }
 
 function drainScore(sig) {
@@ -1353,54 +1353,4 @@ describe('R1105 pinned test-gaming evidence producer', () => {
     expect(src).toMatch(/scanTestTampering\(\{\s*netDiffText, pinnedHeadSha: v\.listedHeadSha \|\| v\.headSha \|\| null/);
     expect(src).toMatch(/gaming\.evidenceIncomplete \|\| shouldReparkForTestTampering/);
   });
-});
-
-describe('CLEAR-HUMAN-NOT-STICKY: a recorded human clearance honours the unverified-diff hold', () => {
-  const H = 'a'.repeat(40);
-  const OLD = 'b'.repeat(40);
-  const unverified = [{ kind: 'test-diff-unverified', path: '(net diff)', detail: 'x' }];
-  it('clearance on the exact live and pinned head releases the hold', () => {
-    expect(shouldReparkForUnverifiedDiff({ unverified: true, findings: unverified, humanClearedSha: H, headSha: H, pinnedHeadSha: H })).toBe(false);
-    expect(shouldReparkForUnverifiedDiff({ unverified: true, findings: [], humanClearedSha: H, headSha: H, pinnedHeadSha: H })).toBe(false);
-  });
-  it.each([
-    ['no clearance', { humanClearedSha: null }],
-    ['an older clearance (new head re-arms)', { humanClearedSha: OLD }],
-    ['a head that moved under the pass', { pinnedHeadSha: OLD }],
-    ['a real tamper finding', { findings: [...unverified, { kind: 'tests-removed' }] }],
-    ['a head read miss', { headSha: null }],
-  ])('keeps the hold: %s', (_n, over) => {
-    expect(shouldReparkForUnverifiedDiff({ unverified: true, findings: unverified, humanClearedSha: H, headSha: H, pinnedHeadSha: H, ...over })).toBe(true);
-  });
-
-  async function drain(comments) {
-    vi.doMock('node:child_process', () => childProcessMock);
-    const ports = { ...prestagePorts, git(args, env) {
-      const result = prestagePorts.git(args, env);
-      while (args[0] === '-c') args = args.slice(2);
-      if (args[0] === 'diff') return { status: 128, stdout: '', stderr: 'fatal: net-diff read unavailable' };
-      return result;
-    } };
-    const world = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports }));
-    let out;
-    try {
-      await world(async ({ pr, run }) => {
-        pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: pr.headRefOid };
-        pr.comments = comments(pr.headRefOid);
-        out = { pr, ...(await run()) };
-      }, { slug: 'web-everything/web-everything' });
-    } finally { vi.doUnmock('node:child_process'); vi.resetModules(); }
-    return out;
-  }
-  const accept = (sha, human) => [{ id: "C_1", author: { login: 'chalbert' }, createdAt: new Date().toISOString(),
-    body: `cleared\n\n<!-- reviewed-sha: ${sha} -->${human ? '\n<!-- cleared-human: chalbert -->' : ''}` }];
-
-  it('drain: unverified diff + human clearance on this head is NOT re-parked', async () => {
-    const r = await drain((head) => accept(head, true));
-    expect(r.report.parked.filter((p) => p.num === r.pr.number), r.stderr).toEqual([]);
-  }, 120_000);
-  it('drain: unverified diff + a plain agent accept (no clear-human) is still parked', async () => {
-    const r = await drain((head) => accept(head, false));
-    expect(r.report.parked, r.stderr).toEqual(expect.arrayContaining([expect.objectContaining({ num: r.pr.number, humanRequired: true })]));
-  }, 120_000);
 });

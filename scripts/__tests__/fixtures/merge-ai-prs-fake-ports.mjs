@@ -21,8 +21,6 @@ if (a[0] === 'api') {
   const path = a.find(x => x.startsWith('repos/')) || '';
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
-  // The complete paginated reader asks for jq-projected TSV rows (body, created_at, login, node id, url).
-  if (path.includes('/comments') && a.includes('--jq')) out((pr.comments || []).map((c, i) => [String(c.body).replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n'), c.createdAt || '', (c.author || c.user || {}).login || '', c.id || 'IC_' + i, ''].join('\t')).join('\n'));
   if (path.includes('/comments')) out([pr.comments]);
   if (path.includes('/reviews')) out([[]]);
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
@@ -34,7 +32,6 @@ if (a[0] === 'api') {
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
-    if (q.includes('comments{totalCount}')) out({ data: { repository: { pullRequest: { comments: { totalCount: (pr.comments || []).length } } } } });
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
     } } } } });
