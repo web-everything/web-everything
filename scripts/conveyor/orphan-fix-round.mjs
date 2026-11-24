@@ -184,12 +184,29 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
 // ── IO shell ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
+const MAX_PAGES = 5;
+// The daemon keeps this per-repository continuation between ticks; a completed scan wraps to page one.
+const bouncedScanPages = new Map();
 
 export function defaultListBounced(slug, { exec = execFileSync } = {}) {
   // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
-  const out = exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200',
-    '--json', 'number,labels,headRefOid,isDraft,body,createdAt'], ghOpts());
-  return JSON.parse(String(out || '[]')).filter((p) => labelNames(p.labels).includes('review:changes'));
+  const perPage = 100, bounced = [];
+  const startPage = bouncedScanPages.get(slug) ?? 1;
+  for (let page = startPage; page < startPage + MAX_PAGES; page++) {
+    const out = exec('gh', ['api', `repos/${slug}/pulls?state=open&sort=created&direction=asc&per_page=${perPage}&page=${page}`], ghOpts());
+    const prs = JSON.parse(String(out));
+    bounced.push(...prs.filter(p => labelNames(p.labels).includes('review:changes')).map(p => ({
+      number: p.number, labels: p.labels, headRefOid: p.head.sha, isDraft: p.draft, body: p.body, createdAt: p.created_at,
+    })));
+    if (prs.length < perPage) {
+      bouncedScanPages.delete(slug);
+      return bounced;
+    }
+  }
+  const nextPage = startPage + MAX_PAGES;
+  bouncedScanPages.set(slug, nextPage);
+  console.error(`orphan-guard: listing cap hit (${MAX_PAGES} pages, ${MAX_PAGES * perPage} PRs); next pass resumes at page ${nextPage}.`);
+  return bounced;
 }
 
 async function defaultReadComments(number, slug) {

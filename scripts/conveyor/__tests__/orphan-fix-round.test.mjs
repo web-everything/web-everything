@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
-  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm, defaultRedispatch,
+  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultListBounced, defaultRearm, defaultRedispatch,
 } from '../orphan-fix-round.mjs';
 import * as fixDispatch from '../reconcile-fix-dispatch.mjs';
 import * as reconcilePass from '../reconcile-pass.mjs';
@@ -96,6 +96,74 @@ describe('verdict-bound orphan re-arm markers', () => {
 
   it('preserves chronological handling of historical unbound markers', () => {
     expect(plan('\n\nHistorical re-arm').reason).toBe('already re-armed after the latest verdict');
+  });
+});
+
+describe('defaultListBounced', () => {
+  const restPr = number => ({ number, labels: [], head: { sha: HEAD }, draft: false,
+    body: `PR ${number}`, created_at: '2026-10-09T22:42:48Z' });
+
+  it('lists every open PR past the 200 page limit', () => {
+    const prs = Array.from({ length: 250 }, (_, i) => restPr(i + 1));
+    prs[249].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn()
+      .mockReturnValueOnce(JSON.stringify(prs.slice(0, 100)))
+      .mockReturnValueOnce(JSON.stringify(prs.slice(100, 200)))
+      .mockReturnValueOnce(JSON.stringify(prs.slice(200)));
+    expect(defaultListBounced('o/n', { exec })).toEqual([{
+      number: 250, labels: [{ name: 'review:changes' }], headRefOid: HEAD, isDraft: false,
+      body: 'PR 250', createdAt: prs[249].created_at,
+    }]);
+    expect(exec).toHaveBeenCalledTimes(3);
+    for (const [i, [command, args, opts]] of exec.mock.calls.entries()) {
+      expect(command).toBe('gh');
+      expect(args).toEqual(['api', `repos/o/n/pulls?state=open&sort=created&direction=asc&per_page=100&page=${i + 1}`]);
+      expect(opts).toMatchObject({ encoding: 'utf8', timeout: expect.any(Number), maxBuffer: 16 * 1024 * 1024 });
+    }
+  });
+
+  it('warns when the page cap is hit and stops at five calls', () => {
+    const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => restPr(i + 1))));
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(defaultListBounced('o/capped', { exec })).toEqual([]);
+      expect(exec).toHaveBeenCalledTimes(5);
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning.mock.calls[0][0]).toMatch(/cap hit.*5 pages.*500 PRs/);
+      expect(warning.mock.calls[0][0]).not.toMatch(/[\r\n]/);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('eventually processes a bounced PR beyond page five and restarts the completed scan', async () => {
+    const slug = 'o/continuation';
+    const prs = Array.from({ length: 550 }, (_, i) => restPr(i + 1));
+    prs[549].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_command, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    const readComments = vi.fn(async () => [VERDICT]);
+    const pass = () => runOrphanFixRoundPass({
+      repos: [{ key: 'test', slug }], nowMs: NOW,
+      listBounced: repo => defaultListBounced(repo, { exec }),
+      readComments, isOwned: async () => false,
+    });
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await pass();
+      expect(exec).toHaveBeenCalledTimes(5);
+      expect(readComments).not.toHaveBeenCalled();
+      await pass();
+      expect(exec).toHaveBeenCalledTimes(6);
+      expect(exec.mock.calls[5][1][1]).toContain('page=6');
+      expect(readComments.mock.calls).toEqual([[550, slug]]);
+      await pass();
+      expect(exec.mock.calls[6][1][1]).toContain('page=1');
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 
@@ -486,6 +554,33 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(result.deferredSettled).toEqual([]);
     expect(result.newlySettled).toEqual([{ repo: repos[0].slug, pr: 4715 }]);
     expect(settled.get(`${repos[0].slug}#4715`)).toEqual({ head: HEAD, at: NOW });
+  });
+
+  describe('settled cache: removing the head or TTL check fails a test', () => {
+    const probe = async cached => {
+      const readComments = vi.fn(async () => [VERDICT]);
+      await runOrphanFixRoundPass(seams([], {
+        settled: new Map([[`${repos[0].slug}#4715`, cached]]), readComments,
+        listBounced: () => [pr4715([]), pr4715([], { number: 5000 })],
+        isOwned: async (_repo, number) => number === 5000,
+        deadlineAt: 0, now: () => 0,
+      }));
+      return readComments;
+    };
+
+    it('reads a matching head with stale TTL', async () => {
+      const readComments = await probe({ head: HEAD, at: NOW - 6 * 60 * 60 * 1000 });
+      expect(readComments.mock.calls).toEqual([[4715, repos[0].slug]]);
+    });
+
+    it('reads a different head with fresh TTL', async () => {
+      const readComments = await probe({ head: 'other', at: NOW });
+      expect(readComments.mock.calls).toEqual([[4715, repos[0].slug]]);
+    });
+
+    it('does not read a matching head with fresh TTL when the budget is spent', async () => {
+      expect(await probe({ head: HEAD, at: NOW })).not.toHaveBeenCalled();
+    });
   });
 
   it('uses leftover budget to read cached PRs oldest first after all uncached PRs', async () => {
