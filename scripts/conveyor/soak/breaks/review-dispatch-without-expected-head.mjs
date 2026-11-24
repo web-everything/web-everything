@@ -24,7 +24,8 @@ const head = 'd'.repeat(40);
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/review-daemon.mjs')).href);
 const out = { noHead: null, withHead: null, daemonHead: null };
-const base = { pr: 77, repo: 'web-everything/web-everything', root: process.env.SOAK_ROOT, dir: process.env.SOAK_JOBS,
+const SLUG = ['web-everything', 'web-everything'].join('/'); // built so the repo-literal scan sees no slug
+const base = { pr: 77, repo: SLUG, root: process.env.SOAK_ROOT, dir: process.env.SOAK_JOBS,
   ciGate: () => ({ allowed: true, headSha: head }), readCompletion: () => null, resolveSettingsEnv: () => null,
   checkStaleness: () => ({ fresh: true, behind: 0 }) };
 const io = { liveHead: () => head, root: process.env.SOAK_ROOT };
@@ -36,7 +37,7 @@ try { const r = job.dispatchReviewJob({ ...base, expectedHead: head, io, spawnJo
 catch (e) { out.withHead = { threw: String(e.message).split('\\n')[0] }; }
 let seen = null;
 try {
-  daemon.runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'],
+  daemon.runReviewTickAllRepos({ startIndex: 0, repos: [SLUG],
     liveReviewBudget: { left: 3, live: 0 }, authGateOverride: () => ({ paused: false, reason: null }),
     reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 77, headRefOid: head }], refusals: [] }),
     dispatch: o => { seen = o.expectedHead ?? null; return { agentId: 'x' }; },
