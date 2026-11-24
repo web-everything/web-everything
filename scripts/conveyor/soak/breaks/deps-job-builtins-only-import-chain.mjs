@@ -79,7 +79,7 @@ export function probe(checkout) {
 
 // Fix presence is decided by git ancestry of the fixing commit, never by the import walk the break judges.
 function fixPresent(checkout) {
-  return spawnSync('git', ['merge-base', '--is-ancestor', FIX_SHA, 'HEAD'], { cwd: checkout }).status === 0;
+  return spawnSync('git', ['merge-base', '--is-ancestor', FIX_SHA, 'HEAD'], { cwd: checkout, maxBuffer: 1024 * 1024 }).status === 0;
 }
 
 export default {
