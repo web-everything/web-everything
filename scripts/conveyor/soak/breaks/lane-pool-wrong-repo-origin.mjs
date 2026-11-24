@@ -1,6 +1,6 @@
 /** LANE-POOL-WRONG-REPO: `lane-pool provision --pool=P` run from another repo's checkout cloned that repo into P's lanes. */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,13 +42,18 @@ export default {
   card: 'LANE-POOL-WRONG-REPO (plateau-app lanes 5 to 8 were web-everything clones)',
   fixedBy: { sha: '108c8c30c4d', where: 'lane/lane-pool-wrong-repo', paths: PATHS },
   fixPresent(root) {
-    try { const r = replayPoolOrigin(root); return r.lane === null || r.lane === r.poolOrigin; } catch { return false; }
+    // Decided independently of the replayed behaviour: the origin-check module exists and the CLI uses it.
+    try {
+      const lib = join(root, 'scripts/lib/lane-pool-origin.mjs');
+      return existsSync(lib) && /export\s+function\s+originsDiffer\b/.test(readFileSync(lib, 'utf8'))
+        && /lane-pool-origin\.mjs/.test(readFileSync(join(root, 'scripts/lane-pool.mjs'), 'utf8'));
+    } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const r = replayPoolOrigin(sourceRoot);
     log?.(`pool=project lane origin=${r.lane} expected=${r.poolOrigin} exit=${r.exit}\n`);
     return r;
   },
-  judge: (r) => (r.lane !== null && r.lane !== r.poolOrigin
-    ? [`lane for pool "project" was cloned from ${r.lane}, not the pool origin ${r.poolOrigin}`] : []),
+  judge: (r) => (r.exit === 0 && r.lane === r.poolOrigin ? []
+    : [`pool "project" provision exit=${r.exit}, lane origin=${r.lane}; expected exit 0 and the pool origin ${r.poolOrigin}`]),
 };
