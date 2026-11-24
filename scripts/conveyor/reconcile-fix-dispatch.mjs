@@ -2,7 +2,7 @@ import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { admitMqFailureRoute } from './mq-failure-intake.mjs';
-import { refreshMqFailureHeadSync, mqFailureRefreshIo } from '../lib/mq-failure-refresh.mjs';
+import { refreshMqFailureHeadSync, mqFailureRefreshIo, mqFailureHoldReason } from '../lib/mq-failure-refresh.mjs';
 import { createMqFailureLedger } from '../lib/mq-failure-ledger.mjs';
 import { FENCED_DATA_RULE, fenceUntrusted } from '../lib/mandate-fence.mjs';
 /**
@@ -2097,11 +2097,6 @@ export function runReconcileFixDispatch({
     // wrong-PR data, so it is dropped from the entry and never reaches the fixer brief.
     if (recovery.repo !== ghRepoSlug(repoKey) || recovery.pr !== Number(entry.prNumber)
         || recovery.head !== entry.headRefOid) { delete entry.mqFailureRecovery; return true; }
-    // Incomplete evidence is the normal fixer's input but never authorizes a mechanical refresh.
-    if (recovery.evidence?.complete !== true) {
-      entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix' };
-      return true;
-    }
     let result;
     try {
       const identity = { repo: recovery.repo, pr: recovery.pr, head: recovery.head };
@@ -2113,7 +2108,22 @@ export function runReconcileFixDispatch({
       }
       if (typeof fallback !== 'boolean') throw new Error('Unreadable MQ fallback decision');
       const io = mqFailureIo ?? mqFailureRefreshIo(repoKey === 'we' ? root : profile.lanePoolRepo);
-      if (!fallback && !dryRun) {
+      const held = mqFailureHoldReason(io.readLabels({ repo: identity.repo, pr: identity.pr }));
+      if (held) throw new Error(held);
+      const useFix = note => {
+        if (!dryRun) {
+          const claim = ledger.claim({ ...identity, kind: 'refresh' });
+          if (claim?.then) { claim.catch(() => {}); throw new Error('Async refresh claim; operator inspection required'); }
+          if (claim?.claimed !== true && !(fallback && claim?.claimed === false)) throw new Error('Refresh attempt already used; operator inspection required');
+          const recorded = ledger.recordFixFallback(identity);
+          if (recorded?.then) { recorded.catch(() => {}); throw new Error('Async fallback; operator inspection required'); }
+          if (recorded?.recorded !== true) throw new Error('Fix fallback unconfirmed; operator inspection required');
+        }
+        return { action: 'fix', note };
+      };
+      if (recovery.evidence?.complete !== true) {
+        result = useFix('Incomplete MQ evidence; normal fix required');
+      } else if (!fallback && !dryRun) {
         // A list snapshot carries no completeness proof. Re-read the full diff, bracketed by live
         // head reads, only for this authenticated current-head route. At most eight such reads/pass.
         let files = null, pinned = false;
@@ -2131,15 +2141,17 @@ export function runReconcileFixDispatch({
           changedFiles: { ...identity, files, complete: pinned } });
         entry.mqFailureRecovery = recovery;
         if (recovery.recoveryAction !== 'refresh') {
-          entry.mqFailureRecovery = { ...recovery,
-            refreshNote: 'Changed files are in-diff, unavailable, stale or over the read bound; normal fix required' };
-          return true;
+          result = useFix('Changed files are in-diff, unavailable, stale or over the read bound; normal fix required');
         }
       }
-      result = fallback
-        ? { action: 'fix', note: 'Persisted MQ refresh failure; normal fix still required' }
+      result ??= fallback
+        ? useFix('Persisted MQ refresh failure; normal fix still required')
         : refreshMqFailure({ ...identity, dryRun, ledger, io });
-    } catch { result = { action: 'stop', note: 'MQ refresh executor failed; operator inspection required' }; }
+      if (result?.action === 'fix') {
+        const fixHeld = mqFailureHoldReason(io.readLabels({ repo: identity.repo, pr: identity.pr }));
+        if (fixHeld) result = { action: 'stop', note: fixHeld };
+      }
+    } catch (error) { result = { action: 'stop', note: error?.message ?? 'MQ refresh executor failed; operator inspection required' }; }
     if (result?.action === 'fix') {
       // Conflict/push rejection consumes the mechanical attempt; the ordinary fixer gets the evidence.
       entry.mqFailureRecovery = { ...recovery, recoveryAction: 'fix', refreshNote: result.note };

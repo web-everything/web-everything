@@ -58,6 +58,18 @@ describe('smoke-scoped gh read memo', () => {
     ]);
   });
 
+  it('noMemo bypasses both memo reads and writes', () => {
+    const f = fixture();
+    gh.runGhSync(read, f.opts);
+    const live = { ...f.opts, throttle: { ...f.opts.throttle, noMemo: true } };
+    gh.runGhSync(read, live);
+    gh.runGhSync(['pr', 'view', '42', '--json', 'labels'], live);
+    expect(f.count()).toBe(3);
+    expect(f.entries()).toHaveLength(1);
+    gh.runGhSync(read, f.opts);
+    expect(f.count()).toBe(3);
+  });
+
   it.each([
     ['api', 'repos/example/project', '--method', 'POST'],
     ['pr', 'edit', '1', '--repo', 'example/project', '--title', 'title'],

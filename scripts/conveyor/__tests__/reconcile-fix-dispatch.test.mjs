@@ -2806,3 +2806,54 @@ describe('bounced no-findings fresh evidence', () => {
     expect(result.reconcileRefusalDetails.some(r => r.kind === 'cap-exhausted')).toBe(true);
   });
 });
+
+
+describe('MQ recovery live holds', () => {
+  function run(labels = ['review:human'], complete = true, fallback = true) {
+    const head = 'a'.repeat(40);
+    const dispatch = vi.fn(), refreshMqFailure = vi.fn(() => ({ action: 'fix' }));
+    const readLabels = vi.fn(() => labels);
+    const claim = vi.fn(() => ({ claimed: true })), recordFixFallback = vi.fn(() => ({ recorded: true }));
+    const result = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH,
+      reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefOid: head,
+        headRefName: 'lane/3438-wire-reconcile-pass', mqFailureRecovery: {
+          repo: 'web-everything/web-everything', pr: 42, head, evidence: { complete },
+        } }], refusals: [] }),
+      mqFailureIo: { readLabels, readHead: () => head },
+      mqFailureLedger: { readFixFallback: () => fallback, claim, recordFixFallback }, refreshMqFailure,
+      findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [2],
+      fetchItemlessDiffPaths: () => [], dispatch, tryResume: () => null,
+      listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null,
+    });
+    return { result, dispatch, refreshMqFailure, readLabels, claim, recordFixFallback };
+  }
+  it('human-only hold blocks a live fix dispatch', () => {
+    const { result, dispatch, refreshMqFailure, readLabels } = run();
+    expect(readLabels).toHaveBeenCalledWith({ repo: 'web-everything/web-everything', pr: 42 });
+    expect(result.refusals).toContainEqual(expect.objectContaining({ why: expect.stringContaining('held: human-only') }));
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it.each(['red-team:blocked', 'red-team:pending', 'review:held-mechanical'])('live hold blocks incomplete recovery: %s', label => {
+    const { dispatch, refreshMqFailure, claim } = run([{ name: label }], false, false);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(claim).not.toHaveBeenCalled();
+  });
+  it('unreadable live labels block the fixer and refresh', () => {
+    const { result, dispatch, refreshMqFailure } = run(null);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+  });
+  it('incomplete recovery consumes a refresh attempt before fixer dispatch', () => {
+    const { dispatch, claim, recordFixFallback, refreshMqFailure } = run([], false, false);
+    expect(claim).toHaveBeenCalledWith(expect.objectContaining({ kind: 'refresh', pr: 42 }));
+    expect(recordFixFallback).toHaveBeenCalledTimes(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(claim.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]);
+    expect(recordFixFallback.mock.invocationCallOrder[0]).toBeLessThan(dispatch.mock.invocationCallOrder[0]);
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+  });
+
+});
