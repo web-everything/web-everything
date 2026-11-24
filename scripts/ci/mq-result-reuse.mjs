@@ -35,32 +35,25 @@ export function judgeRun(run, jobs, sha) {
 }
 
 /**
- * Find the verdict via the GitHub API. `api(path)` returns parsed JSON. Any throw means reuse=false.
- * `quarantineClear()` resolves true only when no red-main quarantine entry is active (the queue may have skipped
- * quarantined tests; main runs every test).
+ * Provider-neutral reuse rule (forge.merge-queue: the tested integration state; forge.check-status: the checks'
+ * outcomes). NO provider calls here: every read is injected.
+ *   listQueueRuns(sha) -> [{id, head_sha, event, status, conclusion}]  merge-queue runs of that exact state
+ *   listRunJobs(runId) -> [{name, conclusion}]  the COMPLETE job list (the adapter throws if it cannot prove completeness)
+ *   quarantineClear()  -> true only when no red-main quarantine entry is active (the queue may have skipped
+ *                         quarantined tests; main runs every test)
+ * Any throw means reuse=false.
  */
-export async function decide({ api, repo, sha, event, quarantineClear = async () => false }) {
+export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantineClear = async () => false }) {
   if (event !== 'push') return { reuse: false, why: `event ${event} is not a main push` };
   if (!/^[0-9a-f]{40}$/.test(sha ?? '')) return { reuse: false, why: 'no full sha' };
   try {
-    const runs = await api(`/repos/${repo}/actions/workflows/${CI_WORKFLOW_ID}/runs?event=merge_group&head_sha=${sha}&per_page=20`);
-    const candidates = (runs.workflow_runs ?? [])
+    const candidates = ((await listQueueRuns(sha)) ?? [])
       .filter((r) => r.head_sha === sha && r.event === 'merge_group')
       .sort((a, b) => Number(b.id) - Number(a.id));
     if (candidates.length === 0) return { reuse: false, why: 'no merge-queue run for this sha' };
     // Only the NEWEST run for the sha counts: a newer failed or unfinished run is contrary evidence.
     const run = candidates[0];
-    const jobs = [];
-    let total = null;
-    for (let page = 1; page <= 10; page += 1) {
-      const res = await api(`/repos/${repo}/actions/runs/${run.id}/jobs?filter=latest&per_page=100&page=${page}`);
-      if (!Array.isArray(res.jobs) || !Number.isInteger(res.total_count)) return { reuse: false, why: 'incomplete jobs listing' };
-      total = res.total_count;
-      jobs.push(...res.jobs);
-      if (jobs.length >= total || res.jobs.length === 0) break;
-    }
-    if (jobs.length !== total) return { reuse: false, why: 'jobs listing incomplete' };
-    const verdict = judgeRun(run, jobs, sha);
+    const verdict = judgeRun(run, await listRunJobs(run.id), sha);
     if (!verdict.reuse) return verdict;
     if (!(await quarantineClear())) return { reuse: false, why: 'red-main quarantine active or unreadable' };
     return { ...verdict, runId: run.id };
@@ -69,22 +62,42 @@ export async function decide({ api, repo, sha, event, quarantineClear = async ()
   }
 }
 
-async function main() {
-  const { GITHUB_SHA: sha, GITHUB_REPOSITORY: repo, GITHUB_TOKEN: token, GITHUB_EVENT_NAME: event } = process.env;
+/** GitHub adapter for the two reads (the only place that knows the provider). */
+export function githubReads({ repo, token, fetchImpl = fetch }) {
   const api = async (path) => {
-    const res = await fetch(`https://api.github.com${path}`, {
+    const res = await fetchImpl(`https://api.github.com${path}`, {
       headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
     });
     if (!res.ok) throw new Error(`GitHub API ${res.status}`);
     return res.json();
   };
+  return {
+    listQueueRuns: async (sha) => (await api(`/repos/${repo}/actions/workflows/${CI_WORKFLOW_ID}/runs?event=merge_group&head_sha=${sha}&per_page=20`)).workflow_runs ?? [],
+    listRunJobs: async (runId) => {
+      const jobs = [];
+      let total = null;
+      for (let page = 1; page <= 10; page += 1) {
+        const res = await api(`/repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100&page=${page}`);
+        if (!Array.isArray(res.jobs) || !Number.isInteger(res.total_count)) throw new Error('incomplete jobs listing');
+        total = res.total_count;
+        jobs.push(...res.jobs);
+        if (jobs.length >= total || res.jobs.length === 0) break;
+      }
+      if (jobs.length !== total) throw new Error('jobs listing incomplete');
+      return jobs;
+    },
+  };
+}
+
+async function main() {
+  const { GITHUB_SHA: sha, GITHUB_REPOSITORY: repo, GITHUB_TOKEN: token, GITHUB_EVENT_NAME: event } = process.env;
   const quarantineClear = async () => {
     const { readQuarantine } = await import('../lib/red-main-quarantine-io.mjs');
     const { activeEntries } = await import('../lib/red-main-quarantine.mjs');
     const got = readQuarantine({});
     return got.ok === true && activeEntries(got.list, { now: Date.now() }).length === 0;
   };
-  const v = await decide({ api, repo, sha, event, quarantineClear });
+  const v = await decide({ ...githubReads({ repo, token }), sha, event, quarantineClear });
   const line = v.reuse
     ? `mq-result-reuse: REUSING merge-queue run ${v.runId} for ${sha}; heavy jobs skipped (${v.why})`
     : `mq-result-reuse: full run (${v.why})`;
