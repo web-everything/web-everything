@@ -1,10 +1,10 @@
 // @vitest-environment node
 import { it, expect } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as q from '../../lib/red-main-quarantine.mjs';
-import { runSafetyNet } from '../../lib/red-main-quarantine-io.mjs';
+import { runSafetyNet, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
 import smell from '../health-smells/main-ci-red.mjs';
 import { parseTimeouts } from '../../lib/test-timeout-policy.mjs';
 
@@ -146,5 +146,100 @@ it('publishes synthetic complete repeat evidence; unknown failures escalate imme
     expect(unknown.applied).toBe(false);
     expect(unknown.alerts).toContainEqual(expect.objectContaining({ type: 'escalation', at: now, why: expect.stringContaining('unknown') }));
     expect(logs.some(line => line.includes('escalation'))).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// A file summary cannot account for an additional infrastructure crash.
+it.each(['Unhandled Rejection', 'Uncaught Exception', 'Worker exited unexpectedly', 'Worker failed', 'teardown failed'])(
+  'rejects a complete assertion summary with extra crash: %s', diagnostic => {
+    expect(q.parseVitestFailures(`${log}\n${diagnostic}`).complete).toBe(false);
+  });
+
+it.each(['AssertionError: broken', 'Error: expected true to be false'])(
+  'keeps ordinary assertion diagnostics complete: %s', diagnostic => {
+    expect(q.parseVitestFailures(`FAIL ${file} > fails\n${diagnostic}\nTest Files 1 failed`).complete).toBe(true);
+  });
+
+it.each(['startup_failure', 'cancelled', 'action_required', 'neutral', 'stale'])(
+  'refuses repeat proof across intervening terminal %s', conclusion => {
+    const earlier = run({ databaseId: 1, headSha: 'aaaaaaa', createdAt: '2026-11-22T22:50:00Z' });
+    const gap = run({ databaseId: 2, createdAt: '2026-11-22T22:53:00Z', conclusion, jobFailures: {} });
+    expect(plan({ repeatRuns: [earlier, gap, run()] })).toMatchObject({
+      action: 'none', why: expect.stringContaining('consecutive main failures do not name this file'),
+    });
+  });
+
+it.each(['startup_failure', 'cancelled', 'action_required', 'neutral', 'stale'])(
+  'keeps terminal %s in the IO repeat window without reading its jobs', conclusion => {
+  const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
+  const earlier = { ...red, databaseId: 1, createdAt: '2026-11-22T22:50:00Z' };
+  const readIds = [];
+  const gap = { ...red, databaseId: 2, headSha: 'bbbbbbb', createdAt: '2026-11-22T22:53:00Z', conclusion };
+  try {
+    const out = runSafetyNet({ dir, now, live: false,
+      mainCiRuns: { runs: [earlier, gap, red], failing: { runId: red.databaseId, jobs: [job] } },
+      mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+      timeoutPolicy: {}, touchedFiles: () => [], readLog: failure,
+      readJobs: id => { readIds.push(id); return { failed: [{ name: job, id: 1 }] }; }, log: () => {} });
+    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('consecutive main failures do not name this file') });
+    expect(readIds).not.toContain(2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([undefined, 1])('re-reads cached failures with parser version %s', parserVersion => {
+  const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
+  let reads = 0;
+  const invoke = () => runSafetyNet({ dir, now, live: false,
+    mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
+    mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+    timeoutPolicy: {}, touchedFiles: () => [], readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
+    readLog: () => { reads++; return reads === 1 ? failure() : q.parseVitestFailures('unreadable crash'); }, log: () => {} });
+  try {
+    invoke();
+    const path = join(dir, SAFETY_NET_LEDGER), ledger = JSON.parse(readFileSync(path, 'utf8'));
+    const rec = Object.values(ledger.reds)[0];
+    rec.parserVersion = parserVersion;
+    rec.readRetryAt = now + 60_000; // version changes also reset stale retry backoff
+    writeFileSync(path, JSON.stringify(ledger));
+    const out = invoke();
+    expect(reads).toBe(2);
+    expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('unknown') });
+    expect(Object.values(JSON.parse(readFileSync(path, 'utf8')).reds)[0]).toMatchObject({
+      parserVersion: q.QUARANTINE_PARSER_VERSION, jobFailures: {},
+    });
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([undefined, 1])('refuses cached attempt proof with parser version %s', parserVersion => {
+  const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
+  const invoke = r => runSafetyNet({ dir, now, live: false,
+    mainCiRuns: { runs: [r], failing: { runId: r.databaseId, jobs: [job] } },
+    mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+    timeoutPolicy: {}, touchedFiles: () => [], readJobs: () => ({ failed: [{ name: job, id: 1 }] }), readLog: failure, log: () => {} });
+  try {
+    invoke(red);
+    const path = join(dir, SAFETY_NET_LEDGER), ledger = JSON.parse(readFileSync(path, 'utf8'));
+    Object.values(ledger.reds)[0].attempts['1'].parserVersion = parserVersion;
+    writeFileSync(path, JSON.stringify(ledger));
+    expect(invoke({ ...red, attempt: 2, updatedAt: '2026-11-22T23:04:00Z' }).plan.action).toBe('none');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it('emits unknown-failure escalation even with an existing live quarantine', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
+  const list = { ...q.addEntries(null, { tests: ['scripts/other.test.mjs'], brokenSha: red.headSha,
+    owner: 'operator', reason: 'known flake', actor: 'operator', now, ttlMs: 60_000 }).list, mode: 'quarantine' };
+  const emitted = [];
+  try {
+    const out = runSafetyNet({ dir, now, live: true,
+      mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
+      mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
+      timeoutPolicy: {}, readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
+      readLog: () => q.parseVitestFailures('unreadable crash'), readList: () => ({ ok: true, list }),
+      write: () => { throw new Error('must not write'); }, log: line => emitted.push(line) });
+    expect(out.applied).toBe(false);
+    expect(out.liveEntries).toHaveLength(1);
+    expect(out.alerts).toContainEqual(expect.objectContaining({ type: 'escalation', why: expect.stringContaining('unknown') }));
+    expect(emitted.some(line => line.includes('"type":"escalation"'))).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

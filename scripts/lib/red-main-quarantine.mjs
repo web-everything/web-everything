@@ -198,14 +198,17 @@ export function setFixPrs(list, { fixPrs, actor, now }) {
 const ANSI = /\x1b\[[0-9;]*m/g;
 const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 
+/** Invalidate persisted parses whenever completeness rules change. */
+export const QUARANTINE_PARSER_VERSION = 2;
+
 /**
  * Failing vitest tests from one CI job's log (untrusted text). Completeness requires
- * a matching failed-file summary. Interrupted logs additionally require a measured
+ * a matching failed-file summary and no crash diagnostics. Interrupted logs require a measured
  * timeout for every individual failure; unsupported diagnostics must escalate. PURE.
  */
 export function parseVitestFailures(logText) {
   const tests = [];
-  let failedFiles = null, interrupted = false, unknownError = false, timeoutLines = 0;
+  let failedFiles = null, interrupted = false, unknownError = false, crash = false, timeoutLines = 0;
   const timeouts = parseTimeouts(logText);
   for (const raw of String(logText ?? '').split('\n')) {
     const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
@@ -213,6 +216,7 @@ export function parseVitestFailures(logText) {
     if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) {
       tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
     }
+    if (/Unhandled|Uncaught|Worker.*(?:exit|fail)|teardown/i.test(line)) crash = true;
     const timeoutLine = /^\s*Error: Test timed out in \d+ms\.\s*$/.test(line);
     if (timeoutLine) timeoutLines++;
     if (/timed out|exceeded.*(?:execution time|timeout)|teardown/i.test(line)) { interrupted = true; if (!timeoutLine) unknownError = true; }
@@ -224,7 +228,7 @@ export function parseVitestFailures(logText) {
   }
   const files = [...new Set(tests.map(t => t.file))];
   const measured = timeoutLines === timeouts.length && tests.length === timeouts.length && tests.every((t, i) => t.file === timeouts[i].file && t.name === timeouts[i].name);
-  return { files, tests, failedFiles, timeouts, complete: files.length > 0 && failedFiles === files.length
+  return { files, tests, failedFiles, timeouts, complete: !crash && files.length > 0 && failedFiles === files.length
     && (!interrupted || (!unknownError && measured)) };
 }
 
@@ -277,12 +281,12 @@ function repeatProofFor(file, { repeatRuns, latestRunId, latestAttempt = 1, touc
     const key = `${r.databaseId}:${attempt}`;
     if (seen.has(key)) return false;
     seen.add(key);
-    return r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion);
+    return r.status === 'completed' && r.conclusion !== 'success';
   });
   const latest = runs.at(-1);
   if (!latest || String(latest.databaseId) !== String(latestRunId) || (latest.attempt === undefined ? 1 : latest.attempt) !== latestAttempt || runs.length < count) return no('insufficient distinct failing main runs');
   const evidence = runs.slice(-count);
-  if (!evidence.every(r => Object.values(r.jobFailures ?? {}).some(f => f?.complete === true && f.files?.includes(file)))) return no('consecutive main failures do not name this file');
+  if (!evidence.every(r => ['failure', 'timed_out'].includes(r.conclusion) && Object.values(r.jobFailures ?? {}).some(f => f?.complete === true && f.files?.includes(file)))) return no('consecutive main failures do not name this file');
   let previousCreatedAt = -Infinity;
   for (const run of evidence) {
     const createdAt = typeof run?.createdAt === 'string' ? Date.parse(run.createdAt) : NaN;

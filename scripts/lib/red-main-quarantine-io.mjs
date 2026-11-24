@@ -40,7 +40,7 @@ import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
   validateQuarantineList, addEntries, removeEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, quarantineWriterError, vitestExcludeArgs,
-  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT,
+  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS, REPEAT_RUN_LIMIT, QUARANTINE_PARSER_VERSION,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL', ...opts });
@@ -234,7 +234,7 @@ export function readTouchedFiles(fromSha, toSha, { board = process.cwd(), run = 
 }
 
 /** At most ten run reads and maxTests log reads per run. Unknown history never proves a repeat. */
-function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings }) {
+function readRepeatRuns(mainCiRuns, { jobFailures, readJobs, readLog, settings }) {
   const history = mainCiRuns?.runs ?? [];
   const timestamp = (value) => typeof value === 'string' ? Date.parse(value) : NaN;
   const failing = history.find((r) => String(r?.databaseId) === String(mainCiRuns?.failing?.runId));
@@ -251,12 +251,12 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
   // Repeated runs can share a SHA across a green boundary; membership alone is insufficient.
   const candidates = history.filter((r) => Number.isFinite(timestamp(r?.createdAt))
     && timestamp(r.createdAt) > windowStart && timestamp(r.createdAt) <= failingCreatedAt
-    && state.redShas?.includes(r.headSha)
-    && r.status === 'completed' && ['failure', 'timed_out'].includes(r.conclusion))
+    && r.status === 'completed' && r.conclusion !== 'success')
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
   const unique = [...new Map(candidates.map((r) => [String(r.databaseId), r])).values()];
   const runs = unique.slice(-REPEAT_RUN_LIMIT);
   return runs.map((r) => {
+    if (!['failure', 'timed_out'].includes(r.conclusion)) return { ...r, jobFailures: {} };
     if (String(r.databaseId) === String(mainCiRuns?.failing?.runId)) return { ...r, jobFailures };
     const failures = {};
     // Invalid ids cannot reach an IO reader.
@@ -392,12 +392,12 @@ export function runSafetyNet({
     const failedJobs = state.status === 'red' ? (mainCiRuns?.failing?.jobs ?? null) : null;
     if (rec && Array.isArray(failedJobs) && failedJobs.length) {
       // Each failed unit job's log is read until it succeeds, then kept for the red window (re-read only if the
-      // failing run changed). A failed read is NEVER cached as an answer: it is retried with a growing backoff.
+      // failing run or parser changed). A failed read is NEVER cached as an answer: it is retried with a growing backoff.
       const runId = mainCiRuns?.failing?.runId ?? null;
       // Attempts share a run id; reread their logs independently, including after an update.
       const run = mainCiRuns?.runs?.find((r) => r?.databaseId === runId);
       const runKey = `${runId}:${run?.attempt ?? 1}@${run?.updatedAt ?? ''}`;
-      if (!rec.jobFailures || rec.runKey !== runKey) { rec.runId = runId; rec.runKey = runKey; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
+      if (!rec.jobFailures || rec.runKey !== runKey || rec.parserVersion !== QUARANTINE_PARSER_VERSION) { rec.parserVersion = QUARANTINE_PARSER_VERSION; rec.runId = runId; rec.runKey = runKey; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
       const unitRe = new RegExp(settings.value.unitJobPattern);
       const wanted = failedJobs.filter((n) => unitRe.test(n));
       if (wanted.some((n) => rec.jobFailures[n] == null) && now >= (Number(rec.readRetryAt) || 0)) {
@@ -436,7 +436,7 @@ export function runSafetyNet({
       && failedJobs.filter(j => new RegExp(settings.value.unitJobPattern).test(j)).every(j => allSoft(jobFailures[j], timeoutOutcomes(jobFailures[j], timeoutPolicy, j)));
     const flakeProof = !softOnly && settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
     let repeatRuns = !softOnly && settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
-      ? readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings: settings.value }) : [];
+      ? readRepeatRuns(mainCiRuns, { jobFailures, readJobs, readLog, settings: settings.value }) : [];
     const failingRun = mainCiRuns?.runs?.find((r) => r?.databaseId === mainCiRuns?.failing?.runId);
     const attempt = failingRun?.attempt === undefined ? 1 : failingRun.attempt;
     const completedFailure = failingRun?.status === 'completed' && ['failure', 'timed_out'].includes(failingRun.conclusion);
@@ -447,12 +447,13 @@ export function runSafetyNet({
       && Object.values(rec.attempts).some((a) => a && typeof a === 'object' && a.runId !== failingRun.databaseId)) rec.attempts = {};
     if (rec && completedFailure && completeFailures && Number.isInteger(attempt) && attempt > 0) {
       rec.attempts ??= {};
-      rec.attempts[String(attempt)] = { runId: failingRun.databaseId, createdAt: failingRun.createdAt,
+      rec.attempts[String(attempt)] = { parserVersion: QUARANTINE_PARSER_VERSION, runId: failingRun.databaseId, createdAt: failingRun.createdAt,
         updatedAt: failingRun.updatedAt, observedAt: now,
         headSha: failingRun.headSha, jobFailures: structuredClone(jobFailures) };
     }
     const previous = rec?.attempts?.[String(attempt - 1)];
     if (settings.value.repeatFailureProof && settings.value.requireProvenFlake && previous
+      && previous.parserVersion === QUARANTINE_PARSER_VERSION
       && previous.runId === failingRun?.databaseId && Number.isInteger(attempt) && attempt > 1
       && completedFailure && completeFailures
       && Object.values(previous.jobFailures ?? {}).length > 0
@@ -605,9 +606,12 @@ export function runSafetyNet({
           ...(output.type === 'quarantine' ? { entry: published } : {}) });
       }
       const alerts = listEmpty ? [] : timeoutAlerts.map(outcome => ({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome }));
-      if (state.status === 'red' && listEmpty && (!out.applied || !out.liveEntries.length) && (isLive || !activeEntries(ledger.shadowList, { now }).length)) {
-        const why = out.error ?? out.plan?.why ?? 'no action; quarantine list empty';
-        alerts.push({ type: /unknown|unreadable|outside the unit|no unit job failed|cap .*reached|bound|expired|invalid/i.test(why) ? 'escalation' : 'alert', ref: `red-main:${sha}`, why });
+      const why = out.error ?? out.plan?.why ?? 'no action; quarantine list empty';
+      const unknownFailure = /unknown|unreadable|outside the unit|no unit job failed|cap .*reached|bound|expired|invalid/i.test(why);
+      const added = out.events?.some(e => ['quarantine-added', 'quarantine-rekeyed'].includes(e.type));
+      if (state.status === 'red' && ((unknownFailure && !added)
+        || (listEmpty && (!out.applied || !out.liveEntries.length) && (isLive || !activeEntries(ledger.shadowList, { now }).length)))) {
+        alerts.push({ type: unknownFailure ? 'escalation' : 'alert', ref: `red-main:${sha}`, why });
       }
       out.alerts = alerts.map(alert => ({ at: now, ...alert }));
       // Persist one bounded signature per red window, including the run and mode.
