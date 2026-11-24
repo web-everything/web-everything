@@ -4034,17 +4034,33 @@ describe('xng7q1p mechanical timeout precedence', () => {
     expect(rerunInFlight(dead, { ...o, budget: b(60_000) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000) })).toBe(false);
     expect(rerunInFlight(dead, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
-    // a live or unknown (incomplete rollup) run always holds, whatever the marker's age
-    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(true);
-    expect(rerunInFlight({ ...dead, rollupIncomplete: true }, { ...o, budget: b(2 * 3_600_000) })).toBe(true);
+    // The quiet hold has an upper bound even when the rollup never settles.
+    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    expect(rerunInFlight({ ...dead, rollupIncomplete: true }, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
     expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000, { reason: 'timeout-state-unreadable:x' }) })).toBe(true);
     expect(rerunInFlight(dead, { ...o, budget: { confirmed: 0, pending: false } })).toBe(false);
+  });
+  it.each([
+    ['live', { statusCheckRollup: [...redRollup, { name: 'stuck', status: 'IN_PROGRESS' }] }],
+    ['queued', { statusCheckRollup: [...redRollup, { name: 'stuck', status: 'QUEUED' }] }],
+    ['commit status', { statusCheckRollup: [...redRollup, { context: 'stuck', state: 'PENDING' }] }],
+    ['incomplete', { rollupIncomplete: true }],
+  ])('old pending planner invariant: %s evidence escalates instead of holding silently', (_name, extra) => {
+    const r = planReconcile({ prs: [pr({ ...extra, timeoutRetryBudget: {
+      confirmed: 0, pending: true, pendingSince: new Date(NOW - 7 * 24 * 3_600_000).toISOString(),
+    } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.refusals.map(row => row.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
   it('mediation: no refusal site reads budget.pending directly; all go through rerunInFlight()', () => {
     const src = readFileSync(join(process.cwd(), 'scripts/conveyor/reconcile-core.mjs'), 'utf8');
     const direct = src.split('\n').filter((l) => /[bB]udget\??\.pending\b/.test(l) && !/^\s*\/\//.test(l));
-    // The one allowed bare read is the escalation guard, whose body routes the hold through rerunInFlight().
-    expect(direct.filter((l) => !l.includes('rerunInFlight')).map((l) => l.trim())).toEqual(['if (!budget?.pending) return false;', 'if (retryBudget?.pending) {']);
+    // Bare pending reads authorize escalations only; every in-flight refusal uses the predicate.
+    expect(direct.filter((l) => !l.includes('rerunInFlight')).map((l) => l.trim())).toEqual([
+      'if (!budget?.pending) return false;',
+      'if (pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)',
+    ]);
     expect(src.match(/rerunInFlight\(/g).length).toBeGreaterThanOrEqual(6);
   });
   it('a re-run unresolved without a timestamp escalates; unreadable state escalates at once', () => {
@@ -4053,6 +4069,12 @@ describe('xng7q1p mechanical timeout precedence', () => {
     const fresh = new Date(NOW - 1000).toISOString();
     const unreadable = planReconcile({ prs: [pr({ timeoutRetryBudget: { pending: true, pendingSince: fresh, reason: 'timeout-state-unreadable:x' } })], now: NOW });
     expect(unreadable.refusals[0].kind).toBe('ci-heal-escalated');
+  });
+  it('a future pending timestamp is unusable and escalates instead of creating an unbounded grace period', () => {
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true,
+      pendingSince: new Date(NOW + 24 * 3_600_000).toISOString() } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
   it('keeps live fix ownership ahead of retries', () => {
     const result = planReconcile({ prs: [pr({ fixClaim: { who: 'fixer' } })], now: NOW });

@@ -750,6 +750,148 @@ describe('xng7q1p retry reservation and restart soak', () => {
     await dispatchTimeoutRetry(e, { dir, repo: e.repo, now: () => t0,
       effects: { observe, request: () => ({ status: 'ambiguous' }) } });
   }
+  const healPass = (dir, e, options = {}) => runReconcileCiHealDispatch({
+    root: dir, repo: e.repo, checkStaleness: FRESH, now: () => t0 + 40 * 60_000,
+    reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: e.pr, headRefOid: e.head, headRefName: 'lane/retry' }], refusals: [] }),
+    flushOwed: () => ({}), flushTimeouts: async () => [], pollAttempts: () => [],
+    unsupportedPath: join(dir, 'unsupported'), resolveWorkUnit: () => ({ itemNum: null, scope: [] }),
+    pickFreeLanes: () => [3], salvage: async () => null, currentBuild: () => null,
+    resolveProfile: () => ({ capabilities: { ciHeal: true }, lanePoolRepo: dir }),
+    fixLoop: { killed: () => false, readRows: () => [], append: async () => {} },
+    fixConfig: { maxSessions: 3, windowHours: 6, hold: true },
+    dispatch: async planned => ({ pr: planned.pr, sessionSlug: 'test-heal' }),
+    timeoutHold: args => readTimeoutHold({ ...args, dir }),
+    ...options,
+  });
+  it('runReconcileCiHealDispatch expires a lost marker, re-reads the hold and dispatches ci-heal', async () => harness(async dir => {
+    const e = evidence(); await reservePending(dir, e);
+    const state = readState(dir, e);
+    state.requests.push(...[1, 2].map(id => ({ id, target: e.jobs[0], status: 'expired' })));
+    writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify(state));
+    const plan = planReconcile({ prs: [{ number: e.pr, headRefOid: e.head, headRefName: 'lane/retry',
+      labels: [], comments: [], statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }],
+      timeoutRetry: e, timeoutRetryBudget: readTimeoutBudget({ ...e, dir }),
+    }], requiredChecks: ['test'], now: t0 + 40 * 60_000 });
+    expect(plan.dispatch.map(row => row.kind)).toEqual(['ci-heal']);
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    const timeoutHold = vi.fn(args => readTimeoutHold({ ...args, dir }));
+    const expireLost = vi.fn(args => expireLostPending({ ...args, dir, effects: { observe } }));
+    const out = await healPass(dir, e, { timeoutHold, expireLost, reconcile: () => plan });
+    expect(expireLost).toHaveBeenCalledOnce();
+    expect(timeoutHold).toHaveBeenCalledTimes(2);
+    expect(readState(dir, e).requests[0].status).toBe('expired');
+    expect(out.refusals).toEqual([]);
+    expect(out.dispatched).toEqual([expect.objectContaining({ pr: e.pr })]);
+  }));
+  it.each(['retired-aged-out', 'retired-pr-closed', 'observe-throws', 'unbound', 'job-in-progress', 'legacy-unstamped', 'future-stamp'])
+  ('non-expiring state %s past the deadline emits a needs-human escalation', async variant => harness(async dir => {
+    const e = evidence(); await reservePending(dir, e);
+    const state = readState(dir, e);
+    if (variant.startsWith('retired-')) state.retired = { reason: variant.slice(8) };
+    if (variant === 'legacy-unstamped') delete state.requests[0].reservedAt;
+    if (variant === 'future-stamp') state.requests[0].reservedAt = new Date(t0 + 24 * 3_600_000).toISOString();
+    writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify(state));
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    const poll = (...args) => {
+      if (variant === 'observe-throws') throw Error('observation unavailable');
+      return { ...observe(...args), ...(variant === 'unbound' ? { runHead: 'other' } : {}),
+        ...(variant === 'job-in-progress' ? { status: 'in_progress' } : {}) };
+    };
+    const out = await healPass(dir, e, { expireLost: args => expireLostPending({ ...args, dir, effects: { observe: poll } }) });
+    expect(out.dispatched).toEqual([]);
+    expect(readState(dir, e).requests[0].status).toBe('pending');
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human', why: expect.stringContaining('needs your decision') }));
+    if (variant === 'observe-throws') expect(out.refusals[0].why).toContain('observation unavailable');
+  }));
+  it.each([
+    ['in-progress', { status: 'in_progress' }], ['queued', { status: 'queued' }], ['newer attempt', { attempt: 2 }],
+    ['unknown attempt', { attempt: undefined }], ['invalid attempt', { attempt: 0 }],
+    ['wrong repo', { repo: 'other/repo' }], ['moved PR head', { head: 'other' }], ['wrong run head', { runHead: 'other' }],
+    ['wrong run', { run: 11 }], ['wrong job', { job: 21 }], ['wrong job run', { jobRun: 11 }], ['closed PR', { open: false }],
+  ])('expireLostPending preserves pending on %s evidence', async (_name, over) => harness(async dir => {
+    const e = evidence(); await reservePending(dir, e);
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    expect(await expireLostPending({ ...e, dir, now: () => t0 + 40 * 60_000,
+      effects: { observe: (...args) => ({ ...observe(...args), ...over }) } })).toBe(0);
+    expect(readState(dir, e).requests[0].status).toBe('pending');
+  }));
+  it.each(['observe-throws', 'unbound', 'running', 'unknown-attempt', 'retired'])
+  ('mechanical retry also escalates an old %s pending marker without sending a request', async variant => harness(async dir => {
+    const e = evidence(); await reservePending(dir, e);
+    if (variant === 'retired') {
+      const state = readState(dir, e); state.retired = { reason: 'aged-out' };
+      writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify(state));
+    }
+    const request = vi.fn();
+    const poll = (...args) => {
+      if (variant === 'observe-throws') throw Error('unavailable');
+      return { ...observe(...args), ...(variant === 'unbound' ? { runHead: 'other' } : {}),
+        ...(variant === 'running' ? { status: 'in_progress' } : {}),
+        ...(variant === 'unknown-attempt' ? { attempt: undefined } : {}) };
+    };
+    expect(await dispatchTimeoutRetry(e, { dir, repo: e.repo, now: () => t0 + 40 * 60_000, effects: { observe: poll, request } }))
+      .toMatchObject({ reason: 'timeout-retry-needs-human', why: expect.stringContaining('needs your decision') });
+    expect(readState(dir, e).requests[0].status).toBe('pending');
+    expect(request).not.toHaveBeenCalled();
+  }));
+  it('expiry reports corrupt files separately and still expires a valid legacy marker', async () => harness(async dir => {
+    const e = evidence();
+    writeFileSync(join(dir, 'a-corrupt.json'), '{');
+    const path = join(dir, 'z-legacy.json');
+    writeFileSync(path, JSON.stringify({ version: 1, evidence: e, requests: [{ id: 0, target: e.jobs[0],
+      status: 'pending', reservedAt: new Date(t0).toISOString() }] }));
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(await expireLostPending({ ...e, dir, now: () => t0 + 40 * 60_000, effects: { observe } })).toBe(1);
+      expect(JSON.parse(readFileSync(path, 'utf8')).requests[0].status).toBe('expired');
+      expect(errors.mock.calls.flat().join(' ')).toContain('a-corrupt.json');
+    } finally { errors.mockRestore(); }
+  }));
+  it('expiry continues after an observation error and reports it after processing the other legacy marker', async () => harness(async dir => {
+    const e = evidence();
+    const paths = ['a-unknown.json', 'b-lost.json'].map(name => join(dir, name));
+    paths.forEach((path, id) => writeFileSync(path, JSON.stringify({ version: 1, evidence: e, requests: [{
+      id: 0, target: { ...e.jobs[0], job: 20 + id }, status: 'pending', reservedAt: new Date(t0).toISOString(),
+    }] })));
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    await expect(expireLostPending({ ...e, dir, now: () => t0 + 40 * 60_000, effects: { observe: (ev, job) => {
+      if (job.job === 20) throw Error('first marker unavailable');
+      return observe(ev, job);
+    } } })).rejects.toThrow('first marker unavailable');
+    expect(paths.map(path => JSON.parse(readFileSync(path, 'utf8')).requests[0].status)).toEqual(['pending', 'expired']);
+  }));
+  it('expiry re-reads under the lock and never demotes a concurrently confirmed request', async () => harness(async dir => {
+    const e = evidence(); await reservePending(dir, e);
+    const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+    expect(await expireLostPending({ ...e, dir, now: () => t0 + 40 * 60_000, effects: { observe: (...args) => {
+      const state = readState(dir, e); state.requests[0].status = 'confirmed';
+      writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify(state));
+      return observe(...args);
+    } } })).toBe(0);
+    expect(readState(dir, e).requests[0].status).toBe('confirmed');
+  }));
+  it.each(['confirmed', 'rejected', 'ambiguous'])('a delayed %s API response cannot overwrite an expired reservation', async status => harness(async dir => {
+    const e = evidence(); const fileFollowup = vi.fn();
+    await dispatchTimeoutRetry(e, { dir, repo: e.repo, now: () => t0, fileFollowup,
+      effects: { observe, request: async () => {
+        const { expireLostPending } = await import('../ci-heal-pr-dispatch.mjs');
+        expect(await expireLostPending({ ...e, dir, now: () => t0 + 40 * 60_000, effects: { observe } })).toBe(1);
+        return { status };
+      } } });
+    expect(readState(dir, e).requests[0].status).toBe('expired');
+    expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ confirmed: 1, expired: 1, pending: false });
+    expect(fileFollowup).not.toHaveBeenCalled();
+  }));
+  it('the dispatcher refuses two expired requests at its own cap without sending another request', async () => harness(async dir => {
+    const e = evidence(); const request = vi.fn(); const fileFollowup = vi.fn();
+    writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify({ version: 1, evidence: e,
+      requests: [0, 1].map(id => ({ id, target: e.jobs[0], status: 'expired' })) }));
+    expect(await dispatchTimeoutRetry(e, { dir, repo: e.repo, effects: { observe, request }, fileFollowup }))
+      .toMatchObject({ reason: 'timeout-retries-exhausted' });
+    expect(request).not.toHaveBeenCalled();
+    expect(fileFollowup).not.toHaveBeenCalled();
+  }));
   // RERUN-PENDING-EXPIRY: a lost pending marker is expired through the one writer, counts toward the cap, and never holds forever.
   it('a lost pending request (job completed, no new attempt, past the window) is expired and counts toward the cap', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
@@ -758,12 +900,12 @@ describe('xng7q1p retry reservation and restart soak', () => {
     expect(readState(dir, e).requests[0].status).toBe('pending');
     // the evidenced job still running is not proof the request was lost, however old
     const running = { ...opts, effects: { ...opts.effects, observe: (...a) => ({ ...observe(...a), status: 'in_progress' }) } };
-    expect(await dispatchTimeoutRetry(e, { ...running, now: () => t0 + 90 * 60_000 })).toMatchObject({ reason: 'retry-outcome-pending' });
+    expect(await dispatchTimeoutRetry(e, { ...running, now: () => t0 + 90 * 60_000 })).toMatchObject({ reason: 'timeout-retry-needs-human' });
     expect(await dispatchTimeoutRetry(e, { ...opts, now: () => t0 + 40 * 60_000 })).toMatchObject({ reason: 'retry-expired-replan' });
     expect(readState(dir, e).requests[0]).toMatchObject({ status: 'expired', expiredReason: expect.any(String) });
     expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ confirmed: 1, expired: 1, pending: false });
   }));
-  it('a delayed API response never overwrites an expired request; expired spends the cap but never files a card as confirmed', async () => harness(async (dir) => {
+  it('expired spends the cap but never files a card as confirmed during follow-up flushing', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
     const path = join(dir, `${timeoutKey(e)}.json`);
     const state = readState(dir, e); state.requests[0].status = 'expired'; writeFileSync(path, JSON.stringify(state));

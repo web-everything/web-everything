@@ -8,13 +8,29 @@ export const timeoutStateDir = () => join(ghThrottleLockRoot(), 'ci-timeout-reru
 export const timeoutKey = ({ repo, pr, head }) => createHash('sha256')
   .update(JSON.stringify([repo, pr, head])).digest('hex');
 
+/** Isolate bad files for recovery scans; ordinary budget reads throw and fail closed. */
+export function readTimeoutStateFiles(dir, { paths, onError } = {}) {
+  if (!existsSync(dir)) return [];
+  const entries = [];
+  for (const path of paths ?? readdirSync(dir).filter(name => name.endsWith('.json')).map(name => join(dir, name))) {
+    try {
+      const state = JSON.parse(readFileSync(path, 'utf8'));
+      if (state?.version !== 1 || !state.evidence || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+      entries.push({ path, state });
+    } catch (error) {
+      if (!onError) throw error;
+      onError(path, error);
+    }
+  }
+  return entries;
+}
+
 export function readTimeoutStates(evidence, dir = timeoutStateDir()) {
   const canonical = join(dir, `${timeoutKey(evidence)}.json`);
   if (!existsSync(dir)) return [];
   const paths = existsSync(canonical) ? [canonical]
     : readdirSync(dir).filter((name) => name.endsWith('.json')).map((name) => join(dir, name));
-  return paths.map((path) => JSON.parse(readFileSync(path, 'utf8'))).filter((state) => {
-    if (state.version !== 1 || !state.evidence || !Array.isArray(state.requests)) throw new Error('corrupt-timeout-state');
+  return readTimeoutStateFiles(dir, { paths }).map(({ state }) => state).filter((state) => {
     return ['repo', 'pr', 'head'].every((key) => state.evidence[key] === evidence[key]);
   });
 }
