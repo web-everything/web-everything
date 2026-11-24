@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { dispatchReviewByMode, dispatchReviewJob, runReviewJob, runReviewJobCli } from '../review-job.mjs';
 import { dispatchReview } from '../review-dispatch.mjs';
 import { createLandAdvanceApplier } from '../land-advance-io.mjs';
+import { planLandAdvance } from '../land-advance.mjs';
 
 const head = 'a'.repeat(40), repo = 'web-everything/web-everything', pr = 10;
 const roots = [];
@@ -137,6 +138,43 @@ it('land-advance defers an unpinned review without a launch ledger entry or spen
   expect(dispatchFix).toHaveBeenCalledOnce();
   expect(writeLedger).toHaveBeenCalledOnce();
   expect(writeLedger.mock.calls[0][0]).toMatchObject({ target: fix.subject, session: 'fix-session' });
+});
+describe.each([false, true])('land-advance planned head (wrapped=%s)', wrapReview => {
+  it.each(['planner', 'supplied row'])('%s preserves the observed head through admission and records the launch', async source => {
+    const { options } = sessionFixture(wrapReview);
+    const plan = planLandAdvance({ now: 1000, freeLanes: 1, prs: [{
+      number: pr, repo: 'we', labels: ['review:pending'], headRefOid: head,
+    }] });
+    if (source === 'supplied row') plan.proposed[0].headRefOid = head;
+    const writeLedger = vi.fn();
+    const dispatch = vi.fn(input => dispatchReview({ ...options, expectedHead: undefined, ...input }));
+    const result = await createLandAdvanceApplier({ dispatchReview: dispatch, writeLedger,
+      readCapacity: () => ({ freeLanes: 1, sessions: [], load: 0 }),
+    })(plan);
+    expect(result.errors).toEqual([]);
+    expect(result.deferred).toEqual([]);
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ expectedHead: head }));
+    expect(wrapReview ? options.launchWrapped : options.spawnAgent).toHaveBeenCalledOnce();
+    expect(writeLedger).toHaveBeenCalledWith(expect.objectContaining({ target: 'we#10', session: 'session-id' }));
+  });
+  it('refuses a head moved after planning without recording a launch', async () => {
+    const { io, options } = sessionFixture(wrapReview);
+    const plan = planLandAdvance({ now: 1000, freeLanes: 1, prs: [{
+      number: pr, repo: 'we', labels: ['review:pending'], headRefOid: head,
+    }] });
+    io.liveHead.mockReturnValue('b'.repeat(40));
+    const writeLedger = vi.fn();
+    const result = await createLandAdvanceApplier({
+      dispatchReview: input => dispatchReview({ ...options, expectedHead: undefined, ...input }),
+      writeLedger, readCapacity: () => ({ freeLanes: 1, sessions: [], load: 0 }),
+    })(plan);
+    expect(result).toMatchObject({ dispatched: [], errors: [],
+      deferred: [{ target: 'we#10', reason: 'refused-head-moved' }] });
+    expect(options.spawnAgent).not.toHaveBeenCalled();
+    expect(options.launchWrapped).not.toHaveBeenCalled();
+    expect(writeLedger).not.toHaveBeenCalled();
+  });
 });
 describe('expected review head admission', () => {
   it.each(['flag', 'environment'])('session CLI selected by %s refuses a missing pin with exit 75', selector => {

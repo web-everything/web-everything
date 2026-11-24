@@ -10,7 +10,8 @@
  *   D. the conveyor runner must carry its planned head through CLI argv into job admission;
  *   E. the manual-pass CLI declaration must project the operator's pin into its effect payload;
  *   F. session mode and direct dispatch must refuse missing or moved heads and admit a matching head;
- *   G. land-advance must defer an unpinned review without writing a launch ledger or spending capacity.
+ *   G. land-advance must defer an unpinned review without writing a launch ledger or spending capacity;
+ *   H. land-advance must preserve a known head from planning through admission and launch.
  */
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -28,6 +29,7 @@ const head = 'd'.repeat(40);
 const job = await import(pathToFileURL(join(src, 'scripts/operations/review-job.mjs')).href);
 const direct = await import(pathToFileURL(join(src, 'scripts/operations/review-dispatch.mjs')).href);
 const land = await import(pathToFileURL(join(src, 'scripts/operations/land-advance-io.mjs')).href);
+const landPlan = await import(pathToFileURL(join(src, 'scripts/operations/land-advance.mjs')).href);
 const daemon = await import(pathToFileURL(join(src, 'skills-src/conveyor/review-daemon.mjs')).href);
 const runner = await import(pathToFileURL(join(src, 'skills-src/conveyor/runner.mjs')).href);
 const manual = await import(pathToFileURL(join(src, 'scripts/operations/manual-daemon-pass.mjs')).href);
@@ -73,6 +75,21 @@ try {
   ] });
   out.land = { ...result, spawns, fixes, ledgerTargets: ledger.map(entry => entry.target) };
 } catch (e) { out.land = { threw: String(e.message).split('\\n')[0] }; }
+try {
+  let spawns = 0;
+  const ledger = [];
+  const plan = landPlan.planLandAdvance({ now: 1000, freeLanes: 1, prs: [
+    { number: 77, repo: 'we', labels: ['review:pending'], headRefOid: head },
+  ] });
+  const result = await land.createLandAdvanceApplier({
+    dispatchReview: input => direct.dispatchReview({ ...base, ...input, io, wrapReview: false,
+      readBrief: () => 'review', ensureSessionCwd: () => process.env.SOAK_ROOT, isolateSession: () => ({}),
+      spawnAgent: () => { spawns++; return 'backgrounded · review-session · review'; } }),
+    readCapacity: () => ({ sessions: [], freeLanes: 1, load: 0 }), writeLedger: entry => ledger.push(entry),
+  })(plan);
+  out.landKnownHead = { spawns, dispatched: result.dispatched.length, deferred: result.deferred,
+    errors: result.errors, ledgerTargets: ledger.map(entry => entry.target) };
+} catch (e) { out.landKnownHead = { threw: String(e.message).split('\\n')[0] }; }
 let seen = null;
 try {
   daemon.runReviewTickAllRepos({ startIndex: 0, repos: [SLUG],
@@ -174,6 +191,11 @@ export default {
         || JSON.stringify(out.land?.ledgerTargets) !== JSON.stringify(['fix'])
         || out.land?.deferred?.[0]?.reason !== 'refused-no-expected-head') {
         violations.push({ invariant: 'land-advance-head-admission', detail: JSON.stringify(out.land) });
+      }
+      if (out.landKnownHead?.spawns !== 1 || out.landKnownHead?.dispatched !== 1
+        || out.landKnownHead?.deferred?.length !== 0 || out.landKnownHead?.errors?.length !== 0
+        || JSON.stringify(out.landKnownHead?.ledgerTargets) !== JSON.stringify(['we#77'])) {
+        violations.push({ invariant: 'land-advance-passes-planned-head', detail: JSON.stringify(out.landKnownHead) });
       }
       return { violations };
     } finally {
