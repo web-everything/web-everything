@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -91,5 +91,72 @@ describe('CI main history fetch transport recovery', () => {
         }
       }
     }
+  });
+});
+
+// Mirror cache: real git is replaced by a recorder; cat-file result is chosen per case.
+function runCached({ catFileOk, withCache = true }) {
+  const dir = mkdtempSync(join(tmpdir(), 'ci-fetch-cache-'));
+  try {
+    mkdirSync(join(dir, 'cache'));
+    mkdirSync(join(dir, 'packs'));
+    if (withCache) {
+      writeFileSync(join(dir, 'cache', 'pack-abc.pack'), 'p');
+      writeFileSync(join(dir, 'cache', 'pack-abc.idx'), 'i');
+      writeFileSync(join(dir, 'cache', 'sha'), 'deadbeef\n');
+    }
+    writeFileSync(join(dir, 'git'), `#!/bin/sh
+printf '%s\\n' "$*" >> "$FETCH_TEST_CALLS"
+case "$1" in
+  rev-parse) echo "$FETCH_TEST_PACKS"; exit 0;;
+  cat-file) [ "$FETCH_TEST_CATFILE" = ok ] && exit 0; exit 1;;
+  *) exit 0;;
+esac
+`, { mode: 0o755 });
+    const result = spawnSync('sh', [script], {
+      cwd: dir, encoding: 'utf8', timeout: 5_000,
+      env: {
+        ...process.env, PATH: `${dir}:${process.env.PATH}`, MAIN_HISTORY_CACHE_DIR: join(dir, 'cache'),
+        FETCH_TEST_CALLS: join(dir, 'calls'), FETCH_TEST_PACKS: join(dir, 'packs'),
+        FETCH_TEST_CATFILE: catFileOk ? 'ok' : 'bad',
+      },
+    });
+    return { ...result, calls: readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n'), packs: readdirSync(join(dir, 'packs')).sort() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('CI main history mirror cache', () => {
+  it('uses a restored mirror and then fetches the live tip', () => {
+    const r = runCached({ catFileOk: true });
+    expect(r.status).toBe(0);
+    expect(r.packs).toEqual(['pack-abc.idx', 'pack-abc.pack', 'pack-abc.promisor']);
+    expect(r.calls).toContain('update-ref refs/remotes/origin/main deadbeef');
+    expect(r.calls.at(-1)).toBe(fetchArgs);
+  });
+
+  it('falls back to the full blobless fetch when the restored mirror is corrupt', () => {
+    const r = runCached({ catFileOk: false });
+    expect(r.status).toBe(0);
+    expect(r.packs).toEqual([]);
+    expect(r.calls.some((c) => c.startsWith('update-ref'))).toBe(false);
+    expect(r.calls.at(-1)).toBe(fetchArgs);
+  });
+
+  it('does the plain full fetch when no cache was restored', () => {
+    const r = runCached({ catFileOk: true, withCache: false });
+    expect(r.calls).toEqual([fetchArgs]);
+  });
+
+  it('only saves the cache from main pushes in the standards job, restores in the fetching jobs', () => {
+    const raw = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+    const { jobs } = yaml.load(raw);
+    const saves = Object.values(jobs).flatMap((j) => j.steps.filter((s) => String(s.uses ?? '').startsWith('actions/cache/save')));
+    expect(saves).toHaveLength(1);
+    expect(saves[0].if).toContain("github.ref == 'refs/heads/main'");
+    expect(saves[0].if).toContain("github.event_name == 'push'");
+    const restores = Object.values(jobs).flatMap((j) => j.steps.filter((s) => String(s.uses ?? '').startsWith('actions/cache/restore') && String(s.with?.key).startsWith('main-history-v1-')));
+    expect(restores.length).toBeGreaterThanOrEqual(5);
   });
 });
