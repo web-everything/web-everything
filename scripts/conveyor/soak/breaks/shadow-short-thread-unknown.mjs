@@ -4,17 +4,17 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
-const FIX_SHA = '8bca7188291f1bad5b03cad6578b9958a6c5b251';
 const HEAD = 'a'.repeat(40);
 
 export default {
   id: 'shadow-short-thread-unknown',
   title: 'the dispatch-eligibility shadow counts a short listed thread as complete and an explicit false as incomplete',
   card: 'plan step SHADOW-FIX-DISPATCH-ELIGIBILITY',
-  fixedBy: { sha: FIX_SHA.slice(0, 9), where: 'lane/shadow-fix-dispatch-eligibility', paths: ['scripts/conveyor/dispatch-eligibility-shadow.mjs'] },
+  fixedBy: { sha: '8bca71882', where: 'lane/shadow-fix-dispatch-eligibility', paths: ['scripts/conveyor/dispatch-eligibility-shadow.mjs'] },
   fixPresent(root) {
     // Git ancestry of the fix commit; never the behaviour under test.
-    try { execFileSync('git', ['merge-base', '--is-ancestor', FIX_SHA, 'HEAD'], { cwd: root, stdio: 'ignore' }); return true; }
+    // Keep argv literal so the push-boundary lint can verify this read-only command.
+    try { execFileSync('git', ['merge-base', '--is-ancestor', '8bca7188291f1bad5b03cad6578b9958a6c5b251', 'HEAD'], { cwd: root, stdio: 'ignore' }); return true; }
     catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
