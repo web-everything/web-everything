@@ -40,12 +40,48 @@ function keyStructureFinding(bytes) {
     if (/(?:^|[^\\])(?:\\\\)*\$\{/.test(body)) return '"oct"';
     return '"' + body.replace(/\\[\s\S]|"/g, piece => piece === '"' ? '\\"' : piece) + '"';
   };
-  const normalized = text.replace(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|`(?:\\[\s\S]|[^`\\])*`/g, quoteTemplate);
+  const normalize = pieces => {
+    const parts = [], displaced = [], stack = [{ kind: '', value: null }];
+    let end = 0;
+    for (const match of text.matchAll(pieces)) {
+      const token = match[0], frame = stack.at(-1);
+      parts.push(text.slice(end, match.index));
+      end = match.index + token.length;
+      if (token[0] === '`') {
+        // A tag is an expression, not necessarily an identifier (String.raw,
+        // computed access, calls, parentheses, etc.). Project its entire member
+        // value to an opaque string; never execute it or infer its return value.
+        const owner = stack.findLast(item => item.value !== null);
+        if (owner && /\S/.test(text.slice(owner.value.source, match.index))) {
+          // Keep nested objects from the displaced expression available to the
+          // structure scan, even if a later template replaces their parent value.
+          displaced.push(parts.splice(owner.value.part).join(''));
+          parts.push('"oct"');
+        } else parts.push(quoteTemplate(token));
+      } else {
+        parts.push(token);
+        if ('{[('.includes(token)) {
+          if (stack.length >= 64) return null;
+          stack.push({ kind: token, value: null });
+        } else if ('}])'.includes(token)) {
+          if (stack.length > 1) stack.pop();
+        } else if (frame.kind === '{' || frame.kind === '') {
+          if (token === ':' && frame.value === null) frame.value = { part: parts.length, source: end };
+          if (token === ',' || token === ';') frame.value = null;
+        }
+      }
+    }
+    parts.push(text.slice(end));
+    return [parts.join(''), ...displaced].join('\n');
+  };
+  const normalized = normalize(/"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\/\/[^\r\n\u2028\u2029]*|\/\*[\s\S]*?(?:\*\/|$)|`(?:\\[\s\S]|[^`\\])*`|[{}[\]():,;]/g);
+  if (normalized === null) return 'private-key-scan-budget-exhausted-use-local';
   const normalizedFinding = normalized === text ? null : sharedKeyStructureFinding(Buffer.from(normalized));
   if (normalizedFinding) return normalizedFinding;
   // Regex literals and prose can contain stray quotes. As in the shared parser's
   // independent object pass, also visit templates without global quote pairing.
-  const independent = text.replace(/`(?:\\[\s\S]|[^`\\])*`/g, quoteTemplate);
+  const independent = normalize(/`(?:\\[\s\S]|[^`\\])*`|[{}[\]():,;]/g);
+  if (independent === null) return 'private-key-scan-budget-exhausted-use-local';
   return independent === text || independent === normalized ? null : sharedKeyStructureFinding(Buffer.from(independent));
 }
 

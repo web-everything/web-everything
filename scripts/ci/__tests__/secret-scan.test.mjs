@@ -62,6 +62,55 @@ const privateJwk = jwk([['d', 'FAKE_TEST_ONLY']]);
 // Build source strings at runtime so this file itself contains no private JWK.
 const templateJwk = (key, members) => 'export default {' + Object.entries(key).map(([name, value]) =>
   JSON.stringify(name) + ':' + (members.includes(name) ? '`' + value + '`' : JSON.stringify(value))).join(',') + '};';
+test('usable String.raw and expression-tagged JWK values fail the whole-file scan', async () => {
+  const key = Object.fromEntries([['kty', 'oct'], ['k', Buffer.alloc(16, 97).toString('base64url')]]);
+  const algorithm = { name: 'HMAC', hash: 'SHA-256' };
+  for (const tag of ['String.raw', 'String["raw"]', '(String.raw)', '(0, String.raw)',
+    'String /* tag */ . raw\n', 'String\r.raw', 'String\u2028.\u2029raw', 'String["r" + "aw"]',
+    '(() => String.raw)()', '(chunks => chunks[0])', 'Str\\u0069ng.raw',
+    '((Str\u200cing) => Str\u200cing.raw)(String)', '((Ｓ) => Ｓ.raw)(String)']) {
+    for (const members of [['k'], ['kty'], ['kty', 'k']]) {
+      const source = templateJwk(key, members).replaceAll(':`', ':' + tag + '`');
+      const actual = runInNewContext('(' + source.slice('export default '.length, -1) + ')');
+      const imported = await webcrypto.subtle.importKey('jwk', actual, algorithm, false, ['sign']);
+      assert.ok((await webcrypto.subtle.sign(algorithm, imported, Buffer.from('probe'))).byteLength);
+      const r = repo(); r.put('tagged.mjs', source); r.commit();
+      const result = r.scan();
+      assert.equal(result.status, 1, tag);
+      assert.equal(result.stdout, 'tagged.mjs:0 private-key-structure\n', tag);
+      assert.ok(!result.output.includes(key.k));
+    }
+  }
+});
+test('value-only tagged edits in nested objects fail while ordinary tags pass', () => {
+  const key = Object.fromEntries([['kty', 'oct'], ['k', 'FAKE']]);
+  const before = templateJwk(key, []);
+  const after = templateJwk(key, ['k']).replaceAll(':`', ':String.raw`');
+  const wrap = source => 'export default [{payload:' + source.slice('export default '.length, -1) + '}];';
+  const r = repo({ 'key.mjs': wrap(before) }); r.put('key.mjs', wrap(after)); r.commit();
+  assert.equal(r.scan().stdout, 'key.mjs:0 private-key-structure\n');
+  const wrappedCall = repo();
+  wrappedCall.put('key.mjs', 'export default {wrapped:fn(' + after.slice('export default '.length, -1) + ', `label`)};');
+  wrappedCall.commit(); assert.equal(wrappedCall.scan().stdout, 'key.mjs:0 private-key-structure\n');
+  const ordinary = repo();
+  ordinary.put('ordinary.mjs', templateJwk({ k: 'click', label: 'hello' }, ['k', 'label']).replaceAll(':`', ':String.raw`'));
+  ordinary.commit(); assert.equal(ordinary.scan().status, 0);
+});
+test('template normalization nesting exhaustion fails closed with manual-review rule', () => {
+  const r = repo(); r.put('deep.mjs', '('.repeat(65) + '`ordinary`' + ')'.repeat(65)); r.commit();
+  assert.equal(r.scan().stdout, 'deep.mjs:0 private-key-scan-budget-exhausted-use-local\n');
+});
+test('tagged templates reach independent scanning, private members and filename redaction', () => {
+  for (const member of ['k', 'd', 'p', 'q', 'dp', 'dq', 'qi']) {
+    const key = Object.fromEntries([['kty', member === 'k' ? 'oct' : 'RSA'], [member, 'FAKE']]);
+    const source = templateJwk(key, [member]).replaceAll(':`', ':String.raw`');
+    const r = repo(); r.put('tagged.mjs', 'const pattern = /"/; ' + source + ' const label = "text";'); r.commit();
+    assert.equal(r.scan().stdout, 'tagged.mjs:0 private-key-structure\n', member);
+  }
+  const source = templateJwk(Object.fromEntries([['kty', 'oct'], ['k', 'FAKE']]), ['k']).replaceAll(':`', ':String.raw`');
+  const r = repo(); r.put(source + '.mjs', privateJwk); r.commit();
+  assert.equal(r.scan().stdout, '[redacted-path]:0 private-key-structure\n');
+});
 test('usable HMAC and Ed25519 JWKs with template-literal values fail the CLI scan', async () => {
   const oct = Object.fromEntries([['kty', 'oct'], ['k', Buffer.alloc(16, 97).toString('base64url')]]);
   const ed = generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' });
