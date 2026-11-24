@@ -11,7 +11,7 @@ const MODES = ['plain', 'facts-off', 'facts-on'];
 export async function collect(sourceRoot, { mode, stripFlag = false } = {}) {
   const { readTimeoutEvidence } = await import(pathToFileURL(join(sourceRoot, 'scripts/conveyor/reconcile-pass.mjs')));
   const { makeFixEvidenceReader } = await import(pathToFileURL(join(sourceRoot, 'scripts/lib/fix-facts.mjs')));
-  const repo = 'web-everything/web-everything', head = 'a'.repeat(40), prefix = `repos/${repo}`;
+  const repo = 'example-org/example-repo', head = 'a'.repeat(40), prefix = `repos/${repo}`;
   const job = { id: 20, run_id: 10, head_sha: head, run_attempt: 1,
     status: 'completed', conclusion: 'failure', name: 'test' };
   const data = {
