@@ -14,6 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { expireLaneLease } from './fixtures/expired-lane-lease.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -277,12 +278,13 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      expireLaneLease(lane);
       writeFileSync(join(lane, 'built-and-tested.txt'), 'four files worth of real work\n');
 
       const reclaim = runPool(
@@ -303,12 +305,13 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      expireLaneLease(lane);
       writeFileSync(join(lane, 'file.txt'), 'v1\nunpushed commit\n');
       git(['add', 'file.txt'], lane);
       git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'unpushed'], lane);
@@ -335,12 +338,13 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(acq.code).toBe(0);
       const lane = acq.out.trim().split('\n').pop();
+      expireLaneLease(lane);
       writeFileSync(join(lane, 'stale-residue.txt'), 'abandoned garbage, for real this time\n');
 
       const reclaim = runPool(
@@ -359,12 +363,13 @@ describe('lane-pool refresh/provision dirty-or-ahead guard (#2267)', () => {
       const acq = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
-          '--branch=main', '--no-install', '--no-reset', '--session=holder', '--ttl-minutes=0', '--exact-ttl',
+          '--branch=main', '--no-install', '--no-reset', '--session=holder',
         ],
         { LANE_POOL_ROOT: poolRoot },
       );
       expect(acq.code).toBe(0);
 
+      expireLaneLease(acq.out.trim().split('\n').pop());
       const reclaim = runPool(
         [
           'acquire', '--lane=1', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=guardtest',
