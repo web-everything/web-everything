@@ -21,7 +21,7 @@ const TRUST_CHAIN_FILES = [
 ];
 
 export const NARROWED_NAME_GLOBS = Object.freeze([
-  'scripts/**/*merge*', 'scripts/**/*review*', 'scripts/**/*drain*', 'scripts/*merge*', 'scripts/*drain*',
+  'scripts/**/*merge*', 'scripts/**/*review*', 'scripts/**/*drain*',
 ].map(oldGlob => Object.freeze({
   oldGlob,
   newGlobs: Object.freeze(['mjs', 'cjs', 'js', 'ts', 'json', 'sh'].map(ext => `${oldGlob}.${ext}`)),
@@ -53,11 +53,6 @@ export const HIGH_MUST_STAY = Object.freeze([
   ...[...GUARD_FLOOR, ...REVIEW_AUTH_FLOOR, ...AUDITOR_FLOOR]
     .filter(glob => glob.endsWith('/')).map(glob => `${glob}**`),
 ]);
-
-// Preserve shared floor roster literals for parity, constraining their name-only
-// merge/drain rules too. Additive extraHigh rules remain unrestricted by this mapping.
-const HIGH_MATCH_RULES = HIGH_MUST_STAY.flatMap(glob =>
-  NARROWED_NAME_GLOBS.find(entry => entry.oldGlob === glob)?.newGlobs ?? [glob]);
 
 export const TIER_RULES = Object.freeze({
   HIGH: HIGH_MUST_STAY,
@@ -118,26 +113,31 @@ function settingsHigh(opts) {
   }
 }
 
+function validPath(path) {
+  return typeof path === 'string' && path.length > 0 && !/[\\\x00-\x1f\x7f]/.test(path)
+    && !path.split('/').some(part => !part || part === '.' || part === '..');
+}
+
 function quarantineContext(opts) {
-  const paths = Object.hasOwn(opts, 'quarantinedTests') ? opts.quarantinedTests : [];
-  return Array.isArray(paths) && Array.from(paths).every(path => typeof path === 'string')
+  const paths = opts.quarantinedTests;
+  if (paths === undefined) return undefined;
+  return Array.isArray(paths) && Array.from(paths).every(validPath)
     ? new Set(paths) : null;
 }
 
 function classifyFile(path, extraHigh, opts, quarantine) {
   if (quarantine === null) return { path, tier: 'HIGH', rule: 'context-invalid' };
-  if (typeof path !== 'string' || !path || /[\\\x00-\x1f\x7f]/.test(path)
-      || path.split('/').some(part => !part || part === '.' || part === '..')) {
+  if (!validPath(path)) {
     return { path, tier: 'HIGH', rule: 'invalid-path' };
   }
   if (extraHigh === null) return { path, tier: 'HIGH', rule: 'settings-unavailable' };
-  if (quarantine.has(path)) return { path, tier: 'HIGH', rule: 'quarantined-test' };
+  if (quarantine?.has(path)) return { path, tier: 'HIGH', rule: 'quarantined-test' };
   // Ordered from highest to lowest: overlapping LOW rules cannot downgrade HIGH.
   for (const tier of ['HIGH', 'MEDIUM', 'LOW']) {
-    const rules = tier === 'HIGH' ? [...HIGH_MATCH_RULES, ...extraHigh] : TIER_RULES[tier];
+    const rules = tier === 'HIGH' ? [...TIER_RULES.HIGH, ...extraHigh] : TIER_RULES[tier];
     const rule = rules.find(glob => matches(glob, path));
     if (rule !== undefined) {
-      if (tier === 'LOW' && opts.redMainFix !== false) {
+      if (tier === 'LOW' && (opts.redMainFix !== false || quarantine === undefined)) {
         return { path, tier: 'MEDIUM', rule: 'red-main-or-unknown-context' };
       }
       return { path, tier, rule };
@@ -146,7 +146,7 @@ function classifyFile(path, extraHigh, opts, quarantine) {
   return { path, tier: 'HIGH', rule: 'unmatched' };
 }
 
-/** opts: additive settings, explicit redMainFix:false for LOW, optional quarantinedTests paths. */
+/** opts: additive settings; LOW requires redMainFix:false and a canonical quarantinedTests array. */
 export function fileTier(path, opts = {}) {
   return classifyFile(path, settingsHigh(opts), opts, quarantineContext(opts)).tier;
 }
