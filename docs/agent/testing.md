@@ -6414,6 +6414,13 @@ Merge-path checklist answers (this slice observes seat selection and has no gate
 | 14 Simplicity | One stateless append hook and one append-only sidecar; no retry machinery, markers or second scorecard rewrite. Byte comparisons and one-line-per-run assertions enforce the boundary. |
 - [Testing topic notes and authoring guidance](testing/README.md)
 
+## Flow-v0 review shadow evidence and leases
+
+The shadow reads the job's durable completion after publication, with a cloned
+context and the same completion directory. Its evidence clock is injectable;
+shared append-lock leases must use real wall time so historical evidence fixtures
+cannot immediately expire an active lease. Keep the concurrent-observation and
+byte-identical completion/return-value cases in the flow-engine contract suite.
 
 ## Test timing ownership
 
