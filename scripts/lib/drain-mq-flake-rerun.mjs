@@ -1,3 +1,8 @@
+/**
+ * Not claimed: this module does not prove flakiness. Timeout text authorises a retry
+ * BY DESIGN: the retry re-runs full merge-queue CI and merges only if green, at most
+ * once per head. A deterministic deadlock fails again and is then refused.
+ */
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { classifyMqTimeoutLog } from './mq-failure-evidence.mjs';
 /** Bounded Actions attempt matching. Check-run IDs are never Actions job IDs. */
@@ -91,8 +96,12 @@ export function requestMqReruns({ attempts, repo, exec, scope = exec, eligible, 
 }
 export function readMqTimeoutFailure({ failed, attempts, repo, exec, spend }) {
   // No per-test pass proof is available here: only one failed unit shard may spend
-  // the persisted, single-use head claim. Other failures require operator inspection.
-  if (failed.length !== 1 || !/^test-shard \([1-9][0-9]*\)$/.test(failed[0].name) || attempts.reason
+  // the persisted, single-use head claim. Known aggregates must prove upstream-only
+  // failure via their logs below; other failures require operator inspection.
+  const shards = failed.filter(check => /^test-shard \([1-9][0-9]*\)$/.test(check.name));
+  if (shards.length !== 1 || failed.length > 3
+    || failed.some(check => check !== shards[0] && !['test', 'coverage-merge'].includes(check.name))
+    || new Set(failed.map(check => check.name)).size !== failed.length || attempts.reason
     || attempts.candidates.length !== failed.length) return false;
   let timeouts = 0;
   try {

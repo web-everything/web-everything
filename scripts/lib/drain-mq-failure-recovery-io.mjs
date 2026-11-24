@@ -2,7 +2,7 @@ import { readMergeQueueState } from './merge-queue-enqueue.mjs';
 import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 /** Production adapter for a drain's held same-head MQ failure. No work runs at import time. */
 import { execFileSyncThrottled } from './gh-throttle.mjs';
-import { createMqLiveReader, readMqTimeline, decideMqSameHead } from './drain-queue-safety.mjs';
+import { createMqLiveReader, readMqTimeline, decideMqSameHead, mqSameHeadGuard } from './drain-queue-safety.mjs';
 import { collectMqFailureEvidence } from './mq-failure-evidence.mjs';
 import { createMqFailureLedger } from './mq-failure-ledger.mjs';
 import { inspectMqReruns, mqActionsJob, readMqTimeoutFailure } from './drain-mq-flake-rerun.mjs';
@@ -50,6 +50,7 @@ export function createDrainMqFailureRecoveryIo({ exec = execFileSyncThrottled,
     forRoute: () => createDrainMqFailureRecoveryIo({ exec, ledger, maxCalls: limit }),
     readQueue: ({ repo, pr }) => readMergeQueueState({ repo, pr, readJson: json }),
     readTimeline: ({ repo, pr }) => readMqTimeline({ repo, pr, exec: request }),
+    readFreshGuard: identity => mqSameHeadGuard({ ...identity, exec: request, allowAlreadyQueued: false, dryRun: true }),
     readPr: ({ repo, pr }) => json(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,mergeStateStatus,baseRefName']),
     readLabels({ repo, pr }) {
       const data = json(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']);
@@ -200,6 +201,8 @@ export function retryMqTimeoutOnHold({ repo, pr, head, guard,
       try {
         const fresh = heldMqFailure({ repo, pr, head, guard, io });
         if (fresh.reason || fresh.history !== history) return refused;
+        const admission = fresh.active.readFreshGuard({ repo, pr, head });
+        if (admission.mainGreen !== true || admission.hold && admission.line !== guard.line) return refused;
         return fresh.active.readTimeoutFailure({ removal: { ...fresh.removal, removedAt: fresh.removedAt } }) === checks
           ? { hold: false, line: null } : refused;
       } catch { return refused; }

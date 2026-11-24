@@ -8,10 +8,10 @@ export function timeoutFixture(root, options = {}) {
   const repo = 'fixture/timeout', pr = 42, head = 'a'.repeat(40), merge = 'b'.repeat(40);
   const event = { __typename: 'RemovedFromMergeQueueEvent', reason: 'failed_checks', createdAt: '2026-11-01T13:45:00Z',
     beforeCommit: { oid: merge, parents: { nodes: [{ oid: 'c'.repeat(40) }, { oid: head }] } } };
-  const checks = [options.checkName ?? 'test-shard (1)', 'test'].map((name, i) => ({ id: i + 1, name, head_sha: merge,
-    status: 'completed', conclusion: i === 0 || options.multipleFailures ? 'failure' : 'success', started_at: '2026-11-01T13:30:00Z', completed_at: '2026-11-01T13:40:00Z',
+  const checks = [options.checkName ?? 'test-shard (1)', 'test', 'coverage-merge', ...(options.multipleFailures ? ['standards'] : [])].map((name, i) => ({ id: i + 1, name, head_sha: merge,
+    status: 'completed', conclusion: 'failure', started_at: '2026-11-01T13:30:00Z', completed_at: '2026-11-01T13:40:00Z',
     details_url: `https://github.com/${repo}/actions/runs/201/job/${i + 1}` }));
-  if (options.repeatedAttempt) checks.push({ ...checks[0], id: 3, started_at: '2026-11-01T13:41:00Z', completed_at: '2026-11-01T13:42:00Z', details_url: `https://github.com/${repo}/actions/runs/201/job/3` });
+  if (options.repeatedAttempt) checks.push({ ...checks[0], id: 5, started_at: '2026-11-01T13:41:00Z', completed_at: '2026-11-01T13:42:00Z', details_url: `https://github.com/${repo}/actions/runs/201/job/5` });
   let phase = 'original', mutations = 0;
   const exec = (command, args) => {
     if (command === 'git' && args[0] === 'ls-remote') return `${'c'.repeat(40)}\trefs/heads/main\n`;
@@ -29,7 +29,14 @@ export function timeoutFixture(root, options = {}) {
       if (!endpoint.includes('filter=all')) throw Error('incomplete history');
       return JSON.stringify({ total_count: options.incomplete ? 101 : checks.length, check_runs: phase === 'attempt changed' ? checks.map(c => ({ ...c, started_at: '2026-11-01T13:31:00Z' })) : checks });
     }
-    const job = /actions\/jobs\/([12])$/.exec(endpoint ?? '');
+    if (endpoint?.includes('/actions/workflows/ci.yml/runs?')) {
+      if (options.mainCi === 'unavailable' || phase === 'main unavailable') throw Error('main CI unreadable');
+      const runs = endpoint.includes('created=<') ? [] : [{ id: 301, head_sha: 'c'.repeat(40),
+        path: '.github/workflows/ci.yml', head_branch: 'main', event: 'push', status: 'completed',
+        conclusion: phase === 'main red' ? 'failure' : 'success', created_at: new Date().toISOString(), updated_at: new Date().toISOString() }];
+      return JSON.stringify({ total_count: runs.length, workflow_runs: runs });
+    }
+    const job = /actions\/jobs\/([1234])$/.exec(endpoint ?? '');
     if (job) return JSON.stringify({ id: Number(job[1]), run_id: 201, head_sha: merge,
       name: checks[Number(job[1]) - 1].name, status: 'completed', conclusion: 'failure', run_attempt: 1,
       run_url: `https://api.github.com/repos/${repo}/actions/runs/201`, ...options.job });
@@ -38,7 +45,9 @@ export function timeoutFixture(root, options = {}) {
     if (endpoint?.endsWith('/logs')) {
       if (options.unreadable || (!args.includes('--allow-escape-sequences'))) throw Error('logs unreadable');
       return endpoint.includes('/jobs/1/') ? options.text ?? timeoutLog
-        : '##[error]Unit shards did not succeed.\n##[error]Process completed with exit code 1.';
+        : options.aggregateText ?? (endpoint.includes('/jobs/3/')
+          ? '##[error]Unit shards did not succeed; refusing incomplete coverage.\n##[error]Process completed with exit code 1.'
+          : '##[error]Unit shards did not succeed.\n##[error]Process completed with exit code 1.');
     }
     throw Error('unexpected IO');
   };

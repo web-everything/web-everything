@@ -16,6 +16,7 @@ const fixture = options => { const root = mkdtempSync(join(process.env.TMPDIR, '
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
 it.each([
   ['unknown timeout check', { checkName: 'deterministic-deadlock' }],
+  ['aggregate with its own assertion failure', { aggregateText: 'AssertionError: coverage mismatch' }],
   ['multiple failed checks', { multipleFailures: true }], ['deterministic repeated attempt', { repeatedAttempt: true }],
   ['unreadable queue', { queue: 'unreadable' }], ['mismatched queue', { queue: 'mismatched' }],
   ['three conflicts', { conflicts: 3 }], ['over conflict cap', { conflicts: 4 }],
@@ -35,7 +36,7 @@ it('sole failed timeout shard retries once across fresh adapters sharing the led
   expect(await f.retry()).toMatchObject({ retry: true, reason: 'mq-flake-timeout' });
   expect(await f.retry()).toMatchObject({ retry: false, reason: 'Already retried this head' });
 });
-it.each(['original', 'second', 'unreadable', 'queue unreadable', 'queue mismatched', 'attempt changed', 'dirty'])('mutation-boundary evidence %s is revalidated after timeout authorization', async phase => {
+it.each(['original', 'second', 'unreadable', 'queue unreadable', 'queue mismatched', 'attempt changed', 'dirty', 'main unavailable', 'main red'])('mutation-boundary evidence %s is revalidated after timeout authorization', async phase => {
   const f = fixture(), authorized = await f.retry();
   expect(authorized.retry).toBe(true);
   f.setTimeline(phase);
@@ -69,4 +70,19 @@ it('an exact-looking stale hold cannot bypass unreadable or mismatched live queu
   for (const queue of ['unreadable', 'mismatched']) {
     expect(fixture({ queue, guard }).retry()).toMatchObject({ retry: false });
   }
+});
+
+it('unavailable main-CI evidence retains the hold and makes no enqueue mutation', () => {
+  const f = fixture({ mainCi: 'unavailable' }), authorized = f.retry();
+  expect(authorized.retry).toBe(true);
+  expect(f.enqueue(authorized.sameHeadAdmission).ok).toBe(false);
+  expect(f.mutations()).toBe(0);
+});
+it('a second timeout on the same head is refused after retrying full MQ CI', () => {
+  const f = fixture(), authorized = f.retry();
+  expect(authorized.retry).toBe(true);
+  expect(f.enqueue(authorized.sameHeadAdmission).ok).toBe(true);
+  f.setTimeline('second');
+  expect(f.retry()).toMatchObject({ retry: false });
+  expect(f.mutations()).toBe(1);
 });

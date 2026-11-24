@@ -1157,6 +1157,7 @@ export function mqSameHeadGuard({ repo, pr, head, exec = execFileSyncThrottled, 
     : decision.line;
   Object.defineProperties(decision, {
     reason: { value: reason }, mainRunId: { value: retryEvidence?.mainRunId ?? null },
+    mainGreen: { value: retryEvidence?.mainGreen === true },
   });
   return decision;
 }
