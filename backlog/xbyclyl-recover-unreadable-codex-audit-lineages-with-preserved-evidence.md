@@ -26,7 +26,7 @@ Recover a disposable ledger containing one torn JSONL line and a separate lineag
 - [A2] **Executable** — Add negative cases for unreadable backups, failed writes, wrong ref/question hash, interrupted recovery, concurrent append and duplicate retries. Incomplete recovery must retain the refusal and must not emit a passing audit record.
 - [A3] **Observed** — Document the operator command, its authorization, preserved-evidence location and recovery diagnostics. Replay a temporary ledger through refusal, recovery and a fresh audit, reporting exact exit codes and the untouched neighboring records.
 
-Run the affected test file through `npm run test:unit -- scripts/operations/__tests__/audit-nonconvergence.test.mjs`. These are planned acceptance checks, not results from this filing.
+Run the affected test file (`we:scripts/operations/__tests__/audit-nonconvergence.test.mjs`) through `npm run test:unit -- <test-file>`, passing its repo-relative path. These are planned acceptance checks, not results from this filing.
 
 ## Non-goals
 
