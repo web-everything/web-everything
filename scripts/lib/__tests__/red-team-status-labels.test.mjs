@@ -226,9 +226,9 @@ describe('awaiting human confirm', () => {
     try {
       const env = { WE_SHARED_RUNS_DIR: join(root, 'runs') }, at = Date.parse('2026-11-24T08:22:00Z');
       const run = { op: 'review-pr', input: { repo: input.repo, pr: input.pr },
-        findings: { read: { netBasis: { rev: head } } }, pending: { kind: 'confirm', step: 'confirm' },
+        findings: { read: { netBasis: { rev: head } } }, pending: { kind: 'confirm', step: 'confirm', of: 'human' },
         verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
-        effects: [{ type: 'review.advisory-note', status: 'applied' }],
+        effects: [{ type: 'review.advisory-note', status: 'applied' }, { type: 'review.advisory-label', status: 'applied' }],
         stepTimings: [{ step: 'read', startedAt: new Date(at - 1000).toISOString() }, { step: 'advise', finishedAt: new Date(at).toISOString() }] };
       recordRedTeamStatus({ ...input, loopPayload: run, status: 'finished', result: { status: 'ran', foldedVerdict: 'accept', findings: [] } }, { env });
       const statusPath = join(redTeamStatusDir(env), `${encodeURIComponent(input.repo)}-${input.pr}-${head}.json`);

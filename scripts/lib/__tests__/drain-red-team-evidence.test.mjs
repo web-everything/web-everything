@@ -1093,7 +1093,8 @@ describe('awaiting human confirm', () => {
     const f = fixture(), at = Date.parse('2026-11-24T08:22:00Z');
     const run = { op: 'review-pr', input: { repo: f.repo, pr: f.pr }, ...payload(f.head),
       verdict: { verdict: 'needs-human', humanRequired: true, lensVerdicts: { correctness: 'accept' }, findings: [] },
-      pending: { kind: 'confirm', step: 'confirm' }, effects: [{ type: 'review.advisory-note', status: 'applied' }],
+      pending: { kind: 'confirm', step: 'confirm', of: 'human' },
+      effects: [{ type: 'review.advisory-note', status: 'applied' }, { type: 'review.advisory-label', status: 'applied' }],
       stepTimings: [{ step: 'read', startedAt: new Date(at - 1000).toISOString() }, { step: 'advise', finishedAt: new Date(at).toISOString() }] };
     const older = { ...run, effects: [{ type: 'review.advisory-note', status: 'failed' }],
       stepTimings: [{ step: 'read', startedAt: new Date(at - 60_000).toISOString() }] };
@@ -1125,6 +1126,9 @@ describe('awaiting human confirm', () => {
     ['wrong pending step', r => { r.pending.step = 'advise'; }],
     ['refused outcome', r => { r.outcome = 'refused'; }],
     ['missing effects', r => { delete r.effects; }],
+    ['empty effects', r => { r.effects = []; }],
+    ['unrelated effects only', r => { r.effects = [{ type: 'other', status: 'applied' }]; }],
+    ['agent-addressed confirm', r => { r.pending.of = 'agent'; }],
     ['malformed finishedAt', r => { r.stepTimings[1].finishedAt = {}; }],
     ['malformed advise timing', r => { r.stepTimings[1] = null; }],
     ['malformed effect', r => { r.effects = [null]; }],

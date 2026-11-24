@@ -296,12 +296,13 @@ const supersededUnfinished = (run, head) => {
 // in newest/exact: a write newer than the status must still schedule any pass it owes.
 const awaitingHumanConfirm = (run, head) => {
   const rev = cleanRev(run?.findings?.read?.netBasis?.rev), live = cleanRev(head);
-  return run?.pending?.kind === 'confirm' && run.pending.step === 'confirm'
+  return run?.pending?.kind === 'confirm' && run.pending.step === 'confirm' && run.pending.of === 'human'
     && verdictOf(run) === 'needs-human' && run.verdict.humanRequired === true
     && run.findings?.confirm == null && run.outcome !== 'refused'
     && run.resumeOf == null && run.resumedAt == null
     && Array.isArray(run.stepTimings) && run.stepTimings.some(t => t?.step === 'advise' && typeof t.finishedAt === 'string' && Number.isFinite(Date.parse(t.finishedAt)))
     && Array.isArray(run.effects) && run.effects.every(effect => effect?.status === 'applied')
+    && ['review.advisory-note', 'review.advisory-label'].every(type => run.effects.some(effect => effect?.type === type))
     && rev !== null && live !== null && rev === live;
 };
 // R622: an unfinished run a comment may settle is one that has NOT decided anything yet: no verdict, or only the
