@@ -473,6 +473,11 @@ function resolveRepo(repoFlags = flags) {
   // LANE-POOL-WRONG-REPO: growth/recovery commands (acquire/provision/refresh/...) must ALSO take the pool's own
   // primary origin, never the caller checkout's — else `--pool=plateau-app` run from web-everything cloned WE.
   const poolPrimaryExists = explicitPool && existsSync(join(dirname(topLevel), explicitPool, '.git'));
+  // Fail closed: growth with --pool whose primary checkout is absent must not fall back to the caller's origin.
+  if (explicitPool && needsOrigin && !poolPrimaryExists && !repoFlags.origin && !repoFlags.reference
+    && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
+    fail(`${cmd} --pool=${explicitPool}: no primary checkout at ${join(dirname(topLevel), explicitPool)} — pass --origin=<url> or --reference=<checkout>; refusing to use the caller's origin`);
+  }
   if (((cmd === 'gc' || cmd === 'release') || (needsOrigin && poolPrimaryExists)) && explicitPool && !repoFlags.origin && !repoFlags.reference
     && explicitPool !== basename(originUrl || '').replace(/\.git$/, '')) {
     const selectedRepo = resolveRepo({ ...repoFlags, reference: join(dirname(topLevel), explicitPool) });
@@ -2632,6 +2637,7 @@ async function cmdAcquire(repo) {
     const n = Number(flags.lane);
     const dir = laneDir(repo, n);
     if (!existsSync(dir)) fail(`lane-${n} does not exist (${dir})`);
+    if (laneIsWrongOrigin(repo, dir)) fail(`lane-${n} is WRONG-ORIGIN (its origin differs from pool "${repo.name}" origin) — never handed out; remove it with \`remove --lane=${n}\` and let the pool re-provision`);
     const quarantine = historyQuarantine(repo, n);
     if (quarantine) fail(`lane-${n} QUARANTINED: ${quarantine.reason}; host-wide git failures auto-clear on the next acquire/reclaim once git works; for real history corruption, inspect/repair history, then remove ${historyQuarantinePath(repo, n)} manually`);
     // #2350 — a RESERVED lane is off-limits to an ordinary acquire, INCLUDING the OWNING session's own plain

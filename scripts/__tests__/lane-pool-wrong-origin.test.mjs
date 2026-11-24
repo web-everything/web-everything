@@ -14,6 +14,10 @@ describe('originsDiffer', () => {
   it('treats ssh/https spellings of the same repo as equal', () => {
     expect(originsDiffer('git@github.com:plateauapp/plateau-app.git', 'https://github.com/plateauapp/plateau-app')).toBe(false);
   });
+  it('keeps path case and ports distinct', () => {
+    expect(originsDiffer('git@github.com:Org/Repo.git', 'git@github.com:org/repo.git')).toBe(true);
+    expect(originsDiffer('ssh://git@host:2222/org/repo', 'git@host:2222/org/repo')).toBe(true);
+  });
   it('never marks a lane wrong when an origin is unknown', () => {
     expect(originsDiffer(null, 'git@github.com:a/b.git')).toBe(false);
     expect(originsDiffer('git@github.com:a/b.git', '')).toBe(false);
