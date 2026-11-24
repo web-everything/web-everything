@@ -22,6 +22,7 @@
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
 import { isNonCodeFile } from '../lib/merge-queue-affected.mjs';
 import { parsePushBeforeGate } from '../lib/fix-push-policy.mjs';
+import { parseVitestFailures as parseQuarantineFailures } from '../lib/red-main-quarantine.mjs';
 
 /**
  * Is this PR's AUTHOR the conveyor or the operator? `gh pr list --json author` reports the conveyor's GitHub App as
@@ -225,6 +226,10 @@ export function parseVitestFailures(logText) {
       if (/^(?:Error\b|AssertionError\b|TypeError\b|[A-Za-z_$][\w.$]*Error:)|timed out/i.test(lines[j])) { error = lines[j]; break; }
     }
     out.push({ file, title, error });
+  }
+  const interrupted = parseQuarantineFailures(logText);
+  if (interrupted.complete) for (const test of interrupted.tests) {
+    if (!out.some(f => f.file === test.file)) out.push({ file: test.file, title: test.name ?? '', error: 'interrupted vitest failure' });
   }
   return out;
 }

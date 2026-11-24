@@ -18,7 +18,7 @@ const dirs = [];
 function temp() { const dir = mkdtempSync(join(tmpdir(), 'quarantine-guards-')); dirs.push(dir); return dir; }
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const plan = (o = {}) => planSafetyNet({ status: 'red', firstRedSha: '62da75ed3', failedJobs: ['integration', 'test'], jobFailures: { integration: failure }, flakeProof: { integration: proof }, now, ...o });
-const entry = (o = {}) => addEntries(null, { tests: [file], job: 'integration', proof, brokenSha: '62da75ed3', owner: 'operator', reason: 'flake', actor: 'operator', now, ...o }).list.entries[0];
+const entry = (o = {}) => addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [file], job: 'integration', proof, brokenSha: '62da75ed3', owner: 'operator', reason: 'flake', actor: 'operator', now, ...o }).list.entries[0];
 
 function net(o = {}) {
   const mainCiRuns = structuredClone(fixture.mainCiRuns);

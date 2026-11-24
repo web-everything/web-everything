@@ -26,7 +26,7 @@ describe('reusable-workflow quarantine job names', () => {
       repeatRuns: rows.map((r) => ({ ...r, jobFailures })) });
     expect(out.action).toBe('add');
     expect(out.entries).toEqual([{ test: file, job, proof }]);
-    const added = addEntries(null, { tests: out.tests, job: out.entries[0].job, proof: out.entries[0].proof,
+    const added = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: out.tests, job: out.entries[0].job, proof: out.entries[0].proof,
       brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: out.why, now });
     expect(added.ok).toBe(true);
     const skip = (list, selectedJob) => decideCiSkip({ mode: 'quarantine', read: { ok: true, list },
@@ -48,7 +48,7 @@ describe('reusable-workflow quarantine job names', () => {
   });
 
   it('normalizes direct writes and recognizes old prefixed entries without renewing their expiry', () => {
-    const options = { tests: [file], job: 'caller / nested / integration', proof,
+    const options = { ttlMs: 6 * 60 * 60 * 1000, tests: [file], job: 'caller / nested / integration', proof,
       brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', now };
     const added = addEntries(null, options);
     expect(added.ok).toBe(true);
@@ -97,7 +97,7 @@ describe('R157 repeat failure quarantine', () => {
   const skip = (list, job) => decideCiSkip({ mode: 'quarantine', read: { ok: true, list },
     ctx: { known: true, onMain: false, prNumber: 99 }, changedFiles: [], now, job }).skip;
   const publish = (list, entries, at = now) => entries.reduce((cur, e) => {
-    const out = addEntries(cur, { tests: [e.test], job: e.job, proof: e.proof, brokenSha: rows[0].headSha,
+    const out = addEntries(cur, { ttlMs: 6 * 60 * 60 * 1000, tests: [e.test], job: e.job, proof: e.proof, brokenSha: rows[0].headSha,
       actor: 'red-main-safety-net', owner: 'operator', reason: 'repeat', now: at });
     expect(out.ok).toBe(true);
     return out.list;
@@ -205,7 +205,7 @@ describe('R157 repeat failure quarantine', () => {
     expect(plan({ settings: { repeatFailureCount: 1 }, repeatRuns: [rows[1]] })).toMatchObject({ action: 'none', why: expect.stringMatching(/count|bound/) });
   });
   it('persisted repeat proof with count 1 is refused', () => {
-    const added = addEntries(null, { tests: [file], brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', proof, now });
+    const added = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [file], brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', proof, now });
     expect(added.ok).toBe(true);
     expect(validateQuarantineList({ ...added.list, entries: [{ ...added.list.entries[0], proof: { ...proof, count: 1, runIds: [2] } }] })).toMatchObject({ ok: false });
   });
@@ -318,7 +318,7 @@ describe('R157 repeat failure quarantine', () => {
   });
   it('configured count must be met', () => expect(plan({ settings: { repeatFailureCount: 3 } }).action).toBe('none'));
   it('validates repeat proof and refuses malformed persisted evidence', () => {
-    const added = addEntries(null, { tests: [file], brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', proof, now });
+    const added = addEntries(null, { ttlMs: 6 * 60 * 60 * 1000, tests: [file], brokenSha: rows[0].headSha, actor: 'operator', owner: 'operator', reason: 'repeat', proof, now });
     expect(added.ok).toBe(true);
     for (const bad of [{ ...proof, count: 3 }, { ...proof, runIds: [1, 1] }, { ...proof, shas: [null, rows[1].headSha] }, { ...proof, kind: 'guess' }, { ...proof, runIds: [0, 2] }]) {
       expect(validateQuarantineList({ ...added.list, entries: [{ ...added.list.entries[0], proof: bad }] }).ok).toBe(false);

@@ -16,7 +16,13 @@ const T = (iso) => Date.parse(iso);
 const NOW = T('2026-10-09T14:00:00Z');
 const SHA = '7e51376635bbb571dfc596f1986960bf35a03fd6';
 const TEST = 'skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs';
-const listWith = (tests, sha = SHA, now = NOW) => addEntries(null, { tests, brokenSha: sha, owner: 'main-fix-7e5137663', reason: 'red on main', actor: 'red-main-safety-net', now }).list;
+const listWith = (tests, sha = SHA, now = NOW) => addEntries(null, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests, brokenSha: sha, owner: 'main-fix-7e5137663', reason: 'red on main', actor: 'red-main-safety-net', now }).list;
+
+it('shared fixture produces a defined list with a bounded TTL', () => {
+  const list = listWith([TEST]);
+  expect(list).toBeDefined();
+  expect(list.entries).toEqual([expect.objectContaining({ test: TEST, expiresAt: NOW + QUARANTINE_DEFAULT_TTL_MS })]);
+});
 
 describe('quarantine — settings', () => {
   it('mode defaults to stop; the shipped platform preference is quarantine; env can switch it', () => {
@@ -32,11 +38,11 @@ describe('quarantine — who may write, and where', () => {
     expect(canWriteQuarantine('red-main-safety-net')).toBe(true);
     expect(canWriteQuarantine('operator')).toBe(true);
     expect(canWriteQuarantine('pr-4613')).toBe(false);
-    expect(addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'x', reason: 'y', actor: 'some-pr', now: NOW }).ok).toBe(false);
+    expect(addEntries(null, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: SHA, owner: 'x', reason: 'y', actor: 'some-pr', now: NOW }).ok).toBe(false);
   });
 
   it('the cap of live files is global across jobs, for operator adds too', () => {
-    const add = (list, tests, job) => addEntries(list, { tests, brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, job });
+    const add = (list, tests, job) => addEntries(list, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests, brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, job });
     let list = add(null, ['a.test.mjs', 'b.test.mjs', 'c.test.mjs'], 'soak-shard (1)').list;
     list = add(list, ['d.test.mjs', 'e.test.mjs'], 'integration').list;
     expect(add(list, ['f.test.mjs'], 'soak-shard (2)')).toMatchObject({ ok: false });
@@ -49,9 +55,9 @@ describe('quarantine — who may write, and where', () => {
     expect(() => assertPushRef('ops/review-requests', QUARANTINE_REF)).toThrow();
   });
   it('every add is an audit event; a malformed test id is refused', () => {
-    const r = addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW });
+    const r = addEntries(null, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW });
     expect(r.events).toEqual([expect.objectContaining({ type: 'quarantine-added', test: TEST, actor: 'operator' })]);
-    expect(addEntries(null, { tests: ['../../etc/passwd'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).ok).toBe(false);
+    expect(addEntries(null, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: ['../../etc/passwd'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).ok).toBe(false);
     expect(validateQuarantineList({ version: 2 }).ok).toBe(false);
   });
 });
@@ -115,11 +121,12 @@ describe('quarantine — what CI skips', () => {
       }
     }
   });
-  it('an entry TTL is capped at a day, and a bad TTL falls back to the default', () => {
+  it('an entry TTL is capped at a day, and invalid TTLs are refused', () => {
     const e = (ttlMs) => addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, ttlMs }).list.entries[0];
     expect(e(1e15).expiresAt - NOW).toBe(QUARANTINE_MAX_TTL_MS);
-    expect(e(Infinity).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
-    expect(e(-5).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
+    for (const ttlMs of [undefined, Infinity, -5]) {
+      expect(addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, ttlMs })).toMatchObject({ ok: false });
+    }
     expect(e(60_000).expiresAt - NOW).toBe(60_000);
   });
   it('listedPrFiles: null when absent or at the 100-file listing cap (it may be truncated), else the paths', () => {
@@ -222,12 +229,12 @@ describe('quarantine — latestRedSha keying and re-keying', () => {
   it('add for an already-listed test with a different brokenSha re-keys it (brokenSha, reason, expiresAt); same sha stays a no-op', () => {
     const first = base(SHA);
     const later = NOW + 3_600_000;
-    const r = addEntries(first, { tests: [TEST], brokenSha: LATEST, owner: 'o2', reason: 'rekeyed', actor: 'operator', now: later });
+    const r = addEntries(first, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: LATEST, owner: 'o2', reason: 'rekeyed', actor: 'operator', now: later });
     expect(r.ok).toBe(true);
     expect(r.list.entries).toHaveLength(1);
     expect(r.list.entries[0]).toMatchObject({ test: TEST, brokenSha: LATEST, reason: 'rekeyed', expiresAt: later + QUARANTINE_DEFAULT_TTL_MS });
     expect(r.events).toHaveLength(1);
-    const same = addEntries(first, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'again', actor: 'operator', now: later });
+    const same = addEntries(first, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'again', actor: 'operator', now: later });
     expect(same.list.entries[0]).toEqual(first.entries[0]);
     expect(same.events).toHaveLength(0);
   });
@@ -240,15 +247,15 @@ describe('quarantine — latestRedSha keying and re-keying', () => {
     expect(r.list.entries[0].expiresAt).toBe(NOW + QUARANTINE_MAX_TTL_MS);
   });
   it('re-key of a test does not touch other tests or other jobs', () => {
-    const l = addEntries(base(SHA), { tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
-    const r = addEntries(l, { tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r2', actor: 'operator', now: NOW + 1 });
+    const l = addEntries(base(SHA), { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: ['a/__tests__/b.test.mjs'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).list;
+    const r = addEntries(l, { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: LATEST, owner: 'o', reason: 'r2', actor: 'operator', now: NOW + 1 });
     expect(r.list.entries.find((e) => e.test === 'a/__tests__/b.test.mjs').brokenSha).toBe(SHA);
   });
 });
 
 
 describe('orchestrator quarantine authority', () => {
-  const options = { tests: [TEST], brokenSha: SHA, owner: 'owner', reason: 'red', actor: 'orchestrator', now: NOW };
+  const options = { ttlMs: QUARANTINE_DEFAULT_TTL_MS, tests: [TEST], brokenSha: SHA, owner: 'owner', reason: 'red', actor: 'orchestrator', now: NOW };
   it.each([undefined, false, 'true', 1])('denies add, remove and prune unless authority is boolean true (%s)', orchestratorAuthority => {
     expect(canWriteQuarantine('orchestrator', { orchestratorAuthority })).toBe(false);
     for (const result of [addEntries(null, { ...options, orchestratorAuthority }),

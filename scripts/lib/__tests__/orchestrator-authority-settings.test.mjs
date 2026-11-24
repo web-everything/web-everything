@@ -81,7 +81,7 @@ describe('orchestrator authority settings', () => {
       ['duplicate inside array', '{"metadata":[{"x":false,"x":true}],"orchestrator":{"authority":{"redMainQuarantine":true}}}'],
     ])('denies %s before it can authorize add/remove/prune', (_, evidence) => {
       const orchestratorAuthority = resolve(evidence);
-      const options = { actor: 'orchestrator', orchestratorAuthority, tests: ['scripts/lib/__tests__/example.test.mjs'],
+      const options = { ttlMs: 6 * 60 * 60 * 1000, actor: 'orchestrator', orchestratorAuthority, tests: ['scripts/lib/__tests__/example.test.mjs'],
         brokenSha: 'a'.repeat(40), owner: 'owner', reason: 'red', now: 1_800_000_000_000 };
       for (const result of [addEntries(null, options), removeEntries(null, options), pruneOnGreen(null, { ...options, mainGreen: true })]) {
         expect(result).toMatchObject({ ok: false, error: expect.stringContaining('orchestrator.authority.redMainQuarantine') });

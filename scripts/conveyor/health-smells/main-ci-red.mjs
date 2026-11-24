@@ -89,6 +89,7 @@ export default {
     const evidence = failing.groupEvidence;
     const owner = mainCiRuns?.owner ?? null;
     const decision = mainCiRuns?.decision ?? null;
+    const quarantineText = quarantine?.alerts?.length ? `; quarantine: ${quarantine.alerts.map(a => a.why).join('; ')}` : '';
     const ownerText = owner ? `owner: ${owner.kind} ${owner.ref}` : `owner: none (${decision?.reason ?? 'not decided'}${decision?.why ? ` — ${decision.why}` : ''})`;
     return [{
       subject: `main:${sha9}`,
@@ -100,9 +101,9 @@ export default {
         owner, ownerDecision: decision?.reason ?? null, dispatched: mainCiRuns?.dispatched ?? null,
         priorityPr: mainCiRuns?.priority?.pr ?? null,
         flakeEvidence: evidence ? { runId: evidence.runId, baseSha: evidence.baseSha, completedAt: evidence.completedAt } : null,
-        quarantine: quarantine ? { mode: quarantine.mode, shadow: quarantine.shadow, action: quarantine.plan?.action ?? null, tests: quarantine.plan?.tests ?? [], why: quarantine.plan?.why ?? null, ...(quarantine.error ? { error: quarantine.error } : {}) } : null,
+        quarantine: quarantine ? { mode: quarantine.mode, shadow: quarantine.shadow, action: quarantine.plan?.action ?? null, tests: quarantine.plan?.tests ?? [], why: quarantine.plan?.why ?? null, alerts: quarantine.alerts ?? [], ...(quarantine.error ? { error: quarantine.error } : {}) } : null,
       },
-      summary: `main CI red for ${fmtMin(redFor)} since ${sha9} (last green ${state.lastGreen?.sha.slice(0, 9) ?? 'unknown'}); failing: ${(failing.jobs || []).join(', ') || 'unknown'}; ${ownerText}${mainCiRuns?.priority ? `; PR #${mainCiRuns.priority.pr} has queue priority` : ''}${evidence ? `; merge-group run ${evidence.runId} passed the failing jobs on the main tip — flake, re-run requested` : ''}.`,
+      summary: `main CI red for ${fmtMin(redFor)} since ${sha9} (last green ${state.lastGreen?.sha.slice(0, 9) ?? 'unknown'}); failing: ${(failing.jobs || []).join(', ') || 'unknown'}; ${ownerText}${mainCiRuns?.priority ? `; PR #${mainCiRuns.priority.pr} has queue priority` : ''}${evidence ? `; merge-group run ${evidence.runId} passed the failing jobs on the main tip — flake, re-run requested` : ''}${quarantineText}.`,
       // card 302: ownership alone is not progress.
       recommendation: mainCiRuns?.ownerStall?.stalled
         ? `Main is red since ${sha9}; ${ownerText} is stalled (${mainCiRuns.ownerStall.reason}) since ${new Date(mainCiRuns.ownerStall.since).toISOString()}; ${mainCiRuns.ownerStall.approval}.`
