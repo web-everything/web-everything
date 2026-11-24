@@ -748,7 +748,7 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
       const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
         headNeverReviewed: () => scan(f) });
       expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review' });
-      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+      expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
       expect(o.settlePending).not.toHaveBeenCalled();
       expect(f.read).toHaveBeenCalledTimes(2);
     });
@@ -809,7 +809,7 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     expect(f.read).toHaveBeenCalledTimes(2);
     expect(o.dispatch).not.toHaveBeenCalled();
     expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
     expect(o.settlePending).not.toHaveBeenCalled();
     expect(f.read).toHaveBeenCalledTimes(3);
     expect(scan(f)).toBe(true);
@@ -832,7 +832,7 @@ describe('headNeverReviewedFromRuns complete bounded proof', () => {
     const o = runFixture({ readEvidence: () => ({ ok: false, reason: 'review-unfinished' }),
       headNeverReviewed: () => scan(f) });
     expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', why: 'head never reviewed; a review is always allowed' });
-    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr });
+    expect(o.dispatch).toHaveBeenCalledWith({ repo, pr, expectedHead: head });
     expect(o.settlePending).not.toHaveBeenCalled();
   });
   it('Tier-1 2: a live-head record among over 400 refuses proof', () => {
@@ -985,7 +985,7 @@ describe('R640 full review preserves pending', () => {
   it('dispatches the full review with lone pending and applies retry cooldown', () => {
     const o = runFixture({ readEvidence: () => evidence({ loopPayload: undefined }) });
     expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');
-    expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+    expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
     expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'skip', why: 'retry cooldown active' });
     expect(o.rawPrs[0].labels).toContain('red-team:pending');
     expect(o.settlePending).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
@@ -998,7 +998,7 @@ describe('R640 full review preserves pending', () => {
       expect(mod.runRedTeamOnSkip(o).rows[0]).toMatchObject({ action: 'review', why: 'head never reviewed; a review is always allowed' });
       expect(o.readReviews).toHaveBeenCalledOnce();
       expect(o.headNeverReviewed).toHaveBeenCalledWith({ repo, pr, head });
-      expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+      expect(o.dispatch).toHaveBeenCalledOnce(); expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
       expect(o.rawPrs[0].labels).toContain('red-team:pending');
       expect(o.escalate).not.toHaveBeenCalled(); expect(o.settlePending).not.toHaveBeenCalled();
       expect(o.settle).not.toHaveBeenCalled(); expect(o.syncLabels).not.toHaveBeenCalled();
@@ -1034,7 +1034,7 @@ describe('R640 default never-reviewed scan', () => {
       }
       const o = runFixture({ env: { OPERATION_RUNS_DIR: dir }, readEvidence: () => ({ ok: false, reason: 'review-unfinished' }) });
       expect(mod.runRedTeamOnSkip(o).rows[0].action).toBe('review');
-      expect(o.dispatch).toHaveBeenCalledWith({ pr, repo });
+      expect(o.dispatch).toHaveBeenCalledWith({ pr, repo, expectedHead: head });
       expect(o.rawPrs[0].labels).toContain('red-team:pending');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
