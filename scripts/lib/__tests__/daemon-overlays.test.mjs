@@ -171,6 +171,16 @@ describe('addOverlay', () => {
     expect(() => addOverlay(cloneRoot, { ref: '--upload-pack=evil' }, { env: env() })).toThrow(TypeError);
     expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
   });
+
+  it('refuses hotpatch refs that are not exactly hotpatch/<40-hex>', () => {
+    const sha = 'a'.repeat(40);
+    for (const ref of [`hotpatch/${sha}-auto-1`, 'hotpatch/short', `hotpatch/${sha.toUpperCase()}`, `hotpatch/${sha}/x`, 'hotpatch/']) {
+      expect(() => addOverlay(cloneRoot, { ref }, { env: env() })).toThrow(TypeError);
+    }
+    expect(readOverlays(cloneRoot, { env: env() })).toEqual([]);
+    addOverlay(cloneRoot, { ref: `hotpatch/${sha}` }, { env: env() });
+    expect(readOverlays(cloneRoot, { env: env() }).map((o) => o.ref)).toEqual([`hotpatch/${sha}`]);
+  });
 });
 
 describe('removeOverlay', () => {

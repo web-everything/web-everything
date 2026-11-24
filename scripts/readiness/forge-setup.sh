@@ -591,11 +591,7 @@ restore_egress_timer=false
 # service and timer are installed. A restored old timer on an earlier failure
 # cannot expose new slots: their directories and sudoers are still unpublished.
 FORGE_EGRESS_UIDS="${slot_uids[*]}" /usr/local/libexec/forge-egress.sh apply
-node --input-type=module - "${slot_uids[@]}" <<'EGRESS_CHECK'
-import {createRunner} from '/usr/local/libexec/forge-exec-run.mjs';
-const runner = createRunner();
-for (const uid of process.argv.slice(2)) await runner.egressReady(Number(uid));
-EGRESS_CHECK
+/usr/local/libexec/forge-exec-run.mjs egress-self-check "${slot_uids[@]}"
 # Final enable: publish the usable directory names, then atomically replace the
 # validated sudoers file. Roll back directory publication if any operation fails.
 python3 - "$sudoers_pending" <<'ENABLE_SLOTS'
