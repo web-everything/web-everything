@@ -66,6 +66,15 @@ export function resolveDraftPromotionSettings(env = process.env, { path = draftP
   return { loop, intervalSeconds };
 }
 
+/** Reject incomplete label evidence before a promotion write. */
+export function validatePrLabels(labels) {
+  if (!Array.isArray(labels) || labels.some(label => {
+    const name = typeof label === 'string' ? label : (label && typeof label === 'object' ? label.name : undefined);
+    return typeof name !== 'string' || name.trim().length === 0;
+  })) throw new Error('PR labels must be an array of label names or {name} records');
+  return labels;
+}
+
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
 /** PURE. The last exact first-line park/release marker in comment order wins. */

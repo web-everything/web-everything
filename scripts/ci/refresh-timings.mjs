@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import yaml from 'js-yaml';
-import { REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings, median, staleRatio } from './shard-assign.mjs';
+import { assertTimingsWriter, REPO_ROOT, TIMINGS_FILE, listUnitTestFiles, timingsFromReports, loadTimings, formatUpdatedTimings, median, staleRatio } from './shard-assign.mjs';
 
 /** Recursively parse unit reports only; malformed or unreadable evidence throws. Report filenames are appended to `names`. */
 export async function foldReports(dir, names = []) {
@@ -73,6 +73,7 @@ export async function refreshFromDir({ dir, timingsFile = TIMINGS_FILE, repoRoot
   const { writeFile: write = writeFile, rename: move = rename } = io;
   let pending;
   try {
+    assertTimingsWriter();
     const perRun = [];
     let count = 0;
     const files = await listUnitTestFiles(repoRoot);
@@ -161,6 +162,7 @@ export async function main(argv, { exec, ...options } = {}) {
       (!sources.length && !threshold.length) || (threshold.length && (!Number.isFinite(Number(threshold[0].slice(12))) || Number(threshold[0].slice(12)) < 1))) {
     throw new Error('usage: refresh-timings.mjs --dir=<reports> | --run=<id|latest> | --runs=<1..5> [--min-stale=<ratio>]');
   }
+  assertTimingsWriter();
   const source = sources[0] ?? '--runs=5';
   let scratch;
   try {

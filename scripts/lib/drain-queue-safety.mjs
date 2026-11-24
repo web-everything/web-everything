@@ -1,17 +1,18 @@
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
-import { redTeamOwedOnHead } from './review-red-team-policy.mjs';
+import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { stripVTControlCharacters } from 'node:util';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 import { cascadePolicy, formatCascadeSourcesLine } from './policy-cascade.mjs';
 import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { readSettings } from './settings-files.mjs';
 import { readMergeQueueState } from './merge-queue-enqueue.mjs';
-import { readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
+import { redTeamForHead, isPublishableRedTeamResult, readRedTeamDisposition, readRedTeamProbes, redTeamHoldPendingOnly } from './red-team-gate.mjs';
 import { readQuarantine } from './red-main-quarantine-io.mjs';
 import { activeEntries, parseVitestFailures, QUARANTINE_SAFETY_NET_DEFAULTS } from './red-main-quarantine.mjs';
 
@@ -20,6 +21,8 @@ const mqOid = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.t
 const MQ_MERGE_CONFLICT_RETRY_CAP = 3;
 const MQ_MAIN_GREEN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const MQ_INFRA_MAX_JOBS = 10;
+const MQ_INFRA_SCAN_BYTES = 64 * 1024;
+const MQ_INFRA_LINE_CHARS = 512;
 const MQ_SUMMARY_TAIL_BYTES = 64 * 1024;
 const MQ_INFRA_LOG_BYTES = 4 * 1024 * 1024;
 
@@ -45,9 +48,6 @@ function pendingFreezeLogComplete(log, pr) {
   const blocking = [...seen].filter(([, status]) => status === 'hold' || status === 'fail-closed');
   return blocking.length === 1 && blocking[0][0] === 'red-main-freeze' && blocking[0][1] === 'fail-closed';
 }
-const MQ_INFRA_SCAN_BYTES = 64 * 1024;
-const MQ_INFRA_LINE_CHARS = 512;
-const MQ_INFRA_SIGNATURES = ['could not fetch \\S+ from promisor remote'];
 const MQ_AGGREGATE_JOBS = ['test', 'coverage-merge'];
 const MQ_AGGREGATE_SUMMARY_STEPS = new Map([
   ['test', 'Gate on shard results'], ['coverage-merge', 'Require successful shards'],
@@ -58,44 +58,6 @@ const validMqAggregateJobs = value => Array.isArray(value) && value.length > 0 &
 const mqDerivedDetails = evidence => evidence?.derivedNames?.length
   ? `; derived aggregates skipped: ${evidence.derivedNames.join(', ')}` : '';
 
-function validMqInfraSignatures(value) {
-  return Array.isArray(value) && value.length > 0 && value.length <= 32 && value.every(source => {
-    if (typeof source !== 'string' || source.length > 200 || !/^[A-Za-z0-9]/.test(source)) return false;
-    let literals = 0, alphanumerics = 0, wildcards = 0, previousWildcard = false;
-    // Consume only literal ASCII letters/digits/spaces, escaped punctuation,
-    // and the three wildcard tokens. Unknown syntax fails closed.
-    for (let i = 0; i < source.length;) {
-      if (/^[A-Za-z0-9 ]$/.test(source[i])) {
-        literals++;
-        if (source[i] !== ' ') alphanumerics++;
-        previousWildcard = false;
-        i++;
-      } else if (source[i] === '\\') {
-        const escaped = source[i + 1];
-        if (['S', 'd', 's'].includes(escaped) && source[i + 2] === '+') {
-          if (previousWildcard || ++wildcards > 1) return false;
-          const next = source[i + 3];
-          // Require a delimiter after each greedy class; escaped punctuation
-          // is allowed by the grammar below. End-of-source is also safe.
-          if (next !== undefined && (escaped === 'S' && next !== ' ' && next !== '\\'
-            || escaped === 's' && next === ' '
-            || escaped === 'd' && /[0-9]/.test(next))) return false;
-          previousWildcard = true;
-          i += 3;
-        } else if (escaped && /[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]/.test(escaped)) {
-          previousWildcard = false;
-          i += 2;
-        } else return false;
-      } else return false;
-    }
-    if (literals < 11 || alphanumerics < 10) return false;
-    try {
-      const re = new RegExp(source);
-      // Generic failure wording is not an infra signature, whatever the grammar admits.
-      return !['test failed', 'Error: assertion failed', 'tests failed', 'command failed'].some(probe => re.test(probe));
-    } catch { return false; }
-  });
-}
 const mqFailureReasons = new Set(['failed_checks', 'ci_failure',
   'branch_protection_failure', 'invalid_merge_commit']);
 const mqRemovalReason = event => typeof event?.reason === 'string' ? event.reason.trim().toLowerCase() : '';
@@ -176,11 +138,9 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
-  const unreadableRetry = retryEvidence?.infra === 'unreadable-log' && retryEvidence.mainGreen === true
-    && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
-  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !unreadableRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
+  if (failedChecksRemovals > 0 && !cancelledRetry && !quarantineRetry && !flakeRetry && !exactTestRetry && !(retryEvidence?.mainGreen === true
     && ['infra', 'main-red', 'rerun-green'].includes(retryEvidence.infra) && retryEvidence.mergeState === 'CLEAN'))
     // A re-entry after a failed removal never authorizes the author-recovery route (it ends differently
     // from a plain "— failed_checks" hold), so a spent first retry stays with the operator.
@@ -198,7 +158,6 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
-      : unreadableRetry ? 'failed_checks unreadable-log retry 1/1 (failed job log unreadable, main green, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -837,13 +796,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
     if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
       return { mainGreen: false, mainRunId: null, infra: 'quarantined', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
-    // Runner terminology alone also appears in ordinary assertion failures.
-    const runnerLoss = /\blost communication\b|\b(?:self-hosted[ \t]+)?runner[ \t]+(?:(?:has|was|is)[ \t]+)?(?:disconnected|went away|lost connection|stopped responding|failed to (?:start|connect))\b/i;
-    // Any test-failure wording vetoes runner-loss: a real failure must never look like infrastructure.
-    const testFailure = /assert|expected|\bexpect\(|\btests?\b|✗|×|\bFAIL\b/i;
-    const summaryInfra = check => infraConclusions.has(check.conclusion)
-      || [check.output?.title, check.output?.summary].some(value => typeof value === 'string' && runnerLoss.test(value))
-        && ![check.output?.title, check.output?.summary, check.output?.text].some(value => typeof value === 'string' && testFailure.test(value));
+    const summaryInfra = check => infraConclusions.has(check.conclusion);
     // Infra proof without logs: every failed job was cancelled/never ran, or the only real failure is the
     // merge-gate's own red-main-freeze HOLD (caused by main, not by this PR). A real failing job never qualifies.
     const cancelledOnly = check => check.conclusion === 'cancelled' || check.conclusion === 'startup_failure';
@@ -898,8 +851,6 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     const noLogInfra = failed.every(cancelledOnly) || freezeProven;
     let logReason = null;
-    const patterns = retryPolicy.mqInfraSignatures.map(source => new RegExp(source));
-    const logVerdicts = new Map();
     const unreadable = new Set();
     const derived = new Set();
     if (noLogInfra) {
@@ -948,26 +899,14 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
-          if (typeof text !== 'string' || !text.trim()) throw new Error('unreadable log');
+          if (typeof text !== 'string' || !stripVTControlCharacters(text).trim()) throw new Error('unreadable log');
           // Bound the scan as well as subprocess output. Injected readers may return oversized text.
           const tail = Buffer.from(text.slice(-MQ_INFRA_SCAN_BYTES), 'utf8').subarray(-MQ_INFRA_SCAN_BYTES).toString('utf8');
-          let truncatedLine = false;
-          const matched = tail.split('\n').some(line => {
-            if (line.length > MQ_INFRA_LINE_CHARS) truncatedLine = true;
-            const boundedLine = line.slice(-MQ_INFRA_LINE_CHARS);
-            return patterns.some(pattern => pattern.test(boundedLine));
-          });
-          logVerdicts.set(check.id, matched);
-          if (!matched && truncatedLine)
+          if (tail.split('\n').some(line => line.length > MQ_INFRA_LINE_CHARS))
             logReason = `non-infrastructure job log within ${MQ_INFRA_LINE_CHARS}-character line scan limit; operator must inspect failed jobs and enqueue manually`;
-        } catch (error) {
+          // Readability alone never proves infrastructure.
+        } catch {
           unreadable.add(check.id);
-          if (['merge-gate', 'review-gate'].includes(localJob(check.name))
-            || error?.code != null && !Number.isInteger(error.code)
-            || /maxBuffer|timed out/i.test(String(error?.message))
-            || ![check.output?.title, check.output?.summary].every(value => typeof value === 'string' && !value.trim()))
-            logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
-          logVerdicts.set(check.id, false);
         }
       }
     }
@@ -983,13 +922,9 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     if (!intrinsic.length && !noLogInfra)
       logReason = 'only derived aggregate failures; operator must inspect failed jobs and enqueue manually';
-    const unreadableOnly = !blocked && !logReason && unreadable.size > 0
-      && !hasAggregateCandidates && derived.size === 0 && !attempts.reason
-      && attempts.candidates.length === intrinsic.length
-      && intrinsic.every(c => unreadable.has(c.id));
-    if (unreadable.size > 0 && !unreadableOnly)
+    if (unreadable.size > 0)
       logReason = 'job log evidence unreadable or incomplete; operator must inspect failed jobs and enqueue manually';
-    let infra = !logReason && (noLogInfra || intrinsic.every(check => (!hasAggregateCandidates && summaryInfra(check)) || logVerdicts.get(check.id) === true));
+    let infra = !logReason && (noLogInfra || intrinsic.every(check => !hasAggregateCandidates && summaryInfra(check)));
     const rerun = requestMqReruns({ attempts, repo, exec, scope: rerunScope,
       eligible: !infra && !logReason && !hasAggregateCandidates && unreadable.size === 0, dryRun,
       spend: () => { if (budget <= 2) throw new Error('retry evidence budget exhausted'); budget--; } });
@@ -1141,7 +1076,6 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     }
     // A pending-rerun freeze proof needs main settled: any unfinished main run keeps the verdict unknown.
     return { mainGreen: !!deciding && !stale && deciding.conclusion === 'success'
-        && (!unreadableOnly || deciding === newest[0] && stale === false)
         && !(freezePending && (newest.some(run => run.status !== 'completed')
           || !newest.some(run => run.id === freezeRunId && run.run_attempt === freezeAttempt && run.status === 'completed' && run.conclusion === 'success'))),
       mainRunId: deciding?.id ?? null,
@@ -1149,7 +1083,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : unreadableOnly ? 'unreadable-log' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
@@ -1170,7 +1104,7 @@ function mqRetryDeclineReasonBase(evidence, holdLine) {
   if (['quarantined', 'cancelled-regroup'].includes(evidence.infra))
     return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   if (evidence.mainGreen !== true) return `main CI is not green (${evidence.mainGreenReason ?? 'no completed run'})`;
-  if (!['infra', 'main-red', 'flaky-test', 'exact-test', 'unreadable-log'].includes(evidence.infra))
+  if (!['infra', 'main-red', 'flaky-test', 'exact-test'].includes(evidence.infra))
     return `non-infrastructure failed check(s): ${(evidence.failedNames ?? []).join(', ') || 'unknown'}; main was not red at removal`;
   if (evidence.mergeState !== 'CLEAN') return `PR is not CLEAN (${typeof evidence.mergeState === 'string' && /^[A-Z_]{1,32}$/.test(evidence.mergeState) ? evidence.mergeState : 'unknown'})`;
   return 'retry conditions not met';
@@ -1231,21 +1165,16 @@ export function readDrainQueueSafety({ env = process.env, tool, platform, log = 
   const booleanEnv = key => env[key] === undefined ? undefined
     : /^(true|1|on)$/i.test(env[key]) ? true : /^(false|0|off)$/i.test(env[key]) ? false : env[key];
   const numberEnv = key => env[key] === undefined ? undefined : Number(env[key]);
-  let mqInfraSignatures;
   let mqAggregateJobs;
   if (env.WE_DRAIN_MQ_AGGREGATE_JOBS !== undefined) {
     try { mqAggregateJobs = JSON.parse(env.WE_DRAIN_MQ_AGGREGATE_JOBS); }
     catch { mqAggregateJobs = env.WE_DRAIN_MQ_AGGREGATE_JOBS; }
   }
-  if (env.WE_DRAIN_MQ_INFRA_SIGNATURES !== undefined) {
-    try { mqInfraSignatures = JSON.parse(env.WE_DRAIN_MQ_INFRA_SIGNATURES); }
-    catch { mqInfraSignatures = env.WE_DRAIN_MQ_INFRA_SIGNATURES; }
-  }
   const positive = v => typeof v === 'number' && Number.isFinite(v) && v > 0;
   const r = cascadePolicy('drain', tool ?? (env.VITEST || env.WE_UNDER_TEST ? {} : readSettings().drain), {
-    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqInfraSignatures: MQ_INFRA_SIGNATURES, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
-    valid: { mqAggregateJobs: validMqAggregateJobs, mqInfraSignatures: validMqInfraSignatures, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
-    envValues: { mqAggregateJobs, mqInfraSignatures, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
+    env, platform, standard: { mqAggregateJobs: MQ_AGGREGATE_JOBS, mqCancelledRetryMax: 2, queueRebuildMax: 3, waitForRedTeamBeforeEnqueue: true, dequeueOnSendBack: true, redTeamPendingBackoffSec: 300, redTeamPendingMaxMin: 45 },
+    valid: { mqAggregateJobs: validMqAggregateJobs, mqCancelledRetryMax: v => Number.isSafeInteger(v) && v >= 1 && v <= 2, queueRebuildMax: v => Number.isSafeInteger(v) && v > 0, waitForRedTeamBeforeEnqueue: v => typeof v === 'boolean', dequeueOnSendBack: v => typeof v === 'boolean', redTeamPendingBackoffSec: positive, redTeamPendingMaxMin: positive },
+    envValues: { mqAggregateJobs, mqCancelledRetryMax: numberEnv('WE_DRAIN_MQ_CANCELLED_RETRY_MAX'), queueRebuildMax: numberEnv('WE_DRAIN_QUEUE_REBUILD_MAX'), waitForRedTeamBeforeEnqueue: booleanEnv('WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE'), dequeueOnSendBack: booleanEnv('WE_DRAIN_DEQUEUE_ON_SEND_BACK'), redTeamPendingBackoffSec: numberEnv('WE_DRAIN_RED_TEAM_PENDING_BACKOFF_SEC'), redTeamPendingMaxMin: numberEnv('WE_DRAIN_RED_TEAM_PENDING_MAX_MIN') },
   });
   log(formatCascadeSourcesLine('drain', r));
   // Retired: this switch let the drain enqueue an owed head with NO red-team result once the deadline passed. It is no
@@ -1275,10 +1204,27 @@ export function postAcceptRedTeamOwed(loopPayload, env = process.env, evidence =
   return redTeamOwedOnHead({ read: loopPayload?.findings?.read, evidence, skipCardOnly: readRedTeamProbes({ env }).value.skipCardOnly });
 }
 
+/** Trusted, publishable evidence bound to this PR and exact live head. PURE; unreadable is absent proof. */
+export function redTeamClearProof({ comments, pr, head } = {}) {
+  try {
+    if (Array.isArray(comments)) {
+      const result = redTeamForHead(comments, pr, head);
+      if (isPublishableRedTeamResult(result)) return { ok: true, kind: result.policyClear ? 'policy-clear' : 'result' };
+    }
+  } catch { /* An unreadable thread never proves clearance. */ }
+  return { ok: false, reason: 'unknown(missing)' };
+}
+
+export const redTeamClearHoldReason = head => `post-accept red team unknown(missing) on ${String(head ?? '').slice(0, 12)}: no result, policy-clear or carry for this head; re-run the red team on the head`;
+
 export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head, repo = null, standingRuling = null, env = process.env, confirmedBreaks, scheduled = false, inFlight = false, recorded = false, skipCardOnly } = {}) {
   // A recorded break still holds even if the scheduler is now disabled or the payload is unavailable.
   // `standingRuling`: the verified scope, so an automatic grant counts here exactly as in the gate (PR #5758).
-  const disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  let disposition;
+  try {
+    if (!Array.isArray(comments)) return redTeamClearHoldReason(head);
+    disposition = readRedTeamDisposition({ comments, pr, head, env, setting: confirmedBreaks, repo, standingRuling });
+  } catch { return redTeamClearHoldReason(head); }
   // A hold that is only "publication pending" (PR #6622) is no break: it still holds, but after the unknown-evidence
   // reason, so a capped scan is reported as such.
   const pendingOnly = redTeamHoldPendingOnly(disposition);
@@ -1288,7 +1234,14 @@ export function redTeamEnqueueHold({ ok, reason, loopPayload, comments, pr, head
   // comment cannot release it either.
   if (ok === false) return `post-accept red team evidence unknown (${reason}); hold and inspect run evidence`;
   if (pendingOnly) return 'post-accept red team result is not published yet (stored evidence not sealed); hold until the sweep publishes it';
-  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly }) || disposition.result) return null;
+  // Proof from a completed pass cannot release a different pass that is still running.
+  if (inFlight && redTeamEnabled(env)) return 'post-accept red team has no recorded result on the live head';
+  if (isPublishableRedTeamResult(disposition.result)) return null;
+  if (!postAcceptRedTeamOwed(loopPayload, env, { scheduled, inFlight, recorded, skipCardOnly })) {
+    // Kill switch thrown (WE_REVIEW_RED_TEAM / WE_REVIEW_EXTRA_SEATS off): enqueue without a result still works.
+    if (!redTeamEnabled(env)) return null;
+    return redTeamClearProof({ comments, pr, head }).ok ? null : redTeamClearHoldReason(head);
+  }
   return 'post-accept red team has no recorded result on the live head';
 }
 

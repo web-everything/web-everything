@@ -21,6 +21,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, appendFileSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { dirname, join } from 'node:path';
@@ -28,9 +29,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import { resolveOrchestratorAuthority } from './orchestrator-authority-settings.mjs';
+import { parseTimeouts, timeoutOutcomes, allSoft, softRecord } from './test-timeout-policy.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold.mjs';
 import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
@@ -274,8 +277,9 @@ function readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, set
 
 /** One failed job's vitest failures from its log (`gh api …/jobs/<id>/logs`). Throws on an unreadable log. */
 export function readJobFailures(jobId, { exec, repoSlug }) {
-  const text = exec('gh', ['api', `repos/${repoSlug}/actions/jobs/${jobId}/logs`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
-  return parseVitestFailures(String(text ?? ''));
+  // gh refuses a log with terminal escape sequences unless allowed (2026-11-22: every soak-shard read threw, so the net never acted).
+  const text = exec('gh', ciJobLogApiArgs(`repos/${repoSlug}/actions/jobs/${jobId}/logs`), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, killSignal: 'SIGKILL' });
+  return { ...parseVitestFailures(String(text ?? '')), timeouts: parseTimeouts(text) };
 }
 
 /**
@@ -322,6 +326,7 @@ const composeChanges = (steps) => (cur) => {
 export function runSafetyNet({
   mainCiRuns, now = Date.now(), dir, board = process.cwd(), live = true, repoSlug = CONSTELLATION_REPOS.we.slug,
   mode = resolveRedMainMode(), settings = resolveQuarantineSettings(),
+  timeoutPolicy = readJson(join(dirname(fileURLToPath(import.meta.url)), '../settings/test-timeout-policy.json')) ?? {},
   exec = execFileSyncThrottled, readJobs = (runId, options = {}) => readFailedJobs(runId, { exec, repoSlug, ...options }),
   readLog = (jobId) => readJobFailures(jobId, { exec, repoSlug }),
   touchedFiles = (fromSha, toSha) => readTouchedFiles(fromSha, toSha, { board }),
@@ -334,12 +339,15 @@ export function runSafetyNet({
   const shadowPath = join(dir, SAFETY_NET_SHADOW_LOG);
   const ledger = readJson(ledgerPath) ?? { version: 1, reds: {}, shadowList: { version: 1, entries: [] } };
   ledger.reds ??= {};
+  ledger.tests ??= {};
   const isLive = mode.value === 'quarantine' && live === true;
   const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false, liveEntries: [] };
   let sha = null;
   let activeKey = null;
   let shadowChanged = false;
+  let listEmpty = true;
+  let timeoutAlerts = [];
   try {
     // Successful reruns have no failed-job snapshot: count the observed successful attempt too.
     for (const red of Object.values(ledger.reds)) {
@@ -410,6 +418,7 @@ export function runSafetyNet({
     }
     let read = { ok: true, list: ledger.shadowList ?? { version: 1, entries: [] } };
     if (isLive) read = readList();
+    if (read.ok) listEmpty = activeEntries(read.list, { now }).length === 0;
     if (!read.ok) { out.plan = { action: 'none', why: `quarantine list unreadable (${read.error})` }; return out; }
     // An entry on the shared list that was added for this red counts as "added for this red" whether or not this
     // ledger recorded it (a push that landed but threw, a lost ledger): it must not be re-added once it expires.
@@ -422,8 +431,11 @@ export function runSafetyNet({
       else if (ledger.publishedMode !== 'quarantine') { ledger.publishedMode = 'stop'; ledger.publishedModeAt = now; }
     }
     if (isLive && read.list?.mode === 'quarantine') out.liveEntries = activeEntries(read.list, { now });
-    const flakeProof = settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
-    let repeatRuns = settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
+    timeoutAlerts = Object.entries(jobFailures).flatMap(([job, f]) => timeoutOutcomes(f, timeoutPolicy, job)).filter(o => o.class === 'unconfigured');
+    const softOnly = Array.isArray(failedJobs) && failedJobs.filter(j => new RegExp(settings.value.unitJobPattern).test(j)).length > 0
+      && failedJobs.filter(j => new RegExp(settings.value.unitJobPattern).test(j)).every(j => allSoft(jobFailures[j], timeoutOutcomes(jobFailures[j], timeoutPolicy, j)));
+    const flakeProof = !softOnly && settings.value.requireProvenFlake && state.status === 'red' ? readFlakeProof(mainCiRuns, { readJobs, now }) : {};
+    let repeatRuns = !softOnly && settings.value.repeatFailureProof && settings.value.requireProvenFlake && state.status === 'red'
       ? readRepeatRuns(mainCiRuns, { state, jobFailures, readJobs, readLog, settings: settings.value }) : [];
     const failingRun = mainCiRuns?.runs?.find((r) => r?.databaseId === mainCiRuns?.failing?.runId);
     const attempt = failingRun?.attempt === undefined ? 1 : failingRun.attempt;
@@ -464,9 +476,16 @@ export function runSafetyNet({
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
       status: state.status, firstRedSha: sha, failedJobs, jobFailures, flakeProof, repeatRuns, latestRunId: mainCiRuns?.failing?.runId, latestAttempt: attempt, touchedFiles, list: read.list, fixPrs,
-      addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
+      addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value, timeoutPolicy,
     });
     out.plan = plan;
+    const softHistory = {};
+    for (const entry of plan.entries ?? []) if (entry.timeouts) {
+      entry.timeout = softRecord(entry, { history: softHistory[entry.test] ?? ledger.tests[entry.test]?.softQuarantines, now, run: mainCiRuns?.failing?.runId, head: failingRun?.headSha ?? sha });
+      softHistory[entry.test] = [...(softHistory[entry.test] ?? ledger.tests[entry.test]?.softQuarantines ?? []), entry.timeout];
+      const card = plan.cards.find(c => c.test === entry.test);
+      if (card) Object.assign(card, { priority: entry.timeout.priority, ref: `${entry.timeout.id}:fix-card`, title: card.title.replace('flaky test', 'soft timeout') });
+    }
     const steps = [];
     const ttlMs = settings.value.ttlMin * 60_000;
     if (plan.action === 'add') {
@@ -474,7 +493,14 @@ export function runSafetyNet({
         // Recheck the cap against the transport's fresh tip.
         const liveFiles = activeEntries(cur, { now }).map((e) => e.test.split('::')[0]);
         if (new Set([...liveFiles, ...plan.tests]).size > settings.value.maxTests) return { ok: false, error: `quarantine cap ${settings.value.maxTests} reached` };
-        const changes = plan.entries.map(({ test, job, proof }) => (list) => addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR, reason: `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs }));
+        const changes = plan.entries.map(({ test, job, proof, timeout }) => (list) => {
+          const r = addEntries(list, { tests: [test], job, proof, brokenSha: sha, owner: SAFETY_NET_ACTOR,
+            reason: timeout ? `${timeout.outcomes.length} soft timeout(s); measurements and policy sources in timeout.outcomes` : `main CI red since ${sha.slice(0, 9)}: ${plan.names.slice(0, 3).join(' | ')}`.slice(0, 400), actor: SAFETY_NET_ACTOR, now, ttlMs });
+          if (r.ok && timeout && r.events.length) {
+            for (const e of [...r.list.entries, ...r.events]) if (e.test === test && e.job === job) Object.assign(e, { timeout, release: timeout.release, note: timeout.note });
+          }
+          return r;
+        });
         const result = composeChanges(changes)(cur);
         if (result.ok && isLive) {
           const added = new Set(result.events.filter((e) => e.type === 'quarantine-added').map((e) => e.test));
@@ -540,6 +566,11 @@ export function runSafetyNet({
       out.events = r.events;
       shadowChanged = true;
     }
+    if (out.applied) for (const entry of plan.entries ?? []) if (entry.timeout && out.events.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type))) {
+      const test = ledger.tests[entry.test] ??= { softQuarantines: [] };
+      test.softQuarantines ??= [];
+      if (!test.softQuarantines.some(e => e.id === entry.timeout.id)) test.softQuarantines.push(entry.timeout);
+    }
     // Live and shadow additions are tracked apart: a shadow "would add" must not block the first real add after a
     // stop → quarantine flip within the same red window.
     if (plan.action === 'add' && rec) {
@@ -552,14 +583,45 @@ export function runSafetyNet({
     return out;
   } finally {
     const rec = ledger.reds[activeKey];
+    // A broken sink must not suppress the other sink or subsequent alerts/cards after publication.
+    const deliver = (line, message) => {
+      let delivered = true;
+      try {
+        mkdirSync(dirname(shadowPath), { recursive: true });
+        appendFileSync(shadowPath, JSON.stringify(line) + '\n');
+      } catch (e) { out.error ??= String(e?.message || e).split('\n')[0]; delivered = false; }
+      try { log(message); }
+      catch (e) { out.error ??= String(e?.message || e).split('\n')[0]; delivered = false; }
+      return delivered;
+    };
+    const emit = (output) => {
+      const line = { at: now, shadow: !isLive, ...output };
+      return deliver(line, `red-main-quarantine: ${JSON.stringify(line)}`);
+    };
+    try {
+      for (const entry of out.plan?.entries ?? []) if (entry.timeout && out.events?.some(e => e.test === entry.test && e.job === entry.job && ['quarantine-added', 'quarantine-rekeyed'].includes(e.type))) {
+        const published = (isLive ? out.liveEntries : ledger.shadowList?.entries)?.find(e => e.test === entry.test && e.job === entry.job);
+        for (const output of entry.timeout.outputs) emit({ ...output, test: entry.test, outcomes: entry.timeout.outcomes,
+          ...(output.type === 'quarantine' ? { entry: published } : {}) });
+      }
+      const alerts = listEmpty ? [] : timeoutAlerts.map(outcome => ({ type: 'alert', ref: `timeout:${outcome.file}`, why: 'unconfigured timeout policy', outcome }));
+      if (state.status === 'red' && listEmpty && !out.applied && (isLive || !activeEntries(ledger.shadowList, { now }).length)) alerts.push({ type: 'alert', ref: `red-main:${sha}`, why: out.error ?? out.plan?.why ?? 'no action; quarantine list empty' });
+      // Persist one bounded signature per red window, including the run and mode.
+      // A changed reason/run emits again; unchanged ticks (including restarts) do not.
+      const alertState = rec ?? ledger;
+      const signature = createHash('sha256').update(JSON.stringify([isLive, rec?.runKey, alerts])).digest('hex');
+      if (alertState.alertSignature !== signature) {
+        let delivered = true;
+        for (const alert of alerts) if (!emit(alert)) delivered = false;
+        if (delivered) alertState.alertSignature = signature;
+      }
+    } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     if (!isLive && out.plan && (shadowChanged || (state.status === 'red' && rec && rec.shadowWhy !== out.plan.why))) {
       const plan = out.plan;
       const line = { at: new Date(now).toISOString(), mode: mode.value, modeSource: mode.source, wouldDo: plan.action, tests: plan.tests ?? [], entries: plan.entries ?? [], cards: plan.cards ?? [], names: plan.names ?? [], fixPrs: plan.fixPrs ?? null, firstRedSha: sha, why: plan.why, settingsSources: settings.sources ?? {} };
       try {
-        mkdirSync(dirname(shadowPath), { recursive: true });
-        appendFileSync(shadowPath, JSON.stringify(line) + '\n');
-        if (rec) rec.shadowWhy = plan.why;
-        log(`red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${plan.action}${plan.tests?.length ? ` ${plan.tests.join(', ')}` : ''} — ${plan.why}`);
+        const delivered = deliver(line, `red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${plan.action}${plan.tests?.length ? ` ${plan.tests.join(', ')}` : ''} — ${plan.why}`);
+        if (delivered && rec) rec.shadowWhy = plan.why;
       } catch (e) { out.error = String(e?.message || e).split('\n')[0]; }
     }
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window

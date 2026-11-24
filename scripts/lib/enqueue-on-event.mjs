@@ -61,7 +61,8 @@
  *   every other state remains a candidate. False retains the previous priority order.
  *   catchUp.snapshotFirst (boolean, default true) allows one catch-up child until the fast-drain reader accepts its round snapshot,
  *   then uses catchUp.concurrency. Missing/invalid/unreadable evidence keeps starts serial; a failed/timed-out
- *   child releases the next attempt. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
+ *   child releases the next attempt. The shared base snapshot is checked against live main SHAs
+ *   and expires after 60 s; every child revalidates lean PR membership. Unknown evidence defers to the next pass. False retains concurrent first listings. Both settings resolve and log per-leaf sources.
  *
  *   catchUp.missBackoff {enabled:true, ttlMinutes:30} skips repeated hold-eligible not-enqueued summaries at the same
  *   head and sorted-label SHA-256 digest until either changes or TTL (integer 1–1440 minutes) expires.
@@ -75,6 +76,9 @@
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
 import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
+import { classifyChildFailure } from './child-failure-class.mjs';
+import { PASS_STEP_ORDER } from './pass-timings.mjs';
+export { classifyChildFailure } from './child-failure-class.mjs';
 import { createPrestageCache, resolvePrestageSettings } from './drain-prestage.mjs';
 import { rmSync } from 'node:fs';
 import { readFastDrainRoundSnapshot } from './fast-drain-scope.mjs';
@@ -317,7 +321,7 @@ export function duePending(pending, { now, debounceSeconds, debounceMaxWaitMs = 
 
 /** The fast-drain argv (node script + args). The drain's own single-PR path; `--this-repo` keeps the listing local. PURE. */
 export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
-  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? [`--listing-snapshot=${listingSnapshot}`] : [])];
+  return [join(scriptRoot, 'scripts', 'merge-ai-prs.mjs'), `--only=${num}`, `--label=${READY_LABEL}`, '--this-repo', '--json', ...(listingSnapshot ? ['--from-catch-up', `--listing-snapshot=${listingSnapshot}`] : [])];
 }
 
 /** Explicit classification of recordEnqueue kinds, including delegated producers. PURE.
@@ -354,26 +358,34 @@ export function isMissBackoffHoldEligible(kind) {
 /** What the fast drain's JSON said about the target PR, in a few words. PURE. */
 export function summarizeFastDrain(json, num) {
   if (!isObj(json)) return 'no JSON result';
-  if (json.skipped === 'drain-in-progress') return `no-op (${json.detail || 'lease held'})`;
-  if (json.ok === false) return `refused: ${json.reason}${json.detail ? ': ' + String(json.detail).slice(0, 200) : ''}`;
+  if (json.skipped === 'drain-in-progress') return 'no-op (lease held)';
+  if (json.ok === false) return 'refused: unknown';
   const hit = (list) => (Array.isArray(list) ? list.find((x) => Number(x?.num) === Number(num)) : null);
   const failed = hit(json.failed);
-  if (failed) return `failed: ${String(failed.detail || failed.reason || failed.error || '').slice(0, 200)}`;
+  if (failed) return 'failed: unknown';
   const outcome = hit(json.enqueueOutcomes);
-  if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${outcome.kind}: ${outcome.reason || ''}`.slice(0, 200);
+  if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${Object.hasOwn(MISS_BACKOFF_HOLD_ELIGIBILITY, outcome.kind) ? outcome.kind : 'unknown'}:`;
   if (outcome?.outcome === 'enqueued') return `passed every drain gate — enqueued${outcome.already ? ' (already queued)' : ''}`;
   const deferred = hit(json.deferred);
   if (deferred && !hit(json.merged)) {
-    const until = deferred.overlapYield?.untilMs;
-    return `deferred: waits on ${(deferred.waitOn ?? []).join(', ')}${until != null ? ` until ${new Date(until).toISOString().slice(11, 16)}Z` : ''} — enqueue not attempted`.slice(0, 200);
+    // Child-chosen text: keep only the fixed `overlap-yield:#<pr>` wait shape.
+    const waits = (Array.isArray(deferred.waitOn) ? deferred.waitOn : []).slice(0, 8)
+      .filter((w) => typeof w === 'string' && /^overlap-yield:#\d{1,7}$/.test(w));
+    const until = Number(deferred.overlapYield?.untilMs);
+    const when = Number.isFinite(until) && Math.abs(until) < 8.64e15 ? ` until ${new Date(until).toISOString().slice(11, 16)}Z` : '';
+    return `deferred: waits on ${waits.join(', ')}${when} — enqueue not attempted`.slice(0, 200);
   }
   if (Array.isArray(json.enqueueOutcomes) && hit(json.toMerge)) return 'not enqueued: no enqueue outcome recorded';
   const aborted = hit(json.revalidationAborted);
-  if (aborted) return `not enqueued: ${String(aborted.reason || aborted.detail || '').slice(0, 200)}`;
+  if (aborted) return 'not enqueued: revalidation-aborted';
   // An enqueued PR is also listed in skipReasons ("ready-not-reached": queued, not merged), so toMerge wins over it.
   if (hit(json.merged) || hit(json.toMerge)) return 'passed every drain gate — enqueued';
   const skip = hit(json.skipReasons) || hit(json.skipped);
-  if (skip) return `skipped: ${String(skip.reason || skip.kind || '').slice(0, 200)}`;
+  if (skip) {
+    if (/merge state BLOCKED/.test(skip.reason)) return 'skipped: merge state BLOCKED';
+    if (/merge-gate hold/.test(skip.reason)) return 'skipped: merge-gate hold';
+    return 'skipped: unknown';
+  }
   if (!json.considered) return 'not listed (not ready-to-merge, closed, or already queued)';
   return 'no verdict for the PR';
 }
@@ -727,11 +739,19 @@ export function planCatchUp({ prs, queued, capacity, pendingNums = [], pendingSi
   return plan;
 }
 
+const TIMING_NAMES = new Set([...PASS_STEP_ORDER, 'total']);
+
 /** Last pass's phase timings, without the trailing verdict counts. PURE. */
 export function extractPassTimings(stderr) {
   let timings = null;
-  for (const match of String(stderr ?? '').matchAll(/^merge-ai-prs · pass timings:[ \t]*([^\r\n(]+)/gm)) {
-    timings = match[1].trim() || null;
+  for (const line of String(stderr ?? '').matchAll(/^merge-ai-prs · pass timings:[ \t]*([^\r\n]*)/gm)) {
+    const tokens = [];
+    for (const token of line[1].split(/\s+/)) {
+      // Names come from the fixed phase list only: stderr can never choose a published name.
+      const match = /^([A-Za-z][A-Za-z0-9._-]{0,31})=(\d+(?:\.\d+)?)ms$/.exec(token);
+      if (match && TIMING_NAMES.has(match[1]) && Number.isFinite(Number(match[2]))) tokens.push(`${match[1]}=${Number(match[2])}`);
+    }
+    timings = tokens.join(' ') || null;
   }
   return timings;
 }
@@ -739,18 +759,21 @@ export function extractPassTimings(stderr) {
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
-    const output = () => ({ stdout, stderrTail: stderr.slice(-2000), passTimings: extractPassTimings(stderr), timedOut });
+    const output = () => ({
+      stdout, stderrBytes: stderr.length, errorClass: classifyChildFailure(stderr, { timedOut }),
+      passTimings: extractPassTimings(stderr), timedOut,
+    });
     let child;
     try { child = spawnImpl(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-    catch (e) { resolveRun({ code: null, stdout: '', error: String(e?.message || e) }); return; }
+    catch { resolveRun({ code: null, ...output(), errorClass: 'spawn-error' }); return; }
     onChild(child);
     child.stdout?.on('data', (d) => { stdout += d; });
-    // Keep the full stream: timing lines can span chunks and fall outside the diagnostic tail.
+    // Keep the full stream: timing lines can span chunks and precede later diagnostics.
     child.stderr?.setEncoding?.('utf8');
     child.stderr?.on('data', (d) => { stderr += d; });
     const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGTERM'); } catch { /* gone */ } }, timeoutMs);
     killer.unref?.();
-    child.on('error', (e) => { clearTimeout(killer); resolveRun({ code: null, ...output(), error: String(e?.message || e) }); });
+    child.on('error', () => { clearTimeout(killer); resolveRun({ code: null, ...output(), errorClass: 'spawn-error' }); });
     child.on('close', (code) => { clearTimeout(killer); resolveRun({ code, ...output() }); });
   });
 }
@@ -1167,6 +1190,7 @@ export function createEnqueueOnEvent({
       attempted.add(p.num);
       activeNums.add(p.num);
       const startedAt = now();
+      // Catch-up passes the round path even without a green event: the catch-up flag selects the shared lean-context path.
       const args = fastDrainArgs({ scriptRoot: scriptRoot(), num: p.num, listingSnapshot: p.catchUp ? listingSnapshot : null });
       if (greenEvent(p)) args.push('--from-green-event');
       if (p.catchUp) catchUpRoom--; // keep the bound across ticks and window closures; unknown results consume room
@@ -1176,9 +1200,14 @@ export function createEnqueueOnEvent({
         const childTimeoutMs = timeoutMs ?? (s.timeoutSeconds ?? ENQUEUE_ON_EVENT_DEFAULTS.timeoutSeconds) * 1000;
         const r = await runChild({ args, cwd, env, spawnImpl, timeoutMs: childTimeoutMs, onChild: (c) => { ownChild = c; children.add(c); } });
         children.delete(ownChild);
-        const json = lastJsonLine(r.stdout);
-        let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : r.error ? `could not run (${r.error})` : summarizeFastDrain(json, p.num);
+        const exitFailed = !r.timedOut && r.code !== 0;
+        // A failed child cannot supply success or permanent-decline evidence.
+        const json = exitFailed ? null : lastJsonLine(r.stdout);
+        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}`;
+        const spawnFailed = r.errorClass === 'spawn-error';
+        let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : spawnFailed ? `could not run (${diagnostic})` : summarizeFastDrain(json, p.num);
         const summary = what;
+        if (!r.timedOut && !spawnFailed && (r.code !== 0 || !json)) what += ` (${diagnostic})`;
         // Recheck at completion: an event-bypassed hold may expire while the child runs.
         const previous = missHold(p.num, pr, s);
         missBackoff.delete(p.num);
@@ -1191,12 +1220,12 @@ export function createEnqueueOnEvent({
           missBackoff.set(p.num, { pr: p.num, headSha: pr.headRefOid, labelsDigest: digest, reason, at: now(), codeVersion: codeVersion(),
             logged: previous?.reason === reason && previous.logged === true });
         }
-        if (!r.error && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
+        if (!spawnFailed && (summary.startsWith('passed every drain gate — enqueued') || summary.startsWith('not listed'))) backoff.delete(p.num);
         // The kind alone also represents missing evidence. Require an affirmative failure reason,
-        // checking the full reason as well as the (truncated) summary so unreadable/incomplete
+        // checking the internal full reason so unreadable/incomplete
         // evidence always retries. This changes retry timing only; the drain still owns admission.
         if (backoff.get(p.num)?.reason === 'same-head-failed') backoff.delete(p.num);
-        if (!r.error && !r.timedOut && missSettings(s).enabled && blockedRounds > 0 && signature && digest
+        if (!spawnFailed && !r.timedOut && missSettings(s).enabled && blockedRounds > 0 && signature && digest
           && enqueueOutcome?.outcome === 'not-enqueued' && enqueueOutcome.kind === 'mq-same-head-failed'
           && summary.startsWith('not enqueued:') && typeof enqueueOutcome.reason === 'string'
           && /same[- ]head.*failed|failed_checks/i.test(enqueueOutcome.reason)
@@ -1204,7 +1233,7 @@ export function createEnqueueOnEvent({
           backoff.set(p.num, { signature, labelsDigest: digest, at: now(), rounds: blockedRounds,
             untilRound: catchUpRound + blockedRounds, reason: 'same-head-failed' });
         }
-        if (p.catchUp && !r.error && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {
+        if (p.catchUp && !spawnFailed && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {
           // A listing consumes a round even if capacity/window holds this PR until a later tick.
           backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
         }
@@ -1217,7 +1246,7 @@ export function createEnqueueOnEvent({
           let membership;
           try { membership = await readMembership({ repo: p.repo, num: p.num }); }
           catch (e) { membership = { ok: false, error: String(e?.message || e).split('\n')[0] }; }
-          if (!membership?.ok) what += ` (unverified: ${membership?.error || 'membership unreadable'})`;
+          if (!membership?.ok) what += ' (unverified: membership unreadable)';
           else if (membership.inQueue) {
             verified = true;
             completed.add(p.num);
@@ -1228,9 +1257,7 @@ export function createEnqueueOnEvent({
           } else {
             verified = false;
             missed = true;
-            const events = (membership.lastEvents || []).map(e => `${e.__typename}${e.createdAt ? ` at ${e.createdAt}` : ''}${e.reason ? `: ${e.reason}` : ''}`).join('; ') || 'no AddedToMergeQueue event';
-            const stderr = String(r.stderrTail || '').replace(/\s+/g, ' ').trim().slice(-300);
-            what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${events}; fast-drain stderr: ${stderr}) — retrying on the next catch-up`;
+            what = `NOT enqueued: the fast drain claimed enqueued but GitHub isInMergeQueue=false (${diagnostic}) — retrying on the next catch-up`;
           }
         }
         if (missed) {
@@ -1246,13 +1273,13 @@ export function createEnqueueOnEvent({
           let dropped = 0;
           pending = new Map(pending);
           for (const [key, entry] of pending) if (entry.catchUp) { pending.delete(key); dropped++; }
-          log(`enqueue-on-event: catch-up stopping this round — batching deferred #${p.num} (${summary.slice('not enqueued: batching-deferred:'.length).trim()}); ${dropped} PR(s) retried at the next catch-up`);
-        } else if (p.catchUp && !r.timedOut && !r.error && fastDrainUsedNoRoom(json, p.num)) {
+          log(`enqueue-on-event: catch-up stopping this round — batching deferred #${p.num}; ${dropped} PR(s) retried at the next catch-up`);
+        } else if (p.catchUp && !r.timedOut && !spawnFailed && fastDrainUsedNoRoom(json, p.num)) {
           catchUpRoom++;
           refillCatchUp();
         }
         if (batchingRetry === p.num && !summary.startsWith('not enqueued: batching-deferred:')) batchingRetry = null;
-        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: r.error });
+        const outcome = fastDrainOutcome({ summary: what, timedOut: r.timedOut, error: spawnFailed || exitFailed });
         declines.delete(p.num); // every actual outcome replaces the previous one, including success/error
         // Allowlist: only affirmative, head-bound declines are remembered. Transient, infrastructure
         // and unknown kinds (batching-deferred, merge-lock-held, live-state-unreadable, ...) always retry.
@@ -1276,12 +1303,12 @@ export function createEnqueueOnEvent({
               at: startedAt }); // checks completed during the child must cause a retry too
           }
         }
-        log(`${prefix} fast drain exit ${r.code ?? 'none'} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]${r.passTimings ? ` · phases: ${r.passTimings}` : ''}`);
+        log(`${prefix} fast drain ${diagnostic} in ${Math.round((now() - startedAt) / 1000)}s — ${what} [outcome=${outcome}]${r.passTimings ? ` · phases: ${r.passTimings}` : ''}`);
         ran.push({ ...metadata, num: p.num, code: r.code, what, verified, outcome });
       };
       const task = finish().catch(e => {
         missBackoff.delete(p.num);
-        const what = `could not finish (${String(e?.message || e).split('\n')[0]})`;
+        const what = 'could not finish (class=unknown)';
         log(`${prefix} — ${what}`);
         ran.push({ ...metadata, num: p.num, code: null, what, outcome: 'error' });
       }).finally(() => { active.delete(p.num); activeNums.delete(p.num); });

@@ -130,7 +130,7 @@ export function readLegacyLocalManifestAt({ headRef, headSha, prNumber, git }) {
 
 
 /** Invalid bounds retain the standard 60s live-refresh fallback. */
-function roundSnapshotTtl(env) {
+export function roundSnapshotTtl(env) {
   const raw = env.WE_FAST_DRAIN_LISTING_SNAPSHOT_TTL_SEC;
   const number = typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : NaN;
   const valid = Number.isFinite(number) && number >= 0;

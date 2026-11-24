@@ -1062,6 +1062,8 @@ export async function saveFixPassCursors({ path, rotation, prCursors, write = wr
 
 // Load once for the daemon defaults; injected state stays independent.
 const { rotation: fixPassRotation, prCursors: fixPassPrCursors } = loadFixPassCursors();
+// Process-local settled verdicts survive ticks; restarts deliberately re-read live evidence.
+const orphanSettled = new Map();
 
 const gitCommandWords = new Set('fetch push rebase merge status rev-parse log diff worktree checkout reset ls-remote show-ref merge-base branch cherry-pick'.split(' '));
 
@@ -1165,6 +1167,7 @@ export async function runTickAllRepos({
   passBudgets = resolveFixPassBudgets(),
   budgetRotation = fixPassRotation,
   prCursors = fixPassPrCursors,
+  orphanSettled: settled = orphanSettled,
   // Optional path/write IO for hermetic persistence probes; state ownership stays with the defaults.
   cursorPersistence = {},
   adoptYieldProbe,
@@ -1271,6 +1274,9 @@ export async function runTickAllRepos({
   // No Claude session is spawned, so the auth gate never pauses it.
   const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
     : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
+  // Unknown supersede evidence cannot authorize fresh fix or CI-heal dispatch.
+  const supersedeFailure = supersede.repos.find(r => r.error || r.blocked);
+  if (supersedeFailure) throw new Error(`supersede dispatch blocked for ${supersedeFailure.repo}; retry next tick: ${supersedeFailure.error ?? 'unreadable evidence'}`);
   const rulingStandDown = await timedAsync('ruling-stand-down', async () => {
     const setting = resolveReviewSettings().rulingResolvesStandDown;
     const settingSource = resolveReviewSettingSource('rulingResolvesStandDown');
@@ -1419,7 +1425,7 @@ export async function runTickAllRepos({
       const result = await orphanGuardTick({ env: process.env, nowMs: now(),
       deadlineAt: phaseStarts['orphan-guard'] + budgets['orphan-guard'].budgetMs,
       ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}),
-      now, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
+      now, settled, cursor: prCursors['orphan-guard'], ...(planCache ? { reconcile: planCache.reconcile } : {}),
       repos: (function* () {
         for (const repo of budgetRepos('orphan-guard', repos)) {
           const key = repoKeyForSlug(repo);
@@ -1435,6 +1441,9 @@ export async function runTickAllRepos({
       else for (const row of result.rows) {
         const key = row?.repo && repoKeyForSlug(row.repo);
         if (!key) { orphanGuardCompleted.clear(); orphanGuardEvidenceUnknown = true; break; }
+        if (row.decision !== 'none' && Number.isInteger(row.pr)) {
+          settled.delete(`${CONSTELLATION_REPOS[key].slug}#${row.pr}`);
+        }
         const success = { rearm: 're-armed', redispatch: 're-dispatched', escalate: 'escalated' };
         if (!Object.hasOwn(success, row.decision)
           || (row.result !== success[row.decision] && row.result !== 'report-only (WE_ORPHAN_FIX_GUARD=0)')) {
@@ -1510,6 +1519,10 @@ export async function runTickAllRepos({
         why: 'orphan-cap guard did not settle this PR; fix deferred until next pass',
       });
     }
+  }
+  for (const row of fix.dispatched ?? []) {
+    const key = repoKeyForSlug(row.repo);
+    if (key) settled.delete(`${CONSTELLATION_REPOS[key].slug}#${row.pr ?? row.prNumber}`);
   }
   planCache?.markTouched(fix);
   // Reclaim after fix so a slow watchdog sweep cannot delay review:changes decisions.
@@ -1639,6 +1652,7 @@ export async function runTickAllRepos({
     autoRoundGrants: notes.autoGrants ?? [], // standing-ruling card-only round grants this tick decided
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
     awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
+    orphanGuard,
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
@@ -1872,6 +1886,8 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         log.error(`ruling-resolves-stand-down: setting=${setting} (source: ${settingSource})`);
         for (const row of rows) log.error(`ruling-resolves-stand-down: ${row.repo}#${row.pr} ${row.action} stand-down=${row.standDownId ?? '?'}${row.why ? ` — ${row.why}` : ''}`);
       }
+      const orphan = result?.orphanGuard;
+      log.error(`orphan-guard: settled ${orphan?.newlySettled?.length ?? 0} PR(s) (deferred ${orphan?.deferredSettled?.length ?? 0} cached)`);
       // card xiqtf7w — one line per supersede hold planned or posted.
       for (const line of formatSupersedeLines(supersede)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.

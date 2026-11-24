@@ -172,6 +172,16 @@ describe('readSettingsChecked — fail-closed evidence', () => {
     finally { rmSync(root, { recursive: true, force: true }); }
   }
 
+  it('standalone timeout policy never becomes a conveyor namespace, including unreadable policy bytes', () => fixture((options) => {
+    writeFileSync(join(options.dir, 'test-timeout-policy.json'), '{"tests":{"a.test.mjs":{"soft":"PT1S"}}}');
+    expect(readSettingsChecked(options)).toEqual({ value: {}, taint: [], duplicates: [] });
+    expect(readDeclaredSettings(options).sources).not.toContain('settings/test-timeout-policy.json');
+    writeFileSync(join(options.dir, 'test-timeout-policy.json'), '{invalid');
+    expect(readSettingsChecked(options)).toEqual({ value: {}, taint: [], duplicates: [] });
+    writeFileSync(join(options.dir, 'other-policy.json'), '{"tests":{"a.test.mjs":{"soft":"PT1S"}}}');
+    expect(readSettingsChecked(options).taint).toEqual([{ source: 'settings/other-policy.json', reason: 'dotted key' }]);
+  }));
+
   it('clean reads select whole trees, subtrees and leaves with empty taint', () => fixture((options) => {
     writeFileSync(options.legacyPath, '{"fixDispatch":{"parkedCapFactor":2}}');
     writeFileSync(join(options.dir, 'a.json'), '{"fixDispatch":{"other":3},"cap":4}');
@@ -442,6 +452,11 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
   it('every file parses, and no leaf has two owner files', () => {
     expect(real.errors).toEqual([]);
     expect(real.duplicates).toEqual([]);
+  });
+
+  it('declares a valid empty build-priority scope allowlist in its feature file', () => {
+    expect(real.settings.allowedFiles).toEqual([]);
+    expect(real.owners.allowedFiles).toBe('settings/build-priority-scope.json');
   });
 
   it('declares catch-up ordering and first-listing defaults in merge-queue settings', () => {

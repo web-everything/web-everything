@@ -14,6 +14,14 @@ export function validateBuildPriorityInput(input) {
   if (!Number.isFinite(ttlHours) || ttlHours <= 0 || ttlHours > 168) {
     throw new Error('build-priority-set: --ttl-hours must be finite, >0 and <=168; choose a TTL within that range');
   }
+  if (input['auto-count'] !== undefined) {
+    if (input.ids !== undefined) throw new Error('build-priority-set: refuse both --ids and --auto-count; choose one');
+    const value = input['auto-count'];
+    if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value) || Number(value) > 20) {
+      throw new Error('build-priority-set: --auto-count must be a positive integer <=20; choose a count from 1 to 20');
+    }
+    return { actor, reason, ids: [], autoCount: Number(value), mode: input.mode, ttlHours };
+  }
   const ids = typeof input.ids === 'string' ? input.ids.split(',').map(id => id.trim()) : [];
   const normalized = resolveBuildPriority({ tool: { priority: ids }, env: {} });
   if (!ids.length || ids.some(id => !/^\d+$/.test(id)) || new Set(ids).size !== ids.length
@@ -29,10 +37,10 @@ export function validateBuildPriorityInput(input) {
 
 export function buildPrioritySetOperation({ prepare }) {
   return op(BUILD_PRIORITY_SET_OP, {
-    input: { ids: 'string', mode: 'string', 'ttl-hours': 'string', actor: 'string', reason: 'string',
+    input: { ids: { type: 'string', required: false }, 'auto-count': { type: 'string', required: false }, mode: 'string', 'ttl-hours': 'string', actor: 'string', reason: 'string',
       preview: { type: 'boolean', required: false, default: false } },
     verdictFrom: 'plan',
-    plan: compute({ reads: ['input.ids', 'input.mode', 'input.ttl-hours', 'input.actor', 'input.reason', 'input.preview'],
+    plan: compute({ reads: ['input.ids', 'input.auto-count', 'input.mode', 'input.ttl-hours', 'input.actor', 'input.reason', 'input.preview'],
       fn: view => prepare(view.input) }),
     install: effect({ reads: ['input', 'verdict'], effects: view => view.input.preview ? []
       : [{ type: BUILD_PRIORITY_SET_EFFECT, idempotent: false, payload: view.input }] }),
