@@ -120,7 +120,7 @@
 
 import { workspaceFor } from './lane-pool-paths.mjs';
 import { daemonCloneRoots } from './daemon-clone-registry.mjs';
-import { gitRun, isCodePath } from './main-staleness.mjs';
+import { gitRun, isCodePath, isStaleMainRefusalMessage } from './main-staleness.mjs';
 import { collectImportClosure, closureHits } from './import-closure.mjs';
 
 export { collectImportClosure };
@@ -227,6 +227,30 @@ export function resolveMaxAdoptWaitTicks(env = {}, settings = {}) {
   const value = settings?.rebuild?.maxAdoptWaitTicks;
   if (Number.isSafeInteger(value) && value >= 0) return { value, source: 'settings' };
   return { value: 2, source: 'default' };
+}
+
+/** PURE: largest parseable behind count from dispatch STALE refusals in either tick shape. */
+export function staleRefusalBehind(tickResult) {
+  let behind = 0;
+  for (const rows of [tickResult?.failed, tickResult?.repos]) {
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!isStaleMainRefusalMessage(row?.error)) continue;
+      const count = Number(row.error.match(/(\d+) commit\(s\) behind origin\//)?.[1]);
+      if (Number.isSafeInteger(count)) behind = Math.max(behind, count);
+    }
+  }
+  return behind;
+}
+
+/** Missing, unreadable or invalid tool settings retain the default threshold. */
+export function loadStaleUrgentSettings(path = new URL('./daemon-rebuild-settings.json', import.meta.url),
+  { log = () => {} } = {}) {
+  let value;
+  try { value = JSON.parse(readFileSync(path, 'utf8'))?.staleUrgent?.behindThreshold; } catch { /* fail soft */ }
+  const valid = Number.isSafeInteger(value) && value >= 0;
+  const threshold = valid ? value : 10;
+  log(`daemon-self-sync: staleUrgent.behindThreshold=${threshold} (source ${valid ? 'tool' : 'default'})`);
+  return threshold;
 }
 
 function loadAdoptWaitSettings() {
@@ -857,6 +881,7 @@ export function withSelfSync(effects, {
   rebuildAsJob: rebuildAsJobOpt, earlyLaunch, earlyLaunchIo = {},
   maintainObjects, maintain, hasMaintenanceRebuildJob = () => cloneHasRebuildJob(root, env),
 }) {
+  const staleUrgentThreshold = loadStaleUrgentSettings(undefined, { log: m => log.error?.(m) });
   const tick = effects.tickOnce;
   if (!strictRebuildEvidence(env)) log.error?.(`daemon-self-sync: strictEvidence=false (source ${env.WE_DAEMON_REBUILD_STRICT_EVIDENCE === '0' ? 'env' : 'default'}; tick-start compatibility)`);
   const unreadableHold = () => {
@@ -1395,7 +1420,10 @@ export function withSelfSync(effects, {
         //    job-mode daemon this adopts a ready candidate or queues the job; it never smokes on the tick path.
         if (attempt === 0 && (tickResult?.yieldedForAdoption === true
           || (typeof hasStaleRefusal === 'function' && hasStaleRefusal(tickResult)))) {
-          const r2 = await rebuild();
+          const behind = staleRefusalBehind(tickResult);
+          const urgent = tickResult?.yieldedForAdoption !== true && behind > staleUrgentThreshold;
+          if (urgent) log.error?.(`daemon-self-sync: STALE refusal with ${behind} commits behind (> ${staleUrgentThreshold}) — requesting an urgent rebuild job (spacing bypassed)`);
+          const r2 = urgent ? await rebuild({ urgent: true }) : await rebuild();
           if (resultReportsReclone(r2)) { noteReclone('clone-recloned'); noteJobs(r2); return tickResult; }
           noteJobs(r2);
           if (r2 && r2.moved && r2.adopted) {

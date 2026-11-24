@@ -904,3 +904,27 @@ it.each(['early', 'recovery'])('%s launch and child prepare preserve actionable 
   expect(nodeFs.existsSync(abandoned)).toBe(false);
   expect(run.mock.calls.some(([args]) => args[0] === 'worktree' && args.includes('remove') && args.includes(abandoned))).toBe(true);
 });
+
+
+it.each([
+  [false, 'needs-build', false, 'rebuild-job-spaced'],
+  [true, 'needs-build', false, 'rebuild-job-started'],
+  [true, 'needs-build', true, 'rebuild-job-running'],
+  [true, 'still-rejected', false, 'still-rejected'],
+  [true, 'clone-recloned', false, 'clone-recloned'],
+  [true, 'up-to-date', false, 'up-to-date'],
+])('urgent=%s adopt=%s inFlight=%s preserves %s', async (urgent, reason, inFlight, expected) => {
+  const store = createJobStore(join(root, 'jobs'));
+  mkdirSync(store.dir, { recursive: true });
+  const now = Date.now();
+  const old = enqueueJob({ store, kindDef: REBUILD_JOB_KIND, codeSha: 'a'.repeat(40), input: { root }, now: now - 1000 });
+  if (!inFlight) store.update(old.id, r => markSucceeded(r, { at: new Date(now - 100).toISOString() }));
+  const adopt = vi.fn(async () => ({ moved: false, reason })), log = { error: vi.fn() };
+  const result = await rebuildCloneAsJob({ root, env: {}, store, urgent, adopt, log,
+    now: () => now, codeSha: 'a'.repeat(40), reattach: async () => {}, evict: () => ({}),
+    recoverySettings: { enabled: false }, settings: { minIntervalMs: 900000, minIntervalJitterPct: 0 } });
+  expect(result.reason).toBe(expected);
+  expect(store.list().records).toHaveLength(expected === 'rebuild-job-started' ? 2 : 1);
+  if (inFlight) expect(adopt).not.toHaveBeenCalled();
+  if (expected === 'rebuild-job-started') expect(log.error).toHaveBeenCalledWith('daemon-rebuild-job: urgent launch — spacing bypassed');
+});

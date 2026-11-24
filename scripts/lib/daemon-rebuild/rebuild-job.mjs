@@ -190,7 +190,7 @@ function clockFor(dir) {
 export async function rebuildCloneAsJob({
   root, env = process.env, log = console, mainOnly = false, entries = [], adopt,
   store = createJobStore(rebuildJobsDir(root, env)), reattach = reattachTick, clock, now = () => Date.now(),
-  launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
+  urgent = false, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0,
   recoverySettings = resolveRecovery({ env, log: m => log.error?.(m) }),
   readState = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy) ? readRebuildStateStrict : readRebuildState,
   readPending = strictRebuildEvidence(env, launchOnly ? 'early' : launchedBy) ? readPendingAdoptionsStrict : readPendingAdoptions,
@@ -322,12 +322,13 @@ export async function rebuildCloneAsJob({
   } catch { return { ...unreadable(), finishedJobs }; }
   const sinceMs = last ? now() - Date.parse(last.job.finishedAt || 0) : Infinity;
   const intervalMs = rebuildJobInterval(settings, entries, rng);
-  if (last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
+  if (!urgent && last && (recover || !lastRes?.readyRecorded) && sinceMs < intervalMs) {
     housekeeping();
     return {
       moved: false, reason: 'rebuild-job-spaced', retryInMs: intervalMs - sinceMs, plan: r.plan, finishedJobs, alerts: r.alerts ?? [],
     };
   }
+  if (urgent) say('urgent launch — spacing bypassed');
   let queued;
   try {
     queued = enqueueJob({

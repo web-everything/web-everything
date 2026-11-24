@@ -300,7 +300,7 @@ async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), prBaseChain, lockOpts = {}, stateOpts = {}, mainOnly = false,
   now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
-  asJob, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
+  asJob, urgent = false, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
 } = {}) {
@@ -312,7 +312,7 @@ async function rebuildCloneInternal({
   // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
   if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
     return rebuildCloneAsJob({
-      root, env: stEnv, log, mainOnly, entries, launchOnly, launchedBy, waitInFlightTickMs,
+      root, env: stEnv, log, mainOnly, entries, urgent, launchOnly, launchedBy, waitInFlightTickMs,
       adopt: (o = {}) => rebuildCloneInternal({
         root, env, log, run, runSmoke, prState, prBaseChain, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
         dispatchSmoke, admissionWaitMs, launchedBy, ...o, stEnv, adoptOnly: true, asJob: false,
