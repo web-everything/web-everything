@@ -24,6 +24,95 @@ import sessionStuck from '../health-smells/session-stuck.mjs';
 import ghostListed from '../health-smells/ghost-session-listed.mjs';
 import { probeSessionWatchdog } from '../health-watch.mjs';
 import { runHealthTick, emptyHealthState } from '../health-watch-core.mjs';
+import { evaluateMergeGatePin, probeMergeGatePin, mergeGatePinFails, main as pinProbeMain } from '../merge-gate-pin-probe.mjs';
+
+describe('merge-gate ruleset pin', () => {
+  const pin = { path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' };
+  const workflows = (...entries) => ({ type: 'workflows', parameters: { workflows: entries } });
+
+  it('a workflows rule without the merge-gate pin to main fails the probe', async () => {
+    for (const rules of [
+      [workflows({ ...pin, ref: 'refs/heads/other' })],
+      [{ type: 'required_status_checks', parameters: {} }],
+      [workflows({ path: '.github/workflows/other.yml', ref: pin.ref })],
+      [workflows()], [],
+    ]) {
+      const result = await probeMergeGatePin({ repo: 'example/repo', ghApi: () => JSON.stringify(rules) });
+      expect(result).toMatchObject({ status: 'missing', reason: expect.any(String) });
+      expect(mergeGatePinFails(result)).toBe(true);
+    }
+  });
+
+  it('a ruleset that pins merge-gate to main passes; an unreadable response is reported unknown, not green', async () => {
+    for (const rules of [
+      [workflows(pin)],
+      [workflows({ ...pin, ref: 'refs/heads/other' }), workflows({ ...pin, path: `repo/${pin.path}` })],
+    ]) {
+      let endpoint;
+      const result = await probeMergeGatePin({ repo: 'example/repo', ghApi: async (path) => { endpoint = path; return JSON.stringify(rules); } });
+      expect(endpoint).toBe('repos/example/repo/rules/branches/main');
+      expect(result).toMatchObject({ status: 'pinned', reason: expect.any(String) });
+      expect(mergeGatePinFails(result)).toBe(false);
+    }
+    for (const ghApi of [() => { throw new Error('API unavailable'); }, async () => { throw new Error('API unavailable'); }, () => '{bad json']) {
+      const result = await probeMergeGatePin({ repo: 'example/repo', ghApi });
+      expect(result.status).toBe('unknown');
+      expect(mergeGatePinFails(result)).toBe(true);
+    }
+    for (const input of [null, {}, 'rules', [null], [{ type: 'workflows' }],
+      [workflows(null)], [workflows({ path: pin.path })], [workflows(pin), null]]) {
+      const result = evaluateMergeGatePin(input);
+      expect(result).toMatchObject({ status: 'unknown', reason: expect.any(String) });
+      expect(mergeGatePinFails(result)).toBe(true);
+    }
+    expect(mergeGatePinFails(undefined)).toBe(true);
+  });
+
+  it('merge-gate concurrency isolates non-gating label events by run_id and keeps cancellation', () => {
+    const yaml = readFileSync(join(HERE, '../../../.github/workflows/merge-gate.yml'), 'utf8');
+    const concurrency = yaml.match(/^concurrency:\n((?:[ \t]+.*\n)+)/m)?.[1];
+    expect(concurrency).toMatch(/^  cancel-in-progress: true$/m);
+    const expression = concurrency.match(/^  group: (.*)$/m)?.[1];
+    expect(expression).toContain("format('unwatched-{0}', github.run_id)");
+    expect(expression).toContain('|| github.event.pull_request.number');
+    // Execute both branches of the actual Actions expression with hermetic event data.
+    const evaluate = new Function('github', 'startsWith', 'format', `return \`${expression.replace(/\$\{\{(.*?)\}\}/g, '${$1}')}\`;`);
+    const group = (action, label, run_id = 900) => evaluate({
+      event: { action, label: { name: label }, pull_request: { number: 42 } }, run_id,
+    }, (value, prefix) => value.startsWith(prefix), (pattern, value) => pattern.replace('{0}', value));
+    for (const action of ['labeled', 'unlabeled']) {
+      expect(group(action, 'documentation')).toBe('merge-gate-unwatched-900');
+      expect(group(action, 'documentation', 901)).toBe('merge-gate-unwatched-901');
+      for (const label of ['ready-to-merge', 'gate:refresh', 'review:accepted', 'red-team:accepted']) {
+        expect(group(action, label)).toBe('merge-gate-42');
+      }
+    }
+    expect(group('synchronize', 'documentation')).toBe('merge-gate-42');
+  });
+
+  it('CLI resolves explicit, environment and default repos with bounded read-only commands and fails closed on overflow', async () => {
+    for (const [argv, env, lookup] of [
+      [['--repo=example/repo'], {}, false], [['--repo', 'example/repo'], {}, false],
+      [['example/repo'], {}, false], [[], { GH_REPO: 'example/repo' }, false], [[], {}, true],
+    ]) {
+      const calls = [];
+      const result = await pinProbeMain({ argv, env, exec: (bin, args, options) => {
+        calls.push(args);
+        expect(bin).toBe('gh');
+        expect(options).toMatchObject({ timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+        return args[0] === 'repo' ? '{"nameWithOwner":"example/repo"}' : JSON.stringify([workflows(pin)]);
+      } });
+      expect(result.status).toBe('pinned');
+      expect(calls).toEqual([...(lookup ? [['repo', 'view', '--json', 'nameWithOwner']] : []), ['api', 'repos/example/repo/rules/branches/main']]);
+    }
+    for (const argv of [[], ['example/repo']]) {
+      const result = await pinProbeMain({ argv, env: {}, exec: () => { throw new Error('ENOBUFS: output exceeds maxBuffer'); } });
+      expect(result.status).toBe('unknown');
+      expect(mergeGatePinFails(result)).toBe(true);
+      expect(result.reason).toMatch(/pass --repo|verify API access/i);
+    }
+  });
+});
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = join(HERE, '..', 'soak', 'breaks', 'fixtures', 'fix-3771-wait-loop.jsonl');
