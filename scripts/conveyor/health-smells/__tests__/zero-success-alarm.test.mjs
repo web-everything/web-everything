@@ -48,3 +48,31 @@ it('parses JSON lines and skips junk', () => {
   const text = [JSON.stringify({ at: new Date(now).toISOString(), loop: 'drain-catchup', failed: 1 }), 'garbage', '{bad'].join('\n');
   expect(parseLoopTicks(text)).toHaveLength(1);
 });
+
+import { parsePrepareTicks, parseDrainCatchupTicks } from '../../health-loop-ticks.mjs';
+
+const prepLine = (ageMin, o = {}) => JSON.stringify({ at: new Date(now - ageMin * minute).toISOString(), timings: {},
+  prepare: { launched: [], failures: Array.from({ length: 230 }, (_, i) => ({ num: String(4000 + i), stage: 'retirement', reason: 'prepare PR listing call budget exhausted (96 of 128)' })), ...o } });
+const drainLine = (ageMin, exit, outcome, tail = 'no JSON result') => `[drain-daemon] ${new Date(now - ageMin * minute).toISOString()} enqueue-on-event: catch-up #7395 fast drain exit ${exit}, 2597B stderr, class=unknown in 4s — ${tail} [outcome=${outcome}]`;
+const feed = (text, parse, t = now) => runHealthTick(null, { loopTicks: { records: parse(text) } }, [smell], t);
+
+it('live replay: the prepare window (many failures, no launches) raises exactly one alarm', () => {
+  const text = Array.from({ length: 8 }, (_, i) => prepLine(i * 10)).join('\n');
+  const r = feed(text, parsePrepareTicks);
+  expect(Object.values(r.state.episodes)).toHaveLength(1);
+  expect(Object.values(r.state.episodes)[0].subject).toBe('prepare');
+});
+
+it('live replay: drain catch-up exit-1 run raises one alarm; the same log with a verdict inside raises none', () => {
+  const bad = Array.from({ length: 8 }, (_, i) => drainLine(i * 10, 1, 'error')).join('\n');
+  expect(Object.values(feed(bad, parseDrainCatchupTicks).state.episodes)).toHaveLength(1);
+  const healthy = `${bad}\n${drainLine(20, 0, 'not-enqueued', 'not enqueued: red-team-pending')}`;
+  expect(Object.keys(feed(healthy, parseDrainCatchupTicks).state.episodes)).toHaveLength(0);
+});
+
+it('a healthy prepare loop (launches) and idle ticks raise nothing', () => {
+  const ok = Array.from({ length: 8 }, (_, i) => prepLine(i * 10, { launched: [{ num: '1' }], failures: [] })).join('\n');
+  const idle = Array.from({ length: 8 }, (_, i) => prepLine(i * 10, { failures: [] })).join('\n');
+  expect(Object.keys(feed(ok, parsePrepareTicks).state.episodes)).toHaveLength(0);
+  expect(parsePrepareTicks(idle)).toHaveLength(0);
+});

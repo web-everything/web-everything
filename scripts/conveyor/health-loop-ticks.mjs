@@ -70,3 +70,60 @@ export function zeroSuccessVerdicts(records, { now, windowMs = 60 * MINUTE, minT
   }
   return out;
 }
+
+// ── per-loop parsers (log line shapes read live 2026-11-24) ───────────────────────────────────────────────────
+
+const mostCommon = (xs) => { const c = new Map(); for (const x of xs) c.set(x, (c.get(x) || 0) + 1); return [...c.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null; };
+
+/**
+ * Prepare loop: each build-dispatch tick is one JSON line (`timings` present); `prepare.launched` are successes,
+ * `prepare.failures` are failures (`{num, stage, reason}`). A tick with neither had nothing to do and is dropped.
+ */
+export function parsePrepareTicks(text) {
+  const out = [];
+  for (const line of String(text ?? '').split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('{') || !t.includes('"timings"')) continue;
+    let r; try { r = JSON.parse(t); } catch { continue; }
+    const at = Date.parse(r?.at ?? '');
+    if (!Number.isFinite(at) || !r.prepare || typeof r.prepare !== 'object') continue;
+    const failures = Array.isArray(r.prepare.failures) ? r.prepare.failures : [];
+    const launched = Array.isArray(r.prepare.launched) ? r.prepare.launched.length : 0;
+    if (!failures.length && !launched) continue;
+    out.push({ at, loop: 'prepare', attempted: failures.length + launched, succeeded: launched, failed: failures.length,
+      error: mostCommon(failures.map((f) => String(f?.reason ?? 'unknown').replace(/\d+/g, 'N').slice(0, 160))) });
+  }
+  return out;
+}
+
+const DRAIN_OK = new Set(['enqueued', 'not-enqueued', 'skipped', 'not-listed']);
+const DRAIN_RE2 = /^\[drain-daemon\] (\S+Z) enqueue-on-event: catch-up #\d+ fast drain exit (\S+?)[ ,].*? — (.*?) \[outcome=([a-z-]+)\]/;
+
+/** Drain catch-up: one line per fast drain; outcome error/timeout/other/refused is a failure, the rest reached a verdict. */
+export function parseDrainCatchupTicks(text) {
+  const out = [];
+  for (const line of String(text ?? '').split('\n')) {
+    if (!line.includes('fast drain exit') || !line.includes('catch-up #')) continue;
+    const m = DRAIN_RE2.exec(line);
+    if (!m) continue;
+    const at = Date.parse(m[1]);
+    if (!Number.isFinite(at)) continue;
+    const ok = DRAIN_OK.has(m[4]);
+    out.push({ at, loop: 'drain-catchup', attempted: 1, succeeded: ok ? 1 : 0, failed: ok ? 0 : 1,
+      error: ok ? null : `exit ${m[2]}: ${m[3].replace(/\d+/g, 'N').slice(0, 140)} [${m[4]}]` });
+  }
+  return out;
+}
+
+/** Merge new records into the kept memory; drop anything older than the window, cap the size. */
+export function mergeLoopTicks(prev, fresh, { now, windowMs = 60 * MINUTE, max = 2000 } = {}) {
+  const keep = [...(Array.isArray(prev) ? prev : []), ...(fresh || [])].filter((r) => r && now - r.at <= windowMs + 10 * MINUTE);
+  const seen = new Set();
+  const uniq = [];
+  for (const r of keep.sort((a, b) => a.at - b.at)) {
+    const k = `${r.loop}|${r.at}|${r.succeeded}|${r.failed}`;
+    if (seen.has(k)) continue;
+    seen.add(k); uniq.push(r);
+  }
+  return uniq.slice(-max);
+}
