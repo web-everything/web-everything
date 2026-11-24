@@ -289,7 +289,7 @@ function mirroredRunContext(job, text) {
     "${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}",
     "${{ always() && needs.changes.outputs.light != 'true' }}",
     fullUnit,
-    "${{ steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true' }}",
+    "${{ needs.changes.outputs.light != 'true' && (steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true') }}",
   ][index]) : job === 'changes' && index === 1 ? "github.event_name == 'pull_request'"
     : job === 'changes' && index === 2 ? "github.event_name == 'push' && github.ref == 'refs/heads/main'"
       : job === 'integration-part' && (setup || index === 1) ? fullIntegration

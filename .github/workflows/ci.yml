@@ -353,7 +353,7 @@ jobs:
       # Only this run's actual, successful test invocation can attest full coverage. Historical ops/quarantine
       # entries may expire or be removed before main considers reuse, so checking the current list is insufficient.
       - name: Full test run (no quarantine exclusions)
-        if: ${{ steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true' }}
+        if: ${{ needs.changes.outputs.light != 'true' && (steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true') }}
         run: echo "All assigned tests ran without quarantine exclusions"
 
       # Upload this shard's partial coverage for the `coverage-merge` job to merge. `if-no-files-found: error`

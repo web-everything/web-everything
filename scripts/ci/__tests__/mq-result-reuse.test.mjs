@@ -166,7 +166,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     const receipt = steps.find(s => s.name === RECEIPT);
     expect(receipt).toMatchObject({ run: 'echo "All assigned tests ran without quarantine exclusions"' });
     expect(receipt.if).toBe(job === 'test-shard'
-      ? "${{ steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true' }}"
+      ? "${{ needs.changes.outputs.light != 'true' && (steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true') }}"
       : "${{ steps.suite.outputs.full == 'true' }}");
     expect(receipt['continue-on-error']).toBeUndefined();
     expect(step.id).toBe(id);
