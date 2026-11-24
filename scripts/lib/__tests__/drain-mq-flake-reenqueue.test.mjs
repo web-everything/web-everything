@@ -73,6 +73,16 @@ function fixture({ checks = [job(21)], events = history(1), mergeState = 'CLEAN'
       return JSON.stringify({ total_count: currentChecks.length,
         check_runs: currentChecks.slice((page - 1) * limit, page * limit) });
     }
+    const jobId = /\/actions\/jobs\/(\d+)$/.exec(endpoint ?? '')?.[1];
+    if (jobId) {
+      const check = currentChecks.find(check => check.details_url.endsWith(`/job/${jobId}`));
+      if (!check) throw new Error('unknown Actions job');
+      return JSON.stringify({ id: Number(jobId), run_id: 201, head_sha: check.head_sha,
+        name: check.name, conclusion: check.conclusion,
+        run_url: `https://api.github.com/repos/${repo}/actions/runs/201` });
+    }
+    if (endpoint === `repos/${repo}/actions/runs/201`) return JSON.stringify({ id: 201,
+      head_sha: mergeCommit, event: 'merge_group', path: '.github/workflows/ci.yml', repository: { full_name: repo } });
     if (/\/actions\/jobs\/\d+\/logs$/.test(endpoint ?? '')) return logText;
     if (endpoint?.startsWith(`repos/${repo}/actions/workflows/ci.yml/runs?`)) {
       const run = { id: 102, conclusion: 'success', status: 'completed',

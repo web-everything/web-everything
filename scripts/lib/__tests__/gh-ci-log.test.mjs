@@ -103,8 +103,8 @@ const deferredFindingReaders = new Map([
   ['scripts/conveyor/main-ci-red-probe.mjs', 0], // Reads logs through ciJobLogApiArgs.
   ['scripts/conveyor/reconcile-pass.mjs', 1],
   ['scripts/conveyor/stale-base-refresh.mjs', 1],
-  ['scripts/lib/drain-mq-failure-recovery-io.mjs', 1],
-  ['scripts/lib/drain-queue-safety.mjs', 2],
+  ['scripts/lib/drain-mq-failure-recovery-io.mjs', 0], // All MQ failure-path log reads use the helper.
+  ['scripts/lib/drain-queue-safety.mjs', 0],
   ['scripts/lib/finished-ci-cache.mjs', 0],
   ['scripts/lib/red-main-quarantine-io.mjs', 1], // Only the documented shell command remains; readJobFailures uses the helper.
   ['scripts/lib/renamed-pr-refresh.mjs', 1],
@@ -158,7 +158,7 @@ describe('CI log reader structural guard', () => {
         } else if (deferredTimeoutReaders.has(name)) {
           expect(issues, name).toEqual([]);
         } else if (deferredFindingReaders.has(name)) {
-          expect({ name, bypasses: issues.length }).toEqual({ name, bypasses: deferredFindingReaders.get(name) });
+          expect({ name, bypasses: issues.length }, issues.join('\n')).toEqual({ name, bypasses: deferredFindingReaders.get(name) });
         } else {
           for (const issue of issues) violations.push(`${name}: ${issue}`);
         }

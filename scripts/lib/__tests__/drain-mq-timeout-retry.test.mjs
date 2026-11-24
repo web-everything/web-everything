@@ -8,11 +8,11 @@ import { enqueuePr, ENQUEUE_MUTATION } from '../merge-queue-enqueue.mjs';
 const roots = [];
 const root = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'mq-timeout-')); roots.push(dir); return dir; };
 afterEach(() => { roots.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })); });
-it('pure timeout allows exactly one re-enqueue, durably across guard instances', () => {
+it('pure timeout without pass proof refuses across guard instances', () => {
   const dir = root();
   const first = timeoutFixture(dir).guard();
-  expect(first.hold).toBe(false);
-  expect(first.line).toContain('mq-flake-timeout');
+  expect(first.hold).toBe(true);
+  expect(first.line).toContain('failed_checks');
   expect(timeoutFixture(dir).guard().hold).toBe(true);
 });
 it('a second flake failure on the same head stays refused', () => {
@@ -37,20 +37,21 @@ it('stderr picker skips real Node warnings and trace hint, preserving fallback a
   expect(firstStderrErrorLine(noise + '\nAuthorization: Bearer abc')).toBe('[redacted]');
 });
 
-it('preflight and dry-run leave the mutation allowance available', () => {
+it('preflight, dry-run and mutation all refuse timeout-only evidence', () => {
   const dir = root();
-  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(false);
-  expect(timeoutFixture(dir, { dryRun: true }).guard().hold).toBe(false);
-  expect(timeoutFixture(dir).guard().hold).toBe(false);
+  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir, { dryRun: true }).guard().hold).toBe(true);
+  expect(timeoutFixture(dir).guard().hold).toBe(true);
   expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
 });
-it('unreadable ledger refuses with an operator-visible fallback', () => {
-  const result = timeoutFixture(root(), { ledger: { atomicUpdate() { throw Error('corrupt'); } } }).guard();
+it('timeout-only evidence refuses before consulting the ledger', () => {
+  let reads = 0;
+  const result = timeoutFixture(root(), { ledger: { atomicUpdate() { reads++; throw Error('corrupt'); } } }).guard();
   expect(result.hold).toBe(true);
-  expect(result.line).toContain('inspect ledger and enqueue manually');
+  expect(reads).toBe(0);
 });
 
-it('ambiguous enqueue failure consumes the timeout allowance and refuses a fresh same-head enqueue', () => {
+it('timeout-only evidence blocks enqueue before any mutation', () => {
   const dir = root(), repo = 'fixture/timeout', num = 42;
   const headSha = 'a'.repeat(40), baseSha = 'c'.repeat(40);
   let mutations = 0;
@@ -79,18 +80,18 @@ it('ambiguous enqueue failure consumes the timeout allowance and refuses a fresh
     },
   });
 
-  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(false);
-  expect(enqueue()).toEqual({ ok: false, error: 'enqueue response timed out' });
+  expect(timeoutFixture(dir, { preflight: true }).guard().hold).toBe(true);
+  expect(enqueue()).toMatchObject({ ok: false, held: true, reason: 'mq-same-head-failed' });
   expect(admissions).toHaveLength(1);
-  expect(admissions[0]).toMatchObject({ hold: false, line: expect.stringContaining('mq-flake-timeout') });
-  expect(mutations).toBe(1);
+  expect(admissions[0].hold).toBe(true);
+  expect(mutations).toBe(0);
   const fresh = timeoutFixture(dir, { preflight: true }).guard();
   expect(fresh.hold).toBe(true);
-  expect(fresh.line).toContain('retry already spent');
+  expect(fresh.line).toContain('failed_checks');
   expect(enqueue()).toMatchObject({ ok: false, held: true, reason: 'mq-same-head-failed' });
   expect(admissions).toHaveLength(2);
   expect(admissions[1].hold).toBe(true);
-  expect(mutations).toBe(1);
+  expect(mutations).toBe(0);
 });
 
 it('timeout log missing only the final exit annotation stays refused', () => {

@@ -27,6 +27,12 @@ export function timeoutFixture(root, { text = timeoutLog, unreadable = false, re
     if (args.includes('mergeStateStatus,headRefOid')) return JSON.stringify({ headRefOid: head, mergeStateStatus: 'CLEAN' });
     const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`));
     if (endpoint?.includes('/check-runs?')) return JSON.stringify({ total_count: checks.length, check_runs: checks });
+    const job = /\/actions\/jobs\/([1-3])$/.exec(endpoint ?? '');
+    if (job) return JSON.stringify({ id: Number(job[1]), run_id: 201, head_sha: merge,
+      name: checks[Number(job[1]) - 1].name, conclusion: 'failure',
+      run_url: `https://api.github.com/repos/${repo}/actions/runs/201` });
+    if (endpoint?.endsWith('/actions/runs/201')) return JSON.stringify({ id: 201, head_sha: merge,
+      event: 'merge_group', path: '.github/workflows/ci.yml', repository: { full_name: repo } });
     if (endpoint?.endsWith('/logs')) {
       if (unreadable) throw Error('logs expired');
       return endpoint.includes('/jobs/1/') ? text : '##[error]Unit shards did not succeed.\n##[error]Process completed with exit code 1.';

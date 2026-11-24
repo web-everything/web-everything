@@ -238,7 +238,7 @@ describe('mq derived failed jobs', () => {
     const io = fixture();
     io.listJobs.mockResolvedValue({ jobs, complete: true, nextPage: null });
     io.readJobLog.mockImplementation(async ({ jobId }) => ({ text: jobId === shard.id ? shardLog
-      : 'Some required jobs were not successful.', complete: true }));
+      : 'Some required jobs were not successful.\n##[error]Process completed with exit code 1.', complete: true }));
     return io;
   }
 
@@ -251,7 +251,8 @@ describe('mq derived failed jobs', () => {
       if (shape === 'real aggregate shell lines' || shape === 'unattributed aggregate status markers') {
         io.readJobLog.mockImplementation(async ({ jobId }) => ({ text: jobId === shard.id ? shardLog
           : aggregateShellLog + '\nSome required jobs were not successful.'
-            + (shape === 'unattributed aggregate status markers' ? '\nfailure: upstream shard failed' : ''), complete: true }));
+            + (shape === 'unattributed aggregate status markers' ? '\nfailure: upstream shard failed' : '')
+            + '\n##[error]Process completed with exit code 1.', complete: true }));
       }
       const evidence = await collect(io);
       expect(evidence).toMatchObject({ complete: true, failedJobs: jobs.map(job => job.name),
@@ -321,7 +322,7 @@ describe('mq derived failed jobs', () => {
   it('unknown lint with only the aggregate shell noise remains incomplete', async () => {
     const io = jobsFixture([shard, ...aggregates, { id: 904, name: 'lint', conclusion: 'failure' }]);
     io.readJobLog.mockImplementation(async ({ jobId }) => ({ text: jobId === shard.id ? shardLog
-      : jobId === 904 ? aggregateShellLog : 'Some required jobs were not successful.', complete: true }));
+      : jobId === 904 ? aggregateShellLog : 'Some required jobs were not successful.\n##[error]Process completed with exit code 1.', complete: true }));
     const evidence = await collect(io);
     expect(evidence.failedJobs).toContain('lint');
     expect(evidence.complete).toBe(false);

@@ -368,6 +368,7 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
       return base(command, args, opts);
     });
     f.guard = () => mqSameHeadGuard({ repo, pr, head, exec: f.exec, log: f.log, now: REMOVED_AT + 3_600_000,
+      timeoutLedger: f.timeoutLedger, allowAlreadyQueued: !f.mutation,
       quarantine: { readList: () => f.list, now: () => NOW } });
     tweak(f);
     test(f);
@@ -378,6 +379,45 @@ describe('merge-queue same-head retry for evidence-backed flakes', () => {
     expect(result.hold).toBe(false);
     expect(f.log.mock.calls[0][0]).toMatch(/^mq-same-head-retry: #6499 head \w+ — failed_checks flake retry 1\/1/);
   }));
+
+  const timeoutEvidence = f => {
+    for (const c of f.checks) Object.assign(c, { head_sha: mergeCommit,
+      started_at: new Date(REMOVED_AT - 120_000).toISOString(),
+      completed_at: new Date(REMOVED_AT - 60_000).toISOString() });
+    f.logs[31] = f.logs[31].replace('\n Test Files', '\nError: Test timed out in 5000ms.\n Test Files');
+    const base = f.exec;
+    f.exec = vi.fn((command, args, opts) => {
+      const endpoint = args[1];
+      if (endpoint === `repos/${repo}/actions/runs/800`) return JSON.stringify({ id: 800, head_sha: mergeCommit,
+        event: 'merge_group', path: '.github/workflows/ci.yml', repository: { full_name: repo } });
+      const id = /\/actions\/jobs\/(31|32|33)$/.exec(endpoint ?? '')?.[1];
+      if (id) return JSON.stringify({ id: Number(id), run_id: 800, head_sha: mergeCommit,
+        name: f.checks.find(c => c.id === Number(id)).name, conclusion: 'failure',
+        run_url: `https://api.github.com/repos/${repo}/actions/runs/800` });
+      return base(command, args, opts);
+    });
+    let state = {};
+    f.timeoutLedger = { atomicUpdate(update) { const next = update(state); state = next.state; return next.result; } };
+  };
+
+  it('timeout with per-test head and later-main pass proof qualifies and consumes one allowance', () => setup(f => {
+    const result = f.guard();
+    expect(result).toMatchObject({ hold: false, line: expect.stringContaining('mq-flake-timeout') });
+    expect(f.guard().hold).toBe(true);
+  }, f => {
+    timeoutEvidence(f);
+    f.mutation = true;
+  }));
+
+  it.each(['missing head pass', 'missing main pass', 'red main'])(
+    'timeout refuses incomplete flake proof: %s', mode => setup(f => {
+      expect(f.guard().hold).toBe(true);
+    }, f => {
+      timeoutEvidence(f);
+      if (mode === 'missing head pass') f.headJson = { testResults: [] };
+      if (mode === 'missing main pass') f.mainJson = { testResults: [] };
+      if (mode === 'red main') f.mainRuns[0].conclusion = 'failure';
+    }));
 
   it('still retries when an unrelated workflow (review-gate) failed on the PR head', () => setup(f => {
     expect(f.guard().hold).toBe(false);

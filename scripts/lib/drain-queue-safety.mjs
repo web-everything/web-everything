@@ -1,3 +1,4 @@
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { mqTimeoutRetryAllowance } from './mq-failure-ledger.mjs';
 /** Queue admission and removal share this policy and head-bound red-team evidence. */
 import { inspectMqReruns, requestMqReruns, readMqTimeoutFailure } from './drain-mq-flake-rerun.mjs';
@@ -139,7 +140,8 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
   // Evidence-backed flake: the same failing test(s) passed on the PR head's CI and on a later main run. Once per head.
   const flakeRetry = retryEvidence?.infra === 'flaky-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
-  const timeoutRetry = retryEvidence?.infra === 'mq-flake-timeout' && retryEvidence.mergeState === 'CLEAN'
+  const timeoutRetry = retryEvidence?.infra === 'mq-flake-timeout' && retryEvidence.mainGreen === true
+    && retryEvidence.testPassProven === true && retryEvidence.mergeState === 'CLEAN'
     && failedChecksRemovals === 1 && reenqueuedAfterFailure === 0;
   const exactTestRetry = retryEvidence?.infra === 'exact-test' && retryEvidence.mainGreen === true
     && retryEvidence.mergeState === 'CLEAN' && failedChecksRemovals === 2 && reenqueuedAfterFailure === 1;
@@ -161,7 +163,7 @@ export function decideMqSameHead({ pr, head, timeline, mergeState, retryEvidence
     ? hold((cancelledRetry ? `failed_checks cancelled/regroup retry ${reenqueuedAfterFailure + 1}/${cancelledMax} (no failed required job; cancelled: ${retryEvidence.cancelledNames.join(', ')}; aggregate derived: ${retryEvidence.derivedNames.join(', ') || 'none'}; PR CLEAN)`
       : quarantineRetry ? 'failed_checks quarantine retry 1/1 (every failing test quarantined, PR CLEAN)'
       : flakeRetry ? 'failed_checks flake retry 1/1 (failing test(s) passed on the PR head CI and on a later main run, PR CLEAN)'
-      : timeoutRetry ? 'failed_checks mq-flake-timeout retry 1/1 (only Vitest test timeouts, PR CLEAN)'
+      : timeoutRetry ? 'failed_checks mq-flake-timeout retry 1/1 (per-test flake proof, main green, PR CLEAN)'
       : exactTestRetry ? 'failed_checks exact-test retry 2/2 (sole failing test passed on the PR head CI, same head, PR CLEAN, main green)'
       : `failed_checks infra retry ${failedChecksRemovals}/2 (main green, PR CLEAN, ${retryEvidence.infra}${retryEvidence.infra === 'rerun-green' ? ' — rerun-confirmed flake' : ''})`) + retryDetails).line
       .replace(/^mq-same-head-failed:/, 'mq-same-head-retry:')
@@ -413,7 +415,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
     }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
-    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+    const read1 = (endpoint, max) => String(exec('gh', endpoint.endsWith('/logs') ? ciJobLogApiArgs(endpoint) : ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
       maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
@@ -493,7 +495,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
     const read = (endpoint, binary = false) => {
       // The staged executor owns the shared allowance, including base-reader IO and cached requests.
-      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
+      return exec('gh', endpoint.endsWith('/logs')
+        ? ciJobLogApiArgs(`repos/${repo}/${endpoint}`) : ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
     };
@@ -700,7 +703,7 @@ function readMqRetryEvidence(options) {
     : { ...evidence, mergeState: readMqMergeState({ repo: options.repo, pr: options.pr, head, exec: uncachedExec }) };
   const baseOptions = { ...options, exec, now };
   const base = readMqBaseRetryEvidence(baseOptions);
-  if (['cancelled-regroup', 'mq-flake-timeout'].includes(base?.infra)) return live(base);
+  if (base?.infra === 'cancelled-regroup') return live(base);
   if (base?.mergeState === 'CLEAN' && (base.infra === 'quarantined'
     || base.mainGreen === true && ['infra', 'rerun-green', 'main-red'].includes(base.infra))) return live(base);
   // The exact-test reader alone may read ONE job log: the failed shard's, for vitest's final summary block (a bounded tail).
@@ -758,13 +761,13 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
     };
     const logCache = new Map(), read = exec;
     exec = (file, args, options) => {
-      const endpoint = file === 'gh' && args.find(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg));
-      if (!endpoint) return read(file, args, options);
-      if (!logCache.has(endpoint)) {
-        try { logCache.set(endpoint, { value: read(file, args, options) }); }
-        catch (error) { logCache.set(endpoint, { error }); }
+      const jobLogEndpoint = file === 'gh' && args.find(arg => /\/actions\/jobs\/[1-9][0-9]*\/logs$/.test(arg));
+      if (!jobLogEndpoint) return read(file, args, options);
+      if (!logCache.has(jobLogEndpoint)) {
+        try { logCache.set(jobLogEndpoint, { value: read(file, args, options) }); }
+        catch (error) { logCache.set(jobLogEndpoint, { error }); }
       }
-      const cached = logCache.get(endpoint);
+      const cached = logCache.get(jobLogEndpoint);
       if (cached.error) throw cached.error;
       return cached.value;
     };
@@ -808,10 +811,10 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
       && MQ_AGGREGATE_SUMMARY_STEPS.has(localJob(check.name)));
     const failedNames = failed.map(check => (typeof check.name === 'string' ? check.name : 'unnamed')
       .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ')).slice(0, 5);
-    // Timeout recovery never requests a job rerun. All failed logs must prove timeouts or upstream gates.
-    if (readMqTimeoutFailure({ failed, attempts, repo, exec, spend: () => {
+    // A timeout is a failure signature, never flake proof. Continue through the existing evidence gates.
+    const timeoutOnly = readMqTimeoutFailure({ failed, attempts, repo, exec, spend: () => {
         if (budget-- <= 2) throw new Error('timeout evidence budget exceeded; operator inspection required');
-      } })) return { infra: 'mq-flake-timeout', failedNames, mergeState: readMqMergeState({ repo, pr, head, exec }) };
+      } });
     // readQuarantineCover validates the aggregators itself (positive evidence, no uncovered failure), so a
     // quarantined shard failure still earns its single retry when `test`/`coverage-merge` fail with it.
     if (!cancelledRegroup && failed.length <= MQ_INFRA_MAX_JOBS && readQuarantineCover({ repo, commit: oid, failed, exec, quarantine }))
@@ -830,7 +833,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
+          const log = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
           if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
@@ -915,7 +918,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
           budget--;
-          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
+          const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
@@ -1103,7 +1106,8 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         : `newest completed run ${deciding.id} ${stale ? 'stale (older than 2h); wait for fresh main CI before retrying' : `concluded ${deciding.conclusion}`}`,
       failedNames,
       derivedNames,
-      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? 'flaky-test' : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      infra: blocked ? null : infra ? (attempts.confirmed ? 'rerun-green' : 'infra') : flaky ? (timeoutOnly ? 'mq-flake-timeout' : 'flaky-test') : !hasAggregateCandidates && !logReason && mainRed ? 'main-red' : null,
+      testPassProven: flaky,
       logReason,
       flakeReason: flaky ? null : flakeReason,
       mergeState };
