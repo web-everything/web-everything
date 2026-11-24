@@ -38,6 +38,10 @@ describe('R1086 measured host saturation', () => {
   it('refuses an unsaturated host with measured idle and an operator fallback', () => {
     expect(decide({ saturation: () => host(80) })).toMatchObject({ ok: false, reason: 'ci-only-not-saturated', detail: expect.stringMatching(/CPU idle 80%.*retry local verification/) });
   });
+  it.each(['park', 'label-on-green', 'open-only'])('ordinary %s keeps ci-only-not-saturated when saturated=false', mode => {
+    expect(decide({ mode, saturation: () => ({ saturated: false, reason: 'idle host' }) }))
+      .toMatchObject({ ok: false, reason: 'ci-only-not-saturated' });
+  });
   it('refuses land and every bad value before sampling, while omission leaves the guard alone', () => {
     const saturation = vi.fn();
     expect(decide({ mode: 'land', saturation })).toMatchObject({ ok: false, reason: 'bad-verify' });

@@ -396,7 +396,7 @@ function resolveBuildDefaultGate(env) {
     const reason = `build.finalGateStandards=${policy.finalGateStandards} (${policy.sources.finalGateStandards}); standards=${gate.decision.standards.policy} (${source})`;
     gate.gateReasons.push(reason);
     gate.decision.reasons = [...gate.decision.reasons, reason];
-    if (policy.finalGate === 'full') {
+    if (policy.finalGate === 'full' && gate.decision.mode !== 'full') {
       const downgrade = `build.finalGate=full (${policy.sources.finalGate}) downgraded to related selection — ${explicitFull ? 'no test:unit script in this checkout' : 'whole-suite execution requires an explicit tool/env opt-in'}; CI owns exhaustive verification`;
       gate.gateReasons.push(downgrade);
       gate.decision.reasons.push(downgrade);
@@ -461,7 +461,8 @@ if (typeof flags.gate === 'string') {
     let defaultBlocked = false;
     try {
       const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
-      defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
+      // A runnable broad fallback still requires affected-test evidence for an explicit override.
+      defaultBlocked = ['blocked', 'full'].includes(decision.mode) && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
     // The policy's own explicit (tool/env) whole-unit-tier command is the default gate, not an agent-supplied one.
     const policyFull = (() => { try {
