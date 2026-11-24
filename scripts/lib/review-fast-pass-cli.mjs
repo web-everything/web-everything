@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withSelfSync } from './daemon-self-sync.mjs';
-import { checkMainStaleness, runInCheckout } from './main-staleness.mjs';
+import { checkMainStaleness, gitRun as runIn } from './main-staleness.mjs';
 import { runFastPass } from './review-fast-pass.mjs';
 import { runGhSync } from './gh-throttle.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -71,7 +71,7 @@ export function fastPassOptions({ repo, options, budget = options.liveReviewBudg
       if (live?.headRefOid !== args.expectedHead) throw Error('head moved or unreadable before spawn');
       return options.dispatch({ ...args, strictStackEvidence: true, checkStaleness: checkout => {
         const evidence = staleness({ autoFf: false, cleanOnly: true, strict: true,
-          run: runInCheckout(checkout) });
+          run: argv => runIn(argv, { cwd: checkout }) });
         if (!evidence || evidence.offline || (!evidence.fresh && evidence.action !== 'warn')) throw Error('main freshness unknown');
         return evidence;
       } });

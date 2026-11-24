@@ -40,9 +40,6 @@ export function gitRun(args, opts = {}) {
   return { status: r.status == null ? 1 : r.status, stdout: r.stdout || '', stderr: r.stderr || '' };
 }
 
-/** A `run` for checkMainStaleness bound to one checkout directory. */
-export const runInCheckout = cwd => args => gitRun(args, { cwd });
-
 /**
  * Classify a local-vs-origin comparison into an action. Pure.
  *   { fresh:true }                 — up to date (behind 0).
