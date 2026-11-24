@@ -53,7 +53,9 @@ import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-poli
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { fixPushGate } from '../lib/review-timing.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
-import { readReviewHead, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
+import { readReviewHead, readReviewHeadAndLabels, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
+import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { headCiVerdict } from './fix-push-ci.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
@@ -420,6 +422,30 @@ function holdHandBack(row, record, gate, persist, nowMs, kind = 'green') {
   } else Object.assign(row, { action: 'wait', reason: `${kind}; ${gate.hold}` });
 }
 
+/**
+ * Rows with a merge-gate red that is only a hold (review path's `excuseMergeGateRows`, plus a verdict whose every
+ * blocking row is `red-main-freeze`) rewritten so it is no CI failure. Any other hold, an unreadable verdict, the
+ * setting off, or any thrown error returns the rows unchanged (fail closed). Only merge-gate rows are touched.
+ */
+export function excusePreviousCiChecks({ checks, prNumber, headSha, labels, setting, readVerdict, freeze }) {
+  try {
+    if (!latestFailingMergeGate(checks)) return checks;
+    const viaClassifier = excuseMergeGateRows(checks, { prNumber, headSha, labels, setting, readVerdict, freeze });
+    if (viaClassifier.excused || viaClassifier.reviewHold) return viaClassifier.rows;
+    if ((typeof setting === 'string' ? setting : setting?.value) !== 'on') return checks;
+    const row = latestFailingMergeGate(checks);
+    const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0 || !headSha || !Number.isSafeInteger(prNumber)) return checks;
+    const verdict = readVerdict({ jobId, prNumber });
+    if (verdict?.error || verdict?.num !== prNumber || String(verdict?.head_sha ?? '').toLowerCase() !== String(headSha).toLowerCase()
+      || verdict.ok !== false || !Array.isArray(verdict.results)) return checks;
+    const holds = verdict.results.filter(r => r?.status === 'hold' || r?.status === 'fail-closed');
+    if (!holds.length || !holds.every(r => r.id === 'red-main-freeze' && r.status === 'hold')) return checks;
+    const excused = { ...row, conclusion: 'success', mergeGateHoldExcused: { kind: 'red-main-freeze', holds, jobId } };
+    return checks.map(r => r === row ? excused : r);
+  } catch { return checks; }
+}
+
 /** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
 const UNCLEARABLE_DONE = new Set();
 /** The last fix-push-policy line this process logged (see runAwaitVerifyPass). */
@@ -454,6 +480,12 @@ async function previousCiPushGate({ io, record, nowMs, policy, persist }) {
       required = (await io.readPreviousRequired({ repo: record.repo, ttlMs: 0 }))?.checks ?? [];
       checks = await io.readPreviousChecks({ repo: record.repo, headSha: state.headSha });
     } catch { /* Incomplete evidence remains held until the bound. */ }
+    // A merge-gate red that is only a hold (freeze) is not a CI failure; unreadable evidence keeps the raw rows.
+    try {
+      if (Array.isArray(checks) && typeof io.excusePreviousChecks === 'function') {
+        checks = (await io.excusePreviousChecks({ repo: record.repo, pr: record.pr, headSha: state.headSha, checks })) ?? checks;
+      }
+    } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
   }
   const decision = state.headSha === lower(record.sha) ? { action: 'push', reason: 'already-on-remote' }
     : fixPushGate({ previousHeadChecks: checks, requiredChecks: required, firstHeldAt: state.firstHeldAt, now: nowMs, policy });
@@ -1140,6 +1172,9 @@ export async function defaultAwaitVerifyIo({
     },
     readPreviousHead: readReviewHead,
     readPreviousChecks: readReviewChecks,
+    excusePreviousChecks: ({ repo, pr, headSha, checks }) => excusePreviousCiChecks({ checks, prNumber: Number(pr), headSha,
+      labels: readReviewHeadAndLabels({ repo, pr }).labels, setting: loadMergeGateHoldSetting(),
+      readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readSharedFreeze() }),
     readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
     infraFallbackToCi: () => { let tool; try { tool = readSettings()?.verify; } catch { /* absent tool layer */ } return resolveInfraFallbackToCi({ env, tool }); },

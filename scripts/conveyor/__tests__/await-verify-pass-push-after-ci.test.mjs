@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { runAwaitVerifyPass, defaultAwaitVerifyIo } from '../await-verify-pass.mjs';
+import { runAwaitVerifyPass, defaultAwaitVerifyIo, excusePreviousCiChecks } from '../await-verify-pass.mjs';
 import { main as markAwaitVerify } from '../await-verify.mjs';
 import ciBreak from '../soak/breaks/claude-fix-push-after-ci.mjs';
 
@@ -366,5 +366,50 @@ describe('Claude verify harness honors fix.pushAfterCi', () => {
 
   it('replays the supported Claude path as a daemon soak break', async () => {
     expect(ciBreak.judge(await ciBreak.run())).toEqual([]);
+  });
+});
+
+describe('a merge-gate red held only by the red-main freeze is not a previous-CI failure', () => {
+  const gate = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+    details_url: 'https://github.com/o/r/actions/runs/1/job/42' };
+  const hold = (id, status = 'hold') => ({ id, status, reason: `${id} reason` });
+  const build = ({ results, ok = false, setting = 'on' }) => {
+    const h = harness();
+    h.state.required = ['test', 'merge-gate'];
+    h.state.checks = [{ name: 'test', status: 'completed', conclusion: 'success' }, { ...gate }];
+    h.io.excusePreviousChecks = ({ checks, headSha }) => excusePreviousCiChecks({ checks, prNumber: 6085, headSha,
+      labels: [], setting, readVerdict: () => ({ num: 6085, head_sha: headSha, ok, results }), freeze: () => ({ frozen: true }) });
+    return h;
+  };
+  it('pushes without a CI-failure handoff when the only hold is red-main-freeze', async () => {
+    const h = build({ results: [hold('red-main-freeze')] });
+    await h.tick();
+    expect(h.state.pushes).toHaveLength(1);
+    expect(h.state.resumes).toHaveLength(0);
+    expect(h.record()?.previousCi?.ready?.ciFailures ?? []).toEqual([]);
+  });
+  it('still treats a real merge-gate failure beside the freeze as a CI failure', async () => {
+    const h = build({ results: [hold('red-main-freeze'), hold('codeql')] });
+    await h.tick();
+    expect(h.state.pushes).toHaveLength(0);
+    expect(h.state.resumes[0].prompt).toContain('"name":"merge-gate"');
+  });
+  it.each([
+    ['an unknown hold class', { results: [hold('some-new-gate')] }],
+    ['a fail-closed freeze row', { results: [hold('red-main-freeze', 'fail-closed')] }],
+    ['an unreadable verdict', { results: undefined }],
+    ['the setting off', { results: [hold('red-main-freeze')], setting: 'off' }],
+  ])('fails closed on %s', async (_name, opts) => {
+    const h = build(opts);
+    await h.tick();
+    expect(h.state.pushes).toHaveLength(0);
+    expect(h.state.resumes[0].prompt).toContain('"name":"merge-gate"');
+  });
+  it('never excuses a real test failure', async () => {
+    const h = build({ results: [hold('red-main-freeze')] });
+    h.state.checks[0] = { name: 'test', status: 'completed', conclusion: 'failure' };
+    await h.tick();
+    expect(h.state.pushes).toHaveLength(0);
+    expect(h.state.resumes[0].prompt).toContain('"name":"test"');
   });
 });

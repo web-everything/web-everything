@@ -191,6 +191,14 @@ describe('classifyPr', () => {
     expect(classifyPr(pr({ labels: ['review:pending'], statusCheckRollup: [...rollup, { name: 'test-shard (3)', conclusion: 'FAILURE' }] }))).toBe('ci-red');
   });
 
+  it('does not read a REQUIRED review-gate red as ci-red, but a real required red still is (#7406)', () => {
+    const rollup = [{ name: 'review-gate', conclusion: 'FAILURE' }, { name: 'test', conclusion: 'SUCCESS' }];
+    const required = ['test', 'review-gate'];
+    expect(ciFailed(rollup, required)).toBe(false);
+    expect(classifyPr(pr({ labels: ['review:pending'], statusCheckRollup: rollup }), required)).not.toBe('ci-red');
+    expect(ciFailed([...rollup, { name: 'test', conclusion: 'FAILURE' }], required)).toBe(true);
+  });
+
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — LIVE INCIDENT 2026-09-26: `chalbert/web-
   // everything#2748`'s real rollup (`gh pr view 2748 --repo web-everything/web-everything --json
   // statusCheckRollup`) has every REQUIRED check (`test`/`smoke`/`daemon-soak`) green and ONLY the new

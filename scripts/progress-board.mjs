@@ -512,6 +512,8 @@ export function ciFailed(rollup, requiredChecks) {
   const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
   return collapseRollupToLatestPerName(rollup).some((c) => {
     const name = String(c?.name ?? '');
+    // `review-gate` is red BY DESIGN under a review hold, even when branch protection requires it (#7406).
+    if (name === 'review-gate') return false;
     if (required) {
       if (!required.includes(name)) return false;
     } else if (CI_TRUTH_EXCLUDED_CHECKS.includes(name)) {
