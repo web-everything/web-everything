@@ -11,7 +11,7 @@ const PATHS = ['scripts/lane-pool.mjs'];
 /** Replays the live case; returns the origin URL of the lane the pool grew for pool "project". */
 export function replayPoolOrigin(root = ROOT) {
   const base = mkdtempSync(join(tmpdir(), 'soak-pool-origin-'));
-  const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = (args, cwd = base) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   try {
     const seed = (name) => {
       const bare = join(base, `${name}.git`), work = join(base, name);
