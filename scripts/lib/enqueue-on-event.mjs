@@ -762,10 +762,13 @@ const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|s
 const URL_USERINFO = /:\/\/[^/\s]*@/;
 
 /** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
+ * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
+ * opaque credentials under unrecognised env names, values under 3 chars, or escaped/ANSI-interrupted values.
+ * The spec (DRAIN-POSTMERGE-PROBE) deliberately publishes one sanitised first line.
  * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
 export function firstStderrErrorLine(stderr, env = {}) {
   const raw = String(stderr ?? '');
-  const line = raw.split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').trim()).find(Boolean);
+  const line = raw.split(/\r?\n/).map(l => l.replace(/[\u0000-\u001f\u007f-\u009f  ​-‏‪-‮⁠-⁤﻿]/g, ' ').trim()).find(Boolean);
   if (!line) return '';
   if (SECRET_LINE.test(line) || URL_USERINFO.test(line)) return '[redacted]';
   // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.

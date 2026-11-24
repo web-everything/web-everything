@@ -474,6 +474,8 @@ describe('createEnqueueOnEvent', () => {
     expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
     expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('')).toBe('');
+    const forged = enqueueModule.firstStderrErrorLine('real error [fake] merged 99​');
+    expect(forged).not.toMatch(/[  ​]/);
     expect(enqueueModule.firstStderrErrorLine('fetch https://alice:hunter2@example.test failed')).toBe('[redacted]');
     // Env-value redaction only (none of these match the pattern blacklist), including short, opaque, multiline and tab values.
     expect(enqueueModule.firstStderrErrorLine('boom abc12', { SERVICE_TOKEN: 'abc12' })).toBe('[redacted]');
