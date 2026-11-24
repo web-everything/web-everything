@@ -107,7 +107,7 @@ export default {
   // Decided by git ancestry of the fix commit (a removable export marker would let a regression hide itself).
   fixPresent(root) {
     try {
-      execFileSync('git', ['-C', root, 'merge-base', '--is-ancestor', 'fcc398bb1c', 'HEAD'], { stdio: 'ignore' });
+      execFileSync('git', ['merge-base', '--is-ancestor', 'fcc398bb1c', 'HEAD'], { cwd: root, stdio: 'ignore' });
       return true;
     } catch { return false; }
   },
