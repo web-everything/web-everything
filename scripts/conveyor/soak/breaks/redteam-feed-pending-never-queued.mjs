@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { CONSTELLATION_REPOS } from '../../../lib/constellation-repos.mjs';
+
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const FEED = 'scripts/lib/red-team-feed.mjs';
 const FIX_SHA = '7c9e367a63b0e60e902db67bb6c2d3612d4ec519';
@@ -25,7 +27,7 @@ export default {
       const head = 'b'.repeat(40);
       const pr = { number: 9, headRefOid: head, state: 'OPEN', isDraft: false, labels: ['red-team:pending'],
         comments: [{ author: { login: 'web-everything' }, body: buildReviewedShaMarker(head), createdAt: '2026-11-24T10:00:00Z' }] };
-      const plan = createRedTeamFeed({})({ repo: 'web-everything/web-everything', plan: { refusals: [] }, rawPrs: [pr] });
+      const plan = createRedTeamFeed({})({ repo: CONSTELLATION_REPOS.we.slug, plan: { refusals: [] }, rawPrs: [pr] });
       if (!plan.refusals.some(r => r.kind === 'already-reviewed-head' && r.prNumber === 9 && r.headSha === head)) {
         violations.push('finished-review red-team:pending PR was never nominated to the queue');
       }
