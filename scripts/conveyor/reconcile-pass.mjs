@@ -1040,7 +1040,9 @@ function mainRedMemoRead(memo, key, read, cacheable) {
  */
 export function enrichPrsWithMainRedFacts(prs, {
   readJobAttempt = defaultReadJobAttempt, readBudget = readTimeoutBudget,
-  readMainRuns = defaultReadMainRuns, readMainTip = defaultReadMainTip, readAheadBy = defaultReadAheadBy,
+  readMainRuns = defaultReadMainRuns, readAheadBy = defaultReadAheadBy,
+  // A caller that injects its own ahead-by reader gets no memo unless it also supplies a tip reader.
+  readMainTip = readAheadBy === defaultReadAheadBy ? defaultReadMainTip : () => null,
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   requiredCheck = null, requiredChecks = DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, defaultBranch = 'main', repo = null,
