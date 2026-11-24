@@ -26,6 +26,7 @@
     "scripts/conveyor/soak/breaks/reclaim-skips-liveness-gate-when-preserved.mjs": {"status":"pending-migration","reason":"S6: seed main and publish landed lane work for preserved-lane reclaim probes.","sites":9},
     "scripts/conveyor/soak/breaks/review-dispatch-stalls-on-unrelated-clone-lag.mjs": {"status":"pending-migration","reason":"S6: advance local main with unrelated landings to exercise review dispatch lag.","sites":12},
     "scripts/conveyor/soak/breaks/stale-ready-candidate-missing-overlay.mjs": {"status":"pending-migration","reason":"S6: seed main and competing lane branches for stale-ready overlay probes.","sites":16},
+    "scripts/conveyor/soak/breaks/waiver-carry-test-only.mjs": {"status":"pending-migration","reason":"S6: builds a throwaway local fixture repo to prove the waiver carry; no push.","sites":3},
     "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.mjs": {"status":"pending-migration","reason":"S6: attempt worker and fixer pushes to verify claim ownership enforcement.","sites":6},
     "scripts/conveyor/soak/fixtures/rebuild-evidence-probe.mjs": {"status":"pending-migration","reason":"S6: publish authored fixture changes to local remote refs for rebuild evidence.","sites":15},
     "scripts/lib/card-group.mjs": {"status":"pending-migration","reason":"S5: publish the combined card-group commit before queue admission.","sites":21},
