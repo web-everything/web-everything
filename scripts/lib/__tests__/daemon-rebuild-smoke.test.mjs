@@ -19,6 +19,11 @@ process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 // keep the same finite hang guard as those suites without making assertions depend on host speed.
 vi.setConfig({ testTimeout: 60_000 });
 
+// Like daemon-rebuild.test.mjs and daemon-rebuild-fallback.test.mjs, these cases create real Git repos and
+// rebuild candidate worktrees (including plain-main and last-good controls on failure). The boot-failure case
+// exceeded Vitest's 5s default in CI; use the sibling suites' bounded hang guard for subprocess-heavy fixtures.
+vi.setConfig({ testTimeout: 60_000 });
+
 const tempDirs = [];
 function mktemp(prefix) {
   const dir = mkdtempSync(join(tmpdir(), prefix));

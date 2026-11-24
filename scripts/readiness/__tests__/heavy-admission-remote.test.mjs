@@ -33,7 +33,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 
 // Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
-const remoteDefaults = { enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
+const remoteDefaults = { hosts:[{alias:'forge',root:'/srv/forge-exec'}], enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];

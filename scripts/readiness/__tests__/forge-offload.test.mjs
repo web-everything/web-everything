@@ -855,6 +855,11 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
       await fs.mkdir(join(root,'.claude'));
       await fs.writeFile(join(root,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{manifest:'legacy'}}}));
     });
+    it('rejects presync alias -V before transport IO', async()=>{
+      const transport=vi.fn();
+      expect(await presync({cwd:repo,host:'-V',exec:transport})).toEqual({status:'failed',reason:'invalid-host'});
+      expect(transport).not.toHaveBeenCalled();
+    });
     // Fake transport around the real runner: presync rsync mirrors the stage
     // into a local cache dir; run rsync honours --copy-dest like real rsync,
     // or plants wrong bytes when tamper is set.
@@ -926,6 +931,7 @@ fs.copyFileSync('a.test.mjs','node_modules/fixture/value');
       const f=await setup(),t=presyncTransport(f);
       const round=await presync({cwd:repo,exec:t.transport,sshOptions:[],env:{GITHUB_TOKEN:'ghs_secret',ANTHROPIC_API_KEY:'sk-secret',PATH:process.env.PATH}});
       expect(round).toMatchObject({status:'synced',count:1,bytes:7});
+      for(const call of t.calls.filter(c=>c.file==='ssh')) expect(call.args.slice(0,2)).toEqual(['--','forge']);
       const state=await remote.readPresyncState(gitDir());
       expect(state.baseManifestDigest).toBe(f.base.manifestDigest);
       const [copy]=presyncRsync(t.calls);

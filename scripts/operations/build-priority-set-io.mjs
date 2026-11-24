@@ -51,7 +51,7 @@ const GUARD_DEPENDENCY_BASENAMES = new Set([
   'model-proposer.mjs', 'needs-git-route.mjs', 'no-prompt-command-rules.mjs',
   'operator-override-reader.mjs', 'pid-alive.mjs', 'pid-liveness.mjs',
   'policy-cascade.mjs', 'pr-land-reasons.mjs', 'pr-snapshot-store.mjs',
-  'queue-store.mjs', 'registry.mjs', 'remote-exec.mjs',
+  'queue-store.mjs', 'registry.mjs', 'remote-exec.mjs', 'remote-target.mjs',
   'remote-git-bundle.mjs', 'repo-names.mjs', 'resource-admission.mjs',
   'resource-gate.mjs', 'resource-policy.mjs', 'scope-glob-overlap.cjs',
   'scope-lease.mjs', 'session-slug.mjs', 'settings-files.mjs',
