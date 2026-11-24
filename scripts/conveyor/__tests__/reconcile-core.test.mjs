@@ -1432,6 +1432,68 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
   // and stood down every tick — nobody ever asked "does this PR still need a review". `not-a-ci-break` closes
   // x6n7c2p keeps that escalation bookkeeping but requires observed successful CI before review.
   describe('not-a-ci-break escalation cannot override required CI (we:backlog/fix-review-ciheal-deadlock)', () => {
+    const escalatedPlan = (labels, statusCheckRollup = greenRollup, outcome = 'not-a-ci-break') => planReconcile({
+      prs: [pr2783({ labels: lbl(...labels), statusCheckRollup,
+        comments: [{ author: AUTOMATION, body: buildCiHealEscalationComment({
+          headSha: HEAD_2783, outcome, reason: 'recorded escalation',
+        }) }],
+      })], agents: [], now: NOW,
+    });
+
+    it('not-a-ci-break escalation still dispatches red-team for an accepted PR', () => {
+      const plan = escalatedPlan(['review:accepted', 'ci:failed']);
+      expect(plan.dispatch).toEqual([expect.objectContaining({
+        kind: 'review', prNumber: 2783, ciHealNotCiBreak: true,
+      })]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 2783 })]);
+    });
+
+    it('not-a-ci-break escalation folds the CI prerequisite for the re-review phase', () => {
+      const plan = escalatedPlan(['review:human'], redRollup);
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'review-ci' }),
+      })]);
+      const green = escalatedPlan(['review:human']);
+      expect(green.dispatch).toEqual([expect.objectContaining({ kind: 'review', phase: 'needs-human' })]);
+    });
+
+    it.each(['review:accepted', 'review:human', 'review:pending'])('needs-human escalation still blocks both for %s', label => {
+      const plan = escalatedPlan([label, 'ci:failed'], redRollup, 'needs-human');
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated' })]);
+      expect(plan.refusals[0].reviewRefusal).toBeUndefined();
+    });
+
+    it.each([
+      { state: 'red', rollup: redRollup },
+      { state: 'pending', rollup: pendingRollup },
+      { state: 'missing', rollup: [] },
+    ])('required checks $state plus not-a-ci-break never dispatches', ({ rollup }) => {
+      const plan = escalatedPlan(['review:accepted', 'ci:failed'], rollup);
+      expect(plan.dispatch).toEqual([]);
+    });
+
+    it('not-a-ci-break escalation keeps review:pending dispatch single', () => {
+      const plan = escalatedPlan(['review:pending', 'ci:failed']);
+      expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review', ciHealNotCiBreak: true })]);
+      expect(plan.refusals).toHaveLength(1);
+    });
+
+    it('not-a-ci-break escalation retains the accepted-head guard in the same refusal row', () => {
+      const escalation = buildCiHealEscalationComment({ headSha: HEAD_2783, outcome: 'not-a-ci-break' });
+      const plan = planReconcile({
+        prs: [pr2783({ labels: lbl('review:accepted', 'ci:failed'), statusCheckRollup: greenRollup,
+          comments: [{ body: escalation, author: AUTOMATION },
+            { body: buildReviewedShaMarker(HEAD_2783), author: AUTOMATION }],
+        })], agents: [], now: NOW,
+      });
+      expect(plan.dispatch).toEqual([]);
+      expect(plan.refusals).toEqual([expect.objectContaining({
+        kind: 'ci-heal-escalated', reviewRefusal: expect.objectContaining({ kind: 'already-reviewed-head' }),
+      })]);
+    });
+
     it('retains the ci-heal escalation and waits for required CI, with findings present', () => {
       const escalation = buildCiHealEscalationComment({
         headSha: HEAD_2783, outcome: 'not-a-ci-break',
@@ -1474,7 +1536,7 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
       expect(row.reviewRefusal).toEqual({ kind: 'cap-exhausted' });
     });
 
-    it('never fires without the `review:pending` label — an already-`review:accepted` PR is refused ci-heal-escalated alone', () => {
+    it('an accepted PR with red required CI folds its review refusal into the escalation', () => {
       const escalation = buildCiHealEscalationComment({ headSha: HEAD_2783, outcome: 'not-a-ci-break', reason: 'not a CI break' });
       const plan = planReconcile({
         prs: [pr2783({ labels: lbl('review:accepted'), comments: [{ body: escalation, author: AUTOMATION }] })],
@@ -1482,6 +1544,7 @@ describe('case 5l — a ci-heal already escalated THIS EXACT head never gets re-
       });
       expect(plan.dispatch).toEqual([]);
       expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 2783 })]);
+      expect(plan.refusals[0].reviewRefusal).toMatchObject({ kind: 'review-ci' });
     });
 
     it('a genuine needs-human escalation is UNCHANGED — still a hard stop, never a parallel review (regression guard)', () => {

@@ -3457,9 +3457,10 @@ export function planReconcile({
                 : `PR #${prNumber}: ci-heal escalated on head \`${escalation.headSha}\` — ${escalation.reason || 'needs a human judgment call'}; will not re-dispatch until a new push changes this head`,
           });
           if (escalation.outcome === 'needs-human') humanHandoffAdvisory('human-handoff');
-          // Retain the escalation and fold the review prerequisite into the same row.
-          // A comment claiming CI is irrelevant cannot override a required check's actual result.
-          if (isNotCiBreak && withPhase.labels.includes('review:pending')) {
+          // Retain the escalation and fold the review prerequisite into the same row for every
+          // review phase, including accepted and re-review PRs. The shared dispatcher still owns
+          // head eligibility and CI: this verdict cannot override a required check's actual result.
+          if (isNotCiBreak) {
             const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'ciHealNotCiBreak');
             dispatchReviewRow({
               pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
