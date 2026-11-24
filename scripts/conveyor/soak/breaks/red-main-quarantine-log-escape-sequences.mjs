@@ -4,11 +4,16 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const LOG = [
+  '##[group]Run npx vitest run',
+  '##[endgroup]',
   '2026-11-22T23:25:07.4285701Z \u001b[33m❯\u001b[39m scripts/conveyor/soak/daemon-soak.soak.test.mjs',
   '2026-11-22T23:25:07.6212213Z \u001b[2m Test Files \u001b[22m \u001b[1m\u001b[31m1 failed\u001b[39m\u001b[22m\u001b[90m (1)\u001b[39m',
   '2026-11-22T23:25:07.6212214Z Tests 1 failed',
   '2026-11-22T23:25:07.6221119Z \u001b[31m\u001b[1m\u001b[7m FAIL \u001b[27m\u001b[22m\u001b[39m scripts/conveyor/soak/daemon-soak.soak.test.mjs\u001b[2m > \u001b[22m50 real daemon ticks',
   '2026-11-22T23:25:07.6237099Z Error: Test timed out in 1020000ms.',
+  '⎯⎯⎯',
+  '##[error]Process completed with exit code 1.',
+  'Post job cleanup.',
 ].join('\n');
 /** A gh that behaves like 2.104: an escape-coded log is refused unless --allow-escape-sequences is passed. */
 const strictGh = (command, args) => {

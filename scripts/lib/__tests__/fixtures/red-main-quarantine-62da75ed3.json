@@ -42,5 +42,5 @@
       "name": "test"
     }
   ],
-  "log": " FAIL  scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs > #3383 daemon scenario simulator > A3: a main move t\nError: Test timed out in 180000ms.\n Test Files  1 failed | 26 passed (27)\n Tests 1 failed\n"
+  "log": "##[group]Run npx vitest run\n##[endgroup]\n FAIL  scripts/conveyor/__tests__/sim-scenario-self-sync-sibling.test.mjs > #3383 daemon scenario simulator > A3: a main move t\nError: Test timed out in 180000ms.\n Test Files  1 failed | 26 passed (27)\n Tests 1 failed\n\n⎯⎯⎯\n##[error]Process completed with exit code 1.\nPost job cleanup."
 }

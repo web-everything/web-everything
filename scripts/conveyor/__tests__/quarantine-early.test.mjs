@@ -16,7 +16,8 @@ const fragment = `❯ ${file} (1 test | 1 failed)\n  → Test timed out in 10200
 const log = `FAIL ${file} > fails\nAssertionError: broken\nTest Files 1 failed\nTests 1 failed`;
 const red = { databaseId: 45080540441, headSha: '70001b920c55f4423d028a2a18d3d79c8a8b2757', status: 'completed', conclusion: 'timed_out',
   createdAt: '2026-11-22T22:57:00Z', updatedAt: '2026-11-22T23:00:00Z', attempt: 1 };
-const failure = () => q.parseVitestFailures(log);
+const parse = text => q.parseVitestFailures(`##[group]Run npx vitest run\n##[endgroup]\n${text}\nPost job cleanup.`);
+const failure = () => parse(log);
 const run = (overrides = {}) => ({ ...red, jobFailures: { [job]: failure() }, ...overrides });
 const plan = (overrides = {}) => q.planSafetyNet({ status: 'red', firstRedSha: red.headSha, failedJobs: [job],
   jobFailures: { [job]: failure() }, now, latestRunId: red.databaseId, touchedFiles: () => [], ...overrides });
@@ -28,16 +29,16 @@ it.each([
   `RUN ${file}\nError: There was an error during teardown`,
   `❯ ${file} (1 test | 1 failed)\nError: Test timed out in 5000ms.`,
 ])('rejects summaryless timeout/teardown/soak fragments: %s', text => {
-  expect(q.parseVitestFailures(text).complete).toBe(false);
-  expect(plan({ jobFailures: { [job]: q.parseVitestFailures(text) } }).action).toBe('none');
+  expect(parse(text).complete).toBe(false);
+  expect(plan({ jobFailures: { [job]: parse(text) } }).action).toBe('none');
 });
 
 it('never promotes a passing file, an ambiguous job timeout, or an incomplete ordinary failure', () => {
   for (const text of [`✓ other.test.mjs\nError: job timed out`,
     `RUN a.test.mjs b.test.mjs\nError: job timed out`, `FAIL ${file} > assertion\nAssertionError: broken`]) {
-    expect(q.parseVitestFailures(text).complete).toBe(false);
+    expect(parse(text).complete).toBe(false);
   }
-  const p = plan({ jobFailures: { [job]: failure(), integration: q.parseVitestFailures('FAIL other.test.mjs\nTest Files 1 failed') },
+  const p = plan({ jobFailures: { [job]: failure(), integration: parse('FAIL other.test.mjs\nTest Files 1 failed') },
     flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } });
   expect(p.tests).toEqual([file]);
 });
@@ -56,7 +57,7 @@ it.each([
   'FAIL a.test.mjs > assertion\nAssertionError: broken\nFAIL b.test.mjs > slow\nError: Test timed out in 5000ms.',
   'FAIL a.test.mjs > assertion\nAssertionError: broken\nError: Test timed out in 5000ms.',
 ])('rejects partial mixed-failure logs with unattributable interruption: %s', text => {
-  const parsed = q.parseVitestFailures(text);
+  const parsed = parse(text);
   expect(parsed.complete).toBe(false);
   expect(plan({ jobFailures: { [job]: parsed },
     flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).action).toBe('none');
@@ -65,7 +66,7 @@ it.each([
 it('requires proof for complete assertions and classifies every accepted timeout', () => {
   expect(plan().action).toBe('none');
   const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed\nTests 1 failed`;
-  const timed = q.parseVitestFailures(text);
+  const timed = parse(text);
   const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
   expect(timed.complete).toBe(true);
   expect(timed.timeouts).toEqual([{ file, name: 'slow', runnerLimitMs: 5000, truncated: true }]);
@@ -75,7 +76,7 @@ it('requires proof for complete assertions and classifies every accepted timeout
 
 it('still refuses to quarantine a hard or unconfigured timeout (early quarantine never widens what can be quarantined)', () => {
   const text = `FAIL ${file} > slow\nError: Test timed out in 5000ms.\nTest Files 1 failed\nTests 1 failed`;
-  const timed = q.parseVitestFailures(text);
+  const timed = parse(text);
   const proof = { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } };
   for (const timeoutPolicy of [{}, { all: { soft: 'PT1S', hard: 'PT2S' } }]) {
     const p = plan({ jobFailures: { [job]: timed }, flakeProof: proof, timeoutPolicy });
@@ -93,7 +94,7 @@ it.each([
   ['unsupported reporter arrow', fragment],
   ['unsupported reporter Error', `❯ ${file} (1 test | 1 failed)\nError: Test timed out in 5000ms.`],
 ])('escalates %s even with a summary and rerun proof', (_, text) => {
-  const parsed = q.parseVitestFailures(`${text}\nTest Files 1 failed\nTests 1 failed`);
+  const parsed = parse(`${text}\nTest Files 1 failed\nTests 1 failed`);
   expect(parsed.complete).toBe(false);
   expect(plan({ jobFailures: { [job]: parsed }, flakeProof: { [job]: { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 } } }).action).toBe('none');
 });
@@ -141,7 +142,7 @@ it('publishes synthetic complete repeat evidence; unknown failures escalate imme
     const output = smell.evaluate({ mainCiRuns: { runs: [red] } }, { now, config: {}, quarantineSafetyNet: () => first });
     expect(output[0].summary).toContain(first.alerts[0].why);
     list = { version: 1, entries: [] };
-    const unknown = invoke({ ...red, databaseId: 99 }, () => q.parseVitestFailures('unreadable crash'));
+    const unknown = invoke({ ...red, databaseId: 99 }, () => parse('unreadable crash'));
     expect(unknown.applied).toBe(false);
     expect(unknown.alerts).toContainEqual(expect.objectContaining({ type: 'escalation', at: now, why: expect.stringContaining('unknown') }));
     expect(logs.some(line => line.includes('escalation'))).toBe(true);
@@ -157,14 +158,14 @@ it.each([
   `${log}\n##[error]Process completed with exit code 2.`,
   `${log}\n##[error]Process completed with exit code 1.\nError: ENOSPC`,
 ])('rejects infrastructure errors outside assertion blocks: %s', text => {
-  expect(q.parseVitestFailures(text).complete).toBe(false);
+  expect(parse(text).complete).toBe(false);
 });
 
 it('accepts the final exit-one CI trailer', () => {
-  expect(q.parseVitestFailures(`${log}\n##[error]Process completed with exit code 1.\ncleanup complete`).complete).toBe(true);
+  expect(parse(`${log}\n##[error]Process completed with exit code 1.\ncleanup complete`).complete).toBe(true);
 });
 
-it.each([undefined, 1])('ignores published parse proof with parser version %s', parserVersion => {
+it.each([undefined, 1, 4])('ignores published parse proof with parser version %s', parserVersion => {
   const proof = { kind: 'rerun-passed', runId: red.databaseId, attempt: 2 };
   const added = q.addEntries(null, { tests: [file], brokenSha: red.headSha, owner: 'red-main-safety-net',
     reason: 'failed main', actor: 'red-main-safety-net', now, ttlMs: 60_000, job, proof });
@@ -195,7 +196,7 @@ it('keeps stale published proof out of the IO live list and escalates unknown fa
       mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
       mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
       timeoutPolicy: {}, readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
-      readLog: () => q.parseVitestFailures('unreadable crash'), readList: () => ({ ok: true, list }),
+      readLog: () => parse('unreadable crash'), readList: () => ({ ok: true, list }),
       write: ({ change }) => {
         const result = change(list);
         expect(result.list.entries).toEqual([]);
@@ -209,18 +210,18 @@ it('keeps stale published proof out of the IO live list and escalates unknown fa
 
 it.each(['Unhandled Rejection', 'Uncaught Exception', 'Worker exited unexpectedly', 'Worker failed', 'teardown failed'])(
   'rejects a complete assertion summary with extra crash: %s', diagnostic => {
-    expect(q.parseVitestFailures(`${log}\n${diagnostic}`).complete).toBe(false);
+    expect(parse(`${log}\n${diagnostic}`).complete).toBe(false);
   });
 
 it('rejects an Error: expected assertion head and a bare FAIL header', () => {
   for (const text of [`FAIL ${file} > fails\nError: expected true to be false`, `FAIL ${file}`]) {
-    expect(q.parseVitestFailures(`${text}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(false);
+    expect(parse(`${text}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(false);
   }
 });
 
 it.each(['AssertionError: broken'])(
   'keeps ordinary assertion diagnostics complete: %s', diagnostic => {
-    expect(q.parseVitestFailures(`FAIL ${file} > fails\n${diagnostic}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(true);
+    expect(parse(`FAIL ${file} > fails\n${diagnostic}\nTest Files 1 failed\nTests 1 failed`).complete).toBe(true);
   });
 
 it.each(['startup_failure', 'cancelled', 'action_required', 'neutral', 'stale'])(
@@ -249,23 +250,31 @@ it.each(['startup_failure', 'cancelled', 'action_required', 'neutral', 'stale'])
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it.each([undefined, 1])('re-reads cached failures with parser version %s', parserVersion => {
+it.each([
+  [undefined, 'missing step boundary', log, 'step-boundary'],
+  [1, 'missing step boundary', log, 'step-boundary'],
+  [4, 'missing step boundary', log, 'step-boundary'],
+  [4, 'extra CI annotation', `##[group]Run npx vitest run\n##[endgroup]\n${log}\n##[error]extra\n##[error]Process completed with exit code 1.\nPost job cleanup.`, 'non-final or duplicate CI trailer'],
+])('re-reads cached parser version %s evidence and rejects %s', (parserVersion, _, rawLog, reason) => {
   const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
-  let reads = 0;
+  let reads = 0, reparsed;
   const invoke = () => runSafetyNet({ dir, now, live: false,
     mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
     mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
     timeoutPolicy: {}, touchedFiles: () => [], readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
-    readLog: () => { reads++; return reads === 1 ? failure() : q.parseVitestFailures('unreadable crash'); }, log: () => {} });
+    readLog: () => { reads++; return reads === 1 ? failure() : (reparsed = q.parseVitestFailures(rawLog)); }, log: () => {} });
   try {
     invoke();
     const path = join(dir, SAFETY_NET_LEDGER), ledger = JSON.parse(readFileSync(path, 'utf8'));
     const rec = Object.values(ledger.reds)[0];
     rec.parserVersion = parserVersion;
+    rec.jobFailures[job].parserVersion = parserVersion;
     rec.readRetryAt = now + 60_000; // version changes also reset stale retry backoff
     writeFileSync(path, JSON.stringify(ledger));
     const out = invoke();
     expect(reads).toBe(2);
+    expect(reparsed).toMatchObject({ complete: false, parserVersion: 5 });
+    expect(reparsed.vetoes[0].reason).toBe(reason);
     expect(out.plan).toMatchObject({ action: 'none', why: expect.stringContaining('unknown') });
     expect(Object.values(JSON.parse(readFileSync(path, 'utf8')).reds)[0]).toMatchObject({
       parserVersion: q.QUARANTINE_PARSER_VERSION, jobFailures: {},
@@ -273,7 +282,7 @@ it.each([undefined, 1])('re-reads cached failures with parser version %s', parse
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-it.each([undefined, 1])('refuses cached attempt proof with parser version %s', parserVersion => {
+it.each([undefined, 1, 4])('refuses cached attempt proof with parser version %s', parserVersion => {
   const dir = mkdtempSync(join(tmpdir(), 'quarantine-early-'));
   const invoke = r => runSafetyNet({ dir, now, live: false,
     mainCiRuns: { runs: [r], failing: { runId: r.databaseId, jobs: [job] } },
@@ -298,7 +307,7 @@ it('emits unknown-failure escalation even with an existing live quarantine', () 
       mainCiRuns: { runs: [red], failing: { runId: red.databaseId, jobs: [job] } },
       mode: { value: 'quarantine' }, settings: { value: q.QUARANTINE_SAFETY_NET_DEFAULTS },
       timeoutPolicy: {}, readJobs: () => ({ failed: [{ name: job, id: 1 }] }),
-      readLog: () => q.parseVitestFailures('unreadable crash'), readList: () => ({ ok: true, list }),
+      readLog: () => parse('unreadable crash'), readList: () => ({ ok: true, list }),
       write: () => { throw new Error('must not write'); }, log: line => emitted.push(line) });
     expect(out.applied).toBe(false);
     expect(out.liveEntries).toHaveLength(1);

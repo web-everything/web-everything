@@ -204,20 +204,27 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
 
 /** Invalidate persisted parses whenever completeness rules change. */
-export const QUARANTINE_PARSER_VERSION = 4;
+export const QUARANTINE_PARSER_VERSION = 5;
 
 /** Trouble is untrusted unless a specific reporter construct claims the entire line. */
 const TROUBLE = /\w*Error\b|\berrors?\b|Exception|Unhandled|Uncaught|exit (?:with )?code|Killed|out of memory|FATAL|panic|Segmentation|core dumped|Aborted|timed out|exceeded|teardown|canceled|##\[error\]|::error|Worker.*(?:exit|fail)/i;
 const SYSTEM_TROUBLE = /\bE[A-Z]{3,}\b|\bSIG[A-Z]+\b/;
 const hasTrouble = line => TROUBLE.test(line) || SYSTEM_TROUBLE.test(line);
+const HARD_TROUBLE = /Killed|out of memory|FATAL|##\[error\]|::error|canceled/i;
+const CRASH_TROUBLE = /Worker.*(?:exit|fail)|Unhandled|Uncaught|Exception|panic|Segmentation|core dumped|Aborted|teardown/i;
 
 /** Parse named Vitest failure blocks; unknown or incomplete evidence keeps main held. PURE. */
 export function parseVitestFailures(logText) {
   const tests = [], timeouts = [], vetoes = [];
   const lines = String(logText ?? '').split('\n').map(raw => raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd());
-  const lastTrouble = lines.findLastIndex(hasTrouble);
+  const stepStarts = lines.flatMap((line, index) => /^##\[group\]Run .*(?:vitest|npm run test)/.test(line.trim()) ? [index] : []);
+  if (stepStarts.length !== 1) return { files: [], tests, failedFiles: null, timeouts, complete: false,
+    parserVersion: QUARANTINE_PARSER_VERSION, vetoes: [{ line: (stepStarts[1] ?? 0) + 1, reason: 'step-boundary' }] };
+  const start = stepStarts[0];
+  const end = lines.findIndex((line, index) => index > start && /^(?:##\[group\]Run |Post job cleanup\.)/.test(line.trim()));
+  const annotations = lines.filter(line => line.includes('##[error]')).length;
   let block = null, failedFiles = null, failedTests = null, headerCount = null;
-  let fileSummaries = 0, testSummaries = 0, trailers = 0, progress = false;
+  let fileSummaries = 0, testSummaries = 0, trailers = 0, progress = false, continuation = false;
   const veto = (line, reason) => { if (vetoes.length < 5) vetoes.push({ line, reason }); };
   const close = () => {
     if (block && !block.head) veto(block.line, 'missing failure head');
@@ -225,7 +232,29 @@ export function parseVitestFailures(logText) {
   };
   for (const [index, raw] of lines.entries()) {
     const line = raw.trim(), lineNumber = index + 1;
-    if (!line) continue;
+    if (index < start || (end !== -1 && index >= end)) {
+      if (HARD_TROUBLE.test(line) || SYSTEM_TROUBLE.test(line)) veto(lineNumber, 'unclaimed trouble token');
+      continue;
+    }
+    if (!line) { progress = continuation = false; continue; }
+    if (line.includes('##[error]')) {
+      if (!/^##\[error\]Process completed with exit code 1\.$/.test(line) || ++trailers > 1 || annotations !== 1) {
+        veto(lineNumber, 'non-final or duplicate CI trailer');
+      }
+      continue;
+    }
+    if (!block) {
+      if (/^❯\s+\S+\s+>\s+.+/.test(line) || /^×\s+.+/.test(line)) { progress = true; continuation = false; continue; }
+      if (/^❯\s+\S+\s+\(.+\)(?:\s+\d+ms)?$/.test(line)) { progress = continuation = false; continue; }
+      if ((continuation || (progress && /^→\s+.+/.test(line)))
+        && (SYSTEM_TROUBLE.test(line) || HARD_TROUBLE.test(line) || CRASH_TROUBLE.test(line))) {
+        veto(lineNumber, 'infrastructure failure in progress diagnostic');
+        continue;
+      }
+      if (progress && /^→\s+.+/.test(line)) { progress = false; continuation = true; continue; }
+      if (continuation && !/^(?:[❯×✓→]|⎯|FAIL\b|Test Files\b|Tests\b)/.test(line)) continue;
+      progress = continuation = false;
+    }
     const fail = /^FAIL\s+(\S+)\s+>\s+(.+)$/.exec(line);
     const fileSummary = /^Test Files\s+(\d+) failed\b/.exec(line);
     const testSummary = /^Tests\s+(\d+) failed\b/.exec(line);
@@ -267,14 +296,6 @@ export function parseVitestFailures(logText) {
       }
       continue;
     }
-    if (/^##\[error\]Process completed with exit code 1\.$/.test(line)) {
-      if (++trailers > 1 || index !== lastTrouble) veto(lineNumber, 'non-final or duplicate CI trailer');
-      continue;
-    }
-    if (/^❯\s+\S+\s+\(.+\)$/.test(line)) { progress = false; continue; }
-    if (/^×\s+.+/.test(line)) { progress = true; continue; }
-    if (progress && /^→\s+.+/.test(line)) { progress = false; continue; }
-    progress = false;
     if (hasTrouble(line)) veto(lineNumber, 'unclaimed trouble token');
   }
   close();

@@ -37,12 +37,17 @@ const JOBS = { failed: [{ id: 114286123395, name: 'test-shard (3)' }, { id: 1142
 // The real log lines of job 114286123395 (ANSI colour + GitHub timestamps kept).
 const E = '\x1b';
 const LOG = [
+  '##[group]Run npx vitest run',
+  '##[endgroup]',
   `2026-10-10T18:51:42.2758298Z  ${E}[32m✓${E}[39m scripts/conveyor/__tests__/review-side-import-cycle.test.mjs ${E}[2m (${E}[22m${E}[2m7 tests${E}[22m${E}[2m)${E}[22m`,
   `2026-10-10T18:51:42.3015305Z ${E}[31m⎯⎯⎯⎯⎯⎯⎯${E}[1m${E}[7m Failed Tests 1 ${E}[27m${E}[22m⎯⎯⎯⎯⎯⎯⎯${E}[39m`,
   `2026-10-10T18:51:42.3059106Z ${E}[31m${E}[1m${E}[7m FAIL ${E}[27m${E}[22m${E}[39m ${TEST_FILE}${E}[2m > ${E}[22m#4979 the sanctioned writer${E}[2m > ${E}[22mthe reader hands the ruled PR and its head to the card resolver`,
   `2026-10-10T18:51:42.3088534Z ${E}[31m${E}[1mAssertionError${E}[22m: expected [] to deeply equal [ { repo: 'o/r', pr: 7, …(1) } ]${E}[39m`,
   `2026-10-10T18:51:42.3315589Z ${E}[2m Test Files ${E}[22m ${E}[1m${E}[31m1 failed${E}[39m${E}[22m${E}[2m | ${E}[22m${E}[1m${E}[32m242 passed${E}[39m${E}[22m${E}[90m (243)${E}[39m`,
   `2026-10-10T18:51:42.3345065Z ${E}[2m      Tests ${E}[22m ${E}[1m${E}[31m1 failed${E}[39m${E}[22m${E}[2m | ${E}[22m${E}[1m${E}[32m8244 passed${E}[39m`,
+  '⎯⎯⎯',
+  '##[error]Process completed with exit code 1.',
+  'Post job cleanup.',
 ].join('\n');
 
 const STOP = { value: 'stop', source: 'settings' };
