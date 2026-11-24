@@ -253,6 +253,20 @@ describe('daemon smoke slots', () => {
     await slot.release(); // idempotent
   });
 
+  it('the committed settings file allows 6 concurrent smokes and a 7th waiter queues', async () => {
+    settings.value = undefined; // read the real daemon-rebuild-settings.json
+    const slots = [];
+    for (let i = 1; i <= 6; i++) slots.push(await acquire(i));
+    const queued = acquire(7);
+    await wake();
+    expect(state().holders).toHaveLength(6);
+    expect(state().waiters).toHaveLength(1);
+    expect(log.error).toHaveBeenCalledWith('daemon-live-smoke: smokeMaxConcurrent=6 (tool)');
+    await slots[0].release(); await wake();
+    await (await queued).release();
+    await Promise.all(slots.slice(1).map(slot => slot.release()));
+  });
+
   it.each([
     [{ smokeMaxConcurrent: 3 }, {}, 3, 'tool'],
     [{ smokeMaxConcurrent: 3 }, { WE_DAEMON_SMOKE_MAX_CONCURRENT: '1' }, 1, 'env'],
