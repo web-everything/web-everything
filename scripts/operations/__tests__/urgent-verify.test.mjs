@@ -6,6 +6,7 @@ import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
@@ -1005,14 +1006,16 @@ describe('urgent-verify real process-tree expiry', () => {
     const { tmpdir } = await import('node:os');
     const { join } = await import('node:path');
     const dir = mkdtempSync(join(tmpdir(), 'uv-expiry-'));
+    tempParents.push(dir);
     mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
     const pidFile = join(dir, 'grandchild.pid');
+    // Both processes outlive the 1.2s deadline, but remain bounded if the assertion fails.
+    const sleeper = keepAliveScript({ maxLifetimeMs: 15_000, prelude: "process.on('SIGTERM', () => {});" });
     writeFileSync(join(dir, 'scripts/readiness/heavy-admission.mjs'), `
       import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
-      process.on('SIGTERM', () => {});
-      const g = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: 'ignore' });
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
       writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
-      setInterval(() => {}, 1000);`);
+      ${sleeper}`);
     const deps = createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 });
     const started = Date.now();
     expect(() => deps.standards()).toThrow(/ETIMEDOUT|exit/);
