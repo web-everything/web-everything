@@ -3,6 +3,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolve, join } from 'node:path';
 
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
+const JOB = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+  steps: [{ name: "Evaluate the drain's merge gates", status: 'completed', conclusion: 'failure' }] };
 // fixPresent is synchronous, so the tree's function is loaded once up front (absent export = fix absent).
 const loaded = new Map();
 try {
@@ -21,7 +23,7 @@ export default {
     const row = { name: 'merge-gate', status: 'completed', conclusion: 'failure', details_url: 'https://github.com/o/r/actions/runs/1/job/42' };
     const head = 'a'.repeat(40);
     const excuse = results => fn({ checks: [row], prNumber: 1, headSha: head, labels: [], setting: 'on', freeze: () => ({ frozen: true }),
-      readVerdict: () => ({ num: 1, head_sha: head, ok: false, results }) })[0];
+      readJob: () => JOB, readVerdict: () => ({ num: 1, head_sha: head, ok: false, results }) })[0];
     try {
       return excuse([{ id: 'red-main-freeze', status: 'hold' }]).conclusion === 'success'
         && excuse([{ id: 'red-main-freeze', status: 'hold' }, { id: 'codeql', status: 'hold' }]).conclusion === 'failure';
@@ -45,7 +47,7 @@ export default {
       readPreviousRequired: () => ({ checks: ['test', 'merge-gate'] }),
       excusePreviousChecks: ({ checks, headSha }) => excusePreviousCiChecks({ checks, prNumber: 7336, headSha, labels: [], setting: 'on',
         readVerdict: () => ({ num: 7336, head_sha: headSha, ok: false, results: [{ id: 'red-main-freeze', status: 'hold', reason: 'main is RED' }] }),
-        freeze: () => ({ frozen: true }) }),
+        freeze: () => ({ frozen: true }), readJob: () => JOB }),
       listRecords: () => record ? [{ key: 'fix-7336', record }] : [],
       writeRecord: next => { record = next; return { ok: true }; },
       clearRecord: () => { record = null; },

@@ -54,7 +54,8 @@ import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { fixPushGate } from '../lib/review-timing.mjs';
 import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { readReviewHead, readReviewHeadAndLabels, readReviewChecks } from '../lib/review-ci-gate-io.mjs';
-import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readGh } from '../lib/proc-read.mjs';
+import { latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
 import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { headCiVerdict } from './fix-push-ci.mjs';
@@ -423,24 +424,34 @@ function holdHandBack(row, record, gate, persist, nowMs, kind = 'green') {
 }
 
 /**
- * Rows with a merge-gate red that is only a hold (review path's `excuseMergeGateRows`, plus a verdict whose every
- * blocking row is `red-main-freeze`) rewritten so it is no CI failure. Any other hold, an unreadable verdict, the
- * setting off, or any thrown error returns the rows unchanged (fail closed). Only merge-gate rows are touched.
+ * Rows with a merge-gate `failure` held ONLY by the red-main freeze, rewritten so it is no CI failure. Proof needed,
+ * else the rows come back unchanged (fail closed): setting on; PR labels readable and not a `ready-to-merge`
+ * candidate; the verdict is for this PR and head, with every blocking row a `red-main-freeze` hold; a live shared
+ * freeze (`frozen: true`, no error); and the job itself shows the evaluator as its sole failed step (a timeout,
+ * cancellation or later step failure is a real failure). Review-admission exemptions never apply here.
  */
-export function excusePreviousCiChecks({ checks, prNumber, headSha, labels, setting, readVerdict, freeze }) {
+export function excusePreviousCiChecks({ checks, prNumber, headSha, labels, setting, readVerdict, readJob, freeze }) {
   try {
-    if (!latestFailingMergeGate(checks)) return checks;
-    const viaClassifier = excuseMergeGateRows(checks, { prNumber, headSha, labels, setting, readVerdict, freeze });
-    if (viaClassifier.excused || viaClassifier.reviewHold) return viaClassifier.rows;
-    if ((typeof setting === 'string' ? setting : setting?.value) !== 'on') return checks;
     const row = latestFailingMergeGate(checks);
+    if (!row || String(row.conclusion).toLowerCase() !== 'failure') return checks;
+    if ((typeof setting === 'string' ? setting : setting?.value) !== 'on') return checks;
+    if (!Array.isArray(labels) || labels.some(l => typeof (typeof l === 'string' ? l : l?.name) !== 'string')
+      || labels.some(l => (typeof l === 'string' ? l : l.name) === 'ready-to-merge')) return checks;
     const jobId = Number(/\/actions\/runs\/\d+\/job\/(\d+)/.exec(row.detailsUrl ?? row.details_url ?? '')?.[1] ?? row.id);
     if (!Number.isSafeInteger(jobId) || jobId <= 0 || !headSha || !Number.isSafeInteger(prNumber)) return checks;
     const verdict = readVerdict({ jobId, prNumber });
     if (verdict?.error || verdict?.num !== prNumber || String(verdict?.head_sha ?? '').toLowerCase() !== String(headSha).toLowerCase()
-      || verdict.ok !== false || !Array.isArray(verdict.results)) return checks;
+      || verdict.ok !== false || verdict.workflowEditProtection === true || !Array.isArray(verdict.results)) return checks;
     const holds = verdict.results.filter(r => r?.status === 'hold' || r?.status === 'fail-closed');
     if (!holds.length || !holds.every(r => r.id === 'red-main-freeze' && r.status === 'hold')) return checks;
+    const live = typeof freeze === 'function' ? freeze() : freeze;
+    if (live?.frozen !== true || live.error) return checks;
+    const job = readJob({ jobId });
+    const steps = job?.steps;
+    if (job?.name !== 'merge-gate' || job.status !== 'completed' || job.conclusion !== 'failure' || !Array.isArray(steps) || !steps.length
+      || steps.some(s => s.status !== 'completed' || !['success', 'failure', 'skipped'].includes(s.conclusion))) return checks;
+    const failed = steps.filter(s => s.conclusion === 'failure');
+    if (failed.length !== 1 || failed[0].name !== "Evaluate the drain's merge gates") return checks;
     const excused = { ...row, conclusion: 'success', mergeGateHoldExcused: { kind: 'red-main-freeze', holds, jobId } };
     return checks.map(r => r === row ? excused : r);
   } catch { return checks; }
@@ -1174,7 +1185,8 @@ export async function defaultAwaitVerifyIo({
     readPreviousChecks: readReviewChecks,
     excusePreviousChecks: ({ repo, pr, headSha, checks }) => excusePreviousCiChecks({ checks, prNumber: Number(pr), headSha,
       labels: readReviewHeadAndLabels({ repo, pr }).labels, setting: loadMergeGateHoldSetting(),
-      readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readSharedFreeze() }),
+      readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readSharedFreeze(),
+      readJob: ({ jobId }) => JSON.parse(readGh(['api', `repos/${repo}/actions/jobs/${jobId}`], { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] })) }),
     readPreviousRequired: getRequiredStatusChecks,
     retryPolicy: () => loadVerifyRecoverySettings({ env }),
     infraFallbackToCi: () => { let tool; try { tool = readSettings()?.verify; } catch { /* absent tool layer */ } return resolveInfraFallbackToCi({ env, tool }); },

@@ -373,12 +373,15 @@ describe('a merge-gate red held only by the red-main freeze is not a previous-CI
   const gate = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
     details_url: 'https://github.com/o/r/actions/runs/1/job/42' };
   const hold = (id, status = 'hold') => ({ id, status, reason: `${id} reason` });
-  const build = ({ results, ok = false, setting = 'on' }) => {
+  const evaluator = { name: "Evaluate the drain's merge gates", status: 'completed', conclusion: 'failure' };
+  const goodJob = { name: 'merge-gate', status: 'completed', conclusion: 'failure',
+    steps: [{ name: 'checkout', status: 'completed', conclusion: 'success' }, evaluator] };
+  const build = ({ results, ok = false, setting = 'on', labels = [], freeze = { frozen: true }, job = goodJob, gateConclusion = 'failure' }) => {
     const h = harness();
     h.state.required = ['test', 'merge-gate'];
-    h.state.checks = [{ name: 'test', status: 'completed', conclusion: 'success' }, { ...gate }];
+    h.state.checks = [{ name: 'test', status: 'completed', conclusion: 'success' }, { ...gate, conclusion: gateConclusion }];
     h.io.excusePreviousChecks = ({ checks, headSha }) => excusePreviousCiChecks({ checks, prNumber: 6085, headSha,
-      labels: [], setting, readVerdict: () => ({ num: 6085, head_sha: headSha, ok, results }), freeze: () => ({ frozen: true }) });
+      labels, setting, readVerdict: () => ({ num: 6085, head_sha: headSha, ok, results }), freeze: () => freeze, readJob: () => job });
     return h;
   };
   it('pushes without a CI-failure handoff when the only hold is red-main-freeze', async () => {
@@ -399,6 +402,15 @@ describe('a merge-gate red held only by the red-main freeze is not a previous-CI
     ['a fail-closed freeze row', { results: [hold('red-main-freeze', 'fail-closed')] }],
     ['an unreadable verdict', { results: undefined }],
     ['the setting off', { results: [hold('red-main-freeze')], setting: 'off' }],
+    ['a candidacy hold (review admission is not push authorisation)', { results: [hold('review-acceptance')] }],
+    ['a ready-to-merge candidate', { results: [hold('red-main-freeze')], labels: ['ready-to-merge'] }],
+    ['unreadable labels', { results: [hold('red-main-freeze')], labels: null }],
+    ['a freeze that is no longer live', { results: [hold('red-main-freeze')], freeze: { frozen: false } }],
+    ['unreadable freeze state', { results: [hold('red-main-freeze')], freeze: { frozen: true, error: 'x' } }],
+    ['a timed-out merge-gate', { results: [hold('red-main-freeze')], gateConclusion: 'timed_out' }],
+    ['a job whose later step also failed', { results: [hold('red-main-freeze')],
+      job: { ...goodJob, steps: [evaluator, { name: 'post', status: 'completed', conclusion: 'failure' }] } }],
+    ['an unreadable job', { results: [hold('red-main-freeze')], job: null }],
   ])('fails closed on %s', async (_name, opts) => {
     const h = build(opts);
     await h.tick();

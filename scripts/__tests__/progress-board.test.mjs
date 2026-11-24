@@ -197,6 +197,9 @@ describe('classifyPr', () => {
     expect(ciFailed(rollup, required)).toBe(false);
     expect(classifyPr(pr({ labels: ['review:pending'], statusCheckRollup: rollup }), required)).not.toBe('ci-red');
     expect(ciFailed([...rollup, { name: 'test', conclusion: 'FAILURE' }], required)).toBe(true);
+    for (const conclusion of ['TIMED_OUT', 'CANCELLED', 'STARTUP_FAILURE']) {
+      expect(ciFailed([{ name: 'review-gate', conclusion }, { name: 'test', conclusion: 'SUCCESS' }], required)).toBe(true);
+    }
   });
 
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — LIVE INCIDENT 2026-09-26: `chalbert/web-
