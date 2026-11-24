@@ -40,6 +40,7 @@ try {
     ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 3771, repo: CONSTELLATION_REPOS.we.slug,
     root: process.env.SOAK_CLONE, dir: process.env.SOAK_JOBS, readCompletion: () => null,
     resolveSettingsEnv: () => null, spawnJob: () => 4242,
+    expectedHead: 'a'.repeat(40), io: { ...job.createReviewJobIo({ root: process.env.SOAK_CLONE }), liveHead: () => 'a'.repeat(40) },
   });
   out.spawned = r.jobPid ?? null;
 } catch (e) { out.threw = String(e.message).split('\\n')[0]; }

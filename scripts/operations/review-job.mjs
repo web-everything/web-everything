@@ -1296,6 +1296,7 @@ function finalHeadSeatsGate(input, io) {
 }
 
 /** An operator-pinned dispatch must refuse unknown or superseded live evidence. */
+export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 function expectedHeadRefusal(expectedHead, input, io, { required = false } = {}) {
   if (expectedHead === undefined) {
     // Unknown reviewed head must mean no verdict: never fall back to whatever the checkout head happens to be.

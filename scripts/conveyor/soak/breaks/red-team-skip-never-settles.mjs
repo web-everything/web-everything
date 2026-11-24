@@ -84,8 +84,8 @@ export default {
           comments: thread, labels: ['red-team:pending'], evidence, env });
         for (const redTeamOnly of [false, true]) {
           const events = [];
-          const out = runReviewJob({ repo, pr, redTeamOnly }, {
-            root: sourceRoot, now: () => 1000, newActorId: () => 'soak-skip',
+          const out = runReviewJob({ repo, pr, redTeamOnly, expectedHead: head }, {
+            liveHead: () => head, root: sourceRoot, now: () => 1000, newActorId: () => 'soak-skip',
             readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
             acquireLane: () => ({ lanePath: sourceRoot }), releaseLane: () => {}, prepareLane: () => ({ head }),
             report: () => {}, log: () => {},
@@ -188,7 +188,7 @@ export default {
           } });
         };
         let dispatches = 0, runnerCalls = 0, job;
-        const arc = { root: scratch, now: Date.now, newActorId: () => 'soak-skip-daemon',
+        const arc = { liveHead: () => head, root: scratch, now: Date.now, newActorId: () => 'soak-skip-daemon',
           readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
           acquireLane: () => ({ lanePath: scratch }), releaseLane: () => {}, report: () => {}, log: () => {},
           prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
