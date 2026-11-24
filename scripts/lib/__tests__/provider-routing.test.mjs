@@ -10,8 +10,11 @@
  *   - Supervision level backdown plan (#3690): clean streak counting, informative trial gating,
  *     calibration-miss hard veto on most recent record, and 'other'-verified skipping.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -27,6 +30,7 @@ import {
   AGY_CLAUDE_MODEL_BY_TIER,
   SUPERVISION_LEVELS,
   DEFAULT_BACKDOWN_THRESHOLDS,
+  DEFAULT_ROUTING_POLICY,
   PROVEN_TASK_ENVELOPES,
   THIN_TRIAL_THRESHOLD,
   workerTierFor,
@@ -37,6 +41,103 @@ import {
   PROBATION_ROSTER,
 } from '../provider-routing.mjs';
 import { CODEX_MODEL } from '../codex-model-routing.mjs';
+import { routeDispatch, decideDispatchRoute } from '../dispatch-contracts.mjs';
+import { runProbe } from '../../operations/agy-auth-probe.mjs';
+
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, homedir: vi.fn(actual.homedir) };
+});
+
+describe('production dispatch consumes the persisted agy auth record', () => {
+  let home, statePath;
+  const now = 3000000;
+  const profile = { taskType: 'doc-fix', filesTouched: ['README.md'], estimatedLoc: 30,
+    acceptanceTestable: true, complexity: 'S', risk: 'low', dependsOn: [] };
+  const dispatch = { kind: 'build', scopePaths: ['README.md'], size: 1, risk: 'low' };
+  const agyRoute = { provider: 'antigravity', model: 'sonnet', fallback: [{ provider: 'claude', model: 'sonnet' }] };
+  const policy = { ...DEFAULT_ROUTING_POLICY, taskTypes: {}, operations: { ...DEFAULT_ROUTING_POLICY.operations,
+    'build:doc-fix': agyRoute } };
+  const save = record => writeFile(statePath, typeof record === 'string' ? record : JSON.stringify(record));
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), 'agy-routing-'));
+    vi.mocked(homedir).mockReturnValue(home);
+    await mkdir(join(home, '.plateau'));
+    statePath = join(home, '.plateau', 'agy-auth-state.json');
+  });
+  afterEach(async () => { vi.mocked(homedir).mockReset(); await rm(home, { recursive: true, force: true }); });
+
+  it('honors explicit off even when the persisted record is on', async () => {
+    await save({ state: 'on', lastProbeAt: now });
+    const route = routeDispatch(profile, { stage: 'task', agyAuth: { state: 'off' }, now });
+    expect(route.alternateBackend).toBeNull();
+    expect(route.auditTrail).toContainEqual(expect.objectContaining({ result: 'auth-off' }));
+  });
+  it.each([undefined, 'not json', null, {}, { state: 'off' }, { state: 'on', lastProbeAt: 1 },
+    { state: 'on', lastProbeAt: now + 1 }, ' '.repeat(65537)]
+    .map(record => [typeof record === 'string' && record.length > 64 ? 'oversized' : JSON.stringify(record), record]))('fails closed for unavailable persisted auth: %s', async (_label, record) => {
+    if (record !== undefined) await save(record);
+    const route = routeDispatch(profile, { stage: 'task', now });
+    expect(route.alternateBackend).toBeNull();
+    const policyRoute = decideDispatchRoute(dispatch, { routingPolicy: policy, now });
+    expect(policyRoute.policyRoute).toMatchObject({ provider: 'claude', fallback: [] });
+    expect(policyRoute.probationWorker).toBeNull();
+  });
+  it('fails closed when the state path is not a regular file', async () => {
+    await mkdir(statePath);
+    expect(routeDispatch(profile, { stage: 'task', now }).alternateBackend).toBeNull();
+  });
+  it('filters agy from policy fallback chains, and retains healthy policy routes', async () => {
+    await save({ state: 'on', lastProbeAt: now });
+    expect(decideDispatchRoute(dispatch, { routingPolicy: policy, now }).policyRoute.provider).toBe('antigravity');
+    await save({ state: 'off' });
+    const fallbackPolicy = { ...policy, operations: { ...policy.operations,
+      'build:doc-fix': { provider: 'codex', model: 'default', fallback: [{ provider: 'antigravity', model: 'sonnet' }, { provider: 'claude', model: 'sonnet' }] } } };
+    const routed = decideDispatchRoute(dispatch, { routingPolicy: fallbackPolicy, now });
+    expect(routed.policyRoute.provider).toBe('codex');
+    expect(routed.policyRoute.fallback.map(route => route.provider)).toEqual(['claude']);
+  });
+  it('holds prepare, ci-heal re-selection, and supervisor agy candidates', async () => {
+    await save({ state: 'off' });
+    const inherited = { ...policy, taskTypes: {}, operations: { '*': { inherit: true } } };
+    const prepare = decideDispatchRoute({ kind: 'prepare-item', cardPath: 'backlog/123-card.md', simple: true },
+      { routingPolicy: inherited, now, scorecards: [{ provider: 'codex', model: CODEX_MODEL, taskType: 'prepare', outcome: 'reworked' }] });
+    expect(prepare.probationWorker).toBeNull();
+    const heal = decideDispatchRoute({ kind: 'ci-heal', scopePaths: ['scripts/example.mjs'], size: 1, reason: 'behind' },
+      { routingPolicy: inherited, now, ciHealAvailability: { codex: 'held' }, ciHealNativeFallback: true });
+    expect(heal.outcome).not.toBe('refused');
+    expect(heal.probationWorker).toBeNull();
+    const story = routeDispatch(profile, { stage: 'story', kind: 'build', now });
+    expect(story.backend).not.toBe('agy');
+    expect(story.shadow?.backend).not.toBe('agy');
+  });
+  it('uses the supplied freshness period and does not replace explicit null with disk state', async () => {
+    await save({ state: 'on', lastProbeAt: now });
+    expect(routeDispatch(profile, { stage: 'task', now }).alternateBackend).not.toBeNull();
+    expect(routeDispatch(profile, { stage: 'task', agyAuth: null, now }).alternateBackend).toBeNull();
+    expect(routeDispatch(profile, { stage: 'task', now: now + 201, agyAuthPeriodMs: 100 }).alternateBackend).toBeNull();
+  });
+  it('observes a signed-out probe and two-probe recovery without restarting the router', async () => {
+    await save({ state: 'on', goodStreak: 2, lastProbeAt: now });
+    const route = () => routeDispatch(profile, { stage: 'task', now });
+    expect(route().alternateBackend).not.toBeNull();
+    let reply = 'Authentication required';
+    const spawn = () => {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.kill = vi.fn();
+      queueMicrotask(() => { child.stdout.emit('data', reply); child.emit('close', 0); });
+      return child;
+    };
+    const probe = { spawn, now: () => now, fileCard: vi.fn() };
+    await runProbe(probe);
+    expect(route().alternateBackend).toBeNull();
+    reply = 'ok';
+    await runProbe(probe);
+    expect(route().alternateBackend).toBeNull();
+    await runProbe(probe);
+    expect(route().alternateBackend).not.toBeNull();
+    expect(probe.fileCard).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('probation availability audit', () => {
   it.each(['antigravity-argon', 'antigravity', 'codex'])('keeps the worker held without coercing malformed %s hold values', (key) => {

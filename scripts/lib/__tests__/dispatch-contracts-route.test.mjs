@@ -2,7 +2,11 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as current from '../dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
-const c = { ...current, decideDispatchRoute: (dispatch, options) => current.decideDispatchRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options }) };
+// Historical policy fixtures explicitly supply healthy auth, independent of host state.
+const auth = { agyAuth: { state: 'on', lastProbeAt: 0 }, now: 0 };
+const c = { ...current,
+  routeDispatch: (profile, options) => current.routeDispatch(profile, { ...auth, ...options }),
+  decideDispatchRoute: (dispatch, options) => current.decideDispatchRoute(dispatch, { ...auth, routingPolicy: inheritedRoutingPolicy, ...options }) };
 import { workerTierFor, CRITICAL_WORK_GATE } from '../provider-routing.mjs';
 
 const profile = (extra = {}) => c.buildDispatchProfile({ taskType: 'doc-fix', estimatedLoc: 30, filesTouched: ['docs/readme.md'], acceptanceTestable: true, dependsOn: [], ...extra }).profile;

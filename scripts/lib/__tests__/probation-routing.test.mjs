@@ -9,7 +9,8 @@ import {
 } from '../provider-routing.mjs';
 import { decideDispatchRoute as currentRoute } from '../dispatch-contracts.mjs';
 import { inheritedRoutingPolicy } from './inherited-routing-policy.mjs';
-const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
+// Historical roster expectations run against an explicit healthy auth snapshot.
+const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { agyAuth: { state: 'on', lastProbeAt: 0 }, now: 0, routingPolicy: inheritedRoutingPolicy, ...options });
 import { BUILD_ARGON_MODELS, readBuildArgonSettings, resolveBuildArgonModel } from '../build-argon-settings.mjs';
 import { resolvePolicyModel } from '../dispatch-routing-policy.mjs';
 import { taskTypeFor } from '../dispatch-task-type.mjs';

@@ -10,12 +10,13 @@
  * and [docs/agent/backlog-workflow.md#effort-routing]; the router may inform that verdict, never
  * replace it (per [docs/agent/platform-decisions.md#delegation-trial-record-graduation] "Reach", #3690).
  *
- * PURE MODULE ARCHITECTURE (per [docs/agent/platform-decisions.md#deterministic-core-thin-judgment]):
+ * SELECTOR ARCHITECTURE (per [docs/agent/platform-decisions.md#deterministic-core-thin-judgment]):
  *   • The default gate is a validated policy snapshot at module load; selectors remain pure over inputs.
  *   • Callers explicitly load and pass in scorecard records (from the shared scorecard store — `run-scorecard-store.mjs#readStore`, #4155
  *     or in-memory fixtures) and backdown thresholds.
  *   • Fully deterministic: identical arguments produce byte-identical return objects every time.
  *   • Auth freshness uses the clock unless context.now is supplied; other routing remains pure.
+ *     readDispatchAuth is the production IO boundary used by the dispatch wrappers.
  *     Timestamps in scorecards are treated as
  *     deterministic ISO-8601 strings.
  *
@@ -67,7 +68,7 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
-import { agyAuthOff } from '../operations/agy-auth-probe.mjs';
+import { agyAuthOff, readAgyAuthState } from '../operations/agy-auth-probe.mjs';
 import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
@@ -78,6 +79,19 @@ export { DEFAULT_ROUTING_POLICY, resolveOperationRoute } from './dispatch-routin
 import { isUsableForExploration } from './model-capability-ratings.mjs';
 import { isTestPath } from './dispatch-task-type.mjs';
 import { CODEX_MODEL } from './codex-model-routing.mjs';
+
+/** Production IO boundary; selectors below remain pure when passed this snapshot. */
+export function readDispatchAuth(options = {}) {
+  const agyAuth = options.agyAuth === undefined ? readAgyAuthState() : options.agyAuth;
+  const now = options.now === undefined ? Date.now() : options.now;
+  const agyAuthPeriodMs = options.agyAuthPeriodMs;
+  const availability = { ...options.availability };
+  if (agyAuthOff(agyAuth, now, agyAuthPeriodMs)) {
+    availability.antigravity = 'auth-off';
+    availability.gemini = 'auth-off';
+  }
+  return { agyAuth, now, agyAuthPeriodMs, availability };
+}
 
 // ── EXPLORATION SIGNAL ONLY — advisory benchmarks, separate from supervision ──
 // @test-only-export-ok: Shared threshold for caller-visible exploration hints

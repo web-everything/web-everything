@@ -44,7 +44,8 @@ import { probationLaunchDecision, probationWorkerDetachedProvider, PROBATION_LAU
 
 // These tests describe codex-first routing; the shipped routing.builder=claude is covered in routing-settings.test.mjs.
 process.env.WE_ROUTING_BUILDER = 'codex';
-const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { routingPolicy: inheritedRoutingPolicy, ...options });
+// Historical roster expectations run against an explicit healthy auth snapshot.
+const decideDispatchRoute = (dispatch, options) => currentRoute(dispatch, { agyAuth: { state: 'on', lastProbeAt: 0 }, now: 0, routingPolicy: inheritedRoutingPolicy, ...options });
 
 describe('probation roster models reach the build runner parser', () => {
   it.each([null, { records: null }, { records: [null, 42] }, [null, false]])('production hold reader tolerates malformed scorecard rows: %j', scorecards => {
@@ -145,7 +146,7 @@ describe('probation roster models reach the build runner parser', () => {
       { provider: 'antigravity', model: 'gemini-3.8-flash-high' }, { provider: 'claude', model: 'sonnet' },
     ] };
     const route = currentRoute({ kind: 'build', size: 1, scopePaths: ['we:scripts/__tests__/example.test.mjs'] }, {
-      routingPolicy: policy, availability: { codex: 'held' },
+      routingPolicy: policy, availability: { codex: 'held' }, agyAuth: { state: 'on', lastProbeAt: 0 }, now: 0,
     });
     expect(route).toMatchObject({ outcome: 'routed', routed: 'claude', probationWorker: null });
     expect(route.policyRoute.fallback).toEqual([]);
@@ -154,7 +155,7 @@ describe('probation roster models reach the build runner parser', () => {
   it.each(['gemini-3.8-flash-high', 'gemini-3.8-flash', 'gemini-3.1-pro', 'claude-sonnet-4-6'])('explicit feature policy refuses non-roster %s before spawn', model => {
     const policy = structuredClone(inheritedRoutingPolicy);
     policy.operations['build:build-new-feature'] = { provider: 'antigravity', model, fallback: [] };
-    expect(currentRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, { routingPolicy: policy }))
+    expect(currentRoute({ kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] }, { routingPolicy: policy, agyAuth: { state: 'on', lastProbeAt: 0 }, now: 0 }))
       .toMatchObject({ outcome: 'refused', probationWorker: null });
   });
 
@@ -765,7 +766,7 @@ vi.mock('../../lib/dispatch-routing-policy-io.mjs', async importOriginal => {
   const { inheritedRoutingPolicy: policy } = await import('../../lib/__tests__/inherited-routing-policy.mjs');
   return { ...actual, readRoutingPolicy: () => policy,
     resolveOperationRoute: options => actual.resolveOperationRoute({ ...options, policy }),
-    resolveDispatchRoute: (dispatch, options) => actual.resolveDispatchRoute(dispatch, { ...options, routingPolicy: policy }) };
+    resolveDispatchRoute: (dispatch, options) => actual.resolveDispatchRoute(dispatch, { agyAuth: { state: 'on', lastProbeAt: options?.now ?? 0 }, ...options, now: options?.now ?? 0, routingPolicy: policy }) };
 });
 
 

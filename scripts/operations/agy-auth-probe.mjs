@@ -1,9 +1,27 @@
 import { spawn as nodeSpawn, execFileSync } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { promises as fs, constants, openSync, fstatSync, readSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, relative } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+
+const defaultStatePath = () => join(homedir(), '.plateau', 'agy-auth-state.json');
+
+// Read the atomic probe snapshot afresh for each dispatch. Bound the read and
+// reject non-files (including FIFOs) without waiting on an external writer.
+export function readAgyAuthState(statePath = defaultStatePath()) {
+  let fd;
+  try {
+    fd = openSync(statePath, constants.O_RDONLY | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 65536) return null;
+    const buffer = Buffer.alloc(65537);
+    const bytes = readSync(fd, buffer, 0, buffer.length, 0);
+    if (bytes > 65536 || bytes !== stat.size) return null;
+    return JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
+  } catch { return null; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
 
 // Accept a plain reply; empty output, diagnostics, and machine/terminal garbage are not auth evidence.
 export function classifyAgyProbe({ stdout = '', stderr = '', exitCode, timedOut } = {}) {
@@ -33,7 +51,7 @@ export function fileCard({ title, outageId }, exec = execFileSync) {
   try { exec(process.execPath, ['scripts/operations/run.mjs', 'file-item', `--title=${title}`,
     '--kind=task', '--workItem=task', '--queue=false',
     `--notDuplicateReason=New authentication outage ${outageId}; a previous sign-in action does not resolve this outage.`,
-    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore the auth record. Production routing requires auth-record integration.`],
+    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore the auth record. Production dispatch reads this record and excludes unavailable agy routes.`],
   { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), stdio: 'ignore', timeout: 45000, maxBuffer: 65536 });
   } catch (error) {
     // Only a failure to START the child proves no card was created. Nonzero exit/timeout
@@ -42,7 +60,7 @@ export function fileCard({ title, outageId }, exec = execFileSync) {
     throw error;
   }
 }
-export async function runProbe({ spawn = nodeSpawn, statePath = join(homedir(), '.plateau', 'agy-auth-state.json'),
+export async function runProbe({ spawn = nodeSpawn, statePath = defaultStatePath(),
   lockDir = join(dirname(statePath), 'agy-auth-probe.lock'), now = Date.now, fileCard: publish = fileCard } = {}) {
   const base = dirname(resolve(statePath)), lock = resolve(lockDir), rel = relative(base, lock);
   if (!rel || rel.startsWith('..') || lock === resolve(statePath)) throw new Error('probe lock must be under the state directory');

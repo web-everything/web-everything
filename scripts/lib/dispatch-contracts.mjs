@@ -1,14 +1,16 @@
 /**
- * dispatch-contracts.mjs — pure mechanical-dispatch contracts (#3383, slice G1).
+ * dispatch-contracts.mjs — mechanical-dispatch contracts (#3383, slice G1).
  *
  * Callers supply cards, plans, provenance, scorecards and timestamps. This module owns
  * validation and composition; provider fitness and supervision remain router policy.
  * Invalid boundary inputs fail closed, including malformed or cyclic objects.
+ * Production routing reads probe auth through readDispatchAuth unless a snapshot
+ * is supplied explicitly; validators and selector policy remain input-driven.
  */
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, PROBATION_ROSTER,
   PROVEN_TASK_ENVELOPES, isStatuteTierPath, isHighStakesTask, isWithinProvenEnvelope,
   selectProvider, selectSupervisionLevel, RECOMMENDATIONS, CLAUDE_TIERS, SUPERVISION_LEVELS, AGY_CLAUDE_MODEL_BY_TIER,
-  workerTierFor, selectProbationWorker, probationWorkerForRoute, CRITICAL_WORK_GATE, decideCriticalWorkGate,
+  workerTierFor, selectProbationWorker, probationWorkerForRoute, CRITICAL_WORK_GATE, decideCriticalWorkGate, readDispatchAuth,
 } from './provider-routing.mjs';
 import { scrubPublish } from './secret-scrub.mjs';
 import { thresholdsForRisk, neverSpotCheck, spotCheckSample } from './dispatch-thresholds.mjs';
@@ -455,7 +457,8 @@ export function routeDispatch(profile, options = {}) {
     if (!ROUTE_STAGES.includes(stage)) errors.push('stage is invalid');
     if (stage === 'story' && !STORY_KINDS.includes(kind)) errors.push('kind is invalid');
     if (errors.length) return refused(errors);
-    if (stage === 'story' && kind === 'build') return { ...selectSupervisor(profile, { scorecards }), spotCheck: null };
+    const auth = readDispatchAuth(options);
+    if (stage === 'story' && kind === 'build') return { ...selectSupervisor(profile, { scorecards, availability: auth.availability }), spotCheck: null };
     // The router does not filter roles: work and supervisor evidence must never mix.
     const records = routingRecords(scorecards).filter(r => r.role !== 'supervise'), ownAudit = [], routerAudit = [];
     const high = profile.risk === 'high' || profile.filesTouched.some(isStatuteTierPath);
@@ -476,7 +479,7 @@ export function routeDispatch(profile, options = {}) {
       // the RAW scorecards, because `routingRecords` projects away the scope evidence a miss row may carry.
       const criticalWork = criticalWorkVerdict({ taskType: profile.taskType, filesTouched: profile.filesTouched, estimatedLoc: profile.estimatedLoc, acceptanceTestable: profile.acceptanceTestable, risk: options.criticalRisk ?? profile.risk, tags });
       const criticalMisses = criticalMissesFor(scorecards, profile.taskType);
-      const context = { risk: profile.risk, filesTouched: [...profile.filesTouched], estimatedSize: profile.estimatedLoc, acceptanceTestable: profile.acceptanceTestable, scorecards: records, kind, tags, criticalWork, criticalMisses, simple: simple === true, availability: options.availability, ...(criticalWorkGate ? { criticalWorkGate } : {}) };
+      const context = { risk: profile.risk, filesTouched: [...profile.filesTouched], estimatedSize: profile.estimatedLoc, acceptanceTestable: profile.acceptanceTestable, scorecards: records, kind, tags, criticalWork, criticalMisses, simple: simple === true, ...auth, ...(criticalWorkGate ? { criticalWorkGate } : {}) };
       const selected = selectProvider(task, context);
       routerAudit.push(...selected.auditTrail);
       out.provider = selected.recommendation;
@@ -635,7 +638,8 @@ export function selectSupervisor(profile, options = {}) {
     // subjectClass:'driver' argument below is the callee's own enforcement of the subject-class boundary.
     const records = routingRecords(options.scorecards).filter(r => r.role === 'supervise');
     const hard = profile.filesTouched.some(isStatuteTierPath) || ['architectural-decision', 'triage-research'].includes(profile.taskType);
-    const ids = hard ? ['claude-opus-5-5'] : SUPERVISOR_LADDERS[`${profile.risk}/${profile.complexity}`];
+    const ids = (hard ? ['claude-opus-5-5'] : SUPERVISOR_LADDERS[`${profile.risk}/${profile.complexity}`])
+      .filter(id => !(id.startsWith('agy-') && options.availability?.antigravity));
     const auditTrail = []; let chosen;
     for (const id of ids) {
       const candidate = SUPERVISOR_CANDIDATES.find(c => c.id === id);
@@ -1114,7 +1118,7 @@ function executedVendorFor(override) {
  * @returns {object} the routing record — see the file's own test for the exact shape.
  */
 // @wired-by-3717: has a runtime caller — the G2 dispatcher wiring (see `decideDispatchRoute`)
-function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], availability = {}, enforceSupervision = false, sizePolicy: rawSizePolicy = DEFAULT_SIZE_POLICY, promotions: rawPromotions = DEFAULT_PROMOTIONS, criticalWorkGate } = {}) {
+function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], availability = {}, agyAuth, now, agyAuthPeriodMs, enforceSupervision = false, sizePolicy: rawSizePolicy = DEFAULT_SIZE_POLICY, promotions: rawPromotions = DEFAULT_PROMOTIONS, criticalWorkGate } = {}) {
   try {
     const kind = String(dispatch?.kind ?? '').trim();
     const scopePaths = Array.isArray(dispatch?.scopePaths) ? dispatch.scopePaths.map(String) : [];
@@ -1149,7 +1153,7 @@ function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], availabilit
       // Preparation edits the card, not its eventual implementation scope. The launcher enforces that
       // single-card envelope; judgment roles (especially prepare-decision) never enter this roster.
       if (kind === 'prepare-item' && (criticalWorkGate ?? CRITICAL_WORK_GATE).openForNonCritical?.prepare) {
-        const picked = selectProbationWorker({ taskType: 'prepare', filesTouched: [], estimatedSize: 0, simple: dispatch.simple === true, scorecards: routingRecords(scorecards), vetoes: criticalMissesFor(scorecards, 'prepare'), availability });
+        const picked = selectProbationWorker({ taskType: 'prepare', filesTouched: [], estimatedSize: 0, simple: dispatch.simple === true, scorecards: routingRecords(scorecards), vetoes: criticalMissesFor(scorecards, 'prepare'), availability, agyAuth, now, agyAuthPeriodMs });
         record.probationWorker = picked.worker;
         record.tier = CLAUDE_TIERS.SONNET;
         record.auditTrail.push(...picked.auditTrail);
@@ -1222,7 +1226,7 @@ function decideDispatchRouteLegacy(dispatch = {}, { scorecards = [], availabilit
     // agy-launcher-probation — a `behind` CI heal (a rebase, no failing test to diagnose) is the one SIMPLE task
     // today; only a simple task may go to the Antigravity-Gemini probation worker (#3922).
     const simple = kind === 'ci-heal' && String(dispatch?.reason ?? '').trim() === 'behind';
-    const out = routeDispatch(built.profile, { stage: 'task', scorecards, taskKey: dispatch?.taskKey, kind, tags, criticalWorkGate, simple, availability, criticalRisk: dispatch?.risk ?? 'low' });
+    const out = routeDispatch(built.profile, { stage: 'task', scorecards, taskKey: dispatch?.taskKey, kind, tags, criticalWorkGate, simple, availability, agyAuth, now, agyAuthPeriodMs, criticalRisk: dispatch?.risk ?? 'low' });
     if (out.role === 'refused') {
       return routeRefused(kind, derivation, `the router refused this dispatch: ${out.auditTrail.map((a) => a.reasoning).join('; ')}`);
     }
@@ -1360,18 +1364,19 @@ function normalizeOverride(dispatch, kind) {
 // @wired-by-3717: has a runtime caller — the G2 dispatcher wiring (see `decideDispatchRoute`)
 export function decideDispatchRoute(dispatch = {}, options = {}) {
   // Retain the ci-heal caller's existing input while carrying holds through every probation path.
-  const availability = { ...(dispatch.kind === 'ci-heal' ? options.ciHealAvailability : {}), ...options.availability };
+  const auth = readDispatchAuth({ ...options, availability: { ...(dispatch.kind === 'ci-heal' ? options.ciHealAvailability : {}), ...options.availability } });
+  const availability = auth.availability;
   const policy = options.routingPolicy ?? DEFAULT_ROUTING_POLICY;
   const criticalWorkGate = options.criticalWorkGate ?? policy.criticalWorkGate;
   // CI heals retain their pre-existing explicit refusal when the offered roster is entirely held.
-  const record = decideDispatchRouteLegacy(dispatch, { ...options, availability: dispatch.kind === 'ci-heal' ? {} : availability, criticalWorkGate });
+  const record = decideDispatchRouteLegacy(dispatch, { ...options, ...auth, availability: dispatch.kind === 'ci-heal' ? {} : availability, criticalWorkGate });
   if (record.outcome === 'refused' || record.refusal || record.override) return record;
   // PR #3311 split: repair dispatch retains the main evidence/tier path.
   if (dispatch.kind === 'ci-heal' && Object.keys(availability).length && record.probationWorker) {
     const picked = selectProbationWorker({ taskType: record.taskType, tier: record.tier,
       simple: dispatch.reason === 'behind', filesTouched: dispatch.scopePaths ?? [],
       scorecards: routingRecords(options.scorecards), vetoes: criticalMissesFor(options.scorecards ?? [], record.taskType),
-      availability });
+      ...auth });
     record.auditTrail.push(...picked.auditTrail);
     if (picked.worker) record.probationWorker = picked.worker;
     // routing.builder=claude (resolveDispatchRoute) asks for native Claude when the whole roster is held; the caller
