@@ -1,17 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { classifyTier, fileTier, HIGH_MUST_STAY, TIER_RULES } from '../delivery-tier.mjs';
+import { classifyTier, fileTier, HIGH_MUST_STAY, TIER_RULES, NARROWED_NAME_GLOBS } from '../delivery-tier.mjs';
 import { GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR } from '../protected-path-floor.mjs';
 import { TRUST_CHAIN } from '../gate-config.mjs';
 
 
 // Concrete witnesses, including directory-marker entries from the protected floors.
-const sample = (glob) => (glob.endsWith('/') ? `${glob}sample.mjs` : glob).replace(/\*\*\//g, 'nested/')
+const sample = (glob) => (glob.endsWith('/') ? `${glob}sample.mjs`
+  : NARROWED_NAME_GLOBS.some(entry => entry.oldGlob === glob) ? `${glob}.mjs` : glob).replace(/\*\*\//g, 'nested/')
   .replace(/\*\*/g, 'sample.mjs').replace(/\*/g, 'sample').replace(/\?/g, 'x');
 const matchedHigh = (path) => {
   const r = classifyTier([path], builtins).perFile[0];
   return r.tier === 'HIGH' && !['unmatched', 'invalid-path', 'settings-unavailable'].includes(r.rule);
 };
-const builtins = { settings: { extraHigh: [] } };
+const builtins = { redMainFix: false, settings: { extraHigh: [] } };
 const highExamples = [
   'scripts/merge-ai-prs.mjs', 'scripts/lib/review-core.mjs', 'scripts/drain-queue.mjs',
   'scripts/conveyor/force-land.mjs', 'scripts/conveyor/red-main-fix.mjs',
@@ -27,6 +28,96 @@ const highExamples = [
 ];
 
 describe('delivery tiers (observe-only)', () => {
+  it('a red-main fix that only touches tests is not LOW', () => {
+    expect(classifyTier(['src/__tests__/x.test.mjs'], { ...builtins, redMainFix: true }).perFile[0])
+      .toMatchObject({ tier: 'MEDIUM', rule: 'red-main-or-unknown-context' });
+    expect(fileTier('README.md', { ...builtins, redMainFix: true })).toBe('MEDIUM');
+  });
+  it('unknown red-main context is not LOW', () => {
+    for (const redMainFix of [undefined, null, 0, '', 'false', {}, []]) {
+      const opts = { ...builtins, redMainFix };
+      expect(classifyTier(['README.md'], opts).perFile[0])
+        .toMatchObject({ tier: 'MEDIUM', rule: 'red-main-or-unknown-context' });
+      expect(fileTier('README.md', opts)).toBe('MEDIUM');
+    }
+    expect(classifyTier(['README.md']).tier).toBe('MEDIUM');
+  });
+  it('a quarantined test is HIGH', () => {
+    const path = 'src/__tests__/x.test.mjs';
+    const opts = { ...builtins, quarantinedTests: [path] };
+    expect(classifyTier([path], opts).perFile[0]).toEqual({ path, tier: 'HIGH', rule: 'quarantined-test' });
+    expect(fileTier(path, opts)).toBe('HIGH');
+    expect(fileTier('other/' + path, opts)).toBe('LOW');
+    expect(fileTier('README.md', { ...builtins, quarantinedTests: [] })).toBe('LOW');
+    expect(classifyTier([{ path: 'README.md', oldPath: path }], opts).tier).toBe('HIGH');
+  });
+  it.each([null, undefined, 'x', {}, [null], [1], Array(1)])('invalid quarantine context refuses: %j', (quarantinedTests) => {
+    const opts = { ...builtins, quarantinedTests };
+    const paths = ['README.md', 'scripts/conveyor/x.mjs', 'src/unknown.js'];
+    expect(classifyTier(paths, opts).perFile.map(f => [f.tier, f.rule]))
+      .toEqual(paths.map(() => ['HIGH', 'context-invalid']));
+    for (const path of paths) expect(fileTier(path, opts)).toBe('HIGH');
+  });
+  it.each([
+    'src/__tests__/safety-check.mjs', 'src/__tests__/x-safety.mjs', 'src/x-safety.test.ts',
+    'docs/governance/policy.txt', 'docs/governance.md', 'docs/nested/governance-policy.md',
+    'AGENTS.md', 'CLAUDE.md', 'docs/agent/testing.md', 'scripts/conveyor/advisory-label-sweep.mjs',
+    'scripts/conveyor/__tests__/advisory-label-sweep.test.mjs',
+  ])('sensitive path has a HIGH rule: %s', path => expect(matchedHigh(path)).toBe(true));
+  it('skills-src is HIGH', () => {
+    for (const path of ['skills-src/x/SKILL.md', 'nested/skills-src/x/SKILL.md']) {
+      expect(matchedHigh(path)).toBe(true);
+    }
+  });
+  it.each(['merge', 'review', 'drain'])('%s name protection is limited to code/config', name => {
+    for (const ext of ['mjs', 'cjs', 'js', 'ts', 'json', 'sh']) {
+      expect(matchedHigh(`scripts/docs/${name}-notes.${ext}`)).toBe(true);
+    }
+    expect(fileTier(`scripts/docs/${name}-notes.md`, builtins)).toBe('LOW');
+    const narrowing = NARROWED_NAME_GLOBS.find(entry => entry.oldGlob === `scripts/**/*${name}*`);
+    expect(narrowing.newGlobs).toEqual(['mjs', 'cjs', 'js', 'ts', 'json', 'sh'].map(ext => `scripts/**/*${name}*.${ext}`));
+    for (const glob of narrowing.newGlobs) expect(HIGH_MUST_STAY).toContain(glob);
+    expect(fileTier(`scripts/${name}-notes.md`, builtins)).toBe('LOW');
+  });
+  it('extraHigh can explicitly protect Markdown under narrowed names', () => {
+    for (const name of ['merge', 'review', 'drain']) {
+      const opts = { ...builtins, settings: { extraHigh: [`scripts/**/*${name}*`] } };
+      expect(classifyTier([`scripts/docs/${name}-notes.md`], opts).perFile[0])
+        .toMatchObject({ tier: 'HIGH', rule: `scripts/**/*${name}*` });
+    }
+  });
+  it('duplicate settings keys refuse', () => {
+    for (const text of [
+      '{"extraHigh":["docs/**"],"extraHigh":[]}',
+      '{"extraHigh":[],"nested":{"x":1,"x":2}}',
+      '{"extraHigh":[],"nested":[{"x":1,"\\u0078":2}]}',
+    ]) {
+      const opts = { ...builtins, readSettings: () => text };
+      delete opts.settings;
+      expect(classifyTier(['README.md'], opts).perFile[0])
+        .toMatchObject({ tier: 'HIGH', rule: 'settings-unavailable' });
+      expect(fileTier('README.md', opts)).toBe('HIGH');
+    }
+  });
+  it('settings tokenizer accepts distinct objects and punctuation in strings', () => {
+    const readSettings = () => '{"extraHigh":[],"a":{"x":"{\\\"x\\\":}"},"b":[{"x":2}]}';
+    expect(fileTier('README.md', { readSettings, redMainFix: false })).toBe('LOW');
+  });
+  it.each([{}, { extraHigh: [''] }, ...['/docs/**', 'docs\\x', 'docs/\nx', 'docs/\x7fx',
+    'docs//x', 'docs/./x', 'docs/../x', 'docs/***', 'docs/'].map(g => ({ extraHigh: [g] }))])(
+    'missing extraHigh or invalid globs refuse: %j', settings => {
+      for (const opts of [{ settings }, { readSettings: () => JSON.stringify(settings) }]) {
+        expect(classifyTier(['README.md'], opts).perFile[0])
+          .toMatchObject({ tier: 'HIGH', rule: 'settings-unavailable' });
+        expect(fileTier('README.md', opts)).toBe('HIGH');
+      }
+    },
+  );
+  it('malformed settings text refuses', () => {
+    expect(classifyTier(['README.md'], { readSettings: () => '{' }).perFile[0])
+      .toMatchObject({ tier: 'HIGH', rule: 'settings-unavailable' });
+  });
+
   it.each(highExamples)('must stay HIGH: %s', (path) => {
     expect(fileTier(path)).toBe('HIGH');
     expect(classifyTier([path], builtins).perFile[0].rule).not.toBe('unmatched');
@@ -34,12 +125,12 @@ describe('delivery tiers (observe-only)', () => {
   it.each([
     ['docs/x.md', 'LOW'], ['README.md', 'LOW'], ['src/__tests__/x.test.mjs', 'LOW'],
     ['__tests__/x.test.mjs', 'LOW'], ['scripts/conveyor/x.mjs', 'MEDIUM'],
-  ])('%s is %s', (path, tier) => expect(fileTier(path)).toBe(tier));
+  ])('%s is %s', (path, tier) => expect(fileTier(path, { redMainFix: false })).toBe(tier));
 
   it('highest matching rule wins, including HIGH tests and conveyor files', () => {
     expect(fileTier('scripts/hooks/__tests__/x.test.mjs')).toBe('HIGH');
     expect(fileTier('scripts/conveyor/__tests__/x.test.mjs')).toBe('MEDIUM');
-    const result = classifyTier(['docs/x.md', 'scripts/conveyor/x.mjs', 'scripts/merge-ai-prs.mjs']);
+    const result = classifyTier(['docs/x.md', 'scripts/conveyor/x.mjs', 'scripts/merge-ai-prs.mjs'], builtins);
     expect(result.tier).toBe('HIGH');
     expect(result.perFile.map(f => f.tier)).toEqual(['LOW', 'MEDIUM', 'HIGH']);
     expect(result.perFile[0]).toEqual({ path: 'docs/x.md', tier: 'LOW', rule: 'docs/**' });
@@ -63,7 +154,7 @@ describe('delivery tiers (observe-only)', () => {
       expect(classifyTier([path], { settings }).tier).toBe('HIGH');
     }
     for (const path of ['docs/private/a.md', 'docs/abc.md', 'docs/aaab.md']) {
-      expect(classifyTier([path], { settings }).tier).toBe('LOW');
+      expect(classifyTier([path], { settings, redMainFix: false }).tier).toBe('LOW');
     }
   });
   it.each([
@@ -125,7 +216,7 @@ describe('delivery tiers (observe-only)', () => {
   });
   it('loads the shipped settings through the default reader', () => {
     const readSettings = vi.fn(() => '{"extraHigh":[]}');
-    expect(classifyTier(['docs/x.md'], { readSettings }).tier).toBe('LOW');
+    expect(classifyTier(['docs/x.md'], { readSettings, redMainFix: false }).tier).toBe('LOW');
     expect(readSettings).toHaveBeenCalledWith(expect.stringMatching(/scripts\/settings\/delivery-tiers\.json$/), 'utf8');
   });
   it.each(['../docs/x.md', '/docs/x.md', 'docs/../scripts/merge.mjs', 'docs/./x.md', 'docs//x.md', '', null])(
