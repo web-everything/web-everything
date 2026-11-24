@@ -18,6 +18,7 @@ export const EXPECTED_MATRIX_JOBS = [
   ...Array.from({ length: 8 }, (_, i) => `soak-shard (${i + 1})`),
 ];
 export const REQUIRED_JOBS = ['changes', 'standards', 'coverage-merge', 'host-paths', 'integration', 'test', 'smoke', 'daemon-soak'];
+export const FULL_TEST_RECEIPT = 'Full test run (no quarantine exclusions)';
 
 /** Pure verdict over one merge_group run and its COMPLETE job list. */
 export function judgeRun(run, jobs, sha) {
@@ -30,6 +31,11 @@ export function judgeRun(run, jobs, sha) {
     const job = byName.get(name);
     if (!job) return { reuse: false, why: `partial run: no ${name} job` };
     if (job.conclusion !== 'success') return { reuse: false, why: `${name} was ${job.conclusion}` };
+    // A successful job may have excluded quarantined tests. Require evidence from its actual runner args,
+    // rather than reconstructing historical quarantine from today's list (entries can expire or be removed).
+    if (EXPECTED_MATRIX_JOBS.includes(name) && !job.steps?.some(s => s.name === FULL_TEST_RECEIPT && s.conclusion === 'success')) {
+      return { reuse: false, why: `partial run: no full-test receipt for ${name}` };
+    }
   }
   return { reuse: true, why: 'merge-queue run succeeded in full' };
 }
@@ -39,8 +45,8 @@ export function judgeRun(run, jobs, sha) {
  * outcomes). NO provider calls here: every read is injected.
  *   listQueueRuns(sha) -> [{id, head_sha, event, status, conclusion}]  merge-queue runs of that exact state
  *   listRunJobs(runId) -> [{name, conclusion}]  the COMPLETE job list (the adapter throws if it cannot prove completeness)
- *   quarantineClear()  -> true only when no red-main quarantine entry is active (the queue may have skipped
- *                         quarantined tests; main runs every test)
+ *   quarantineClear()  -> true only when today's quarantine is readable and clear. Per-job full-test receipts
+ *                         independently prove that the queue did not skip tests under historical quarantine.
  * Any throw means reuse=false.
  */
 export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantineClear = async () => false }) {
@@ -89,21 +95,23 @@ export function githubReads({ repo, token, fetchImpl = fetch }) {
   };
 }
 
-async function main() {
-  const { GITHUB_SHA: sha, GITHUB_REPOSITORY: repo, GITHUB_TOKEN: token, GITHUB_EVENT_NAME: event } = process.env;
-  const quarantineClear = async () => {
-    const { readQuarantine } = await import('../lib/red-main-quarantine-io.mjs');
-    const { activeEntries } = await import('../lib/red-main-quarantine.mjs');
-    const got = readQuarantine({});
-    return got.ok === true && activeEntries(got.list, { now: Date.now() }).length === 0;
-  };
-  const v = await decide({ ...githubReads({ repo, token }), sha, event, quarantineClear });
+/** Current quarantine guard; injected dependencies also exercise the real adapter without network access. */
+export async function quarantineClear({ readQuarantine, activeEntries, board = process.cwd(), run, now = Date.now() } = {}) {
+  readQuarantine ??= (await import('../lib/red-main-quarantine-io.mjs')).readQuarantine;
+  activeEntries ??= (await import('../lib/red-main-quarantine.mjs')).activeEntries;
+  const got = readQuarantine({ board, ...(run ? { run } : {}) });
+  return got.ok === true && activeEntries(got.list, { now }).length === 0;
+}
+
+export async function main({ env = process.env, fetchImpl = fetch, quarantineOptions } = {}) {
+  const { GITHUB_SHA: sha, GITHUB_REPOSITORY: repo, GITHUB_TOKEN: token, GITHUB_EVENT_NAME: event } = env;
+  const v = await decide({ ...githubReads({ repo, token, fetchImpl }), sha, event, quarantineClear: () => quarantineClear(quarantineOptions) });
   const line = v.reuse
     ? `mq-result-reuse: REUSING merge-queue run ${v.runId} for ${sha}; heavy jobs skipped (${v.why})`
     : `mq-result-reuse: full run (${v.why})`;
   console.log(line);
-  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `reuse=${v.reuse ? 'true' : 'false'}\n`);
-  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${line}\n`);
+  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `reuse=${v.reuse ? 'true' : 'false'}\n`);
+  if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, `${line}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

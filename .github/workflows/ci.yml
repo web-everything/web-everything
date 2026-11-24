@@ -314,6 +314,7 @@ jobs:
       # Card 12: `--group=covered` is the tests that can reach a coverage-counted file (scripts/ci/coverage-reach.mjs);
       # only those run under --coverage, so the covered files' numbers are unchanged.
       - name: Unit suite shard ${{ matrix.shard }}/9 (coverage, no per-shard bar)
+        id: covered
         if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard != 10) }}
         working-directory: web-everything
         run: |
@@ -324,9 +325,15 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit shard ${{ matrix.shard }}/9: ${#files[@]} files"
-          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+          test_args=(npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
+        id: nocov
         if: ${{ needs.changes.outputs.light != 'true' && (matrix.shard == 10) }}
         working-directory: web-everything
         run: |
@@ -336,7 +343,18 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit no-coverage group: ${#files[@]} files"
-          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
+          test_args=(npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      # Only this run's actual, successful test invocation can attest full coverage. Historical ops/quarantine
+      # entries may expire or be removed before main considers reuse, so checking the current list is insufficient.
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ steps.covered.outputs.full == 'true' || steps.nocov.outputs.full == 'true' }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       # Upload this shard's partial coverage for the `coverage-merge` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
@@ -616,11 +634,22 @@ jobs:
 
       # Vite can transform private sibling imports; its cache must also stay on the runner.
       - name: Real-git integration suite (lane-pool, operations transport)
+        id: suite
         if: ${{ steps.gate.outputs.run == 'true' }}
         working-directory: web-everything
         env:
           WE_INTEGRATION_GROUP: ${{ matrix.group }}
-        run: npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration")
+        run: |
+          test_args=(npm run test:integration:vitest -- --reporter=default --reporter=json --outputFile.json=coverage/timing-integration-${{ matrix.group }}.json $(node scripts/ci/quarantine-skip.mjs --job="integration"))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ steps.suite.outputs.full == 'true' }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       # Per-file timing evidence only; missing reports never gate CI. One artifact per matrix group
       # (upload-artifact@v4 refuses a duplicate name across matrix legs).
@@ -767,7 +796,18 @@ jobs:
         run: npm ci
 
       - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
-        run: npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})")
+        id: suite
+        run: |
+          test_args=(npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})"))
+          "${test_args[@]}"
+          case " ${test_args[*]} " in
+            *" --exclude"*|*" --quarantined"*) ;;
+            *) echo "full=true" >> "${GITHUB_OUTPUT:-/dev/null}" ;;
+          esac
+
+      - name: Full test run (no quarantine exclusions)
+        if: ${{ steps.suite.outputs.full == 'true' }}
+        run: echo "All assigned tests ran without quarantine exclusions"
 
       - name: Measure shard resources
         if: always()
