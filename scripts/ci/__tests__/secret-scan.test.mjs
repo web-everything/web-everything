@@ -5,7 +5,7 @@ const { afterEach, test } = process.env.VITEST
 import { createHash, generateKeyPairSync, webcrypto } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
 import { runInNewContext } from 'node:vm';
@@ -58,6 +58,30 @@ const exemption = (path, rule, bytes = token) => ({ path, rule, sha256: sha256(b
 // Assemble synthetic JWKs at runtime so this credential-named test source can ship to Forge.
 const jwk = (members, space) => JSON.stringify(Object.fromEntries([['kty', 'RSA'], ...members]), null, space);
 const privateJwk = jwk([['d', 'FAKE_TEST_ONLY']]);
+
+for (const linkType of ['file', 'directory']) {
+  for (const scenario of ['hit', 'clean', 'invalid-base']) {
+    test(`CLI through a ${linkType} symlink scans ${scenario}`, () => {
+      const r = repo();
+      r.put('fixture.txt', scenario === 'hit' ? token : 'clean');
+      r.commit();
+      const dir = temporary();
+      const link = join(dir, linkType === 'file' ? 'scanner.mjs' : 'linked-ci');
+      symlinkSync(linkType === 'file' ? cli : dirname(cli), link, linkType === 'file' ? 'file' : 'dir');
+      const entry = linkType === 'file' ? link : join(link, 'secret-scan.mjs');
+      const result = spawnSync(process.execPath, [entry, '--repo', r.dir,
+        '--base', scenario === 'invalid-base' ? 'nonexistent-base' : r.base, '--head', 'HEAD'], {
+        cwd: dir, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024,
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status, scenario === 'clean' ? 0 : 1);
+      assert.equal(result.stdout, scenario === 'hit' ? 'fixture.txt:1 github-token\n' : '');
+      if (scenario === 'invalid-base') assert.match(result.stderr, /secret-scan: incomplete input/);
+      else assert.equal(result.stderr, '');
+      assert.ok(!(result.stdout + result.stderr).includes(token));
+    });
+  }
+}
 
 // Build source strings at runtime so this file itself contains no private JWK.
 const templateJwk = (key, members) => 'export default {' + Object.entries(key).map(([name, value]) =>
