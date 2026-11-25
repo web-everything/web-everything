@@ -360,10 +360,12 @@ describe('audit safeguards', () => {
 });
 
 describe('D1: review-owned merge-gate red is never sent back', () => {
-  const gateRow = () => row('merge-gate', 'FAILURE', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/555' });
+  const gateRow = (extra = {}) => row('merge-gate', 'FAILURE', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/555', checkRunId: 555, ...extra });
+  const EVAL = "Evaluate the drain's merge gates";
+  const okSteps = [{ name: 'Set up job', conclusion: 'success' }, { name: EVAL, conclusion: 'failure' }, { name: 'Post', conclusion: 'skipped' }];
   const prWith = (rows, extra = {}) => fixture({ statusCheckRollup: rows, ...extra });
   const verdict = (results, extra = {}) => ({ num: 7196, head_sha: head, ok: false, results,
-    failedSteps: ["Evaluate the drain's merge gates"], ...extra });
+    stepResults: okSteps, jobId: 555, jobName: 'merge-gate', ...extra });
   const hold = (id, status = 'hold') => ({ id, status, reason: 'x' });
   const run = (pr, readVerdict, extra = {}) => {
     const directory = mkdtempSync(join(tmpdir(), 'drain-d1-'));
@@ -410,21 +412,47 @@ describe('D1: review-owned merge-gate red is never sent back', () => {
     expect(mixed.out.sent).toBe(true);
   });
   it.each([
-    ['another failed step', () => verdict([hold('review-acceptance')], { failedSteps: ["Evaluate the drain's merge gates", 'Validate'] })],
-    ['unknown steps', () => verdict([hold('review-acceptance')], { failedSteps: null })],
-    ['no step evidence', () => { const v = verdict([hold('review-acceptance')]); delete v.failedSteps; return v; }],
-  ])('R2.4: a failed job step outside the hold table is not review-owned (%s)', (_n, reader) => {
+    ['another failed step', () => verdict([hold('review-acceptance')], { stepResults: [...okSteps, { name: 'Validate', conclusion: 'failure' }] })],
+    ['empty step list', () => verdict([hold('review-acceptance')], { stepResults: [] })],
+    ['unknown steps', () => verdict([hold('review-acceptance')], { stepResults: null })],
+    ['no step evidence', () => { const v = verdict([hold('review-acceptance')]); delete v.stepResults; return v; }],
+    ['cancelled evaluator', () => verdict([hold('review-acceptance')], { stepResults: [{ name: EVAL, conclusion: 'cancelled' }] })],
+    ['duplicate evaluator failures', () => verdict([hold('review-acceptance')], { stepResults: [{ name: EVAL, conclusion: 'failure' }, { name: EVAL, conclusion: 'failure' }] })],
+    ['skipped-only evaluator (no failure)', () => verdict([hold('review-acceptance')], { stepResults: [{ name: EVAL, conclusion: 'skipped' }] })],
+  ])('R3.2: exactly one failed step, the evaluator, with conclusion failure (%s)', (_n, reader) => {
     expect(run(prWith([row('test'), gateRow()]), reader).out.sent).toBe(true);
   });
-  it('R2.1: a review-hold annotation on any check other than merge-gate is ignored', () => {
-    const pr = prWith([{ ...row('test', 'FAILURE'), mergeGateReviewHold: { holds: ['review-acceptance'], sendBackValidatedHead: head } }]);
-    expect(decideGateSendBack({ pr, headSha: head, requiredChecks: ['test'], ledger: {} }).send).toBe(true);
+  it.each([
+    ['job id from a foreign job', () => verdict([hold('review-acceptance')], { jobId: 999 }), gateRow()],
+    ['job not named merge-gate', () => verdict([hold('review-acceptance')], { jobName: 'lint' }), gateRow()],
+    ['check run id differs from the details-URL job', () => verdict([hold('review-acceptance')]), gateRow({ checkRunId: 777 })],
+    ['foreign app row', () => verdict([hold('review-acceptance')]), gateRow({ appSlug: 'evil-app' })],
+  ])('R3.3: the job id must be anchored to the merge-gate check run (%s)', (_n, reader, gate) => {
+    expect(run(prWith([row('test'), gate]), reader).out.sent).toBe(true);
   });
-  it('R2.2: a pre-existing annotation without the local validation stamp, or for another head, is not trusted', () => {
-    const base = { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555 } };
-    expect(decideGateSendBack({ pr: prWith([row('test'), base]), headSha: head, requiredChecks, ledger: {} }).send).toBe(true);
-    const other = { ...base, mergeGateReviewHold: { ...base.mergeGateReviewHold, sendBackValidatedHead: 'b'.repeat(40) } };
-    expect(decideGateSendBack({ pr: prWith([row('test'), other]), headSha: head, requiredChecks, ledger: {} }).send).toBe(true);
+  it('R2.1: a review-hold annotation on any check other than merge-gate is ignored', () => {
+    const pr = prWith([{ ...row('test', 'FAILURE'), mergeGateReviewHold: { holds: ['review-acceptance'], sendBackStamp: 'x' } }]);
+    expect(decideGateSendBack({ pr, headSha: head, requiredChecks: ['test'], ledger: {}, setting: 'on' }).send).toBe(true);
+  });
+  it('R3.1: a stamp from anywhere else (absent, guessed, copied for another head/run/holds/setting) is ignored', () => {
+    const good = markReviewOwnedGate(prWith([row('test'), gateRow()]), { headSha: head, repo: 'o/r', readVerdict: () => verdict([hold('review-acceptance')]), readFreeze: () => ({}), setting: 'on' });
+    const gate = good.statusCheckRollup[1];
+    expect(gate.mergeGateReviewHold.sendBackStamp).toMatch(/^[0-9a-f]{64}$/);
+    const decide = (g, setting = 'on', headSha = head) => decideGateSendBack({ pr: prWith([row('test'), g]), headSha, requiredChecks, ledger: {}, setting });
+    expect(decide(gate).send).toBe(false);
+    const withHold = patch => ({ ...gate, mergeGateReviewHold: { ...gate.mergeGateReviewHold, ...patch } });
+    expect(decide(withHold({ sendBackStamp: undefined })).send).toBe(true);
+    expect(decide(withHold({ sendBackStamp: 'a'.repeat(64) })).send).toBe(true);
+    expect(decide(withHold({ holds: ['codeql'] })).send).toBe(true);
+    expect(decide(withHold({ jobId: 556 })).send).toBe(true);
+    expect(decide({ ...gate, checkRunId: 556 }).send).toBe(true);
+    expect(decide(gate, 'off').send).toBe(true);
+    expect(decide(gate, null).send).toBe(true);
+    expect(decide(gate, 'on', 'b'.repeat(40)).send).toBe(false); // wrong head: decide refuses before any send
+  });
+  it('R2.2: a hand-made annotation with holds [codeql] and no stamp never suppresses the send-back', () => {
+    const base = { ...gateRow(), mergeGateReviewHold: { holds: ['codeql'], jobId: 555 } };
+    expect(decideGateSendBack({ pr: prWith([row('test'), base]), headSha: head, requiredChecks, ledger: {}, setting: 'off' }).send).toBe(true);
   });
   it('R2.2: a stale PR head or an unreadable setting fails closed (send back as today)', () => {
     const pr = prWith([row('test'), gateRow()]);
@@ -433,8 +461,8 @@ describe('D1: review-owned merge-gate red is never sent back', () => {
     expect(run(pr, () => verdict([hold('review-acceptance')]), { mergeGateSetting: null }).out.sent).toBe(true);
   });
   it('decideGateSendBack reports the review-owned reason and keeps merge-gate failed in the rollup', () => {
-    const pr = prWith([row('test'), { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555, sendBackValidatedHead: head } }]);
-    expect(decideGateSendBack({ pr, headSha: head, requiredChecks, ledger: {} }))
+    const pr = markReviewOwnedGate(prWith([row('test'), gateRow()]), { headSha: head, repo: 'o/r', readVerdict: () => verdict([hold('review-acceptance')]), readFreeze: () => ({}), setting: 'on' });
+    expect(decideGateSendBack({ pr, headSha: head, requiredChecks, ledger: {}, setting: 'on' }))
       .toMatchObject({ send: false, reason: expect.stringContaining('review-owned (review-acceptance)') });
     expect(pr.statusCheckRollup[1].conclusion).toBe('FAILURE');
   });
