@@ -2820,7 +2820,7 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     const dispatch = vi.fn(p => ok(p.pr));
     const readPushHold = vi.fn(() => null);
     const result = run({ dispatch, readPushHold, dryRun: false });
-    expect(readPushHold).toHaveBeenCalledWith(expect.objectContaining({ pr: 1764 }));
+    expect(readPushHold).toHaveBeenCalledWith(expect.objectContaining({ pr: 1764 }), undefined);
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(result.dispatched).toHaveLength(1);
   });
@@ -2850,25 +2850,142 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   it('a hold added after lane selection returns the lane and spawns nothing (:2152)', () => {
-    let laneSelected = false;
+    let reads = 0;
     const dispatch = vi.fn(p => ok(p.pr));
-    const readPushHold = vi.fn(({ pr }) => (laneSelected && pr === 1764 ? { code: 'hold-label', reason: 'review:human' } : null));
-    const pickFreeLanes = () => { laneSelected = true; return [4]; };
+    const readPushHold = vi.fn(({ pr }) => (pr === 1764 && ++reads === 2 ? { code: 'hold-label', reason: 'review:human' } : null));
+    const pickFreeLanes = () => [4];
     const second = { kind: 'fix', prNumber: 1765, headRefName: 'lane/3439-other-thing' };
     const result = run({ dispatch, readPushHold, pickFreeLanes, dryRun: false }, [entry, second]);
     expect(dispatch).toHaveBeenCalledTimes(1);
     // The held PR's lane went back to the pool, so the next PR still got lane 4.
     expect(dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ pr: 1765, lane: 4 }));
     expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    expect(reads).toBe(2);
   });
 
-  it('a held ordinary (non-conflict) PR is not resumed either', () => {
+  it.each([{ isConflict: true }, { attempts: 1 }])('a held eligible resume is refused, with a clear positive control (%j)', shape => {
     const tryResume = vi.fn(() => ({ resumed: true, result: { pr: 1764 } }));
+    const tryResumeRound = vi.fn(() => ({ resumed: true, result: { pr: 1764 } }));
     const dispatch = vi.fn(p => ok(p.pr));
-    const result = run({ dispatch, tryResume, tryResumeRound: vi.fn(), readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }), dryRun: false });
+    const options = { dispatch, tryResume, tryResumeRound, dryRun: false };
+    const readPushHold = vi.fn().mockReturnValueOnce(null).mockReturnValue({ code: 'hold-label', reason: 'review:human' });
+    const result = run({ ...options, readPushHold }, [{ ...entry, ...shape }]);
+    expect(readPushHold).toHaveBeenCalledTimes(2);
     expect(tryResume).not.toHaveBeenCalled();
+    expect(tryResumeRound).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    run({ ...options, readPushHold: () => null }, [{ ...entry, ...shape }]);
+    expect(shape.isConflict ? tryResume : tryResumeRound).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a held first entry consumes no fix-cap, queue demand or pass allowance', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const tryAdmit = vi.fn(() => ({ admit: tryAdmit.mock.calls.length <= 1, kind: 'fix-cap' }));
+    const queue = vi.fn(() => ({ admit: queue.mock.calls.length <= 1 }));
+    const result = run({ dispatch, dispatchThrottle: { tryAdmit }, queueAdmission: { tryAdmit: queue },
+      readPushHold: ({ pr }) => pr === 1764 ? { code: 'hold-label', reason: 'review:human' } : null,
+    }, [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1765]);
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(result.handled).toBe(1);
+  });
+
+  it('a correctly bound MQ refresh on a held PR never reaches the push port', () => {
+    const refreshMqFailure = vi.fn(() => ({ action: 'refreshed' }));
+    const dispatch = vi.fn();
+    const held = { ...entry, mqFailureRecovery: { repo: 'web-everything/web-everything', pr: entry.prNumber,
+      head: entry.headRefOid, evidence: { complete: true, testFiles: ['tests/failure.test.mjs'], assertions: ['break'] } } };
+    const options = { dispatch, refreshMqFailure, mqFailureLedger: { readFixFallback: () => false },
+      mqFailureIo: { readHead: () => entry.headRefOid }, fetchItemlessDiffPaths: () => ['src/unrelated.mjs'] };
+    const result = run({ ...options, readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }) }, [held]);
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    run({ ...options, readPushHold: () => null }, [held]);
+    expect(refreshMqFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it('held reads still obey the pass deadline without spending dispatch allowance', () => {
+    let time = 0;
+    const readPushHold = vi.fn(() => { time = 2; return { code: 'hold-label', reason: 'review:human' }; });
+    const result = run({ now: 0, clock: () => time, deadlineAt: 1, readPushHold },
+      [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(readPushHold).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ handled: 0, deferred: [1765] });
+  });
+
+  it.each([
+    ['advisory-fix', ['review:human', 'advisory:changes'], {}],
+    ['operator-send-back', ['review:human'], { operatorSendBack: { body: 'repair' } }],
+    ['ruling-not-addressed', ['review:human'], { rulingNotAddressed: { matches: [] } }],
+    ['block-ruled-referral', ['review:human'], { blockRuledReferrals: [{}] }],
+    ['takeover', ['review:human'], { takeover: {} }],
+    ['scope-bloat-rebase', ['review:changes'], { scopeBloat: {} }],
+    ['stale-base-rebase', ['review:human'], { isConflict: true, staleBase: {} }],
+    ['stacked-rebase', ['review:accepted'], { isConflict: true }],
+    [undefined, ['review:human', CONFLICT_LABEL], { isConflict: true }],
+    [undefined, ['review:changes', 'red-team:blocked'], {}],
+    [undefined, ['review:changes'], {}],
+    [undefined, ['review:pending', CONFLICT_LABEL], { isConflict: true }],
+    ['mq-failure-recovery', ['review:changes'], {}],
+    [undefined, ['review:changes', 'red-team:pending'], {}, false],
+    ['advisory-fix', ['review:human', 'advisory:changes', 'review:held-mechanical'], {}, false],
+  ])('planner repair shape %s with %j obeys the live reader', (mode, labels, fields, allowed = true) => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = context => readLivePushHold(context, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) });
+    const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, mode, labels, ...fields }]);
+    if (allowed) {
+      expect(result.refusals).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } else {
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    }
+  });
+
+  it('both default reader wirings reach gh with hermetic off', () => {
+    const gh = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }));
+    const readPushHoldOptions = { run: gh, hermetic: false };
+    const dispatch = vi.fn();
+    run({ dispatch, readPushHoldOptions });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(1);
+    const spawnAgent = vi.fn();
+    expect(() => dispatchFix({ itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, readPushHoldOptions, grantConflictHelper: vi.fn() })).toThrow(/push-hold/);
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [['review:human'], { mode: 'advisory-fix', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes'], { mode: 'advisory-fix', labels: [] }],
+    [['red-team:blocked', 'review:changes'], { labels: ['review:changes'] }],
+    [['red-team:blocked'], { labels: ['red-team:blocked', 'review:changes'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending'], { mode: 'advisory-fix', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'review:held-mechanical'], { mode: 'advisory-fix', labels: ['review:human'] }],
+  ])('repair context cannot bypass a new, unrelated or superseded hold (%j)', (labels, repair) => {
+    const dispatch = vi.fn();
+    const result = run({ dispatch, readPushHoldOptions: { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) } }, [{ ...entry, ...repair }]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+  });
+
+  it.each([true, false].flatMap(itemBacked => [
+    { itemBacked, mode: 'advisory-fix', labels: ['review:human', 'advisory:changes'] },
+    { itemBacked, mode: 'operator-send-back', labels: ['review:human'], operatorSendBack: { body: 'repair' } },
+    { itemBacked, labels: ['review:changes', 'red-team:blocked'] },
+  ]))('direct callers retain hold repair context ($mode, item-backed=$itemBacked)', ({ itemBacked, ...context }) => {
+    const row = { ...entry, ...(itemBacked ? {} : { headRefName: 'topic' }), ...context };
+    const { planned } = planFixesFromReconcile([row], findItemStub, () => [], () => [], 'we', () => ['src/a.mjs']);
+    expect(planned[0]).toMatchObject(context);
+    expect(readLivePushHold({ repo: 'we', pr: 1764, repair: planned[0] }, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: row.labels.map(name => ({ name })) }) })).toBeNull();
   });
 
   it('dispatchFix re-reads the hold after the slow prep and spawns nothing; the claim is released', () => {

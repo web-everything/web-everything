@@ -99,14 +99,25 @@ import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
  * field is a refusal, never a spawn. A hold seen here is read-only: it grants nothing, it only stops a launch.
  * Hermetic under a test runner unless a test injects its own reader.
  */
-export function readLivePushHold({ repo, pr }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
+export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
   if (hermetic) return null;
   const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
     || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };
   if (view.state !== 'OPEN') return { code: 'pr-not-open', reason: 'PR is not open' };
-  const label = view.labels.find(l => PUSH_HOLD_LABELS.includes(l.name))?.name;
+  const labels = view.labels.map(l => l.name);
+  // These labels hold landing/review, but the planner can owe a repair while they remain present.
+  // Only exempt a hold already carried by that repair; a newly added hold still stops it. MQ refresh
+  // supplies no repair context and never receives these exceptions. Check every remaining hold too.
+  const humanRepair = (repair?.reviewHuman === true || repair?.labels?.includes('review:human'))
+    && ((repair.mode === 'advisory-fix' && labels.includes('advisory:changes'))
+      || repair.operatorSendBack || repair.rulingNotAddressed || repair.blockRuledReferrals?.length
+      || repair.takeover || repair.scopeBloat || repair.staleBase || repair.isConflict);
+  const label = labels.find(name => PUSH_HOLD_LABELS.includes(name)
+    && !(name === 'review:human' && humanRepair)
+    && !(name === 'red-team:blocked' && repair?.labels?.includes(name)
+      && (labels.includes('review:changes') || humanRepair)));
   return label ? { code: 'hold-label', reason: label } : null;
 }
 import { execFileSync } from 'node:child_process';
@@ -407,7 +418,8 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         ...(entry.mqFailureRecovery ? { mqFailureRecovery: entry.mqFailureRecovery } : {}),
         ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),
         ...(entry.labels?.includes('review:human') ? { reviewHuman: true } : {}),
-        ...(includeLabels && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
+        ...((includeLabels || entry.labels?.some(label => PUSH_HOLD_LABELS.includes(label)))
+          && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
         overlapScope: fetchDiffPathsForEntry(pr).map((path) => `${prefix}:${path}`),
         itemNum: null, pr, laneRef: headRefName, scope: itemlessScope, scopeSource: 'pr-diff',
         isConflict: isConflictItemless, body: entry.body ?? null, headRefOid: entry.headRefOid ?? null,
@@ -531,7 +543,8 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         ...(entry.mqFailureRecovery ? { mqFailureRecovery: entry.mqFailureRecovery } : {}),
       ...(entry.waitingSince ? { waitingSince: entry.waitingSince } : {}),
       ...(entry.labels?.includes('review:human') ? { reviewHuman: true } : {}),
-        ...(includeLabels && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
+      ...((includeLabels || entry.labels?.some(label => PUSH_HOLD_LABELS.includes(label)))
+        && Array.isArray(entry.labels) && entry.labels.length ? { labels: entry.labels } : {}),
       overlapScope: changedPaths.map((path) => `${prefix}:${path}`),
       itemNum: itemNumOut, pr, laneRef: headRefName, scope, scopeSource, isConflict, body: entry.body ?? null,
       // #xu2krte security review finding — needed by `tryResumeFix` to confirm a resume CANDIDATE actually
@@ -544,6 +557,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.staleBase ? { staleBase: entry.staleBase } : {}),
+      ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
       ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
       ...(entry.mainFix === true ? { mainFix: true } : {}), // the red-main fix PR: its repair stays on Claude.
@@ -556,6 +570,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
 /** Card xrbu1bp — the planner's spent-round count and the PR's base ref, carried onto a planned fix. */
 function roundFields(entry) {
   return {
+    ...(entry.mode ? { mode: entry.mode } : {}),
     ...(entry.isConflict === true && entry.conflictFixMechanical === true ? { conflictFixMechanical: true } : {}),
     ...(Number.isFinite(Number(entry.attempts)) && entry.attempts != null ? { attempts: Number(entry.attempts) } : {}),
     ...(Number.isFinite(Number(entry.cap)) && entry.cap != null ? { cap: Number(entry.cap) } : {}),
@@ -1573,6 +1588,7 @@ export function dispatchFix(planned, {
   readTakeoverDiff = ({ repo: r, from, to }) => (isUnderTestEnv() ? null : readTakeoverDiffViaGh({ repo: r, from, to })),
   // PUSH-GATE-S4 — live hold read right before the launch; injectable so a test reads nothing.
   readPushHold = readLivePushHold,
+  readPushHoldOptions,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -1677,7 +1693,7 @@ export function dispatchFix(planned, {
     // A throw here releases the claim in the catch below and nothing is spawned.
     {
       let hold;
-      try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef }); }
+      try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef, repair: planned }, readPushHoldOptions); }
       catch { hold = { code: 'unreadable', reason: 'Cannot read push authority' }; }
       if (hold) throw new Error(`push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})`);
     }
@@ -1902,6 +1918,7 @@ export function runReconcileFixDispatch({
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
   // PUSH-GATE-S4 — live hold read right before any launch; injectable so tests read nothing.
   readPushHold = readLivePushHold,
+  readPushHoldOptions,
   root = REPO_ROOT,
   repo = null,
   // This pass targets WE when repo is omitted, including idle restacks. Pin the shared
@@ -2119,9 +2136,10 @@ export function runReconcileFixDispatch({
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
   }
   // PUSH-GATE-S4 — live hold read; a hold or any unreadable evidence is a refusal, never a launch or a push.
-  const pushHoldRefusal = (entry) => {
+  const pushHoldRefusal = (entry, { mechanicalRefresh = false } = {}) => {
     let hold;
-    try { hold = readPushHold({ repo: repoKey, pr: Number(entry.pr ?? entry.prNumber), branch: entry.laneRef ?? entry.headRefName }); }
+    try { hold = readPushHold({ repo: repoKey, pr: Number(entry.pr ?? entry.prNumber), branch: entry.laneRef ?? entry.headRefName,
+      ...(!mechanicalRefresh ? { repair: entry } : {}) }, readPushHoldOptions); }
     catch { hold = { code: 'unreadable', reason: 'Cannot read push authority; restore evidence before retrying' }; }
     return hold ? { pr: Number(entry.pr ?? entry.prNumber), kind: 'push-hold',
       why: `PR #${entry.pr ?? entry.prNumber} not launched: ${hold.code} (${hold.reason})` } : null;
@@ -2176,7 +2194,7 @@ export function runReconcileFixDispatch({
       }
       if (!fallback && !dryRun) {
         // The mechanical refresh pushes directly: a hold added after planning stops it here.
-        const hold = pushHoldRefusal(entry);
+        const hold = pushHoldRefusal(entry, { mechanicalRefresh: true });
         if (hold) { mqRefreshRefusals.push({ pr: hold.pr, kind: 'push-hold', why: hold.why }); return false; }
       }
       result = fallback
@@ -2315,6 +2333,7 @@ export function runReconcileFixDispatch({
   refusals.push(...mqRefreshRefusals);
   const dispatched = [];
   let handled = 0;
+  let examined = 0;
   let deferred = [];
   let conflictHandled = 0;
   let conflictExemptHandled = 0;
@@ -2329,21 +2348,25 @@ export function runReconcileFixDispatch({
   console.error(`reconcile-fix-dispatch: fix.conflictFixExemptPerPass=${exemptCap} (source ${fixSettings.sources?.conflictFixExemptPerPass ?? 'invalid'})`);
   console.error(`reconcile-fix-dispatch: fix.conflictFixesPerPass=${conflictCap} (source ${fixSettings.sources?.conflictFixesPerPass ?? 'invalid'})`);
   for (const entry of planned) {
-    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if (examined > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
     const conflict = entry.isConflict === true && !entry.restack;
     const mechanical = conflict && entry.conflictFixMechanical === true;
     // Shared total bounds mixed mechanical/unproven conflicts too; allowances never add together.
     const exempt = conflict && conflictHandled < Math.max(conflictCap, exemptCap)
       && (conflictHandled < conflictCap || (mechanical && conflictExemptHandled < exemptCap));
-    if ((handled > 0 && dispatchDeadlineAt != null && clock() > dispatchDeadlineAt && !exempt) || yieldedForAdoption) {
+    if ((examined > 0 && dispatchDeadlineAt != null && clock() > dispatchDeadlineAt && !exempt) || yieldedForAdoption) {
       deferred.push(entry.pr);
       continue;
     }
+    examined += 1;
+    // PUSH-GATE-S4 — a dry run launches nothing and never reaches the dispatcher or the hold read.
+    if (dryRun) { handled += 1; refusals.push({ pr: entry.pr, kind: 'dry-run', why: `dry run: no fixer launched for PR #${entry.pr}` }); continue; }
+    // Refuse existing holds before consuming any pass allowance, fixer slot or heavy-queue demand.
+    const admissionHold = pushHoldRefusal(entry);
+    if (admissionHold) { refusals.push(admissionHold); continue; }
     if (conflict) conflictHandled += 1;
     if (mechanical) conflictExemptHandled += 1;
     handled += 1;
-    // PUSH-GATE-S4 — a dry run launches nothing and never reaches the dispatcher or the hold read.
-    if (dryRun) { refusals.push({ pr: entry.pr, kind: 'dry-run', why: `dry run: no fixer launched for PR #${entry.pr}` }); continue; }
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
@@ -2410,7 +2433,8 @@ export function runReconcileFixDispatch({
       continue;
     }
     // PUSH-GATE-S4 — the resume path also launches a fixer, so it reads the live hold first (the fresh path re-reads after its lane pop).
-    {
+    if ((entry.isConflict && !borrowed && !entry.restack)
+      || (tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2)) {
       const resumeHold = pushHoldRefusal(entry);
       if (resumeHold) { refusals.push(resumeHold); continue; }
     }
@@ -2460,7 +2484,7 @@ export function runReconcileFixDispatch({
     const holdRefusal = pushHoldRefusal(entry);
     if (holdRefusal) { lanes.unshift(lane); refusals.push(holdRefusal); continue; }
     try {
-      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
+      const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, readPushHold, readPushHoldOptions, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a

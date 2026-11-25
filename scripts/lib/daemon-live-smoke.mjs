@@ -670,7 +670,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "  dispatchFix(",
   "    { itemNum: null, pr: 900002, laneRef: 'lane/900002-smoke-fix', scope: ['we:scripts/lib/daemon-live-smoke.mjs'], lane: 90101, headRefOid: null },",
   "    // recordAdvisor: a dry run is not a real fix run, so it never lands in the advisor trial's per-run ledger (#x331b7u).",
-  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {} },",
+  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {}, readPushHold: () => null },",
   "  );",
   "  checkFilled(captured, 'fix PR #900002', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND.fix);",
   "});",
