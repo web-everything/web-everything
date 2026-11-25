@@ -245,6 +245,34 @@ describe('14 worker marker and one launcher-owned key list (round 3)', () => {
   });
 });
 
+describe('15 claude launches go through markWorkerEnv (round 4)', () => {
+  const map = { enforce: true, '*': 'refuse', daemons: { 'com.we.mapped': 'acct' }, accounts: { acct: { service: 'svc', account: 'a', type: 'oauth' } } };
+  const readKeychain = () => 'secret-token';
+  it('refuses an unmapped daemon before any other IO', () => {
+    vi.stubEnv('XPC_SERVICE_NAME', 'com.we.unmapped');
+    const io = seam({ accountMap: map, readKeychain });
+    refuses(claude(), io, /no usable Claude account mapping/);
+    expect(io.resolveBinary).not.toHaveBeenCalled();
+    vi.unstubAllEnvs();
+  });
+  it('a mapped daemon gets its account credential in env and never in argv or settings', () => {
+    vi.stubEnv('XPC_SERVICE_NAME', 'com.we.mapped');
+    const spec = buildAgentInvocation(claude({ env: { PATH: binDir, ANTHROPIC_API_KEY: 'caller-key' } }), seam({ accountMap: map, readKeychain }));
+    expect(spec.options.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('secret-token');
+    expect(spec.options.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(spec.options.env).not.toHaveProperty('XPC_SERVICE_NAME');
+    expect(spec.options.env.WE_CONVEYOR_WORKER).toBe('1');
+    expect(JSON.stringify(spec.args)).not.toContain('secret-token');
+    vi.unstubAllEnvs();
+  });
+  it('a non-daemon launch is unchanged, and codex is not subject to the claude account map', () => {
+    vi.stubEnv('XPC_SERVICE_NAME', 'com.we.unmapped');
+    expect(() => buildAgentInvocation(codex(), seam({ accountMap: map, readKeychain }))).not.toThrow();
+    vi.unstubAllEnvs();
+    expect(buildAgentInvocation(claude(), seam({ accountMap: map, readKeychain })).options.env.WE_CONVEYOR_WORKER).toBe('1');
+  });
+});
+
 describe('12 manifest validation (finding 5)', () => {
   const clone = () => JSON.parse(JSON.stringify(MANIFEST));
   it('refuses empty, missing and malformed manifests', () => {
