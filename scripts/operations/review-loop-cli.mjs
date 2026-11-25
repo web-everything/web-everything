@@ -890,6 +890,13 @@ export async function runReviewLoopOnce({
     run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
   });
 
+  if (outcome.stopped === 'juror-timeout') {
+    const seat = outcome.run.seatTimeouts.findLast(s => s.step === outcome.run.pending?.step);
+    const { lens, provider, model, head, timeoutMs, wallMs } = seat;
+    const payload = { stopped: 'juror-timeout', runId: outcome.run.id, lens, provider, model, head, timeoutMs, wallMs };
+    return { code: 1, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, ...payload };
+  }
+
   if (outcome.stopped === 'confirm') {
     const hold = acceptHold(outcome.run);
     if (hold) {
