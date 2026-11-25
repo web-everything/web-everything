@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ghRepoSlug } from '../../constellation-repos.mjs';
 import { askPinMoved, raiseOrchestratorAsk } from '../orchestrator-ask.mjs';
 
 const roots = [];
@@ -20,7 +21,7 @@ describe('orchestrator asks', () => {
     for (let i = 0; i < 20; i++) askPinMoved({ ref: 'lane/x', pr: 7, adopted: sha('a'), newTip: sha(String(i % 10)), env });
     const rows = lines(file);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ kind: 'pin-moved', key: `pin-moved:lane/x@${sha('a')}`, repo: 'web-everything/web-everything' });
+    expect(rows[0]).toMatchObject({ kind: 'pin-moved', key: `pin-moved:lane/x@${sha('a')}`, repo: ghRepoSlug('we') });
   });
 
   it('a new pin sha asks again', () => {

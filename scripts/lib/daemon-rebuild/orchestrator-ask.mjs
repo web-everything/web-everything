@@ -6,6 +6,7 @@
 import { readFileSync, appendFileSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { ghRepoSlug } from '../constellation-repos.mjs';
 
 const MAX_READ = 4 * 1024 * 1024;
 
@@ -38,7 +39,7 @@ export function raiseOrchestratorAsk({ key, kind = 'pin-moved', ask, evidence, e
     }
     mkdir(dirname(file), { recursive: true });
     const prefix = text && !text.endsWith('\n') ? '\n' : '';
-    append(file, `${prefix}${JSON.stringify({ at: now(), repo: 'web-everything/web-everything', kind, key, ask, evidence })}\n`);
+    append(file, `${prefix}${JSON.stringify({ at: now(), repo: ghRepoSlug('we'), kind, key, ask, evidence })}\n`);
     return { ok: true, asked: true };
   } catch (error) {
     return { ok: false, asked: false, error: String(error?.message || error) };
