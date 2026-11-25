@@ -460,7 +460,7 @@ test('generated documentation retains rotation, rerun, audit debounce/delta, aud
   assert.equal(reviewAutoAudit.value.mode, 'shadow');
   const audit = registry.rows.find(row => row.key === 'audit');
   assert.deepEqual(audit.value.debounce, { minutes: 5 });
-  assert.deepEqual(audit.value.delta, { maxFiles: 0, waivedCarry: { maxFiles: 40 } });
+  assert.deepEqual(audit.value.delta, { maxFiles: 0, waivedCarry: { maxFiles: 15 } });
   const auditRow = doc.split('\n').find(line => line.startsWith('| audit |'));
   assert.ok(auditRow.includes('"debounce":{"minutes":5}'));
   assert.ok(auditRow.includes('"delta":{"maxFiles":0,"waivedCarr…'));

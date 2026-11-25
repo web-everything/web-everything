@@ -189,12 +189,14 @@ export function resolveWaivedMaxFiles({ readFile = readFileSync, env = process.e
     }
     if (platform !== undefined && !object(platform)) throw new Error('invalid platform audit settings');
     const key = 'delta.waivedCarry.maxFiles';
-    const resolved = cascadePolicy('audit', tool, { standard: { delta: { waivedCarry: { maxFiles: 40 } } },
+    const resolved = cascadePolicy('audit', tool, { standard: { delta: { waivedCarry: { maxFiles: 0 } } },
       platform, env, log, valid: { [key]: count } });
     for (const layer of [platform, tool]) {
       if (layer?.delta !== undefined && !object(layer.delta)) throw new Error('invalid delta');
+      if (layer?.delta && Object.hasOwn(layer.delta, 'maxFiles') && !count(layer.delta.maxFiles))
+        throw new Error('invalid delta.maxFiles');
       const carry = layer?.delta?.waivedCarry;
-      if (carry !== undefined && (!object(carry) || !count(carry.maxFiles))) throw new Error('invalid waivedCarry');
+      if (layer !== undefined && (!object(carry) || !count(carry.maxFiles))) throw new Error('missing or invalid waivedCarry.maxFiles');
     }
     if (resolved.invalid.some(e => e.includes('.delta.waivedCarry'))) throw new Error('invalid waived bound');
     value = resolved.value.delta.waivedCarry.maxFiles;
@@ -240,11 +242,12 @@ async function deltaBasis(deps, base, head, maxFiles, branch) {
       const record = records.findLast(r => r?.head === h);
       return findAudit(records, { base: record.base, head: h, questionHash: QUESTION_HASH, priorQuestionHashes: [], now });
     }).filter(Boolean).sort((a, b) => records.lastIndexOf(b) - records.lastIndexOf(a));
-    let reason = 'no full WEAKENED ancestor audit';
     for (const record of candidates) {
-      if (record.verdict !== 'WEAKENED' || Object.hasOwn(record, 'basis') || Date.parse(record.at) > now
-        || !Array.isArray(record.findings) || !record.findings.length || !record.findings.every(f => typeof f === 'string' && f.trim())
+      if (record.verdict !== 'WEAKENED'
         || await Promise.resolve().then(() => deps.isAncestor(record.head, head)).catch(() => false) !== true) continue;
+      if (Object.hasOwn(record, 'basis') || Date.parse(record.at) > now
+        || !Array.isArray(record.findings) || !record.findings.length || !record.findings.every(f => typeof f === 'string' && f.trim())
+      ) return refuse('candidate is not a usable full WEAKENED audit');
       // Inspect every raw record for this head: findAudit intentionally skips malformed evidence.
       if (records.some(r => r?.head === record.head && (r.base !== record.base
         || r.verdict !== 'WEAKENED' || Object.hasOwn(r, 'basis') || Date.parse(r.at) > now
@@ -254,7 +257,7 @@ async function deltaBasis(deps, base, head, maxFiles, branch) {
         return refuse('candidate head has conflicting or unreadable evidence');
       const waiver = waivers.find(w => w?.ref === branch && w.sha?.toLowerCase() === record.head
         && typeof w.ruling === 'string' && w.ruling.trim() && JSON.stringify(w.findings) === JSON.stringify(record.findings));
-      if (!waiver) { reason = 'no matching non-revoked waiver with byte-equal findings'; continue; }
+      if (!waiver) return refuse('no matching non-revoked waiver with byte-equal findings');
       if (await deps.mergesBetween(record.head, head) !== false) return refuse('merge commits or incomplete merge evidence in delta');
       try {
         const priorFork = await deps.mergeBaseOf(record.base, record.head);
@@ -269,7 +272,7 @@ async function deltaBasis(deps, base, head, maxFiles, branch) {
         return refuse('delta touches protected merge path');
       return { basis: record.head, waiver, findings: record.findings };
     }
-    return refuse(reason);
+    return refuse('no full WEAKENED ancestor audit');
   } catch (error) { return refuse(`unreadable waived basis evidence: ${clean(String(error?.message ?? error)).slice(0, 120)}`); }
 }
 

@@ -599,7 +599,7 @@ describe('debounce and delta audits', () => {
     const findings = ['docs/a.md:12 first waived issue', 'docs/b.md:34 second waived issue'];
     const args = [...ARGS, `--branch=${ref}`, '--now'];
     const waivedBasis = (over = {}) => basis({ verdict: 'WEAKENED', findings: [...findings], ...over });
-    function settings(maxFiles = 40, ordinaryMaxFiles = 5) {
+    function settings(maxFiles = 15, ordinaryMaxFiles = 5) {
       settingsOverride.text = JSON.stringify({ audit: { delta: { maxFiles: ordinaryMaxFiles, waivedCarry: { maxFiles } } } });
     }
     function waived({ records = [waivedBasis()], files, answer = 'NOT WEAKENED' } = {}) {
@@ -631,6 +631,11 @@ describe('debounce and delta audits', () => {
     it.each(['0', '1', 'invalid'])('global delta env cap %s also limits waived carry', async bound => {
       vi.stubEnv('WE_AUDIT_DELTA_MAX_FILES', bound);
       await refused(waived());
+    });
+    it.each([{}, { basis: PREV }])('newer WEAKENED ancestor %j cannot fall back to an older waived ancestor', async over => {
+      // Ledger order wins even when the later record reports an earlier timestamp.
+      const newer = waivedBasis({ head: NEXT, at: '2026-11-01T11:00:00.000Z', ...over });
+      await refused(waived({ records: [waivedBasis(), newer] }));
     });
     it.each([
       { base: NEXT }, { base: NEXT, verdict: 'NOT WEAKENED' },
@@ -666,7 +671,9 @@ describe('debounce and delta audits', () => {
         findings: [...findings, 'delta audit reported WEAKENED without a waived finding to attribute it to'] });
     });
     it.each(['package.json', 'package-lock.json', 'vitest.config.ts', 'vitest.config.mjs',
-      'scripts/check-standards.mjs', 'scripts/lib/related-test-selection.mjs',
+      'scripts/check-standards.mjs', 'scripts/check-standards-extra.mjs', 'scripts/lib/standards-extra.mjs',
+      'scripts/operations/__tests__/codex-audit.test.mjs', 'scripts/operations/__tests__/codex-audit-extra.test.mjs',
+      'scripts/operations/codex-audit.mjs', 'scripts/operations/codex-audit-extra.mjs', 'scripts/lib/related-test-selection.mjs',
       'scripts/operations/urgent-verify-marker.mjs', 'scripts/verify-lane.mjs', 'scripts/verify-lane-io.mjs'])(
       'merge protection refuses build or verification path %s', async file => { await refused(waived({ files: [file] })); });
 
@@ -739,7 +746,7 @@ describe('debounce and delta audits', () => {
       ['candidate base unreadable', f => f.deps.readRecords.mockReturnValue([waivedBasis({ base: 'invalid' })])],
       ['merge in delta', f => f.deps.mergesBetween.mockReturnValue(true)],
       ['fork point differs', f => f.deps.mergeBaseOf.mockReturnValueOnce(BASE).mockReturnValueOnce(NEXT)],
-      ['oversized delta', f => f.deps.diffFiles.mockReturnValue(Array.from({ length: 41 }, (_, i) => `docs/${i}.md`))],
+      ['oversized delta', f => f.deps.diffFiles.mockReturnValue(Array.from({ length: 16 }, (_, i) => `docs/${i}.md`))],
       ['unreadable file list', f => f.deps.diffFiles.mockReturnValue(null)],
       ['WEAKENED current head', f => f.deps.readRecords.mockReturnValue([waivedBasis(), waivedBasis({ head: HEAD })])],
       ['equal-at later delta record', f => f.deps.readRecords.mockReturnValue([waivedBasis(), waivedBasis({ basis: NEXT })])],
@@ -767,27 +774,27 @@ describe('debounce and delta audits', () => {
     ])('protected delta including either rename side forces full: %j', async (...files) => {
       await refused(waived({ files }));
     });
-    it.each([0, -1, '40', null, {}, 1.5])('disabled or invalid waivedCarry.maxFiles=%j forces full', async maxFiles => {
+    it.each([0, -1, '15', null, {}, 1.5])('disabled or invalid waivedCarry.maxFiles=%j forces full', async maxFiles => {
       settings(maxFiles); await refused(waived());
     });
     it('unreadable settings force full', async () => {
       settingsOverride.text = 'unreadable JSON'; await refused(waived());
     });
-    it('the default waived bound is 40 even with ordinary delta OFF', async () => {
-      settingsOverride.text = JSON.stringify({ audit: { delta: { maxFiles: 0 } } });
-      const f = waived({ files: Array.from({ length: 40 }, (_, i) => `docs/${i}.md`) });
+    it('the shipped waived bound is 15 even with ordinary delta OFF', async () => {
+      settingsOverride.text = null;
+      const f = waived({ files: Array.from({ length: 15 }, (_, i) => `docs/${i}.md`) });
       expect(await main(args, f.deps)).toBe(1);
       expect(f.records[0].basis).toBe(PREV);
     });
-    it('the default waived bound refuses 41 files', async () => {
-      settingsOverride.text = JSON.stringify({ audit: { delta: { maxFiles: 0 } } });
-      await refused(waived({ files: Array.from({ length: 41 }, (_, i) => `docs/${i}.md`) }));
+    it('the shipped waived bound refuses 16 files', async () => {
+      settingsOverride.text = null;
+      await refused(waived({ files: Array.from({ length: 16 }, (_, i) => `docs/${i}.md`) }));
     });
     it('environment may tighten the waived bound', async () => {
       vi.stubEnv('WE_AUDIT_DELTA_WAIVED_MAX_FILES', '1'); await refused(waived());
     });
     it('environment cannot raise the waived bound', async () => {
-      settings(1); vi.stubEnv('WE_AUDIT_DELTA_WAIVED_MAX_FILES', '40'); await refused(waived());
+      settings(1); vi.stubEnv('WE_AUDIT_DELTA_WAIVED_MAX_FILES', '15'); await refused(waived());
     });
     it('invalid environment bound forces full', async () => {
       vi.stubEnv('WE_AUDIT_DELTA_WAIVED_MAX_FILES', 'invalid'); await refused(waived());
@@ -1115,24 +1122,47 @@ describe('waived audit real evidence adapters', () => {
 });
 
 describe('waived bound policy cascade', () => {
-  const resolve = (audit, extra = {}) => resolveWaivedMaxFiles({ readFile: () => JSON.stringify({ audit }),
-    platform: {}, env: {}, log: () => {}, ...extra });
+  const resolve = (audit, extra = {}) => resolveWaivedMaxFiles({ readFile: path => String(path).endsWith('codex-audit.json') ? JSON.stringify({ audit }) : '{}',
+    env: {}, log: () => {}, ...extra });
   it.each([null, [], 'bad', 1, false])('malformed platform or tool audit %j disables waived carry', audit => {
     expect(resolve({}, { platform: audit })).toBe(0);
     expect(resolve(audit)).toBe(0);
   });
-  it('defaults to 40 and logs tool/platform/environment provenance', () => {
-    expect(resolve({})).toBe(40);
+  it.each([{}, { nested: 1 }, [], '5', null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'malformed ordinary maxFiles %j disables waived carry in either layer', maxFiles => {
+      const valid = { delta: { waivedCarry: { maxFiles: 15 } } };
+      const audit = { delta: { maxFiles, waivedCarry: { maxFiles: 15 } } };
+      for (const layer of ['tool', 'platform']) {
+        const log = vi.fn();
+        expect(resolve(layer === 'tool' ? audit : valid, {
+          platform: layer === 'platform' ? audit : undefined, log,
+        })).toBe(0);
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('0 means FULL; retry full audit or request human review'));
+      }
+    });
+  it('defaults to 0 and logs tool/environment provenance', () => {
+    expect(resolve({})).toBe(0);
     const log = vi.fn();
-    expect(resolve({}, { platform: { delta: { waivedCarry: { maxFiles: 3 } } }, log })).toBe(3);
-    expect(log).toHaveBeenCalledWith(expect.stringContaining('maxFiles=3 (platform;'));
+    expect(resolve({ delta: { waivedCarry: { maxFiles: 3 } } }, { log })).toBe(3);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('maxFiles=3 (tool;'));
     expect(resolve({ delta: { waivedCarry: { maxFiles: 2 } } }, {
       platform: { delta: { waivedCarry: { maxFiles: 3 } } }, env: { WE_AUDIT_DELTA_WAIVED_MAX_FILES: '1' }, log,
     })).toBe(1);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('maxFiles=1 (env (tightened from tool)'));
   });
-  it.each([null, [], '40', {}, { maxFiles: {} }, { maxFiles: -1 }])('refuses malformed platform carry %j', waivedCarry => {
-    expect(resolve({}, { platform: { delta: { waivedCarry } } })).toBe(0);
+  it.each([
+    {}, { delta: {} }, { delta: { waivedCarry: {} } },
+    ...[undefined, '15', 1.5, -1, null, {}, Number.MAX_SAFE_INTEGER + 1].map(maxFiles => ({ delta: { waivedCarry: { maxFiles } } })),
+    ...[null, [], '15'].map(waivedCarry => ({ delta: { waivedCarry } })),
+  ])('missing or malformed carry bound %j disables reuse in either layer', audit => {
+    const valid = { delta: { waivedCarry: { maxFiles: 15 } } };
+    for (const layer of ['tool', 'platform']) {
+      const log = vi.fn();
+      expect(resolve(layer === 'tool' ? audit : valid, {
+        platform: layer === 'platform' ? audit : valid, log,
+      })).toBe(0);
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('0 means FULL; retry full audit or request human review'));
+    }
   });
   it('unreadable platform evidence disables reuse', () => {
     expect(resolve({}, { platform: undefined, readFile: path => {
