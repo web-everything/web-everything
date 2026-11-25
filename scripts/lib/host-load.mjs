@@ -17,6 +17,8 @@ import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMOR
   DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { decideMemoryPressure } from './memory-warn-corroboration.mjs';
 import { readSnapshot } from './resource-admission.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
@@ -40,7 +42,7 @@ export function readHostLoad({ env = process.env, load = os.loadavg } = {}) {
  *  inactive file cache) plus free swap. Pure. Throws on unparseable input. */
 export function parseDarwinMemoryHeadroomMb(vmStat, swapUsage) {
   const page = Number(/page size of (\d+) bytes/.exec(vmStat)?.[1]);
-  const pages = (name) => Number(new RegExp(`Pages ${name}:\\s+(\\d+)`).exec(vmStat)?.[1] ?? NaN);
+  const pages = (name) => Number(new RegExp(`^Pages ${name}:\\s+(\\d+)\\.?\\s*$`, 'm').exec(vmStat)?.[1] ?? NaN);
   const free = pages('free'); const spec = pages('speculative'); const purge = pages('purgeable');
   const swapFree = /free = ([\d.]+)M/.exec(swapUsage)?.[1];
   if (![page, free, spec].every(Number.isFinite) || swapFree === undefined) throw Error('unparseable vm_stat/swapusage');
@@ -132,7 +134,7 @@ export function readHostMemoryHeadroomMb(options = {}) {
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
   capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
-  readSnap = () => { try { return readSnapshot(); } catch { return null; } }, now = Date.now,
+  readSnap = ({ env: e = env } = {}) => { try { return readSnapshot({ root: resolveCoordinationRoot({ env: e }) }); } catch { return null; } }, now = Date.now,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
@@ -162,13 +164,18 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
     let corroboration = '';
     if (source === 'memory-pressure' && level === 'warn') {
       // Warn alone is not scarcity (61% of samples): hold only when the shared rule corroborates it from a fresh snapshot.
-      const snap = readSnap();
+      const snap = readSnap({ env });
       const m = snap?.memory ?? {};
+      const cap = policy.settings.host.capacity ?? {};
+      const maxFreshMs = cap.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS;
+      const skewMs = cap.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS;
       const sampledAt = Date.parse(snap?.sampledAt); const freshUntil = Date.parse(snap?.freshUntil); const t = now();
       const fresh = Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
-        && freshUntil - sampledAt <= DEFAULT_SNAPSHOT_MAX_FRESH_MS && sampledAt <= t + DEFAULT_SNAPSHOT_CLOCK_SKEW_MS && t <= freshUntil;
-      if (!fresh) return { admitted: false, reason: 'host memory pressure warn; resource snapshot stale or unreadable (fail closed); source=memory-pressure' };
-      const d = decideMemoryPressure({ pressureLevel: 2, freePct: m.freePct, swapGrowthMb: m.swapGrowthMb });
+        && freshUntil - sampledAt <= maxFreshMs && sampledAt <= t + skewMs && t <= freshUntil
+        && m.metric === (cap.memoryMetric ?? 'available')
+        && typeof m.freePct === 'number' && typeof m.swapGrowthMb === 'number' && Number.isFinite(m.swapGrowthMb);
+      if (!fresh) return { admitted: false, reason: 'host memory pressure warn; resource snapshot stale, unreadable or wrong metric (fail closed); source=memory-pressure' };
+      const d = decideMemoryPressure({ pressureLevel: 2, freePct: m.freePct, swapGrowthMb: m.swapGrowthMb, ...loadMemoryPressureSettings({ env }) });
       if (d.held) return { admitted: false, reason: `host memory pressure warn corroborated: ${d.reason}; source=memory-pressure` };
       corroboration = `; pressure warn uncorroborated (free ${d.freePct}%, swap growth ${d.swapGrowthMb}MB)`;
     }

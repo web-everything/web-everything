@@ -249,7 +249,22 @@ describe('hostLoadAdmission with the default memoryReading', () => {
   });
 
   const T = Date.parse('2026-11-25T12:00:10Z');
-  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z', memory, ...over });
+  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z', memory: { metric: 'available', ...memory }, ...over });
+  it.each([
+    ['missing swap growth', { freePct: 27 }],
+    ['string swap growth', { freePct: 27, swapGrowthMb: '0' }],
+    ['wrong metric', { freePct: 27, swapGrowthMb: 0, metric: 'free' }],
+  ])('warn with %s holds', (_n, memory) => {
+    expect(admission({ pressure: '2', readSnap: () => snap(memory), now: () => T }).admitted).toBe(false);
+  });
+  it('warn honours the configured corroboration threshold from env', () => {
+    const r = admission({ pressure: '2', env: { WE_LOAD_ADMISSION_WARN_MIN_FREE_PCT: '40' }, readSnap: () => snap({ freePct: 27, swapGrowthMb: 0 }), now: () => T });
+    expect(r.admitted).toBe(false);
+  });
+  it('warn with a malformed page count holds', () => {
+    const vm = vmStat.replace('Pages free: 65536.', 'Pages free: 999999garbage.');
+    expect(admission({ pressure: '2', vm, readSnap: () => snap({ freePct: 27, swapGrowthMb: 0 }), now: () => T }).admitted).toBe(false);
+  });
   const warn = (s) => admission({ pressure: '2', readSnap: () => s, now: () => T });
 
   it('warn uncorroborated (free 27%, swap +0MB) admits with measured reclaimable MB', () => {
