@@ -247,18 +247,21 @@ export function checkClaudeLaunchRoute(route) {
 }
 
 /**
- * PURE — the route a Claude launch is checked against, derived from the dispatcher's own evidence. A policy route
- * that is not Claude but lists Claude in its fallback chain yields the documented fallback (with a recorded reason);
- * with no policy route, only an explicit `executor: 'claude'` stands for Claude. Anything else returns a route the
- * guard refuses (or `null`).
+ * PURE — the route a Claude launch is checked against, derived from the dispatcher's own evidence.
+ * A configured fallback chain is not a fallback decision. Only an explicitly selected Claude route or a
+ * fallbackProvider with its own recorded reason can authorize Claude. An inherited route uses the actual executor.
  */
 export function claudeLaunchRouteFor({ policyRoute = null, executor = null, reason = '' } = {}) {
-  if (policyRoute && typeof policyRoute === 'object') {
-    if (policyRoute.provider === 'claude') return { provider: 'claude', reason: reason || 'policy route claude' };
-    if (Array.isArray(policyRoute.fallback) && policyRoute.fallback.some(r => r?.provider === 'claude')) {
-      return { provider: policyRoute.provider, fallbackProvider: 'claude', reason: `routing-policy fallback to claude from ${policyRoute.provider}` };
-    }
-    return { provider: policyRoute.provider };
+  if (policyRoute != null) {
+    if (!object(policyRoute)) return null;
+    if (policyRoute.provider === 'claude') return { provider: 'claude', reason: policyRoute.reason || reason || 'policy route claude' };
+    return { provider: policyRoute.provider, fallbackProvider: policyRoute.fallbackProvider, reason: policyRoute.reason };
   }
   return executor === 'claude' ? { provider: 'claude', reason: reason || 'executor claude' } : null;
+}
+
+/** A wrapped external task intentionally runs under a separate Claude supervisor, not a provider fallback. */
+export function claudeSupervisorRouteFor({ executor, mode } = {}) {
+  if (mode !== 'wrapped' || !['codex', 'antigravity'].includes(executor)) return null;
+  return { provider: 'claude', reason: `wrapped ${executor} task: Claude supervisor` };
 }

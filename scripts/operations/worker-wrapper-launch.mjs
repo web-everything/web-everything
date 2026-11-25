@@ -35,6 +35,12 @@ import { COMPLETION_RECORD_V2, listCompletionSessions, resolveCompletionsDir, tr
 import { STRUCTURED_OUTPUT_SUFFIX, WORKER_WRAPPER_ENV, launchDetached, withStructuredOutput, resumeRequestPath } from './worker-wrapper.mjs';
 import { isValidSessionSlug } from './completion-record.mjs';
 import { checkClaudeLaunchRoute } from '../lib/dispatch-routing-policy.mjs';
+import { notApplied } from './effect-executor.mjs';
+
+/** Convert a returned pre-launch refusal into the shared, retryable no-start error at each dispatch site. */
+export function assertWrappedClaudeStarted(launched) {
+  if (launched.refused) throw notApplied(launched.refused, { code: 'WORKER_LAUNCH_REFUSED' });
+}
 
 /** The roles whose launch is wrapped when the knob is unset (D7 FINAL, operator 2026-10-08). */
 export const WRAPPED_ROLES_DEFAULT_ON = Object.freeze(['fix', 'ci-heal', 'review']);
@@ -125,6 +131,7 @@ export function requestWrappedResume({ session, prompt, specDir = defaultWorkerS
  * @param {string[]} o.bgArgv the argv `buildAgentArgv` built for the old launch
  * @param {string} o.cwd
  * @param {object} o.env      the env the old spawn would have used (already sanitized and worker-marked)
+ * @param {object|null} o.route actual process route, including a reason for any selected Claude fallback
  * @returns {{handle: string, wrapperPid: number|null, sessionId: string, argv: string[]}}
  */
 export function launchWrappedClaudeWorker({

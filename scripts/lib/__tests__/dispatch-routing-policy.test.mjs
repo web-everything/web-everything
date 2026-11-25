@@ -527,10 +527,32 @@ describe('checkClaudeLaunchRoute (DIRECT-EXEC-GUARD)', () => {
 });
 
 describe('claudeLaunchRouteFor + unknown provider (DIRECT-EXEC-GUARD)', () => {
+  it.each([['codex'], [''], [false], [0], [[]]])('malformed policy evidence %j cannot inherit the Claude executor', async policyRoute => {
+    const { claudeLaunchRouteFor } = await import('../dispatch-routing-policy.mjs');
+    expect(claudeLaunchRouteFor({ policyRoute, executor: 'claude' })).toBeNull();
+  });
+  it('preserves an actual fallback decision and never invents its reason', async () => {
+    const { claudeLaunchRouteFor, checkClaudeLaunchRoute } = await import('../dispatch-routing-policy.mjs');
+    const actual = { provider: 'codex', fallbackProvider: 'claude', reason: 'quota exhausted' };
+    expect(claudeLaunchRouteFor({ policyRoute: actual })).toEqual(actual);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: actual })).ok).toBe(true);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallbackProvider: 'claude' },
+      executor: 'claude', reason: 'generic caller reason' })).ok).toBe(false);
+  });
+  it('supervisor evidence is limited to supported wrapped external executors', async () => {
+    const { claudeSupervisorRouteFor } = await import('../dispatch-routing-policy.mjs');
+    for (const shape of [{}, { executor: 'codex', mode: 'direct' }, { executor: 'unknown', mode: 'wrapped' }]) {
+      expect(claudeSupervisorRouteFor(shape)).toBeNull();
+    }
+    for (const executor of ['codex', 'antigravity']) {
+      expect(claudeSupervisorRouteFor({ executor, mode: 'wrapped' })).toEqual({ provider: 'claude',
+        reason: `wrapped ${executor} task: Claude supervisor` });
+    }
+  });
   it('derives from policy evidence and refuses unknown providers', async () => {
     const { claudeLaunchRouteFor, checkClaudeLaunchRoute } = await import('../dispatch-routing-policy.mjs');
     expect(checkClaudeLaunchRoute({ provider: 'bogus', fallbackProvider: 'claude', reason: 'x' }).ok).toBe(false);
-    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallback: [{ provider: 'claude' }] } })).ok).toBe(true);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallback: [{ provider: 'claude' }] } })).ok).toBe(false);
     expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallback: [] } })).ok).toBe(false);
     expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'claude' } })).ok).toBe(true);
     expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({})).ok).toBe(false);

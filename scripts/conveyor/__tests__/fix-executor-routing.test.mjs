@@ -14,6 +14,7 @@ vi.mock('../../lib/settings-files.mjs', async importOriginal => {
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider, fixLauncherAvailable } from '../../operations/dispatch-providers/fix.mjs';
 import { dispatchFix, launchTableFor, roundEscalationFor, routeFixExecutor } from '../reconcile-fix-dispatch.mjs';
+import { launchWrappedClaudeWorker } from '../../operations/worker-wrapper-launch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
 describe('configured capacity candidates reach the fix launcher', () => {
@@ -799,15 +800,19 @@ describe('chain dispatch and critical scope', () => {
   });
   it.each([['scripts/build-docs.mjs','direct'],['scripts/pr-land.mjs','direct'],['scripts/build-docs.mjs','wrapped']])('%s uses the configured %s invocation', (path,mode) => {
     const planned = {pr:42,itemNum:'42',lane:2,laneRef:'lane/42-x',scope:[`we:${path}`],strongerModel:true};
-    const decision = routeFixExecutor(planned,{...options,chain:{...chain,mode}}), launch = vi.fn(()=>'pid:1'), wrapper = vi.fn(()=>({handle:'pid:2'}));
+    const decision = routeFixExecutor(planned,{...options,chain:{...chain,mode}}), launch = vi.fn(()=>'pid:1');
+    const detached = vi.fn(() => ({ wrapperPid: 2 }));
+    const wrapper = options => launchWrappedClaudeWorker({ ...options, launch: detached });
     expect(decision).toMatchObject({executor:'codex',mode,requiresReview:path.includes('pr-land')});
     dispatchFix(planned,{root:'/repo',executorDecision:decision,readBrief:()=>'{{PR_NUM}} {{LANE_REF}}',readFixClaim:()=>null,
-      acquireClaim:()=>({ok:true}),stampExecutor:vi.fn(),stampRunner:vi.fn(),postNotice:vi.fn(),writeBorrowedPrompt:()=>'/unused',spawnBorrowed:launch,spawnAgent:wrapper,launchWrapped:wrapper,wrapFix:true,
+      acquireClaim:()=>({ok:true}),releaseClaim:vi.fn(),stampExecutor:vi.fn(),stampRunner:vi.fn(),postNotice:vi.fn(),writeBorrowedPrompt:()=>'/unused',spawnBorrowed:launch,spawnAgent:wrapper,launchWrapped:wrapper,wrapFix:true,
       sessionCwdFor:()=>'/unused',ensureSessionCwd:p=>p,grantConflictHelper:vi.fn(),isolateSession:()=>({}),resolveSettingsEnv:()=>null,advisorFor:()=>({enabled:false}),recordAdvisor:vi.fn()});
-    expect(launch).toHaveBeenCalledTimes(mode === 'direct' ? 1 : 0); expect(wrapper).toHaveBeenCalledTimes(mode === 'wrapped' ? 1 : 0);
+    expect(launch).toHaveBeenCalledTimes(mode === 'direct' ? 1 : 0); expect(detached).toHaveBeenCalledTimes(mode === 'wrapped' ? 1 : 0);
     if (mode === 'wrapped') {
-      expect(wrapper.mock.calls[0][0].bgArgv.at(-1)).toContain('codex-direct-task');
-      expect(wrapper.mock.calls[0][0].bgArgv.at(-1)).toContain('Provider=codex, model=gpt-6-astra, effort=high');
+      expect(detached.mock.calls[0][0].argv.at(-1)).toContain('codex-direct-task');
+      expect(detached.mock.calls[0][0].argv.at(-1)).toContain('Provider=codex, model=gpt-6-astra, effort=high');
+      expect(detached.mock.calls[0][0].route).toEqual({ provider: 'claude', fallbackProvider: null,
+        reason: 'wrapped codex task: Claude supervisor' });
     }
   });
   it.each(['reset', 'stand-down'])('keeps mechanical repeated-finding %s direct under wrapped mode', async action => {

@@ -152,7 +152,7 @@ import {
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
-import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
+import { assertWrappedClaudeStarted, launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
@@ -1960,6 +1960,7 @@ export function defaultClaudeProvider(request, {
   // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
   wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
   launchWrapped = launchWrappedClaudeWorker,
+  resolveRoute = resolveOperationRoute,
 } = {}) {
   if (request?.groupMembers?.length) {
     throw notApplied('dispatch-lane: grouped requests require a group-capable worker provider');
@@ -1981,7 +1982,8 @@ export function defaultClaudeProvider(request, {
     }
   }
   // build-path-codex-isolation — this port implementation always runs Claude; say so on the record.
-  request.reportExecutor?.('claude');
+  const executor = 'claude';
+  request.reportExecutor?.(executor);
   // advisor trial (#x331b7u) — sampled per run id; only kinds the settings list (fix today).
   const advisor = (request.advisorFor ?? advisorForLaunch)({ runId: request.sessionId, kind: request.launchKind ?? 'build' });
   const argv = buildAgentArgv({
@@ -2021,9 +2023,10 @@ export function defaultClaudeProvider(request, {
     const launched = launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
-      route: request.route ?? claudeLaunchRouteFor({ policyRoute: request.policyRoute, executor: request.table?.model || request.operatorPostBuild ? 'claude' : null, reason: request.table?.reason }),
+      route: claudeLaunchRouteFor({ policyRoute: request.policyRoute ?? request.route ?? resolveRoute({ operation: kind }),
+        executor, reason: request.modelReason || request.table?.reason || `inherited ${kind} Claude tier route` }),
     });
-    if (launched.refused) throw new Error(launched.refused);
+    assertWrappedClaudeStarted(launched);
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;

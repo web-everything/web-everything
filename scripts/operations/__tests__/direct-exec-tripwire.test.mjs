@@ -29,6 +29,8 @@ describe('direct-exec tripwire', () => {
       expect(bodies.length).toBeGreaterThan(0);
       for (const body of bodies) {
         expect(body, `${site} launchWrapped call lacks a derived route`).toMatch(/\n\s*route:\s*(claudeLaunchRouteFor\(|request\.route \?\? claudeLaunchRouteFor\()/);
+        expect(body, `${site} must carry resolved policy evidence`).toMatch(/policyRoute:/);
+        expect(body, `${site} must derive its executor`).not.toMatch(/executor:\s*['"]claude['"]/);
       }
     });
   }
@@ -45,10 +47,18 @@ describe('direct-exec tripwire', () => {
     };
     walk(scripts);
     // dispatch-smoke-launch spreads the dispatcher's own request (which carries the derived route) into the launcher.
-    const known = new Set([...SITES, 'scripts/operations/worker-wrapper-launch.mjs', 'scripts/lib/dispatch-smoke-launch.mjs']);
+    // The soak replay also forwards real dispatch requests, with detached process creation stubbed.
+    const known = new Set([...SITES, 'scripts/operations/worker-wrapper-launch.mjs', 'scripts/lib/dispatch-smoke-launch.mjs',
+      'scripts/conveyor/soak/breaks/claude-launch-route-boundaries.mjs']);
     expect(found.filter(f => !known.has(f))).toEqual([]);
   });
   it('the scanner flags a call without a route', () => {
     expect(callBodies('launchWrapped({ role: 1 })')[0]).not.toMatch(/\broute\s*[:,]/);
+  });
+  it('configured wrapped invocation coverage uses the real guard with only detached launch injected', () => {
+    const src = readFileSync(join(ROOT, 'scripts/conveyor/__tests__/fix-executor-routing.test.mjs'), 'utf8');
+    const body = src.slice(src.indexOf("'%s uses the configured %s invocation'"), src.indexOf("it.each(['reset', 'stand-down'])"));
+    expect(body).toContain('launchWrappedClaudeWorker({ ...options, launch: detached })');
+    expect(body).not.toMatch(/wrapper\s*=\s*vi\.fn/);
   });
 });

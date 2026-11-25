@@ -87,6 +87,7 @@ describe('launchWrappedClaudeWorker', () => {
     expect(launch).toHaveBeenCalledWith(expect.objectContaining({
       role: 'fix', launcher: 'claude-p', session: 'fix-12', command: 'claude',
       legacyFromCompletion: true, preserveLegacyWords: true, timeoutMs: 7_200_000, pr: '12', sessionId: SESSION_ID,
+      route: { provider: 'claude', fallbackProvider: null, reason: 'test' },
     }), { specDir });
     launch.mockReturnValue({ wrapperPid: undefined });
     expect(launchWrappedClaudeWorker(options)).toMatchObject({ handle: null, wrapperPid: null });
@@ -257,6 +258,12 @@ describe('launchWrappedClaudeWorker route guard (DIRECT-EXEC-GUARD)', () => {
     const r = launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'codex', fallbackProvider: 'claude', reason: 'codex unavailable: quota' } });
     expect(r.handle).toBe('pid:7');
     expect(launch).toHaveBeenCalledTimes(1);
+    expect(launch.mock.calls[0][0].route).toEqual({ provider: 'codex', fallbackProvider: 'claude', reason: 'codex unavailable: quota' });
+  });
+  it('records omitted optional route fields as null', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 7 }));
+    launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'claude' } });
+    expect(launch.mock.calls[0][0].route).toEqual({ provider: 'claude', fallbackProvider: null, reason: null });
   });
   it('claude fallback without a reason refuses', () => {
     const launch = vi.fn(() => ({ wrapperPid: 7 }));
