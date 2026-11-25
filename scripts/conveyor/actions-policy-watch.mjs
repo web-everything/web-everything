@@ -74,10 +74,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const cfg = loadConfig();
   const orgArg = argv.find((a) => a.startsWith('--org='));
   const org = orgArg ? orgArg.slice(6) : process.env.GH_ORG
-    || JSON.parse(execFileSync('gh', ['repo', 'view', '--json', 'owner'], { encoding: 'utf8' })).owner.login;
+    || JSON.parse(execFileSync('gh', ['repo', 'view', '--json', 'owner'], { encoding: 'utf8', maxBuffer: 1024 * 1024 })).owner.login;
   const result = await runWatch({
     cfg, org, fetchFeed: fetchFeedText,
-    ghApi: async (endpoint) => execFileSync('gh', ['api', endpoint], { encoding: 'utf8', timeout: 30_000 }),
+    ghApi: async (endpoint) => execFileSync('gh', ['api', endpoint], { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
   });
   process.stdout.write(argv.includes('--json') ? `${JSON.stringify(result)}\n` : `${result.alerts.join('\n') || 'ok'}\n`);
   process.exitCode = result.alerts.length ? 1 : 0;
