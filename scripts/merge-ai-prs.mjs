@@ -178,6 +178,7 @@ import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewG
   normalizeDiffFingerprint, // card xu7kxtt — strict net-diff identity for carrying a clearance
 } from './lib/review-escalation.mjs';
 import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBaseline, recordBaseline, diffBaseline } from './lib/review-baseline-state.mjs';
+import { forgeNetDiffSignals, describeUnverifiedNetDiff } from './lib/forge-net-diff.mjs';
 import { mergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
 import { DERIVED_REGEN, DERIVED_OUTPUT_PATHS, numberPendingHashes, isPostLandTreeDirty, landedNumberFor, resolveLandedItem } from './lane-drain.mjs'; // #2899 A5 — `resolveLandedItem` shares lane-drain's ONE resolve-on-land home, exactly as `numberPendingHashes` shares its numbering (never a fork)
 import { isHash } from './backlog/id.mjs'; // #2393 — a stackParent hash's bornAs-on-main lookup is hash-only
@@ -5140,8 +5141,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
   // sibling directory is missing (not provisioned) or isn't a git working copy falls back to the prior skip —
-  // nothing here clones on the fly (provisioning is the lane-pool allocator's job — #2303, see
-  // skills-src/drain/SKILL.md's Preconditions).
+  // nothing here clones on the fly. These clones serve rebase plumbing only; non-local net-diff
+  // admission always reads the forge and needs no sibling clone.
   const siblingCloneDir = (repo) => {
     if (isLocalRepo(repo)) return null;
     const name = siblingCloneName(repo);
@@ -6683,9 +6684,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       let cumulativeDiffLines = null;
       // #2373 — score off the SHARED net-diff basis (`computeNetDiffChangedFiles`, also used by the
       // producer path in pr-land.mjs — the ONE place this basis is computed, #1821's original fix folded
-      // in). Best-effort local git read (needs the local clone or a provisioned sibling clone); falls back
-      // to the old GitHub files-list read if neither is available.
-      const escCwd = isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo);
+      // in). Local admission reads git; non-local admission always reads the forge. On an unscored
+      // read, the GitHub files list fills score statistics only and cannot verify the diff.
       let netScored = false;
       // #2890 — the net diff TEXT (base-vs-head CONTENT, not just changed-file names + a line count), needed as
       // `scoreEscalation`'s `diffHunks`: the shared precondition #2839's `assertNotPrincipleAndImpl` and #2840's
@@ -6694,11 +6694,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // closure, and reused below by the anti-test-gaming scan (which used to run its own separate
       // `computeNetDiffText`), so the score, the hunks, and the gaming scan can never see a different diff.
       //
-      // No local/sibling clone ⇒ `computeNetDiffSignals` is never called and `diffHunks` stays `null`. That is
-      // NOT the same posture as the sibling signals here: `changedFiles` has a `gh pr view --json files`
-      // FALLBACK that still populates in exactly that case, so `diffHunks` must travel as `null` (NOT COMPUTED)
-      // and never as `''` (#2890-review-fix finding 1). A real file list beside a fake-empty content signal is
-      // how a content-reading detector silently concludes "no principle touch".
+      // An unscored git or forge read leaves `diffHunks` null (NOT COMPUTED), even when the files-list
+      // fallback supplies statistics. Empty hunks would falsely claim content was inspected (#2890).
       let netDiffText = { text: '', scored: false, reason: 'no-clone' };
       let diffHunks = null;
       // #3343 — whether the cumulative basis below is provably this PR's file set. `true` on the paths where the
@@ -6707,8 +6704,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       let basisNarrowed = true;
       // The clone-pinned git runner, kept for the test-gaming carry's SHA-bound re-read below (null = no clone).
       let diffExec = null;
-      if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
-        const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
+      if (!isLocalRepo(v.repo)) {
+        const sig = forgeNetDiffSignals({ repo: v.repo, headSha: v.listedHeadSha, allowedRepos: REPOS });
+        if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev} (forge)\n`);
+        changedFiles = sig.changedFiles;
+        diffLines = sig.diffLines;
+        humanBasisFiles = sig.humanBasisFiles;
+        cumulativeDiffLines = sig.cumulativeDiffLines;
+        netScored = sig.scored;
+        netDiffText = sig.netDiffText;
+        diffHunks = sig.diffHunks;
+        basisNarrowed = sig.scored ? sig.basisNarrowed !== false : true;
+      } else if (v.headRef) {
+        const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: undefined, ...opts });
         diffExec = exec;
         const sig = computeNetDiffSignals({ exec, rev: /^[0-9a-f]{40}$/i.test(v.listedHeadSha || '') ? v.listedHeadSha : null, baseRev: v.base, fetchExtraRefs: [v.headRef], pinRev: true });
         if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev}\n`);
@@ -6736,7 +6744,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
       // #2890-review-fix finding 1 — `diffHunks` comes from `computeNetDiffSignals` above, which applies
       // `diffHunksFrom` (never a hand-rolled `scored ? text : null`): the text when it was actually computed,
-      // `null` when it was not — including the no-clone path this block skipped entirely. Finding 4 — the hunks
+      // `null` when it was not — including an unreadable forge compare. Finding 4 — the hunks
       // are always CUMULATIVE while `changedFiles` may be de-inflated to `v.base…head`; the verdict's
       // `diffHunksBasisFiles` (= `humanBasisFiles`, same basis as the hunks) is what a detector pairs them with.
       const score = scoreEscalation({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings: v.dismissedFindings, crossRepo: v.crossRepo, diffHunks, basisNarrowed, deviation: v.deviation });
@@ -6744,7 +6752,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         score.escalate = true;
         score.humanRequired = true;
         score.careLevel = 'high';
-        score.reasons.push(`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`);
+        score.reasons.push(describeUnverifiedNetDiff({ repo: v.repo, headSha: v.listedHeadSha, reason: netDiffText.reason || 'unscored', transient: netDiffText.transient }));
       }
       // #2766/#2767 — this PR's OWN changed-file set, stamped onto the verdict (best-effort — whatever this
       // pass already scored, never a new `gh` call) so a LATER sibling verdict in this SAME batch can ask
@@ -6837,13 +6845,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // failing test, or shrinking the case set). Scan this PR's NET diff text for those deterministic,
       // diff-visible tamper forms; on a hit, REFUSE the auto-land and park `review:human` — a test removal is a
       // trust-chain concern the agent panel must not clear for itself; a human clears a legit removal. Best-
-      // effort like the manifest gate: only when a local/sibling clone is present to read the diff text (no
-      // clone ⇒ no text ⇒ unverified: the gate below requires review rather than trusting an empty scan).
+      // effort like the manifest gate: git locally, forge remotely; unreadable text holds for review.
       // #2890 — `netDiffText` was already fetched above (feeding `scoreEscalation`'s `diffHunks`); reused here
       // rather than re-fetched, so this scan and the escalation score can never disagree on what changed.
       const gaming = scanTestTampering({
         netDiffText, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
-        noClone: !isLocalRepo(v.repo) && !escCwd,
+        noClone: false,
       });
       // #xuboo0q — WAS THIS EXACT TAMPERING FINDING ALREADY HUMAN-CLEARED, AT THE CURRENT HEAD? Before #xuboo0q
       // this gate had no memory: it re-parked `review:human` on every drain pass that saw a tampering-shaped
@@ -6901,7 +6908,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         v.escalated = 'yes';
         v.humanRequired = true;
         const tamperReasons = netDiffText.scored === true ? gaming.reasons
-          : [`net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff`];
+          : [describeUnverifiedNetDiff({ repo: v.repo, headSha: v.listedHeadSha, reason: netDiffText.reason || 'unscored', transient: netDiffText.transient })];
         v.escalateReasons = tamperReasons;
         // #2766/#2767 — is this PR's own tampering finding (at least partly) INHERITED from an already-
         // escalated stacked base (its own `baseRefName` IS another open PR's `headRef`, and that PR already

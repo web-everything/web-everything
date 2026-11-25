@@ -774,3 +774,120 @@ describe('R559 safety reads never reuse a cache: the gh env is an allowlist', ()
     }
   });
 });
+
+
+// Forge net-diff evidence: every unknown refuses admission, with no git fallback.
+import * as drainReads from '../drain-api-reads.mjs';
+import { parseUnifiedDiff, scanTestTampering } from '../pr-merge-gate.mjs';
+import { rmSync } from 'node:fs';
+const netFile = (over = {}) => ({ filename: 'blocks/__tests__/x.test.ts', status: 'added', additions: 1, deletions: 0, changes: 1, patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});', ...over });
+const netDoc = (over = {}) => ({ status: 'ahead', merge_base_commit: { sha: OTHER }, base_commit: { sha: OTHER }, files: [netFile()], ...over });
+const netRead = (doc, o = {}) => drainReads.readCompareNetDiff('o/r', SHA, { allowedRepos: ['o/r'], source: { read: () => ({ ok: true, value: doc, fetchedAt: NOW }) }, ...o });
+describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
+  it('round-trips rename, delete, add, binary and pure rename conservatively', () => {
+    const files = [netFile(), netFile({ filename: 'gone.ts', status: 'removed', additions: 0, deletions: 1, patch: '@@ -1 +0,0 @@\n-old' }),
+      netFile({ filename: 'new.ts', previous_filename: 'old.ts', status: 'renamed' }),
+      netFile({ filename: 'binary.test.ts', changes: 0, additions: 0, patch: undefined }),
+      netFile({ filename: 'pure.ts', previous_filename: 'was.ts', status: 'renamed', changes: 0, additions: 0, patch: undefined })];
+    const r = netRead(netDoc({ files }));
+    expect(r).toMatchObject({ ok: true, value: { headSha: SHA, mergeBase: OTHER, baseTip: OTHER, diffLines: 3 } });
+    expect(r.value.changedFiles).toEqual(expect.arrayContaining(['old.ts', 'new.ts', 'was.ts', 'pure.ts']));
+    const parsed = parseUnifiedDiff(drainReads.synthesizeUnifiedDiff(files));
+    expect(parsed).toHaveLength(5);
+    expect(parsed.some(f => f.hunkIncomplete || f.pathUnresolved)).toBe(false);
+    expect(parsed[1].deleted).toBe(true); expect(parsed[3].binary).toBe(true); expect(parsed[4].binary).toBe(false);
+  });
+  it.each([
+    ['api-malformed', netDoc({ files: null })], ['api-malformed', netDoc({ base_commit: {} })],
+    ['api-malformed', netDoc({ merge_base_commit: {} })], ['compare-ceiling', netDoc({ files: Array.from({ length: 300 }, () => netFile()) })],
+    ['compare-empty', netDoc({ status: 'identical' })], ['compare-empty', netDoc({ status: 'behind' })],
+    ['api-malformed', netDoc({ files: [netFile({ status: 'unknown' })] })],
+    ['api-malformed', netDoc({ files: [netFile({ changes: 2 })] })],
+    ['api-malformed', netDoc({ files: [netFile({ additions: -1, changes: -1 })] })],
+    ['api-malformed', netDoc({ files: [netFile({ additions: 0.5, changes: 0.5 })] })],
+    ['patch-omitted', netDoc({ files: [netFile({ patch: undefined })] })],
+    ['patch-truncated', netDoc({ files: [netFile({ additions: 2, changes: 2 })] })],
+    ['patch-truncated', netDoc({ files: [netFile({ additions: 0, deletions: 1, patch: '@@ -1 +0,0 @@\n' })] })],
+    ['path-unsupported', netDoc({ files: [netFile({ filename: 'a b/c.ts' })] })],
+    ['path-unsupported', netDoc({ files: [netFile({ filename: 'a/../x.ts' })] })],
+    ['path-unsupported', netDoc({ files: [netFile({ filename: 'x.ts\n' })] })],
+    ['path-unsupported', netDoc({ files: [netFile({ status: 'copied', previous_filename: '../x.ts' })] })],
+    ['synth-mismatch', netDoc({ files: [netFile({ patch: '@@ -0,0 +1,2 @@\n+it.skip("x");' })] })],
+  ])('refuses incomplete evidence: %s %#', (reason, doc) => expect(netRead(doc)).toMatchObject({ ok: false, reason }));
+  it.each(['api-http-500', 'api-http-404', 'deadline', 'api-error'])('preserves transport failure %s', reason => {
+    expect(netRead(null, { source: { read: () => ({ ok: false, reason }) } })).toMatchObject({ ok: false, reason });
+  });
+  it('refuses throwing and malformed sources', () => {
+    expect(netRead(null, { source: { read() { throw Error('no'); } } })).toMatchObject({ ok: false, reason: 'source-error' });
+    expect(netRead(null, { source: { read: () => ({}) } })).toMatchObject({ ok: false, reason: 'source-malformed' });
+  });
+  it('rejects undrained slugs and unbound heads before any read', () => {
+    const source = { read: vi.fn() };
+    for (const repo of ['other/r', 'o/r\n', 'https://evil/o/r']) expect(drainReads.readCompareNetDiff(repo, SHA, { allowedRepos: ['o/r'], source })).toMatchObject({ ok: false, reason: 'repo-not-drained' });
+    for (const head of ['short', SHA + '\n', null]) expect(drainReads.readCompareNetDiff('o/r', head, { allowedRepos: ['o/r'], source })).toMatchObject({ ok: false, reason: 'head-unbound' });
+    expect(source.read).not.toHaveBeenCalled();
+  });
+  it('fresh source disables ETag storage and pins host, repo and immutable head without reading origin', () => {
+    const git = vi.fn(() => { throw Error('no git'); });
+    const rest = vi.fn((path, options) => {
+      expect(path).toBe(`repos/o/r/compare/main...${SHA}?per_page=100&page=1`);
+      expect(options.env).toMatchObject({ GH_HOST: 'github.com', WE_GH_ETAG_CACHE: '0' });
+      expect(options.env).not.toHaveProperty('GH_ENTERPRISE_TOKEN');
+      expect(options.execOpts.timeout).toBe(20000);
+      return ok(netDoc());
+    });
+    expect(drainReads.readCompareNetDiff('o/r', SHA, { allowedRepos: ['o/r'], rest, git, env: { GH_HOST: 'evil.example', GH_ENTERPRISE_TOKEN: 'x' } }).ok).toBe(true);
+    expect(rest).toHaveBeenCalledTimes(1); expect(git).not.toHaveBeenCalled();
+  });
+  it('patch omissions, truncations and unsupported paths are permanent holds', () => {
+    for (const r of ['compare-ceiling', 'patch-omitted', 'patch-truncated', 'path-unsupported']) expect(drainReads.isPermanentReadReason(r)).toBe(true);
+  });
+  it('synthesized forge text and a real three-commit git diff produce the same tamper scan', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forge-diff-git-'));
+    const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } });
+    try {
+      git('init'); git('config', 'user.email', 'fixture@example.com'); git('config', 'user.name', 'Fixture');
+      writeFileSync(join(dir, 'README.md'), 'base\n'); git('add', '.'); git('commit', '-m', 'base');
+      mkdirSync(join(dir, 'blocks/__tests__'), { recursive: true });
+      writeFileSync(join(dir, 'blocks/__tests__/x.test.ts'), 'it("works", () => {});\n'); git('add', '.'); git('commit', '-m', 'test');
+      const base = git('rev-parse', 'HEAD').trim();
+      writeFileSync(join(dir, 'blocks/__tests__/x.test.ts'), 'it.skip("works", () => {});\n'); git('add', '.'); git('commit', '-m', 'skip');
+      const actual = git('diff', '--no-ext-diff', base, 'HEAD');
+      const r = netRead(netDoc({ files: [netFile({ status: 'modified', deletions: 1, changes: 2, patch: '@@ -1 +1 @@\n-it("works", () => {});\n+it.skip("works", () => {});' })] }));
+      expect(r.ok).toBe(true);
+      expect(scanTestTampering({ diffText: r.value.text })).toEqual(scanTestTampering({ diffText: actual }));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+import { forgeNetDiffSignals, describeUnverifiedNetDiff } from '../forge-net-diff.mjs';
+describe('forgeNetDiffSignals and reasoned hold text', () => {
+  it('maps the verified compare to the shared cumulative merge-base shape', () => {
+    const read = vi.fn(() => netRead(netDoc()));
+    const sig = forgeNetDiffSignals({ repo: 'o/r', headSha: SHA, allowedRepos: ['o/r'], read });
+    expect(sig).toMatchObject({ scored: true, basisKind: 'merge-base', basisNarrowed: true, changedFiles: ['blocks/__tests__/x.test.ts'], humanBasisFiles: ['blocks/__tests__/x.test.ts'], diffLines: 1, cumulativeDiffLines: 1,
+      netDiffText: { scored: true, source: 'forge', base: OTHER, baseTip: OTHER, rev: SHA, revSha: SHA } });
+    expect(sig.diffHunks).toBe(sig.netDiffText.text);
+    expect(read).toHaveBeenCalledWith('o/r', SHA, { allowedRepos: ['o/r'], env: undefined });
+  });
+  it.each(['api-http-500', 'api-malformed', 'compare-ceiling', 'patch-omitted', 'patch-truncated', 'path-unsupported', 'head-unbound', 'repo-not-drained'])('a forge miss is always unscored: %s', reason => {
+    const sig = forgeNetDiffSignals({ read: () => ({ ok: false, reason }) });
+    expect(sig).toMatchObject({ scored: false, diffHunks: null, netDiffText: { scored: false, text: '', base: null, rev: null, reason: `forge-${reason}`, transient: !drainReads.isPermanentReadReason(reason) } });
+  });
+  it('throwing, missing and malformed success sources never score', () => {
+    for (const read of [() => { throw Error('boom'); }, () => undefined, () => ({ ok: true }), () => ({ ok: true, value: {} })]) {
+      expect(forgeNetDiffSignals({ read })).toMatchObject({ scored: false, diffHunks: null, netDiffText: { reason: 'forge-source-error' } });
+    }
+  });
+  it('reason text keeps its exact prefix and gives stable transient and permanent wake events', () => {
+    const input = { repo: 'o/r', headSha: SHA, reason: 'forge-api-http-500', transient: true };
+    const text = describeUnverifiedNetDiff(input);
+    expect(text.startsWith('net diff unverified (forge-api-http-500); ')).toBe(true);
+    expect(text).toContain('o/r main...aaaaaaaaaaaa');
+    expect(text).toContain('clear-human does not override it');
+    expect(text).toContain('next pass');
+    expect(describeUnverifiedNetDiff(input)).toBe(text);
+    expect(describeUnverifiedNetDiff({ ...input, reason: 'forge-compare-ceiling', transient: false })).toContain('split the PR');
+  });
+});

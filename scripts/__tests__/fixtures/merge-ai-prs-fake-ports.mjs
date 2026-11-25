@@ -19,6 +19,12 @@ if (a[0] === 'pr' && a[1] === 'view') out(pr);
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
+  if (path.includes('/contents/.lane-manifest.json')) { fs.writeSync(2, 'gh: HTTP 404'); process.exit(1); }
+  if (path.includes('/compare/')) {
+    fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['compare-env', process.env.GH_HOST, process.env.GH_ENTERPRISE_TOKEN ?? null]) + '\n');
+    if (typeof pr.compare?.status === 'number') { fs.writeSync(2, 'gh: HTTP ' + pr.compare.status); process.exit(1); }
+    out(pr.compare ?? {});
+  }
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
   if (path.includes('/comments')) out([pr.comments]);
@@ -53,7 +59,7 @@ function prestageGit(process, fs, page, scoredGit) {
 let a = process.argv.slice(2);
 while (a[0] === '-c') a = a.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\n');
+if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + (process.env.PRESTAGE_LOCAL_REPO || process.env.PRESTAGE_REPO) + '.git\n');
 else if (['rev-parse', 'cat-file', 'merge-base', 'diff'].includes(a[0])) {
   const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: [{ path: 'README.md' }] });
   if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
@@ -98,7 +104,7 @@ function capture(port, args, env) {
   } }, openPrPageFixture, drainScoredGit); } catch (error) { if (error !== stopped) throw error; }
   return { status, stdout, stderr };
 }
-const port = fn => (args, env) => capture(fn, args, env);
+const port = fn => (args, env) => capture(fn, args, { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('PRESTAGE_'))), ...env });
 export const prestagePorts = { gh: port(prestageGh), git: port(prestageGit) };
 export const listingPorts = { gh: port(listingGh), git: args => {
   // The original throwaway repo has no origin and no commits.

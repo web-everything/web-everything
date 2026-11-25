@@ -7,6 +7,7 @@
  *   Setting `drain.reads.source`: "api" (default) | "git" (the old local-git reads). An API failure NEVER falls
  *   back to git: it throws/returns a DrainReadError that is transient (retry next pass) and names its reason.
  */
+import { parseUnifiedDiff } from './pr-merge-gate.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ghRestGetJson } from './gh-rest-read.mjs';
@@ -24,7 +25,7 @@ export const isTransientReadFailure = (text) => String(text ?? '').includes(DRAI
  * so consumers say "needs you" instead of "retry next pass". The old git path could judge such a PR; in `api` mode the
  * way out is to set `drain.reads.source=git`.
  */
-export const PERMANENT_READ_REASONS = new Set(['compare-ceiling']);
+export const PERMANENT_READ_REASONS = new Set(['compare-ceiling', 'patch-omitted', 'patch-truncated', 'path-unsupported']);
 export const isPermanentReadReason = (reason) => PERMANENT_READ_REASONS.has(reason);
 
 export class DrainReadError extends Error {
@@ -113,7 +114,7 @@ export function pinnedGhEnv(env = process.env) {
   return { ...out, GH_HOST: 'github.com' };
 }
 
-export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now, priority = false } = {}) {
+export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env = process.env, slug, repo, remote = 'origin', git, timeoutMs = DEFAULT_CALL_TIMEOUT_MS, deadlineAt, now = Date.now, priority = false, fresh = false } = {}) {
   return {
     read(kind, key) {
       if (kind !== 'json') return unreadable('unsupported-kind', now, kind);
@@ -124,7 +125,7 @@ export function createRestSource({ rest, exec = execFileSyncThrottled, cwd, env 
         pinned ??= readOriginSlug(cwd, { env, remote, ...(git ? { git } : {}) });
         if (repo && String(repo).toLowerCase() !== pinned.toLowerCase()) return unreadable('repo-mismatch', now, `configured ${repo} is not origin ${pinned}`);
       } catch (e) { return unreadable(e?.reason ?? 'repo-pin', now, e?.message); }
-      const cleanEnv = pinnedGhEnv(env);
+      const cleanEnv = { ...pinnedGhEnv(env), ...(fresh ? { WE_GH_ETAG_CACHE: '0' } : {}) };
       // gh-throttle's read memo is keyed off throttle.env (default process.env), not the child env: hand it the allowlisted env too.
       const pinnedExec = (file, args, opts = {}) => exec(file, args, { ...opts, throttle: { ...opts.throttle, env: cleanEnv, ...(priority ? { reservedSlot: true, caller: 'red-main-freeze-read' } : {}) } });
       let res;
@@ -305,4 +306,58 @@ export function readAddedFiles(base, headSha, o = {}) {
   }
   if (files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${files.length} files, at the ${COMPARE_CEILING}-file ceiling`);
   return { ...good(r, { added, previous, removed, renames }), baseSha };
+}
+
+
+/** Synthesize scanner-readable git headers around complete, validated forge patches. Pure. */
+export function synthesizeUnifiedDiff(files) {
+  return files.map((f) => {
+    const old = f.previous_filename ?? f.filename;
+    const next = f.filename;
+    const lines = [`diff --git a/${old} b/${next}`];
+    if (f.status === 'added') lines.push('new file mode 100644');
+    if (f.status === 'removed') lines.push('deleted file mode 100644');
+    if (f.status === 'renamed') lines.push(`rename from ${old}`, `rename to ${next}`);
+    if (f.status === 'renamed' && !f.patch && f.changes === 0) return lines.join('\n') + '\n';
+    lines.push(`--- ${f.status === 'added' ? '/dev/null' : `a/${old}`}`, `+++ ${f.status === 'removed' ? '/dev/null' : `b/${next}`}`);
+    // Empty/mode-only and binary changes cannot be distinguished by this API. Binary is conservative for tests.
+    lines.push(f.patch || `Binary files a/${old} and b/${next} differ`);
+    return lines.join('\n') + (lines.at(-1).endsWith('\n') ? '' : '\n');
+  }).join('');
+}
+
+/**
+ * GH-CALL-AUDIT: GET repos/{slug}/compare/main...{headSha}?per_page=100&page=1.
+ * Purpose: net diff for the drain gate; kind: read; once per scored non-local candidate per pass.
+ * Fields: files[].{filename,previous_filename,status,additions,deletions,changes,patch},
+ * merge_base_commit.sha, base_commit.sha, status. Freshness: consistent, fresh 200, immutable head.
+ * Retry owner: gh-throttle. Timeout: DEFAULT_CALL_TIMEOUT_MS. No local origin discovery or git fallback.
+ */
+export function readCompareNetDiff(repo, headSha, o = {}) {
+  const initial = { read: 'net-diff', fetchedAt: (o.now ?? Date.now)() };
+  if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+(?![\s\S])/.test(repo) || !(Array.isArray(o.allowedRepos) && o.allowedRepos.includes(repo))) return bad(initial, 'repo-not-drained');
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}(?![\s\S])/i.test(headSha)) return bad(initial, 'head-unbound');
+  const r = pull('net-diff', `repos/{owner}/{repo}/compare/main...${headSha}?per_page=100&page=1`, { ...o, slug: repo, repo, fresh: true });
+  if (!r.ok) return r;
+  const doc = r.value;
+  if (!Array.isArray(doc?.files)) return bad(r, 'api-malformed', 'files is not an array');
+  if (doc.files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', 'split the PR so the full diff is readable');
+  const sha = (v) => typeof v === 'string' && /^[0-9a-f]{40}(?![\s\S])/i.test(v);
+  if (!sha(doc.merge_base_commit?.sha) || !sha(doc.base_commit?.sha)) return bad(r, 'api-malformed', 'base sha missing');
+  if (!['ahead', 'diverged'].includes(doc.status)) return bad(r, 'compare-empty');
+  const path = (v) => typeof v === 'string' && /^[A-Za-z0-9._@+\-/]+(?![\s\S])/.test(v) && v.split('/').every(p => p && p !== '.' && p !== '..');
+  for (const f of doc.files) {
+    if (!path(f?.filename) || ((f.previous_filename !== undefined || ['renamed', 'copied'].includes(f.status)) && !path(f.previous_filename))) return bad(r, 'path-unsupported');
+    if (!KNOWN_STATUS.has(f.status) || ![f.additions, f.deletions, f.changes].every(n => Number.isSafeInteger(n) && n >= 0) || f.changes !== f.additions + f.deletions) return bad(r, 'api-malformed', 'file status or counts invalid');
+    if (typeof f.patch !== 'string' && f.changes > 0) return bad(r, 'patch-omitted');
+    if (f.patch != null && typeof f.patch !== 'string') return bad(r, 'api-malformed', 'patch is not text');
+    const lines = (f.patch ?? '').split('\n');
+    if (lines.filter(l => l.startsWith('+')).length !== f.additions || lines.filter(l => l.startsWith('-')).length !== f.deletions) return bad(r, 'patch-truncated');
+  }
+  const text = synthesizeUnifiedDiff(doc.files);
+  const parsed = parseUnifiedDiff(text);
+  if (parsed.length !== doc.files.length || parsed.some(f => f.hunkIncomplete || f.pathUnresolved)) return bad(r, 'synth-mismatch');
+  return good(r, { text, mergeBase: doc.merge_base_commit.sha, baseTip: doc.base_commit.sha, headSha,
+    changedFiles: [...new Set(doc.files.flatMap(f => [f.filename, ...(f.previous_filename ? [f.previous_filename] : [])]))],
+    diffLines: doc.files.reduce((n, f) => n + f.changes, 0) });
 }

@@ -41,6 +41,8 @@ serially, in a later session, under the same self-approved PR transport the prod
 
 ## Preconditions
 
+- A non-local repo’s net diff is read from the forge and needs no sibling clone.
+
 - **Run from a LEASED lane-pool clone — NEVER the shared primary checkout (#2197 / ratified #2123).** The
   drain is an edit-action session (it advances `main` and, per #2198, rebuilds lane tips), so #2123's "every
   edit-action session runs in an isolated clone" applies. The primary tree almost always carries a peer
