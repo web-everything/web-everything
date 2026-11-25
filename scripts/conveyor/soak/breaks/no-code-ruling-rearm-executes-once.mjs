@@ -20,7 +20,7 @@ export default {
   id: 'no-code-ruling-rearm-executes-once',
   title: 'an operator no-code rearm ruling was never executed and fell through to a fixer that could not change anything (#7448, #7451)',
   card: 'STANDDOWN-EMPTY-ROUND',
-  fixedBy: { sha: 'pending', where: 'lane/standdown-s2-d2', paths: ['scripts/conveyor/reconcile-core.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs'] },
+  fixedBy: { sha: '54eda3510dec77d9bb844af567674590ea214374', where: 'lane/standdown-s2-d2', paths: ['scripts/conveyor/reconcile-core.mjs', 'scripts/operations/promote-draft-pr-dispatch.mjs'] },
   fixPresent(root) {
     const p = join(root, 'scripts/conveyor/reconcile-core.mjs');
     return existsSync(p) && /rearm-no-code/.test(readFileSync(p, 'utf8'));
