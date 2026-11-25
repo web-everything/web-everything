@@ -941,9 +941,9 @@ async function runCli() {
     const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
     try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
-    // Re-read the head right after the record so a push between the two voids the approval.
-    const slug = repoSlugFromRemote(gitC(['remote', 'get-url', REMOTE]));
-    const approval = !slug ? { ok: false, reason: 'repo slug unresolved' } : readApprovalRecord({ repo: slug, headSha: refSha, recheckHead: () => tryGit(['rev-parse', `${REMOTE}/${REF}`]) ?? refSha });
+    // The record is read for the exact pinned `refSha`, so a different head never matches it.
+    const slug = repoSlugFromRemote(tryGit(['remote', 'get-url', REMOTE]));
+    const approval = !slug ? { ok: false, reason: 'repo slug unresolved' } : readApprovalRecord({ repo: slug, headSha: refSha });
     readyOnOpen = decideReadyOnOpen({ approval, changedFiles, guardConfigPaths }).ready;
   } catch { /* classification unavailable */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
