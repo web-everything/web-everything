@@ -19,7 +19,7 @@ const matrix = [
 const ok = (name) => ({ name, conclusion: 'success', steps: [{ name: RECEIPT, conclusion: 'success' }] });
 const fullJobs = () => [...matrix, ...required].map(ok);
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
-const run = (over = {}) => ({ id: 7, workflow_id: 382175354, head_sha: SHA, event: 'merge_group', status: 'completed', conclusion: 'success', ...over });
+const run = (over = {}) => ({ id: 7, workflow_id: 382175354, head_sha: SHA, event: 'merge_group', status: 'completed', conclusion: 'success', updated_at: '2026-11-25T12:00:00Z', ...over });
 
 const go = (runs, jobs, extra = {}) =>
   decide({ listQueueRuns: async () => runs, listRunJobs: async () => jobs, sha: SHA, event: 'push', quarantineClear: async () => true, ...extra });
@@ -95,7 +95,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       .toEqual({ reuse: false, why: 'error: GitHub API 503' });
   });
   it('includes a newer failed queue run on a later repository page', async () => {
-    const pages = [Array.from({ length: 100 }, (_, i) => run({ id: i + 10, workflow_id: 1 })), [run(), run({ id: 9, conclusion: 'failure' })]];
+    const pages = [Array.from({ length: 100 }, (_, i) => run({ id: i + 10, workflow_id: 1 })), [run(), run({ id: 9, conclusion: 'failure', updated_at: '2026-11-25T13:00:00Z' })]];
     const fetchImpl = async url => {
       if (url.includes('/jobs?')) return response({ jobs: fullJobs(), total_count: fullJobs().length });
       const page = Number(new URL(url).searchParams.get('page'));
@@ -194,7 +194,52 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     expect((await go([run({ status: 'in_progress', conclusion: null })], fullJobs())).reuse).toBe(false);
   });
   it('a newer failed run for the same sha beats an older success', async () => {
-    expect((await go([run({ id: 7 }), run({ id: 9, conclusion: 'failure' })], fullJobs())).reuse).toBe(false);
+    expect((await go([run({ id: 7 }), run({ id: 9, conclusion: 'failure', updated_at: '2026-11-25T13:00:00Z' })], fullJobs())).reuse).toBe(false);
+  });
+  it.each([
+    ['completed', 'failure'], ['completed', 'cancelled'], ['in_progress', null], ['queued', null],
+  ])('a newer lower-ID rerun that is %s/%s prevents reuse in either listing order', async (status, conclusion) => {
+    const rerun = run({ id: 6, run_attempt: 2, status, conclusion, updated_at: '2026-11-25T13:00:00Z' });
+    for (const runs of [[run(), rerun], [rerun, run()]]) {
+      expect(await go(runs, fullJobs())).toEqual({ reuse: false, why: `run ${status}/${conclusion}` });
+    }
+  });
+  it('reuses a newer successful lower-ID rerun and reads that run’s jobs', async () => {
+    const listRunJobs = vi.fn(async () => fullJobs());
+    const rerun = run({ id: 6, run_attempt: 2, updated_at: '2026-11-25T13:00:00Z' });
+    expect(await go([run({ conclusion: 'failure' }), rerun], fullJobs(), { listRunJobs }))
+      .toMatchObject({ reuse: true, runId: 6 });
+    expect(listRunJobs).toHaveBeenCalledTimes(1);
+    expect(listRunJobs).toHaveBeenCalledWith(6);
+  });
+  it.each([undefined, null, '', 'invalid', 0, '0', '2026-02-30T12:00:00Z', '2026-11-25T12:00:00'])('runs fully when a candidate has unknown update time: %j', async updated_at => {
+    const listRunJobs = vi.fn(async () => fullJobs());
+    expect(await go([run(), run({ id: 6, updated_at })], fullJobs(), { listRunJobs }))
+      .toEqual({ reuse: false, why: 'unknown merge-queue run update time' });
+    expect(listRunJobs).not.toHaveBeenCalled();
+  });
+  it('runs fully when the newest update times tie, regardless of IDs or listing order', async () => {
+    for (const runs of [[run(), run({ id: 6, conclusion: 'failure' })], [run({ id: 6, updated_at: '2026-11-25T12:00:00.000Z' }), run()]]) {
+      expect(await go(runs, fullJobs())).toEqual({ reuse: false, why: 'ambiguous newest merge-queue run' });
+      expect(await go([...runs].reverse(), fullJobs())).toEqual({ reuse: false, why: 'ambiguous newest merge-queue run' });
+    }
+  });
+  it('CLI refuses a newer failed lower-ID rerun found on a later provider page', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mq-rerun-cli-'));
+    const pages = [[run(), ...Array.from({ length: 99 }, (_, i) => run({ id: i + 10, workflow_id: 1 }))],
+      [run({ id: 6, run_attempt: 2, conclusion: 'failure', updated_at: '2026-11-25T13:00:00Z' })]];
+    const fetchImpl = async url => {
+      if (url.includes('/jobs?')) return response({ jobs: fullJobs(), total_count: fullJobs().length });
+      return response({ workflow_runs: pages[Number(new URL(url).searchParams.get('page')) - 1], total_count: 101 });
+    };
+    try {
+      const output = join(dir, 'output'), summary = join(dir, 'summary');
+      await main({ env: { GITHUB_SHA: SHA, GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 't', GITHUB_EVENT_NAME: 'push',
+        GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary }, fetchImpl,
+      quarantineOptions: { readQuarantine: () => ({ ok: true, list: { entries: [] } }) } });
+      expect(readFileSync(output, 'utf8')).toBe('reuse=false\n');
+      expect(readFileSync(summary, 'utf8')).toContain('full run (run completed/failure)');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('runs fully with an incomplete jobs listing', async () => {
     const reads = (body) => githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([run()], body) });

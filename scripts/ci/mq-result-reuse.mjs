@@ -7,6 +7,7 @@
 import { appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
+import { isStrictUtcTimestamp } from '../lib/strict-utc-timestamp.mjs';
 
 export const CI_WORKFLOW_ID = 382175354;
 // Interface forge.merge-queue: a queue result is reusable only for the exact same integration state (same sha).
@@ -44,7 +45,8 @@ export function judgeRun(run, jobs, sha) {
 /**
  * Provider-neutral reuse rule (forge.merge-queue: the tested integration state; forge.check-status: the checks'
  * outcomes). NO provider calls here: every read is injected.
- *   listQueueRuns(sha) -> [{id, head_sha, event, status, conclusion}]  merge-queue runs of that exact state
+ *   listQueueRuns(sha) -> [{id, head_sha, event, status, conclusion, updated_at}]  merge-queue runs of that exact state
+ *                         updated_at is the latest run activity timestamp, including reruns (ISO 8601).
  *   listRunJobs(runId) -> [{name, conclusion}]  the COMPLETE job list (the adapter throws if it cannot prove completeness)
  *   quarantineClear()  -> true only when today's quarantine is readable and clear. Per-job full-test receipts
  *                         independently prove that the queue did not skip tests under historical quarantine.
@@ -55,10 +57,18 @@ export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantin
   if (!/^[0-9a-f]{40}$/.test(sha ?? '')) return { reuse: false, why: 'no full sha' };
   try {
     const candidates = ((await listQueueRuns(sha)) ?? [])
-      .filter((r) => r.head_sha === sha && r.event === 'merge_group')
-      .sort((a, b) => Number(b.id) - Number(a.id));
+      .filter((r) => r.head_sha === sha && r.event === 'merge_group');
     if (candidates.length === 0) return { reuse: false, why: 'no merge-queue run for this sha' };
-    // Only the NEWEST run for the sha counts: a newer failed or unfinished run is contrary evidence.
+    // Run IDs describe creation order, not rerun activity. Unknown or tied update times cannot
+    // establish which result is newest, so they must never fall back to ID or listing order.
+    if (candidates.some(r => !isStrictUtcTimestamp(r.updated_at))) {
+      return { reuse: false, why: 'unknown merge-queue run update time' };
+    }
+    candidates.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    if (candidates.length > 1 && Date.parse(candidates[0].updated_at) === Date.parse(candidates[1].updated_at)) {
+      return { reuse: false, why: 'ambiguous newest merge-queue run' };
+    }
+    // Only the most recently updated run counts, including a failed or unfinished lower-ID rerun.
     const run = candidates[0];
     const verdict = judgeRun(run, await listRunJobs(run.id), sha);
     if (!verdict.reuse) return verdict;
