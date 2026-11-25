@@ -38,7 +38,7 @@ function probe({ mode, startAfter, state = 'matching' }) {
   let spawns = 0;
   let headReads = 0;
   try {
-    const out = dispatchReviewByMode({ mode, pr: 5911, repo: REPO, root: '/daemon', dir,
+    const out = dispatchReviewByMode({ expectedHead: HEAD, io: { liveHead: () => HEAD }, mode, pr: 5911, repo: REPO, root: '/daemon', dir,
       env: { WE_REVIEW_START_AFTER: startAfter,
         ...(state.startsWith('explicit-fast-') ? { WE_REVIEW_FAST_CHECKS: JSON.stringify(state.endsWith('array') ? ['review-gate']
           : { [state.endsWith('slug') ? REPO : 'frontierui']: ['review-gate'] }) } : {}) },

@@ -41,7 +41,7 @@ export default {
       for (const flag of ['--red-team-only', '--red-team-only=fresh']) {
         recordRedTeamStatus({ repo, pr, loopPayload, status: 'finished', result: 'ran' }, { env });
         const modes = [], statuses = [];
-        const io = { root: sourceRoot, now: () => 1000, newActorId: () => 'soak',
+        const io = { liveHead: () => head, root: sourceRoot, now: () => 1000, newActorId: () => 'soak',
           readPrevCompletion: () => null, claim: () => ({ ok: true }), updateRecord: noop, unclaim: noop,
           acquireLane: () => ({ lanePath: sourceRoot }), releaseLane: noop, log: noop, report: noop,
           prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
@@ -51,7 +51,7 @@ export default {
           runRedTeamGate: () => ({ status: 'ok', outcome: 'advisory' }),
         };
         let out;
-        runReviewJobCli(['run', `--pr=${pr}`, `--repo=${repo}`, flag], {
+        runReviewJobCli(['run', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`, flag], {
           runJob: options => { out = runReviewJob(options, io); return {}; },
         });
         const stored = readRedTeamStatus({ repo, pr, head, env });

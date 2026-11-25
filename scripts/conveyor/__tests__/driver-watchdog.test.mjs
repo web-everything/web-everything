@@ -1239,6 +1239,7 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'resolve-runner-checkout.mjs',// lease pid → checkout
       'runner-lock.mjs',            // the singleton lease
       'settings-safe-direction.mjs',// D15 — policy-cascade's env-may-only-tighten classifier (leaf: no imports)
+      'strict-utc-timestamp.mjs',   // file-locks' UTC evidence validator (leaf: no imports)
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate
       'write-all-sync.mjs',
     ]);
@@ -1250,6 +1251,11 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       files: [entry],
       external: ['node:child_process', 'node:fs'],
     });
+  });
+
+  it('the shared UTC evidence validator remains a leaf with no imports', () => {
+    const entry = join(WATCHDOG_REPO_ROOT, 'scripts', 'lib', 'strict-utc-timestamp.mjs');
+    expect(importGraph(entry)).toEqual({ files: [entry], external: [] });
   });
 
   it('reads the queue sidecar as BYTES through the shared parser, never through the driver\'s planner', () => {

@@ -5,6 +5,7 @@ import { readStackBases } from '../../conveyor/review-stack-base.mjs';
 it.each(['job', 'session'])('fast %s dispatch refuses unreadable stack evidence before spawn', mode => {
   const spawnJob = vi.fn(), spawnAgent = vi.fn();
   expect(() => dispatchReviewByMode({ mode, pr: 1, repo: 'fixture/repo', strictStackEvidence: true,
+    expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) },
     stackCheck: () => { throw Error('stack unreadable'); }, spawnJob, spawnAgent })).toThrow('stack unreadable');
   expect(spawnJob).not.toHaveBeenCalled(); expect(spawnAgent).not.toHaveBeenCalled();
 });

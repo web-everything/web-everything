@@ -308,7 +308,7 @@ it('reads the full-review anchor only from the producer basis slot, and fails cl
 it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {
   const spawn = vi.fn();
   for (const startAfter of ['fast-checks', 'push']) {
-    const result = dispatch({ pr: 7, repo: 'web-everything/web-everything', root: join(tmpdir(), 'review-timing-daemon-fixture'),
+    const result = dispatch({ expectedHead: head, io: { liveHead: () => head }, pr: 7, repo: 'web-everything/web-everything', root: join(tmpdir(), 'review-timing-daemon-fixture'),
       dir: join(tmpdir(), 'review-timing-jobs-fixture'), checkoutExists: () => true,
       checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
       spawnAgent: spawn, spawnJob: spawn, advisoryCiWaiver: { head },

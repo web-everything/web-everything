@@ -31,7 +31,7 @@ async function exercise(root, kind, load) {
     const repo = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug, head = 'a'.repeat(40);
     const entries = Array.from({ length: 15 }, (_, i) => ({
       key: `${repo}#${i + 1}`, repo, pr: i + 1, head, attempts: 0, enqueuedAt: 1,
-      ...(kind === 'blocked' ? { blocked: i % 2 ? 'planner-skip' : 'review-unfinished' } : {}),
+      ...(kind === 'blocked' ? { blocked: i % 2 ? 'planner-skip' : 'review-unfinished', blockedReason: 'soak fixture evidence' } : {}),
     }));
     process.env.WE_RED_TEAM_QUEUE_FILE = join(directory, 'queue.json');
     process.env.WE_RED_TEAM_DISPATCH_QUEUE = 'on';

@@ -19,7 +19,7 @@ import { afterEach, describe, it, expect, vi } from 'vitest';
 
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import {
-  assertMainNotStale, canonicalReviewPlaceholder, dispatchReview, fillReviewBrief, formatSessionDispatchResult, isReviewCodePath, planReviewDispatch,
+  assertMainNotStale, canonicalReviewPlaceholder, dispatchReview as realDispatchReview, fillReviewBrief, formatSessionDispatchResult, isReviewCodePath, planReviewDispatch,
   reviewDispatchDisallowedToolsArgs, reviewSessionSlug, REVIEW_BRIEF_PLACEHOLDERS,
   REVIEW_DISPATCH_DISALLOWED_TOOLS, REVIEW_DISPATCH_SYSTEM_PROMPT_FILE,
   REVIEW_SANDBOX_ROOTS, TOOL_FREE_ONLY_JUDGE_PROVIDERS,
@@ -41,6 +41,10 @@ const DISALLOWED_TOOLS_ARGV = reviewDispatchDisallowedToolsArgs();
 // A `checkStaleness` stub that never touches git — every `dispatchReview` test below injects one, so none of
 // them depend on real subprocess/network fail-soft behavior for a nonexistent `root`.
 const GREEN_CI = () => ({ allowed: true, headSha: 'a'.repeat(40) });
+// These launch/CI fixtures now carry explicit matching admission evidence. Negative head
+// cases exercise the unwrapped production export in review-job-expected-head.test.mjs.
+const dispatchReview = options => realDispatchReview({ expectedHead: 'a'.repeat(40),
+  io: { liveHead: () => 'a'.repeat(40) }, ...options });
 const FRESH = () => ({ fresh: true, behind: 0 });
 
 const REAL_TEMPLATE_STUB = [
