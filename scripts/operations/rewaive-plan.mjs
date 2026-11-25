@@ -138,4 +138,4 @@ export function runCli({ argv, repo = process.cwd(), env = process.env, loadReco
   return { code: r.status === 0 ? 0 : 3, plan: out };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) process.exit(runCli({ argv: process.argv.slice(2) }).code);
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.exitCode = runCli({ argv: process.argv.slice(2) }).code;
