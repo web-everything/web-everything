@@ -3,6 +3,7 @@
  * No revocation or tooling deletion: equivalent greens for the same commit and policy coexist through EEXIST.
  * Manual escape: `rm <coordRoot>/verify-shared/<repo>/<sha>/<policyKey>.json` forces re-verification.
  * A crashed writer can leave a temp file; readers only open the exact final path.
+ * Only a fresh verify run publishes: a "green, no new run needed" reuse of the lane marker writes nothing.
  */
 import { mkdirSync, openSync, writeFileSync, fsyncSync, closeSync, linkSync, unlinkSync, lstatSync, fstatSync, readFileSync, constants } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
