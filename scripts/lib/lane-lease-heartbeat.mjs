@@ -14,6 +14,7 @@ import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync }
 import { dirname, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { LEASE_FILENAME, renewedLease, isLeaseStale } from './lane-lease.mjs';
+import { withLaneLeaseMutation } from './lane-lease-lock.mjs';
 
 export const DEFAULT_LEASE_HEARTBEAT_MS = 10 * 60_000;
 
@@ -59,25 +60,28 @@ export function renewLaneLeaseOnce({ cwd, owner = null, now = () => new Date(), 
     const gitDir = leaseDirFn(cwd);
     if (!gitDir) return false;
     const file = join(gitDir, LEASE_FILENAME);
-    if (!fs.existsSync(file)) return false;
-    const lease = readLease(file, fs);
-    if (!lease) return false;
-    if (owner && ownerKey(lease) !== owner) return false;
-    // An expired lease may already be reclaimable: it comes back only through the allocator, never a renewal.
-    if (isLeaseStale(lease, now().getTime())) return false;
-    const next = renewedLease(lease, now().toISOString());
-    if (!next || next === lease) return false;
-    const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
-    try {
-      fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
-      // Re-read right before the swap: a lease replaced or released meanwhile is never overwritten.
-      const again = readLease(file, fs);
-      if (!again || ownerKey(again) !== ownerKey(lease)) return false;
-      fs.renameSync(tmp, file);
-    } finally {
-      fs.rmSync(tmp, { force: true });
-    }
-    return true;
+    return withLaneLeaseMutation(file, () => {
+      if (!fs.existsSync(file)) return false;
+      const lease = readLease(file, fs);
+      if (!lease) return false;
+      if (owner && ownerKey(lease) !== owner) return false;
+      // An expired lease returns only through the allocator, never a renewal.
+      if (isLeaseStale(lease, now().getTime())) return false;
+      const next = renewedLease(lease, now().toISOString());
+      if (!next || next === lease) return false;
+      const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
+      try {
+        fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
+        // Defense in depth; the lock excludes writers through the swap,
+        // including after this final read.
+        const again = readLease(file, fs);
+        if (!again || ownerKey(again) !== ownerKey(lease)) return false;
+        fs.renameSync(tmp, file);
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
+      return true;
+    });
   } catch { return false; }
 }
 
@@ -99,7 +103,7 @@ export function startLaneLeaseHeartbeat({ cwds, everyMs = DEFAULT_LEASE_HEARTBEA
   const tick = () => {
     for (const t of targets) {
       if (renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, now, leaseDirFn, fs })) { t.lost = false; continue; }
-      if (!t.lost) { t.lost = true; try { warn(`lane-lease-heartbeat: could not renew the lease for ${t.cwd} (lost, replaced, expired or unreadable); the run continues unprotected`); } catch { /* best-effort */ } }
+      if (!t.lost) { t.lost = true; try { warn(`lane-lease-heartbeat: could not renew the lease for ${t.cwd} (lost, replaced, expired, unreadable or mutation busy); the run continues unprotected. If a .lane-lease-lock persists, confirm no writer remains before removing it.`); } catch { /* best-effort */ } }
     }
   };
   tick();
