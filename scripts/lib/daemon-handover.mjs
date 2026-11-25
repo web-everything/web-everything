@@ -40,8 +40,9 @@ export function validateReadyRecord(rec, { gen, codeDigest, pid } = {}) {
  */
 export function probationVerdict({ startedAt, now, passExitCodes = [], lastHeartbeatAt, staleAfterMs, probationMs }) {
   if (![startedAt, now, staleAfterMs, probationMs].every(Number.isFinite)) return 'rollback';
-  if (passExitCodes.some((c) => c !== 0)) return 'rollback';
-  if (!Number.isFinite(lastHeartbeatAt) || now - lastHeartbeatAt > staleAfterMs) return 'rollback';
+  if (!Array.isArray(passExitCodes) || Array.from(passExitCodes).some((c) => typeof c !== 'number' || c !== 0)) return 'rollback';
+  if (now - startedAt >= probationMs) return 'rollback';
+  if (!Number.isFinite(lastHeartbeatAt) || lastHeartbeatAt > now || now - lastHeartbeatAt > staleAfterMs) return 'rollback';
   if (passExitCodes.length > 0 && now - startedAt >= 0) return 'promote';
   return now - startedAt >= probationMs ? 'rollback' : 'wait';
 }

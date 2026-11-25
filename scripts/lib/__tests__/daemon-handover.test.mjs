@@ -44,3 +44,16 @@ describe('daemon-handover', () => {
     expect(switchPauseMs(4000, 1000)).toBeNull();
   });
 });
+
+describe('probation audit regressions', () => {
+  const base = { startedAt: 0, now: 100, lastHeartbeatAt: 90, staleAfterMs: 50, probationMs: 1000, passExitCodes: [0] };
+  it.each([1000, 1001])('rejects a clean pass at or after expiry (%i)', (now) => {
+    expect(probationVerdict({ ...base, now, lastHeartbeatAt: now })).toBe('rollback');
+  });
+  it('rejects future heartbeats', () => {
+    expect(probationVerdict({ ...base, lastHeartbeatAt: 101 })).toBe('rollback');
+  });
+  it.each([new Array(1), [0, , 0], ['0'], [undefined], null, { length: 1 }].map((passExitCodes) => ({ passExitCodes })))('rejects non-dense numeric pass arrays: $passExitCodes', ({ passExitCodes }) => {
+    expect(probationVerdict({ ...base, passExitCodes })).toBe('rollback');
+  });
+});

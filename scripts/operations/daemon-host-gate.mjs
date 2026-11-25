@@ -159,7 +159,8 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
   let ended = false;
   let stopping = false;
   let requestReload;
-  const reload = new Promise((resolve) => { requestReload = resolve; });
+  let reload = new Promise((resolve) => { requestReload = resolve; });
+  let reloadRequests = 0;
   let cleanupFailed = false;
   let revoking = false; // set by the wrapper before it stops the child for revocation
   let completedCode = null; // the command's own exit code, recorded when it ends without a wrapper stop
@@ -176,7 +177,8 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     const fn = () => {
       const first = !stopping;
       stopping = true;
-      stop(sig);
+      // Swap candidates always begin shutdown with TERM, including wrapper INT/HUP.
+      stop(env?.WE_DAEMON_ROLE === 'green' ? 'SIGTERM' : sig);
       if (first && !ended) {
         void sleep(killGraceMs, { signal: grace.signal }).then(() => {
           stop('SIGKILL'); // done still waits for the child's exit event.
@@ -229,14 +231,21 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     child = spawn(cmd, args, env
       ? { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], detached: true, env: { ...process.env, ...env } }
       : { stdio: 'inherit', detached: true });
-    child.on?.('message', (m) => { if (m?.type === 'reload') requestReload(); });
+    child.on?.('message', (m) => { if (m?.type === 'reload') { reloadRequests += 1; requestReload(); } });
     // A failed spawn has no exit event; errors on a live child must not release it.
     child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
     if (child.pid) marker.track(child.pid);
   } catch { end(127); }
   return {
-    done, stop, reload,
+    done, stop,
+    get reload() { return reload; },
+    takeReload() {
+      reloadRequests -= 1;
+      if (reloadRequests === 0) reload = new Promise((resolve) => { requestReload = resolve; });
+    },
+    get exited() { return ended; },
+    useMarker(next) { marker = next; },
     get pid() { return child?.pid; },
     revoke() { revoking = true; },
     get completedCode() { return completedCode; },
@@ -277,43 +286,60 @@ async function watchChild(child, ctx) {
 }
 
 /**
- * Swap-aware watch (BLUE-GREEN-SWAP S1.1). Active (blue) exit 76 spawns a candidate (green) beside it while blue
- * keeps running; blue exit 77 promotes green with no owner re-read from cold (the periodic poll keeps revoking
- * both slots as before). A green that dies in shadow is dropped; MAX_GREEN_DROPS drops raise needs-you.
- * Any other blue exit ends the gate as today; a stray 76 with no way to spawn also ends it.
+ * Swap-aware watch (BLUE-GREEN-SWAP S1.1). IPC reload requests start an inert green;
+ * blue exit 76/77 promotes a live, ready candidate. Failed shadows are bounded.
  */
 async function watchSwap(first, ctx) {
-  const { thisHost, source, watchSleep, sleep, killGraceMs, log, spawnCandidate, marker } = ctx;
+  const { thisHost, source, watchSleep, sleep, killGraceMs, log, spawnCandidate,
+    marker, greenMarker, candidateReady, greenCapable, shutdown, shuttingDown } = ctx;
   let active = first;
   let candidate = null;
   let gen = 1;
   let drops = 0;
-  let revoked = false;
-  let reloadSeen = false;
-  const stopAll = async () => {
-    const slots = [active, candidate].filter(Boolean);
+  const stopSlots = async (slots) => {
     for (const c of slots) { c.revoke(); c.stop('SIGTERM'); }
-    const exited = await Promise.race([Promise.all(slots.map((c) => c.done)).then(() => true), sleep(killGraceMs).then(() => false)]);
+    const exited = await Promise.race([
+      Promise.all(slots.map((c) => c.done)).then(() => true),
+      sleep(killGraceMs).then(() => false),
+    ]);
     if (!exited) for (const c of slots) c.stop('SIGKILL');
     const codes = await Promise.all(slots.map((c) => c.done));
-    return slots.some((c) => c.cleanupFailed) ? codes[0] : null;
+    if (slots.some((c) => c.cleanupFailed)) {
+      log('host-gate: slot cleanup failed; exiting 1, operator cleanup required');
+      return 1;
+    }
+    return codes[0];
   };
-  let poll = watchSleep(POLL_MS).then(() => 'poll');
-  while (!revoked) {
-    const waits = [active.done.then((code) => ({ who: 'active', code })), poll.then(() => ({ who: 'poll' }))];
-    if (!candidate && !reloadSeen) waits.push(active.reload.then(() => ({ who: 'reload' })));
+  const slots = () => [active, candidate].filter(Boolean);
+  const startCandidate = () => {
+    if (shuttingDown() || !greenCapable || drops >= MAX_GREEN_DROPS) return;
+    candidate = spawnCandidate(gen + 1);
+    log(`host-gate: blue asked for a successor; green gen=${gen + 1} started in shadow`);
+  };
+  let poll = watchSleep(POLL_MS);
+  while (true) {
+    if (shuttingDown()) return await stopSlots(slots());
+    const waits = [active.done.then((code) => ({ who: 'active', code })),
+      poll.then(() => ({ who: 'poll' })), shutdown.then(() => ({ who: 'shutdown' }))];
+    if (!candidate && greenCapable && drops < MAX_GREEN_DROPS) waits.push(active.reload.then(() => ({ who: 'reload' })));
     if (candidate) waits.push(candidate.done.then((code) => ({ who: 'candidate', code })));
-    const ev = await Promise.race(waits);
+    let ev = await Promise.race(waits);
+    if (shuttingDown()) return await stopSlots(slots());
     if (ev.who === 'poll') {
-      poll = watchSleep(POLL_MS).then(() => 'poll');
+      poll = watchSleep(POLL_MS);
       const now = await pollRole(thisHost, source);
-      if (active.completedCode !== null) return await active.done;
-      if (now.active) continue;
-      log(`host-gate: owner=${now.owner} self=${thisHost}; stopping daemon, back to standby`);
-      revoked = true;
-      return await stopAll();
+      if (shuttingDown()) return await stopSlots(slots());
+      if (!now.active) {
+        log(`host-gate: owner=${now.owner} self=${thisHost}; stopping daemon, back to standby`);
+        const code = await stopSlots(slots());
+        if (slots().some((c) => c.cleanupFailed)) return 1;
+        return shuttingDown() ? code : (active.completedCode !== null ? code : null);
+      }
+      if (active.completedCode === null) continue;
+      ev = { who: 'active', code: await active.done };
     }
     if (ev.who === 'candidate') {
+      if (candidate.cleanupFailed) return await stopSlots(slots());
       candidate = null;
       drops += 1;
       log(`host-gate: green gen=${gen + 1} dropped (exit ${ev.code}), drop ${drops}/${MAX_GREEN_DROPS}; blue keeps running`);
@@ -321,27 +347,41 @@ async function watchSwap(first, ctx) {
       continue;
     }
     if (ev.who === 'reload') {
-      reloadSeen = true;
-      if (drops >= MAX_GREEN_DROPS) continue;
-      candidate = spawnCandidate(gen + 1);
-      log(`host-gate: blue asked for a successor; green gen=${gen + 1} started in shadow`);
+      active.takeReload();
+      try { startCandidate(); }
+      catch (error) {
+        log(`host-gate: cannot reserve green cleanup marker: ${error.message}; operator cleanup required`);
+        await stopSlots(slots());
+        return 1;
+      }
       continue;
     }
-    // Blue is gone (76: asked for a successor then exited; 77: handed over). Never a cold owner re-read.
-    if (ev.code === EX_RELOAD && !candidate && drops < MAX_GREEN_DROPS) candidate = spawnCandidate(gen + 1);
-    if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate) {
-      active = candidate;
-      candidate = null;
-      reloadSeen = false;
-      gen += 1;
-      marker.track(active.pid);
-      log(`host-gate: handover complete; green promoted to active gen=${gen}`);
-      continue;
+    if (active.cleanupFailed) return await stopSlots(slots());
+    try {
+      if (ev.code === EX_RELOAD && !candidate) startCandidate();
+      if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate && !candidate.exited
+          && await candidateReady(gen + 1) && !candidate.exited && !shuttingDown()) {
+        // Write before transferring cleanup ownership; failed promotion must still stop green.
+        marker.track(candidate.pid);
+        greenMarker.clear();
+        candidate.useMarker(marker);
+        active = candidate;
+        candidate = null;
+        gen += 1;
+        log(`host-gate: handover complete; green promoted to active gen=${gen}`);
+        continue;
+      }
+    } catch (error) {
+      log(`host-gate: promotion failed: ${error.message}; exiting 1, operator cleanup required`);
+      await stopSlots(slots());
+      return 1;
     }
-    if (candidate) { candidate.revoke(); candidate.stop('SIGTERM'); await candidate.done; }
+    if (candidate) {
+      await stopSlots([candidate]);
+      if (candidate.cleanupFailed) return 1;
+    }
     return ev.code;
   }
-  return null;
 }
 
 /**
@@ -370,6 +410,9 @@ export async function runGate(parsed, deps = {}) {
     killGraceMs = 30_000,
     markerPath: suppliedMarkerPath,
     markerFs = nodeFs,
+    greenCapable = true,
+    // S1.3/S1.4 wire this to validateReadyRecord; the gate cannot read green-ready itself.
+    candidateReady = () => true,
     // Setting daemons.blueGreenSwap.<daemon>; absent = off (today's exit-and-restart path).
     swapEnabled = (daemon) => swapSettingOn({ daemons: platformPreference('daemons') }, daemon),
   } = deps;
@@ -380,6 +423,7 @@ export async function runGate(parsed, deps = {}) {
     return 1;
   }
   const marker = cleanupMarker(markerPath, markerFs, killGroup);
+  const greenMarker = cleanupMarker(`${markerPath}.green`, markerFs, killGroup);
   try { marker.lock(); }
   catch (error) {
     log(`host-gate: cleanup lock ${markerPath}.lock: ${error.message}; refusing to spawn, operator cleanup required`);
@@ -420,23 +464,39 @@ export async function runGate(parsed, deps = {}) {
         return 1;
       }
       const swap = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
+      if (swap) {
+        try { greenMarker.check(); }
+        catch (error) {
+          marker.clear();
+          log(`host-gate: green cleanup marker: ${error.message}; refusing to spawn, operator cleanup required`);
+          return 1;
+        }
+      }
       const child = startChild(parsed, {
         spawn, killGroup, processSignals, sleep, killGraceMs, log, marker,
         env: swap ? { WE_DAEMON_ROLE: 'blue', WE_DAEMON_GEN: '1' } : undefined,
       });
       const code = swap
         ? await watchSwap(child, {
-          thisHost, source, watchSleep, sleep, killGraceMs, log, marker,
-          // The cleanup marker tracks the active slot only; a shadow green must not rewrite or clear it.
-          spawnCandidate: (gen) => startChild(parsed, {
-            spawn, killGroup, processSignals, sleep, killGraceMs, log,
-            marker: { track() {}, clear() {} },
-            env: { WE_DAEMON_ROLE: 'green', WE_DAEMON_GEN: String(gen) },
+          thisHost, source, watchSleep, sleep, killGraceMs, log, marker, greenMarker,
+          candidateReady, greenCapable, shuttingDown: () => shutdownCode !== null,
+          shutdown: new Promise((resolve) => {
+            if (shutdown.signal.aborted) resolve();
+            else shutdown.signal.addEventListener('abort', resolve, { once: true });
           }),
+          // The daemon MUST honour WE_DAEMON_ROLE to keep green inert (S1.3 follows).
+          spawnCandidate: (gen) => {
+            greenMarker.claim();
+            return startChild(parsed, {
+              spawn, killGroup, processSignals, sleep, killGraceMs, log,
+              marker: greenMarker,
+              env: { WE_DAEMON_ROLE: 'green', WE_DAEMON_GEN: String(gen) },
+            });
+          },
         })
         : await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
-      if (shutdownCode !== null) return await child.done;
+      if (shutdownCode !== null) return swap ? code : await child.done;
       if (code !== null) return code;
     }
     return shutdownCode ?? 75;
