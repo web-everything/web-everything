@@ -6,7 +6,8 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, mkdirSync, rmdirSync, utimesSync, symlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { renewLaneLeaseOnce, startLaneLeaseHeartbeat } from '../lane-lease-heartbeat.mjs';
 import { laneLeaseLockPath, withLaneLeaseMutation } from '../lane-lease-lock.mjs';
 import { heartbeatMutationRace, judgeMutationRace } from '../../conveyor/soak/breaks/heartbeat-renewal-mutation-race.mjs';
@@ -89,7 +90,8 @@ describe('lease mutation coordination', () => {
   it('never expires an abandoned lock; explicit recovery permits a later renewal', () => {
     const d = gitDir(), file = join(d, '.lane-lease');
     put(d, lease);
-    const helper = new URL('../lane-lease-lock.mjs', import.meta.url).href;
+    // Resolve on disk: Vite rewrites relative new URL expressions into browser asset URLs.
+    const helper = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lane-lease-lock.mjs')).href;
     const crashed = spawnSync(process.execPath, ['--input-type=module', '-e',
       `import { withLaneLeaseMutation } from ${JSON.stringify(helper)}; withLaneLeaseMutation(process.argv[1], () => process.exit(0));`, file],
     { encoding: 'utf8', timeout: 5000, maxBuffer: 4096 });
