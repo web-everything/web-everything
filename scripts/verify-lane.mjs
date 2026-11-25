@@ -102,6 +102,10 @@ import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
+import { publishGreen, readSharedGreen } from './lib/verify-shared-marker.mjs';
+import { verifyPolicyKey } from './lib/verify-lane-gate.mjs';
+import { repoSlugFromRemote } from './lib/lane-verify.mjs';
+import { basename } from 'node:path';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 import { SHARD_RUN_SCRIPT, checkoutHasRetryableTestUnit, scanRetryCommand, localPhaseReason, localPhaseShape, localPhaseBypassDetail, phaseAdmissionPlan, shouldConfirmRemoteRed, decidePhaseRemote, readRemoteReport, phaseRunLocation, mergeRunLocation, overallRunLocation, remoteInfrastructureFailure, REMOTE_TERMINATION_UNCONFIRMED } from './lib/verify-remote-routing.mjs';
 import { SHARD_LOCAL_ENV } from './lib/verify-shard-run.mjs';
@@ -375,6 +379,31 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
     suites: GATE, selectionMode: resolvedGate?.decision?.selectionMode?.mode ?? null } })) {
     process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);
   }
+}
+function maybePublishSharedGreen({ status, treeHash, skipped = null }) {
+  const skip = reason => process.stderr.write(`verify shared: skip (${reason}); re-verify for shared reuse\n`);
+  try {
+    if (typeof flags.gate === 'string' || FORCE_LOCAL) return skip('explicit gate or local run');
+    const ours = resolveBuildDefaultGate(process.env);
+    if (!resolvedGate || !gateCommandsEqual(ours.command, GATE) || !gateCommandsEqual(resolvedGate.command, GATE)) return skip('executed gate differs from own env plan');
+    const sharedGit = args => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, env: laneGitHardeningEnv(process.env) });
+    const statusOut = sharedGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all']);
+    const cleanTree = statusOut.split('\n').filter(Boolean).every(line => line.startsWith('?? ') && isAllowlistedLitterPath(line.slice(3)));
+    if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree, skipped })) return skip('not a stable clean default-gate green');
+    if (sharedGit(['ls-files', '-v']).split('\n').some(line => /^[a-zS] /.test(line))) return skip('assume-unchanged or skip-worktree entries');
+    const repo = repoSlugFromRemote(sharedGit(['remote', 'get-url', 'origin']).trim());
+    const policyKey = verifyPolicyKey(process.env), coordRoot = resolveCoordinationRoot();
+    const selectionMode = resolvedGate.decision?.selectionMode?.mode;
+    const deltaBase = selectionMode === 'since-last-green' ? resolvedGate.decision.selectionMode.base : null;
+    if (selectionMode === 'since-last-green') {
+      const base = readSharedGreen({ coordRoot, repo, sha: deltaBase, policyKey });
+      if (!base || base.corrupt) return skip('delta base has no valid shared green under this policy');
+    }
+    if (!publishGreen({ coordRoot, repo, sha: headSha, policyKey, record: { v: 1, writer: 'verify-lane', repo,
+      sha: headSha, policyKey, status: 'green', exitCode: 0, executedGate: resolvedGate.command, selectionMode, deltaBase,
+      finishedAt: new Date().toISOString(), lane: basename(REPO) } })) return skip('store publication failed');
+  } catch { return skip('publication checks failed'); }
 }
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
@@ -1363,6 +1392,7 @@ const finished = verifyFinishBody(startBody, {
 });
 writeMarker({ ...finished, ...(FORCE_LOCAL ? { local: true } : {}), ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
+maybePublishSharedGreen({ status: finished.status, treeHash: finished.treeHash });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);

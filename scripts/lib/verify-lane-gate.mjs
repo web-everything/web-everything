@@ -64,6 +64,7 @@ import { hostSaturation } from './verify-ci-only.mjs';
 import { repoKeyForSlug, DEFAULT_REPO_KEY } from './constellation-repos.mjs';
 import { canonicalRepoSlug } from './lane-alternates.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
+import { resolveBuildPolicy } from './build-policy.mjs';
 
 import { createHash } from 'node:crypto';
 import { relative, sep, join, dirname } from 'node:path';
@@ -80,6 +81,20 @@ import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDepths } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
+
+/** The consumer resolves these inputs itself, never from a producer's marker. Also used in refusal logs. */
+export function verifyPolicyInputs(env = process.env) {
+  const { finalGate, finalGateStandards } = resolveBuildPolicy({ env });
+  return { v: 1, verify: resolveVerifySettings({ fileConfig: defaultFileConfig, env }).values,
+    finalGate, finalGateStandards, diffTestSelection: String(env?.[SELECTION_FLAG] ?? '') === '0' ? '0' : '1' };
+}
+
+/** Canonical JSON (sorted object keys, preserved array order), hashed over every effective verify value. */
+export function verifyPolicyKey(env = process.env) {
+  const canonical = value => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])])) : value;
+  return createHash('sha256').update(JSON.stringify(canonical(verifyPolicyInputs(env)))).digest('hex');
+}
 
 /**
  * PR 7008 — decode one line of Git path output. With the default `core.quotePath`, Git wraps a path holding a

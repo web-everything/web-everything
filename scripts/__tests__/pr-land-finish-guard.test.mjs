@@ -15,24 +15,29 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveFinishGuardVerdict } from '../pr-land.mjs';
+import * as land from '../pr-land.mjs';
+import * as verifyGate from '../lib/verify-lane-gate.mjs';
+import { existsSync, readFileSync } from 'node:fs';
+const sharedPath = join(process.cwd(), 'scripts/lib/verify-shared-marker.mjs');
+const sharedStore = existsSync(sharedPath) ? await import(sharedPath) : {};
 import { readVerifyMarker } from '../lib/lane-verify.mjs';
 
 let dir;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'pr-land-finish-guard-'));
-  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['init', '-q'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 const gitDirOf = (d) => join(d, '.git');
-const runGit = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const runGit = (args) => execFileSync('git', args, { maxBuffer: 2 * 1024 * 1024, cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const headSha = () => runGit(['rev-parse', 'HEAD']);
 const laneBranch = () => runGit(['symbolic-ref', '--short', 'HEAD']);
-const commit = (msg) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', msg], { cwd: dir });
+const commit = (msg) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', msg], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 const writeAndAdd = (relPath, contents) => {
   mkdirSync(join(dir, relPath.split('/').slice(0, -1).join('/') || '.'), { recursive: true });
   writeFileSync(join(dir, relPath), contents);
-  execFileSync('git', ['add', relPath], { cwd: dir });
+  execFileSync('git', ['add', relPath], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 };
 /** Write a marker directly (never through the real `verify-lane.mjs` writer — this suite only needs the SHAPE
  *  `resolveFinishGuardVerdict` reads, and driving the real gate here would be the exact "run everything" cost
@@ -49,18 +54,18 @@ describe('resolveFinishGuardVerdict (#4296) — a real merge of origin/main touc
     writeAndAdd('scripts/operations/ci-heal-pr-dispatch.mjs', 'base\n');
     commit('base');
     const main = laneBranch();
-    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 
     writeAndAdd('scripts/verify-lane.mjs', 'lane edit\n');
     commit('lane edit');
     const laneSha = headSha();
     writeGreenMarker(laneSha);
 
-    execFileSync('git', ['checkout', '-q', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('scripts/operations/ci-heal-pr-dispatch.mjs', 'upstream edit\n');
     commit('upstream edit');
-    execFileSync('git', ['checkout', '-q', main], { cwd: dir });
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', main], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     const mergeSha = headSha();
     expect(mergeSha).not.toBe(laneSha);
 
@@ -76,27 +81,27 @@ describe('resolveFinishGuardVerdict (#4296) — a real merge of origin/main touc
     writeAndAdd('scripts/verify-lane.mjs', 'base\n');
     commit('base');
     const main = laneBranch();
-    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 
     writeAndAdd('scripts/verify-lane.mjs', 'lane edit\n');
     commit('lane edit');
     const laneSha = headSha();
     writeGreenMarker(laneSha);
 
-    execFileSync('git', ['checkout', '-q', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('scripts/verify-lane.mjs', 'base\nupstream addition\n');
     commit('upstream addition to the lane\'s own file');
-    execFileSync('git', ['checkout', '-q', main], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', main], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     // May auto-merge cleanly or conflict, depending on git's hunk heuristics — either way the merge commit's
     // diff against the marker's sha touches scripts/verify-lane.mjs, which is exactly what this counter-case
     // needs; `resolveFinishGuardVerdict` never runs `git merge` itself, so how the conflict (if any) resolves is
     // incidental to what it is testing.
     try {
-      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
     } catch {
       writeFileSync(join(dir, 'scripts/verify-lane.mjs'), 'lane edit\nupstream addition\n');
-      execFileSync('git', ['add', 'scripts/verify-lane.mjs'], { cwd: dir });
-      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--no-edit', '-q'], { cwd: dir });
+      execFileSync('git', ['add', 'scripts/verify-lane.mjs'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
+      execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--no-edit', '-q'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     }
     const mergeSha = headSha();
     expect(mergeSha).not.toBe(laneSha);
@@ -113,18 +118,18 @@ describe('resolveFinishGuardVerdict (#4296) — a real merge of origin/main touc
     writeAndAdd('scripts/operations/ci-heal-pr-dispatch.mjs', 'base\n');
     commit('base');
     const main = laneBranch();
-    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 
     writeAndAdd('scripts/verify-lane.mjs', 'lane edit\n');
     commit('lane edit');
     const laneSha = headSha();
     writeFileSync(join(gitDirOf(dir), '.lane-verify'), JSON.stringify({ sha: laneSha, status: 'red', startedAt: 't', finishedAt: 'u', suites: 'test', exitCode: 2 }, null, 2) + '\n');
 
-    execFileSync('git', ['checkout', '-q', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('scripts/operations/ci-heal-pr-dispatch.mjs', 'upstream edit\n');
     commit('upstream edit');
-    execFileSync('git', ['checkout', '-q', main], { cwd: dir });
-    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', main], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'merge', '--no-edit', '-q', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     const mergeSha = headSha();
 
     const gate = resolveFinishGuardVerdict({
@@ -137,7 +142,7 @@ describe('resolveFinishGuardVerdict (#4296) — a real merge of origin/main touc
   it('an unreachable recordSha (a torn/foreign marker) fails CLOSED, never open — the real `git diff` throws and the caller\'s runGit propagates it', () => {
     writeAndAdd('scripts/verify-lane.mjs', 'base\n');
     commit('base');
-    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('scripts/verify-lane.mjs', 'lane edit\n');
     commit('lane edit');
     // No checkout back to `main` needed here — this test never touches `origin/main` again.
@@ -161,7 +166,7 @@ describe('resolveFinishGuardVerdict — a green marker carries over docs-only co
   const setup = () => {
     writeAndAdd('scripts/a.mjs', 'base\n');
     commit('base');
-    execFileSync('git', ['branch', 'origin/main'], { cwd: dir });
+    execFileSync('git', ['branch', 'origin/main'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('scripts/a.mjs', 'lane edit\n');
     commit('fix');
     const sha = headSha();
@@ -198,15 +203,61 @@ describe('resolveFinishGuardVerdict — a green marker carries over docs-only co
   it('REFUSES code renamed to a docs .md name', () => {
     setup();
     writeAndAdd('docs/a.md', 'lane edit\n'); // identical content: git sees a rename
-    execFileSync('git', ['rm', '-q', 'scripts/a.mjs'], { cwd: dir });
+    execFileSync('git', ['rm', '-q', 'scripts/a.mjs'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     commit('rename code to md');
     expect(verdict().ok).toBe(false);
   });
   it('REFUSES a marker on a non-ancestor commit', () => {
     setup();
-    execFileSync('git', ['checkout', '-q', '--orphan', 'other'], { cwd: dir });
+    execFileSync('git', ['checkout', '-q', '--orphan', 'other'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
     writeAndAdd('backlog/1-y.md', 'c\n');
     commit('orphan card');
     expect(verdict().ok).toBe(false);
+  });
+});
+
+
+describe('finish-guard shared readMarker wiring', () => {
+  const setup = () => {
+    writeAndAdd('code.txt', 'base\n'); commit('base');
+    runGit(['remote', 'add', 'origin', 'https://github.com/example/project.git']);
+    const sha = headSha(), coordRoot = join(dir, 'coord');
+    const policyKey = verifyGate.verifyPolicyKey({});
+    const record = { v: 1, writer: 'verify-lane', repo: 'example/project', sha, policyKey, status: 'green', exitCode: 0,
+      executedGate: 'npm run test:unit', selectionMode: 'pr', deltaBase: null, finishedAt: new Date().toISOString(), lane: 'lane-A' };
+    expect(sharedStore.publishGreen({ coordRoot, repo: record.repo, sha, policyKey, record })).toBe(true);
+    const logs = [];
+    const read = (env = {}, head = sha) => land.readFinishGuardMarker({ gitDir: gitDirOf(dir), headSha: head,
+      remote: 'origin', runGit, coordRoot, env, log: text => logs.push(text) });
+    return { sha, read, logs };
+  };
+  it('reads the exact consumer SHA and computed policy, logs sharedFrom on acceptance and key inputs on refusal', () => {
+    const { sha, read, logs } = setup();
+    expect(read()).toMatchObject({ sha, status: 'green', suites: 'npm run test:unit', sharedFrom: { lane: 'lane-A' } });
+    expect(logs.join('\n')).toMatch(/sharedFrom.*lane-A.*\d{4}-/);
+    expect(read({ WE_BUILD_FINAL_GATE: 'none' })).toBeNull();
+    expect(logs.join('\n')).toMatch(/policyKey.*finalGate.*none.*finalGateStandards.*diffTestSelection/);
+    expect(read({}, 'f'.repeat(40))).toBeNull();
+  });
+  it.each(['red', 'running', 'green', 'corrupt'])('local %s at head decides before shared green', status => {
+    const { sha, read, logs } = setup();
+    writeFileSync(join(gitDirOf(dir), '.lane-verify'), status === 'corrupt' ? '{bad' : JSON.stringify({ sha, status, suites: 'local' }));
+    expect(read()).toMatchObject(status === 'corrupt' ? { corrupt: true } : { sha, status, suites: 'local' });
+    expect(read().sharedFrom).toBeUndefined();
+    if (status !== 'green') expect(logs.join('\n')).toMatch(/policyKey=.*finalGate.*finalGateStandards.*diffTestSelection/);
+  });
+  it('stale local yields to shared head but remains available for existing carry-forward when shared is absent', () => {
+    const { sha, read } = setup();
+    const stale = { sha: 'e'.repeat(40), status: 'green', suites: 'old' };
+    writeFileSync(join(gitDirOf(dir), '.lane-verify'), JSON.stringify(stale));
+    expect(read()).toMatchObject({ sha, sharedFrom: { lane: 'lane-A' } });
+    expect(read({ WE_BUILD_FINAL_GATE: 'none' })).toMatchObject(stale);
+  });
+  it('CLI finish guard actually supplies the shared reader with refSha and its git runner', () => {
+    const source = readFileSync(join(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+    const finishArgs = source.slice(source.indexOf('const finishArgs ='), source.indexOf('const gate = resolveFinishGuardVerdict', source.indexOf('const finishArgs =')));
+    expect(finishArgs).toMatch(/readMarker:.*readFinishGuardMarker/s);
+    expect(finishArgs).toMatch(/headSha: refSha/);
+    expect(finishArgs).toMatch(/runGit: gitC/);
   });
 });
