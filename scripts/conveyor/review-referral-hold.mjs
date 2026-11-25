@@ -21,6 +21,8 @@ import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { jurorTimeoutEvidence } from '../operations/juror-timeout-route.mjs';
+import { resolveBuilder } from '../operations/review-builder.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
@@ -125,7 +127,9 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
+    const jurorTimeout = jurorTimeoutEvidence(run, resolveBuilder(read));
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(jurorTimeout ? { jurorTimeout } : {}),
       ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
@@ -376,6 +380,7 @@ function latestReviewAttempt(history) {
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
   const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
+  if (last?.jurorTimeout && last.head === pr.headRefOid && last.jurorTimeout.attempts < RESUME_MAX_ATTEMPTS) return { id: last.id, head: last.head };
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
     && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;

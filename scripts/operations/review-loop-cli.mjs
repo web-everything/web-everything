@@ -82,6 +82,7 @@ import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPoli
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { nextJurorRoute, jurorTimeoutHold } from './juror-timeout-route.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -404,12 +405,14 @@ export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
  * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax, jurorOnly = false }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return null;
-    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
-      ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
+    const runs = readRuns();
+    const id = findResumableParkedRun({ ...view, number: Number(pr) }, runs, { repo,
+      ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id;
+    return id && (!jurorOnly || runs.find(r => r.id === id)?.jurorTimeout) ? id : null;
   } catch { return null; }
 }
 
@@ -723,12 +726,14 @@ export async function runReviewLoopOnce({
   };
 
   let run;
+  let retrySeat = null;
   if (parsed.control.resume) {
     run = store.read(parsed.control.resume);
     if (!run) return { code: 2, lines: [`error: no run record for ${JSON.stringify(parsed.control.resume)}`], run: null, stopped: 'refused' };
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
+    if (reviewRunEvidence(run)?.jurorTimeout) parsed.input = run.input;
   }
   if (parsed.control.resume && reviewRunEvidence(run)?.ciHeldRecordRetry) {
     const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
@@ -737,7 +742,7 @@ export async function runReviewLoopOnce({
     run = prepared.run;
     store.write(run);
   }
-  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
+  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused || reviewRunEvidence(run)?.jurorTimeout) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
@@ -754,6 +759,10 @@ export async function runReviewLoopOnce({
     let persistSpent = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
+      const timeoutEvidence = reviewRunEvidence(parked);
+      const timeoutSeat = timeoutEvidence?.jurorTimeout;
+      const resumeJuror = timeoutSeat && timeoutSeat.attempts < RESUME_MAX_ATTEMPTS
+        && readResumePr(parked.input, { refreshHead: true })?.headRefOid === timeoutEvidence.head;
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
       // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
@@ -802,7 +811,12 @@ export async function runReviewLoopOnce({
       if (retryableRecordEffect && !ciHeldRecordRetry && recordAttempts >= RESUME_MAX_ATTEMPTS) {
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} record effect resume attempts spent; inspect run store and body-file refusal before retrying.`] };
       }
-      if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
+      if (resumeJuror && rosterMatches) {
+        const hold = jurorTimeoutHold(timeoutEvidence);
+        if (hold) return { code: 2, run: parked, stopped: 'refused', lines: [hold.why] };
+        retrySeat = { step: timeoutSeat.step, ...nextJurorRoute(timeoutSeat) };
+        rewound = { ...parked, jurorResumeAttempts: timeoutSeat.attempts + 1 };
+      } else if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect || retryableRecordEffect)) {
@@ -887,7 +901,7 @@ export async function runReviewLoopOnce({
   // reader of the run's own step-timing record can tell this pass apart from a human at a terminal — the same
   // distinction `applyPendingEffects`'s `attemptedBy` already threads for its effect rows.
   const outcome = await drive({
-    run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
+    run, registry, store, sinks, judge: activeJudge, resume, retrySeat, autoConfirm, attemptedBy: 'agent',
   });
 
   if (outcome.stopped === 'juror-timeout') {

@@ -210,6 +210,35 @@ const cannedJudge = (answer) => () => async () => judgeOutcome(answer, {});
 
 const BASE_ARGV = ['--pr=1234', '--repo=web-everything/web-everything'];
 
+it.each(['same', 'moved', 'roster', 'budget'])('juror timeout resume guard: %s head/roster', async scenario => {
+  const head = 'a'.repeat(40), store = createMemoryRunStore();
+  const first = registryFor({ rev: head });
+  const timedOut = Object.assign(new Error('timeout'), { timedOut: true, timeoutMs: 1200000, wallMs: 1200001 });
+  const parked = await runReviewLoopOnce({ ...first, argv: BASE_ARGV, store, sinks: recordingSinks([]),
+    makeJudge: () => async () => { throw timedOut; }, mintRunId: () => 'timeout-run' });
+  expect(parked.stopped).toBe('juror-timeout');
+  const saved = JSON.parse(JSON.stringify(parked.run));
+  saved.pending.request.seatProvider = { fallbackModel: 'claude-opus-5-5-high' };
+  if (scenario === 'roster') saved.findings.read.securitySeat = false;
+  if (scenario === 'budget') saved.jurorResumeAttempts = RESUME_MAX_ATTEMPTS;
+  store.write(saved);
+  const liveHead = scenario === 'moved' ? 'b'.repeat(40) : head;
+  expect(defaultFindResumableRun({ repo: saved.input.repo, pr: saved.input.pr }, {
+    readPr: () => ({ headRefOid: liveHead }), readRuns: () => [reviewRunEvidence(saved)],
+  })).toBe(['moved', 'budget'].includes(scenario) ? null : saved.id);
+  const current = registryFor({ rev: liveHead });
+  const judge = vi.fn(async () => CLEAN_ANSWER);
+  const resumed = await runReviewLoopOnce({ ...current, argv: ['--resume=timeout-run'], store,
+    sinks: recordingSinks([]), makeJudge: () => judge, readResumePr: () => ({ headRefOid: liveHead }), mintRunId: () => 'fresh-run' });
+  expect(resumed.run?.id, resumed.lines.join('\n')).toBe(scenario === 'same' ? 'timeout-run' : 'fresh-run');
+  if (scenario === 'same') {
+    const { model, timeoutMs, ...rest } = judge.mock.calls[0][0];
+    const { model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
+    expect(JSON.stringify(rest)).toBe(JSON.stringify(oldRest));
+    expect({ model, timeoutMs }).toEqual({ model: 'claude-opus-5-5-high', timeoutMs: 1800000 });
+  } else expect(resumed.run.seatTimeouts).toBeUndefined();
+});
+
 describe('runReviewLoopOnce — the loop field (converged/in-progress/exhausted/escalated) survives --json on EVERY stop', () => {
   it('on a mechanically-accepted stop, --json carries run.verdict.loop unmodified, no queue fields at all — #3434', async () => {
     const { declaration, registry } = registryFor({});

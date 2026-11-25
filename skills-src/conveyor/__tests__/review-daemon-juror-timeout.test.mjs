@@ -4,6 +4,41 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runReviewTick } from '../review-daemon.mjs';
 import { diagnoseEndedJob, writeEndedJobDiagnosis } from '../../../scripts/operations/review-job-end-diagnosis.mjs';
+import { reviewRunEvidence, notifyReferralHold } from '../../../scripts/conveyor/review-referral-hold.mjs';
+
+it('holds a second timeout over three ticks including restart; a moved head starts fresh', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'timeout-hold-'));
+  try {
+  const head = 'b'.repeat(40), repo = 'web-everything/web-everything';
+  const request = { lens: 'correctness', model: 'sonnet', seatProvider: { fallbackModel: 'claude-opus-5-5-high' } };
+  const run = { id: 'r', op: 'review-pr', input: { pr: 10, repo }, findings: { read: { repo, pr: 10, netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: '2026-11-25T00:00:00Z' }], pending: { kind: 'judge', step: 'judge', request },
+    seatTimeouts: ['sonnet', 'claude-opus-5-5-high'].map((model, i) => ({ step: 'judge', lens: 'correctness', head, provider: 'claude', model, timeoutMs: i ? 1800000 : 1200000 })) };
+  const dispatch = vi.fn(() => ({})), post = vi.fn();
+  const notifyReferral = vi.fn(args => notifyReferralHold({ ...args, dir, post, log() {} }));
+  const tick = (liveHead = head, providerCapacity = () => null) => runReviewTick({ repo, now: () => 1000,
+    dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+    readRuns: () => [reviewRunEvidence(JSON.parse(JSON.stringify(run)))], providerCapacity,
+    holdReconcile: () => [], reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 10, headRefOid: liveHead }], refusals: [] }),
+    readPrs: () => [{ number: 10, headRefOid: liveHead, labels: ['review:pending'] }], readAgents: () => [],
+    dispatch, notifyReferral, tagRound() {}, tagStatus() {}, statusCandidates: () => [], log() {} });
+  tick(); tick(); tick();
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(notifyReferral.mock.calls[0][0].hold.why).toContain('review-blocked-on-infra: juror timeout x2 (correctness: claude/sonnet 20m, claude/opus 30m; head bbbbbbbbbbbb)');
+  expect(notifyReferral.mock.calls[0][0].hold.why).toContain('Orchestrator:');
+  expect(post).toHaveBeenCalledTimes(1);
+  tick('c'.repeat(40));
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  run.seatTimeouts.pop();
+  tick(head, () => 'provider capacity held');
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(notifyReferral.mock.calls.at(-1)[0].hold.why).toContain('provider capacity held');
+  delete run.pending.request.seatProvider;
+  tick();
+  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(notifyReferral.mock.calls.at(-1)[0].hold.why).toContain('no allowed route remains');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 it('bounds and redacts hostile timeout metadata and ignores an oversized ended record', () => {
   const dir = mkdtempSync(join(tmpdir(), 'juror-timeout-'));

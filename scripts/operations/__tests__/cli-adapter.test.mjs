@@ -181,4 +181,32 @@ describe('driveRun permanent guard refusal', () => {
   expect(store.read(run.id).pending.step).toBe('judge');
   if (parallelJudges) expect(store.read(run.id).prefilledSeats[0].step).toBe('other');
   expect(spawnFn).toHaveBeenCalledTimes(1);
+  const saved = store.read(run.id);
+  const retried = vi.fn(() => ({ findings: [] }));
+  const resumed = await driveRun({ run: saved, registry, store, judge: retried, parallelJudges, log() {},
+    retrySeat: { step: 'judge', model: 'claude-opus-5-5-high', timeoutMs: 1800000 } });
+  expect(resumed.run.id).toBe(run.id);
+  const { model, timeoutMs, ...rest } = retried.mock.calls[0][0];
+  const { model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
+  expect(JSON.stringify(rest)).toBe(JSON.stringify(oldRest));
+  expect({ model, timeoutMs }).toEqual({ model: 'claude-opus-5-5-high', timeoutMs: 1800000 });
+  expect(retried).toHaveBeenCalledTimes(parallelJudges ? 1 : 2);
  });
+import { nextJurorRoute } from '../juror-timeout-route.mjs';
+
+it('retries only declared unused routes with a 1.5x timeout capped at the registry maximum', () => {
+  const directive = { model: 'sonnet', fallbackModel: 'claude-opus-5-5-high', timeoutMs: 1200000 };
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet'], directive })).toEqual({ model: directive.fallbackModel, provider: 'claude', timeoutMs: 1800000 });
+  expect(nextJurorRoute({ lens: 'security', tried: [], directive: { ...directive, timeoutMs: 3600000 } }).timeoutMs).toBe(3600000);
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet', directive.fallbackModel], directive })).toBeNull();
+  expect(nextJurorRoute({ directive: { ...directive, timeoutMs: NaN } })).toBeNull();
+});
+it.each([null, undefined, { provider: 'unknown' }, { provider: 'codex' }])('skips cross-vendor routes when builder independence is unproven: %s', builder => {
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet'], builder,
+    directive: { model: 'sonnet', fallbackModel: 'gpt-6-astra', timeoutMs: 1200000 } })).toBeNull();
+});
+it('allows an independent cross-vendor key lens only', () => {
+  const args = { tried: ['sonnet'], builder: { provider: 'claude' }, directive: { model: 'sonnet', fallbackModel: 'gpt-6-astra', timeoutMs: 1200000 } };
+  expect(nextJurorRoute({ ...args, lens: 'security' })?.provider).toBe('codex');
+  expect(nextJurorRoute({ ...args, lens: 'advisory' })).toBeNull();
+});

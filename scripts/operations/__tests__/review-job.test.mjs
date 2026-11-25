@@ -23,6 +23,14 @@ import {
 import { assessLiveness, bindAgents } from '../../conveyor/reconcile-core.mjs';
 import { deriveReviewStatus, tagReviewStatus } from '../../conveyor/review-status-tag.mjs';
 import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
+
+it('dispatches the same parked run by --resume through the existing loop entry', () => {
+  const spawnNode = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }));
+  const io = createReviewJobIo({ spawnNode, findResumableRun: () => 'parked-timeout', log() {} });
+  io.runLoop({ pr: 10, repo: 'o/r', lanePath: '/lane', timeoutMs: 2000000 });
+  expect(spawnNode.mock.calls[0][1]).toContain('--resume=parked-timeout');
+  expect(spawnNode.mock.calls[0][1]).not.toContain('--pr=10');
+});
 import { repoProfile } from '../../lib/repo-profile.mjs';
 
 const REPO = 'web-everything/web-everything';
