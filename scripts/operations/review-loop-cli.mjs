@@ -57,7 +57,7 @@
  */
 
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync, existsSync, mkdirSync, appendFileSync, chmodSync } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, lstatSync, openSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -594,9 +594,16 @@ function writeErrorDebugLog(site, error, env = process.env) {
   try {
     const path = errorDebugLogPath(env);
     mkdirSync(dirname(path), { recursive: true });
-    appendFileSync(path, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`, { mode: 0o600 }); // error-class-allowed
-    chmodSync(path, 0o600);
-  } catch { /* debug log is best effort */ }
+    // Fail closed: never append raw text to a symlink, a non-regular file, a file we do not own, or one that
+    // is group/world accessible. A missing file is created 0600 atomically (open mode), never chmod'd after.
+    let st = null;
+    try { st = lstatSync(path); } catch { st = null; }
+    if (st && (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o077) !== 0
+      || (typeof process.getuid === 'function' && st.uid !== process.getuid()))) return;
+    const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
+    try { writeSync(fd, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`); } // error-class-allowed
+    finally { closeSync(fd); }
+  } catch { /* debug log is best effort; skipping it never changes the printed class */ }
 }
 /** `<site>:<class>` — the only form of an error that may reach output. */
 export function describeErrorClass(site, error, { log = writeErrorDebugLog } = {}) {
@@ -612,7 +619,7 @@ function refusalClass(site, lines) {
 export async function runReviewLoopCliOnce(options) {
   try { return await runReviewLoopOnce(options); }
   catch (error) {
-    return { code: 1, lines: [`${describeErrorClass('error', error)}`], run: null, stopped: 'refused' };
+    return { code: 1, lines: [`error: ${describeErrorClass('error-class', error)}`], run: null, stopped: 'refused' };
   }
 }
 

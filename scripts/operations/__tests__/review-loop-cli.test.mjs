@@ -23,7 +23,7 @@
  *      (property 3's actor refusal fires first; `file-item` is never even called).
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -2180,11 +2180,19 @@ describe('CI-held record driver resume', () => {
     saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL).status = 'pending';
     f.store.write(saved);
     const checks = f.publishGate.mock.calls.length;
-    const out = await runReviewLoopCliOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'] });
+    const logDir = mkdtempSync(join(tmpdir(), 'rlc-replay-log-'));
+    const logPath = join(logDir, 'debug.log');
+    const prevLog = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = logPath;
+    let out;
+    try { out = await runReviewLoopCliOnce({ ...f.args, argv: [`--resume=${saved.id}`, '--json'] }); }
+    finally { if (prevLog === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG; else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prevLog; }
     expect(out.code).not.toBe(0);
     expect(out.stopped).toBe('refused');
     expect(out.run).toBeNull();
-    expect(out.lines.join(' ')).toContain('error:unknown');
+    expect(out.lines[0]).toMatch(/^error: error-class:unknown$/);
+    // the replay-specific refusal text is in the debug log (not in output), proving THIS fence fired
+    expect(readFileSync(logPath, 'utf8')).toContain('UNKNOWN');
     expect(f.publishGate).toHaveBeenCalledTimes(checks);
     expect(f.runNode).not.toHaveBeenCalled();
   });
@@ -2385,9 +2393,23 @@ describe('runReviewLoopOnce — error-class output (REVIEW-CLI-ERROR-CLASS): a t
   });
 
   it('the executable boundary prints error:<class>, not the message', async () => {
-    const out = await runReviewLoopCliOnce({ declaration: null, registry: null, argv: BASE_ARGV, store: { read() { throw new Error(`boom ${SECRET}`); } } });
+    const { declaration, registry } = registryFor({});
+    const logDir = mkdtempSync(join(tmpdir(), 'rlc-boundary-log-'));
+    const logPath = join(logDir, 'debug.log');
+    const prevLog = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = logPath;
+    let out;
+    try {
+      out = await runReviewLoopCliOnce({
+        declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks([]),
+        makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => { throw new Error(`boom ${SECRET}`); },
+      });
+    } finally { if (prevLog === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG; else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prevLog; }
     expect(out.code).toBe(1);
     expect(out.lines.join('\n')).not.toMatch(/test-xyz/);
-    expect(out.lines[0]).toMatch(/^error:[a-z-]+$/);
+    expect(out.lines[0]).toBe('error: error-class:auth');
+    // the token-bearing error WAS reached: the full text is only in the 0600 debug log
+    expect(readFileSync(logPath, 'utf8')).toContain('test-xyz');
+    expect(statSync(logPath).mode & 0o077).toBe(0);
   });
 });

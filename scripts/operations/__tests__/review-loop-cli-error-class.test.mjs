@@ -5,7 +5,8 @@
  * failed filing leaves the state as it was) — the end-to-end negatives live in review-loop-cli.test.mjs
  * ("error-class" describe); this file pins the classifier and the static ban on `.message` in output.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 
@@ -43,6 +44,28 @@ describe('classifyErrorClass', () => {
     expect(out).toBe('error:auth');
     expect(seen).toHaveLength(1);
     expect(String(seen[0][1].message)).toMatch(/abc123/);
+  });
+});
+
+describe('debug log fails closed', () => {
+  it('never appends through a symlink or into a group/world-readable file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-'));
+    const target = join(dir, 'target.txt');
+    writeFileSync(target, 'orig');
+    const link = join(dir, 'link.log');
+    symlinkSync(target, link);
+    const open = join(dir, 'open.log');
+    writeFileSync(open, 'orig', { mode: 0o644 });
+    chmodSync(open, 0o644);
+    for (const p of [link, open]) {
+      const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+      process.env.REVIEW_LOOP_CLI_DEBUG_LOG = p;
+      try { cli.describeErrorClass('x', new Error('Bearer leak-me')); }
+      finally { if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG; else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev; }
+    }
+    expect(readFileSync(target, 'utf8')).toBe('orig');
+    expect(readFileSync(open, 'utf8')).toBe('orig');
+    expect(statSync(open).mode & 0o777).toBe(0o644);
   });
 });
 
