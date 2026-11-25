@@ -1,15 +1,20 @@
 import { daemonAppEnv } from './daemon-app-env.mjs';
 import { expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const sha = 'a'.repeat(40);
 import { fakeGh, fakeGit } from './merge-ai-prs-fake-ports.mjs';
 
 export function createPrestageWorld(runCommand) {
-  return async function world(fn, { slug = 'fixture/prestage', localSlug = slug } = {}) {
+  return async function world(fn, { slug = 'fixture/prestage', localSlug = slug, siblingCloneSource = null } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
     try {
+      const cwd = siblingCloneSource ? join(dir, 'local') : dir;
+      if (siblingCloneSource) {
+        mkdirSync(cwd);
+        symlinkSync(siblingCloneSource, join(dir, slug.split('/').at(-1)), 'dir');
+      }
       const bin = join(dir, 'bin'); mkdirSync(bin);
       mkdirSync(join(dir, 'backlog'));
       const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord'), ledger = join(dir, 'ledger');
@@ -27,7 +32,7 @@ export function createPrestageWorld(runCommand) {
         writeFileSync(fixture, JSON.stringify(pr)); writeFileSync(log, '');
         const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
           '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
-          ...(green ? ['--from-green-event'] : [])], { cwd:dir,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
+          ...(green ? ['--from-green-event'] : [])], { cwd,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
           env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug, PRESTAGE_LOCAL_REPO:localSlug,
             PRESTAGE_DEFAULT_BRANCH:defaultBranch, PRESTAGE_FAIL_BRANCH:failDefaultBranch ? '1' : '0',
             ...(failDefaultBranch ? { WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS:'1' } : {}),

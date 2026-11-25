@@ -784,9 +784,18 @@ const netFile = (over = {}) => ({ filename: 'blocks/__tests__/x.test.ts', status
 const netDoc = (over = {}) => ({ status: 'ahead', merge_base_commit: { sha: OTHER }, base_commit: { sha: OTHER }, files: [netFile()], ...over });
 const netRead = (doc, o = {}) => drainReads.readCompareNetDiff('o/r', SHA, { allowedRepos: ['o/r'], source: { read: () => ({ ok: true, value: doc, fetchedAt: NOW }) }, ...o });
 describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
+  it.each(['ahead', 'diverged'])('holds %s compares with an empty files array', status => {
+    expect(netRead(netDoc({ status, files: [] }))).toMatchObject({ ok: false, reason: 'compare-empty' });
+  });
+  it('refuses synth-mismatch when a completed hunk has a trailing blank line', () => {
+    const f = netFile({ patch: netFile().patch + '\n\n' });
+    expect(drainReads.wellFormedPatch(f)).toBe(true);
+    expect(netRead(netDoc({ files: [f] }))).toMatchObject({ ok: false, reason: 'synth-mismatch' });
+  });
   const T = 'blocks/__tests__/x.test.ts';
   const bare = { additions: 0, deletions: 0, changes: 0, patch: undefined };
   it.each([
+    ['pure rename within test paths pending mode/type proof', netFile({ filename: T, previous_filename: 'blocks/__tests__/old.test.ts', status: 'renamed', ...bare })],
     ['binary rename of a test file', netFile({ filename: T, previous_filename: 'old.ts', status: 'renamed', ...bare })],
     ['binary rename away from a test path', netFile({ filename: 'new.ts', previous_filename: T, status: 'renamed', ...bare })],
     ['copy of a test file', netFile({ filename: 'copy.ts', previous_filename: T, status: 'copied', ...bare })],
@@ -890,21 +899,26 @@ describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
 
 import { forgeNetDiffSignals, describeUnverifiedNetDiff } from '../forge-net-diff.mjs';
 describe('forgeNetDiffSignals and reasoned hold text', () => {
+  it('an omitted base refuses scoring without reading the compare', () => {
+    const read = vi.fn();
+    expect(forgeNetDiffSignals({ read })).toMatchObject({ scored: false, netDiffText: { reason: 'forge-stacked-base' } });
+    expect(read).not.toHaveBeenCalled();
+  });
   it('maps the verified compare to the shared cumulative merge-base shape', () => {
     const read = vi.fn(() => netRead(netDoc()));
-    const sig = forgeNetDiffSignals({ repo: 'o/r', headSha: SHA, allowedRepos: ['o/r'], read });
+    const sig = forgeNetDiffSignals({ repo: 'o/r', headSha: SHA, allowedRepos: ['o/r'], read, baseRef: 'main' });
     expect(sig).toMatchObject({ scored: true, basisKind: 'merge-base', basisNarrowed: true, changedFiles: ['blocks/__tests__/x.test.ts'], humanBasisFiles: ['blocks/__tests__/x.test.ts'], diffLines: 1, cumulativeDiffLines: 1,
       netDiffText: { scored: true, source: 'forge', base: OTHER, baseTip: OTHER, rev: SHA, revSha: SHA } });
     expect(sig.diffHunks).toBe(sig.netDiffText.text);
     expect(read).toHaveBeenCalledWith('o/r', SHA, { allowedRepos: ['o/r'], env: undefined });
   });
   it.each(['api-http-500', 'api-malformed', 'compare-ceiling', 'patch-omitted', 'patch-truncated', 'path-unsupported', 'head-unbound', 'repo-not-drained'])('a forge miss is always unscored: %s', reason => {
-    const sig = forgeNetDiffSignals({ read: () => ({ ok: false, reason }) });
+    const sig = forgeNetDiffSignals({ baseRef: 'main', read: () => ({ ok: false, reason }) });
     expect(sig).toMatchObject({ scored: false, diffHunks: null, netDiffText: { scored: false, text: '', base: null, rev: null, reason: `forge-${reason}`, transient: !drainReads.isPermanentReadReason(reason) } });
   });
   it('throwing, missing and malformed success sources never score', () => {
     for (const read of [() => { throw Error('boom'); }, () => undefined, () => ({ ok: true }), () => ({ ok: true, value: {} })]) {
-      expect(forgeNetDiffSignals({ read })).toMatchObject({ scored: false, diffHunks: null, netDiffText: { reason: 'forge-source-error' } });
+      expect(forgeNetDiffSignals({ baseRef: 'main', read })).toMatchObject({ scored: false, diffHunks: null, netDiffText: { reason: 'forge-source-error' } });
     }
   });
   it('reason text keeps its exact prefix and gives stable transient and permanent wake events', () => {
@@ -913,7 +927,7 @@ describe('forgeNetDiffSignals and reasoned hold text', () => {
     expect(text.startsWith('net diff unverified (forge-api-http-500); ')).toBe(true);
     expect(text).toContain('o/r main...aaaaaaaaaaaa');
     expect(text).toContain('clear-human does not override it');
-    expect(text).toContain('next pass');
+    expect(text).toContain('once the compare is readable, run clear-human and restore ready-to-merge');
     expect(describeUnverifiedNetDiff(input)).toBe(text);
     expect(describeUnverifiedNetDiff({ ...input, reason: 'forge-compare-ceiling', transient: false })).toContain('split the PR');
   });

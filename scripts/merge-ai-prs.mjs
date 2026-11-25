@@ -5141,7 +5141,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
   // sibling directory is missing (not provisioned) or isn't a git working copy falls back to the prior skip —
-  // nothing here clones on the fly. These clones serve rebase plumbing only; non-local net-diff
+  // nothing here clones on the fly. These clones serve rebase plumbing and clearance carry; non-local net-diff
   // admission always reads the forge and needs no sibling clone.
   const siblingCloneDir = (repo) => {
     if (isLocalRepo(repo)) return null;
@@ -6705,6 +6705,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // The clone-pinned git runner, kept for the test-gaming carry's SHA-bound re-read below (null = no clone).
       let diffExec = null;
       if (!isLocalRepo(v.repo)) {
+        // Scoring uses forge evidence; clearance fingerprints must retain git's exact text when a clone exists.
+        const carryClone = siblingCloneDir(v.repo);
+        if (carryClone) diffExec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: carryClone, ...opts });
         const sig = forgeNetDiffSignals({ repo: v.repo, headSha: v.listedHeadSha, allowedRepos: REPOS, baseRef: v.baseRefName ?? null });
         if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev} (forge)\n`);
         changedFiles = sig.changedFiles;

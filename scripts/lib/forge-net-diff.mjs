@@ -2,7 +2,7 @@
 import { readCompareNetDiff, isPermanentReadReason } from './drain-api-reads.mjs';
 import { diffHunksFrom } from './review-escalation.mjs';
 
-export function forgeNetDiffSignals({ repo, headSha, allowedRepos, read = readCompareNetDiff, env, baseRef = 'main' } = {}) {
+export function forgeNetDiffSignals({ repo, headSha, allowedRepos, read = readCompareNetDiff, env, baseRef } = {}) {
   const failed = (reason) => ({
     changedFiles: [], humanBasisFiles: [], diffLines: 0, cumulativeDiffLines: 0,
     basisKind: null, basisNarrowed: false, scored: false, diffHunks: null,
@@ -25,10 +25,10 @@ export function forgeNetDiffSignals({ repo, headSha, allowedRepos, read = readCo
 export function describeUnverifiedNetDiff({ repo, headSha, reason = 'unscored', transient } = {}) {
   const prefix = `net diff unverified (${reason}); `;
   if (!reason.startsWith('forge-')) return prefix + 'restore diff access and rerun the drain, or obtain human review of the full diff';
-  if (reason === 'forge-stacked-base') return prefix + 'stacked PR: net diff is read once its base lands. Wake: the base PR merges and this PR is retargeted to main.';
+  if (reason === 'forge-stacked-base') return prefix + 'stacked PR: net diff is read once its base lands. Wake: after retargeting to main and verifying the compare is readable, run clear-human and restore ready-to-merge.';
   const cause =`the forge compare read of ${repo} main...${String(headSha ?? 'unknown').slice(0, 12)} failed (${reason}); without a verified diff the anti-test-gaming scan cannot run, so the hold stays and clear-human does not override it. `;
   const wake = transient === false
-    ? 'Wake: a re-read gives the same answer; split the PR so its diff is readable, or obtain human review of the full diff.'
-    : 'Wake: the drain re-reads on its next pass; a new head re-arms it.';
+    ? 'Wake: split the PR or make its diff readable; once the compare is readable, run clear-human and restore ready-to-merge. If the compare cannot represent the change, obtain human review and merge outside the drain.'
+    : 'Wake: restore forge access; once the compare is readable, run clear-human and restore ready-to-merge.';
   return prefix + cause + wake;
 }

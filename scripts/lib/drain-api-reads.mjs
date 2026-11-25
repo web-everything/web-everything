@@ -383,7 +383,7 @@ export function readCompareNetDiff(repo, headSha, o = {}) {
   if (doc.files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', 'split the PR so the full diff is readable');
   const sha = (v) => typeof v === 'string' && /^[0-9a-f]{40}(?![\s\S])/i.test(v);
   if (!sha(doc.merge_base_commit?.sha) || !sha(doc.base_commit?.sha)) return bad(r, 'api-malformed', 'base sha missing');
-  if (!['ahead', 'diverged'].includes(doc.status)) return bad(r, 'compare-empty');
+  if (!['ahead', 'diverged'].includes(doc.status) || doc.files.length === 0) return bad(r, 'compare-empty');
   const path = (v) => typeof v === 'string' && /^[A-Za-z0-9._@+\-/]+(?![\s\S])/.test(v) && v.split('/').every(p => p && p !== '.' && p !== '..');
   for (const f of doc.files) {
     if (!path(f?.filename) || ((f.previous_filename !== undefined || ['renamed', 'copied'].includes(f.status)) && !path(f.previous_filename))) return bad(r, 'path-unsupported');

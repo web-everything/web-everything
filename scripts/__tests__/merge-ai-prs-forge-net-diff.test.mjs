@@ -1,7 +1,10 @@
 // @vitest-environment node
 import { it, expect, vi, afterEach } from 'vitest';
 import { mkdirSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
+import { synthesizeUnifiedDiff } from '../lib/drain-api-reads.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
 import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
@@ -36,6 +39,45 @@ it("a non-local repo's clean forge compare scores the net diff and does not park
   expect(r.calls.some(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge'))).toBe(true);
   noRemoteGit(r.calls);
 }, setup), 120_000);
+it.each(['ahead', 'diverged'])('an %s compare with no files holds and prevents delivery', status => world(async ({ pr, run }) => {
+  ready(pr); pr.compare = compare({ status, files: [] });
+  held(await run(false, options), 'net diff unverified (forge-compare-empty); ');
+}, setup), 120_000);
+it('clear-human cannot admit an unverified forge compare', () => world(async ({ pr, run }) => {
+  ready(pr); pr.compare = { status: 500 };
+  pr.comments[0].body += '\n<!-- cleared-human: chalbert -->';
+  held(await run(false, options), 'net diff unverified (forge-api-http-500); ');
+}, setup), 120_000);
+it('a non-local test-tampering PR stays cleared at the current head and attempts delivery', () => world(async ({ pr, run }) => {
+  ready(pr); pr.compare = compare({ files: [file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })] });
+  pr.comments[0].body += '\n<!-- cleared-human: chalbert -->';
+  const r = await run(false, options);
+  expect(r.report.parked, r.stderr).toEqual([]);
+  expect(r.calls.some(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge'))).toBe(true);
+  noRemoteGit(r.calls);
+}, setup), 120_000);
+it.each([true, false])('an older non-local clearance carries an identical diff only with a sibling clone: %s', sibling => world(async ({ pr, run }) => {
+  ready(pr);
+  pr.compare = compare({ files: [file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })] });
+  pr.gitDiffText = synthesizeUnifiedDiff(pr.compare.files);
+  pr.comments[0].body = `<!-- reviewed-sha: ${'c'.repeat(40)} -->\n<!-- cleared-human: chalbert -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(pr.gitDiffText)} -->`;
+  const r = await run(false, { ...options, env: { WE_ACCEPT_CARRY_FORWARD: 'on' } });
+  const delivered = r.calls.some(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge'));
+  expect(delivered, r.stderr).toBe(sibling);
+  if (sibling) {
+    expect(r.report.parked, r.stderr).toEqual([]);
+    expect(r.calls.some(a => a[0] === 'git' && a.includes('diff') && a.includes(pr.headRefOid))).toBe(true);
+  } else {
+    expect(r.calls.some(a => a.includes('--add-label') && a.some(x => x?.includes('review:held-mechanical')))).toBe(true);
+  }
+}, { ...setup, ...(sibling ? { siblingCloneSource: resolve(dirname(fileURLToPath(import.meta.url)), '../..') } : {}) }), 120_000);
+it('the CLI passes a non-main base through to the forge guard before any compare read', () => world(async ({ pr, run }) => {
+  ready(pr); pr.baseRefName = 'release';
+  // Match the repo default so classification reaches scoring; the forge reader only supports main.
+  const r = await run(false, { ...options, defaultBranch: 'release' });
+  held(r, 'net diff unverified (forge-stacked-base); ');
+  expect(r.calls.some(a => a[0] === 'api' && a.some(x => x?.includes('/compare/')))).toBe(false);
+}, setup), 120_000);
 it.each([
   ['api-http-500', { status: 500 }], ['api-http-404', { status: 404 }],
   ['api-malformed', compare({ files: undefined })], ['compare-ceiling', compare({ files: Array.from({ length: 300 }, () => file()) })],
@@ -60,7 +102,7 @@ it('a stacked or unknown base is unscored with forge-stacked-base and never read
     expect(s.netDiffText).toMatchObject({ scored: false, reason: 'forge-stacked-base' });
     expect(read).not.toHaveBeenCalled();
     expect(describeUnverifiedNetDiff({ repo: 'o/r', headSha: 'a'.repeat(40), reason: s.netDiffText.reason, transient: s.netDiffText.transient }))
-      .toBe('net diff unverified (forge-stacked-base); stacked PR: net diff is read once its base lands. Wake: the base PR merges and this PR is retargeted to main.');
+      .toBe('net diff unverified (forge-stacked-base); stacked PR: net diff is read once its base lands. Wake: after retargeting to main and verifying the compare is readable, run clear-human and restore ready-to-merge.');
   }
 });
 it.each([

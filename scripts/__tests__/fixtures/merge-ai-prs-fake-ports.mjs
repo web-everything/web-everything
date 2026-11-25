@@ -61,6 +61,10 @@ while (a[0] === '-c') a = a.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + (process.env.PRESTAGE_LOCAL_REPO || process.env.PRESTAGE_REPO) + '.git\n');
 else if (['rev-parse', 'cat-file', 'merge-base', 'diff'].includes(a[0])) {
+  const pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+  if (a[0] === 'diff' && !a.includes('--name-only') && !a.includes('--numstat') && typeof pr.gitDiffText === 'string') {
+    process.stdout.write(pr.gitDiffText); process.exit(0);
+  }
   const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: [{ path: 'README.md' }] });
   if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
 } else if (a[0] === 'ls-tree' && a.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')) process.stdout.write('backlog/xabc123-card.md\n');
