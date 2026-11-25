@@ -1,0 +1,9 @@
+{
+  "_doc": "Thresholds for scripts/conveyor/delivery-strategy.mjs selectStrategy. No defaults live in code: a missing key yields hold/settings-missing.",
+  "staleMin": 60,
+  "daemonKinds": ["daemon-tooling", "daemon-fix", "gate-fix"],
+  "prototypeLoadWithinMin": 15,
+  "designPassAfterRounds": 3,
+  "buildAheadMax": 2,
+  "unblockerCap": 4
+}
