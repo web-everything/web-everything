@@ -1429,6 +1429,41 @@ describe('applyGateMode changes only the exit code', () => {
     expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
   });
 
+  const wfHeld = (facts2) => evaluatePrGates(facts({ gatePaths: { files: ['.github/workflows/ci.yml'] }, pinnedHead: { sha: 'a'.repeat(40) }, ...facts2 }), {});
+  const modeExit = (mode, prs) => applyGateMode({ mode, source: 'repo', childStatus: prs.every((p) => p.ok) ? 0 : 1, report: report(prs) }).exitCode;
+
+  it('shadow mode keeps a human-only hold failing', () => {
+    const wf = wfHeld({});
+    expect(wf.results.find((x) => x.id === 'review-acceptance')).toMatchObject({ status: 'hold', humanOnly: true });
+    const out = applyGateMode({ mode: 'shadow', source: 'repo', childStatus: 1, report: report([wf]) });
+    expect(out.exitCode).toBe(1);
+    expect(out.text).toMatch(/human-only-hold/);
+    expect(out.text).not.toMatch(/SHADOW: would HOLD/);
+  });
+
+  it('shadow mode with an unreadable workflowEditFact fails', () => {
+    const bad = wfHeld({ gatePaths: { error: 'boom' } });
+    expect(bad.results.find((x) => x.id === 'review-acceptance')).toMatchObject({ status: 'fail-closed', humanOnly: true });
+    expect(modeExit('shadow', [bad])).toBe(1);
+  });
+
+  it('shadow mode fails a blocking result that lacks the humanOnly field', () => {
+    const stripped = { ...held, results: held.results.map(({ humanOnly, ...x }) => x) };
+    expect(modeExit('shadow', [stripped])).toBe(1);
+  });
+
+  it('shadow mode still passes an ordinary advisory failure', () => {
+    expect(modeExit('shadow', [held])).toBe(0);
+  });
+
+  it('an unknown or empty mode is treated as enforce', () => {
+    for (const mode of ['bogus', '', undefined]) {
+      expect(modeExit(mode, [held]), String(mode)).toBe(1);
+      expect(modeExit(mode, [wfHeld({})]), String(mode)).toBe(1);
+    }
+    expect(modeExit('enforce', [held])).toBe(1);
+  });
+
   it('no verdict (crash, usage error, unparsable or inconsistent output) is never masked, even in shadow', () => {
     for (const [childStatus, rep] of [[1, null], [3, null], [1, { ok: true, prs: [] }], [0, { ok: false, prs: [held] }], [1, { prs: [] }]]) {
       const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus, report: rep });

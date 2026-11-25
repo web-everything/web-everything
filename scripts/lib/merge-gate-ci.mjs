@@ -94,7 +94,8 @@ export function duplicateIdText(d) {
   return typeof d === 'string' ? d : JSON.stringify(d);
 }
 
-const r = (id, status, reason) => ({ id, status, reason });
+// `humanOnly`: the hold can be cleared only by a human ceremony; shadow mode must never turn it into exit 0.
+const r = (id, status, reason, humanOnly = false) => ({ id, status, reason, humanOnly });
 
 let loggedCarryApproval = false;
 const defaultProveCarry = ({ evidence }) => proveHumanClearanceCarry({
@@ -114,7 +115,7 @@ const defaultProveCarry = ({ evidence }) => proveHumanClearanceCarry({
 export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true, mergeEvent = null, carrySetting = undefined, proveCarry = undefined, write = (s) => process.stderr.write(s) } = {}) {
   const num = Number(facts?.pr?.number ?? facts?.num);
   const out = new Map();
-  const set = (id, status, reason) => out.set(id, r(id, status, reason));
+  const set = (id, status, reason, humanOnly = false) => out.set(id, r(id, status, reason, humanOnly));
   for (const g of DRAIN_GATES) if (g.where !== 'merge-gate') set(g.id, g.where, g.note || `${g.where}-owned`);
 
   const mergeGateIds = DRAIN_GATES.filter((g) => g.where === 'merge-gate').map((g) => g.id);
@@ -188,7 +189,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   // reviewed sha IS the pinned head can. An unread or missing change list fails closed.
   const sig = facts.netSignals;
   const wf = workflowEditFact({ ...facts, acceptance });
-  if (wf) set('review-acceptance', wf.status, wf.reason);
+  if (wf) set('review-acceptance', wf.status, wf.reason, true);
   else if (facts.manifest?.error) set('review-acceptance', 'fail-closed', `manifest read failed: ${facts.manifest.error}`);
   else if (!sig || (!sig.scored && !sig.fallbackFiles)) set('review-acceptance', 'fail-closed', `net diff unreadable: ${sig?.error || 'not computed'}`);
   else {
@@ -308,7 +309,7 @@ function finish(num, out, policy, mergeEvent) {
   const results = DRAIN_GATES.map((g) => {
     const res = out.get(g.id) || r(g.id, 'fail-closed', 'not evaluated');
     if (g.where === 'merge-gate' && drainMerges && placementOf(policy, g.id) === 'drain') {
-      return r(g.id, 'skipped-by-policy', `placement drain (drain-direct merges): ${res.reason}`);
+      return r(g.id, 'skipped-by-policy', `placement drain (drain-direct merges): ${res.reason}`, res.humanOnly === true);
     }
     return res;
   });
@@ -485,10 +486,15 @@ export function applyGateMode({ mode, source, childStatus, report }) {
   }
   const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
   const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
-  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
-  const exitCode = report.ok || shadowLine ? 0 : 1;
-  const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
-  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
+  // A human-only hold is never masked: a blocking result is shadow-maskable only when it says `humanOnly === false`
+  // (a missing field counts as human-only, fail closed).
+  const humanOnlyHold = !report.ok && report.prs.some((p) => (p.results || []).some((x) => BLOCKING.has(x.status) && x.humanOnly !== false));
+  const shadowMasked = !report.ok && mode === 'shadow' && !humanOnlyHold;
+  const exitCode = report.ok || shadowMasked ? 0 : 1;
+  const shadowLine = shadowMasked ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
+  const humanLine = humanOnlyHold && mode === 'shadow' ? 'human-only-hold: shadow mode does not mask a human-only hold; failing' : null;
+  const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}${humanLine ? `${humanLine}\n` : ''}`;
+  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}${humanLine ? `**${humanLine}**\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
   return { exitCode, holds, text, summary };
 }
 
