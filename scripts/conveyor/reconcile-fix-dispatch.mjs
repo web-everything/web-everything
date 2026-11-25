@@ -2984,7 +2984,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
           protectedIds.add(c.id);
           const previous = landingBlockedSince.get(`${entry.pr}:${c.pr}`);
           protectedHolds.set(c.id, { pr: entry.pr, holder: c.pr,
-            holderHead: state?.headRefOid || c.headRefOid || null,
+            holderHead: state?.headRefOid || c.headRefOid || c.headSha || observation.holderHead || null,
             since: Number.isFinite(Date.parse(previous)) && Date.parse(previous) <= now ? previous : new Date(now).toISOString(),
             failedClosed: Boolean(d.failedClosed) });
           observation = { overlap: true, why: d.why, failedClosed: d.failedClosed, rule: 'waitForLandingHolder' };

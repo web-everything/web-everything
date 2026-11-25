@@ -73,7 +73,7 @@ describe('#3881 — scope-overlap aging override', () => {
 
 
 // Landing holds use the production aging bound, and a separate per-pair observation clock.
-import { resolveFixScopePolicy } from '../fix-scope-policy.mjs';
+import { createLiveRegionOverlap, resolveFixScopePolicy } from '../fix-scope-policy.mjs';
 import * as dispatchApi from '../reconcile-fix-dispatch.mjs';
 import { noteEpisodeKey, noteHeadline } from '../reconcile-note-comment.mjs';
 const isoAgo = minutes => new Date(NOW - minutes * 60000).toISOString();
@@ -138,6 +138,51 @@ describe('landing holder aging protection', () => {
 });
 describe('landing-holder-stuck reconcile notes', () => {
   const escalation = { holder: 90, holderHead: 'h1', waiters: [80, 81], since: isoAgo(61), waitedMinutes: 61, maxWaitMinutes: 60, failedClosed: false };
+  it.each(['claim-head', null])('escalates a 720-minute live-claim hold with unreadable holder state (claim head %s)', headSha => {
+    const claim = { meta: { pr: 90, scope: [FILE], ...(headSha ? { headSha } : {}) } };
+    const waiter = { ...oldWaiter, headRefOid: 'waiter-head', waitingSince: isoAgo(720) };
+    const regionOverlap = createLiveRegionOverlap({
+      readPrHeads: () => new Map([[90, 'observed-head']]),
+      regionReader: { hunksFor: () => new Map([[FILE.replace(/^we:/, ''), [[1, 2]]]]), mergeConflicts: () => true },
+      policy: landingPolicy,
+    });
+    const out = landingGate({
+      holderState: () => null, landingHolders: [], regionOverlap,
+      landingBlockedSince: new Map([['80:90', isoAgo(720)]]),
+    }, [waiter], [claim]);
+    expect(out.planned).toEqual([]);
+    expect(out.landingEscalations).toHaveLength(1);
+    expect(out.landingEscalations[0]).toMatchObject({
+      holder: 90, holderHead: headSha || 'observed-head', waitedMinutes: 720, failedClosed: true,
+    });
+    const comments = [], postComment = vi.fn(({ body }) => {
+      comments.push({ body, viewerDidAuthor: true }); return { ok: true };
+    }), notify = vi.fn();
+    const record = () => dispatchApi.recordLandingHolderEscalation({
+      escalation: out.landingEscalations[0], repo: 'owner/repo', readPrComments: () => comments, postComment, notify,
+    });
+    record(); record();
+    expect(postComment).toHaveBeenCalledOnce();
+    expect(postComment.mock.calls[0][0]).toMatchObject({ pr: 90, body: expect.stringContaining('720 minutes') });
+    expect(notify).toHaveBeenCalledOnce();
+    expect(regionOverlap(waiter, claim.meta, FILE).holderHead).toBe('observed-head');
+  });
+  it('keeps a 720-minute live-claim hold silent when every holder head source is unknown', () => {
+    const out = landingGate({
+      holderState: () => null, landingHolders: [],
+      landingBlockedSince: new Map([['80:90', isoAgo(720)]]),
+    }, [{ ...oldWaiter, waitingSince: isoAgo(720) }], [{ meta: { pr: 90, scope: [FILE] } }]);
+    expect(out.planned).toEqual([]);
+    expect(out.landingEscalations).toHaveLength(1);
+    expect(out.landingEscalations[0].holderHead).toBeNull();
+    const readPrComments = vi.fn(), postComment = vi.fn(), notify = vi.fn();
+    expect(dispatchApi.recordLandingHolderEscalation({
+      escalation: out.landingEscalations[0], readPrComments, postComment, notify,
+    })).toEqual({ headUnknown: true });
+    expect(readPrComments).not.toHaveBeenCalled();
+    expect(postComment).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+  });
   it('keys and headlines the holder head episode', () => {
     const note = { kind: 'landing-holder-stuck', prNumber: 90, holderHead: 'h1' };
     expect(noteEpisodeKey(note)).toBe('landing-holder-stuck:90:h1');
