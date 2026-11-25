@@ -716,6 +716,10 @@ export async function defaultProviderQuotaHold(providerName, when) {
  * @param {string} effectiveProviderName
  */
 function buildProviderRequest(effective, cwd, effectiveProviderName) {
+  if (effective.timeoutMs !== undefined
+    && (!Number.isInteger(effective.timeoutMs) || effective.timeoutMs <= 0 || effective.timeoutMs > 3600000)) {
+    throw new Error('operations: timeoutMs must be a positive integer at most 3600000; correct the saved request before retrying.');
+  }
   return {
     mandate: effective.mandate,
     input: effective.input,

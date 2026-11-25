@@ -828,6 +828,8 @@ export async function runReviewLoopOnce({
         const blocked = next ? await providerCapacity(next.provider) : null;
         const hold = jurorTimeoutHold(timeoutEvidence, () => blocked);
         if (hold) return { code: 2, run: parked, stopped: 'refused', lines: [hold.why] };
+        if (!rosterMatches) return { code: 2, run: parked, stopped: 'refused',
+          lines: ['review-blocked-on-infra: saved timeout roster changed on the same head; inspect the saved run before re-arming.'] };
       }
       if (resumeJuror && rosterMatches) {
         retrySeat = { step: timeoutSeat.step, ...nextJurorRoute(timeoutSeat) };

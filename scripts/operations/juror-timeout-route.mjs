@@ -21,14 +21,18 @@ export function nextJurorRoute({ lens, tried = [], directive, builder }) {
 }
 
 export function jurorTimeoutEvidence(run, builder) {
-  const request = run?.pending?.kind === 'judge' && run.pending.request;
+  if (run?.pending?.kind !== 'judge'
+    || (!Object.hasOwn(run, 'seatTimeouts') && !Object.hasOwn(run, 'jurorResumeAttempts'))) return null;
+  const request = run.pending.request;
   const head = run?.findings?.read?.netBasis?.rev;
-  const tried = (run?.seatTimeouts ?? []).filter(s => s.head === head && s.lens === request?.lens);
-  if (!request || !tried.some(s => s.step === run.pending.step)) return null;
-  return { lens: request.lens, tried, builder, step: run.pending.step,
-    attempts: run.jurorResumeAttempts === undefined ? 0 : retryCounterValid(run.jurorResumeAttempts, 3) ? run.jurorResumeAttempts : 3,
-    directive: { model: request.model, providerName: request.providerName,
-      fallbackModel: request.seatProvider?.fallbackModel, timeoutMs: tried.at(-1).timeoutMs } };
+  const history = Array.isArray(run.seatTimeouts) ? run.seatTimeouts : [];
+  const tried = history.filter(s => s && s.head === head && s.lens === request?.lens && s.step === run.pending.step);
+  // A persisted retry marker without matching seat evidence cannot prove a fresh retry budget.
+  const complete = request && head && tried.length > 0 && history.every(s => s && typeof s === 'object');
+  return { lens: request?.lens, tried, builder, step: run.pending.step,
+    attempts: !complete ? 3 : run.jurorResumeAttempts === undefined ? 0 : retryCounterValid(run.jurorResumeAttempts, 3) ? run.jurorResumeAttempts : 3,
+    directive: complete ? { model: request.model, providerName: request.providerName,
+      fallbackModel: request.seatProvider?.fallbackModel, timeoutMs: tried.at(-1).timeoutMs } : null };
 }
 
 export function jurorTimeoutHold(run, capacity = () => null) {

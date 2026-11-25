@@ -274,3 +274,33 @@ it('still strips a foreign model before the Codex provider seam', async () => {
   });
   expect(spawn.mock.calls[0][0]).not.toHaveProperty('model');
 });
+
+
+it.each([0, -1, 0.5, NaN, Infinity, null, '1200000', 3600001])('refuses invalid provider timeoutMs %s before spawning', async timeoutMs => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await expect(createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
+  })).rejects.toThrow(/timeoutMs/);
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it.each([1, 3600000])('forwards valid provider timeoutMs %s unchanged', async timeoutMs => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
+  });
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs }));
+});
+
+it.each(['empty', 'head', 'lens', 'step', 'missing', 'malformed'])('keeps exhausted timeout hold on %s saved evidence', scenario => {
+  const head = 'a'.repeat(40);
+  const row = { head, lens: 'correctness', step: 'judge', model: 'sonnet', provider: 'claude', timeoutMs: 1200000 };
+  if (['head', 'lens', 'step'].includes(scenario)) row[scenario] = 'mismatched';
+  const run = { jurorResumeAttempts: 3, findings: { read: { netBasis: { rev: head } } },
+    pending: { kind: 'judge', step: 'judge', request: { lens: 'correctness', model: 'sonnet' } },
+    seatTimeouts: scenario === 'empty' ? [] : scenario === 'malformed' ? [null] : [row] };
+  if (scenario === 'missing') delete run.seatTimeouts;
+  const seat = jurorTimeoutEvidence(run);
+  expect(seat).toMatchObject({ attempts: 3 });
+  expect(jurorTimeoutHold({ id: 'saved', head, jurorTimeout: seat })).toMatchObject({ kind: 'juror-timeout' });
+});

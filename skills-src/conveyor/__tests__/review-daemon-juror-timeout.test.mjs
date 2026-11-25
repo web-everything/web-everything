@@ -1,4 +1,6 @@
 import { expect, it, vi } from 'vitest';
+import { REARM_COMMENT_MARKER } from '../../../scripts/conveyor/rearm-review.mjs';
+import { AUTOMATION_LOGINS } from '../../../scripts/lib/marker-authorship.mjs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -83,4 +85,14 @@ it.each(['run a fresh review', '🔁 review — changes requested'])('timeout re
   const pr = { number: 10, headRefOid: head, comments: [{ author: { login: 'chalbert' }, body, createdAt: '2026-11-25T01:00:00Z' }] };
   expect(findResumableParkedRun(pr, [run], { repo })).toBeNull();
   expect(findResumableParkedRun({ ...pr, comments: [] }, [run], { repo })).toEqual({ id: run.id, head });
+});
+
+
+it.each(['🔁 review — changes requested', REARM_COMMENT_MARKER])('automation wake keeps exhausted timeout run resumable: %s', body => {
+  const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+  const run = { id: 'parked', repo, pr: 10, head, incomplete: true,
+    startedAt: Date.parse('2026-11-25T00:00:00Z'), rulings: [], jurorTimeout: { attempts: 3 } };
+  const pr = { number: 10, headRefOid: head,
+    comments: [{ author: { login: AUTOMATION_LOGINS[0] }, body, createdAt: '2026-11-25T01:00:00Z' }] };
+  expect(findResumableParkedRun(pr, [run], { repo })).toEqual({ id: run.id, head });
 });

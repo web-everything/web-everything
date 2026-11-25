@@ -387,8 +387,7 @@ export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRec
   const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
   if (last?.jurorTimeout && last.head === pr.headRefOid) {
-    return wakeEvents(pr, last).some(e => e.kind === 'fresh' && e.at > last.startedAt)
-      ? null : { id: last.id, head: last.head };
+    return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   }
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax

@@ -232,10 +232,15 @@ it.each(['same', 'moved', 'moved-spent', 'roster', 'roster-spent', 'budget', 'in
   const resumed = await runReviewLoopOnce({ ...current, argv: ['--resume=timeout-run'], store: { ...store, read: () => saved },
     providerCapacity: () => { if (scenario === 'capacity-error') throw Error('unreadable capacity'); return scenario === 'capacity' ? 'provider quota held' : null; },
     sinks: recordingSinks([]), makeJudge: () => judge, readResumePr: () => { if (scenario === 'head-error') throw Error('head read failed'); return scenario === 'head-missing' ? {} : { headRefOid: liveHead }; }, mintRunId: () => 'fresh-run' });
-  if (!['same', 'moved', 'moved-spent', 'roster'].includes(scenario)) {
+  if (!['same', 'moved', 'moved-spent'].includes(scenario)) {
     expect(resumed.stopped).toBe('refused');
     expect(resumed.run.id).toBe(saved.id);
     expect(judge).not.toHaveBeenCalled();
+    if (scenario.startsWith('roster')) {
+      expect(resumed.run.seatTimeouts).toEqual(saved.seatTimeouts);
+      expect(resumed.run.jurorResumeAttempts).toBe(saved.jurorResumeAttempts);
+      expect(resumed.lines.join('\n')).toMatch(/roster|retry budget spent/);
+    }
     return;
   }
   expect(resumed.run?.id, resumed.lines.join('\n')).toBe(scenario === 'same' ? 'timeout-run' : 'fresh-run');
