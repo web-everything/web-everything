@@ -12,11 +12,16 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
+  cacheWriteFailure = false, watchDirty = false, pinnedPatches = {},
   catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null, extraContextRows = false } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
     mkdirSync(bin); mkdirSync(snapshots); mkdirSync(join(dir, 'backlog'));
+    if (cacheWriteFailure) {
+      const slug = `fixture/${cacheWriteFailure === true ? 'web-everything' : cacheWriteFailure}`;
+      mkdirSync(join(snapshots, `heavy-${createHash('sha256').update(slug).digest('hex')}.json`));
+    }
     const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
@@ -91,6 +96,13 @@ if (a[0] === 'pr' && a[1] === 'view') {
   if (fields.some(f => !realFields.has(f))) process.exit(1);
   const p = selected.find(p => p.number === Number(a[2]));
   const view = p ? Object.fromEntries(fields.map(f => [f, f === 'commits' ? [] : p[f]])) : {};
+  if (fields.includes('baseRefOid') && fields.includes('body') && fields.includes('files')) {
+    Object.assign(view, JSON.parse(process.env.CONTEXT_PINNED_PATCHES || '{}')[a[2]] || {});
+  }
+  // Commit reads happen after the first listing has persisted, between watch listings.
+  if (process.env.CONTEXT_WATCH_DIRTY === '1' && fields.includes('commits')) {
+    fs.writeFileSync(process.env.WE_PR_SNAPSHOT_DIR + '/fixture__web-everything.dirty', 'dirty');
+  }
   fs.appendFileSync(process.env.CONTEXT_CALLS + '.views', JSON.stringify({fields,view}) + '\\n');
   out(view);
 }
@@ -122,6 +134,7 @@ out({});
       : [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7', '--from-green-event', '--label=ready-to-merge',
         ...(outputAsJson ? ['--json'] : []), ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])];
     const result = spawnSync(process.execPath, [...args, '--dry-run', '--no-drain-lease',
+      ...(watchDirty ? ['--watch', '--max-idle=2', '--interval=1'] : []),
       '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
@@ -134,6 +147,8 @@ out({});
         WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
         CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
         CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0', CONTEXT_EXTRA_ROWS: extraContextRows ? '1' : '0',
+        CONTEXT_WATCH_DIRTY: watchDirty ? '1' : '0',
+        CONTEXT_PINNED_PATCHES: JSON.stringify(pinnedPatches),
         CONTEXT_CALLS: join(dir, 'calls.jsonl'), CONTEXT_ROWS: join(dir, 'rows.json') },
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);

@@ -31,17 +31,21 @@ it('empty fixture labels are complete and pagination preserves the server count'
     nodes: [{ number: 43, baseRefOid: pr.baseRefOid, labels: { totalCount: 0, nodes: [] } }] });
 });
 
-it('the shared fixture preserves missing base evidence so delta still refuses it', async () => {
+it('the shared fixture preserves missing base evidence so delta defers only that row', async () => {
   const incomplete = { ...pr };
   delete incomplete.baseRefOid;
-  await expect(listOpenPrsPagedHydratedCompleteAsync({ ...options,
+  const result = await listOpenPrsPagedHydratedCompleteAsync({ ...options,
     exec: () => JSON.stringify(openPrPageFixture([incomplete], query)),
     execAsync: async () => ({ stdout: JSON.stringify(incomplete) }),
-  })).rejects.toMatchObject({ stage: 'hydrate', cause: { reason: 'malformed' } });
+  });
+  expect(result.rows).toMatchObject([{number:42,heavyReadError:expect.stringContaining('row-invalid'),rowsComplete:false}]);
+  expect(result.store.size).toBe(0);
 });
 
 it('a base moved between the shared page and pinned view remains refused', async () => {
-  await expect(listOpenPrsPagedHydratedCompleteAsync({ ...options,
+  const result = await listOpenPrsPagedHydratedCompleteAsync({ ...options,
     execAsync: async () => ({ stdout: JSON.stringify({ ...pr, baseRefOid: 'c'.repeat(40) }) }),
-  })).rejects.toMatchObject({ stage: 'hydrate', cause: { reason: 'moved' } });
+  });
+  expect(result.rows).toMatchObject([{number:42,heavyReadError:expect.stringContaining('moved'),rowsComplete:false}]);
+  expect(result.store.size).toBe(0);
 });

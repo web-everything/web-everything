@@ -13,7 +13,7 @@
  *   → env WE_PR_LIST_PAGE_SIZE (pageSize only). resolvePrListPaging returns each leaf's source; policy-cascade
  *   logs those sources in daemons. All GitHub execution is injected so pure transforms and tests need no network.
  */
-import { HEAVY, IDENTITY, loadBounds, whyNotReuse, readHeavyPinned } from './heavy-cache.mjs';
+import { HEAVY, IDENTITY, identityOf, HeavyReadError, loadBounds, whyNotReuse, readHeavyPinned } from './heavy-cache.mjs';
 import { mapWithConcurrency } from './drain-concurrency.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -372,7 +372,7 @@ export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {
     exec: (_cmd, args) => byNumber.get(Number(args[2])) });
 }
 
-/** One pinned read per stale row, joined before publishing any rows or entries. */
+/** Pinned reads join before publishing; retry a moved read once, then defer that row. */
 export async function hydrateDeltaAsync({ repo, rows, execAsync, store = new Map(), nowMs, bounds, isCandidate, execOpts = {} }) {
   if (typeof isCandidate !== 'function') throw new TypeError('delta requires isCandidate');
   const incomplete = rows.find(row => row.labelsComplete !== true);
@@ -388,18 +388,33 @@ export async function hydrateDeltaAsync({ repo, rows, execAsync, store = new Map
     return reason;
   });
   const reads = await mapWithConcurrency(rows.filter((_row, i) => reasons[i] !== null), 6, async row => {
+    if (!identityOf(row)) return { number: row.number, deferred: 'row-invalid' };
     try {
-      const { stdout } = await execAsync('gh', heavyArgs(repo, row, [...IDENTITY, ...HEAVY]), execOptions(execOpts));
-      return { number: row.number, entry: readHeavyPinned(row, stdout, nowMs) };
+      const read = async () => {
+        const { stdout } = await execAsync('gh', heavyArgs(repo, row, [...IDENTITY, ...HEAVY]), execOptions(execOpts));
+        return readHeavyPinned(row, stdout, nowMs);
+      };
+      let entry;
+      try { entry = await read(); }
+      catch (cause) {
+        if (!(cause instanceof HeavyReadError) || cause.reason !== 'moved') throw cause;
+        entry = await read();
+      }
+      return { number: row.number, entry };
     } catch (cause) {
+      if (cause instanceof HeavyReadError && cause.reason === 'moved') return { number: row.number, deferred: 'moved' };
       return { error: new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number, cause }) };
     }
   });
   const failed = reads.find(read => read.error);
   if (failed) throw failed.error;
   const fetched = new Map(reads.map(read => [read.number, read.entry]));
+  const deferred = new Map(reads.filter(read => read.deferred).map(read => [read.number, read.deferred]));
+  if (deferred.size) stats.deferred = deferred.size;
   const next = new Map();
   const hydrated = rows.map(row => {
+    if (deferred.has(row.number)) return { ...row, body: '', files: [], rowsComplete: false,
+      heavyReadError: `heavy PR evidence ${deferred.get(row.number)} — deferring until the next pass` };
     const entry = fetched.get(row.number) ?? store.get(row.number);
     next.set(row.number, entry);
     return { ...row, body: entry.body, files: entry.files.map(file => ({ ...file })) };

@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { listOpenPrsPagedHydratedCompleteAsync as list, resolvePrListPaging } from '../pr-list-paged.mjs';
 import { loadBounds, loadHeavyStore, saveHeavyStore } from '../heavy-cache.mjs';
+import { LISTED_FILES_CAP, listedPrFiles } from '../red-main-quarantine.mjs';
 const repo = 'owner/name', nowMs = Date.parse('2026-11-25T12:01:00Z');
 const paging = {pageSize:20,pageRetries:0,heavyBackstopSeconds:3600,heavySettleSeconds:5};
 const row = (number=1,extra={}) => ({number,headRefOid:'a'.repeat(40),baseRefOid:'b'.repeat(40),baseRefName:'main',
@@ -27,18 +28,61 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(snapshotDir, {recursive:true,force:true}); });
 describe('pr-list-paged-delta',()=>{
- it('a second pass in a NEW process reuses unchanged non-candidates from the store',async()=>{
+ it('a capped file list does not block healthy rows and is never reused',async()=>{
+  const rows=[row(),row(2)], execAsync=vi.fn(async(_cmd,args)=>({stdout:JSON.stringify({
+   ...rows.find(r=>r.number===Number(args[2])),...heavy,
+   ...(Number(args[2])===1?{files:Array.from({length:LISTED_FILES_CAP},()=>({path:'large.mjs'}))}:{}),
+  })}));
+  const first=await pass(rows,{execAsync});
+  expect(first.rows.map(r=>r.number)).toEqual([1,2]);
+  expect(listedPrFiles(first.rows[0])).toBeNull();
+  const second=await pass(rows,{execAsync,store:first.store});
+  expect(second.rows.map(r=>r.number)).toEqual([1,2]);
+  expect(second.stats).toMatchObject({fetched:1,reused:1});
+ });
+ it.each(['headRefOid','updatedAt'])('one moved %s among six is isolated without using stale evidence',async field=>{
+  const rows=Array.from({length:6},(_,i)=>row(i+1)), first=await pass(rows);
+  const result=await pass(rows,{store:first.store,delta:{isCandidate:()=>true},execAsync:async(_cmd,args)=>{
+   const r=rows.find(r=>r.number===Number(args[2]));
+   return {stdout:JSON.stringify({...r,...heavy,...(r.number===1?{
+    [field]:field==='headRefOid'?'f'.repeat(40):'2026-11-25T12:00:01Z',
+   }:{})})};
+  }});
+  expect(result.rows).toHaveLength(6);
+  expect(result.rows[0]).toMatchObject({number:1,body:'',files:[],rowsComplete:false});
+  expect(result.store.has(1)).toBe(false);
+  expect(result.rows.slice(1).every(r=>r.body===heavy.body)).toBe(true);
+ });
+ it.each(['baseRefOid','baseRefName'])('a null %s defers only that row and never caches it',async field=>{
+  const result=await pass([row(1,{[field]:null}),row(2)]);
+  expect(result.rows).toHaveLength(2);
+  expect(result.rows[0]).toMatchObject({number:1,body:'',files:[],rowsComplete:false});
+  expect(result.rows[1].body).toBe(heavy.body);
+  expect([...result.store.keys()]).toEqual([2]);
+ });
+ it('retries a moved read only once and accepts a second read matching the page identity',async()=>{
+  const r=row(), execAsync=vi.fn()
+   .mockResolvedValueOnce({stdout:JSON.stringify({...r,...heavy,headRefOid:'f'.repeat(40)})})
+   .mockResolvedValueOnce({stdout:JSON.stringify({...r,...heavy})});
+  const result=await pass([r],{execAsync});
+  expect(execAsync).toHaveBeenCalledTimes(2);
+  expect(result.rows[0].body).toBe(heavy.body);
+  expect(result.rows[0].heavyReadError).toBeUndefined();
+  expect(result.store.has(1)).toBe(true);
+ });
+ it('a second pass in a NEW process makes zero heavy reads for twenty unchanged non-candidates',async()=>{
   const dir=mkdtempSync(join(process.env.TMPDIR,'heavy-process-'));
   try {
-   const first=await pass([row()]); saveHeavyStore({repo,dir,entries:first.store});
+   const rows=Array.from({length:20},(_,i)=>row(i+1));
+   const first=await pass(rows); saveHeavyStore({repo,dir,entries:first.store});
    const source=`import {loadHeavyStore} from ${JSON.stringify(pathToFileURL(resolve('scripts/lib/heavy-cache.mjs')).href)};
     import {listOpenPrsPagedHydratedCompleteAsync as list} from ${JSON.stringify(pathToFileURL(resolve('scripts/lib/pr-list-paged.mjs')).href)};
     const result=await list({repo:${JSON.stringify(repo)},paging:${JSON.stringify(paging)},heavyFields:['body','files'],nowMs:${nowMs+1000},
     delta:{isCandidate:()=>false},store:loadHeavyStore({repo:${JSON.stringify(repo)},dir:${JSON.stringify(dir)}}).entries,
-    exec:()=>${JSON.stringify(page([row()]))},execAsync:async()=>{throw Error('unexpected read');}});
+    exec:()=>${JSON.stringify(page(rows))},execAsync:async()=>{throw Error('unexpected read');}});
     console.log(JSON.stringify(result.stats));`;
    const child=spawnSync(process.execPath,['--input-type=module','-e',source],{encoding:'utf8',timeout:10000,maxBuffer:1024*1024});
-   expect(child.status,child.stderr).toBe(0); expect(JSON.parse(child.stdout)).toMatchObject({fetched:0,reused:1});
+   expect(child.status,child.stderr).toBe(0); expect(JSON.parse(child.stdout)).toMatchObject({fetched:0,reused:20});
   } finally {rmSync(dir,{recursive:true,force:true});}
  });
  it('a ready candidate is always re-read',async()=>{
@@ -71,7 +115,7 @@ describe('pr-list-paged-delta',()=>{
    second.rows[0].files[0].path='mutable'; expect(second.store.get(1).files[0].path).toBe('a.mjs');
   } finally {rmSync(dir,{recursive:true,force:true});}
  });
- it.each(['moved','failed'])('one %s read among six joins the pool, leaves store and disk unchanged',async(kind)=>{
+ it.each(['malformed','failed'])('one %s read among six joins the pool, leaves store and disk unchanged',async(kind)=>{
   const dir=mkdtempSync(join(process.env.TMPDIR,'heavy-failure-'));
   try {
    const rows=Array.from({length:6},(_,i)=>row(i+1)), first=await pass(rows);
@@ -81,7 +125,7 @@ describe('pr-list-paged-delta',()=>{
     await new Promise(resolve=>setImmediate(resolve)); finished++;
     const r=rows.find(r=>r.number===Number(args[2]));
     if(r.number===1 && kind==='failed') throw Error('fixture failure');
-    return {stdout:JSON.stringify({...r,...heavy,...(r.number===1?{headRefOid:'f'.repeat(40)}:{})})};
+    return {stdout:JSON.stringify({...r,...heavy,...(r.number===1?{body:null}:{})})};
    }})).rejects.toMatchObject({stage:'hydrate',cause:expect.any(Error)});
    expect(finished).toBe(6); expect(readFileSync(path,'utf8')).toBe(before); expect(first.store.size).toBe(6);
   } finally {rmSync(dir,{recursive:true,force:true});}
@@ -119,6 +163,33 @@ describe('pr-list-paged-delta',()=>{
   }
  });
 });
+
+// Opt-in live acceptance: the ordinary suite is hermetic. Run on a network-enabled host
+// with WE_HEAVY_CACHE_LIVE_ACCEPTANCE=1; retain stdout as the requested ET evidence.
+it.skipIf(process.env.WE_HEAVY_CACHE_LIVE_ACCEPTANCE !== '1')('live two-process acceptance: second listing.pages is below 15000 ms with ET timestamps',()=>{
+ const dir=mkdtempSync(join(process.env.TMPDIR,'heavy-live-acceptance-'));
+ try {
+  const et=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',dateStyle:'short',timeStyle:'long'}).format(new Date());
+  const env={...process.env,WE_UNDER_TEST:'',VITEST:'',FAKE_GH_FIXTURE:'',WE_PR_SNAPSHOT:'1',
+   WE_PR_SNAPSHOT_DIR:dir,WE_FAST_DRAIN_CONTEXT:'live',WE_FAST_DRAIN_LISTING:'live'};
+  const run=()=>{
+   const started=et();
+   const child=spawnSync(process.execPath,['scripts/merge-ai-prs.mjs','--this-repo','--dry-run','--json',
+    '--label=heavy-cache-acceptance-non-candidate','--no-drain-lease','--no-red-main-freeze',
+    '--no-review-escalation','--repoll-delay=0'],{env,encoding:'utf8',timeout:180000,maxBuffer:16*1024*1024});
+   const finished=et();
+   console.log(JSON.stringify({startedET:started,finishedET:finished,status:child.status}));
+   expect(child.status,child.stderr).toBe(0);
+   const result=JSON.parse(child.stdout);
+   const duration=result.timings?.['listing.pages'];
+   expect(Number.isFinite(duration),child.stdout).toBe(true);
+   console.log(JSON.stringify({startedET:started,finishedET:finished,listingPagesMs:duration}));
+   return {duration,stderr:child.stderr};
+  };
+  run(); const second=run();
+  expect(second.duration).toBeLessThan(15000);
+ } finally {rmSync(dir,{recursive:true,force:true});}
+},400000);
 
 describe('delta fail-closed evidence', () => {
  it.each([false,true])('incomplete labels reject the page before hydration (candidate=%s)', async candidate => {

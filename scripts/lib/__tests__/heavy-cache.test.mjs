@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { IDENTITY, HEAVY, identityOf, validHeavy, makeEntry, loadBounds, whyNotReuse, mayReuse,
   readHeavyPinned, loadHeavyStore, saveHeavyStore } from '../heavy-cache.mjs';
@@ -21,7 +21,7 @@ const invalid = field => [undefined, null, '', ...(field === 'number' ? ['1', 0,
 
 const badHeavy = () => [null, ...[null, undefined, 1, {}, []].map(body => ({...heavy(),body})),
   ...[null, {}, [null], [{}], [{path:''}], [{path:1}], [new (class File {path='a';})()],
-    Array.from({length:LISTED_FILES_CAP}, () => ({path:'a'}))].map(files => ({body:'',files}))];
+    Array.from({length:LISTED_FILES_CAP+1}, () => ({path:'a'}))].map(files => ({body:'',files}))];
 
 const storeFile = (dir, repo) => join(dir, `heavy-${createHash('sha256').update(repo.toLowerCase()).digest('hex')}.json`);
 let snapshotDir;
@@ -32,6 +32,15 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(snapshotDir, {recursive:true,force:true}); });
 describe('heavy-cache', () => {
+  it('capped files remain visibly incomplete and cannot be reused, including after persistence', () => {
+    const r=row(), h={body:'large',files:Array.from({length:LISTED_FILES_CAP},()=>({path:'a'}))};
+    const e=readHeavyPinned(r,JSON.stringify({...r,...h}),stamp+5000);
+    expect(e.files).toHaveLength(LISTED_FILES_CAP);
+    expect(whyNotReuse(e,r,stamp+6000,bounds())).toBe('files-capped');
+    saveHeavyStore({repo:'owner/name',entries:new Map([[r.number,e]])});
+    const loaded=loadHeavyStore({repo:'owner/name'}).entries.get(r.number);
+    expect(whyNotReuse(loaded,r,stamp+6000,bounds())).toBe('files-capped');
+  });
   it('P1 every identity field missing, null, empty, wrong-typed or malformed: makeEntry throws and mayReuse is false', () => {
     for (const field of IDENTITY) for (const value of invalid(field)) {
       const r = { ...row(), [field]: value };
@@ -110,6 +119,12 @@ describe('heavy-cache', () => {
 });
 
 describe('heavy store isolation', () => {
+  it.each(['malformed JSON', 'read failure'])('unreadable heavy store returns no reusable entries: %s', kind => {
+    const path = storeFile(snapshotDir, 'owner/name');
+    if (kind === 'malformed JSON') writeFileSync(path, '{');
+    else mkdirSync(path); // EISDIR is deterministic even when tests run as root.
+    expect(loadHeavyStore({repo:'owner/name'})).toEqual({entries:new Map(), dropped:1});
+  });
   it.each(['disabled', 'under-test', 'fake-gh'])('%s loads empty and saves nothing even with an explicit dir argument', kind => {
     const repo = 'owner/name', r = row(), entries = new Map([[r.number, makeEntry(r, heavy(), stamp + 5000)]]);
     saveHeavyStore({repo, dir:snapshotDir, entries});

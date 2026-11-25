@@ -1147,6 +1147,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  else if (pr?.heavyReadError) { decision = 'skip'; reason = pr.heavyReadError; }
   else if (pr?.rowsComplete === false) { decision = 'skip'; checkEvidenceIncomplete = true; reason = 'check evidence incomplete — retry with a complete live check read'; }
   // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
   // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
@@ -2312,7 +2313,7 @@ export function reduceOpenPrContext({ listings = [], reads = new Map(), reconcil
       manifestByPr.set(key, manifest);
       commitsByPr.set(key, commits);
       if (r.malformed) { malformedRepos.add(repo); malformedByPr.set(key, true); }
-      degradedByPr.set(key, !!r.degraded);   // #xc7p3q9 Fix 2 — a swallowed-error read → fail closed in the couple gate
+      degradedByPr.set(key, !!r.degraded || !!p.heavyReadError); // Unknown heavy evidence cannot prove a blocker absent.
       if (manifest && manifest.item != null) openItems.add(asItemId(manifest.item));
     }
   }
@@ -4754,7 +4755,7 @@ const execFileP = execDrainAsync;
 
 /** Manifest bodies can change at the same head SHA; an unknown body/identity must remain retryable. */
 export function prReadCacheIdentity(p) {
-  return p.headRefOid && typeof p.body === 'string' ? JSON.stringify([p.headRefOid, p.body]) : null;
+  return !p.heavyReadError && p.headRefOid && typeof p.body === 'string' ? JSON.stringify([p.headRefOid, p.body]) : null;
 }
 
 /**
@@ -5553,6 +5554,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       shaOf: ({ p }) => prReadCacheIdentity(p),
       isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
       fetchOne: async ({ repo, p }) => {
+        if (p.heavyReadError) return { manifest: null, degraded: true };
         const readCommits = shouldReadContextCommits({ onlyPr, scope: fastDrain.scope, isTarget: isFastDrainTarget(repo, p) });
         const [manifestRes, commitsRes] = await Promise.all([readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p)), readCommits ? fetchPrCommits(repo, p.number, prHeadSha(p)) : { degraded: false }]);
         return shapeOpenPrRead({ manifestRes, commitsRes, includeCommits: readCommits });
@@ -5590,8 +5592,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
           heavyFields: ['body', 'files'], delta: { isCandidate: operatorSelects }, store,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
-        saveHeavyStore({ repo: slug, entries: listed.store });
-        drainHeavyStoresByRepo.set(slug, listed.store);
+        persistHeavyListing(slug, listed.store);
         logHeavyListing(listed, paging);
         return resolveListedChecks(repo, listed.rows);
       }
@@ -5774,14 +5775,17 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
 
   // ── ONE sweep pass — reconcile labels → list → classify → cascade-merge → sync. Returns the pass result (no
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
-  const drainHeavyStoresByRepo = new Map(); // Disk is authoritative across processes; retain validated entries for --watch.
+  // Reload each pass, including --watch: dirty markers and external writes invalidate disk evidence.
   const heavyStoreFor = (repo) => {
-    if (!drainHeavyStoresByRepo.has(repo)) {
-      const loaded = loadHeavyStore({ repo });
-      drainHeavyStoresByRepo.set(repo, loaded.entries);
-      if (loaded.dropped) process.stderr.write(`heavy-cache ${repo}: dropped=${loaded.dropped}; invalid records will be re-read\n`);
+    const loaded = loadHeavyStore({ repo });
+    if (loaded.dropped) process.stderr.write(`heavy-cache ${repo}: dropped=${loaded.dropped}; invalid records will be re-read\n`);
+    return loaded.entries;
+  };
+  const persistHeavyListing = (repo, entries) => {
+    try { saveHeavyStore({ repo, entries }); }
+    catch {
+      process.stderr.write(`heavy-cache ${repo}: persistence failed; using fresh listing, retrying cache on the next pass\n`);
     }
-    return drainHeavyStoresByRepo.get(repo);
   };
   const logHeavyListing = (listed, paging) => {
     process.stderr.write(`listing.pages.light=${listed.timing.lightMs}ms listing.pages.hydrate=${listed.timing.hydrateMs}ms hydrate=${JSON.stringify(listed.stats)} heavyBackstopSeconds=${paging.heavyBackstopSeconds} (${paging.source?.heavyBackstopSeconds ?? 'absent'}) heavySettleSeconds=${paging.heavySettleSeconds} (${paging.source?.heavySettleSeconds ?? 'absent'})\n`);
@@ -6057,8 +6061,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
             heavyFields: ['body', 'files'], delta: { isCandidate: operatorSelects }, store,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
-          saveHeavyStore({ repo: slug, entries: listed.store });
-          drainHeavyStoresByRepo.set(slug, listed.store);
+          persistHeavyListing(slug, listed.store);
           logHeavyListing(listed, paging);
         } else if (!slug) {
           // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
@@ -6189,6 +6192,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     shaOf: ({ p }) => prReadCacheIdentity(p),
     isDegraded: (v) => !!v?.degraded || !!v?.transient, // #2417 review — an error-path or non-head read is NOT cached
     fetchOne: async ({ repo, p }) => {
+      if (p.heavyReadError) return { manifest: null, degraded: true };
       const [commitsRes, manifestRes] = await Promise.all([fetchPrCommits(repo, p.number, prHeadSha(p)), readPrManifest(repo, p.headRefName, p.body, p.number, prHeadSha(p))]);
       return shapeOpenPrRead({ manifestRes, commitsRes });
     },

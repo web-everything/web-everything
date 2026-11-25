@@ -22,7 +22,7 @@ export function identityOf(x) {
 }
 
 export function validHeavy(h) {
-  return !!h && typeof h.body === 'string' && Array.isArray(h.files) && h.files.length < LISTED_FILES_CAP
+  return !!h && typeof h.body === 'string' && Array.isArray(h.files) && h.files.length <= LISTED_FILES_CAP
     && Array.from(h.files).every(file => plain(file) && typeof file.path === 'string' && file.path.length > 0);
 }
 
@@ -47,6 +47,9 @@ export function loadBounds(paging) {
 export function whyNotReuse(entry, liveRow, nowMs, bounds) {
   if (!BOUNDS.has(bounds)) return 'bounds';
   if (!MADE.has(entry)) return 'new';
+  // A capped response is usable for this pass, but its file inventory is unknown.
+  // Keep the cap visible to listedPrFiles/completeListedFiles and fetch it again next pass.
+  if (entry.files.length === LISTED_FILES_CAP) return 'files-capped';
   const identity = identityOf(liveRow);
   if (!identity) return 'row-invalid';
   const changed = IDENTITY.filter(key => entry[key] !== identity[key]);
