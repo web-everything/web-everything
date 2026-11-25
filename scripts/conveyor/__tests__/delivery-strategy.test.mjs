@@ -169,11 +169,39 @@ describe('SHIP-WM-157/158/159: table load checks', () => {
     expect(tableFindings({ table: bad }).length).toBeGreaterThan(0);
     outcome(run({}, { table: bad }), 'unhandled', 'EVIDENCE_UNKNOWN');
   });
+  it.each(['boolean', 'count', 'enum', 'invalid'])('SHIP-WM-158: malformed values on a %s declaration are refused without throwing', (type) => {
+    for (const values of [{}, 'none,stage,hold', true, 1, null]) {
+      for (const name of ['blocker', 'step-kind']) {
+        const changed = clone(table);
+        Object.assign(changed.inputs.find((i) => i.name === name), { type, values });
+        expect(tableFindings({ table: changed }).length).toBeGreaterThan(0);
+        expect(run({}, { table: changed })).toMatchObject({ rule: 'unconfigured', strategy: 'unhandled', build: false });
+      }
+    }
+  });
 });
 
 describe('SHIP-WM-164/165/166/168/170/178: mandatory row entries', () => {
   it('SHIP-WM-164: stalled-stage hold row missing is refused', () => refused(164, (t) => { t.rules = t.rules.filter((r) => r.id !== 'R6'); }));
   it('SHIP-WM-164: stalled-stage hold row must precede a gate-feeding row', () => refused(164, (t) => { row(t, 'R6').rank = 100; }));
+  it.each([{ eq: 'hold' }, { eq: 'stage' }, { in: ['stage', 'hold'] }])('SHIP-WM-164: blocker %j alone does not prove an early gate-feeding candidate clears the hold', (blocker) => {
+    const changed = clone(table);
+    row(changed, 'R10').rank = 5;
+    row(changed, 'R5').rank = 20;
+    row(changed, 'R10').when.blocker = blocker;
+    row(changed, 'R10').when['loaded-stage-stress'] = { eq: 'clear' };
+    expect(tableFindings({ table: changed }).some((f) => f.includes('SHIP-WM-164'))).toBe(true);
+    const got = run({ blocker: 'hold', 'hold-causer': false, 'loads-stalled-stage': true }, { table: changed });
+    expect(got.build).toBe(false);
+    expect(['hold', 'unhandled']).toContain(got.strategy);
+    row(changed, 'R10').when['hold-causer'] = { eq: false };
+    expect(tableFindings({ table: changed }).some((f) => f.includes('SHIP-WM-164'))).toBe(true);
+    row(changed, 'R10').when['hold-causer'] = { eq: true };
+    expect(tableFindings({ table: changed })).toEqual([]);
+    const candidate = { blocker: blocker.eq ?? 'hold', 'hold-causer': true, 'loads-stalled-stage': true };
+    outcome(run(candidate, { table: changed }), 'normal-pr', 'NORMAL_CAPACITY');
+    outcome(run({ ...candidate, 'hold-causer': false }, { table: changed }), 'hold', 'STALLED_GATE');
+  });
   it('SHIP-WM-164: stalled stage holds before normal-pr and build-ahead', () => {
     outcome(run({ 'loads-stalled-stage': true }), 'hold', 'STALLED_GATE');
     outcome(run({ 'loads-stalled-stage': true, 'loaded-stage-stress': 'stressed', 'stress-incident': 'fix-landed' }), 'hold', 'STALLED_GATE');
@@ -238,6 +266,24 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
   });
   it('SHIP-WM-162: complete decision record replays', () => {
     expect(decisionFindings({ record: decision(), table, settings })).toEqual([]);
+  });
+  it.each([false, true])('SHIP-WM-161: custom strategy contracts (feedsGates=%s) survive decision and golden replay', (feedsGates) => {
+    const changed = clone(table);
+    changed.strategies.closed = false;
+    changed.strategies.names.push('x-custom');
+    row(changed, 'R10').output.strategy = 'x-custom';
+    const strategies = table.strategies.names.map((name) => ({ name, feedsGates: ['normal-pr', 'build-ahead', 'stacked'].includes(name) }));
+    strategies.push({ name: 'x-custom', feedsGates });
+    expect(tableFindings({ table: changed, strategies })).toEqual([]);
+    const recorded = inputs();
+    const got = select({ table: changed, settings, inputs: recorded, at, strategies });
+    expect(got).toMatchObject({ rule: 'R10', strategy: 'x-custom', build: true });
+    const record = { ...decision(), ...got, inputs: recorded, table: { uri: changed.id, version: changed.version, digest: digestOf(changed) } };
+    expect(decisionFindings({ record, table: changed, settings, strategies })).toEqual([]);
+    const points = [{ at, candidates: [{ id: '#example', planOrder: 1, inputs: recorded }], expected: { order: ['#example'], outputs: { '#example': got } } }];
+    expect(replayFindings({ table: changed, settings, points, strategies })).toEqual([]);
+    expect(decisionFindings({ record, table: changed, settings }).some((f) => f.includes('SHIP-WM-161'))).toBe(true);
+    expect(replayFindings({ table: changed, settings, points }).length).toBeGreaterThan(0);
   });
   it.each(DECISION_FIELDS)('SHIP-WM-162: decision missing %s is refused', (field) => {
     const record = decision();

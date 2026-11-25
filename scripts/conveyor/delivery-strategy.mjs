@@ -97,7 +97,9 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
   const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   if (!object(t) || !['inputs', 'settings', 'reasonCodes', 'overrideReasons', 'prototypeStepKinds', 'rules'].every((k) => Array.isArray(t[k]))
     || !object(t.strategies) || !Array.isArray(t.strategies.names)
-    || !t.inputs.every((i) => object(i) && nonEmpty(i.name) && (i.type !== 'enum' || Array.isArray(i.values)))
+    || !t.inputs.every((i) => object(i) && nonEmpty(i.name)
+      && (i.values === undefined || Array.isArray(i.values))
+      && (i.type !== 'enum' || Array.isArray(i.values)))
     || !t.reasonCodes.every(object)
     || !t.rules.every((r) => object(r) && nonEmpty(r.id) && object(r.when) && object(r.output)
       && Object.values(r.when).every(object))) {
@@ -147,7 +149,7 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
   else for (const r of stratRows) if (rankOf(r) < rankOf(sec)) add(`rule ${r.id} picks a strategy before the security row ${sec.id}: refused`, 157);
   // 164: stop feeding a stalled gate
   const st = sorted.find((r) => requires(r, 'loads-stalled-stage', 'eq', true) && r.output?.strategy === 'hold' && Object.keys(r.when ?? {}).length === 1);
-  const clears = (r) => requires(r, 'blocker', 'in', ['stage', 'hold']);
+  const clears = (r) => requires(r, 'blocker', 'in', ['stage', 'hold']) && requires(r, 'hold-causer', 'eq', true);
   if (!st) add('no row gives hold to a candidate that loads a stalled stage: refused', 164);
   else for (const r of stratRows) if (contract(r)?.feedsGates === true && !clears(r) && rankOf(r) < rankOf(st)) add(`rule ${r.id} feeds the gates before the stalled-gate row ${st.id}: refused`, 164);
   // 165: prototype-first only for declared kinds, adoption, the exact-revision audit, and under the overlay cap
@@ -185,7 +187,7 @@ export function orderFindings({ candidates, order }) {
 
 // ---- SHIP-WM-161, 162, 173: the decision record and its replay (S1)
 export const DECISION_FIELDS = ['decisionId', 'at', 'candidate', 'position', 'positionReason', 'inputs', 'table', 'settings', 'evaluated', 'rule', 'strategy', 'build', 'reason', 'unknown', 'actions'];
-export function decisionFindings({ record: d, table, settings }) {
+export function decisionFindings({ record: d, table, settings, strategies = STRATEGY_EFFECTS }) {
   const out = [], add = (m, r) => out.push(`decision ${d?.decisionId ?? '?'}: ${m} (SHIP-WM-${r})`);
   for (const f of DECISION_FIELDS) if (d?.[f] === undefined || d[f] === null) add(`field ${f} is absent: refused`, 162);
   for (const i of table.inputs ?? []) {
@@ -200,7 +202,7 @@ export function decisionFindings({ record: d, table, settings }) {
   if (d?.settings && (d.settings.revision !== settings.revision || canon(d.settings.digest) !== canon(digestOf(settings.values)))) add('pins a settings revision or digest that is not the one supplied: refused', 162);
   if (!Number.isFinite(secs(d?.at))) add('decision time is invalid: refused', 162);
   if (d?.inputs) {
-    const got = select({ table, settings, inputs: d.inputs, at: d.at }), rec = { rule: d.rule, strategy: d.strategy, build: d.build, reason: d.reason, evaluated: d.evaluated, unknown: d.unknown };
+    const got = select({ table, settings, strategies, inputs: d.inputs, at: d.at }), rec = { rule: d.rule, strategy: d.strategy, build: d.build, reason: d.reason, evaluated: d.evaluated, unknown: d.unknown };
     if (canon(got) !== canon(rec)) add(`records ${canon(rec).slice(0, 160)}, the selector derives ${canon(got).slice(0, 160)}: refused`, 161);
   }
   return out;
@@ -216,13 +218,13 @@ export function tableChangeFindings({ from, to }) {
 }
 
 // ---- the golden replay: decision points, each with its candidates, order and expected outputs
-export function replayFindings({ table, settings, points }) {
+export function replayFindings({ table, settings, points, strategies = STRATEGY_EFFECTS }) {
   const out = [];
   for (const p of points) {
     const order = candidateOrder(p.candidates);
     if (canon(order) !== canon(p.expected.order)) out.push(`${p.at}: order ${canon(order)}, expected ${canon(p.expected.order)} (SHIP-WM-163)`);
     for (const c of p.candidates) {
-      const got = select({ table, settings, inputs: c.inputs, at: p.at }), want = p.expected.outputs[c.id];
+      const got = select({ table, settings, strategies, inputs: c.inputs, at: p.at }), want = p.expected.outputs[c.id];
       for (const k of ['strategy', 'reason', 'rule']) if (got[k] !== want?.[k]) out.push(`${p.at} ${c.id}: ${k} ${got[k]}, expected ${want?.[k]} (SHIP-WM-160)`);
     }
   }
