@@ -157,3 +157,52 @@ test('withdrawals and unreadable revocation ledgers revoke stored waivers', () =
     assert.deepEqual(loadLedgerEvidence({ env }).waivers, []);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+
+test('strict parsing rejects malformed audit shapes and malformed negative evidence vetoes', () => {
+  const pass = { ...valid, head: sha, base, verdict: 'NOT WEAKENED' };
+  for (const record of [null, 'WEAKENED', [], { ...pass, findings: 'WEAKENED' },
+    { ...pass, verdict: ['NOT WEAKENED'] }, { ...pass, at: [valid.at] },
+    { ...pass, head: [sha] }, { ...pass, base: [base] }]) {
+    assert.equal(auditEvidenceFor(sha, { auditRecords: [record], covers }).ok, false);
+  }
+  assert.equal(auditEvidenceFor(sha, { auditRecords: [pass, { ...pass, verdict: 'WEAKENED', findings: 'WEAKENED' }], covers }).ok, false);
+});
+
+test('later unusable WEAKENED vetoes an older usable pass on the same base', () => {
+  const pass = { ...valid, head: sha, base, verdict: 'NOT WEAKENED' };
+  for (const patch of [{ at: 'invalid' }, { at: '2026-11-11T00:00:00Z', findings: ['NOT WEAKENED'] }]) {
+    assert.equal(auditEvidenceFor(sha, { covers, auditRecords: [pass,
+      { ...pass, verdict: 'WEAKENED', findings: ['accepted'], ...patch }] }).ok, false);
+  }
+});
+
+test('platform read errors block tool and store waivers', () => {
+  for (const failure of ['{broken', 'unreadable']) {
+    const fs = { readFileSync(path) {
+      if (path === '/fixture/prefs.json') {
+        if (failure === 'unreadable') throw Object.assign(Error('denied'), { code: 'EACCES' });
+        return failure;
+      }
+      if (String(path).endsWith('/scripts/settings/prototype-load.json')) return JSON.stringify({ ruledWeakened: [{ ref, sha, ruling: 'R12', findings: ['accepted'] }] });
+      if (String(path).endsWith('/ruled-weakened.jsonl')) return JSON.stringify(waiver) + '\n';
+      throw Object.assign(Error('missing'), { code: 'ENOENT' });
+    } };
+    assert.deepEqual(loadAuditEvidence({ env: { HOME: '/fixture', WE_PLATFORM_PREFERENCES_FILE: '/fixture/prefs.json' }, fs }).waivers, []);
+  }
+});
+
+test('waiver times are bounded by injectable now before evaluation and revocation', () => {
+  const now = Date.parse('2026-11-12T00:00:00Z');
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: waiver.findings };
+  for (const at of ['invalid', '2026-11-12T00:05:01Z']) {
+    assert.equal(auditEvidenceFor(sha, { auditRecords: [weak], waivers: [{ ...waiver, at }], ref, covers, now }).ok, false);
+    const fs = { readFileSync(path) {
+      if (String(path).endsWith('/ruled-weakened.jsonl')) return JSON.stringify({ ...waiver, at }) + '\n';
+      if (String(path).endsWith('/waiver-requests.jsonl')) return JSON.stringify({ ref, sha, ruling: 'WITHDRAWN', at: '2026-11-11T00:00:00Z' }) + '\n';
+      throw Object.assign(Error('missing'), { code: 'ENOENT' });
+    } };
+    assert.deepEqual(loadAuditEvidence({ env: { HOME: '/fixture' }, fs, now }).waivers, []);
+  }
+  assert.equal(auditEvidenceFor(sha, { auditRecords: [weak], waivers: [{ ...waiver, at: '2026-11-12T00:05:00Z' }], ref, covers, now }).ok, true);
+});

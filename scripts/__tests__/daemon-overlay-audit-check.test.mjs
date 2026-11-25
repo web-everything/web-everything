@@ -170,3 +170,26 @@ test('CLI only resolves local refs and ancestry, with lazy fetch and optional lo
     ]);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
+
+
+test('inventory loads evidence for each clone instead of borrowing the caller pass', () => {
+  const sha = 'a'.repeat(40), base = 'b'.repeat(40), seen = [];
+  const pass = { head: sha, base, verdict: 'NOT WEAKENED', findings: [], questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z' };
+  const results = checkOverlays({ states: ['/caller', '/candidate'].map(clone => ({ clone, overlays: [{ ref: 'lane/fix' }] })),
+    evidence: { auditRecords: [pass] }, evidenceForClone: clone => {
+      seen.push(clone);
+      return { auditRecords: [{ ...pass, ...(clone === '/candidate' ? { verdict: 'WEAKENED', findings: ['unsafe'] } : {}) }] };
+    }, resolveSha: () => sha, covers: () => true });
+  assert.deepEqual(seen, ['/caller', '/candidate']);
+  assert.deepEqual(results.map(r => r.ok), [true, false]);
+});
+
+test('inventory requires evidence for the approved edge SHA as well as the branch tip', () => {
+  const sha = 'a'.repeat(40), edgeSha = 'c'.repeat(40);
+  const pass = { head: sha, base: 'b'.repeat(40), verdict: 'NOT WEAKENED', findings: [], questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z' };
+  const check = auditRecords => checkOverlays({ states: [{ clone: '/clone', overlays: [{ ref: 'lane/fix', edgeResolution: { sha: edgeSha } }] }],
+    evidence: { auditRecords }, resolveSha: () => sha, covers: () => true })[0];
+  assert.equal(check([pass]).edgeSha, edgeSha);
+  assert.equal(check([pass]).ok, false);
+  assert.equal(check([pass, { ...pass, head: edgeSha }]).ok, true);
+});

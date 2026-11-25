@@ -18,20 +18,26 @@ const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i
 const clean = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
 /** Inspect registrations using injected evidence, time and read-only SHA resolution. Pure with supplied resolver and covers. */
-export function checkOverlays({ states, evidence, resolveSha, covers, now = new Date() }) {
-  return states.flatMap(state => state.overlays.map(entry => {
-    let sha;
-    try { sha = resolveSha(state.clone, entry.ref); } catch { sha = null; }
-    if (!fullSha(sha)) sha = null;
-    const movedFrom = entry.sha && (sha === null || entry.sha.toLowerCase() !== sha.toLowerCase()) ? entry.sha : null;
-    const result = auditEvidenceFor(sha, { ...evidence, ref: entry.ref,
-      covers: base => covers ? covers(base, state.clone) : mainCovers(base, { cwd: state.clone }),
+export function checkOverlays({ states, evidence, evidenceForClone, resolveSha, covers, now = new Date() }) {
+  return states.flatMap(state => {
+    const cloneEvidence = evidenceForClone ? evidenceForClone(state.clone) : evidence;
+    return state.overlays.map(entry => {
+      let sha;
+      try { sha = resolveSha(state.clone, entry.ref); } catch { sha = null; }
+      if (!fullSha(sha)) sha = null;
+      const movedFrom = entry.sha && (sha === null || entry.sha.toLowerCase() !== sha.toLowerCase()) ? entry.sha : null;
+      const options = { ...cloneEvidence, ref: entry.ref, now: Number(new Date(now)),
+        covers: base => covers ? covers(base, state.clone) : mainCovers(base, { cwd: state.clone }),
+      };
+      const result = auditEvidenceFor(sha, options);
+      const edge = entry.edgeResolution === undefined ? null : auditEvidenceFor(entry.edgeResolution?.sha, options);
+      const at = Date.parse(entry.addedAt);
+      return { clone: state.clone, ref: entry.ref, sha, ...(movedFrom ? { movedFrom } : {}), addedAt: Number.isFinite(at) ? new Date(at).toISOString() : null,
+        ageDays: Number.isFinite(at) ? Math.max(0, Math.floor((Number(new Date(now)) - at) / 86400000)) : null,
+        ...(edge ? { edgeSha: entry.edgeResolution?.sha ?? null } : {}),
+        ok: result.ok && (!edge || edge.ok), kind: result.ok && (!edge || edge.ok) ? result.kind : null };
     });
-    const at = Date.parse(entry.addedAt);
-    return { clone: state.clone, ref: entry.ref, sha, ...(movedFrom ? { movedFrom } : {}), addedAt: Number.isFinite(at) ? new Date(at).toISOString() : null,
-      ageDays: Number.isFinite(at) ? Math.max(0, Math.floor((Number(new Date(now)) - at) / 86400000)) : null,
-      ok: result.ok, kind: result.kind };
-  }));
+  });
 }
 
 function localSha(clone, ref, env) {
@@ -65,13 +71,13 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     if (state.corrupt || !state.clone || state.overlays.some(entry => !entry || !safeRegistrationRef(entry.ref))) report(file);
     else states.splice(states.length, 0, state);
   }
-  const results = checkOverlays({ states, evidence: loadAuditEvidence({ env }), resolveSha: (clone, ref) => localSha(clone, ref, env),
+  const results = checkOverlays({ states, evidenceForClone: clone => loadAuditEvidence({ env, cwd: clone }), resolveSha: (clone, ref) => localSha(clone, ref, env),
     covers: (base, clone) => mainCovers(base, { cwd: clone, env }),
   });
   if (json) process.stdout.write(`${JSON.stringify(results)}\n`);
   else {
     for (const entry of results.filter(entry => !entry.ok)) {
-      process.stdout.write(`UNAUDITED ${clean(basename(entry.clone))} ${clean(entry.ref)} sha=${entry.sha || 'unresolved'}${entry.movedFrom ? ` moved-from=${clean(entry.movedFrom)}` : ''} added=${entry.addedAt || 'unknown'} age=${entry.ageDays ?? 'unknown'}d missing=audit+waiver\n`);
+      process.stdout.write(`UNAUDITED ${clean(basename(entry.clone))} ${clean(entry.ref)} sha=${entry.sha || 'unresolved'}${entry.movedFrom ? ` moved-from=${clean(entry.movedFrom)}` : ''}${Object.hasOwn(entry, 'edgeSha') ? ` edgeSha=${clean(entry.edgeSha ?? 'unresolved')}` : ''} added=${entry.addedAt || 'unknown'} age=${entry.ageDays ?? 'unknown'}d missing=audit+waiver\n`);
     }
     if (!unreadable && results.every(entry => entry.ok)) process.stdout.write(`OK ${results.length} overlays audited\n`);
   }

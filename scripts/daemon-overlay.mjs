@@ -126,6 +126,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
 import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
+import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './lib/overlay-audit-evidence.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { readOverlayStale } from './lib/daemon-rebuild/overlay-prune.mjs';
@@ -919,7 +920,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     if (allowNoPr && !reason?.trim()) {
       return fail('--allow-no-pr requires --reason=<why>');
     }
-    const { noPr } = overlaySafetySettings(process.env);
+    const { noPr, auditEvidence, auditEvidenceSource } = overlaySafetySettings(process.env);
     if (pr == null) {
       const refused = noPr === 'refuse' && !allowNoPr;
       if (!refused || flags.check) {
@@ -959,6 +960,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       if (check.ok && flags['expected-sha'] && check.candSha !== flags['expected-sha']) {
         return { ...check, ok: false, reason: 'sha-moved', expectedSha: flags['expected-sha'] };
       }
+      if (check.ok) {
+        process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${auditEvidence} (source=${auditEvidenceSource})\n`);
+        const sha = flags['expected-sha'] || check.candSha;
+        const evidence = auditEvidenceFor(sha, { ...loadAuditEvidence({ env, cwd: root }), ref: flags.ref,
+          covers: base => mainCovers(base, { cwd: root, env }) });
+        if (!evidence.ok) {
+          process.stderr.write(`daemon-overlay: ${auditEvidence === 'warn' ? 'WARNING' : 'REFUSED'} — ${flags.ref}: ${evidence.detail} (overlaySafety.auditEvidence=${auditEvidence}, source=${auditEvidenceSource}). Run codex-audit for this SHA or record a matching operator waiver.\n`);
+          if (auditEvidence === 'refuse') return { ...check, ok: false, reason: 'no-audit-evidence', detail: evidence.detail };
+        }
+      }
       return check;
     };
 
@@ -987,7 +998,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           + `would be REFUSED${allowConflict ? ' (but --allow-conflict is set, so it would register anyway)' : ''}.\n`);
       }
       if (check.ok && !check.clean && !allowConflict) process.exitCode = 3;
-      else if (!check.ok) process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
+      else if (!check.ok) process.exitCode = ['sha-moved', 'no-audit-evidence'].includes(check.reason) ? 3 : 1;
       return;
     }
 
@@ -1011,7 +1022,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         // is safe to override; it does not cover "the check itself could not run".
         process.stderr.write(`daemon-overlay: could not verify ${flags.ref} merges clean (${describeFailure(check)}) — refusing to register. Pass --allow-conflict --reason=... only for a CONFIRMED conflict this guard itself reported.\n`);
         if (asJson) process.stdout.write(`${JSON.stringify({ conflictCheck: check })}\n`);
-        process.exitCode = check.reason === 'sha-moved' ? 3 : 1;
+        process.exitCode = ['sha-moved', 'no-audit-evidence'].includes(check.reason) ? 3 : 1;
         return null;
       }
       if (!check.clean) {

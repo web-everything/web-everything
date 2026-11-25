@@ -60,6 +60,7 @@ import {
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './overlay-audit-evidence.mjs';
 import {
   pickSmokeDiagnostics, smokeDiagnosticsDir, smokeErrorClass, smokeExitCode, smokeSignal, strictEnvInteger, writeStderrTail,
 } from './daemon-boot-smoke.mjs';
@@ -78,7 +79,7 @@ import {
  * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
  * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
  */
-export async function guardedRegister({ root, ref, pr, env, gate, register }) {
+export async function guardedRegister({ root, ref, pr, env, gate, register, settings = overlaySafetySettings(env), log = console, warnings = [] }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
   const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
@@ -88,6 +89,15 @@ export async function guardedRegister({ root, ref, pr, env, gate, register }) {
       root, ref, pr, existingOverlays: st.overlays.filter((o) => o?.ref !== ref), env,
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
+    const mode = settings.auditEvidence === 'warn' ? 'warn' : 'refuse';
+    log.error?.(`daemon-load-overlay: overlaySafety.auditEvidence=${mode} (source=${settings.auditEvidenceSource ?? 'default'})`);
+    const audit = auditEvidenceFor(check.candSha, { ...loadAuditEvidence({ env, cwd: root }), ref,
+      covers: base => mainCovers(base, { cwd: root, env }) });
+    if (!audit.ok) {
+      log.error?.(`daemon-load-overlay: ${mode === 'warn' ? 'WARNING' : 'REFUSED'} — ${ref}: ${audit.detail}. Run codex-audit for this SHA or record a matching operator waiver.`);
+      if (mode === 'refuse') return { registered: false, reason: 'no-audit-evidence', check: { ...check, ok: false, reason: 'no-audit-evidence', detail: audit.detail } };
+      warnings.push('no-audit-evidence');
+    }
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
     register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
     return { registered: true, check };
@@ -238,7 +248,7 @@ function readSettingsFile() {
 /**
  * The overlay-safety settings: built-in defaults, then `overlaySafety` in daemon-rebuild-settings.json, then env.
  * An invalid safety value falls back to the default (never to "off"). Launch retries use the overlaySmoke policy cascade.
- * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
+ * @returns {{dispatchSmoke:'on'|'off', dispatchPaths:string[], noPr:'warn'|'refuse', auditEvidence:'refuse'|'warn', auditEvidenceSource:string, smokeTimeoutMs:number, smokeKind:'ci-heal'|'fix'}}
  */
 export function overlaySafetySettings(env = process.env, { readSettings = readSettingsFile } = {}) {
   const declared = readSettings() || {};
@@ -259,7 +269,15 @@ export function overlaySafetySettings(env = process.env, { readSettings = readSe
     ? env.WE_OVERLAY_DISPATCH_PATHS.split(',').map((x) => x.trim()).filter(Boolean) : null;
   const filePaths = Array.isArray(file.dispatchPaths) && file.dispatchPaths.every((x) => typeof x === 'string') ? file.dispatchPaths : null;
   const timeout = Number(env?.WE_OVERLAY_DISPATCH_SMOKE_TIMEOUT_MS ?? file.smokeTimeoutMs);
+  const fileAudit = pick(undefined, file.auditEvidence, ['refuse', 'warn'], 'refuse');
+  const envAudit = pick(env?.WE_OVERLAY_AUDIT_EVIDENCE, fileAudit, ['refuse', 'warn'], 'refuse');
+  const auditEvidence = fileAudit === 'refuse' || envAudit === 'refuse' ? 'refuse' : 'warn';
+  const envAuditSet = typeof env?.WE_OVERLAY_AUDIT_EVIDENCE === 'string'
+    ? !!env.WE_OVERLAY_AUDIT_EVIDENCE.trim() : env?.WE_OVERLAY_AUDIT_EVIDENCE != null;
+  const auditEvidenceSource = envAuditSet && envAudit === 'refuse'
+    ? 'environment' : file.auditEvidence === undefined ? 'default' : 'tool';
   return {
+    auditEvidence, auditEvidenceSource,
     dispatchLaunchRetries: retries.value.dispatchLaunchRetries,
     dispatchLaunchRetriesSource: retries.sources.dispatchLaunchRetries,
     dispatchSmoke: pick(env?.WE_OVERLAY_DISPATCH_SMOKE, file.dispatchSmoke, ['on', 'off'], 'on'),
@@ -723,7 +741,7 @@ export async function runDaemonLoadOverlay({
   }, { env });
   const admitFn = admit ?? (addOverlayFn === addOverlay ? guardedRegister : null);
   if (admitFn) {
-    const admitted = await admitFn({ root, ref, pr, env, gate, register });
+    const admitted = await admitFn({ root, ref, pr, env, gate, register, settings: safety, log, warnings });
     if (!admitted.registered) {
       const c = admitted.check;
       log.error?.(`daemon-load-overlay: REFUSED — ${ref} ${admitted.reason === 'conflict'

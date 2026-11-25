@@ -8,9 +8,16 @@ import { readPlatformPreferences } from './policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
 import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
 import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead } from '../operations/prototype-load.mjs';
+import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from '../operations/codex-audit.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
 const prototypeSettingsPath = fileURLToPath(new NodeURL('../settings/prototype-load.json', import.meta.url));
+const validTime = (at, now) => typeof at === 'string' && Number.isFinite(Date.parse(at))
+  && Number.isFinite(now) && Date.parse(at) <= now + 5 * 60 * 1000;
+const auditShape = record => record && typeof record === 'object' && !Array.isArray(record)
+  && fullSha(record.head) && fullSha(record.base) && typeof record.at === 'string'
+  && ['NOT WEAKENED', 'WEAKENED'].includes(record.verdict)
+  && Array.isArray(record.findings) && record.findings.every(f => typeof f === 'string');
 // Main's overlay reader derives a file from a clone; an inventory must read each discovered file directly.
 export function overlayDir(env = process.env) {
   const override = env.WE_DAEMON_OVERLAY_DIR;
@@ -43,15 +50,29 @@ export function mainCovers(base, { cwd = process.cwd(), env = process.env } = {}
 }
 
 /** Canonical evaluation. Supplying covers keeps evaluation pure; default IO is read-only Git. */
-export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, covers = mainCovers } = {}) {
+export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, covers = mainCovers, now = Date.now() } = {}) {
   const missing = { ok: false, kind: null, detail: describeMissing(sha) };
-  if (!fullSha(sha)) return missing;
+  // Damaged records require ledger repair; dropping them could conceal negative evidence.
+  if (!fullSha(sha) || !Array.isArray(auditRecords) || !auditRecords.every(auditShape)) return missing;
+  const records = auditRecords.map(record => ({ ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase() }));
+  const priorQuestionHashes = resolvePriorQuestionHashes();
+  const options = { questionHash: QUESTION_HASH, priorQuestionHashes, now };
+  for (const [index, record] of records.entries()) {
+    if (record.head !== sha.toLowerCase() || record.base === record.head || record.verdict !== 'WEAKENED'
+      || !isAcceptedQuestionHash(record.questionHash, { priorQuestionHashes, now,
+        at: Number.isFinite(Date.parse(record.at)) ? record.at : undefined })
+      || findAudit([record], { ...options, head: record.head, base: record.base })) continue;
+    const later = findAudit(records.slice(index + 1), { ...options, head: record.head, base: record.base });
+    // An unusable negative still vetoes an older pass, until a usable re-audit supersedes it.
+    if (!later || (record.questionHash === QUESTION_HASH && later.questionHash !== QUESTION_HASH)) return missing;
+  }
   const covered = base => { try { return !!covers(base); } catch { return false; } };
-  const evaluate = ruledWeakened => canonicalAuditEvidence(auditRecords, sha, covered, null, { ruledWeakened });
+  const evaluate = ruledWeakened => canonicalAuditEvidence(records, sha, covered, null, { ruledWeakened, priorQuestionHashes, now });
   if (evaluate().ok) return { ok: true, kind: 'audit', detail: `NOT WEAKENED canonical audit record for ${sha}` };
-  for (const entry of waivers) {
+  for (const entry of Array.isArray(waivers) ? waivers : []) {
     // Settings rulings have the prototype loader's schema; only ledger entries require actor/quote/at.
     const settingsWaiver = entry?.layer === 'tool' || entry?.layer === 'platform';
+    if ((!settingsWaiver || Object.hasOwn(entry, 'at')) && !validTime(entry?.at, now)) continue;
     if (!(settingsWaiver ? waiverForHead([entry], { branch: ref, sha }) : validateEntry(entry))
       || !fullSha(entry.sha) || entry.ref !== ref || entry.sha.toLowerCase() !== sha.toLowerCase()) continue;
     if (evaluate({ record: entry, ruledWeakened: entry }).ok)
@@ -61,7 +82,7 @@ export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, co
 }
 
 /** Read settings and shared ledgers using their existing readers/resolvers. Unreadable evidence grants nothing. */
-export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cwd = process.cwd() } = {}) {
+export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cwd = process.cwd(), now = Date.now() } = {}) {
   let auditRecords = [], waivers = [];
   if (typeof env.HOME !== 'string' || !env.HOME.trim()) return { auditRecords, waivers };
   try {
@@ -79,15 +100,16 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
     } });
     if (!damaged) {
       const platform = readPlatformPreferences({ env, readFile: (path, encoding) => fs.readFileSync(path, encoding) });
+      if (platform.errors.length) return { auditRecords, waivers: [] };
       let tool;
       try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
       catch { /* Missing or unreadable tool settings supply no waivers. */ }
       waivers = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn)
-        .filter(entry => !revoked(entry));
+        .filter(entry => (!Object.hasOwn(entry, 'at') || validTime(entry.at, now)) && !revoked(entry));
       // Keep the loader's tool > platform > store precedence for the same ref/SHA/ruling.
       const key = entry => JSON.stringify([entry.ref, entry.sha.toLowerCase(), entry.ruling]);
       const seen = new Set(waivers.map(key));
-      if (!store.error) waivers = [...waivers, ...store.entries.filter(entry => !revoked(entry) && !seen.has(key(entry)))];
+      if (!store.error) waivers = [...waivers, ...store.entries.filter(entry => validTime(entry.at, now) && !revoked(entry) && !seen.has(key(entry)))];
     }
   } catch { /* Missing or unreadable waiver ledger: no waiver evidence. */ }
   return { auditRecords, waivers };

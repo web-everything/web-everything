@@ -48,7 +48,7 @@ describe('push-gate lint (negative test 14)', () => {
 function admit(sources, entries) {
   const found = {};
   for (const [file, source] of Object.entries(sources)) {
-    const sites = findRawPushes(source, file); // Parse errors must never become allowlisted sites.
+    const sites = findRawPushes(source, file, entries[file]?.commands); // Parse errors must never become allowlisted sites.
     if (sites.length) found[file] = sites.length;
   }
   for (const file of new Set([...Object.keys(sources), ...Object.keys(entries)])) {
@@ -87,4 +87,11 @@ describe('push-gate boundary over the real tree', () => {
     const entries = Object.fromEntries(Object.entries(allow.entries).filter(([file]) => !scope || scope.has(file)));
     admit(sources, entries);
   });
+});
+
+
+it('command pins reject a raw git push even when the site count stays unchanged', () => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['-C', dir, 'rev-parse', '--verify', ref]);" }, entries)).not.toThrow();
+  expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['push', ref]);" }, entries)).toThrow(/command/);
 });

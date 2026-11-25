@@ -17,6 +17,7 @@ import {
   EDGE_BRANCH, EDGE_IDENTITY_ENV, EDGE_SOFT_CAP, edgeLedgerPath, owedId,
 } from '../daemon-edge.mjs';
 import { REBUILD_IDENTITY_ENV } from '../daemon-rebuild.mjs';
+import { recordPassingOverlayAudit } from '../../__tests__/fixtures/overlay-audit.mjs';
 
 const REPO = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..');
 const temps = [];
@@ -115,7 +116,9 @@ describe('flag', () => {
     pushBranch('lane/fix-a', { 'a.txt': 'a\n' });
     const clone = join(mktemp('daemon-edge-slice1-clone-'), 'w');
     gitOk(tmpdir(), ['clone', '-q', origin, clone]);
-    const offEnv = { ...env, WE_DAEMON_EDGE: '', WE_DAEMON_OVERLAY_DIR: join(dirname(clone), 'ov'), WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+    const offEnv = { ...env, HOME: dirname(clone), WE_DAEMON_EDGE: '', WE_DAEMON_OVERLAY_DIR: join(dirname(clone), 'ov'), WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
+    recordPassingOverlayAudit({ home: offEnv.HOME, head: gitOk(origin, ['rev-parse', 'refs/heads/lane/fix-a']),
+      base: gitOk(origin, ['rev-parse', 'refs/heads/main']) });
     const r = spawnSync(process.execPath, [join(REPO, 'scripts/daemon-overlay.mjs'), 'add', `--clone=${clone}`, '--ref=lane/fix-a', '--pr=7', '--json'], {
       encoding: 'utf8', env: offEnv, timeout: 20_000,
     });
