@@ -269,12 +269,13 @@ export function readBacklogNames(branch = 'main', o = {}) {
 }
 
 const KNOWN_STATUS = new Set(['added', 'modified', 'removed', 'renamed', 'copied', 'changed', 'unchanged']);
-const COMPARE_CEILING = 300; // GitHub lists at most 300 files per compare, with no truncation flag: 300 or more may hide files
+// Conservatively refuse a full requested page: this single-response read cannot prove exhaustion.
+const COMPARE_PAGE_SIZE = 100;
 
 /**
  * Files ADDED by headSha relative to base (merge-base compare, like `git diff base...head --diff-filter=A`).
- * GitHub returns the WHOLE file list (up to 300) on the first response; `page` pages the commits and later pages
- * carry no files, so the files are read from that one response and never paged. value: { added, previous, removed, renames } -
+ * Read only the first response and conservatively hold at the requested page size; do not infer completeness
+ * from the absence of a truncation flag. value: { added, previous, removed, renames } -
  * `added` is every added file plus the NEW path of every renamed/copied entry (the old no-rename git diff counted a
  * rename as an addition); `previous` is the old path of renamed/copied entries; `removed` is every deleted path;
  * `renames` is each { from, to } of a renamed entry (a copy leaves its source in place, so it is in neither).
@@ -285,7 +286,7 @@ export function readAddedFiles(base, headSha, o = {}) {
   const baseTip = readBranchSha(base, o);
   if (!baseTip.ok) return { ...baseTip, read };
   const baseSha = baseTip.value;
-  const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=100&page=1`, o);
+  const r = pull(read, `repos/{owner}/{repo}/compare/${baseSha}...${headSha}?per_page=${COMPARE_PAGE_SIZE}&page=1`, o);
   if (!r.ok) return r;
   const files = r.value?.files;
   if (!Array.isArray(files)) return bad(r, 'api-malformed', 'no files list');
@@ -304,7 +305,7 @@ export function readAddedFiles(base, headSha, o = {}) {
     if (f.status === 'removed') removed.push(f.filename);
     if (f.status === 'added' || f.status === 'renamed' || f.status === 'copied') added.push(f.filename);
   }
-  if (files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', `compare returned ${files.length} files, at the ${COMPARE_CEILING}-file ceiling`);
+  if (files.length >= COMPARE_PAGE_SIZE) return bad(r, 'compare-ceiling', `compare returned ${files.length} files, at the ${COMPARE_PAGE_SIZE}-file ceiling`);
   return { ...good(r, { added, previous, removed, renames }), baseSha };
 }
 
@@ -376,11 +377,11 @@ export function readCompareNetDiff(repo, headSha, o = {}) {
   const initial = { read: 'net-diff', fetchedAt: (o.now ?? Date.now)() };
   if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+(?![\s\S])/.test(repo) || !(Array.isArray(o.allowedRepos) && o.allowedRepos.includes(repo))) return bad(initial, 'repo-not-drained');
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}(?![\s\S])/i.test(headSha)) return bad(initial, 'head-unbound');
-  const r = pull('net-diff', `repos/{owner}/{repo}/compare/main...${headSha}?per_page=100&page=1`, { ...o, slug: repo, repo, fresh: true });
+  const r = pull('net-diff', `repos/{owner}/{repo}/compare/main...${headSha}?per_page=${COMPARE_PAGE_SIZE}&page=1`, { ...o, slug: repo, repo, fresh: true });
   if (!r.ok) return r;
   const doc = r.value;
   if (!Array.isArray(doc?.files)) return bad(r, 'api-malformed', 'files is not an array');
-  if (doc.files.length >= COMPARE_CEILING) return bad(r, 'compare-ceiling', 'split the PR so the full diff is readable');
+  if (doc.files.length >= COMPARE_PAGE_SIZE) return bad(r, 'compare-ceiling', 'split the PR so the full diff is readable');
   const sha = (v) => typeof v === 'string' && /^[0-9a-f]{40}(?![\s\S])/i.test(v);
   if (!sha(doc.merge_base_commit?.sha) || !sha(doc.base_commit?.sha)) return bad(r, 'api-malformed', 'base sha missing');
   if (!['ahead', 'diverged'].includes(doc.status) || doc.files.length === 0) return bad(r, 'compare-empty');

@@ -40,6 +40,7 @@ function probe(root = ROOT) {
       { name: 'empty-ahead', compare: { ...clean, files: [] }, reason: 'compare-empty' },
       { name: 'empty-diverged', compare: { ...clean, status: 'diverged', files: [] }, reason: 'compare-empty' },
       { name: 'cleared-500', compare: { status: 500 }, reason: 'api-http-500', cleared: true },
+      { name: 'cleared-full-page', compare: { ...clean, files: Array.from({ length: 100 }, (_, i) => ({ ...clean.files[0], filename: `src/file-${i}.ts` })) }, reason: 'compare-ceiling', cleared: true },
       { name: 'cleared-tamper', compare: tamper, cleared: true },
       { name: 'carry-no-clone', compare: tamper, carry: true },
       { name: 'carry-sibling', compare: tamper, carry: true, sibling: true },

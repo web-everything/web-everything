@@ -491,9 +491,8 @@ describe('verified decode: base64 against reported size and sha', () => {
 
 describe('pagination: follow to the end or be unreadable', () => {
   const page = (n, status = 'modified') => Array.from({ length: n }, (_x, i) => ({ filename: `f${i}-${n}-${Math.random()}`, status }));
-  // GitHub's compare returns its whole file list (up to 300) on the FIRST page; `page` pages the commits and later
-  // pages carry no files. A reader that pages files on a full first page would read page 2 and find no files list.
-  it.each([99, 100, 101, 250, 299])('%i files in the one response are complete; exactly one compare call is made', (n) => {
+  // The single-response reader accepts only lists smaller than its requested page size.
+  it.each([1, 99])('%i files below the page size are complete; exactly one compare call is made', (n) => {
     const rest = routes({ '&page=1': ok({ files: [...page(n - 1), { filename: 'backlog/a.md', status: 'added' }] }), '&page=2': ok({ commits: [] }) });
     const r = readAddedFiles('main', SHA, { source: src(rest) });
     expect(r).toMatchObject({ ok: true, value: { added: ['backlog/a.md'] } });
@@ -503,10 +502,9 @@ describe('pagination: follow to the end or be unreadable', () => {
   it('a compare failing is unreadable, not a partial list', () => {
     expect(readAddedFiles('main', SHA, { source: src(routes({ 'compare/': http(502) })) })).toMatchObject({ ok: false, reason: 'api-http-502' });
   });
-  it('the compare lists at most 300 files with no truncation flag: 300 or more is compare-ceiling, never complete', () => {
+  it.each([100, 101, 250, 299, 300, 301])('a full requested page or larger is compare-ceiling, never complete: %i files', n => {
     const one = (n) => readAddedFiles('main', SHA, { source: src(routes({ 'compare/': ok({ files: page(n) }) })) });
-    expect(one(300)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
-    expect(one(301)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
+    expect(one(n)).toMatchObject({ ok: false, reason: 'compare-ceiling' });
   });
   it('a tree flagged truncated is unreadable', () => {
     const rest = routes(hwWorld([], { bk: ok({ truncated: false, tree: [], truncated: true }) }));
@@ -784,6 +782,14 @@ const netFile = (over = {}) => ({ filename: 'blocks/__tests__/x.test.ts', status
 const netDoc = (over = {}) => ({ status: 'ahead', merge_base_commit: { sha: OTHER }, base_commit: { sha: OTHER }, files: [netFile()], ...over });
 const netRead = (doc, o = {}) => drainReads.readCompareNetDiff('o/r', SHA, { allowedRepos: ['o/r'], source: { read: () => ({ ok: true, value: doc, fetchedAt: NOW }) }, ...o });
 describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
+  it.each([100, 101, 300])('a full per_page-sized page or larger holds as compare-ceiling: %i files', count => {
+    const files = Array.from({ length: count }, (_, i) => netFile({ filename: `src/file-${i}.ts` }));
+    expect(netRead(netDoc({ files }))).toMatchObject({ ok: false, reason: 'compare-ceiling' });
+  });
+  it('scores a complete compare below the requested page size: 99 files', () => {
+    const files = Array.from({ length: 99 }, (_, i) => netFile({ filename: `src/file-${i}.ts` }));
+    expect(netRead(netDoc({ files }))).toMatchObject({ ok: true, value: { changedFiles: files.map(f => f.filename) } });
+  });
   it.each(['ahead', 'diverged'])('holds %s compares with an empty files array', status => {
     expect(netRead(netDoc({ status, files: [] }))).toMatchObject({ ok: false, reason: 'compare-empty' });
   });

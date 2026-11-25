@@ -48,6 +48,12 @@ it('clear-human cannot admit an unverified forge compare', () => world(async ({ 
   pr.comments[0].body += '\n<!-- cleared-human: chalbert -->';
   held(await run(false, options), 'net diff unverified (forge-api-http-500); ');
 }, setup), 120_000);
+it('a full 100-file compare page holds and prevents delivery even after clear-human', () => world(async ({ pr, run }) => {
+  ready(pr);
+  pr.compare = compare({ files: Array.from({ length: 100 }, (_, i) => file({ filename: `src/file-${i}.ts` })) });
+  pr.comments[0].body += '\n<!-- cleared-human: chalbert -->';
+  held(await run(false, options), 'net diff unverified (forge-compare-ceiling); ');
+}, setup), 120_000);
 it('a non-local test-tampering PR stays cleared at the current head and attempts delivery', () => world(async ({ pr, run }) => {
   ready(pr); pr.compare = compare({ files: [file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })] });
   pr.comments[0].body += '\n<!-- cleared-human: chalbert -->';
