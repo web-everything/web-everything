@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // mq-result-reuse (CI-MAIN-REUSE-MQ). On a main push, decide whether the merge queue already ran CI IN FULL for
 // this exact commit sha. If so, main may skip the heavy jobs and record that result; any doubt (no run, other sha,
-// partial run, failed run, API error) means a full run. Fail closed: the verdict is reuse=false unless proven.
-// Usage (CI): node scripts/ci/mq-result-reuse.mjs   env: GITHUB_SHA GITHUB_REPOSITORY GITHUB_TOKEN GITHUB_EVENT_NAME
+// partial run, failed run, changed/unreadable workflows, API error) means a full run. Fail closed unless proven.
+// Usage (CI): node scripts/ci/mq-result-reuse.mjs   env: GITHUB_SHA PUSH_BEFORE GITHUB_REPOSITORY GITHUB_TOKEN GITHUB_EVENT_NAME
 // Writes reuse=true|false to $GITHUB_OUTPUT and one summary line to $GITHUB_STEP_SUMMARY and stdout.
 import { appendFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -50,9 +50,10 @@ export function judgeRun(run, jobs, sha) {
  *   listRunJobs(runId) -> [{name, conclusion}]  the COMPLETE job list (the adapter throws if it cannot prove completeness)
  *   quarantineClear()  -> true only when today's quarantine is readable and clear. Per-job full-test receipts
  *                         independently prove that the queue did not skip tests under historical quarantine.
+ *   workflowUnchanged() -> true only when the pushed range leaves .github/workflows/** unchanged.
  * Any throw means reuse=false.
  */
-export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantineClear = async () => false }) {
+export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantineClear = async () => false, workflowUnchanged = async () => false }) {
   if (event !== 'push') return { reuse: false, why: `event ${event} is not a main push` };
   if (!/^[0-9a-f]{40}$/.test(sha ?? '')) return { reuse: false, why: 'no full sha' };
   try {
@@ -70,6 +71,7 @@ export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantin
     }
     // Only the most recently updated run counts, including a failed or unfinished lower-ID rerun.
     const run = candidates[0];
+    if (await workflowUnchanged() !== true) return { reuse: false, why: 'workflow changed or push range unreadable' };
     const verdict = judgeRun(run, await listRunJobs(run.id), sha);
     if (!verdict.reuse) return verdict;
     if (!(await quarantineClear())) return { reuse: false, why: 'red-main quarantine active or unreadable' };
@@ -77,6 +79,21 @@ export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantin
   } catch (err) {
     return { reuse: false, why: `error: ${err?.message ?? err}` };
   }
+}
+
+/** Queue CI may use main's workflow definition. Only reuse when the entire push leaves workflows unchanged.
+ * A shallow checkout missing either tree, invalid/creation SHAs, a changed workflow or a timeout runs in full.
+ * --quiet compares trees without a capped filename listing; no output is captured and no history is fetched.
+ */
+export function workflowUnchanged({ before, sha, cwd = process.cwd(), run = execFileSync } = {}) {
+  const validSha = value => typeof value === 'string' && value.length === 40 && /^[0-9a-f]{40}$/.test(value) && value !== '0'.repeat(40);
+  if (!validSha(before) || !validSha(sha)) return false;
+  try {
+    run('git', ['diff', '--quiet', '--no-ext-diff', '--no-textconv', before, sha, '--', '.github/workflows/'], {
+      cwd, stdio: 'ignore', timeout: 5000,
+    });
+    return true;
+  } catch { return false; }
 }
 
 /** GitHub adapter for the two reads (the only place that knows the provider). */
@@ -158,9 +175,12 @@ export async function quarantineClear({ readQuarantine, activeEntries, board = p
   return got.ok === true && activeEntries(got.list, { now }).length === 0;
 }
 
-export async function main({ env = process.env, fetchImpl = fetch, quarantineOptions } = {}) {
+export async function main({ env = process.env, fetchImpl = fetch, quarantineOptions, workflowOptions } = {}) {
   const { GITHUB_SHA: sha, GITHUB_REPOSITORY: repo, GITHUB_TOKEN: token, GITHUB_EVENT_NAME: event } = env;
-  const v = await decide({ ...githubReads({ repo, token, fetchImpl }), sha, event, quarantineClear: () => quarantineClear(quarantineOptions) });
+  const v = await decide({ ...githubReads({ repo, token, fetchImpl }), sha, event,
+    quarantineClear: () => quarantineClear(quarantineOptions),
+    workflowUnchanged: () => workflowUnchanged({ ...workflowOptions, before: env.PUSH_BEFORE, sha }),
+  });
   const line = v.reuse
     ? `mq-result-reuse: REUSING merge-queue run ${v.runId} for ${sha}; heavy jobs skipped (${v.why})`
     : `mq-result-reuse: full run (${v.why})`;

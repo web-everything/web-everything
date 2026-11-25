@@ -303,7 +303,9 @@ function mirroredRunContext(job, text) {
       REPO: '${{ github.repository }}', PR_NUMBER: '${{ github.event.pull_request.number }}',
       HEAD_REF: '${{ github.event.pull_request.head.ref }}', HEAD_SHA: '${{ github.event.pull_request.head.sha }}',
       AUTHOR: '${{ github.event.pull_request.user.login }}', HEAD_REPO: '${{ github.event.pull_request.head.repo.full_name }}',
-    } : job === 'changes' && index === 2 ? { GITHUB_TOKEN: '${{ github.token }}' } : job === 'changes' ? {
+    } : job === 'changes' && index === 2 ? {
+      GITHUB_TOKEN: '${{ github.token }}', PUSH_BEFORE: '${{ github.event.before }}',
+    } : job === 'changes' ? {
       EVENT_NAME: '${{ github.event_name }}', BASE_SHA: '${{ github.event.pull_request.base.sha }}',
       MG_BASE_SHA: '${{ github.event.merge_group.base_sha }}', BASE_REF: '${{ github.event.pull_request.base.ref }}',
     } : job === 'integration-part' && index === 1 ? { WE_INTEGRATION_GROUP: '${{ matrix.group }}' } : undefined,

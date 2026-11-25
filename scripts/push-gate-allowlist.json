@@ -57,7 +57,7 @@
     "scripts/backlog.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
     "scripts/check-standards.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":15},
     "scripts/ci-card-only.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
-    "scripts/ci/mq-result-reuse.mjs": {"status":"pending-migration","reason":"Reviewed unresolved execFileSync git argv: readFromTransportBranch supplies only fetch, ls-tree and show for the quarantine guard; no push.","sites":1},
+    "scripts/ci/mq-result-reuse.mjs": {"status":"pending-migration","reason":"Reviewed two unresolved git argv sites: workflowUnchanged runs only diff --quiet with validated full SHAs and a fixed workflows path; readFromTransportBranch supplies only fetch, ls-tree and show for the quarantine guard; no push.","sites":2},
     "scripts/ci/quarantine-skip.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/codemap.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/codex-direct-task.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},

@@ -5,10 +5,12 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
 import { describe, expect, it, vi } from 'vitest';
-import { decide, githubReads, main, quarantineClear, EXPECTED_MATRIX_JOBS, REQUIRED_JOBS } from '../mq-result-reuse.mjs';
+import { decide, githubReads, main, quarantineClear, workflowUnchanged, EXPECTED_MATRIX_JOBS, REQUIRED_JOBS } from '../mq-result-reuse.mjs';
 import { activeEntries, addEntries } from '../../lib/red-main-quarantine.mjs';
 
 const SHA = 'a'.repeat(40);
+const BEFORE = 'b'.repeat(40);
+const workflowClear = { workflowUnchanged: async () => true };
 const RECEIPT = 'Full test run (no quarantine exclusions)';
 const required = ['changes', 'standards', 'coverage-merge', 'host-paths', 'integration', 'test', 'smoke', 'daemon-soak'];
 const matrix = [
@@ -22,7 +24,7 @@ const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.y
 const run = (over = {}) => ({ id: 7, workflow_id: 382175354, head_sha: SHA, event: 'merge_group', status: 'completed', conclusion: 'success', updated_at: '2026-11-25T12:00:00Z', ...over });
 
 const go = (runs, jobs, extra = {}) =>
-  decide({ listQueueRuns: async () => runs, listRunJobs: async () => jobs, sha: SHA, event: 'push', quarantineClear: async () => true, ...extra });
+  decide({ listQueueRuns: async () => runs, listRunJobs: async () => jobs, sha: SHA, event: 'push', quarantineClear: async () => true, workflowUnchanged: async () => true, ...extra });
 // Repository endpoint confirmed by review's live probe (run 45531076311, workflow_id 382175354).
 // The ruleset-pinned workflow ID does NOT resolve under actions/workflows/<id>/runs.
 const runsUrl = `https://api.github.com/repos/o/r/actions/runs?event=merge_group&head_sha=${SHA}&per_page=100&page=1`;
@@ -50,7 +52,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     let watchdog;
     try {
       const verdict = await Promise.race([
-        decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }),
+        decide({ ...reads, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true }),
         new Promise((_, reject) => { watchdog = setTimeout(() => reject(new Error('reuse read hung')), 1000); }),
       ]);
       expect(observedSignal?.aborted).toBe(true);
@@ -80,7 +82,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([
       run(), run({ id: 99, workflow_id: 305968843, conclusion: 'failure' }),
     ], { jobs: fullJobs(), total_count: fullJobs().length }) });
-    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true })).toMatchObject({ reuse: true, runId: 7 });
+    expect(await decide({ ...reads, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true })).toMatchObject({ reuse: true, runId: 7 });
     const unrelated = githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([run({ workflow_id: 1 })], {}) });
     expect(await unrelated.listQueueRuns(SHA)).toEqual([]);
   });
@@ -91,7 +93,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       ? response(endpoint === 'runs' ? { workflow_runs: [run()], total_count: 1 } : { jobs: fullJobs(), total_count: fullJobs().length }, 503)
       : good(url);
     const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl });
-    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }))
+    expect(await decide({ ...reads, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true }))
       .toEqual({ reuse: false, why: 'error: GitHub API 503' });
   });
   it('includes a newer failed queue run on a later repository page', async () => {
@@ -102,7 +104,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       return response({ workflow_runs: pages[page - 1] ?? [], total_count: 102 });
     };
     const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl });
-    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }))
+    expect(await decide({ ...reads, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true }))
       .toEqual({ reuse: false, why: 'run completed/failure' });
   });
   it.each([{}, { workflow_runs: [run()] }, { workflow_runs: [], total_count: 1 }, { workflow_runs: [run()], total_count: 1001 },
@@ -123,7 +125,8 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
         return result;
       }`);
       const script = `import { main } from ${JSON.stringify(new URL('../mq-result-reuse.mjs', import.meta.url).href)};
-        await main({ env: ${JSON.stringify({ GITHUB_SHA: SHA, GITHUB_REPOSITORY: 'o/r', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: join(dir, 'output') })},
+        await main({ env: ${JSON.stringify({ GITHUB_SHA: SHA, PUSH_BEFORE: BEFORE, GITHUB_REPOSITORY: 'o/r', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: join(dir, 'output') })},
+          workflowOptions: { run: () => {} },
           fetchImpl: async url => ({ ok: true, json: async () => url.includes('/jobs?')
             ? ${JSON.stringify({ jobs: fullJobs(), total_count: fullJobs().length })}
             : ${JSON.stringify({ workflow_runs: [run()], total_count: 1 })} }),
@@ -150,6 +153,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
           : ${JSON.stringify({ workflow_runs: [run()], total_count: 1 })} });
         child.execFileSync = (command, args) => {
           if (command !== 'git') throw new Error('unexpected command');
+          if (args[0] === 'diff') return '';
           if (args[0] === 'fetch') return '';
           if (args[0] === 'ls-tree') return 'quarantine.json';
           if (args[0] === 'show') return '{"version":1,"entries":[]}';
@@ -163,7 +167,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       const output = join(dir, 'output');
       const result = spawnSync(process.execPath, ['--import', preload, new URL('../mq-result-reuse.mjs', import.meta.url).pathname], {
         cwd: dir, encoding: 'utf8', timeout: 15000,
-        env: { ...process.env, GITHUB_EVENT_NAME: kind === 'summary' ? 'push' : 'pull_request', GITHUB_SHA: SHA,
+        env: { ...process.env, GITHUB_EVENT_NAME: kind === 'summary' ? 'push' : 'pull_request', GITHUB_SHA: SHA, PUSH_BEFORE: BEFORE,
           GITHUB_REPOSITORY: 'o/r', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: dir },
       });
       expect(result.status, result.stderr).toBe(0);
@@ -176,6 +180,59 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     const v = await go([run()], fullJobs());
     expect(v.reuse).toBe(true);
     expect(v.runId).toBe(7);
+  });
+  it.each([false, undefined, null, 'true', 'error'])('runs fully when workflow equality is not proven: %s', async evidence => {
+    const listRunJobs = vi.fn(async () => fullJobs());
+    const verdict = await go([run()], fullJobs(), {
+      listRunJobs,
+      workflowUnchanged: evidence === undefined ? undefined : async () => {
+        if (evidence === 'error') throw new Error('workflow evidence unreadable');
+        return evidence;
+      },
+    });
+    expect(verdict.reuse).toBe(false);
+    expect(listRunJobs).not.toHaveBeenCalled();
+  });
+  it('wires the pre-push SHA into the workflow guard from the push event', () => {
+    const reuse = workflow.jobs.changes.steps.find(step => step.id === 'reuse');
+    expect(reuse.env.PUSH_BEFORE).toBe('${{ github.event.before }}');
+    expect(reuse.run).toBe('node scripts/ci/mq-result-reuse.mjs');
+    expect(workflow.jobs.changes.steps.find(step => step.uses === 'actions/checkout@v4').with['fetch-depth']).toBeGreaterThan(1);
+  });
+  it('compares the entire workflows tree across the push without a truncated path listing', () => {
+    const run = vi.fn();
+    expect(workflowUnchanged({ before: BEFORE, sha: SHA, cwd: '/fixture', run })).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith('git',
+      ['diff', '--quiet', '--no-ext-diff', '--no-textconv', BEFORE, SHA, '--', '.github/workflows/'],
+      { cwd: '/fixture', stdio: 'ignore', timeout: 5000 });
+  });
+  it.each([undefined, null, '', '0'.repeat(40), 'a'.repeat(39), `${BEFORE}\n`, '--help', '$(id)'])('refuses missing or invalid push endpoints %j without invoking Git', value => {
+    const run = vi.fn();
+    expect(workflowUnchanged({ before: value, sha: SHA, run })).toBe(false);
+    expect(workflowUnchanged({ before: BEFORE, sha: value, run })).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['changed workflows', { status: 1 }], ['missing history', { status: 128 }], ['Git timeout', { code: 'ETIMEDOUT' }],
+  ])('runs fully for %s through the CLI provider and local workflow guard', async (_reason, failure) => {
+    const dir = mkdtempSync(join(tmpdir(), 'mq-workflow-'));
+    try {
+      const output = join(dir, 'output'), summary = join(dir, 'summary');
+      const localRun = vi.fn(() => { throw Object.assign(new Error('diff refused'), failure); });
+      await main({
+        env: { GITHUB_SHA: SHA, PUSH_BEFORE: BEFORE, GITHUB_REPOSITORY: 'o/r', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+        fetchImpl: fakeFetch([run()], { jobs: fullJobs(), total_count: fullJobs().length }),
+        workflowOptions: { run: localRun },
+        quarantineOptions: { readQuarantine: () => ({ ok: true, list: { entries: [] } }) },
+      });
+      expect(localRun).toHaveBeenCalledTimes(1);
+      expect(localRun).toHaveBeenCalledWith('git',
+        ['diff', '--quiet', '--no-ext-diff', '--no-textconv', BEFORE, SHA, '--', '.github/workflows/'],
+        expect.objectContaining({ stdio: 'ignore', timeout: 5000 }));
+      expect(readFileSync(output, 'utf8')).toBe('reuse=false\n');
+      expect(readFileSync(summary, 'utf8')).toContain('full run (workflow changed or push range unreadable)');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('runs fully for a different sha', async () => {
     expect((await go([run({ head_sha: 'b'.repeat(40) })], fullJobs())).reuse).toBe(false);
@@ -234,8 +291,9 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     };
     try {
       const output = join(dir, 'output'), summary = join(dir, 'summary');
-      await main({ env: { GITHUB_SHA: SHA, GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 't', GITHUB_EVENT_NAME: 'push',
+      await main({ env: { GITHUB_SHA: SHA, PUSH_BEFORE: BEFORE, GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 't', GITHUB_EVENT_NAME: 'push',
         GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary }, fetchImpl,
+      workflowOptions: { run: () => {} },
       quarantineOptions: { readQuarantine: () => ({ ok: true, list: { entries: [] } }) } });
       expect(readFileSync(output, 'utf8')).toBe('reuse=false\n');
       expect(readFileSync(summary, 'utf8')).toContain('full run (run completed/failure)');
@@ -245,10 +303,10 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     const reads = (body) => githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([run()], body) });
     for (const body of [{ jobs: fullJobs(), total_count: 999 }, {}, { jobs: fullJobs() }]) {
       const r = reads(body);
-      expect((await decide({ ...r, sha: SHA, event: 'push', quarantineClear: async () => true })).reuse).toBe(false);
+      expect((await decide({ ...r, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true })).reuse).toBe(false);
     }
     const good = reads({ jobs: fullJobs(), total_count: fullJobs().length });
-    expect((await decide({ ...good, sha: SHA, event: 'push', quarantineClear: async () => true })).reuse).toBe(true);
+    expect((await decide({ ...good, ...workflowClear, sha: SHA, event: 'push', quarantineClear: async () => true })).reuse).toBe(true);
   });
   it('runs fully when a red-main quarantine is active or unreadable', async () => {
     expect((await go([run()], fullJobs(), { quarantineClear: async () => false })).reuse).toBe(false);
@@ -308,7 +366,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     expect(EXPECTED_MATRIX_JOBS).toEqual(matrix);
   });
   it('runs fully with no quarantineClear on an otherwise perfect run', async () => {
-    const v = await decide({ listQueueRuns: async () => [run()], listRunJobs: async () => fullJobs(), sha: SHA, event: 'push' });
+    const v = await decide({ listQueueRuns: async () => [run()], listRunJobs: async () => fullJobs(), ...workflowClear, sha: SHA, event: 'push' });
     expect(v).toMatchObject({ reuse: false, why: 'red-main quarantine active or unreadable' });
   });
   it('runs fully if a quarantine guard throws', async () => {
@@ -417,7 +475,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       writeFileSync(join(bin, 'npm'), '#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGV_FILE"\nexit "$TEST_STATUS"\n');
       chmodSync(join(bin, 'node'), 0o755); chmodSync(join(bin, 'npm'), 0o755);
       const script = step.run.replaceAll('${{ matrix.shard }}', '1').replaceAll('${{ matrix.group }}', 'parallel').replaceAll('${{ strategy.job-total }}', '8');
-      for (const exclusions of ['', '--exclude=scripts/a.test.mjs', '--exclude=scripts/a.test.mjs --quarantined=scripts/a.test.mjs']) {
+      for (const exclusions of ['', '--exclude=scripts/a.test.mjs', '--quarantined=scripts/a.test.mjs', '--exclude=scripts/a.test.mjs --quarantined=scripts/a.test.mjs']) {
         for (const status of [0, 1]) {
           const output = join(dir, 'output'), argv = join(dir, 'argv'); writeFileSync(output, '');
           const result = spawnSync('bash', ['-e', '-c', script], { cwd: dir, encoding: 'utf8', env: {
@@ -441,8 +499,9 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     try {
       const output = join(dir, 'output'), summary = join(dir, 'summary');
       await main({
-        env: { GITHUB_SHA: SHA, GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 't', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
+        env: { GITHUB_SHA: SHA, PUSH_BEFORE: BEFORE, GITHUB_REPOSITORY: 'o/r', GITHUB_TOKEN: 't', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: summary },
         fetchImpl: fakeFetch([run()], { jobs: fullJobs(), total_count: fullJobs().length }),
+        workflowOptions: { run: () => {} },
         quarantineOptions: { readQuarantine: () => ({ ok: reuse, list: { entries: [] } }) },
       });
       expect(readFileSync(output, 'utf8')).toBe(`reuse=${reuse}\n`);

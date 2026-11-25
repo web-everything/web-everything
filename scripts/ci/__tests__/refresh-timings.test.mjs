@@ -497,6 +497,18 @@ describe('rolling timing refresh', () => {
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
   });
 
+  it('refuses a truncated artifact listing even when it contains a valid timing artifact', async () => {
+    const calls = [];
+    const exec = (_, args) => {
+      calls.push(args);
+      if (args[1] === 'list') return '[{"databaseId":100}]';
+      return JSON.stringify({ total_count: 2, artifacts: [{ name: 'timing-unit-1', expired: false }] });
+    };
+    await expect(main(['--runs=1'], { exec, timingsFile, repoRoot })).rejects.toThrow(/Incomplete artifact listing/);
+    expect(calls.some(args => args[1] === 'download')).toBe(false);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
   it.each([{}, { total_count: 1, artifacts: [] }, { total_count: 101, artifacts: [] },
     { total_count: 1, artifacts: [{ name: 'timing-unit-1' }] }, 'invalid JSON', 'API failure', 'download failure',
   ])('refuses incomplete artifact evidence or IO failure without changing timings: %j', async evidence => {

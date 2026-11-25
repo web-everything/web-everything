@@ -130,6 +130,7 @@ jobs:
         # Timeout/error leaves reuse false; only a successful step can authorize skipping.
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: node scripts/ci/mq-result-reuse.mjs
       - name: Enforce bot-owned test timings
         if: github.event_name == 'pull_request'
