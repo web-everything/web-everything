@@ -61,6 +61,13 @@ export const REPO_SCAN_TESTS = Object.freeze([
       'scripts/lib/testing-notes-advisory.mjs', 'scripts/lib/rules-loader.cjs'],
   },
   {
+    test: 'scripts/__tests__/agent-launch-structure.test.mjs',
+    scope: 'full',
+    why: 'counts literal agent process launches under scripts and symlinked skills; a new launch site anywhere must be seen',
+    matches: (f) => f.startsWith('scripts/lib/agent-launch'),
+    inputs: ['scripts/__tests__/agent-launch-structure.test.mjs', 'scripts/lib/agent-launch-approved.json'],
+  },
+  {
     test: 'scripts/__tests__/capability-dispatch-only.test.mjs',
     scope: 'files',
     why: 'capability checks admit dispatch only; roster filtering and unapproved admission are forbidden per source file',

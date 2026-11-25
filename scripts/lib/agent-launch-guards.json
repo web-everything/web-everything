@@ -1,0 +1,20 @@
+{
+  "codex": {
+    "dir": "scripts/codex-shims",
+    "pinned": {
+      "npm": "4e909f6c999e32a846c48020fa34ed38d6802775cac6f0b1839c1361629eb749",
+      "npx": "4e909f6c999e32a846c48020fa34ed38d6802775cac6f0b1839c1361629eb749",
+      "vitest": "583665ce59b7efa9adc347b34601de2d712c4aba70a39bdf567726f1e0f57e62",
+      "playwright": "d1bcee43715cef50c7c37a7725c3bbd00a5d034b4c8f763e27863e4723e48efe"
+    },
+    "sourced": {
+      "_guard.sh": "aafa0dbb440eb37cf74c20929259fd09b3635b6a16d2709ab62b0c504f5892e7"
+    },
+    "generated": ["gh"]
+  },
+  "claude": {
+    "pinned": {},
+    "sourced": {},
+    "generated": ["gh"]
+  }
+}
