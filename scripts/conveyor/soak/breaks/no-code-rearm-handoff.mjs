@@ -9,10 +9,45 @@ import { defaultRearmNoCode } from '../../../operations/promote-draft-pr-dispatc
 import { runReviewLabelCli } from '../../../review-set-label.mjs';
 import { REVIEW_PR_CHANNEL } from '../../../lib/review-escalation.mjs';
 import { REVIEW_PR_FOOTER } from '../../mechanical-round-cap.mjs';
+import { defaultRearm } from '../../orphan-fix-round.mjs';
+import { NOTE_COMMENT_MARKER, planNoteComment } from '../../reconcile-note-comment.mjs';
 
 const HEAD = '93ff74ce966785fe5844fa63f2be9b8ed091aa52';
 const BOT = { login: 'web-everything' };
 const NOW = Date.parse('2026-11-25T09:00:00Z');
+
+/** Exercise the orphan guard's actual argv through both production CLI layers, with in-memory IO. */
+export function replayOrphanRearm(label) {
+  let labels = ['review:changes', label];
+  const writes = [];
+  defaultRearm({ slug: 'fixture/orphan', pr: 7480, head: HEAD, exec: (_cmd, args) => {
+    const exit = process.exit;
+    const output = [];
+    process.exit = code => { throw Object.assign(new Error(output.join('')), { writerExit: code }); };
+    try {
+      runRearmReview(args.slice(1), {
+        read: args => JSON.stringify(args[0] === 'api' ? [[]] : { headRefOid: HEAD }),
+        runLabel: config => runReviewLabelCli({ ...config,
+          emit: line => output.push(line), appendLedgerVerdict: () => ({ ok: true }),
+          provider: {
+            readPostingIdentity: () => ({ login: BOT.login, type: 'User' }),
+            readPrState: () => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, labels, comments: [] }),
+            readComments: () => [], readPrReviews: () => [],
+            setLabels: (_repo, _pr, { add, remove }) => {
+              writes.push({ add, remove });
+              labels = labels.filter(name => !remove.includes(name));
+              if (add && !labels.includes(add)) labels.push(add);
+            },
+            postComment: () => ({ id: 'IC_rearmed' }),
+          },
+        }),
+      });
+    } catch (error) {
+      if (error.writerExit !== 0) throw error;
+    } finally { process.exit = exit; }
+  } });
+  return { labels, writes };
+}
 
 /** Production planner, executor and label writer with all GitHub IO held in memory. */
 export function replayNoCodeHandoff({ human = false, rounds = 0, red = true, guardUnreadable = false } = {}) {
@@ -82,6 +117,12 @@ export default {
   fixPresent: root => readFileSync(join(root, 'scripts/conveyor/rearm-round-count.mjs'), 'utf8').includes('NO_CODE_REARM_TRAILER'),
   async run() {
     const violations = [];
+    for (const label of ['red-team:pending', 'red-team:blocked']) {
+      try {
+        const result = replayOrphanRearm(label);
+        if (result.labels.join() !== 'review:pending' || result.writes.length !== 1) violations.push(`orphan ${label}: handoff failed`);
+      } catch (error) { violations.push(`orphan ${label}: ${error.message}`); }
+    }
     for (const config of [{ human: true }, { human: false }, { rounds: 5, red: false }, { rounds: 5, red: false, guardUnreadable: true }]) {
       const result = replayNoCodeHandoff(config);
       const expected = config.red === false ? 'review' : 'ci-heal';
@@ -91,6 +132,10 @@ export default {
       if (result.second.dispatch.map(d => d.kind).join() !== expected) {
         violations.push(`${JSON.stringify(config)} tick 2: ${JSON.stringify(result.second)}`);
       }
+      if (result.second.dispatch.some(row => Object.hasOwn(row, 'operatorAnswer'))) violations.push('no-code answer leaked into ordinary work');
+      const asks = result.second.notes.map(note => planNoteComment(note, result.snapshot.comments))
+        .filter(note => !note.alreadyPosted && !note.suppressed && note.body.startsWith(NOTE_COMMENT_MARKER));
+      if (asks.length) violations.push(`successful handoff asks for a decision: ${asks.map(note => note.body).join()}`);
       if (result.attempts !== (config.rounds ?? 0)) violations.push(`handoff consumed a round: ${result.attempts}`);
       if (config.human && !result.snapshot.labels.some(l => l.name === 'review:human')) violations.push('human hold lost');
     }

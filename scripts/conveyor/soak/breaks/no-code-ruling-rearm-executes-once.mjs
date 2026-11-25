@@ -67,6 +67,8 @@ export default {
           invariant: 'complete-two-tick-dispatch', detail: `#${number} ${fails ? 'failure' : 'success'} tick ${tick + 1}: ${JSON.stringify(plan.dispatch.map(d => d.kind))}, want ${JSON.stringify(expected)}` });
         if ((tick === 0 || !fails) && plan.refusals.length) violations.push({
           invariant: 'no-refusals', detail: `#${number} tick ${tick + 1}: ${JSON.stringify(plan.refusals)}` });
+        if (plan.dispatch.some(row => row.kind !== 'rearm-no-code' && Object.hasOwn(row, 'operatorAnswer'))) violations.push({
+          invariant: 'no-ruling-payload-on-ordinary-work', detail: `#${number} tick ${tick + 1}: no-code answer reached an ordinary dispatch row` });
         runReconcilePromoteDraftDispatch({
           root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }), clearAwaitingCi: () => {},
           readHeadCheckState: () => ({ state: 'green', why: '', counts: {} }), provider: { ready: () => {} },

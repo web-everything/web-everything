@@ -319,6 +319,10 @@ export function hasInvalidArgs(argv) {
   const seen = new Set();
   for (const a of argv) {
     if (!a.startsWith('--')) continue;
+    if (a.startsWith('--no-code-rearm')) {
+      if (a !== '--no-code-rearm' || seen.has('no-code-rearm')) return true;
+      seen.add('no-code-rearm');
+    }
     if (/^--(repo|actor|round|main-ref|only-if|expect-head)(?!=)/.test(a)) return true;
     // A repeated flag is ambiguous (this guard and the shared CLI could resolve different occurrences): refuse.
     const name = /^--(repo|actor|round|main-ref|only-if|expect-head)=/.exec(a)?.[1];
@@ -426,7 +430,7 @@ export function runRearmReview(argv = process.argv.slice(2), { read = readGh, ru
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>] [--no-code-rearm]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.

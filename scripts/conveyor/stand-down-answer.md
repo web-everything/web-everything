@@ -56,11 +56,20 @@ and accepts a fresh CLI answer` in `scripts/conveyor/__tests__/no-code-rearm.tes
 receipt states and legacy rearm/empty-round notes through the CLI and back into planning.
 After the label handoff, remaining red required checks resume ordinary `ci-heal` planning, including
 a `review:human` handoff, which preserves the human hold without adding `review:pending`.
+Confirmed handoffs produce no new no-code decision ask. An unconfirmed intent still asks a person to
+check the live labels. Ordinary work never receives the no-code `operatorAnswer` payload.
+The executor passes `--no-code-rearm` with `--expect-head` to preserve live red-team labels. A head pin
+alone keeps ordinary recovery semantics: the orphan guard can re-arm a repaired red-team send-back.
 The handoff comment records the honoured no-code ruling without spending another repair round, so
 the requested review remains eligible when the existing repair count is exactly at its cap.
 The tests `incident #%s ruling rearms once with no refusals, then resumes required-check CI healing` cover both
 incident IDs with reconstructed required-check evidence; captured real-state rollups were unavailable
 in the offline repair context.
+The PR body's original acceptance claim of a read-only replay on the real state of #7448 and #7451
+at b74314d4 is a **manual one-off check**, not a named automated test. Its captured inputs and output
+were not supplied to this repair, so it is not independently verified here. The automated coverage
+is the reconstructed incident test above and the `no-code-rearm-handoff` soak replay through the
+production planner, executor and label writer with injected IO.
 The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
 we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-command workflow,
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.

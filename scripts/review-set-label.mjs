@@ -420,15 +420,15 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-function pinnedRearmSecurityRefusal(labels) {
+function noCodeRearmSecurityRefusal(labels) {
   const names = Array.isArray(labels) && labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
     ? labels.map(l => typeof l === 'string' ? l : l.name) : null;
   const hold = names?.find(l => l === 'red-team:blocked' || l === 'red-team:pending');
-  return names === null ? 'pinned re-arm refused: labels unreadable'
-    : hold ? `pinned re-arm refused: ${hold} stands` : null;
+  return names === null ? 'no-code re-arm refused: labels unreadable'
+    : hold ? `no-code re-arm refused: ${hold} stands` : null;
 }
 
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, pinnedRearm = false } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, noCodeRearm = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -533,8 +533,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // gap (a stale-accepted PR was never re-planned for review); it is not what was standing between a stale
   // acceptance and a bad merge — that gate already held.
   if (to === 'rearm') {
-    if (pinnedRearm) {
-      const security = pinnedRearmSecurityRefusal(currentLabels);
+    if (noCodeRearm) {
+      const security = noCodeRearmSecurityRefusal(currentLabels);
       if (security) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: security };
     }
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
@@ -1288,6 +1288,11 @@ export function runReviewLabelCli({
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
+  // Head pinning is shared with real-code recovery (including the orphan guard).
+  // Only the no-code executor opts into preserving outstanding red-team labels.
+  const noCodeFlags = argv.filter(a => a.startsWith('--no-code-rearm'));
+  const noCodeRearm = noCodeFlags.length === 1 && noCodeFlags[0] === '--no-code-rearm';
+  if (noCodeFlags.length && (!noCodeRearm || !pinnedRearm)) fail('--no-code-rearm requires a pinned re-arm and must appear once');
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
   if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedClearHuman && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, pinned accept or clear-human');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
@@ -1661,7 +1666,7 @@ export function runReviewLabelCli({
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
-    pinnedRearm,
+    noCodeRearm,
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
@@ -2095,8 +2100,8 @@ export function runReviewLabelCli({
     }))) {
       return readError(new Error('pre-swap labels unreadable — cannot guarantee re-arm rollback'));
     }
-    if (pinnedRearm) {
-      const security = pinnedRearmSecurityRefusal(fresh.labels);
+    if (noCodeRearm) {
+      const security = noCodeRearmSecurityRefusal(fresh.labels);
       if (security) return refuse(security);
     }
     if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');

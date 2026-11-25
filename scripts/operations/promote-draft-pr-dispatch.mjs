@@ -206,7 +206,7 @@ export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, r
     // Persist BEFORE spawning the label writer: a crash here must never launch another attempt next tick.
     post('intent');
     const script = new URL('../conveyor/rearm-review.mjs', import.meta.url).pathname;
-    const result = run(process.execPath, [script, String(prNumber), `--repo=${repoSlug}`, `--expect-head=${expectHead}`,
+    const result = run(process.execPath, [script, String(prNumber), `--repo=${repoSlug}`, `--expect-head=${expectHead}`, '--no-code-rearm',
       `--actor=conveyor (operator no-code ruling ${answerId})`],
     { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 });
     if (result?.status !== 0) {

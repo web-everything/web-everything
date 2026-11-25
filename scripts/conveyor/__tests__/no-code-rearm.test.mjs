@@ -11,9 +11,10 @@ import { buildOperatorAnswer, isNoCodeRearmAnswer, isNoCodeRearmExecuted, latest
 import { runStandDownAnswer } from '../stand-down-answer.mjs';
 import { decideSetLabel, runReviewLabelCli } from '../../review-set-label.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
-import { buildNoChangeComment, buildRearmComment, decideRearm } from '../rearm-review.mjs';
+import { buildNoChangeComment, buildRearmComment, decideRearm, hasInvalidArgs } from '../rearm-review.mjs';
 import { runReconcilePromoteDraftDispatch, defaultRearmNoCode } from '../../operations/promote-draft-pr-dispatch.mjs';
-import { replayNoCodeHandoff } from '../soak/breaks/no-code-rearm-handoff.mjs';
+import { replayNoCodeHandoff, replayOrphanRearm } from '../soak/breaks/no-code-rearm-handoff.mjs';
+import { NOTE_COMMENT_MARKER, planNoteComment } from '../reconcile-note-comment.mjs';
 import { NO_CODE_REARM_TRAILER, REARM_COMMENT_MARKER, isFixRoundRearmComment } from '../rearm-round-count.mjs';
 
 const BOT = { login: 'web-everything' };
@@ -32,15 +33,59 @@ const kinds = (p, kind) => p.dispatch.filter((d) => d.kind === kind);
 const noFixers = (p) => expect(p.dispatch.filter((d) => ['fix', 'ci-heal', 'review'].includes(d.kind))).toEqual([]);
 const refusalKinds = (p) => p.refusals.map((r) => r.kind);
 const workRows = p => p.dispatch.map(({ operatorAnswer: _ruling, ...row }) => row);
+const noRulingPayload = p => p.dispatch.filter(row => row.kind !== 'rearm-no-code').forEach(row => {
+  expect(row).not.toHaveProperty('operatorAnswer');
+});
 const receipt = (state, head = HEAD, answerId = 'IC_200') => ({ id: `IC_${state}`, author: BOT,
   body: `<!-- no-code-rearm ${state === 'failed' ? 'attempt' : 'state'}=${state} answer=${answerId} head=${head} -->` });
 
 describe('review recovery regressions', () => {
+  it.each([
+    { flags: ['--no-code-rearm=false'] }, { flags: ['--no-code-rearm-typo'] },
+    { flags: ['--no-code-rearm', '--no-code-rearm'] },
+  ])('rejects malformed no-code opt-in $flags in both CLI layers before IO', ({ flags }) => {
+    expect(hasInvalidArgs(['7448', `--expect-head=${HEAD}`, ...flags])).toBe(true);
+    const exit = process.exit;
+    const output = [];
+    process.exit = code => { throw new Error(`exit ${code}`); };
+    try {
+      expect(() => runReviewLabelCli({ fixedTo: 'rearm',
+        argv: ['7448', '--repo=o/r', `--expect-head=${HEAD}`, ...flags],
+        emit: line => output.push(line), provider: new Proxy({}, { get() { throw new Error('unexpected IO'); } }),
+      })).toThrow('exit 2');
+    } finally { process.exit = exit; }
+    expect(output.join('')).toContain('--no-code-rearm requires a pinned re-arm');
+  });
+  it('requires a head pin for the no-code opt-in before IO', () => {
+    const exit = process.exit;
+    const output = [];
+    process.exit = code => { throw new Error(`exit ${code}`); };
+    try {
+      expect(() => runReviewLabelCli({ fixedTo: 'rearm', argv: ['7448', '--repo=o/r', '--no-code-rearm'],
+        emit: line => output.push(line), provider: new Proxy({}, { get() { throw new Error('unexpected IO'); } }),
+      })).toThrow('exit 2');
+    } finally { process.exit = exit; }
+    expect(output.join('')).toContain('--no-code-rearm requires a pinned re-arm');
+  });
+  it.each(['red-team:pending', 'red-team:blocked'])('orphan guard argv still rearms a repaired PR carrying %s', label => {
+    const result = replayOrphanRearm(label);
+    expect(result.labels).toEqual(['review:pending']);
+    expect(result.writes).toHaveLength(1);
+  });
+  it.each([false, true])('successful handoff publishes no new decision ask (human=%s)', human => {
+    const { second, snapshot } = replayNoCodeHandoff({ human });
+    expect(second.notes.filter(note => note.kind.startsWith('no-code-rearm-'))).toEqual([]);
+    const asks = second.notes.map(note => planNoteComment(note, snapshot.comments))
+      .filter(note => !note.alreadyPosted && !note.suppressed && note.body.startsWith(NOTE_COMMENT_MARKER));
+    expect(asks).toEqual([]);
+    noRulingPayload(second);
+  });
   it.each([false, true])('retires waived structured findings after the real label writer handoff (human=%s)', human => {
     const { first, second, snapshot } = replayNoCodeHandoff({ human });
     expect(first.dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
     expect(first.refusals).toEqual([]);
     expect(second.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+    noRulingPayload(second);
     expect(second.dispatch[0].joinedInputs?.reviewFindings ?? []).toEqual([]);
     expect(snapshot.labels.some(l => l.name === 'review:human')).toBe(human);
     expect(snapshot.labels.some(l => l.name === 'review:pending')).toBe(!human);
@@ -68,6 +113,7 @@ describe('review recovery regressions', () => {
     const { snapshot, planNext } = replayNoCodeHandoff({ human: true });
     mutate(snapshot);
     const next = planNext();
+    noRulingPayload(next);
     // review:changes with a spent ruling is an operator hold; a later verdict/claim or security label
     // invalidates the waiver and resumes the ordinary fixer policy.
     if (_why === 'review:changes') expect(next.dispatch).toEqual([]);
@@ -124,6 +170,7 @@ describe('review recovery regressions', () => {
     }, run: () => { snapshot.labels = [{ name: 'review:pending' }]; return { status: 0 }; } });
     const second = tick();
     expect(second.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: number })]);
+    noRulingPayload(second);
     expect(second.refusals).toEqual([]);
   });
   it.each([
@@ -182,8 +229,8 @@ describe('review recovery regressions', () => {
     expect(noCodeRearmState(snapshot.comments, HEAD).applicable).toBe(false);
     expect(noCodeRearmState([...snapshot.comments, receipt('confirm', HEAD)], moved).executed).toBe(false);
   });
-  it.each(['red-team:blocked', 'red-team:pending'])('a pinned rearm refuses live %s without removing labels', label => {
-    expect(decideSetLabel({ to: 'rearm', currentLabels: ['review:changes', label], pinnedRearm: true }))
+  it.each(['red-team:blocked', 'red-team:pending'])('an explicit no-code rearm refuses live %s without removing labels', label => {
+    expect(decideSetLabel({ to: 'rearm', currentLabels: ['review:changes', label], noCodeRearm: true }))
       .toMatchObject({ allowed: false, removeLabels: [], reason: expect.stringContaining(label) });
   });
   it.each(['red-team:blocked', 'red-team:pending'])('the shared writer preserves %s arriving between the first read and label write', label => {
@@ -194,7 +241,7 @@ describe('review recovery regressions', () => {
     process.exit = code => { throw Object.assign(new Error('exit'), { exitCode: code }); };
     try {
       expect(() => runReviewLabelCli({ fixedTo: 'rearm',
-        argv: ['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--actor=conveyor'],
+        argv: ['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--no-code-rearm', '--actor=conveyor'],
         defaultActor: 'conveyor', usage: 'test', buildComment: () => 'rearm',
         successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ reason: decision.reason }),
         emit: line => output.push(line), appendLedgerVerdict: () => ({ ok: true }),
@@ -208,7 +255,7 @@ describe('review recovery regressions', () => {
       })).toThrow('exit');
     } finally { process.exit = exit; }
     expect(reads).toBeGreaterThan(1);
-    expect(output.join('')).toContain(`pinned re-arm refused: ${label} stands`);
+    expect(output.join('')).toContain(`no-code re-arm refused: ${label} stands`);
     expect(writes).toEqual([]);
   });
   it.each([
@@ -240,6 +287,7 @@ describe('round-1 negative regressions', () => {
   });
   it.each([[[]], [[receipt('confirm')]]])('a newer head ignores the old ruling and receipts (%j)', receipts => {
     const p = plan({ headRefOid: 'a'.repeat(40), comments: [...base, ...receipts] });
+    noRulingPayload(p);
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
     expect(refusalKinds(p)).not.toContain('no-code-rearm-spent');
     expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
@@ -250,9 +298,11 @@ describe('round-1 negative regressions', () => {
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
     expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
     expect(workRows(p)).toEqual(workRows(ordinary));
+    noRulingPayload(p);
     expect(refusalKinds(p)).toEqual(refusalKinds(ordinary));
     expect(refusalKinds(p)).toContain('already-reviewed-head');
     if (state === 'intent') expect(p.notes).toContainEqual(expect.objectContaining({ kind: 'no-code-rearm-crashed', text: expect.stringMatching(/check.*labels/i) }));
+    if (state === 'confirm') expect(p.notes.some(note => note.kind.startsWith('no-code-rearm-'))).toBe(false);
   });
   it('pending labels after an intent still dispatch a review with complete green CI evidence', () => {
     const comments = [ { ...verdict, body: '🔁 review — changes requested' }, ...base.slice(1), receipt('intent') ];
@@ -405,6 +455,7 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
     const swapped = plan({ labels: [{ name: 'review:pending' }], comments: [...base, { id: 'IC_300', author: BOT, body: buildNoChangeComment({ actor: 'x', since: 'abc' }) }] });
     expect(kinds(swapped, 'rearm-no-code')).toEqual([]);
     expect(refusalKinds(swapped)).not.toContain('no-code-rearm-spent');
+    expect(swapped.notes.some(note => note.kind.startsWith('no-code-rearm-'))).toBe(false);
   });
   it('1,3: a live fix claim plans no rearm-no-code, no review, no fixer', () => {
     const p = plan({ fixClaim: { who: 'fix-1', claimedAt: '2026-11-24T21:59:00Z' } });
@@ -422,6 +473,7 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
     const p = plan({ labels: [{ name: 'review:changes' }, { name: label }] });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
     expect(kinds(p, 'fix')).toHaveLength(1);
+    noRulingPayload(p);
     expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
   });
   it('4: a head that is not a full sha or an incomplete label list is held until evidence recovers', () => {
@@ -440,6 +492,7 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
     ['a hand acceptance', { labels: [{ name: 'review:accepted' }] }],
   ])('%s makes the ruling stale and resumes the ordinary plan', (_why, over) => {
     const p = plan(over);
+    noRulingPayload(p);
     const ordinary = plan({ ...over, comments: [...(over.comments ?? base), answer({ noCodeOwed: false }, 'IC_299')] });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
     expect(workRows(p)).toEqual(workRows(ordinary));
@@ -449,6 +502,7 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
     const comments = [...base, { ...begin('IC_210'), body: '🔒 conveyor fix-begin — fix claim held\nclaim without a starting sha' }];
     const p = plan({ comments });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    noRulingPayload(p);
     expect(workRows(p)).toEqual(workRows(plan({ comments: [...comments, answer({ noCodeOwed: false }, 'IC_299')] })));
   });
   it('an answer without noCodeOwed (plain rearm-review) never plans rearm-no-code', () => {
@@ -483,7 +537,7 @@ describe('executor: one attempt per tick, rearm-review is the only writer', () =
     const seen = [];
     defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200', postComment: () => {}, run: (cmd, args) => { seen.push([cmd, args]); return { status: 0, stdout: 'ok' }; } });
     expect(seen[0][1].some((a) => a.endsWith('rearm-review.mjs'))).toBe(true);
-    expect(seen[0][1]).toEqual(expect.arrayContaining(['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--actor=conveyor (operator no-code ruling IC_200)']));
+    expect(seen[0][1]).toEqual(expect.arrayContaining(['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--no-code-rearm', '--actor=conveyor (operator no-code ruling IC_200)']));
     expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 1, expectHead: HEAD, answerId: 'IC_200', postComment: () => {}, run: () => ({ status: 1, stderr: 'refused' }) })).toThrow('refused');
   });
 });

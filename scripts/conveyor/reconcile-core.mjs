@@ -2910,7 +2910,7 @@ export function planReconcile({
     // ── STANDDOWN-EMPTY-ROUND (D2) — the orchestrator's `rearm-review --no-code-owed` ruling is EXECUTED once by the
     // conveyor and NEVER handed to a fixer. After every refusal above (live claim, pause, liveness) and before every
     // round-cap or fix branch. Stale rulings resume ordinary work; spent attempts on review:changes await a fresh answer.
-    // Rearm-review.mjs rechecks head and labels again at write time (`--expect-head`).
+    // Rearm-review.mjs rechecks head and labels at write time (`--expect-head`, `--no-code-rearm`).
     const noCodeState = noCodeRearmState(pr?.comments, pr?.headRefOid);
     if ((pr?.state ?? 'OPEN') === 'OPEN' && isNoCodeRearmAnswer(operatorAnswer) && noCodeState.applicable) {
       const { held, stale } = noCodeRearmGuard(pr);
@@ -2925,8 +2925,15 @@ export function planReconcile({
           text: `PR #${prNumber}: no-code rearm intent has no confirmation — a person must check the labels before issuing a fresh answer.` });
       }
       if (stale) {
-        notes.push({ kind: 'no-code-rearm-stale', prNumber,
-          text: `PR #${prNumber}: the no-code rearm ruling is stale — ${stale}; ordinary planning resumes.` });
+        // Losing review:changes is the expected successful handoff. A confirmed
+        // receipt (or legacy success without an outstanding intent) owes no new ask.
+        // Failed and unconfirmed intents still retain their recovery notes.
+        const completed = noCodeState.executed && !noCodeState.failed
+          && (!noCodeState.intent || noCodeState.confirmed);
+        if (!completed || withPhase.labels.includes('review:changes')) {
+          notes.push({ kind: 'no-code-rearm-stale', prNumber,
+            text: `PR #${prNumber}: the no-code rearm ruling is stale — ${stale}; ordinary planning resumes.` });
+        }
       } else if (noCodeState.executed) {
         if (noCodeState.failed) {
           refuse('no-code-rearm-failed', { why: 'the no-code rearm attempt failed; check labels and issue a fresh operator answer' });
