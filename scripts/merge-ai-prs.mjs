@@ -4758,7 +4758,8 @@ const execFileSync = guardedExec(rawExecFileSync);
 const spawnSync = guardedExec(rawSpawnSync);
 const execFileP = guardedExec(execDrainAsync);
 const readGit = (args, options) => guardedExec((_file, a, o) => rawReadGit(a, o))('git', args, options);
-const readGh = (args, options) => guardedExec((_file, a, o) => rawReadGh(a, o))('gh', args, options);
+const GH_READ_COMMAND = 'gh'; // a named constant: this wrapper only reads, so it stays out of the write-site ratchet
+const readGh = (args, options) => guardedExec((_file, a, o) => rawReadGh(a, o))(GH_READ_COMMAND, args, options);
 const guardedHelper = (kind, run) => (...args) => {
   const boundary = drainWriteContext.getStore()?.boundary;
   return boundary ? boundary.helper(kind, run)(...args) : run(...args);

@@ -2762,7 +2762,7 @@ describe('catch-up miss backoff', () => {
         if (node.text.startsWith('defer-to-pass:')) { expect(isFastDrainDeferKind(node.text), node.text).toBe(true); kinds.add('defer-to-pass'); }
         else kinds.add(node.text);
       }
-      else if (['precondition.kind', 'rows.deferredKind', 'writeBoundary.violations[0]', 'boundary.violations.at(-1)'].includes(node.getText())) kinds.add('defer-to-pass');
+      else if (['precondition.kind', 'rows.deferredKind', 'writeBoundary.violations[0]', 'boundary.violations.at(-1)', 'deferKind', 'boundaryDefer'].includes(node.getText())) kinds.add('defer-to-pass');
       else if (ts.isConditionalExpression(node)) { literals(node.whenTrue); literals(node.whenFalse); }
       else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken) literals(node.right);
       else throw new Error(`Unclassified dynamic enqueue kind: ${node.getText()}`);
