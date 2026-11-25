@@ -158,6 +158,18 @@ describe('update-branch', () => {
     expect(f.gh).not.toHaveBeenCalled();
   });
 
+  it.each([null, [head, 'd'.repeat(40)], [head, head]])('refuses an explicit null or repeated expected head before any IO (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it('accepts a single-element array from the repeatable CLI flag and runs the head lock', async () => {
+    const f = fixture([pull]);
+    expect(await f.run({ ...input, 'expected-head': ['d'.repeat(40)] })).toMatchObject({ status: 'head-moved' });
+    expect(writes(f)).toHaveLength(0);
+  });
+
   it('declares --expected-head in the CLI usage', async () => {
     const { declaration } = resolveOperation(UPDATE_BRANCH_OP);
     expect(parseOperationArgv(declaration, ['--pr=42', '--reason=x', `--expected-head=${head}`]).ok).toBe(true);

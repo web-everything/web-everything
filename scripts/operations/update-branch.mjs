@@ -6,7 +6,14 @@ import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repo
 export const UPDATE_BRANCH_OP = 'update-branch';
 
 const EXPECTED_HEAD = /^[0-9a-f]{40}$/;
-const expectedOf = input => input['expected-head'] ?? input.expectedHead;
+/** Absent key -> undefined (no guard). A present key must hold exactly one 40-hex sha: null, a repeated flag
+ * (the parser collects repeats into an array) or any other shape is returned as-is so validate refuses it. */
+function expectedOf(input) {
+  if (!Object.hasOwn(input, 'expected-head')) return undefined;
+  const value = input['expected-head'];
+  if (value === undefined || (Array.isArray(value) && value.length === 0)) return undefined; // the CLI supplies [] when the flag is omitted
+  return Array.isArray(value) && value.length === 1 ? value[0] : (Array.isArray(value) ? value.join(',') : (value ?? null));
+}
 
 function validate({ pr, reason, ...rest }) {
   const expected = expectedOf(rest);
@@ -91,7 +98,8 @@ export function updateBranchOperation() {
   return op(UPDATE_BRANCH_OP, {
     input: { pr: { type: 'number', required: true }, reason: { type: 'string', required: true },
       repo: { type: 'string', required: false, default: CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug },
-      'expected-head': { type: 'string', required: false } },
+      // repeatable: a repeated --expected-head reaches validate as a 2+ element array and is refused, never last-wins.
+      'expected-head': { type: 'array', repeatable: true, required: false } },
     verdictFrom: 'assess',
     act: effect({ reads: ['input.pr', 'input.reason', 'input.repo', 'input.expected-head'], effects: ({ input }) => {
       validate(input);
