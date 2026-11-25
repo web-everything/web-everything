@@ -17,7 +17,6 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { dispatchReviewJob, runReviewJob, runReviewJobCli, createReviewJobIo } from '../review-job.mjs';
-import * as childProcess from 'node:child_process';
 it('job CLI forwards its high-care model and the loop spawns with that model', () => {
   const runJob = vi.fn(() => ({ refused: true }));
   const previousExit = process.exitCode;
@@ -25,9 +24,12 @@ it('job CLI forwards its high-care model and the loop spawns with that model', (
   try {
     runReviewJobCli(['run', '--pr=1', '--repo=web-everything/web-everything', `--expected-head=${'a'.repeat(40)}`, '--review-model=opus'], { runJob });
     expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ reviewModel: 'opus' }));
-    const spawn = vi.spyOn(childProcess, 'spawnSync').mockReturnValue({ status: 0, stdout: '', stderr: '' });
-    createReviewJobIo({ root: '/fixture', env: {} }).runLoop({ pr: 1, repo: 'fixture/repo', lanePath: '/lane', reviewModel: 'opus' });
-    expect(spawn.mock.calls.at(-1)[1]).toContain('--model=opus');
+    const spawnNode = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }));
+    createReviewJobIo({ root: '/fixture', env: {}, spawnNode }).runLoop({ pr: 1, repo: 'fixture/repo', lanePath: '/lane', reviewModel: 'opus' });
+    expect(spawnNode).toHaveBeenCalledTimes(1);
+    expect(spawnNode).toHaveBeenCalledWith(process.execPath,
+      expect.arrayContaining(['scripts/operations/review-loop-cli.mjs', '--model=opus']),
+      expect.objectContaining({ cwd: '/fixture' }));
   } finally { process.exitCode = previousExit; stdout.mockRestore(); vi.restoreAllMocks(); }
 });
 
