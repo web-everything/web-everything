@@ -660,7 +660,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!check.ok) return { ok: false, refused: check.reason, containment, check, code: 1 };
     if (check.candSha !== expectedSha) return { ok: false, refused: 'sha-moved', containment, check, code: 3 };
     if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
-    const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: deps.tip });
+    const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: tip });
     if (!hp.ok) return { ok: false, refused: hp.reason, containment, check, code: 3 };
     return { ok: true, oldEntry, containment, check };
   };

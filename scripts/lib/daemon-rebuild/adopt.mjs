@@ -517,7 +517,7 @@ async function finalizeRebuildLocked({
   }
 
   // unaudited-tip — the plan was minted BEFORE the (unlocked, minutes-long) smoke, so a red fix-ready record appended for a tip it
-  // applies during that window would still be adopted here. Only the direct smoke path passes the gate (a ready-candidate
+  // applies during that window would still be adopted here. The direct smoke and force-watch rollback paths pass the gate (a ready-candidate
   // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
   // RS-HP-3 (FLOW-DMN-048): only a rollback whose target IS the recorded previous generation (the force watch's lastGood, re-read
   // now) skips the revoked-evidence check. The lease token alone proves nothing; any other target gets the full check.

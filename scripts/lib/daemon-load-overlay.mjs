@@ -83,7 +83,7 @@ import {
 /**
  * RS-HP-3 (the ONE door): a hotpatch/* ref registers only when the hotpatch admission (CI receipt + own-sha audit) passes
  * for the exact candidate sha the merge check fetched, and origin/<ref> is still that sha afterwards. Fail closed.
- * Shared by guardedRegister and `daemon-overlay add`; non-hotpatch refs pass untouched.
+ * Shared by guardedRegister and `daemon-overlay add/replace`; non-hotpatch refs pass untouched.
  * @returns {Promise<{ok:true}|{ok:false, reason:string}>}
  */
 export async function admitHotpatchRef({ root, ref, candSha, env = process.env, admitHotpatch = null, tipOf = null }) {
@@ -93,7 +93,9 @@ export async function admitHotpatchRef({ root, ref, candSha, env = process.env, 
     if (typeof candSha !== 'string' || !/^[a-f0-9]{40}$/.test(candSha)) return refused('hotpatch-not-admitted');
     const admit = admitHotpatch ?? (async (sha) => realAdmitHotpatch(sha, createHotpatchReaders({ cwd: root, env })));
     if ((await admit(candSha, { root, ref, env }))?.outcome !== 'pass') return refused('hotpatch-not-admitted');
-    const tip = typeof tipOf === 'function' ? await tipOf(ref) : null; // callers pass daemon-overlay's remoteTip; none = refuse
+    // Lazy import avoids the cycle: daemon-overlay imports this module's safety settings.
+    const readTip = tipOf ?? ((r) => import('../daemon-overlay.mjs').then(({ remoteTip }) => remoteTip({ root, ref: r, env })));
+    const tip = await readTip(ref);
     return tip === candSha ? { ok: true } : refused('hotpatch-sha-moved');
   } catch { return refused('hotpatch-not-admitted'); }
 }
