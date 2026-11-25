@@ -1,0 +1,8 @@
+{
+  "standardsStatus": {
+    "enabled": true,
+    "repos": ["plateauapp/plateau-app"],
+    "validatorPath": "~/workspace/.operations/handoff/standards/drafts/tools/validate.mjs",
+    "runTimeoutMs": 120000
+  }
+}

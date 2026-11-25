@@ -141,6 +141,7 @@ import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-set
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { resolveCeilingMs as resolveAdmissionCeilingMs } from '../readiness/heavy-admission.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { runStandardsStatusPassFromSettings } from './standards-status-pass.mjs';
 import { branchMatchesQueueIds, isQueueScopeEnabled, readScopedQueueIds } from './queue-scope.mjs';
 
 /** Several multiples of the gate's documented 150-350s normal range — generous on purpose (see file header):
@@ -308,6 +309,7 @@ const expandHome = (p) => (p && p.startsWith('~') ? join(homedir(), p.slice(1)) 
 const POOL_ROOT = expandHome(process.env.LANE_POOL_ROOT) || join(homedir(), 'workspace', '.lanes');
 
 const log = (m) => process.stderr.write(m + '\n');
+let standardsStatusInFlight = null;
 
 /** Lane indices under a pool dir (`lane-N` children), sorted — mirrors lane-pool's own `laneIndicesIn`. */
 export function laneIndicesIn(poolDir) {
@@ -797,8 +799,15 @@ export function readLaneState(dir) {
  */
 export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateBounded, poolRoot = POOL_ROOT,
   inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env), onSettled = null,
-  launchGate = null, killJobGate = null, laneHeld = null,
+  launchGate = null, killJobGate = null, laneHeld = null, standardsStatusPass = poolRoot === POOL_ROOT ? runStandardsStatusPassFromSettings : null,
 } = {}) {
+  // VERIFIER-STANDARDS-STATUS: post `standards/validate` for open plateau-app PRs. Never awaited (a run takes seconds
+  // per PR and must not delay gate dispatch) and never overlapping itself; every failure is contained and logged.
+  if (!dryRun && standardsStatusPass && !standardsStatusInFlight) {
+    standardsStatusInFlight = Promise.resolve().then(() => standardsStatusPass({ log }))
+      .catch((error) => log(`  ⚠ standards-status pass failed (non-fatal): ${String(error?.message || error).split('\n')[0]}`))
+      .finally(() => { standardsStatusInFlight = null; });
+  }
   const deferred = [];
   const superseded = [];
   const dispatched = [];
