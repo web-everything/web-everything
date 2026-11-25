@@ -132,6 +132,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/review-red-team-on-skip.json',
   // Decides which red-main timeouts the safety net quarantines at once (quarantine-early slice 2).
   'scripts/settings/test-timeout-policy.json',
+  // Standalone selector documents named by settings-files.mjs, a protected settings reader.
+  'scripts/settings/delivery-strategy.json', 'scripts/settings/delivery-strategy-table.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
