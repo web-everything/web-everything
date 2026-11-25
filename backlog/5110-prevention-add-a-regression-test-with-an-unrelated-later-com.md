@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/conveyor/main-red-recovery.mjs", "we:scripts/conveyor/ci-heal-mark.mjs", "we:scripts/operations/land-advance-repair.mjs", "we:scripts/conveyor/__tests__/reconcile-pass.test.mjs", "we:scripts/conveyor/__tests__/tick-core.test.mjs", "we:scripts/conveyor/__tests__/main-red-recovery.test.mjs", "we:scripts/conveyor/__tests__/ci-heal-mark.test.mjs", "we:scripts/operations/__tests__/land-advance-repair.test.mjs"]
+
 dateOpened: "2026-10-04"
 tags: []
 ---
@@ -27,3 +27,12 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-25)
+
+The build-dispatch daemon held #5110 with:
+
+> worker-declined: Not prepared: #5110 — could-not-prepare. Its instruction to leave the in-session tally untouched conflicts with the gross-tally refund behavior explicitly retained by #5968 and tested in 'we:scripts/conveyor/__tests__/tick-core.test.mjs:2322'. The unresolved choice is whether to replace that accounting model or preserve it while adding attempt-level correlation so historical refunds cannot erase unrelated attempts. Current subtraction occurs at 'we:scripts/conveyor/tick-core.mjs:922'. The overall goal remains undelivered; newline collapsing is already implemented at 'we:scripts/conveyor/main-red…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
