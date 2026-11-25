@@ -1,8 +1,9 @@
 /** Validated, provenance-bound heavy PR entries. Only this module constructs or persists them. */
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { LISTED_FILES_CAP } from './red-main-quarantine.mjs';
-import { prSnapshotDir } from './pr-snapshot-store.mjs';
+import { prSnapshotDir, prSnapshotEnabled, latestDirtyMs } from './pr-snapshot-store.mjs';
 import { withFileLock, writeJsonAtomic } from './atomic-json-file.mjs';
 
 export const IDENTITY = Object.freeze(['number', 'headRefOid', 'baseRefOid', 'baseRefName', 'updatedAt']);
@@ -72,10 +73,12 @@ export function readHeavyPinned(row, ghStdout, fetchedAtMs) {
 
 function storePath(repo, dir) {
   if (typeof repo !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new TypeError('repo must be an owner/name slug');
-  return join(dir, `heavy-${repo.replace('/', '-').toLowerCase()}.json`);
+  return join(dir, `heavy-${createHash('sha256').update(repo.toLowerCase()).digest('hex')}.json`);
 }
 export function loadHeavyStore({ repo, dir = prSnapshotDir() }) {
-  const path = storePath(repo, dir), entries = new Map();
+  const entries = new Map();
+  if (!prSnapshotEnabled()) return { entries, dropped: 0 };
+  const path = storePath(repo, dir);
   let data;
   try { data = JSON.parse(readFileSync(path, 'utf8')); }
   catch (error) {
@@ -84,17 +87,23 @@ export function loadHeavyStore({ repo, dir = prSnapshotDir() }) {
     return { entries, dropped: 1 };
   }
   if (!Array.isArray(data?.entries)) return { entries, dropped: 1 };
+  const dirtyMs = latestDirtyMs(dir, repo);
+  if (dirtyMs > 0 && data.entries.some(record => record?.fetchedAtMs <= dirtyMs)) {
+    return { entries, dropped: data.entries.length };
+  }
   let dropped = 0;
   for (const record of data.entries) {
+    if (record?.repo !== repo.toLowerCase()) { dropped++; continue; }
     try { const entry = makeEntry(record, record, record?.fetchedAtMs); entries.set(entry.number, entry); }
     catch { dropped++; }
   }
   return { entries, dropped };
 }
 export function saveHeavyStore({ repo, dir = prSnapshotDir(), entries }) {
+  if (!prSnapshotEnabled()) return;
   const path = storePath(repo, dir);
   const records = [...entries.values()];
   if (records.some(entry => !MADE.has(entry))) throw new TypeError('cannot save an unvalidated heavy entry');
   mkdirSync(dir, { recursive: true });
-  withFileLock(`${path}.lock`, () => writeJsonAtomic(path, { entries: records }));
+  withFileLock(`${path}.lock`, () => writeJsonAtomic(path, { entries: records.map(entry => ({ ...entry, repo: repo.toLowerCase() })) }));
 }

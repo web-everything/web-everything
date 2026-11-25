@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /** Real drain entrypoint with hermetic git/gh transports; every listing is recorded as argv. */
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -141,7 +142,7 @@ out({});
         ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))
         ? readFileSync(join(dir, 'calls.jsonl.views'), 'utf8').trim().split('\n').map(JSON.parse) : [],
-      heavyStores: ['web-everything','frontierui','plateau-app'].filter(name => existsSync(join(snapshots, `heavy-fixture-${name}.json`))),
+      heavyStores: ['web-everything','frontierui','plateau-app'].filter(name => existsSync(join(snapshots, `heavy-${createHash('sha256').update(`fixture/${name}`).digest('hex')}.json`))),
       passSnapshotPublished: existsSync(roundPath),
       cachedBranch: readDefaultBranchCache('fixture/web-everything', { env: cacheEnv }),
       fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && v.includes('statusCheckRollup'))).length,

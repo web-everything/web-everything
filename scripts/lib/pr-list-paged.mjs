@@ -59,14 +59,24 @@ export function resolvePrListPaging({ env = process.env, file } = {}) {
     const src = file === undefined ? readDeclaredSettings().settings : file;
     const raw = env?.[PR_LIST_PAGE_SIZE_ENV];
     const pageSize = raw != null && String(raw).trim() !== '' ? Number(raw) : undefined;
+    const deltaValid = {
+      heavyBackstopSeconds: n => Number.isInteger(n) && n >= 0 && n <= 604800,
+      heavySettleSeconds: n => Number.isInteger(n) && n >= 1 && n <= 300,
+    };
     const c = cascadePolicy('prListPaging', isObj(src?.prListPaging) ? src.prListPaging : undefined, {
       env, standard: PR_LIST_PAGING_DEFAULTS, envValues: { pageSize },
       valid: { pageSize: n => Number.isInteger(n) && n >= 1 && n <= 100,
         pageRetries: n => Number.isInteger(n) && n >= 0 && n <= 3,
         heavyMaxAgeSeconds: n => Number.isInteger(n) && n >= 0 && n <= 86400,
-        heavyBackstopSeconds: n => Number.isInteger(n) && n >= 0 && n <= 604800,
-        heavySettleSeconds: n => Number.isInteger(n) && n >= 1 && n <= 300 },
+        ...deltaValid },
     });
+    // Invalid explicit delta bounds disable reuse instead of falling through to platform values.
+    for (const key of ['heavyBackstopSeconds', 'heavySettleSeconds']) {
+      if (Object.hasOwn(src?.prListPaging ?? {}, key) && !deltaValid[key](src.prListPaging[key])) {
+        c.value[key] = undefined;
+        c.sources[key] = 'tool';
+      }
+    }
     return { ...PR_LIST_PAGING_DEFAULTS, ...c.value, source: c.sources };
   } catch {
     return { ...PR_LIST_PAGING_DEFAULTS,
@@ -365,6 +375,9 @@ export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {
 /** One pinned read per stale row, joined before publishing any rows or entries. */
 export async function hydrateDeltaAsync({ repo, rows, execAsync, store = new Map(), nowMs, bounds, isCandidate, execOpts = {} }) {
   if (typeof isCandidate !== 'function') throw new TypeError('delta requires isCandidate');
+  const incomplete = rows.find(row => row.labelsComplete !== true);
+  if (incomplete) throw new PrListUnreadableError({ repo, stage: 'page', page: `PR #${incomplete.number}`,
+    cause: new Error(`incomplete labels for PR #${incomplete.number} — refusing partial candidacy evidence`) });
   const stats = { fetched: 0, reused: 0, candidates: 0, byReason: {} };
   const reasons = rows.map(row => {
     const candidate = !!isCandidate(row);

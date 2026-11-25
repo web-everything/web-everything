@@ -1,8 +1,10 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { IDENTITY, HEAVY, identityOf, validHeavy, makeEntry, loadBounds, whyNotReuse, mayReuse,
   readHeavyPinned, loadHeavyStore, saveHeavyStore } from '../heavy-cache.mjs';
+import { markPrSnapshotDirty } from '../pr-snapshot-store.mjs';
 import { LISTED_FILES_CAP } from '../red-main-quarantine.mjs';
 
 // Deterministic seeded rows; each property case changes exactly one field.
@@ -21,6 +23,14 @@ const badHeavy = () => [null, ...[null, undefined, 1, {}, []].map(body => ({...h
   ...[null, {}, [null], [{}], [{path:''}], [{path:1}], [new (class File {path='a';})()],
     Array.from({length:LISTED_FILES_CAP}, () => ({path:'a'}))].map(files => ({body:'',files}))];
 
+const storeFile = (dir, repo) => join(dir, `heavy-${createHash('sha256').update(repo.toLowerCase()).digest('hex')}.json`);
+let snapshotDir;
+beforeEach(() => {
+ snapshotDir = mkdtempSync(join(process.env.TMPDIR, 'heavy-isolated-'));
+ vi.stubEnv('WE_PR_SNAPSHOT_DIR', snapshotDir);
+ vi.stubEnv('WE_PR_SNAPSHOT', '1');
+});
+afterEach(() => { vi.unstubAllEnvs(); rmSync(snapshotDir, {recursive:true,force:true}); });
 describe('heavy-cache', () => {
   it('P1 every identity field missing, null, empty, wrong-typed or malformed: makeEntry throws and mayReuse is false', () => {
     for (const field of IDENTITY) for (const value of invalid(field)) {
@@ -57,7 +67,7 @@ describe('heavy-cache', () => {
     try {
       saveHeavyStore({repo:'owner/name',dir,entries:new Map([[r.number,e]])});
       expect(mayReuse(loadHeavyStore({repo:'owner/name',dir}).entries.get(r.number),r,stamp+6000,bounds())).toBe(true);
-      writeFileSync(join(dir,'heavy-owner-name.json'), JSON.stringify({entries:[e,{...e,number:null}]}));
+      writeFileSync(storeFile(dir,'owner/name'), JSON.stringify({entries:[{...e,repo:'owner/name'},{...e,repo:'owner/name',number:null}]}));
       const loaded = loadHeavyStore({repo:'owner/name',dir});
       expect(loaded.dropped).toBe(1); expect(loaded.entries.size).toBe(1);
     } finally { rmSync(dir,{recursive:true,force:true}); }
@@ -96,5 +106,55 @@ describe('heavy-cache', () => {
     expect(() => {e.files[0].path='changed';}).toThrow(TypeError);
     expect(() => {e.files.push({path:'x'});}).toThrow(TypeError);
     h.files[0].path='source changed'; expect(e.files[0].path).toBe('src/a.mjs');
+  });
+});
+
+describe('heavy store isolation', () => {
+  it.each(['disabled', 'under-test', 'fake-gh'])('%s loads empty and saves nothing even with an explicit dir argument', kind => {
+    const repo = 'owner/name', r = row(), entries = new Map([[r.number, makeEntry(r, heavy(), stamp + 5000)]]);
+    saveHeavyStore({repo, dir:snapshotDir, entries});
+    const path = storeFile(snapshotDir, repo), before = readFileSync(path, 'utf8');
+    if (kind === 'disabled') vi.stubEnv('WE_PR_SNAPSHOT', '0');
+    else {
+      vi.stubEnv('WE_PR_SNAPSHOT_DIR', '');
+      if (kind === 'fake-gh') {
+        vi.stubEnv('VITEST', ''); vi.stubEnv('WE_UNDER_TEST', ''); vi.stubEnv('FAKE_GH_FIXTURE', 'fixture');
+      }
+    }
+    expect(loadHeavyStore({repo, dir:snapshotDir})).toEqual({entries:new Map(), dropped:0});
+    saveHeavyStore({repo, dir:snapshotDir, entries:new Map()});
+    expect(readFileSync(path, 'utf8')).toBe(before);
+    saveHeavyStore({repo:'absent/repo', dir:snapshotDir, entries});
+    expect(readdirSync(snapshotDir)).toEqual([path.split('/').at(-1)]);
+  });
+  it.each(['owner/name', null])('a %s dirty marker drops and counts the store until fresh reads replace it', dirtyRepo => {
+    const repo = 'owner/name', r = row();
+    const entries = new Map([[r.number, makeEntry(r, heavy(), stamp + 5000)]]);
+    saveHeavyStore({repo, entries});
+    expect(markPrSnapshotDirty({repo:dirtyRepo, nowMs:stamp+6000})).toBe(true);
+    expect(loadHeavyStore({repo})).toEqual({entries:new Map(), dropped:1});
+    saveHeavyStore({repo, entries:new Map([[r.number, makeEntry(r, heavy(), stamp+7000)]])});
+    expect(loadHeavyStore({repo}).entries.size).toBe(1);
+  });
+  it('another repo dirty marker does not invalidate this repo', () => {
+    const r = row();
+    saveHeavyStore({repo:'owner/name', entries:new Map([[r.number, makeEntry(r, heavy(), stamp+5000)]])});
+    markPrSnapshotDirty({repo:'other/repo', nowMs:stamp+6000});
+    expect(loadHeavyStore({repo:'owner/name'}).entries.size).toBe(1);
+  });
+  it('formerly colliding slugs persist independently and normalize case', () => {
+    const r = row();
+    for (const repo of ['a-b/c', 'a/b-c']) saveHeavyStore({repo, entries:new Map([[r.number,makeEntry(r,{...heavy(),body:repo},stamp+5000)]])});
+    expect(readdirSync(snapshotDir)).toHaveLength(2);
+    for (const repo of ['a-b/c', 'a/b-c']) {
+      const loaded = loadHeavyStore({repo:repo.toUpperCase()});
+      expect(loaded.entries.get(r.number).body).toBe(repo);
+      expect(JSON.parse(readFileSync(storeFile(snapshotDir,repo),'utf8')).entries[0].repo).toBe(repo);
+    }
+  });
+  it('drops and counts foreign and historical unbound records even with identical PR identity', () => {
+    const repo = 'owner/name', r = row(), e = makeEntry(r,heavy(),stamp+5000);
+    writeFileSync(storeFile(snapshotDir,repo),JSON.stringify({entries:[{...e,repo:'other/repo'},e]}));
+    expect(loadHeavyStore({repo})).toEqual({entries:new Map(), dropped:2});
   });
 });
