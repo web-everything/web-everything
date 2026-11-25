@@ -161,7 +161,9 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       ...DISALLOWED_TOOLS_ARGV,
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
 
     expect(result.sessionId).toBe('11111111-1111-4111-8111-111111111111');
@@ -273,7 +275,9 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
       '--permission-mode', 'plan',
       '# brief for 1234 in web-everything/web-everything\n'
       + 'acquire: node scripts/lane-pool.mjs acquire --session=review-1234\n'
-      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token',
+      + 'this brief documents {{LIKE_THIS}} as an example convention, not a real token'
+      + `\n\nPINNED HEAD: ${'a'.repeat(40)}. Before running review-loop-cli and again before any verdict write, `
+      + `read the live head of web-everything/web-everything#1234; if it is not exactly ${'a'.repeat(40)}, exit without reviewing.\n`,
     ]);
   });
 
