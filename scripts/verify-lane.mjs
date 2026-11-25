@@ -89,7 +89,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
 import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger, writeSharedVerifyMarker, sharedMarkerDir, repoSlugFromRemote } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger, writeSharedVerifyMarker, clearSharedVerifyMarker, sharedMarkerDir, repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
@@ -203,20 +203,17 @@ function writeMarker(record) {
   const tmp = `${MARKER}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n');
   renameSync(tmp, MARKER);
-  writeSharedCopy(record);
+  // VERIFY-MARKER-PER-SHA — ANY non-green write for this sha (running, red, ...) first withdraws the shared green, so a
+  // stale shared green can never outlive a later blocking local result. Only `maybeRecordGreen` publishes a green.
+  if (record?.status !== 'green') sharedStore((dir, repo) => clearSharedVerifyMarker({ dir, repo, sha: headSha }));
 }
 
-// VERIFY-MARKER-PER-SHA — a default-gate record is mirrored into the shared per-sha store (any lane at the same sha and
-// tree can use it). `running` goes first and green/red last, because every write of this function passes through here.
-function writeSharedCopy(record) {
+function sharedStore(fn) {
   try {
-    if (!record?.sha || !record.treeHash || record.corrupt || record.gateExplicit) return;
-    if (typeof record.suites === 'string' && record.suites.includes('local gate skipped')) return;
     if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
     const repoSlug = repoSlugFromRemote(git(['remote', 'get-url', 'origin']));
-    if (!repoSlug) return;
-    writeSharedVerifyMarker({ dir: sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repo: repoSlug, record, lane: basename(REPO) });
-  } catch { /* best-effort: the lane-local marker stays authoritative for this lane */ }
+    if (repoSlug) fn(sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repoSlug);
+  } catch { /* the lane-local marker stays authoritative for this lane */ }
 }
 
 // #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
@@ -385,6 +382,9 @@ function treeIsClean() {
 function maybeRecordGreen({ status, treeHash, skipped = null }) {
   if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
   if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree: treeIsClean(), skipped })) return;
+  // The shared per-sha copy rides the SAME conditions as the ledger: default gate (this process's own `resolvedGate`, never the
+  // on-disk request), clean tree, stable tree hash, not skipped, green.
+  sharedStore((dir, repo) => writeSharedVerifyMarker({ dir, repo, lane: basename(REPO), record: { sha: headSha, status: 'green', exitCode: 0, treeHash, suites: GATE, finishedAt: new Date().toISOString() } }));
   if (recordGreenLedger({ dir: GREEN_LEDGER_DIR, sha: headSha, record: { status: 'green', repo: REPO, recordedAt: new Date().toISOString(),
     suites: GATE, selectionMode: resolvedGate?.decision?.selectionMode?.mode ?? null } })) {
     process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);

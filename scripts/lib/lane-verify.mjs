@@ -124,7 +124,7 @@
  * defect class this item closes is a default that reads as "allow" when the answer is unknown.
  */
 import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
-import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { constants } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -270,19 +270,33 @@ export function readSharedVerifyMarker({ dir, repo, gate = 'default', sha, treeH
   const file = sharedMarkerPath({ dir, repo, gate, sha });
   if (!file || !existsSync(file)) return null;
   try {
-    if (uid !== undefined && statSync(file).uid !== uid) return { corrupt: true };
+    const st = statSync(file);
+    if (uid !== undefined && st.uid !== uid) return { corrupt: true };
+    if ((st.mode & 0o022) !== 0) return { corrupt: true }; // group/world-writable: anyone could have forged it
     const rec = normalizeVerifyRecord(JSON.parse(readFileSync(file, 'utf8')));
     if (rec.corrupt || rec.sha !== sha) return { corrupt: true };
     if (rec.status === 'running') return rec;
+    // Only a clean, finished, genuinely green default-gate record is usable: never skipped, explicit, local-only or nonzero.
+    if (rec.status !== 'green' || rec.exitCode !== 0 || rec.skipped || rec.gateExplicit || rec.local) return { corrupt: true };
     if (typeof treeHash !== 'string' || !treeHash || rec.treeHash !== treeHash) return { corrupt: true };
     return rec;
   } catch { return { corrupt: true }; }
 }
 
-/** The marker a gate should judge: the lane's own marker when it is for `sha`, else the shared copy. Pure given its deps. */
+/** Withdraw the shared copy for `sha` (a later running/red result supersedes it). If the file cannot be removed it is
+ *  overwritten with a `running` tombstone, which the gate refuses. Best-effort, never throws. */
+export function clearSharedVerifyMarker({ dir, repo, gate = 'default', sha }) {
+  const file = sharedMarkerPath({ dir, repo, gate, sha });
+  if (!file || !existsSync(file)) return false;
+  try { unlinkSync(file); return true; } catch { /* fall through to the tombstone */ }
+  try { writeFileSync(file, `${JSON.stringify({ sha, status: 'running', treeHash: null })}\n`, { mode: 0o600 }); return true; } catch { return false; }
+}
+
+/** The marker a gate should judge: the lane's own marker when it is for `sha`; a lane-local running/red/corrupt record
+ *  is never replaced by the shared copy. Only an absent marker, or a stale GREEN for another sha, yields to a shared green. */
 export function resolveMarkerWithShared({ local, headSha, readShared }) {
   if (local && !local.corrupt && local.sha === headSha) return local;
-  if (local?.corrupt) return local;
+  if (local && (local.corrupt || local.status !== 'green')) return local;
   const shared = readShared();
   return shared ?? local;
 }
