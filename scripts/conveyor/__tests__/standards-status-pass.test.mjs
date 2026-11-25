@@ -10,9 +10,10 @@ import { STANDARDS_CONTEXT, TRUSTED_BOT } from '../../lib/standards-status.mjs';
 const REPO = 'plateauapp/plateau-app';
 const HEAD = 'a'.repeat(40);
 const MAIN = 'c'.repeat(40);
-const PASS = { status: 0, stdout: 'ok\nStandards validator exit status: 0\n' };
+const VALID_OK = { status: 0, stdout: 'RESULT: PASS\n' };
+const goodDriver = call => ({ status: 0, stdout: `${JSON.stringify({ nonce: call.fdInput, ok: true, count: 3 })}\n` });
 
-function harness({ prs = [{ number: 7, head: { sha: HEAD } }], liveHead = HEAD, statuses = [], spawnResult = PASS,
+function harness({ prs = [{ number: 7, head: { sha: HEAD } }], liveHead = HEAD, statuses = [], validatorResult = VALID_OK, driverResult = goodDriver,
   probeOk = true, fetched = HEAD, postFails = 0, env = { PATH: '/bin', CI: 'true', GITHUB_ACTIONS: 'true', PLATEAU_PROTOCOLS_HERMETIC: '1' } } = {}) {
   const calls = { posts: [], postEnvs: [], spawns: [], git: [], removed: [], dirs: [] };
   let failuresLeft = postFails;
@@ -41,10 +42,10 @@ function harness({ prs = [{ number: 7, head: { sha: HEAD } }], liveHead = HEAD, 
     if (args.includes('worktree') && args.includes('remove')) calls.removed.push(args.at(-1));
     return '';
   };
-  const spawn = call => { calls.spawns.push(call); return spawnResult; };
+  const spawn = call => { calls.spawns.push(call); const r = call.fdInput !== undefined ? driverResult : validatorResult; return typeof r === 'function' ? r(call) : r; };
   const deps = { repos: [REPO], gh, git, spawn, env, validatorPath: '/studio/validate.mjs', validatorHash: 'abcd1234',
     appWriterProbe: () => { if (!probeOk) throw new Error('403'); }, exists: () => true, runId: () => 'run1',
-    makeDir: label => `/scratch/${label}`, log: () => {}, sandbox: false };
+    makeDir: label => `/scratch/${label}`, log: () => {}, sandbox: false, allowUnsandboxed: true };
   return { calls, deps };
 }
 const KEY = `abcd1234.${MAIN.slice(0, 8)}`;
@@ -100,13 +101,16 @@ describe('runStandardsStatusPass', () => {
   });
 
   it.each([
-    ['SKIP', { status: 0, stdout: 'Standards validator exit status: 0\nSKIP: x\n' }],
-    ['NOT RUN', { status: 0, stdout: 'NOT RUN HERE\n' }],
-    ['exit 0 without the status line', { status: 0, stdout: 'fine\n' }],
-    ['non-zero exit', { status: 1, stdout: 'Standards validator exit status: 0\n' }],
-    ['timeout', { status: null, timedOut: true, stdout: '' }],
-  ])('%s posts failure, never success', async (_n, spawnResult) => {
-    const { calls, deps } = harness({ spawnResult });
+    ['validator SKIP', { validatorResult: { status: 0, stdout: 'SKIP: x\n' } }],
+    ['validator NOT RUN', { validatorResult: { status: 0, stdout: 'NOT RUN HERE\n' } }],
+    ['validator non-zero exit', { validatorResult: { status: 1, stdout: 'RESULT: PASS\n' } }],
+    ['driver early exit(0) with a forged marker and no result', { driverResult: { status: 0, stdout: 'Standards validator exit status: 0\n' } }],
+    ['driver result with a guessed nonce', { driverResult: { status: 0, stdout: `${JSON.stringify({ nonce: 'guess-guess', ok: true, count: 3 })}\n` } }],
+    ['driver extra output', { driverResult: call => ({ status: 0, stdout: `forged\n${goodDriver(call).stdout}` }) }],
+    ['driver non-zero exit', { driverResult: call => ({ ...goodDriver(call), status: 1 }) }],
+    ['driver timeout', { driverResult: { status: null, timedOut: true, stdout: '' } }],
+  ])('%s posts failure, never success', async (_n, overrides) => {
+    const { calls, deps } = harness(overrides);
     await runStandardsStatusPass(deps);
     expect(calls.posts.at(-1).state).toBe('failure');
     expect(calls.posts.map(p => p.state)).not.toContain('success');
@@ -123,15 +127,15 @@ describe('runStandardsStatusPass', () => {
     const { calls, deps } = harness();
     // A head whose harness would print a fake pass is simply never run: the spawned script lives in the main worktree.
     await runStandardsStatusPass(deps);
-    const [spawned] = calls.spawns;
-    expect(spawned.args[0]).toMatch(/main-wt/);
-    expect(spawned.args[0]).not.toMatch(/head-wt/);
-    expect(spawned.args.find(a => a.startsWith('--root=')) ?? '').toMatch(/head-wt/);
-    expect(spawned.args).toContain('--standards-validator=/studio/validate.mjs');
+    const [validator, driver] = calls.spawns;
+    expect(validator.args).toEqual(['/studio/validate.mjs']);
+    expect(driver.args.find(a => a.startsWith('--harness=')) ?? '').toMatch(/main-wt/);
+    expect(driver.args.join(' ')).not.toMatch(/head-wt\/protocols\/tools/);
+    expect(driver.args.find(a => a.startsWith('--root=')) ?? '').toMatch(/head-wt/);
   });
 
   it('the real result of main\'s harness is what is posted (a failing real run is not masked)', async () => {
-    const { calls, deps } = harness({ spawnResult: { status: 1, stdout: 'Standards validator exit status: 0\n' } });
+    const { calls, deps } = harness({ driverResult: call => ({ status: 1, stdout: `${JSON.stringify({ nonce: call.fdInput, ok: false, count: 3 })}\n` }) });
     await runStandardsStatusPass(deps);
     expect(calls.posts.at(-1).state).toBe('failure');
   });
@@ -139,7 +143,7 @@ describe('runStandardsStatusPass', () => {
   it('the child env has no CI or hermetic vars', async () => {
     const { calls, deps } = harness();
     await runStandardsStatusPass(deps);
-    const env = calls.spawns[0].env;
+    const env = calls.spawns[1].env;
     expect(env.CI).toBeUndefined();
     expect(env.GITHUB_ACTIONS).toBeUndefined();
     expect(env.PLATEAU_PROTOCOLS_HERMETIC).toBeUndefined();
@@ -205,7 +209,7 @@ describe('runStandardsStatusPass', () => {
     const prs = [{ number: 1, head: { sha: HEAD } }, { number: 2, head: { sha: HEAD } }];
     const { calls, deps } = harness({ prs });
     let first = true;
-    await runStandardsStatusPass({ ...deps, spawn: call => { calls.spawns.push(call); if (first) { first = false; throw new Error('x'); } return PASS; } });
+    await runStandardsStatusPass({ ...deps, spawn: call => { calls.spawns.push(call); if (first) { first = false; throw new Error('x'); } return goodDriver(call); } });
     expect(calls.posts.filter(p => p.state === 'success')).toHaveLength(1);
   });
 
@@ -248,19 +252,21 @@ describe('hardening from the first audit', () => {
   it('points --root at the head protocols folder, not the repo root', async () => {
     const { calls, deps } = harness();
     await runStandardsStatusPass(deps);
-    expect(calls.spawns[0].args).toContain('--root=/scratch/head-wt/protocols');
+    expect(calls.spawns[1].args).toContain('--root=/scratch/head-wt/protocols');
   });
 
   it('runs the harness inside a network-denied, write-denied sandbox when enabled', async () => {
     const { calls, deps } = harness();
     await runStandardsStatusPass({ ...deps, sandbox: true });
-    const [spawned] = calls.spawns;
+    const spawned = calls.spawns[1];
     expect(spawned.cmd).toBe('/usr/bin/sandbox-exec');
     expect(spawned.args[0]).toBe('-p');
     expect(spawned.args[1]).toContain('(deny network*)');
     expect(spawned.args[1]).toContain('(deny file-write*)');
     expect(spawned.args[1]).toContain('.secrets');
-    expect(spawned.args.join(' ')).toContain('validate-protocols.mjs');
+    expect(spawned.args.join(' ')).toContain('standards-harness-driver.mjs');
+    expect(spawned.args.join(' ')).not.toContain(spawned.fdInput); // the nonce is never in argv
+    expect(JSON.stringify(spawned.env)).not.toContain(spawned.fdInput); // nor in env
   });
 
   it('an unreadable validator input refuses the pass instead of reusing a value', async () => {
@@ -268,5 +274,24 @@ describe('hardening from the first audit', () => {
     const result = await runStandardsStatusPass({ ...deps, validatorHash: undefined, validatorPath: '/nonexistent/tools/validate.mjs' });
     expect(result.refused).toMatch(/unreadable/);
     expect(calls.posts).toEqual([]);
+  });
+});
+
+describe('PR rules run in a child with an unpredictable nonce over an fd', () => {
+  it('uses a fresh nonce per run, passed only as fdInput', async () => {
+    const nonces = [];
+    const { calls, deps } = harness({ prs: [{ number: 1, head: { sha: HEAD } }, { number: 2, head: { sha: HEAD } }] });
+    let n = 0;
+    await runStandardsStatusPass({ ...deps, nonce: () => { n += 1; nonces.push(`nonce-number-${n}`); return nonces.at(-1); } });
+    const driverCalls = calls.spawns.filter(c => c.fdInput !== undefined);
+    expect(driverCalls.map(c => c.fdInput)).toEqual(nonces);
+    expect(new Set(nonces).size).toBe(2);
+  });
+
+  it('refuses to run PR rules without a sandbox (and posts failure)', async () => {
+    const { calls, deps } = harness();
+    await runStandardsStatusPass({ ...deps, allowUnsandboxed: false });
+    expect(calls.spawns.some(c => c.fdInput !== undefined)).toBe(false);
+    expect(calls.posts.at(-1).state).toBe('failure');
   });
 });

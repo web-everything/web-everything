@@ -14,26 +14,46 @@ export const STANDARDS_PAGE_CAP = 10;
 const SHA = /^[0-9a-f]{40}$/;
 export const validHead = value => typeof value === 'string' && SHA.test(value);
 
-const PASS_LINE = /^Standards validator exit status: 0\s*$/m;
 const SKIP_LINE = /^\s*SKIP:|NOT RUN/m;
 
-/**
- * Success only for the exact pass shape: harness exit 0 with no signal, no timeout and no spawn error, the
- * `Standards validator exit status: 0` line, and no `SKIP:` or `NOT RUN` text.
- * @param {{status?:number|null, signal?:string|null, timedOut?:boolean, error?:unknown, stdout?:string}} result
- * @returns {{state:'success'|'failure', reason:string}}
- */
-export function runVerdict(result) {
-  const fail = reason => ({ state: 'failure', reason });
-  if (!result || typeof result !== 'object') return fail('no run result');
-  if (result.error) return fail('harness could not start');
-  if (result.timedOut) return fail('harness timed out');
-  if (result.signal) return fail(`harness killed by ${String(result.signal)}`);
-  if (result.status !== 0) return fail(`harness exit ${String(result.status)}`);
-  const out = typeof result.stdout === 'string' ? result.stdout : '';
-  if (SKIP_LINE.test(out)) return fail('validator skipped or not run');
-  if (!PASS_LINE.test(out)) return fail('missing "Standards validator exit status: 0" line');
+const fail = reason => ({ state: 'failure', reason });
+const baseProblem = (result, who) => {
+  if (!result || typeof result !== 'object') return `no ${who} result`;
+  if (result.error) return `${who} could not start`;
+  if (result.timedOut) return `${who} timed out`;
+  if (result.signal) return `${who} killed by ${String(result.signal)}`;
+  if (result.truncated) return `${who} output overflowed`;
+  if (result.status !== 0) return `${who} exit ${String(result.status)}`;
+};
+
+/** The Studio's own Standards validator, run by the parent (it reads nothing from the PR): exit 0, no signal or
+ * timeout, and no `SKIP:` or `NOT RUN` text. */
+export function validatorVerdict(result) {
+  const problem = baseProblem(result, 'validator');
+  if (problem) return fail(problem);
+  if (SKIP_LINE.test(`${result.stdout ?? ''}`)) return fail('validator skipped or not run');
   return { state: 'success', reason: 'validator passed' };
+}
+
+/**
+ * The PR-supplied rules run inside a child driver, so a rule that exits early or prints a fake marker must not become a
+ * pass. The ONLY accepted evidence is the driver's single structured stdout line `{nonce, ok:true, count>=1}` carrying
+ * the per-run nonce (given to the driver over an fd, never env or argv), with nothing else on stdout and exit status 0.
+ * Any early exit, missing or wrong nonce, extra output or extra key is a failure.
+ */
+export function harnessVerdict(result, expectedNonce) {
+  const problem = baseProblem(result, 'harness');
+  if (problem) return fail(problem);
+  if (typeof expectedNonce !== 'string' || expectedNonce.length < 8) return fail('no run nonce');
+  const out = typeof result.stdout === 'string' ? result.stdout : '';
+  if (!out.endsWith('\n') || out.indexOf('\n') !== out.length - 1) return fail('harness stdout is not exactly one result line');
+  let parsed;
+  try { parsed = JSON.parse(out); } catch { return fail('harness result is not JSON'); }
+  const keys = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed).sort().join(',') : '';
+  if (keys !== 'count,nonce,ok') return fail('harness result has the wrong shape');
+  if (parsed.nonce !== expectedNonce) return fail('harness result nonce mismatch');
+  if (parsed.ok !== true || !Number.isSafeInteger(parsed.count) || parsed.count < 1) return fail('harness reported no passing protocols');
+  return { state: 'success', reason: `${parsed.count} protocols validated` };
 }
 
 /** Status body. The description binds the status to the run and the validator hash (140-char GitHub limit). */

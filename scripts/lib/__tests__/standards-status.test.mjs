@@ -3,9 +3,8 @@
  * @description Negative-first tests for the pure Standards status core (merge-path checklist lines 1-3, 5-7).
  */
 import { describe, it, expect } from 'vitest';
-import { runVerdict, statusPayload, evaluateStandardsStatus, STANDARDS_CONTEXT, TRUSTED_BOT } from '../standards-status.mjs';
+import { harnessVerdict, validatorVerdict, statusPayload, evaluateStandardsStatus, STANDARDS_CONTEXT, TRUSTED_BOT } from '../standards-status.mjs';
 
-const OK = 'validated\nStandards validator exit status: 0\n';
 const HEAD = 'a'.repeat(40);
 const bot = { ...TRUSTED_BOT };
 const st = (id, state, creator = bot, context = STANDARDS_CONTEXT) => ({ id, state, context, creator });
@@ -15,19 +14,42 @@ const combinedFor = (history, extra = {}) => {
 };
 const evalWith = (history, over = {}) => evaluateStandardsStatus({ combined: combinedFor(history), history, head: HEAD, ...over });
 
-describe('runVerdict', () => {
-  it('passes only the exact pass shape', () => expect(runVerdict({ status: 0, stdout: OK }).state).toBe('success'));
+const NONCE = 'n0nce-1234';
+const good = (over = {}) => ({ status: 0, stdout: `${JSON.stringify({ nonce: NONCE, ok: true, count: 3 })}\n`, ...over });
+describe('harnessVerdict (structured child result)', () => {
+  it('passes only the exact shape with the run nonce and exit 0', () => expect(harnessVerdict(good(), NONCE).state).toBe('success'));
   it.each([
-    ['SKIP output', { status: 0, stdout: `${OK}SKIP: no validator\n` }],
-    ['NOT RUN output', { status: 0, stdout: `NOT RUN HERE: absent\n${OK}` }],
-    ['exit 0 without the status line', { status: 0, stdout: 'all good\n' }],
-    ['non-zero exit', { status: 1, stdout: OK }],
-    ['signal', { status: null, signal: 'SIGKILL', stdout: OK }],
-    ['timeout', { status: 0, timedOut: true, stdout: OK }],
+    ['early process.exit(0): no result at all', { status: 0, stdout: 'Standards validator exit status: 0\n' }],
+    ['wrong nonce', good({ stdout: `${JSON.stringify({ nonce: 'guess', ok: true, count: 3 })}\n` })],
+    ['missing nonce', good({ stdout: `${JSON.stringify({ ok: true, count: 3 })}\n` })],
+    ['extra line before the result', good({ stdout: `forged\n${good().stdout}` })],
+    ['extra line after the result', good({ stdout: `${good().stdout}more\n` })],
+    ['text glued to the result line', good({ stdout: `x${good().stdout}` })],
+    ['extra key in the result', good({ stdout: `${JSON.stringify({ nonce: NONCE, ok: true, count: 3, extra: 1 })}\n` })],
+    ['ok false', good({ stdout: `${JSON.stringify({ nonce: NONCE, ok: false, count: 3 })}\n`, status: 1 })],
+    ['zero protocols', good({ stdout: `${JSON.stringify({ nonce: NONCE, ok: true, count: 0 })}\n` })],
+    ['ok string', good({ stdout: `${JSON.stringify({ nonce: NONCE, ok: 'true', count: 3 })}\n` })],
+    ['non-zero exit despite a good result', good({ status: 1 })],
+    ['signal', good({ status: null, signal: 'SIGKILL' })],
+    ['timeout', good({ timedOut: true })],
+    ['stdout overflow', good({ truncated: true })],
     ['spawn error', { status: null, error: new Error('ENOENT') }],
-    ['validator exit status 1', { status: 0, stdout: 'Standards validator exit status: 1\n' }],
     ['no result', undefined],
-  ])('%s is a failure', (_name, result) => expect(runVerdict(result).state).toBe('failure'));
+  ])('%s is a failure', (_name, result) => expect(harnessVerdict(result, NONCE).state).toBe('failure'));
+  it('fails without an expected nonce', () => expect(harnessVerdict(good(), '').state).toBe('failure'));
+});
+
+describe('validatorVerdict (the Studio validator run by the parent)', () => {
+  it('passes exit 0 with clean output', () => expect(validatorVerdict({ status: 0, stdout: 'RESULT: PASS\n' }).state).toBe('success'));
+  it.each([
+    ['SKIP output', { status: 0, stdout: 'SKIP: no vectors\n' }],
+    ['NOT RUN output', { status: 0, stdout: 'NOT RUN HERE\n' }],
+    ['non-zero exit', { status: 1, stdout: 'RESULT: PASS\n' }],
+    ['signal', { status: null, signal: 'SIGKILL', stdout: '' }],
+    ['timeout', { status: 0, timedOut: true, stdout: '' }],
+    ['spawn error', { status: null, error: new Error('x') }],
+    ['no result', undefined],
+  ])('%s is a failure', (_name, result) => expect(validatorVerdict(result).state).toBe('failure'));
 });
 
 describe('statusPayload', () => {

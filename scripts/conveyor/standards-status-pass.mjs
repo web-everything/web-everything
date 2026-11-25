@@ -22,12 +22,13 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { redTeamWriterEnv, requireRedTeamAppWriter } from '../lib/red-team-check-run.mjs';
-import { STANDARDS_CONTEXT, STANDARDS_PAGE_CAP, evaluateStandardsStatus, runVerdict, statusPayload, validHead } from '../lib/standards-status.mjs';
+import { STANDARDS_CONTEXT, STANDARDS_PAGE_CAP, evaluateStandardsStatus, harnessVerdict, validatorVerdict, statusPayload, validHead } from '../lib/standards-status.mjs';
 
 const SETTINGS_PATH = new URL('../settings/standards-status.json', import.meta.url);
 const ioOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] };
 const DROPPED_CHILD_ENV = ['CI', 'GITHUB_ACTIONS', 'PLATEAU_PROTOCOLS_HERMETIC', 'GH_TOKEN', 'GITHUB_TOKEN'];
 const HARNESS = 'protocols/tools/validate-protocols.mjs';
+const DRIVER = join(dirname(fileURLToPath(import.meta.url)), 'standards-harness-driver.mjs');
 
 /** Settings: `standardsStatus` {enabled, repos, validatorPath, runTimeoutMs}. Unreadable means disabled. */
 export function loadStandardsStatusSettings(path = SETTINGS_PATH) {
@@ -49,16 +50,18 @@ const gitBase = ['-c', 'core.hooksPath=/dev/null', '-c', 'protocol.file.allow=ne
 const defaultGit = (args, { env, cwd } = {}) => execFileSync('git', args, { ...ioOptions, env, cwd });
 
 /** Run a child in its own process group; kill the whole group on timeout. Never throws. */
-function defaultSpawn({ cmd, args, cwd, env, timeoutMs }) {
+export function defaultSpawn({ cmd, args, cwd, env, timeoutMs, fdInput }) {
   return new Promise(resolve => {
-    let stdout = ''; let timedOut = false; let settled = false;
-    const child = spawnChild(cmd, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let timedOut = false; let settled = false; let truncated = false;
+    // fd 3 carries the per-run nonce (never env or argv); the child reads and closes it before any PR code runs.
+    const child = spawnChild(cmd, args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe', ...(fdInput === undefined ? [] : ['pipe'])] });
+    if (fdInput !== undefined) { child.stdio[3].on('error', () => {}); child.stdio[3].end(String(fdInput)); }
     const finish = result => { if (!settled) { settled = true; clearTimeout(timer); resolve(result); } };
     const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, timeoutMs);
-    child.stdout.on('data', chunk => { if (stdout.length < 4_000_000) stdout += chunk; });
+    child.stdout.on('data', chunk => { if (stdout.length < 4_000_000) stdout += chunk; else truncated = true; });
     child.stderr.on('data', () => {});
-    child.on('error', error => finish({ status: null, error, stdout }));
-    child.on('close', (status, signal) => finish({ status, signal, timedOut, stdout }));
+    child.on('error', error => finish({ status: null, error, stdout, truncated }));
+    child.on('close', (status, signal) => finish({ status, signal, timedOut, stdout, truncated }));
   });
 }
 
@@ -108,7 +111,7 @@ function readStatuses({ repo, head, gh, env }) {
  */
 export async function runStandardsStatusPass({
   repos = [], dryRun = false, env = process.env, gh = runGhSync, git = defaultGit, spawn = defaultSpawn,
-  validatorPath = '', validatorHash, appWriterProbe, sandbox = process.platform === 'darwin', exists = existsSync, runId = () => randomBytes(4).toString('hex'),
+  validatorPath = '', validatorHash, appWriterProbe, sandbox = process.platform === 'darwin', allowUnsandboxed = false, nonce = () => randomBytes(16).toString('hex'), exists = existsSync, runId = () => randomBytes(4).toString('hex'),
   makeDir = label => mkdtempSync(join(tmpdir(), `standards-${label}-`)), runTimeoutMs = 120_000,
   mirrorRoot = join(homedir(), '.local', 'state', 'we', 'standards-status'), log = () => {},
 } = {}) {
@@ -173,13 +176,22 @@ export async function runStandardsStatusPass({
         let verdict;
         if (!validatorPath || !exists(validatorPath)) verdict = { state: 'failure', reason: 'validator missing on the Studio' };
         else {
-          // The harness's --root is the protocols folder (its default is `../` of the tools folder), not the repo root.
-          const harnessArgs = [join(mainTree, HARNESS), `--root=${join(headTree, 'protocols')}`, `--standards-validator=${validatorPath}`];
-          const run = await spawn(sandbox
-            ? { cmd: '/usr/bin/sandbox-exec', cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs,
-              args: ['-p', sandboxProfile(), process.execPath, ...harnessArgs] }
-            : { cmd: process.execPath, cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs, args: harnessArgs });
-          verdict = runVerdict(run);
+          // 1. The Studio's own validator, run here: it reads nothing from the PR.
+          verdict = validatorVerdict(await spawn({ cmd: process.execPath, cwd: mainTree, env: childEnv(env), timeoutMs: 30_000, args: [validatorPath] }));
+          // 2. The PR's protocol rules run in a CHILD driver (main's harness, the head's protocols folder, which is the
+          // harness's --root, not the repo root). The verdict is the child's structured, nonce-carrying result only.
+          if (verdict.state === 'success') {
+            if (!sandbox && !allowUnsandboxed) verdict = { state: 'failure', reason: 'no sandbox on this host; PR rules not run' };
+            else {
+              const runNonce = nonce();
+              const driverArgs = [DRIVER, `--harness=${join(mainTree, HARNESS)}`, `--root=${join(headTree, 'protocols')}`];
+              const run = await spawn(sandbox
+                ? { cmd: '/usr/bin/sandbox-exec', cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs, fdInput: runNonce,
+                  args: ['-p', sandboxProfile(), process.execPath, ...driverArgs] }
+                : { cmd: process.execPath, cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs, fdInput: runNonce, args: driverArgs });
+              verdict = harnessVerdict(run, runNonce);
+            }
+          }
         }
         const live = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}`], { ...ioOptions, env }))?.head?.sha;
         if (live !== head) { result.skipped.push({ repo, pr: number, reason: 'head moved during the run' }); continue; }
