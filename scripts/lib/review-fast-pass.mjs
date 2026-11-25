@@ -1,13 +1,20 @@
 import { reviewDispatchContext } from './review-dispatch-context.mjs';
 
+// Ignore continuously changing telemetry (e.g. transcript age), but detect new or
+// replaced workers and changes to the identity/state the admission plan observed.
+const agentInventoryKey = agents => JSON.stringify(agents.map(agent => [agent?.sessionId,
+  agent?.id, agent?.name, agent?.sessionSlug, agent?.pid, agent?.cwd, agent?.laneHeadOid,
+  agent?.state, agent?.status, agent?.startedAt, agent?.pidAlive]).map(row => JSON.stringify(row)).sort());
+
 /** IO-free orchestration. Readers throw or mark incomplete evidence; the normal tick is the fallback.
  * readPr({pending:true}) returns a bounded inventory of currently pending PRs. planOne must use the
  * same admission/planner gates as the tick. liveCap returns the total ceiling, never saved free slots.
  */
 export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAgents, readJobs,
   dispatch, hostAdmission, liveCap, mainSha, acquirableLanes, starts = { count: 0 }, budget, log = () => {}, now = Date.now,
-  leaseHeld = () => true }) {
+  leaseHeld = () => true, withDispatchLease = run => run(leaseHeld) }) {
   const result = { dispatched: [], failed: [] };
+  if (starts.leaseLost) return result;
   let leaseLost = false;
   const note = (pr, reason) => {
     result.failed.push({ prNumber: pr, reason });
@@ -50,52 +57,68 @@ export async function runFastPass({ repo, readLastPlan, readPr, planOne, readAge
           || !Array.isArray(pr.statusCheckRollup) || !Array.isArray(pr.comments)) throw Error('PR evidence incomplete');
         if (!/^[a-f0-9]{40}$/i.test(plannedHead ?? '') || pr.headRefOid !== plannedHead) throw Error('head moved or unknown');
         const agents = await readAgents({ repo });
-        const jobs = await readJobs({ repo });
-        if (!Array.isArray(agents) || agents.incomplete || !Array.isArray(jobs) || jobs.incomplete) throw Error('live inventory incomplete');
-        const unobservedStarts = starts.jobs.filter(start => !jobs.some(job =>
-          (start.pid && job.pid === start.pid) || (job.repo === start.repo && Number(job.pr) === start.pr))).length;
-        const cap = await liveCap({ repo, jobs, agents, unobservedStarts });
-        if (!Number.isFinite(cap) || cap <= jobs.length + unobservedStarts) throw Error('live-review cap exhausted');
-        if (jobs.some(job => job.repo === repo && Number(job.pr) === number)) throw Error('live job slot');
+        if (!Array.isArray(agents) || agents.incomplete) throw Error('live inventory incomplete');
+        const plannedAgents = agentInventoryKey(agents);
         const plan = await planOne({ repo, pr, agents, now: now() });
         const row = plan?.dispatch?.find(r => r.kind === 'review' && r.prNumber === number);
         if (plan?.deferred || plan?.agentsIncomplete || !row || plan.refusals?.some(r => r.prNumber === number)) throw Error('fresh plan holds PR');
         if (await mainSha(repo) !== main) throw Error('main changed during plan');
-        const lanes = await acquirableLanes({ repo });
-        const freeLanes = Array.isArray(lanes) ? lanes.filter(lane => !occupiedLanes.has(lane)) : null;
-        const available = freeLanes ? freeLanes.length : lanes - occupiedLanes.size;
-        if (!(available > 0)) throw Error('lane inventory empty or unknown');
-        if (budget && !(budget.left > (budget.reserve ?? 0))) throw Error('live-review reserve exhausted');
-        const host = await hostAdmission();
-        if (host?.admitted !== true || !(host.maxPerTick > 0) || !((host.startBudget ?? host.maxPerTick) > starts.count)) throw Error('host admission refused');
-        // Heartbeat and re-check the dispatch lease right before spending capacity; a lost lease stops the pass.
-        let held = false;
-        try { held = (await leaseHeld()) === true; } catch { /* unknown means lost */ }
-        if (!held) { leaseLost = true; throw Error('dispatch lease lost'); }
-        starts.count++;
-        const lane = freeLanes ? freeLanes[0] : occupiedLanes.size;
-        occupiedLanes.add(lane);
-        const reservation = { repo, pr: number };
-        starts.jobs.push(reservation);
-        if (budget) budget.left--;
-        let out;
-        try { out = await dispatch({ repo, pr: number, expectedHead: pr.headRefOid, leaseHeld,
-          ...reviewDispatchContext(pr),
-          ...(freeLanes ? { preferLane: lane } : {}),
-          ...(row.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: row.advisoryReview } : {}) });
-        } catch (error) { host.take?.(1); throw error; }
-        if (out?.refused || (out?.skipped && out.skipped !== 'live-job')) {
-          starts.count--;
-          starts.jobs.splice(starts.jobs.indexOf(reservation), 1);
-          occupiedLanes.delete(lane);
-          if (budget) budget.left++;
-        } else {
-          reservation.pid = out?.jobPid;
-          host.take?.(1);
-        }
-        if (!out || out.skipped || out.refused) throw Error(out?.skipped ?? out?.reason ?? out?.outcome ?? 'dispatch refused');
-        result.dispatched.push({ prNumber: number, ...out });
-        log(`review-fast-pass: ${repo}#${number} dispatched`);
+        const admission = await withDispatchLease(async ownershipHeld => {
+          // Only fresh capacity discovery through spawn is serialized. The full planner never holds the mutex.
+          const currentAgents = await readAgents({ repo });
+          if (!Array.isArray(currentAgents) || currentAgents.incomplete || agentInventoryKey(currentAgents) !== plannedAgents) {
+            throw Error('live agent inventory changed or incomplete during planning');
+          }
+          const jobs = await readJobs({ repo });
+          if (!Array.isArray(jobs) || jobs.incomplete) throw Error('live inventory incomplete');
+          const unobservedStarts = starts.jobs.filter(start => !jobs.some(job =>
+            (start.pid && job.pid === start.pid) || (job.repo === start.repo && Number(job.pr) === start.pr))).length;
+          const cap = await liveCap({ repo, jobs, agents: currentAgents, unobservedStarts });
+          if (!Number.isFinite(cap) || cap <= jobs.length + unobservedStarts) throw Error('live-review cap exhausted');
+          if (jobs.some(job => job.repo === repo && Number(job.pr) === number)) throw Error('live job slot');
+          const lanes = await acquirableLanes({ repo });
+          const freeLanes = Array.isArray(lanes) ? lanes.filter(lane => !occupiedLanes.has(lane)) : null;
+          const available = freeLanes ? freeLanes.length : lanes - occupiedLanes.size;
+          if (!(available > 0)) throw Error('lane inventory empty or unknown');
+          if (budget && !(budget.left > (budget.reserve ?? 0))) throw Error('live-review reserve exhausted');
+          const host = await hostAdmission();
+          if (host?.admitted !== true || !(host.maxPerTick > 0) || !((host.startBudget ?? host.maxPerTick) > starts.count)) throw Error('host admission refused');
+          // Heartbeat and re-check the dispatch lease right before spending capacity; a lost lease stops the pass.
+          let held = false;
+          const dispatchLeaseHeld = () => {
+            let owned = false;
+            try { owned = ownershipHeld() === true && leaseHeld() === true; } catch { /* unknown means lost */ }
+            if (!owned) { leaseLost = true; starts.leaseLost = true; }
+            return owned && !leaseLost;
+          };
+          held = dispatchLeaseHeld();
+          if (!held) { leaseLost = true; throw Error('dispatch lease lost'); }
+          starts.count++;
+          const lane = freeLanes ? freeLanes[0] : occupiedLanes.size;
+          occupiedLanes.add(lane);
+          const reservation = { repo, pr: number };
+          starts.jobs.push(reservation);
+          if (budget) budget.left--;
+          let out;
+          try { out = await dispatch({ repo, pr: number, expectedHead: pr.headRefOid, leaseHeld: dispatchLeaseHeld,
+            ...reviewDispatchContext(pr),
+            ...(freeLanes ? { preferLane: lane } : {}),
+            ...(row.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: row.advisoryReview } : {}) });
+          } catch (error) { host.take?.(1); throw error; }
+          if (out?.refused || (out?.skipped && out.skipped !== 'live-job')) {
+            starts.count--;
+            starts.jobs.splice(starts.jobs.indexOf(reservation), 1);
+            occupiedLanes.delete(lane);
+            if (budget) budget.left++;
+          } else {
+            reservation.pid = out?.jobPid;
+            host.take?.(1);
+          }
+          if (!out || out.skipped || out.refused) throw Error(out?.skipped ?? out?.reason ?? out?.outcome ?? 'dispatch refused');
+          result.dispatched.push({ prNumber: number, ...out });
+          log(`review-fast-pass: ${repo}#${number} dispatched`);
+        });
+        if (admission?.deferred) throw Error(admission.reason ?? 'dispatch mutex held');
       } catch (error) { note(number, String(error?.message ?? error)); }
     }
   } catch (error) { note(null, String(error?.message ?? error)); }

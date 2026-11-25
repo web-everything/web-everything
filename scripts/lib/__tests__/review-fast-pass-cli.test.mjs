@@ -82,7 +82,7 @@ it('once configures one tick, heartbeats its lease and releases it on failure', 
   await expect(runFastPassCli({ repos: [], cliReviewTickOpts: () => ({}), sharedHostBudget: () => () => ({}), once: true, env: { WE_REVIEW_FAST_PASS_INTERVAL_MS: '90000' }, runDaemonLoop: loop, log })).rejects.toThrow('test loop stopped');
   expect(log).toHaveBeenCalledWith(expect.stringContaining('source: env'));
   expect(leases.heartbeatRunnerLease).toHaveBeenCalledWith(expect.anything(), expect.anything(), { key: REVIEW_FAST_PASS_LEASE_KEY });
-  expect(leases.releaseRunnerLeaseIfOwned).toHaveBeenCalledTimes(2);
+  expect(leases.releaseRunnerLeaseIfOwned).toHaveBeenCalledTimes(1); // no candidates, no dispatch mutex
 });
 
 it('rejects a full 300-row listing before filtering pending labels', () => {
@@ -143,6 +143,14 @@ it('the CLI dispatch requests strict read-only clean freshness evidence', () => 
 it('CLI stops dispatch when the real dispatch-lease heartbeat loses ownership', async () => {
   const { exerciseFastCli } = await import('./fixtures/review-fast-cli-integration.mjs');
   expect(await exerciseFastCli(['lease-lost'])).toEqual({ violations: [] });
+});
+it.each(['lease-ci', 'lease-stack'])('CLI prevents spawn when ownership is lost inside %s after orchestration', async kind => {
+  const { exerciseFastCli } = await import('./fixtures/review-fast-cli-integration.mjs');
+  expect(await exerciseFastCli([kind])).toEqual({ violations: [] });
+});
+it.each(['maintenance', 'cadence-load', 'contention'])('ordinary/fast contention integration: %s', async kind => {
+  const { exerciseFastCli } = await import('./fixtures/review-fast-cli-integration.mjs');
+  expect(await exerciseFastCli([kind])).toEqual({ violations: [] });
 });
 it('an expired dispatch holder cannot resume or release its successor', async () => {
   const root = mkdtempSync(join(tmpdir(), 'expired-dispatch-'));

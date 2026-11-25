@@ -1534,7 +1534,8 @@ export function runAutoAuditShadow({ repo, rawPrs, mode, check, seen = autoAudit
   } catch { /* Audit observation must never block the capacity queue. */ }
 }
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr, leaseHeld = () => true } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr, leaseHeld = () => true,
+  dispatchWithLease = (dispatch, args) => dispatch({ ...args, leaseHeld }) } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   const livePrs = new Map();
   const readQueuePr = args => {
@@ -1580,6 +1581,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
+    readLiveReviewBudget: () => liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
     reconcileRedTeamQueue: ({ inventoryComplete: complete = true } = {}) => {
       livePrs.clear();
       inventoryComplete = complete;
@@ -1636,7 +1638,7 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
           if (!leaseHeld()) throw Error('dispatch lease lost');
           const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });
           if (refusal) return { skipped: refusal.why };
-          return dispatchReviewJob({ ...d, leaseHeld });
+          return dispatchWithLease(dispatchReviewJob, d, { recovery: true });
         }, log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
@@ -2075,15 +2077,26 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
 
 export function runReviewDispatchPass({ owner, lockRoot = RUNNER_LOCK_ROOT, log = console,
   reviewTickOpts = cliReviewTickOpts, tick = runReviewTick, factCache = null, ...opts } = {}) {
-  return withReviewDispatchLease(leaseHeld => {
-    const options = reviewTickOpts({ log, factCache, leaseHeld });
-    const dispatch = options.dispatch ?? dispatchReviewByMode;
-    options.dispatch = args => {
-      if (!leaseHeld()) throw Error('dispatch lease lost');
-      return dispatch({ ...args, leaseHeld });
+  let lost = false;
+  const leaseHeld = () => !lost;
+  const dispatchWithLease = (dispatch, args, { recovery = false } = {}) => withReviewDispatchLease(owned => {
+    const currentLeaseHeld = () => {
+      try { if (owned() !== true) lost = true; } catch { lost = true; }
+      return !lost;
     };
-    return runReviewTickAllRepos({ tick, ...options, ...opts, leaseHeld });
+    if (!currentLeaseHeld()) throw Error('dispatch lease lost');
+    const capacity = options.readLiveReviewBudget?.();
+    if (options.readLiveReviewBudget && (!Number.isFinite(capacity?.left) || !Number.isFinite(capacity.reserve ?? 0))) throw Error('live-review budget unknown');
+    if (capacity && !(capacity.left > (recovery ? 0 : (capacity.reserve ?? 0)))) return { skipped: 'live-review cap exhausted' };
+    const readLanes = recovery ? options.recoveryAcquirableLanes ?? options.acquirableLanes : options.acquirableLanes;
+    const lanes = readLanes?.({ repo: args.repo });
+    if (readLanes && !(Array.isArray(lanes) ? lanes.length : lanes > 0)) return { skipped: 'lane inventory empty or unknown' };
+    return dispatch({ ...args, ...(Array.isArray(lanes) ? { preferLane: lanes.includes(args.preferLane) ? args.preferLane : lanes[0] } : {}), leaseHeld: currentLeaseHeld });
   }, { lockRoot, owner, log: line => log.error(line) });
+  const options = reviewTickOpts({ log, factCache, leaseHeld, dispatchWithLease });
+  const dispatch = options.dispatch ?? dispatchReviewByMode;
+  options.dispatch = args => dispatchWithLease(dispatch, args);
+  return runReviewTickAllRepos({ tick, ...options, ...opts, dispatch: options.dispatch, leaseHeld });
 }
 
 export function buildCliDaemonEffects({

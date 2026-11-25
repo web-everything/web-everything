@@ -1,5 +1,6 @@
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
+import { assertReviewSessionPin } from '../lib/review-session-pin.mjs';
 import { basisLineOf, isReviewVerdictComment, reviewedHeadsOf } from '../conveyor/mechanical-round-cap.mjs';
 import { rereviewMode, reviewMustVoid } from '../lib/review-timing.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
@@ -331,7 +332,7 @@ export function resolveViewReader(env = process.env) {
  * @returns {{detail: object, net: object, diff: object, headRefName: string, body: string}}
  */
 export function readPr({
-  pr, repo, exec = null, cwd = REPO_ROOT, readView = resolveViewReader(), originRepo = defaultOriginRepo,
+  pr, repo, exec = null, cwd = REPO_ROOT, readView = resolveViewReader(), originRepo = defaultOriginRepo, env = process.env,
   // #xgmzd0y — the checkouts the caller's subject resolution already tried, named in the refusal below so
   // an operator sees WHERE it looked rather than only that it failed. Message-only; decides nothing.
   probed = null,
@@ -377,6 +378,7 @@ export function readPr({
   }
 
   const view = readView({ pr, repo, cwd });
+  assertReviewSessionPin({ pr, repo, head: view?.headRefOid }, env);
   // THE TRANSPORT SUPPLIES THE SUBJECT, SO THE SUBJECT IS VERIFIED. `gh` could only ever return the PR it was
   // asked for, so nothing checked; a FILE has no such property. A stale or mispasted view sitting under the
   // right filename was otherwise accepted whole — and because `headRefName` a few lines below decides the diff
@@ -413,6 +415,7 @@ export function readPr({
 
   const priorRounds = priorRoundsFor(repo, pr);
   const revSha = revParseCommit(gitExec, netPaths.rev);
+  assertReviewSessionPin({ pr, repo, head: revSha }, env);
 
   // Held item 177 — A STACKED TOP IS JUDGED AGAINST ITS STACK BASE. Only when the stack was detected on the SAME
   // head this clone diffed (`revSha`); any mismatch or failed read keeps the main basis (today's behaviour).
@@ -1150,6 +1153,8 @@ export function createReviewPrSinks({
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
  } = {}) {
   const assertPublishable = async (payload, { requireCiGate = false } = {}) => {
+    try { assertReviewSessionPin({ pr: payload.pr, repo: payload.repo, head: payload.reviewedHead }, env); }
+    catch (error) { throw notApplied(error.message); }
     // shapeReadFinding deliberately records netBasis.rev === null for an unpinned read.
     // Such a verdict still has to publish its DEGRADED BASIS / UNPINNED result; there
     // is no reviewed commit against which to apply head/CI cancellation. Never

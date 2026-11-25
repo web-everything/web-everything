@@ -501,9 +501,11 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }
     }
     const sets = readOffMainSets(heads.map((r) => r.headRefOid), { root, run });
+    const target = rows.find(row => row.pr === requirePr);
     if (strict && trusted.some(row => !sets.has(row.headRefOid)
       && (requirePr === null || row.pr === requirePr
-        || rows.find(target => target.pr === requirePr)?.baseRefName === row.headRefName))) throw Error('stack heads unreadable');
+        || target?.baseRefName === row.headRefName
+        || (target && sameStackActor(target, row))))) throw Error('stack heads unreadable');
     const bases = findStackBases(trusted, sets, { log });
     for (const top of rows) {
       if (!LANE_REF.test(top.baseRefName ?? '')) continue;

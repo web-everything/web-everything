@@ -25,11 +25,28 @@ it('strict target lookup ignores an unrelated moved tip', () => {
   expect(readStackBase({ ...readers(), pr: 1,
     readLanes: () => new Map([['lane/one', head], ['lane/two', head]]) })).toBeNull();
 });
-it('strict unstacked target ignores unrelated unreadable heads', () => {
-  expect(readStackBase({ ...readers(), pr: 1, run: args => {
+it('strict unstacked target ignores unreadable heads by another actor', () => {
+  expect(readStackBase({ ...readers(), pr: 1, readRefs: () => {
+    const rows = refs(); rows.get(2).author = 'unrelated'; return rows;
+  }, run: args => {
     if (args.includes(other)) throw Error('unrelated head');
     return head;
   } })).toBeNull();
+});
+it('strict ancestry-only stack refuses an unreadable same-actor bottom', () => {
+  expect(() => readStackBase({ ...readers(), pr: 2, readRefs: () => {
+    const rows = refs(); rows.get(2).baseRefName = 'main'; return rows;
+  }, run: args => {
+    if (args[0] === 'rev-list' && args.includes(head)) throw Error('bottom unreadable');
+    return args.includes(other) ? `${other}\n${head}` : head;
+  } })).toThrow('heads unreadable');
+});
+it.each(['limit', 'failure'])('strict refs refuses %s even with a valid target', kind => {
+  const rows = refs();
+  if (kind === 'limit') {
+    Array.from({ length: 198 }, (_, i) => rows.set(i + 3, { ...rows.get(1), headRefName: `lane/${i + 3}` }));
+  } else rows.failure = 'refs-timeout';
+  expect(() => readStackBase({ ...readers(), pr: 1, readRefs: () => rows })).toThrow('refs incomplete');
 });
 it('strict mode is forwarded from dispatch to the real stack reader', () => {
   const stackCheck = vi.fn(args => checkStackBeforeReview({ ...args, env: { WE_STACK_AWARE_REVIEW: '1' },

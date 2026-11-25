@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveFastPlan, REVIEW_DISPATCH_LEASE_KEY } from '../../../scripts/lib/review-fast-pass-cli.mjs';
 import { acquireRunnerLease, releaseRunnerLeaseIfOwned } from '../runner-lock.mjs';
+import { dispatchReviewByMode } from '../../../scripts/operations/review-job.mjs';
 vi.mock('../../../scripts/lib/review-facts.mjs', async (original) => ({
   ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
 }));
@@ -12,7 +13,7 @@ vi.mock('../../../scripts/lib/review-fast-pass-cli.mjs', async original => ({
 }));
 import {
   runReviewTick, runReviewTickAllRepos, runConvertAdvisoryTick,
-  runConvertAdvisoryTickAllRepos, buildCliDaemonEffects, resolveReviewTickSharing,
+  runConvertAdvisoryTickAllRepos, buildCliDaemonEffects, resolveReviewTickSharing, runReviewDispatchPass,
 } from '../review-daemon.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -21,24 +22,31 @@ const reviewOpts = { holdReconcile: () => [], statusCandidates: () => [], readMa
 const authGateOverride = () => ({ paused: false, reason: null });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 
-it('ordinary CLI acquires the shared dispatch mutex before reading its capacity and releases on throw', async () => {
+it('ordinary maintenance runs while the dispatch mutex is held; capacity reads and spawn alone hold it', async () => {
   const root = mkdtempSync(join(tmpdir(), 'ordinary-mutex-'));
   const key = REVIEW_DISPATCH_LEASE_KEY;
-  const factory = vi.fn(() => {
+  const maintenance = vi.fn(() => []), dispatch = vi.fn();
+  const readLiveReviewBudget = vi.fn(() => {
     expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(false);
     throw Error('fixture capacity unreadable');
   });
-  const effects = buildCliDaemonEffects({ owner: 'ordinary', dispatchLockRoot: root, reviewTickOpts: factory,
-    reapSessions: () => null, runPrepReview: () => null, convertAdvisoryEnabled: false, log: { error: () => {} } });
+  const run = () => runReviewDispatchPass({ owner: 'ordinary', lockRoot: root, repos: [repo], authGateOverride,
+    log: { error: () => {} }, reviewTickOpts: () => ({ ...reviewOpts,
+      holdReconcile: maintenance, readLiveReviewBudget, dispatch, acquirableLanes: () => [1],
+      dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 77, headRefOid: 'a'.repeat(40) }] }),
+    }) });
   try {
     acquireRunnerLease(root, 'competitor', { key });
-    const deferred = await effects.tickOnce();
-    expect(deferred).toMatchObject({ skipped: true, reason: 'dispatch mutex held' });
-    expect(factory).not.toHaveBeenCalled();
-    expect(() => effects.onTick(deferred)).not.toThrow();
+    await run();
+    expect(maintenance).toHaveBeenCalledOnce();
+    expect(readLiveReviewBudget).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
     releaseRunnerLeaseIfOwned(root, 'competitor', { key });
-    await expect(effects.tickOnce()).rejects.toThrow('fixture capacity unreadable');
-    expect(factory).toHaveBeenCalledOnce();
+    const out = await run();
+    expect(out.failed).toContainEqual(expect.objectContaining({ error: 'fixture capacity unreadable' }));
+    expect(maintenance).toHaveBeenCalledTimes(2);
+    expect(readLiveReviewBudget).toHaveBeenCalledOnce();
     expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
@@ -49,6 +57,28 @@ it('ordinary dispatch stops the remaining candidates on lost ownership', () => {
     reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }) });
   expect(out.failed).toContainEqual({ prNumber: 1, error: 'dispatch lease lost' });
   expect(dispatch).not.toHaveBeenCalled();
+});
+it.each(['ci', 'stack'])('ordinary pass forwards lease ownership through a slow %s read to the final spawn guard', async stage => {
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-lease-loss-'));
+  const spawnJob = vi.fn(), head = 'a'.repeat(40);
+  const lose = () => releaseRunnerLeaseIfOwned(root, 'ordinary', { key: REVIEW_DISPATCH_LEASE_KEY });
+  try {
+    const out = await runReviewDispatchPass({ owner: 'ordinary', lockRoot: root, repos: [repo], authGateOverride,
+      log: { error: () => {} }, reviewTickOpts: () => ({ ...reviewOpts,
+        dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+        reconcile: () => ({ dispatch: [77, 78].map(prNumber => ({ kind: 'review', prNumber, headRefOid: head })) }),
+        acquirableLanes: () => [1, 2], readLiveReviewBudget: () => ({ left: 2, reserve: 0 }),
+        dispatch: args => dispatchReviewByMode({ ...args, mode: 'job', root, dir: join(root, 'jobs'),
+          io: { liveHead: () => head }, checkStaleness: () => ({ fresh: true }),
+          readCompletion: () => null, resolveSettingsEnv: () => ({}),
+          stackCheck: () => { if (stage === 'stack') lose(); return { base: null }; },
+          ciGate: () => { if (stage === 'ci') lose(); return { allowed: true, headSha: head }; }, spawnJob,
+        }),
+      }) });
+    expect(spawnJob).not.toHaveBeenCalled();
+    expect(out.failed).toContainEqual(expect.objectContaining({ prNumber: 77, error: 'dispatch lease lost' }));
+    expect(out.failed).toContainEqual(expect.objectContaining({ prNumber: 78, error: 'dispatch lease lost' }));
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 describe('review tick plan sharing', () => {

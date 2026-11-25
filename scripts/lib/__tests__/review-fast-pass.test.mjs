@@ -54,9 +54,24 @@ it('stops all remaining candidates after losing the lease even if it later recov
   expect(o.dispatch).not.toHaveBeenCalled();
 });
 describe('fast review admission negatives', () => {
+  it.each([
+    ['closed PR', o => { o.readPr = ({ pending }) => pending ? [] : { ...pr, state: 'CLOSED' }; }],
+    ['wrong PR', o => { o.readPr = ({ pending }) => pending ? [] : { ...pr, number: 13 }; }],
+    ['deferred plan', o => { o.planOne = () => ({ dispatch: [row], deferred: true }); }],
+    ['incomplete plan agents', o => { o.planOne = () => ({ dispatch: [row], agentsIncomplete: true }); }],
+    ['incomplete agents', o => { o.readAgents = () => Object.assign([], { incomplete: true }); }],
+    ['incomplete pending inventory', o => { o.readPr = ({ pending }) => pending ? Object.assign([], { incomplete: true }) : pr; }],
+    ['missing save time', o => { o.readLastPlan = () => ({ plan: { dispatch: [row] }, rawPrs: [pr], mainSha: 'main' }); }],
+  ])('refuses %s with every other fact admissible', async (_name, invalidate) => {
+    expect((await runFastPass(fixture())).dispatched).toHaveLength(1);
+    const o = fixture(); invalidate(o);
+    const out = await runFastPass(o);
+    expect(out.failed).toHaveLength(1);
+    expect(o.dispatch).not.toHaveBeenCalled();
+  });
   it.each(['operator', 'referral', 'ledger', 'review:human', 'fix-claim'])('refuses a fresh %s hold', async hold => {
     const o = fixture();
-    o.planOne.mockReturnValue({ dispatch: [], refusals: [{ prNumber: 12, kind: hold }] });
+    o.planOne.mockReturnValue({ dispatch: [row], refusals: [{ prNumber: 12, kind: hold }] });
     await runFastPass(o);
     expect(o.planOne).toHaveBeenCalled();
     expect(o.dispatch).not.toHaveBeenCalled();
@@ -185,6 +200,26 @@ it('spends host and live start capacity before a post-spawn throw, across reposi
 it('retains the red-team reserve', async () => {
   const o = fixture(); o.budget = { left: 1, reserve: 1 };
   await runFastPass(o); expect(o.dispatch).not.toHaveBeenCalled();
+});
+it('refuses an agent appearing between planning and locked capacity discovery', async () => {
+  const o = fixture();
+  o.readAgents.mockReturnValueOnce([]).mockReturnValue([{ pid: 8, pr: 12 }]);
+  expect((await runFastPass(o)).failed[0].reason).toContain('agent inventory changed');
+  expect(o.dispatch).not.toHaveBeenCalled();
+});
+it('changing agent telemetry does not invalidate an unchanged admission inventory', async () => {
+  const o = fixture();
+  o.readAgents.mockReturnValueOnce([{ pid: 8, transcriptAgeMs: 1 }])
+    .mockReturnValue([{ pid: 8, transcriptAgeMs: 1000 }]);
+  expect((await runFastPass(o)).dispatched).toHaveLength(1);
+});
+it('losing ownership in dispatch stops subsequent repositories in the same fast tick', async () => {
+  const o = fixture(), starts = { count: 0 };
+  let held = true;
+  o.dispatch.mockImplementation(({ leaseHeld }) => { held = false; leaseHeld(); throw Error('dispatch lease lost'); });
+  await runFastPass({ ...o, starts, leaseHeld: () => held });
+  await runFastPass({ ...o, starts, repo: 'second/repo', leaseHeld: () => true });
+  expect(o.dispatch).toHaveBeenCalledTimes(1);
 });
 it('passes ordinary routing context and the acquirable lane', async () => {
   const o = fixture(); const subject = { ...pr, files: ['docs/agent/platform-decisions.md', { path: 'scripts/a.mjs' }], body: '## Escalation reason\n- high risk' };

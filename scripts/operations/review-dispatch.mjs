@@ -704,7 +704,8 @@ export function dispatchReview({
     // #x8mpubm follow-up / #4174 — resolved once, here, for this FRESH dispatch, mirroring
     // `reconcile-fix-dispatch.mjs`'s own call exactly. Written into `<sessionCwd>/.claude/settings.local.json`
     // — the cwd this dispatched review session ACTUALLY starts in, never `root`'s any more.
-    settingsEnv: resolveSettingsEnv(sessionCwd),
+    settingsEnv: { ...resolveSettingsEnv(sessionCwd),
+      WE_REVIEW_SESSION_PIN: JSON.stringify({ pr: planned.pr, repo: planned.repo, head: expectedHead }) },
     worktreeSettings: isolateSession(sessionCwd).worktreeSettings,
   });
   // #3331 — THE HANDLE COMES BACK OFF STDOUT, it is not the uuid minted above. `claude --bg` DISCARDS
