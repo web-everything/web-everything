@@ -11,7 +11,7 @@ import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
-function wellFormedAudit(record) {
+export function wellFormedAudit(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)
     || !validSha(record.head) || !validSha(record.base)
     || typeof record.questionHash !== 'string' || !/^[a-f0-9]{64}(?![\s\S])/i.test(record.questionHash)

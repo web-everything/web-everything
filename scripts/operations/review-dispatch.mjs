@@ -124,6 +124,7 @@ import { isRealHead } from '../lib/red-team-skip-outcome.mjs';
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { claudeLaunchRouteFor } from '../lib/dispatch-routing-policy.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
@@ -178,7 +179,7 @@ import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
-import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
+import { assertWrappedClaudeStarted, launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 // re-exported so nothing that already imports `reviewSessionSlug` from this file has to change (#3437) — the
 // slug itself now lives in `we:scripts/conveyor/review-session-slug.mjs`, a PURE module both this file and
@@ -639,9 +640,13 @@ export function dispatchReview({
   // `--json-schema`, a v2 completion record) instead of `claude --bg`. `false` keeps the old spawn byte for byte.
   wrapReview = workerWrapperEnabledFor('review'),
   launchWrapped = launchWrappedClaudeWorker,
+  resolveRoute = resolveOperationRoute,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
-  const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: true });
+  // TEMPORARY (SMOKE-GUARD-RELAND): `required` is off so the OLD installed rebuild-smoke harness (which passes no
+  // expectedHead) still reaches its stub spawner. A PROVIDED expectedHead is still checked. Re-land `required: true`
+  // once every daemon has adopted the harness that passes expectedHead.
+  const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: false });
   if (refusal) return { pr: planned.pr, repo: planned.repo, ...refusal };
   assertNotALaneCheckout(root);
   // #3439 — refuse (not silently spawn) when this checkout is behind origin/main: see `assertMainNotStale`.
@@ -721,10 +726,15 @@ export function dispatchReview({
   if (spawnRefusal) return { pr: planned.pr, repo: planned.repo, ...spawnRefusal };
   if (leaseHeld() !== true) throw Error('dispatch lease lost');
   if (wrapReview) {
+    // The session is the Claude supervisor; judgeProvider selects a child juror, including Antigravity.
+    const executor = 'claude';
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+      route: claudeLaunchRouteFor({ policyRoute: resolveRoute({ operation: 'review' }), executor,
+        reason: 'review-dispatch: inherited Claude review tier' }),
     });
+    assertWrappedClaudeStarted(launched);
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
       unknownTokens, judgeProvider, wrapped: true,

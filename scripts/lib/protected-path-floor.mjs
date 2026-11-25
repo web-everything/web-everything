@@ -13,6 +13,8 @@
  * of this family is most of scripts/, so a module two imports away is protected only if it is named here.
  */
 export const REVIEW_AUTH_FLOOR = Object.freeze([
+  // AUTH-BOUND-APPROVAL: the pinned approval trust root (App id, operator allowlist) and its writer.
+  'scripts/lib/approval-record.mjs', 'scripts/operations/approve-head.mjs',
   'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
   'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
   'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',

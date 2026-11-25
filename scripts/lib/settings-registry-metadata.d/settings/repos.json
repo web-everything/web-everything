@@ -1,0 +1,6 @@
+{
+  "description": "Constellation repository inventory with canonical slugs, aliases, owner paths, daemons, merge paths and app installation IDs.",
+  "owner": "scripts/settings/repos.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -35,7 +35,7 @@ describe('ci.yml soak runs in the merge queue only (R1068)', () => {
 // files remain exercised by the normal soak discovery and required daemon-soak aggregate.
 describe('slow real-git matrices retain merge-queue coverage', () => {
   it.each(['lane-pool-release-unpushed-guard', 'lane-pool-git-diet'])(
-    '%s is excluded from PR units and assigned to exactly one required soak shard', name => {
+    '%s is excluded from PR units and assigned to exactly one required full-soak shard', name => {
       const original = `scripts/__tests__/${name}.test.mjs`;
       const entry = `scripts/conveyor/soak/breaks/${name}.soak.test.mjs`;
       expect(unitConfig.test.exclude).toContain(original);
@@ -43,11 +43,17 @@ describe('slow real-git matrices retain merge-queue coverage', () => {
       expect(soakConfig.test.include).toContain('scripts/conveyor/soak/**/*.soak.test.mjs');
       expect(readFileSync(new URL(`../../../${entry}`, import.meta.url), 'utf8'))
         .toContain(`import '../../../__tests__/${name}.test.mjs';`);
-      const assignments = jobs['soak-shard'].strategy.matrix.shard.flatMap(shard =>
-        shardFiles({ shard, total: jobs['soak-shard'].strategy.matrix.shard.length }));
+      // The matrix is now a scope expression. These closure members select the full
+      // eight-shard run; producer behaviour is exercised in soak-scope.test.mjs.
+      expect(jobs['soak-shard'].strategy.matrix.shard)
+        .toBe('${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}');
+      const fullSoakShards = [1, 2, 3, 4, 5, 6, 7, 8];
+      const assignments = fullSoakShards.flatMap(shard =>
+        shardFiles({ shard, total: fullSoakShards.length }));
       expect(assignments.filter(file => file === entry)).toEqual([entry]);
       expect(jobs['soak-shard'].if).toMatch(/github\.event_name != 'pull_request'/);
-      expect(jobs['soak-shard'].steps.some(step => step.run?.includes('npm run test:soak:shard'))).toBe(true);
+      const command = jobs['soak-shard'].steps.find(step => step.run?.includes('npm run test:soak:shard'))?.run;
+      expect(command).toContain('npm run test:soak:shard -- --shard=${{ matrix.shard }}/8');
       expect(jobs['daemon-soak'].needs).toContain('soak-shard');
       expect(jobs['daemon-soak'].if).toMatch(/merge_group/);
     },

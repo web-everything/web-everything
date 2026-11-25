@@ -3,12 +3,13 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
@@ -472,6 +473,67 @@ describe('createEnqueueOnEvent', () => {
     expect(line).not.toContain('\u001b');
   });
 
+  it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {
+    const noise = '(node:1) DeprecationWarning: The `punycode` module is deprecated.\n(Use `node --trace-deprecation ...` to show where)\n(node:1) ExperimentalWarning: x\n';
+    expect(enqueueModule.firstStderrErrorLine(`${noise}TypeError: x`)).toBe('TypeError: x');
+    expect(enqueueModule.firstStderrErrorLine(`${noise}opaque-value-123`)).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: secret follows\nopaque-value-123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('plain first line')).toBe('plain first line');
+    expect(enqueueModule.firstStderrErrorLine(noise)).toBe('');
+    expect(enqueueModule.firstStderrErrorLine('Error: DeprecationWarning is fatal')).toBe('Error: DeprecationWarning is fatal');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nSESSION=opaque123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nError: SESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION: opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJhbGciOi.eyJzdWIiOi.sig123')).toBe('[redacted]');
+  });
+
+  it.each(['DeprecationWarning', 'ExperimentalWarning'])('firstStderrErrorLine skips real Node %s output and trace hints', type => {
+    const child = spawnSync(process.execPath, ['--eval', `
+      process.emitWarning('fixture warning', { type: ${JSON.stringify(type)}, ${type === 'DeprecationWarning' ? "code: 'DEP0040'" : ''} });
+      process.nextTick(() => process.stderr.write('TypeError: x\\n'));
+    `], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+      env: { ...process.env, NODE_OPTIONS: '', NODE_NO_WARNINGS: '', NODE_REDIRECT_WARNINGS: '' } });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stderr).toContain(`${type}: fixture warning`);
+    expect(child.stderr).toContain(type === 'DeprecationWarning' ? '[DEP0040]' : '--trace-warnings');
+    expect(enqueueModule.firstStderrErrorLine(child.stderr)).toBe('TypeError: x');
+    expect(enqueueModule.firstStderrErrorLine(child.stderr.replace('TypeError: x\n', ''))).toBe('');
+  });
+
+  it('firstStderrErrorLine scans long assignment and JWT near-misses without blocking', () => {
+    // The browser test environment exposes an HTTP import.meta.url; the Node child needs a file URL.
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs')).href;
+    const script = `import { firstStderrErrorLine } from ${JSON.stringify(moduleUrl)};
+      const assignment = 'session'.repeat(100000);
+      const jwt = 'eyJabcde-'.repeat(100000);
+      if (firstStderrErrorLine(assignment) !== assignment.slice(0, 200) + '...') throw new Error('assignment changed');
+      if (firstStderrErrorLine(jwt) !== jwt.slice(0, 200) + '...') throw new Error('JWT changed');`;
+    expect(() => execFileSync(process.execPath, ['--input-type=module', '--eval', script],
+      { timeout: 5000, maxBuffer: 64 * 1024, stdio: 'pipe' })).not.toThrow();
+  });
+
+  it('firstStderrErrorLine preserves assignment and JWT redaction boundaries', () => {
+    for (const line of ['pass: 2', 'drain-prs: pass: 2 failed', 'Error: monkey: banana', 'error: bypass=1 not allowed']) {
+      expect(enqueueModule.firstStderrErrorLine(line)).toBe(line);
+    }
+    for (const key of ['SESSION', 'MY_SESSION', 'session.id', 'service-key', 'AUTH', 'PASS', 'DB_PASS']) {
+      expect(enqueueModule.firstStderrErrorLine(`${key}=opaque123`)).toBe('[redacted]');
+    }
+    expect(enqueueModule.firstStderrErrorLine('PASS=2')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('PASS: opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('DB_PASS: 2')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('MY_SESSION.id-1 : value')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('session =   ')).toBe('session =');
+    expect(enqueueModule.firstStderrErrorLine('session! = value')).toBe('session! = value');
+    expect(enqueueModule.firstStderrErrorLine('jwt prefix-eyJabcde.abcde.')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt xeyJabcde.abcde.')).toBe('jwt xeyJabcde.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcd.abcde.')).toBe('jwt eyJabcd.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcd.')).toBe('jwt eyJabcde.abcd.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcde')).toBe('jwt eyJabcde.abcde');
+  });
+
   it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {
     expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
     expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
@@ -483,6 +545,7 @@ describe('createEnqueueOnEvent', () => {
     expect(enqueueModule.firstStderrErrorLine('a' + String.fromCharCode(0x61c, 0xe9, 0xd83d, 0xde00) + 'b')).toBe('a    b');
     expect(enqueueModule.firstStderrErrorLine('fetch https://alice:hunter2@example.test failed')).toBe('[redacted]');
     // Env-value redaction only (none of these match the pattern blacklist), including short, opaque, multiline and tab values.
+    expect(enqueueModule.firstStderrErrorLine('opaque123', { MY_SESSION: 'opaque123' })).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('boom abc12', { SERVICE_TOKEN: 'abc12' })).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('boom zq81xk', { DATABASE_URL: 'zq81xk' })).toBe('[redacted]');
     expect(enqueueModule.firstStderrErrorLine('boom line-one-xyz\nline-two-xyz', { DB_CONN: 'line-one-xyz\nline-two-xyz' })).toBe('[redacted]');

@@ -30,8 +30,9 @@ const resolveDefaultGate = options => resolveGate({ saturation: () => ({ saturat
  *  `diff --name-only <sha>` returns the (working-tree) changed files; `--diff-filter=D` the deleted ones;
  *  `ls-files --others` the untracked ones; `grep -l -F -e <needle>…` the test files naming a needle (exit 1 —
  *  a throw — when none do, exactly as real `git grep`). No real git process. */
-function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {} } = {}) {
+function fakeGit(changedFiles, { deleted = [], untracked = [], grepHits = {}, origin = 'https://github.com/web-everything/web-everything.git' } = {}) {
   return (args) => {
+    if (args[0] === 'remote') { if (origin === null) throw new Error('no origin'); return origin; }
     if (args[0] === 'merge-base') return 'deadbeef';
     if (args[0] === 'diff' && args.includes('--diff-filter=D')) return deleted.join('\n');
     if (args[0] === 'diff') {
@@ -120,6 +121,94 @@ describe('broad selection host policy', () => {
       saturation: idle, scripts: ['check:standards'] });
     expect(gate.command).toBe(FALLBACK_GATE);
     expect(gate.decision).toMatchObject({ mode: 'full', standards: { run: true, scoped: false } });
+  });
+
+  it('sibling checkout without check-standards.mjs never runs that path; uses own script or skips with a reason', () => {
+    const noWe = (p) => p !== 'scripts/check-standards.mjs';
+    const pa = { origin: 'git@github.com:plateauapp/plateau-app.git' };
+    const own = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json'], pa),
+      saturation: idle, scripts: ['test', 'check:standards'], fileExists: noWe });
+    expect(own.command).toBe('npx vitest run && npm run check:standards');
+    // fail closed: WE (validator deleted), unknown origin, or unreadable origin never skip standards
+    for (const origin of ['https://github.com/web-everything/web-everything.git', 'https://github.com/x/unknown.git', null]) {
+      const closed = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'always' },
+        runGit: fakeGit(['package.json'], { origin }), saturation: idle, scripts: ['test'], fileExists: noWe });
+      expect(closed.command).toBe(FALLBACK_GATE);
+    }
+    const none = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json'], pa),
+      saturation: idle, scripts: ['test'], fileExists: noWe });
+    expect(none.command).toBe('npx vitest run');
+    expect(none.command).not.toContain('check-standards.mjs');
+    expect(none.standardsCommand).toBeNull();
+    expect(none.decision.standards).toMatchObject({ run: false });
+    expect(none.gateReasons.join(' ')).toContain('standards step SKIPPED');
+    const we = resolveDefaultGate({ fileConfig: null, env: TODAY, runGit: fakeGit(['package.json']),
+      saturation: idle, scripts: ['test'], fileExists: () => true });
+    expect(we.command).toBe(FALLBACK_GATE);
+  });
+
+  it.each([
+    'https://github.com/plateauapp/plateau-app.git',
+    'https://github.com/PlateauApp/plateau-app.git',
+    'git@github.com:PlateauApp/Plateau-App.git',
+    'ssh://git@github.com/FRONTIER-UI/FrontierUI.git',
+    'https://github.com/Chalbert/Plateau-App.git',
+    'https://github.com/plateauapp/plateau-app.git/',
+    'https://github.com/plateauapp/plateau-app/',
+    'https://github.com/PlateauApp/Plateau-App.git///',
+    'git@github.com:PlateauApp/Plateau-App.git/',
+    'ssh://git@github.com/FRONTIER-UI/FrontierUI.git/',
+    'ssh://git@GITHUB.COM:22/FRONTIER-UI/FrontierUI.GIT/',
+    'https://github.com/Chalbert/Plateau-App.git/',
+    '  https://github.com/plateauapp/plateau-app.git/\n',
+  ])('normalized sibling origin preserves its own standards script: %s', origin => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY,
+      runGit: fakeGit(['package.json'], { origin }), saturation: idle,
+      scripts: ['test', 'check:standards'], fileExists: p => p !== 'scripts/check-standards.mjs' });
+    expect(gate.command).toBe('npx vitest run && npm run check:standards');
+    expect(gate.standardsCommand).toBe('npm run check:standards');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+    const skipped = resolveDefaultGate({ fileConfig: null, env: TODAY,
+      runGit: fakeGit(['package.json'], { origin }), saturation: idle,
+      scripts: ['test'], fileExists: p => p !== 'scripts/check-standards.mjs' });
+    expect(skipped.command).toBe('npx vitest run');
+    expect(skipped.standardsCommand).toBeNull();
+    expect(skipped.decision.standards).toMatchObject({ run: false, reason: expect.stringContaining('SKIPPED') });
+    expect(skipped.gateReasons.join(' ')).toContain('standards step SKIPPED');
+  });
+
+  it.each([
+    'https://github.com/web-everything/web-everything.git/',
+    'https://github.com/Chalbert/Web-Everything.git///',
+    'https://github.com/x/unknown.git/',
+    'https://example.com/plateauapp/plateau-app.git/',
+    'https://github.com.evil.example/plateauapp/plateau-app.git/',
+    'file:///plateauapp/plateau-app.git/',
+    '/plateauapp/plateau-app.git/',
+    'https://github.com/other/plateauapp/plateau-app.git/',
+    null,
+  ])('unrecognized or WE origin keeps mandatory direct standards: %s', origin => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: TODAY,
+      runGit: fakeGit(['package.json'], { origin }), saturation: idle,
+      scripts: ['test', 'check:standards'], fileExists: p => p !== 'scripts/check-standards.mjs' });
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
+  });
+
+  it.each([
+    ['without fileExists', undefined],
+    ['with the WE standards file present', () => true],
+  ].flatMap(([label, fileExists]) => [
+    [label, fileExists, 'https://github.com/plateauapp/plateau-app.git'],
+    [label, fileExists, 'https://github.com/plateauapp/plateau-app.git/'],
+  ]))('known sibling %s keeps mandatory direct standards (%s, %s)', (_label, fileExists, origin) => {
+    const gate = resolveDefaultGate({ fileConfig: null, env: { ...TODAY, WE_VERIFY_STANDARDS: 'ci-only' },
+      runGit: fakeGit(['package.json'], { origin }),
+      saturation: idle, scripts: ['test', 'check:standards'], fileExists });
+    expect(gate.command).toBe(FALLBACK_GATE);
+    expect(gate.standardsCommand).toBe('node scripts/check-standards.mjs');
+    expect(gate.decision.standards).toMatchObject({ run: true, scoped: false });
   });
 
   it('oversized targets still refuse on an idle host with an explicit gate fallback', () => {

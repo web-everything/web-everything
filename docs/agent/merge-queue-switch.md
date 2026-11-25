@@ -66,8 +66,8 @@ does not cancel preparation of the other PRs. Async GitHub reads run through the
 - [ ] `merge-gate` runs in **enforce**. PR #4715 does not itself set `mergeGate.mode`; enforce needs
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
   (`we:scripts/lib/merge-gate-ci.mjs`, `loadMergeGateMode`). Confirm the merge-gate log shows `mode=enforce`.
-  Apply step 4 re-checks this on a fresh merge-gate run on main and stops unless its log says `enforce`: in `shadow` the
-  required `merge-gate` check passes with "SHADOW: would HOLD", so the queue would merge PRs the drain holds.
+  Apply step 4 re-checks this on a fresh merge-gate run on main and stops unless its log says `enforce`: shadow no
+  longer changes the exit code (PRT-SHADOW-HOLD v2); the "SHADOW (log only)" line is observation only.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
 - [ ] Card `5918` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
   opened, synchronize and reopened (plus `merge_group`), so a label or body edit may not re-run the pinned
