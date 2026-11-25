@@ -10,7 +10,9 @@
 import { join } from 'node:path';
 import { readdirSync, readFileSync } from 'node:fs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { readLockEntry, parseLockEntry, isLeaseExpired } from '../readiness/file-locks.mjs';
+import { readLockEntry, parseLockEntry, isLeaseExpired, readClaimEvidence } from '../readiness/file-locks.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { isStrictUtcTimestamp } from '../lib/strict-utc-timestamp.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
 
 /** How long an unreleased claim survives before a DIFFERENT owner may reclaim it (dead-holder floor). Chosen
@@ -19,6 +21,8 @@ import { mintSessionSlug } from './session-slug.mjs';
  *  it, while still short enough that an abandoned claim (the release-on-reap hook not yet wired, above) self-
  *  heals without anyone touching a lock file by hand. */
 export const DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES = 10;
+// Shared with the dispatcher: no claim TTL may exceed its absolute refresh ceiling.
+export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
 
 /** The pinned, cross-checkout root every dispatcher's claim lives under — see this file's own header for why
  *  it is NOT `file-locks.mjs`'s own checkout-local default. `WE_COORDINATION_ROOT`-overridable via
@@ -100,4 +104,54 @@ export function listFixDispatchClaims(lockRoot = fixDispatchClaimRoot(), {
     out.push(entry);
   }
   return out;
+}
+
+/** Strip refs/heads/ and surrounding whitespace for branch comparisons. */
+export const normalizeBranch = ref => String(ref ?? '').trim().replace(/^refs\/heads\//, '');
+
+/** Canonical short branch metadata follows Git ref syntax, independent of the lane-only push policy.
+ * Keep this pure: claim scans also run in the pre-push hook and must not spawn git for each neighbor. */
+function isCanonicalClaimBranch(branch) {
+  return typeof branch === 'string' && branch === normalizeBranch(branch)
+    && branch !== 'HEAD' && !branch.startsWith('-') && !branch.endsWith('.')
+    && !/[\x00-\x20\x7f~^:?*\[\\]/.test(branch)
+    && !branch.includes('..') && !branch.includes('@{')
+    && branch.split('/').every(part => part && !part.startsWith('.') && !part.endsWith('.lock'));
+}
+
+/** Shared strict metadata contract for scans and the authorized-push claim reader. */
+export function validateFixClaimMeta(meta) {
+  const validTtl = value => Number.isInteger(value) && value >= 1
+    && value <= MAX_FIX_DISPATCH_CLAIM_REFRESH_MS / 60_000;
+  return Boolean(meta && typeof meta.repo === 'string' && Object.hasOwn(CONSTELLATION_REPOS, meta.repo)
+    && Number.isSafeInteger(meta.pr) && meta.pr > 0 && ['fix', 'ci-heal', 'fixing'].includes(meta.kind)
+    && (meta.kind !== 'fixing' || validTtl(meta.ttlMinutes))
+    && (!('ttlMinutes' in meta) || validTtl(meta.ttlMinutes))
+    && (!('leaseMinutes' in meta) || validTtl(meta.leaseMinutes))
+    && (!(meta.kind === 'fixing' || 'branch' in meta) || isCanonicalClaimBranch(meta.branch)));
+}
+
+/** Fail closed on incomplete claim evidence; confirm concurrent directory removal. */
+export function listFixDispatchClaimsStrict(lockRoot = fixDispatchClaimRoot()) {
+  const entries = [];
+  const latestEvidenceMs = Date.now() + 60_000; // Allow bounded clock skew, never an indefinitely live future claim.
+  let names, unreadable = false;
+  try { names = readdirSync(lockRoot); } catch { return { entries, unreadable: true }; }
+  for (const name of names) {
+    try {
+      const { entry, sidecarAt } = readClaimEvidence(join(lockRoot, name));
+      if (!entry || typeof entry.owner !== 'string' || !entry.owner.trim()
+        || !isStrictUtcTimestamp(entry.heartbeatAt)
+        || Date.parse(entry.heartbeatAt) > latestEvidenceMs
+        || (sidecarAt && Date.parse(sidecarAt) > latestEvidenceMs)
+        || !validateFixClaimMeta(entry.meta)) unreadable = true;
+      else entries.push({ ...parseLockEntry(JSON.stringify(entry)), ...(sidecarAt ? { sidecarAt } : {}) });
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        try { if (!readdirSync(lockRoot).includes(name)) continue; } catch { /* unreadable root */ }
+      }
+      unreadable = true;
+    }
+  }
+  return { entries, unreadable };
 }

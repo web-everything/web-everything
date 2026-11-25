@@ -160,7 +160,7 @@ describe('verify settings', () => {
     const phases = buildVerifyPhases({ decision });
     expect(phases.settingsSource).toEqual(decision.settingsSource);
     expect(formatVerifyPhases(phases)).toContain('settingsSource=');
-    const blocked = resolveDefaultGate({ runGit: () => { throw Error('unreadable diff'); }, env: {}, fileConfig: null });
+    const blocked = resolveDefaultGate({ runGit: () => { throw Error('unreadable diff'); }, env: {}, fileConfig: null, saturation: () => ({ saturated: true, known: true }) });
     expect(blocked.decision.mode).toBe('blocked');
     expect(blocked.decision.settingsSource).toEqual(allSources('default'));
   });

@@ -12,13 +12,13 @@ import { allowedCommand, allowedEnv, normalizeScanFilesValue, digestInput, diges
 import {trackedTree, validateTrackedFile, logManifestVerdict, FORGE_MANIFEST_FILE_CAP, FORGE_MANIFEST_TOTAL_CAP, FORGE_MANIFEST_SIZE_EXCEPTIONS} from './forge-manifest-tracked.mjs';
 export {FORGE_MANIFEST_SIZE_EXCEPTIONS, FORGE_MANIFEST_BINARY_EXTENSIONS} from './forge-manifest-tracked.mjs';
 
+import {validRemoteHosts} from './remote-target.mjs';
 import {BASE_RETENTION} from './forge-exec-bases.mjs';
 import {resolveTransport,runnerSupportsBundle,planBundle,mainFreshness,bundleEvidence,makeBundleDirectory,removeBundleDirectory} from './remote-git-bundle.mjs';
 import {routeNeedsGit,selectionUnproven} from './needs-git-route.mjs';
 import {writeJsonAtomic} from '../lib/atomic-json-file.mjs';
 import {SKIP_REASON, SECTION_INPUTS, DYNAMIC_SECTIONS, createSectionGate} from '../lib/standards-sections.mjs';
 
-const ROOT = '/srv/forge-exec';
 const LIMIT = 4 * 1024 * 1024;
 const SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10'];
 // @test-only-export-ok: exercise private-directory refusal without touching user state.
@@ -210,10 +210,10 @@ export function validateRunId(id) {
 
 // Captures have a hard byte limit; streamed command output is inherited verbatim.
 // @test-only-export-ok: the capture boundary suite exercises this process adapter directly.
-export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal }) {
+export function defaultExec({ file, args, cwd, input, inherit = false, onOutput, sshOptions, env, signal, timeout }) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, file === 'ssh' ? [...(sshOptions??connectionOptions()), ...args] : args, {
-      cwd, env, stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
+      cwd, env, timeout, killSignal: 'SIGKILL', stdio: [input === undefined ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe', inherit && !onOutput ? 'inherit' : 'pipe'],
     });
     const stdout = [];
     let bytes = 0;
@@ -235,7 +235,8 @@ export function defaultExec({ file, args, cwd, input, inherit = false, onOutput,
     const stop = () => { child.kill('SIGTERM'); };
     if (signal) { if (signal.aborted) stop(); else { signal.addEventListener('abort', stop, { once: true }); child.once('close', () => signal.removeEventListener('abort', stop)); } }
     child.on('error', reject);
-    child.on('close', (code) => exceeded ? reject(new Error('Captured output limit exceeded'))
+    child.on('close', (code, exitSignal) => exceeded ? reject(new Error('Captured output limit exceeded'))
+      : timeout && exitSignal ? reject(new Error(`Execution terminated: ${exitSignal}`))
       : resolve({ code: code ?? 1, stdout: Buffer.concat(stdout) }));
     if (input !== undefined) {
       child.stdin.on('error', () => {}); // A failed SSH may close stdin before reading.
@@ -1250,7 +1251,6 @@ async function discoverDelta({cwd,exec,fs,env,host,discovery,fetchBaseManifest,h
 // ahead of the run. The run passes the cache only as an rsync --copy-dest
 // basis, so nothing about what is trusted changes: rsync reuses a cached leaf
 // only on a checksum match and Forge re-verifies every assembled byte.
-const PRESYNC_ROOT=ROOT+'/presync';
 const PRESYNC_STATE='forge-presync.json';
 const PRESYNC_LOCK='forge-presync.lock';
 const PRESYNC_BASE='forge-presync-base.json';
@@ -1307,12 +1307,12 @@ async function acquirePresyncLock(path,fs) {
 }
 // One presync round. Every failure is recorded in the lane state and never
 // thrown: a run must behave exactly as without presync.
-export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now,home}={}) {
+export async function presync({cwd=process.cwd(),host='forge',root='/srv/forge-exec',exec=defaultExec,fs=filesystem,sshOptions,env=process.env,clock=Date.now,home}={}) {
   const {loadAdmissionPolicy} = await import('./heavy-admission.mjs');
   const policy = loadAdmissionPolicy({env,checkoutRoot:cwd,home});
   if (policy.manifestFailClosed || policy.settings.remote.manifest !== 'legacy')
     return {status:'skipped',reason:policy.manifestFailClosed ? policy.sources['remote.enabled'] : 'tracked-manifest'};
-  if(!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host))return {status:'failed',reason:'invalid-host'};
+  if(!validRemoteHosts([{alias:host,root}]))return {status:'failed',reason:'invalid-host'};
   try {exec=await bindGit({cwd,env,exec});}catch {return {status:'failed',reason:'unbound-worktree'};}
   const gitDir=exec[gitBinding].dir;
   sshOptions ??= connectionOptions();
@@ -1323,7 +1323,7 @@ export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,f
   const key=previous?.host===host?previous.key:randomBytes(16).toString('hex');
   const record=state=>writeJsonAtomic(join(gitDir,PRESYNC_STATE),{v:1,host,key,atET:easternTimestamp(clock()),...state},{mode:0o600});
   try {
-    const ssh=(command,request)=>exec({file:'ssh',args:[host,`sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],input:JSON.stringify(request),cwd,sshOptions});
+    const ssh=(command,request)=>exec({file:'ssh',args:['--',host,`sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],input:JSON.stringify(request),cwd,sshOptions});
     const delta=await discoverDelta({cwd,exec,fs,env,host,discovery:await ssh('bases',{}),fetchBaseManifest:sha=>ssh('base-manifest',{sha})});
     // Never ship a full tree or coverage in the background. Sibling trees are
     // left to the run's own transfer (a Follow-up).
@@ -1337,10 +1337,10 @@ export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,f
     const files={};
     await stageSnapshot({fs,stageDirectory:stageDirectoryIn(fs,staging,0o711,0o711),source:cwd,destination:staging,entries,
       onStaged:(entry,destination,content)=>{files[entry.path.toString('hex')]={sha256:entry.sha256,size:content.length};}});
-    const ready=await exec({file:'ssh',args:[host,`umask 077 && mkdir -p -m 0711 ${PRESYNC_ROOT} && test -d ${PRESYNC_ROOT} && test ! -L ${PRESYNC_ROOT} && test -O ${PRESYNC_ROOT}`],cwd,sshOptions});
+    const ready=await exec({file:'ssh',args:['--',host,`umask 077 && mkdir -p -m 0711 ${root}/presync && test -d ${root}/presync && test ! -L ${root}/presync && test -O ${root}/presync`],cwd,sshOptions});
     if(ready.code!==0)throw new Error('Presync cache unavailable');
     const copied=await exec({file:'rsync',args:['-a','--delete','--no-links','--safe-links','-e',`ssh ${sshOptions.map(quote).join(' ')}`,
-      './',`${host}:${PRESYNC_ROOT}/${key}/`],cwd:staging});
+      './',`${host}:${root}/presync/${key}/`],cwd:staging});
     if(copied.code!==0)throw new Error('Presync copy failed');
     record({baseSha:delta.baseSha,baseManifestDigest:delta.baseManifestDigest,files});
     return {status:'synced',count:entries.length,bytes:Object.values(files).reduce((n,f)=>n+f.size,0)};
@@ -1353,9 +1353,9 @@ export async function presync({cwd=process.cwd(),host='forge',exec=defaultExec,f
   }
 }
 // The run starts the next presync detached with a minimal env; it never waits.
-export function spawnPresync({cwd,host,env=process.env,spawnFn=spawn}={}) {
+export function spawnPresync({cwd,host,root='/srv/forge-exec',env=process.env,spawnFn=spawn}={}) {
   try {
-    const child=spawnFn(process.execPath,[fileURLToPath(import.meta.url),'presync',`--host=${host}`],{cwd,env:presyncEnv(env),detached:true,stdio:'ignore'});
+    const child=spawnFn(process.execPath,[fileURLToPath(import.meta.url),'presync',`--host=${host}`,...(root==='/srv/forge-exec'?[]:[`--root=${root}`])],{cwd,env:presyncEnv(env),detached:true,stdio:'ignore'});
     child.on?.('error',()=>{});child.unref?.();
   } catch { /* presync is best effort */ }
 }
@@ -1386,7 +1386,7 @@ export async function runRemote(options={}) {
   timings.push({stage:'total',startedAtET:easternTimestamp(start),ms:Math.max(0,Math.round(clock()-start))});
   // Only the real transport presyncs; injected transports opt in explicitly.
   const after=options.spawnPresync??(options.exec===undefined?spawnPresync:null);
-  if(after&&result.mode==='remote'&&timings.some(t=>t.stage==='rsync'&&t.shipMode==='delta'))after({cwd:options.cwd??process.cwd(),host:options.host??'forge',env:options.env??process.env});
+  if(after&&result.mode==='remote'&&timings.some(t=>t.stage==='rsync'&&t.shipMode==='delta'))after({cwd:options.cwd??process.cwd(),host:options.host??'forge',root:options.root??'/srv/forge-exec',env:options.env??process.env});
   return {...result,timings};
 }
 
@@ -1422,7 +1422,7 @@ export function detectTestNeedsGit({argv,cwd,route=routeNeedsGit,unproven=select
   try{return route({argv,cwd}).local===true||unproven({argv,cwd})===true;}catch{return true;}
 }
 
-async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', shadow = false, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
+async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = process.env, runId = newRunId(), host = 'forge', root = '/srv/forge-exec', exec = defaultExec, listFiles, fs = filesystem, clock, timings, begin, disableDelta=false, sshOptions, cancelSignal, onRun, slotUnits = 1, transport, manifestMode = 'legacy', shadow = false, onCapabilities, onWarning, bundleMainMaxAgeMs = 600000, log = text=>process.stderr.write(text) } = {}) {
   let warningCount=0;
   // The credential-warn log is what a later re-tightening reads: never drop a warning silently. With no callback,
   // or when the callback throws, append it to remote-fallbacks.jsonl; a failed write is logged, never fatal.
@@ -1439,6 +1439,8 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     catch(error) {try{log(`remote-exec: could not record ${reason}: ${String(error?.message??error).slice(0,200)}\n`);}catch{ /* logging only */ }}
   };
   const fallback = (reason, detail) => ({ mode: 'not-started', terminated: true, reason, detail });
+  if (!validRemoteHosts([{alias:host,root}]))
+    return fallback(root === '/srv/forge-exec' ? 'invalid-parameters' : 'invalid-target');
   if (!Number.isSafeInteger(slotUnits) || slotUnits < 1 || slotUnits > 256) return fallback('invalid-slot-units');
   const guardSplit = splitGuardReport(argv);
   const guardOutputFile = guardSplit.outputFile;
@@ -1462,14 +1464,14 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
   }
   const needsGit=standardsNeedGit||testNeedsGit;
   let bundleDirectory;
-  if (!validateRunId(runId) || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(host)) return fallback('invalid-parameters');
+  if (!validateRunId(runId)) return fallback('invalid-parameters');
   try {exec=await bindGit({cwd,env,exec});}catch(error){return fallback(error.code??'unbound-worktree');}
   sshOptions ??= connectionOptions();
   const start=work=>Promise.resolve().then(work);
   const initial=await Promise.allSettled([
-    start(()=>exec({file:'ssh',args:[host,'true'],cwd,sshOptions})),
+    start(()=>exec({file:'ssh',args:['--',host,'true'],cwd,sshOptions})),
     start(()=>needsGit?exec({file:'git',args:['rev-parse','HEAD'],cwd}):undefined),
-    start(()=>disableDelta?undefined:exec({file:'ssh',args:[host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
+    start(()=>disableDelta?undefined:exec({file:'ssh',args:['--',host,'sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs bases'],input:'{}',cwd,sshOptions})),
   ]);
   // All speculative children are drained and all rejections observed before fallback.
   if(initial[0].status==='rejected'||initial[0].value.code!==0||initial[1].status==='rejected')return fallback('forge-unreachable');
@@ -1519,7 +1521,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
     }
   };
   const ssh = (command, request, inherit = false) => exec({file:'ssh',
-    args:[host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
+    args:['--',host, `sudo -n -u ops /usr/local/libexec/forge-exec-run.mjs ${command}`],
     input:JSON.stringify(request), cwd, inherit, sshOptions,
     ...(command === 'run' ? {signal: cancel.signal} : {}),
     ...(command === 'run' && argv[2] === 'check:standards' ? {onOutput:observeStandards} : {}),
@@ -1642,7 +1644,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       try {onRun?.(run, {nonce, slot:typeof preparation.slot === 'string' ? preparation.slot : undefined});} catch { /* advisory only */ }
       const slot=preparation.slot??'forge-exec';
       if(slot!=='forge-exec'&&(!/^forge-exec-[1-9]\d*$/.test(slot)||!Array.isArray(preparation.capabilities?.workers)||!preparation.capabilities.workers.includes(slot)))throw new Error('Invalid server slot');
-      const runRoot=slot==='forge-exec'?ROOT:ROOT+'/'+slot.replace('forge-exec-','slot-');
+      const runRoot=slot==='forge-exec'?root:root+'/'+slot.replace('forge-exec-','slot-');
       guardRemoteRoot=`${runRoot}/${run}/work`;
       if(bundleTransport)try{onCapabilities?.(preparation.capabilities);}catch{ /* advisory routing cache only */ }
       if(needsGit&&preparation.capabilities?.gitWorktree!==2)return {mode:'not-started',terminated:true,reason:'forge-runner-too-old'};
@@ -1688,7 +1690,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       // assembled tree against the sha256 manifest before anything runs.
       const presynced=delta?await matchPresync({exec,fs,host,delta,entries:manifest.entries.filter(entry=>selectedKeys.has(entry.path.toString('hex')))}):undefined;
       const copied = await exec({file:'rsync',args:['-a','--chmod=Da+rx','--no-recursive','--no-dirs','--no-links','--safe-links','--exclude=.exit-code',
-        ...(presynced?.count?['--checksum',`--copy-dest=${PRESYNC_ROOT}/${presynced.key}/`]:[]),
+        ...(presynced?.count?['--checksum',`--copy-dest=${root}/presync/${presynced.key}/`]:[]),
         '--from0','--files-from=-',`--rsync-path=sudo -u ${slot} rsync`,'-e',`ssh ${sshOptions.map(quote).join(' ')}`,
         './',`${host}:${runRoot}/${run}/work/`],cwd:workStage,input:inventory});
       if(copied.code !== 0) throw new Error('Copy failed');
@@ -1718,7 +1720,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
       if(delta) {
         await finish();
         if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+        return executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,root,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
       }
       if (error.code === 'sibling-inventory-failed') return {mode:'not-started',terminated:true,reason:error.code,detail:safeFallbackDetail(error.code,error.siblingPath)};
       if (error.code === 'unsupported-sibling-dependency') return fallback(error.code);
@@ -1752,7 +1754,7 @@ async function executeRemote({ warningSink, argv, cwd = process.cwd(), env = pro
           // finish consumed protected prepared state and proved started=false.
           // A fresh full prepare is safe once; disableDelta bounds the retry.
           if(staging){await fs.rm(staging,{recursive:true,force:true});staging=undefined;}
-          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
+          const retried=await executeRemote({argv:withGuardReport(argv,guardOutputFile),cwd,env,runId,host,root,exec,listFiles,fs,clock,timings,begin,disableDelta:true,sshOptions,cancelSignal,onRun,slotUnits,transport,manifestMode,shadow,onCapabilities,onWarning:reportWarning,bundleMainMaxAgeMs,log});
           for(const timing of timings)if(timing.stage==='rsync')timing.shipMode='delta-then-full';
           return retried;
         }
@@ -1860,14 +1862,25 @@ export function parseArgs(args) {
   return options;
 }
 
+export function parsePresyncArgs(args) {
+  const options = {host:'forge', root:'/srv/forge-exec'}, seen = new Set();
+  for (const arg of args) {
+    const key = arg.startsWith('--host=') ? 'host' : arg.startsWith('--root=') ? 'root' : null;
+    if (!key) throw new Error('Unknown presync option');
+    if (seen.has(key)) throw new Error('Duplicate presync option');
+    seen.add(key);
+    options[key] = arg.slice(arg.indexOf('=') + 1);
+  }
+  return options;
+}
+
 const cliPath = (() => { try { return realpathSync(process.argv[1]); } catch { return ''; } })();
 if (process.argv[1] && cliPath === realpathSync(fileURLToPath(import.meta.url))) {
   (async () => {
   try {
     if(process.argv[2]==='presync'){
-      const extra=process.argv.slice(3),host=extra.length===1&&extra[0].startsWith('--host=')?extra[0].slice(7):extra.length===0?'forge':null;
-      if(host===null)throw new Error('Usage: remote-exec.mjs presync [--host=forge]');
-      const result=await presync({host});
+      const {host,root}=parsePresyncArgs(process.argv.slice(3));
+      const result=await presync({host,root});
       process.stderr.write(`presync: ${JSON.stringify(result)}\n`);
       process.exitCode=result.status==='failed'?1:0;
     } else process.exitCode = await main(parseArgs(process.argv.slice(2)));

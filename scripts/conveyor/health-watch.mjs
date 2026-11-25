@@ -105,6 +105,7 @@ import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-en
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
 import { ghThrottleLockRoot, ghThrottleLogPath, budgetProbeArgs } from '../lib/gh-throttle.mjs';
 import { persistSpendHours } from '../lib/gh-spend.mjs';
+import { readDrainQueueSafety } from '../lib/drain-queue-safety.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readClaudeAuthExpiredInfo, readHungInfo } from './hung-session.mjs';
 import { readJsonlTail } from '../operations/land-advance-io.mjs';
@@ -776,8 +777,26 @@ export function probeRestBudget({ exec = run } = {}) {
   return { limit: j?.limit ?? null, used: j?.used ?? null, remaining: j?.remaining ?? null, reset: j?.reset ?? null };
 }
 
-export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now() } = {}) {
+/** `repo#number` of every PR holding an open (or pending) `red-team-pending-overdue` episode — the only rows whose
+ *  cached labels are worth a live confirmation, since only an open episode can close on fresh clear evidence. */
+export function openRedTeamPrs(episodes) {
   const out = [];
+  for (const ep of Object.values(episodes || {})) {
+    if (ep?.smell !== 'red-team-pending-overdue' || typeof ep.subject !== 'string') continue;
+    out.push(ep.subject.split('@')[0]);
+  }
+  return out;
+}
+
+export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.now(), drainOptions = {}, clock = Date.now, readSnapshot = null, openRedTeamPrs: openPrs = [] } = {}) {
+  // Live label confirmation is bounded to PRs with an open episode: a cached non-pending row without one has nothing to
+  // close and stays unknown (cachedLabels), so the common case costs zero per-PR calls and the shared snapshot stays the budgeted path.
+  const confirmOpen = new Set(openPrs || []);
+  // One deadline across every repo: exhaustion leaves evidence unknown, never clean.
+  const pendingDeadline = clock() + 60_000;
+  const out = [];
+  out.inventoryComplete = true;
+  const { redTeamPendingMaxMin } = readDrainQueueSafety({ log: line => console.error(line), ...drainOptions }).value;
   for (const { slug } of Object.values(CONSTELLATION_REPOS)) {
     // #gh-graphql-budget — the host-shared open-PR snapshot when this is the real `run` (never a test's fake exec).
     // `isDraft` (draft-first PRs, operator-approved 2026-09-27) — already part of `SNAPSHOT_FIELDS`, added here
@@ -786,10 +805,59 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
     // watch's own way (needs `mergeable`) and reads its markers off the thread; `stood-down-prs` counts the
     // stand-down markers. Both are already in the shared snapshot's field set, so the snapshot path costs nothing extra.
     const fields = 'number,title,headRefName,headRefOid,labels,statusCheckRollup,updatedAt,isDraft,mergeable,comments';
-    const shared = exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
-    const listed = shared || JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
-    const rows = Array.isArray(listed) ? listed : []; // a throttle deferral object = skip this repo's PR smells this pass
+    const shared = readSnapshot ? readSnapshot({ repo: slug, fields })
+      : exec === run ? readSharedOpenPrs({ repo: slug, fields }) : null;
+    const listed = shared ?? JSON.parse(exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '100', '--json', fields]));
+    const inventoryComplete = Array.isArray(listed) && listed.length < (shared != null ? 500 : 100);
+    if (!inventoryComplete) out.inventoryComplete = false;
+    const rows = Array.isArray(listed) ? listed : [];
+    // Missing subjects remain unknown to the pending smell even when a deferred repo yields zero rows.
+    // Carry completeness on rows too (array metadata may be lost during JSON transport).
     for (const pr of rows) {
+      let cachedLabels = shared != null;
+      let pendingLabels = pr.labels;
+      let isDraft = !!pr.isDraft;
+      // A snapshot's missing label is not proof of a clear. Fresh confirmation shares
+      // the timeline deadline; labels and draft status must be refreshed together so a stale
+      // cached draft cannot clear live pending. Failed/partial reads keep cachedLabels set.
+      if (cachedLabels && confirmOpen.has(`${slug}#${pr.number}`) && !pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+        const remaining = pendingDeadline - clock();
+        if (remaining > 0) try {
+          const live = JSON.parse(exec('gh', ['pr', 'view', String(pr.number), '--repo', slug, '--json', 'labels,isDraft'],
+            { timeoutMs: Math.min(15_000, remaining) }));
+          if (typeof live?.isDraft === 'boolean' && Array.isArray(live.labels)
+            && live.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0)) {
+            pendingLabels = live.labels;
+            isDraft = live.isDraft;
+            cachedLabels = false;
+          }
+        } catch { /* Unknown labels carry forward; only fresh evidence can clear. */ }
+      }
+      let redTeamPendingSince = null;
+      let redTeamPendingPartial = false;
+      if (!isDraft && pendingLabels?.some?.(l => l?.name === 'red-team:pending')) {
+        redTeamPendingPartial = true;
+        const [owner, name] = slug.split('/');
+        const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr.number)}) {
+          timelineItems(last:30,itemTypes:[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } }
+        } } }`;
+        try {
+          const remaining = pendingDeadline - clock();
+          const tail = remaining > 0
+            ? JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`], { timeoutMs: Math.min(15_000, remaining) }))
+            : null;
+          if (tail && !tail.errors?.length) {
+            const events = tail?.data?.repository?.pullRequest?.timelineItems?.nodes;
+            const pending = Array.isArray(events) ? events.filter(e => e?.label?.name === 'red-team:pending') : [];
+            // Timeline nodes are chronological; an unreadable latest event remains unknown.
+            const latest = pending.at(-1)?.createdAt;
+            if (Number.isFinite(Date.parse(latest))) {
+              redTeamPendingSince = latest;
+              redTeamPendingPartial = false;
+            }
+          }
+        } catch { /* Unknown age must alert; never substitute updatedAt. */ }
+      }
       // Snapshot rows may be cached. Only a successful fresh provider read counts for this smell — and only a PR
       // whose cached labels hold no `review:*` label can be in breach, so a labelled PR costs no per-PR call
       // (the shared snapshot stays the budgeted path for the common case). The labelled row still reports a clean
@@ -806,16 +874,16 @@ export function probePrs({ exec = run, readCommits = fetchPrCommits, now = Date.
             ...(exec !== run ? { exec: args => exec('gh', args) } : {}) }) };
       } catch { /* Unknown, not a clean observation. */ }
       out.push({
-        reviewObservation,
+        reviewObservation, redTeamPendingSince, redTeamPendingPartial, redTeamPendingMaxMin, inventoryComplete, cachedLabels,
         repo: slug, number: pr.number, title: pr.title, headRefName: pr.headRefName, headRefOid: pr.headRefOid ?? null, updatedAt: pr.updatedAt,
-        isDraft: !!pr.isDraft,
+        isDraft,
         mergeable: pr.mergeable ?? null,
         // Only what the marker readers need (leading line, time, trusted author) — never the whole comment record.
         comments: (pr.comments || []).map((c) => ({
           body: c.body, createdAt: c.createdAt, author: { login: c.author?.login ?? null }, viewerDidAuthor: c.viewerDidAuthor,
         })),
-        labels: Array.isArray(pr.labels) ? pr.labels.map(l => ({ name: l?.name })) : [],
-        labelsValid: Array.isArray(pr.labels) && pr.labels.every(l => l && typeof l.name === 'string' && l.name.length > 0),
+        labels: Array.isArray(pendingLabels) ? pendingLabels.map(l => ({ name: l?.name })) : [],
+        labelsValid: Array.isArray(pendingLabels) && pendingLabels.every(l => l && typeof l.name === 'string' && l.name.length > 0),
         // `status` (draft-first PRs, operator-approved 2026-09-27) — carried alongside `state`/`conclusion` so
         // `we:scripts/operations/pr-status.mjs#reduceCheckState` (the `draft-not-promoted` smell's own green
         // check) reads the SAME completion signal every other CI-truth consumer in this repo does off a raw
@@ -1058,13 +1126,13 @@ export { GH_GROUP_PROBE_NAMES };
  * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
  * @returns {{probes: object, errors: Record<string, string>}}
  */
-export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = null, laneScanWrite = false } = {}) {
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false, laneScanDir = null, laneScanWrite = false, openRedTeamPrs: openPrs = [] } = {}) {
   const probes = {};
   const errors = {};
   const attempt = (name, fn) => {
     try { return fn(); } catch (e) { errors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; }
   };
-  const prs = attempt('prs', () => probePrs({ now }));
+  const prs = attempt('prs', () => probePrs({ now, openRedTeamPrs: openPrs }));
   const agents = attempt('agents', () => probeAgents());
   // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
   // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
@@ -1392,7 +1460,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (ghJobsOn || reconcileOnly) {
     const out = await attempt('ghJob', () => runGhProbeJobs({
       ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
-      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite },
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite, openRedTeamPrs: openRedTeamPrs(prev.episodes) },
     }));
     if (out) {
       jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
@@ -1407,7 +1475,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     }
   }
   if (!ghJobsOn && ghDue && !ghFromJob) {
-    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite });
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'], laneScanDir, laneScanWrite, openRedTeamPrs: openRedTeamPrs(prev.episodes) });
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
     if (got.probes.prs && got.probes.agents) ghCache.at = now;

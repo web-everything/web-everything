@@ -126,6 +126,7 @@ export function planLandAdvance(inputs) {
       evidence = ['review:changes; no matched live fixer'];
     } else if (ls.includes('review:pending') && !worker('review').includes('matched')) {
       action = 'dispatch-review'; since = p.createdAt; evidence = ['review:pending; no matched live reviewer'];
+      extra.headRefOid = p.headRefOid;
     } else if (STALE_LABEL_RULES.some((r) => ls.includes(r.label) && p.mergeStateStatus === r.mergeStateStatus && Number(now) - Date.parse(p.updatedAt) > r.thresholdMs)) {
       action = 'stale-label'; evidence = ['checking on CLEAN PR for over one hour'];
     }

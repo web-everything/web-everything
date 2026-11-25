@@ -13,19 +13,24 @@ export function hostSaturation({ collect = collectHostCapacity, admission = host
   const idle = reading?.mac?.idlePct;
   const threshold = reading?.thresholds?.cpuIdleLowPct;
   const validIdle = Number.isFinite(idle) && idle >= 0 && idle <= 100;
+  const validThreshold = Number.isFinite(threshold) && threshold >= 0 && threshold <= 100;
   const detail = `CPU idle ${validIdle ? idle : 'unknown'}%`;
   // collectHostCapacity resolves this threshold through the capacity gate's policy cascade (default 15).
-  if (validIdle && Number.isFinite(threshold) && threshold >= 0 && threshold <= 100 && idle < threshold) {
+  if (validIdle && validThreshold && idle < threshold) {
     const source = reading.sources?.['host.capacity.cpuIdleLowPct'] ?? 'standard';
-    return { saturated: true, reason: `${detail} < host.capacity.cpuIdleLowPct=${threshold}% (${source})` };
+    return { saturated: true, known: true, reason: `${detail} < host.capacity.cpuIdleLowPct=${threshold}% (${source})` };
   }
+  let admissionKnown = false;
   try {
     const verdict = admission({ interactive: false, capacity: () => reading });
+    const load = /^host load (\d+(?:\.\d+)?)\//.exec(verdict?.reason ?? '');
+    const positiveLoad = load !== null && Number.isFinite(Number(load[1])) && Number(load[1]) > 0;
+    admissionKnown = verdict?.admitted === true && (positiveLoad || (validIdle && validThreshold));
     if (verdict?.admitted === false && /^host load \d/.test(verdict.reason)) {
-      return { saturated: true, reason: `${detail}; ${oneLine(verdict.reason)}` };
+      return { saturated: true, known: true, reason: `${detail}; ${oneLine(verdict.reason)}` };
     }
   } catch { /* unknown admission is not evidence of saturation */ }
-  return { saturated: false, reason: `${detail}; no measured CPU or host-load saturation; retry local verification or inspect host probes` };
+  return { saturated: false, known: admissionKnown, reason: `${detail}; no measured CPU or host-load saturation; retry local verification or inspect host probes` };
 }
 
 /** Pure apart from the injected saturation reader; omitted verify preserves the existing finish guard. */

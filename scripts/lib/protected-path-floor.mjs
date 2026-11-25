@@ -103,6 +103,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  // The invariant enforcer catalogue is also named by the protected POC registry module.
+  'scripts/lib/invariant-catalogue.json',
   'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
@@ -248,6 +250,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
 export const LOCK_USERS = Object.freeze([
   // The quarantine guard dynamically imports a lock holder, so the conservative source scan includes it.
   'scripts/ci/mq-result-reuse.mjs',
+  // Remote discovery imports the remote-exec lock holder for its execution adapter.
+  'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
@@ -331,6 +335,9 @@ export const LOCK_USERS = Object.freeze([
 // blocks more, and the audit-verdict test lists that over-capture.
 // A Set: the lock users repeat a few modules other entries already name.
 export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
+  'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
+  'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
+  'scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs', 'scripts/lib/strict-utc-timestamp.mjs',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',

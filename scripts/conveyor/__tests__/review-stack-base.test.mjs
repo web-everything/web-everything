@@ -412,7 +412,7 @@ describe('checkStackBeforeReview', () => {
   });
   it('dispatchReviewByMode returns the injected skip before dispatching a job', () => {
     const calls = [];
-    expect(dispatchReviewByMode({ mode: 'job', pr: 4631, repo: REPO, env: {},
+    expect(dispatchReviewByMode({ expectedHead: TOP, io: { liveHead: () => TOP }, mode: 'job', pr: 4631, repo: REPO, env: {},
       stackCheck: opts => { calls.push(opts); return { skipped: 'x' }; },
     })).toEqual({ mode: 'job', pr: 4631, repo: REPO, skipped: 'x' });
     expect(calls).toHaveLength(1);

@@ -72,6 +72,7 @@ export default defineConfig({
       'scripts/lib/__tests__/daemon-rebuild-keep-established.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs',
       'scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs',
+      'scripts/lib/__tests__/daemon-rebuild-smoke.test.mjs',
       'scripts/operations/__tests__/wake-cli.test.mjs',
       'scripts/__tests__/lane-pool-acquire-base.test.mjs',
       'scripts/__tests__/publish-secret-gate.test.mjs',
@@ -169,6 +170,8 @@ export default defineConfig({
       ['scripts/lib/__tests__/daemon-rebuild-skip-unrelated.test.mjs', 'forks'],
       // Fallback's harness-backoff case runs three real-git rebuilds; preserve its 5s deadline under less contention.
       ['scripts/lib/__tests__/daemon-rebuild-fallback.test.mjs', 'forks'],
+      // Dispatch-smoke's real-git rebuilds hit the same 5s unit deadline (shard 9); keep assertions and timeout.
+      ['scripts/lib/__tests__/daemon-rebuild-smoke.test.mjs', 'forks'],
       ['scripts/operations/__tests__/wake-cli.test.mjs', 'forks'],
       ['scripts/operations/__tests__/dispatch-spawn-live.test.mjs', 'forks'],
       // Rust parity tests compile the scanner and scan the real repository. A separate threads pool

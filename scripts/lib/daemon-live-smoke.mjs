@@ -655,7 +655,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "  let captured = null;",
   "  const spawn = (argv) => { captured = argv[argv.length - 1]; return 'stub-review-900001'; };",
   "  // A synthetic PR has no live CI; this check exercises brief filling and the injected spawner.",
-  "  dispatchReview({ pr: 900001, repo: WE_SLUG, spawnAgent: spawn, ciGate: () => ({ allowed: true }), extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude' });",
+  "  dispatchReview({ pr: 900001, repo: WE_SLUG, expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) }, spawnAgent: spawn, ciGate: () => ({ allowed: true }), extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude' });",
   "  checkFilled(captured, 'review PR #900001', canonicalReviewPlaceholder, REVIEW_BRIEF_PLACEHOLDERS);",
   "});",
   "",
