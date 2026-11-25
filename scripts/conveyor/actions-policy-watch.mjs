@@ -74,19 +74,19 @@ export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set(), o
   }
   // Deliver policy alerts before awaiting the feed; the returned aggregate alone cannot do this.
   const alerts = [];
-  const emit = (message) => {
+  const emit = async (message) => {
     const safe = message.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ');
     alerts.push(safe);
-    onAlert(safe);
+    await onAlert(safe);
   };
-  if (policy.status !== 'ok') emit(`needs-you: actions policy ${cfg.policyId} ${policy.status}: ${policy.reason}`);
+  if (policy.status !== 'ok') await emit(`needs-you: actions policy ${cfg.policyId} ${policy.status}: ${policy.reason}`);
   let changelog = [];
   let feed = { status: 'ok' };
   try { changelog = evaluateChangelog(await fetchFeed(cfg.changelogFeed), cfg, seen); } catch (e) {
     feed = { status: 'unknown', reason: String(e?.message ?? e).slice(0, 120) };
-    emit(`needs-you: changelog feed unreadable (${feed.reason}); sunset posts are unwatched`);
+    await emit(`needs-you: changelog feed unreadable (${feed.reason}); sunset posts are unwatched`);
   }
-  for (const i of changelog) emit(`needs-you: changelog "${i.title}" mentions the allow-policy (${i.id})`);
+  for (const i of changelog) await emit(`needs-you: changelog "${i.title}" mentions the allow-policy (${i.id})`);
   return { policy, feed, changelog, alerts };
 }
 
@@ -122,6 +122,32 @@ export async function fetchFeedText(url, fetchImpl = fetch) {
 /** Policy API invocation: a plain GET (no method, field or input flags). */
 export const ghReadArgs = (endpoint) => ['api', endpoint];
 
+/** A write returning true/false only describes buffering; its callback confirms delivery. */
+function writeOutput(stream, text) {
+  return new Promise((resolve, reject) => {
+    if (stream.destroyed || stream.writableEnded) {
+      reject(new Error('output is already closed'));
+      return;
+    }
+    const cleanup = () => {
+      stream.removeListener('error', onError);
+      stream.removeListener('close', onClose);
+    };
+    const onError = (error) => { cleanup(); reject(error); };
+    const onClose = () => { cleanup(); reject(new Error('output closed before delivery')); };
+    stream.once('error', onError);
+    stream.once('close', onClose);
+    try {
+      stream.write(text, (error) => {
+        // Node emits 'error' after the failed callback. Keep its listener until that event/close.
+        if (error) { reject(error); return; }
+        cleanup();
+        resolve();
+      });
+    } catch (error) { cleanup(); reject(error); }
+  });
+}
+
 /** Production wiring, injectable without replacing the state-handling path. Returns the CLI exit code. */
 export async function main({ argv = process.argv.slice(2), exec = execFileSync, fetchImpl = fetch,
   env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
@@ -150,21 +176,25 @@ export async function main({ argv = process.argv.slice(2), exec = execFileSync, 
     const result = await runWatch({
       cfg, org, seen, fetchFeed: (url) => fetchFeedText(url, fetchImpl),
       ghApi: async (endpoint) => exec('gh', ghReadArgs(endpoint), { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
-      onAlert: (alert) => (json ? stderr : stdout).write(`${alert}\n`),
+      onAlert: (alert) => writeOutput(json ? stderr : stdout, `${alert}\n`),
     });
+    if (json) await writeOutput(stdout, `${JSON.stringify(result)}\n`);
+    else if (!result.alerts.length) await writeOutput(stdout, 'ok\n');
     // IDs are acknowledged only after alert delivery succeeds. Atomic replacement preserves prior state on failure.
     result.changelog.forEach((item) => seen.add(item.id));
     try { writeJsonAtomic(state, { scope, seen: [...seen] }); } catch { throw new Error('state could not be saved; changelog alerts may repeat until storage is repaired'); }
-    if (json) stdout.write(`${JSON.stringify(result)}\n`);
-    else if (!result.alerts.length) stdout.write('ok\n');
     return result.alerts.length ? 1 : 0;
   } catch (e) {
-    stderr.write(`needs-you: actions policy watcher ${String(e?.message ?? e).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}\n`);
+    try {
+      if (!stderr.destroyed) await writeOutput(stderr, `needs-you: actions policy watcher ${String(e?.message ?? e).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')}\n`);
+    } catch { /* A broken diagnostic stream still leaves the run failed and IDs unacknowledged. */ }
     return 1;
   } finally {
     if (lock) {
       try { rmdirSync(lock); } catch {
-        stderr.write('needs-you: actions policy watcher state lock could not be released; recover it after the watcher stops\n');
+        try {
+          if (!stderr.destroyed) await writeOutput(stderr, 'needs-you: actions policy watcher state lock could not be released; recover it after the watcher stops\n');
+        } catch { /* The exit code also reports this failure when diagnostics cannot be delivered. */ }
         return 1;
       }
     }

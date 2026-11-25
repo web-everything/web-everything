@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { Writable } from 'node:stream';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import * as watcher from '../actions-policy-watch.mjs';
 import { evaluatePolicy, evaluateChangelog, runWatch, parseFeed, fetchFeedText, ghReadArgs } from '../actions-policy-watch.mjs';
@@ -15,6 +16,13 @@ const cfg = {
 };
 const policy = (workflows) => ({ id: 17152, rules: [{ event: 'pull_request_target', workflows }] });
 
+function outputSink(handle = () => {}) {
+  const output = vi.fn(handle);
+  const stream = new Writable({ write(chunk, _encoding, done) { output(String(chunk)); done(); } });
+  stream.output = output;
+  return stream;
+}
+
 // Synthetic offline fixtures mirroring the RSS content:encoded and Atom content fields.
 const bodyFeeds = [
   '<rss><channel><item><guid>body-rss</guid><title>Actions update</title><description>short</description><content:encoded><![CDATA[<p>The allow-policy will sunset.</p>]]></content:encoded></item></channel></rss>',
@@ -22,6 +30,105 @@ const bodyFeeds = [
 ];
 
 describe('actions-policy-watch production regressions', () => {
+  it.each([false, true])('keeps saved IDs and retries after an asynchronous alert write error (json=%s)', async (json) => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-delivery-'));
+    const state = join(dir, 'state.json');
+    const saved = { scope: `o/17152/${watcher.loadConfig().changelogFeed}`, seen: ['older'] };
+    writeFileSync(state, JSON.stringify(saved));
+    const failed = new Writable({ write(_chunk, _encoding, done) {
+      setImmediate(() => done(new Error('EPIPE: alert delivery failed')));
+    } });
+    const error = new Promise((resolve) => failed.once('error', resolve));
+    const delivered = [];
+    const sink = () => new Writable({ write(chunk, _encoding, done) { delivered.push(String(chunk)); done(); } });
+    const options = { argv: ['--org=o', `--state=${state}`, ...(json ? ['--json'] : [])],
+      exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+      fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }),
+      stdout: json ? sink() : failed, stderr: json ? failed : sink() };
+    try {
+      expect(await watcher.main(options)).toBe(1);
+      await error;
+      expect(JSON.parse(readFileSync(state, 'utf8'))).toEqual(saved);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+      expect(await watcher.main({ ...options, stdout: sink(), stderr: sink() })).toBe(1);
+      expect(delivered.filter((text) => text.startsWith('needs-you: changelog'))).toHaveLength(1);
+      expect(JSON.parse(readFileSync(state, 'utf8')).seen).toEqual(['older', 'body-rss']);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it('waits for a successful alert write callback before acknowledging IDs or releasing the lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-delivery-pending-'));
+    const state = join(dir, 'state.json');
+    let complete;
+    let started;
+    const ready = new Promise((resolve) => { started = resolve; });
+    const stdout = new Writable({ highWaterMark: 1, write(_chunk, _encoding, done) { complete = done; started(); } });
+    const running = watcher.main({ argv: ['--org=o', `--state=${state}`], stdout,
+      stderr: new Writable({ write(_chunk, _encoding, done) { done(); } }),
+      exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+      fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }) });
+    try {
+      try {
+        await ready;
+        await new Promise(setImmediate);
+        expect(existsSync(state)).toBe(false);
+        expect(existsSync(`${state}.lock`)).toBe(true);
+      } finally { complete(); await running; }
+      expect(JSON.parse(readFileSync(state, 'utf8')).seen).toEqual(['body-rss']);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it.each(['error-event', 'close', 'throw'])('leaves new IDs unacknowledged when alert delivery fails by %s', async (failure) => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-output-failure-'));
+    const state = join(dir, 'state.json');
+    const stdout = new Writable({ write(_chunk, _encoding, _done) {
+      if (failure === 'throw') throw new Error('write threw');
+      setImmediate(() => stdout.destroy(failure === 'error-event' ? new Error('output failed') : undefined));
+    } });
+    // Observe the event as well as the CLI result; production must install its own error handler.
+    stdout.on('error', () => {});
+    try {
+      expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stdout, stderr: outputSink(),
+        exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+        fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }) })).toBe(1);
+      expect(existsSync(state)).toBe(false);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it.each([false, true])('returns failure and releases the lock if the final output write fails (json=%s)', async (json) => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-final-output-'));
+    const state = join(dir, 'state.json');
+    const stdout = new Writable({ write(_chunk, _encoding, done) {
+      setImmediate(() => done(new Error('EPIPE: result delivery failed')));
+    } });
+    const error = new Promise((resolve) => stdout.once('error', resolve));
+    const stderr = outputSink();
+    try {
+      expect(await watcher.main({ argv: ['--org=o', `--state=${state}`, ...(json ? ['--json'] : [])], stdout, stderr,
+        exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+        fetchImpl: async () => ({ ok: true, text: async () => json ? bodyFeeds[0] : '<rss><channel/></rss>' }) })).toBe(1);
+      await error;
+      expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/needs-you:.*result delivery failed/));
+      expect(existsSync(state)).toBe(false);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it('stops before fetching the feed when asynchronous policy-alert delivery fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-alert-output-'));
+    const state = join(dir, 'state.json');
+    const stdout = new Writable({ write(_chunk, _encoding, done) {
+      setImmediate(() => done(new Error('policy alert failed')));
+    } });
+    const error = new Promise((resolve) => stdout.once('error', resolve));
+    const fetchImpl = vi.fn();
+    try {
+      expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stdout, stderr: outputSink(),
+        exec: () => JSON.stringify(policy(['x.yml'])), fetchImpl })).toBe(1);
+      await error;
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(existsSync(state)).toBe(false);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
   it.each([false, 1, 'policy', [], {}, { id: 17152, rules: {} }, policy(null), policy('x.yml')])(
     'fails closed for malformed policy evidence %j', (value) => {
       expect(evaluatePolicy(value, cfg).status).toBe('unknown');
@@ -98,7 +205,7 @@ describe('actions-policy-watch production regressions', () => {
     const output = [];
     const options = { argv: ['--once', '--json', '--org=o', `--state=${state}`], exec,
       fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }),
-      stdout: { write: (s) => output.push(s) }, stderr: { write: vi.fn() }, env: {} };
+      stdout: outputSink((s) => output.push(s)), stderr: outputSink(), env: {} };
     try {
       expect(await watcher.main(options)).toBe(1);
       expect(JSON.parse(output.pop()).changelog).toHaveLength(1);
@@ -119,17 +226,17 @@ describe('actions-policy-watch production regressions', () => {
   it('reports corrupt state and a competing writer without claiming a clean scan', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-state-'));
     const state = join(dir, 'state.json');
-    const stderr = { write: vi.fn() };
-    const options = { argv: ['--org=o', `--state=${state}`], env: {}, stderr, stdout: { write: vi.fn() },
+    const stderr = outputSink();
+    const options = { argv: ['--org=o', `--state=${state}`], env: {}, stderr, stdout: outputSink(),
       exec: vi.fn(), fetchImpl: vi.fn() };
     try {
       writeFileSync(state, '{broken');
       expect(await watcher.main(options)).toBe(1);
-      expect(stderr.write).toHaveBeenLastCalledWith(expect.stringMatching(/needs-you:.*state/));
+      expect(stderr.output).toHaveBeenLastCalledWith(expect.stringMatching(/needs-you:.*state/));
       expect(readFileSync(state, 'utf8')).toBe('{broken');
       mkdirSync(`${state}.lock`);
       expect(await watcher.main(options)).toBe(1);
-      expect(stderr.write).toHaveBeenLastCalledWith(expect.stringMatching(/needs-you:.*state/));
+      expect(stderr.output).toHaveBeenLastCalledWith(expect.stringMatching(/needs-you:.*state/));
       expect(options.exec).not.toHaveBeenCalled();
     } finally { rmSync(dir, { recursive: true }); }
   });
@@ -137,11 +244,11 @@ describe('actions-policy-watch production regressions', () => {
     'refuses malformed or differently scoped persisted state %j', async (saved) => {
       const dir = mkdtempSync(join(tmpdir(), 'policy-invalid-state-'));
       const state = join(dir, 'state.json');
-      const stderr = { write: vi.fn() };
+      const stderr = outputSink();
       try {
         writeFileSync(state, JSON.stringify(saved));
         expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stderr })).toBe(1);
-        expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/state has an invalid/));
+        expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state has an invalid/));
         expect(JSON.parse(readFileSync(state, 'utf8'))).toEqual(saved);
         expect(existsSync(`${state}.lock`)).toBe(false);
       } finally { rmSync(dir, { recursive: true }); }
@@ -154,17 +261,17 @@ describe('actions-policy-watch production regressions', () => {
     let started;
     const ready = new Promise((resolve) => { started = resolve; });
     const pending = new Promise((resolve) => { release = resolve; });
-    const stdout = { write: vi.fn() };
-    const stderr = { write: vi.fn() };
+    const stdout = outputSink();
+    const stderr = outputSink();
     const options = { argv: ['--org=o', `--state=${state}`], stdout, stderr,
       exec: vi.fn(() => JSON.stringify(policy(['x.yml']))),
       fetchImpl: () => { started(); return pending; } };
     const first = watcher.main(options);
     try {
       await ready;
-      expect(stdout.write).toHaveBeenCalledWith(expect.stringMatching(/policy.*drift/));
+      expect(stdout.output).toHaveBeenCalledWith(expect.stringMatching(/policy.*drift/));
       expect(await watcher.main(options)).toBe(1);
-      expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/state is locked/));
+      expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state is locked/));
       expect(options.exec).toHaveBeenCalledTimes(1);
     } finally {
       release({ ok: true, text: async () => '<rss><channel/></rss>' });
@@ -175,8 +282,8 @@ describe('actions-policy-watch production regressions', () => {
   it('reports a failed state replacement, releases its lock and retries without suppressing an unsaved alert', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-write-state-'));
     const state = join(dir, 'state.json');
-    const stdout = { write: vi.fn() };
-    const stderr = { write: vi.fn() };
+    const stdout = outputSink();
+    const stderr = outputSink();
     const options = { argv: ['--org=o', `--state=${state}`], stdout, stderr,
       exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
       fetchImpl: async () => {
@@ -185,11 +292,11 @@ describe('actions-policy-watch production regressions', () => {
       } };
     try {
       expect(await watcher.main(options)).toBe(1);
-      expect(stderr.write).toHaveBeenCalledWith(expect.stringMatching(/state could not be saved/));
+      expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state could not be saved/));
       expect(existsSync(`${state}.lock`)).toBe(false);
       rmdirSync(state);
       expect(await watcher.main({ ...options, fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }) })).toBe(1);
-      expect(stdout.write.mock.calls.filter(([s]) => s.includes('mentions the allow-policy'))).toHaveLength(2);
+      expect(stdout.output.mock.calls.filter(([s]) => s.includes('mentions the allow-policy'))).toHaveLength(2);
     } finally { rmSync(dir, { recursive: true }); }
   });
   it('uses the exact read-only owner discovery call and env organization fallback', async () => {
@@ -198,7 +305,7 @@ describe('actions-policy-watch production regressions', () => {
       ? JSON.stringify({ owner: { login: 'o' } }) : JSON.stringify(policy([cfg.expectedWorkflowPath])));
     const options = { argv: [`--state=${join(dir, 'state.json')}`], exec, env: {},
       fetchImpl: async () => ({ ok: true, text: async () => '<rss><channel/></rss>' }),
-      stdout: { write: vi.fn() }, stderr: { write: vi.fn() } };
+      stdout: outputSink(), stderr: outputSink() };
     try {
       expect(await watcher.main(options)).toBe(0);
       expect(exec.mock.calls.map(([command, args]) => [command, args])).toEqual([
