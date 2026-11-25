@@ -1,11 +1,11 @@
 /**
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
- * Child env = caller record minus runtime loader variables (undefined omitted), with optional
- * PATH prefix and task TMP roots. Refused before spawn: non-string/NUL values, empty/=/NUL keys.
- * Loader variables (NODE_OPTIONS, BUN_OPTIONS, LD_*, DYLD_*, ...) run caller code inside the agent process
- * before its sandbox exists, so they are always dropped. Wider narrowing (shell startup, Git,
- * bypass flags) is S1e.
- * Codex must resolve to the same executable on caller PATH as the fixed installation lookup.
+ * Child env keeps only explicit transport, locale, terminal, temp and credential keys.
+ * HOME comes only from the OS account; caller policy, shell, Git and loader settings are dropped.
+ * Invalid environment serialization is refused even for dropped keys.
+ * Every launch requires an absolute guard-shim pathPrefix. Both agents must resolve to the
+ * same executable on the final absolute-only child PATH as the fixed installation lookup.
+ * Config PATH, when supplied, must equal that final child PATH.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
  */
 import { spawn } from 'node:child_process';
@@ -74,27 +74,18 @@ function paths(value, name) {
   if (!Array.isArray(value)) fail(`${name} must be an array`);
   return value.map(p => absolute(p, name));
 }
-// Runtime loader variables: each makes a runtime load caller-chosen code at startup — the agent's
-// own Node or native loader first (OPENSSL_* config can name a provider/engine shared library
-// that Node loads at startup), plus the common interpreter loader keys. Compared upper-cased,
-// which over-drops case variants (fail-safe). Dropped, never passed.
-const LOADER_PREFIXES = ['LD_', 'DYLD_'];
-const LOADER_KEYS = new Set(['NODE_OPTIONS', 'BUN_OPTIONS', 'NODE_PATH', 'NODE_REPL_EXTERNAL_MODULE',
-  'OPENSSL_CONF', 'OPENSSL_MODULES', 'OPENSSL_ENGINES',
-  'PYTHONPATH', 'PYTHONSTARTUP', 'PYTHONHOME', 'PYTHONUSERBASE', 'PERL5OPT', 'PERL5LIB', 'PERLLIB', 'PERL5DB',
-  'RUBYOPT', 'RUBYLIB', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'GCONV_PATH']);
-function isLoaderKey(key) {
-  const upper = key.toUpperCase();
-  return LOADER_KEYS.has(upper) || LOADER_PREFIXES.some(prefix => upper.startsWith(prefix));
-}
-// Validate serialization; then drop loader variables. Other environment policy belongs to S1e.
+const ENV_KEYS = new Set(['PATH', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'TZ',
+  'NO_COLOR', 'FORCE_COLOR', 'CI', 'TMPDIR', 'TMP', 'TEMP', 'SSH_AUTH_SOCK',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'no_proxy',
+  'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_API_KEY']);
+// Validate all serialization before dropping anything outside the closed allowlist.
 function envRecord(value) {
   record(value, 'env');
   for (const [key, entry] of Object.entries(value)) {
     if (!key || key.includes('=') || key.includes('\0')) fail(`env key ${JSON.stringify(key)} must be non-empty and contain neither '=' nor NUL`);
     if (entry !== undefined && (typeof entry !== 'string' || entry.includes('\0'))) fail(`env.${key} must be a NUL-free string or undefined`);
   }
-  return Object.fromEntries(Object.entries(value).filter(([key, entry]) => entry !== undefined && !isLoaderKey(key)));
+  return Object.fromEntries(Object.entries(value).filter(([key, entry]) => entry !== undefined && (ENV_KEYS.has(key) || key.startsWith('LC_'))));
 }
 function configValue(key, value) {
   switch (key) {
@@ -175,15 +166,15 @@ export function findAgentBinary(agent, dirs) {
 export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor)); }
 
 // Validate the entire child search path before identifying the first executable.
-function firstCodex(path) {
-  if (path === undefined) fail('codex not found on child PATH; set an absolute installation PATH and retry');
+function firstAgent(agent, path) {
+  if (path === undefined) fail(`${agent} not found on child PATH; set an absolute installation PATH and retry`);
   const dirs = path.split(':');
   for (const dir of dirs) if (!isAbsolute(dir)) fail('relative child PATH entry; use absolute directories and retry');
   for (const dir of dirs) {
     try {
       // Preserve the OS lookup: normalization can erase missing/non-directory components
       // or change the meaning of '..' after a symlink.
-      const file = `${dir}/codex`;
+      const file = `${dir}/${agent}`;
       if (!statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;
@@ -191,7 +182,7 @@ function firstCodex(path) {
       if (!['ENOENT', 'ENOTDIR'].includes(error.code)) fail('child PATH binary unreadable; restore access and retry');
     }
   }
-  fail('codex not found on child PATH; set an absolute installation PATH and retry');
+  fail(`${agent} not found on child PATH; set an absolute installation PATH and retry`);
 }
 
 /** Snapshot is the first operation, including before any test seam executes. */
@@ -199,10 +190,14 @@ export function buildAgentInvocation(descriptor, io) {
   const d = snapshot(descriptor);
   const args = argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   const env = envRecord(d.env ?? {});
-  if (d.pathPrefix !== undefined) {
-    const rest = env.PATH === undefined ? [] : env.PATH.split(':').filter(dir => dir !== d.pathPrefix);
-    rest.forEach(dir => absolute(dir, 'PATH'));
-    env.PATH = [d.pathPrefix, ...rest].join(':');
+  absolute(d.pathPrefix, 'pathPrefix (required guard-shim directory)');
+  env.HOME = absolute(userInfo().homedir, 'OS account HOME');
+  const rest = env.PATH === undefined ? [] : env.PATH.split(':').filter(dir => dir !== d.pathPrefix);
+  for (const dir of rest) if (!isAbsolute(dir)) fail('relative or empty child PATH entry; use absolute directories and retry');
+  env.PATH = [d.pathPrefix, ...rest].join(':');
+  if (d.config?.['shell_environment_policy.set.PATH'] !== undefined
+    && d.config['shell_environment_policy.set.PATH'] !== env.PATH) {
+    fail('config PATH must equal final child PATH; align the configured PATH and retry');
   }
   if (d.tempRoot !== undefined && d.sandbox !== 'read-only') {
     for (const key of ['TMPDIR', 'TMP', 'TEMP']) env[key] = d.tempRoot;
@@ -212,8 +207,8 @@ export function buildAgentInvocation(descriptor, io) {
   const file = absolute((io?.resolveBinary ?? resolveBinary)(d.agent), 'resolved binary');
   // The JS realpath implementation normalizes '..' before walking symlinks.
   // Native resolution preserves the lookup semantics used by stat/access and exec.
-  if (d.agent === 'codex' && realpathSync.native(firstCodex(env.PATH)) !== realpathSync.native(file)) {
-    fail('codex binary identity differs from child PATH; align PATH with the fixed installation and retry');
+  if (realpathSync.native(firstAgent(d.agent, env.PATH)) !== realpathSync.native(file)) {
+    fail(`${d.agent} binary identity differs from child PATH; align PATH with the fixed installation and retry`);
   }
   return { file, args, options: { shell: false, cwd: d.cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: d.processGroup === true } };
 }

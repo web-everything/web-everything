@@ -1,6 +1,6 @@
 import { URL as NodeURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync, readFileSync, symlinkSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -17,14 +17,14 @@ function codexDescriptor({ cwd, env, review = false, tempRoot, model, effort, ep
   }
   return { agent: 'codex', cwd, env, sandbox: review ? 'read-only' : 'workspace-write',
     processGroup: true, model, ephemeral, outputLastMessageFile, config,
-    ...(review ? {} : { pathPrefix: CODEX_SHIM_DIR, tempRoot }) };
+    pathPrefix: CODEX_SHIM_DIR, ...(review ? {} : { tempRoot }) };
 }
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 const cwd = process.cwd();
 let root, bin, binary;
-const base = () => ({ agent: 'codex', cwd, model: 'gpt-5.6-sol', sandbox: 'workspace-write', env: { PATH: bin } });
-const claude = () => ({ agent: 'claude', cwd, print: true, sessionId: SID, prompt: 'hello', env: { PATH: bin } });
+const base = () => ({ agent: 'codex', cwd, pathPrefix: CODEX_SHIM_DIR, model: 'gpt-5.6-sol', sandbox: 'workspace-write', env: { PATH: bin } });
+const claude = () => ({ agent: 'claude', cwd, pathPrefix: CODEX_SHIM_DIR, print: true, sessionId: SID, prompt: 'hello', env: { PATH: bin } });
 const seam = () => ({ admit: vi.fn(() => true), spawn: vi.fn(() => 'child'), resolveBinary: vi.fn(() => binary) });
 function refused(descriptor, reason) {
   const io = seam();
@@ -62,11 +62,12 @@ const LOADER_ORACLE = {
   // Case variants: dropped too, so a case-folding platform can never revive one.
   node_options: '--require=/attacker/x.cjs', Ld_Preload: '/attacker/lib', dyld_insert_libraries: '/attacker/lib',
 };
-const withoutLoaders = env => Object.fromEntries(Object.entries(env).filter(([key]) => !Object.hasOwn(LOADER_ORACLE, key)));
+const projectedEnv = env => ({ PATH: prefixedPath(env), HOME: userInfo().homedir,
+  ...Object.fromEntries(['TMPDIR', 'TMP', 'TEMP'].filter(key => env[key] !== undefined).map(key => [key, env[key]])) });
 const matrix = [
   ...Object.keys(LOADER_ORACLE).map(key => [key, { [key]: 'caller-value' }]),
   ['CUSTOM_OPTIONS', { CUSTOM_OPTIONS: 'caller-value' }],
-  ['loader look-alikes stay', { NODE_ENV: 'production', PYTHONUNBUFFERED: '1', LDFLAGS: '-L/x', OLD_PRELOAD: 'x' }],
+  ['nonallowlisted loader look-alikes', { NODE_ENV: 'production', PYTHONUNBUFFERED: '1', LDFLAGS: '-L/x', OLD_PRELOAD: 'x' }],
   ['Git config parameters', { GIT_CONFIG_PARAMETERS: "'protocol.ext.allow'='user'" }],
   ['Git transport pair', { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'protocol.ext.allow', GIT_CONFIG_VALUE_0: 'always' }],
   ['Git protocol allowlist', { GIT_ALLOW_PROTOCOL: 'https:ext' }],
@@ -136,7 +137,7 @@ describe('B1/B2 caller environment without any ambient merge', () => {
   it('does not inherit omitted ambient bypasses, runtime options or Git pairs', () => {
     for (const [key, value] of Object.entries({ WE_HEAVY_ADMISSION: 'off', WE_PR_LIMIT_OFF: '1', NODE_OPTIONS: '--require x', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.sshCommand', GIT_CONFIG_VALUE_0: 'x' })) vi.stubEnv(key, value);
     const io = seam(); launchAgent(base(), io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin });
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv({ PATH: bin }));
   });
   it('has no ambient process environment access in the launcher source', () => {
     expect(readFileSync(new NodeURL('../lib/agent-launch.mjs', import.meta.url), 'utf8')).not.toContain('process.env');
@@ -148,22 +149,22 @@ describe('B1/B2 caller environment without any ambient merge', () => {
     const descriptor = codexDescriptor({ cwd, env, review, tempRoot });
     expect(descriptor.env).toBe(env);
     const io = seam(); launchAgent(descriptor, io);
-    const defined = withoutLoaders(Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined)));
+    const defined = projectedEnv(env);
     expect(io.spawn.mock.calls[0][2].env).toEqual(review ? defined : {
       ...defined, PATH: prefixedPath(env), TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
     });
   });
   it.each([null, [], 'X=1', { X: 1 }, { X: 'nul\0value' }])('refuses invalid env %j before spawn', env => refused({ ...base(), env }, /env/));
-  it('omits undefined values without changing other keys', () => {
+  it('omits undefined and unknown keys and replaces caller HOME', () => {
     const env = { PATH: bin, OMIT: undefined, EMPTY: '', HOME: '/caller-home' };
     const io = seam(); launchAgent({ ...base(), env }, io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin, EMPTY: '', HOME: '/caller-home' });
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv({ PATH: bin }));
   });
   it('keeps caller TMP untouched when read-only has an explicit tempRoot', () => {
     const env = { PATH: bin, TMP: '/c' };
     const io = seam();
     launchAgent({ ...base(), sandbox: 'read-only', tempRoot: '/x', env }, io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual(env);
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv(env));
   });
   it('executes a dispatcher symlink using its codex PATH name', () => {
     const dispatcher = join(root, 'dispatcher');
@@ -191,7 +192,7 @@ describe('B1/B2 caller environment without any ambient merge', () => {
     const env = { PATH: bin, HOME: '/caller-home' }; const io = seam();
     io.resolveBinary.mockImplementation(() => { env.PATH = '/mutated'; env.HOME = '/mutated'; return binary; });
     launchAgent({ ...base(), env }, io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin, HOME: '/caller-home' });
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv({ PATH: bin }));
   });
 });
 
@@ -206,8 +207,8 @@ describe('snapshot PATH isolation', () => {
     });
     launchAgent(descriptor, io);
     expect(trap).not.toHaveBeenCalled();
-    expect(io.admit.mock.calls[0][0].options.env).toEqual({ PATH: bin });
-    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin });
+    expect(io.admit.mock.calls[0][0].options.env).toEqual(projectedEnv({ PATH: bin }));
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv({ PATH: bin }));
   });
   it('refuses a hostile snapshotted PATH even if the caller replaces it with a trusted PATH', () => {
     const wrapper = join(root, 'snapshot-wrapper'); mkdirSync(wrapper);
@@ -234,20 +235,18 @@ describe('B3/B4 exact PATH and TMP projection', () => {
     expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${CODEX_SHIM_DIR}:${guard}:${real}`);
     expect(findAgentBinary('gh', io.spawn.mock.calls[0][2].env.PATH.split(':'))).toBe(join(guard, 'gh'));
   });
-  it('projects /usr/bin to exactly shim:/usr/bin, with no fixed, node or agent dirs', () => {
-    const d = codexDescriptor({ cwd, env: { PATH: '/usr/bin' } });
+  it('projects exactly shim then caller directories, with no additional installation dirs', () => {
+    const d = codexDescriptor({ cwd, env: { PATH: bin } });
     expect(d.pathPrefix).toBe(CODEX_SHIM_DIR);
-    // Claude has no Codex identity check; exercise the child projection independently of installed codex.
-    const io = seam(); launchAgent({ ...claude(), env: { PATH: '/usr/bin' }, pathPrefix: CODEX_SHIM_DIR }, io);
-    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${CODEX_SHIM_DIR}:/usr/bin`);
+    const io = seam(); launchAgent(claude(), io);
+    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${CODEX_SHIM_DIR}:${bin}`);
   });
-  it('review keeps PATH exactly, TMP unchanged, and an absent PATH stays absent', () => {
+  it('review prefixes PATH while leaving caller TMP unchanged', () => {
     const env = { PATH: `${bin}:${bin}`, TMPDIR: '/caller/tmp' };
     const io = seam(); launchAgent(codexDescriptor({ cwd, env, review: true, tempRoot: '/ignored' }), io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual(env);
-    expect(buildAgentInvocation({ ...claude(), env: { TMP: '/caller/tmp' } }, seam()).options.env).toEqual({ TMP: '/caller/tmp' });
+    expect(io.spawn.mock.calls[0][2].env).toEqual(projectedEnv(env));
   });
-  it('review without PATH refuses Codex without adding a PATH key', () => {
+  it('review without caller PATH refuses when the guard directory has no Codex', () => {
     const descriptor = codexDescriptor({ cwd, env: { TMP: '/caller/tmp' }, review: true });
     expect(descriptor.env).not.toHaveProperty('PATH');
     const io = seam();
@@ -260,10 +259,11 @@ describe('B3/B4 exact PATH and TMP projection', () => {
     expect(() => launchAgent(codexDescriptor({ cwd, env: { PATH: `.:${bin}` } }), io)).toThrow(/PATH/);
     expect(io.spawn).not.toHaveBeenCalled(); expect(io.resolveBinary).not.toHaveBeenCalled();
   });
-  it('keeps config PATH tokens rather than rewriting them to the child PATH', () => {
-    const io = seam(); launchAgent({ ...base(), config: { 'shell_environment_policy.set.PATH': '/explicit' } }, io);
-    expect(io.spawn.mock.calls[0][1]).toContain('shell_environment_policy.set.PATH="/explicit"');
-    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(bin);
+  it('accepts config PATH only when it exactly matches the final child PATH', () => {
+    const PATH = prefixedPath(base().env);
+    const io = seam(); launchAgent({ ...base(), config: { 'shell_environment_policy.set.PATH': PATH } }, io);
+    expect(io.spawn.mock.calls[0][1]).toContain(`shell_environment_policy.set.PATH=${JSON.stringify(PATH)}`);
+    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(PATH);
   });
 });
 
@@ -320,10 +320,10 @@ describe('B5 same executable as main or refuse', () => {
     rmSync(join(other, 'bin', 'codex'));
     symlinkSync(binary, join(other, 'bin', 'codex'));
     launchAgent(descriptor, io);
-    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(descriptor.env.PATH);
+    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(prefixedPath(descriptor.env));
     expect(io.spawn.mock.calls[0][0]).toBe(source === 'fixed binary' ? `${PATH}/codex` : binary);
   });
-  it('compares review binary identity against caller PATH without adding a prefix', () => {
+  it('compares review binary identity against prefixed child PATH', () => {
     const wrapper = join(root, 'review-wrapper'); mkdirSync(wrapper);
     writeFileSync(join(wrapper, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const io = seam();
@@ -421,8 +421,8 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
     for (const field of ['execPath', 'execArgv', 'fork', 'file', 'args', 'argv', 'stdio', 'detached']) refused({ ...base(), [field]: [] }, new RegExp(field));
   });
   it.each(['codex', 'claude'])('11 drops caller runtime loader variables for %s, admission and spawn alike', agent => {
-    const kept = { PATH: bin, SAFE: 'kept', CUSTOM_OPTIONS: 'x', NODE_ENV: 'production', PYTHONUNBUFFERED: '1', LDFLAGS: '-L/x' };
-    const env = { ...kept, ...LOADER_ORACLE };
+    const kept = { PATH: prefixedPath({ PATH: bin }), HOME: userInfo().homedir, LANG: 'en_CA.UTF-8' };
+    const env = { PATH: bin, LANG: kept.LANG, ...LOADER_ORACLE, SAFE: 'dropped', NODE_ENV: 'production' };
     const io = { ...seam(), admit: vi.fn(spec => { expect(spec.options.env).toEqual(kept); return true; }) };
     io.spawn.mockImplementation((_file, _args, options) => {
       expect(options.env).toEqual(kept);
@@ -452,13 +452,13 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
     expect(child.stdout).toBe('agent started');
     expect(existsSync(marker), 'caller preload must never execute in the agent').toBe(false);
   });
-  it('12 passes shell startup variables through as main does', () => {
+  it('12 drops shell startup variables while preserving allowlisted SHELL', () => {
     const env = { ...base().env, BASH_ENV: '/caller/startup', ENV: '/caller/env', ZDOTDIR: '/caller/zsh', SHELL: '/caller/shell' };
-    expect(buildAgentInvocation({ ...base(), env }, seam()).options.env).toEqual(env);
+    expect(buildAgentInvocation({ ...base(), env }, seam()).options.env).toEqual({ ...projectedEnv(env), SHELL: env.SHELL });
   });
-  it('13 preserves caller HOME while refusing a raw HOME descriptor field', () => {
+  it('13 replaces caller HOME while refusing a raw HOME descriptor field', () => {
     vi.stubEnv('HOME', '/ambient');
-    expect(buildAgentInvocation({ ...base(), env: { ...base().env, HOME: '/caller-home' } }, seam()).options.env.HOME).toBe('/caller-home');
+    expect(buildAgentInvocation({ ...base(), env: { ...base().env, HOME: '/caller-home' } }, seam()).options.env.HOME).toBe(userInfo().homedir);
     refused({ ...base(), HOME: '/hostile' }, /HOME/);
   });
   it('14 snapshots once before resolver mutation and detaches aliased nested arrays', () => {
@@ -512,7 +512,7 @@ describe('built invocation positive controls', () => {
     const d = codexDescriptor({ cwd, env: { PATH: bin }, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high' });
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(binary, buildAgentArgs(d), {
-      shell: false, cwd, env: { PATH: prefixedPath(d.env) }, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
+      shell: false, cwd, env: projectedEnv(d.env), stdio: ['pipe', 'pipe', 'pipe'], detached: true,
     });
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
@@ -561,5 +561,65 @@ describe('admission hook point (#7090 moves runtime admission here)', () => {
     const io = seam(); io.admit = spec => { try { spec.args.push('--dangerous'); } catch { /* frozen */ } return true; };
     launchAgent(base(), io);
     expect(io.spawn.mock.calls[0][1]).not.toContain('--dangerous');
+  });
+});
+
+
+describe('RS-7170-1 round-2 security boundary', () => {
+  const forged = {
+    WE_HEAVY_ADMISSION: 'off', WE_HEAVY_ADMISSION_HELD: '1', WE_PR_LIMIT_OFF: '1', MAIN_PUSH_OK: '1',
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/dev/null',
+    BASH_ENV: '/caller/bash', ENV: '/caller/env', ZDOTDIR: '/caller/zsh',
+    CODEX_HOME: '/caller/codex', CLAUDE_CONFIG_DIR: '/caller/claude', UNKNOWN_FUTURE_BYPASS: '1',
+  };
+  for (const [role, descriptor] of envLaunchPaths) {
+    it.each(Object.entries(forged))(`drops forged %s from spawn env (${role})`, (key, value) => {
+      const io = seam();
+      launchAgent({ ...descriptor({ PATH: bin, [key]: value }), pathPrefix: root }, io);
+      expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty(key);
+    });
+    it(`replaces caller HOME with the OS account home (${role})`, () => {
+      const io = seam();
+      launchAgent({ ...descriptor({ PATH: bin, HOME: '/caller/forged-home' }), pathPrefix: root }, io);
+      expect(io.spawn.mock.calls[0][2].env.HOME).toBe(userInfo().homedir);
+    });
+    it.each([undefined, 'relative', ''])(`refuses missing/nonabsolute guard prefix %j (${role})`, pathPrefix => {
+      const d = { ...descriptor({ PATH: bin }), pathPrefix };
+      const io = seam();
+      expect(() => buildAgentInvocation(d, io)).toThrow(/pathPrefix/);
+      expect(() => launchAgent(d, io)).toThrow(/pathPrefix/);
+      expect(io.spawn).not.toHaveBeenCalled();
+      expect(io.admit).not.toHaveBeenCalled();
+    });
+  }
+  it.each(['codex', 'claude'])('preserves every allowlisted env category for %s', agent => {
+    const allowed = {
+      USER: 'caller', LOGNAME: 'caller', SHELL: '/bin/sh', TERM: 'xterm', LANG: 'en_CA.UTF-8',
+      LC_ALL: 'C', LC_CUSTOM: 'custom', TZ: 'UTC', NO_COLOR: '', FORCE_COLOR: '1', CI: 'true',
+      TMPDIR: '/task/tmp', TMP: '/task/tmp', TEMP: '/task/tmp', SSH_AUTH_SOCK: '/task/socket',
+      HTTP_PROXY: 'http://proxy', HTTPS_PROXY: 'http://proxy', NO_PROXY: 'localhost',
+      http_proxy: 'http://proxy', https_proxy: 'http://proxy', no_proxy: 'localhost',
+      ANTHROPIC_API_KEY: 'test-anthropic', OPENAI_API_KEY: 'test-openai',
+      CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth', CODEX_API_KEY: 'test-codex',
+    };
+    const env = { PATH: bin, ...allowed, OMIT: undefined };
+    const io = seam(); launchAgent({ ...(agent === 'codex' ? base() : claude()), env }, io);
+    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: prefixedPath(env), HOME: userInfo().homedir, ...allowed });
+    expect(io.admit.mock.calls[0][0].options.env).toEqual(io.spawn.mock.calls[0][2].env);
+    expect(env).not.toHaveProperty('HOME');
+  });
+  it.each(['.:/usr/bin', ':/usr/bin', '/usr/bin:'])('refuses unsafe Claude PATH %j', PATH => {
+    refused({ ...claude(), pathPrefix: root, env: { PATH } }, /PATH/);
+  });
+  it('refuses Claude shadowed ahead of the fixed installation', () => {
+    const shadow = join(root, 'shadow'); mkdirSync(shadow);
+    writeFileSync(join(shadow, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const io = seam();
+    expect(() => launchAgent({ ...claude(), pathPrefix: root, env: { PATH: `${shadow}:${bin}` } }, io)).toThrow(/claude.*identity/);
+    expect(io.spawn).not.toHaveBeenCalled();
+    expect(io.admit).not.toHaveBeenCalled();
+  });
+  it('refuses config PATH that differs from the final prefixed child PATH', () => {
+    refused({ ...base(), pathPrefix: root, config: { 'shell_environment_policy.set.PATH': bin } }, /PATH.*match|PATH.*equal/);
   });
 });
