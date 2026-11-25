@@ -5,24 +5,15 @@
  * failed filing leaves the state as it was) — the end-to-end negatives live in review-loop-cli.test.mjs
  * ("error-class" describe); this file pins the classifier and the static ban on `.message` in output.
  */
-import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync, openSync, fstatSync, closeSync } from 'node:fs';
+import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 
 import * as cli from '../review-loop-cli.mjs';
 
-// Install stable mocks before the CLI captures named builtin imports. Configure
-// those same functions below; default-fs spies and syncBuiltinESMExports cannot
-// replace references already captured by Vitest. Unmocked calls remain hermetic.
-vi.mock('node:fs', async importOriginal => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    ...Object.fromEntries(['openSync', 'fstatSync', 'closeSync']
-      .map(key => [key, vi.fn(actual[key])])),
-  };
-});
+// Inject descriptor operations into the real writer. Builtin module mocks can
+// miss imports captured before the mock, including the hermetic fs wrappers.
 
 const SOURCE = readFileSync(join(process.cwd(), 'scripts/operations/review-loop-cli.mjs'), 'utf8');
 const CLASSES = ['auth', 'network', 'rate-limit', 'not-found', 'parse', 'unknown'];
@@ -86,25 +77,25 @@ describe('debug log fails closed', () => {
     chmodSync(replacement, 0o644);
     const actualOpen = fs.openSync;
     let openedFd;
-    const open = vi.mocked(openSync).mockClear().mockImplementationOnce((target, ...args) => {
+    const open = vi.fn((target, ...args) => {
       if (target === path) renameSync(replacement, path);
       const fd = actualOpen(target, ...args);
       if (target === path) openedFd = fd;
       return fd;
     });
-    const close = vi.mocked(closeSync).mockClear();
+    const close = vi.fn(fs.closeSync);
+    const log = (site, error) => cli.writeErrorDebugLog(site, error, process.env,
+      { openSync: open, fstatSync: fs.fstatSync, closeSync: close });
     const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
     process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
     try {
-      expect(cli.describeErrorClass('filing-failed', new Error('Bearer race-secret'))).toBe('filing-failed:auth');
+      expect(cli.describeErrorClass('filing-failed', new Error('Bearer race-secret'), { log })).toBe('filing-failed:auth');
       expect(open).toHaveBeenCalledWith(path, expect.any(Number), 0o600);
       expect(openedFd).toEqual(expect.any(Number));
       expect(close).toHaveBeenCalledWith(openedFd);
       expect(statSync(path).mode & 0o777).toBe(0o644);
       expect(readFileSync(path, 'utf8')).toBe('orig');
     } finally {
-      open.mockRestore();
-      close.mockRestore();
       if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
       else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
     }
@@ -115,24 +106,24 @@ describe('debug log fails closed', () => {
     const path = join(dir, 'debug.log');
     writeFileSync(path, 'orig', { mode: 0o600 });
     const actualStat = fs.fstatSync;
-    const stat = vi.mocked(fstatSync).mockClear().mockImplementationOnce((fd) => {
+    const stat = vi.fn((fd) => {
       if (kind === 'stat-failure') throw new Error('descriptor unavailable');
       const st = actualStat(fd);
       if (kind === 'non-regular') st.isFile = () => false;
       else st.uid = process.getuid() + 1;
       return st;
     });
-    const close = vi.mocked(closeSync).mockClear();
+    const close = vi.fn(fs.closeSync);
+    const log = (site, error) => cli.writeErrorDebugLog(site, error, process.env,
+      { openSync: fs.openSync, fstatSync: stat, closeSync: close });
     const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
     process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
     try {
-      expect(cli.describeErrorClass('filing-failed', new Error('Bearer metadata-secret'))).toBe('filing-failed:auth');
+      expect(cli.describeErrorClass('filing-failed', new Error('Bearer metadata-secret'), { log })).toBe('filing-failed:auth');
       expect(stat).toHaveBeenCalledTimes(1);
       expect(close).toHaveBeenCalledWith(stat.mock.calls[0][0]);
       expect(readFileSync(path, 'utf8')).toBe('orig');
     } finally {
-      stat.mockRestore();
-      close.mockRestore();
       if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
       else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
     }
