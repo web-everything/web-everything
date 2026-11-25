@@ -3,7 +3,7 @@ import { runApproveHead } from '../approve-head.mjs';
 
 const A = 'c'.repeat(40);
 const mk = (over = {}) => {
-  const gh = vi.fn((args) => args.includes('--jq') && args[1].includes('pulls') ? A : args[1] === 'user' ? 'op' : '1');
+  const gh = vi.fn((args) => args.includes('--jq') && args[1].includes('pulls') ? A : args[1] === 'user' ? 'chalbert' : '1');
   return { gh, env: {}, readRulings: () => 'R474 guard config\nR475 other\n', ...over };
 };
 const posted = gh => gh.mock.calls.some(c => c[0].includes('POST'));
@@ -27,6 +27,11 @@ describe('approve-head', () => {
     }
     expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ readRulings: () => '- **R474** (operator): x\n' })).ok).toBe(true);
   });
+  it('a non-operator login writes nothing', () => {
+    const gh = vi.fn((args) => args.includes('--jq') && args[1].includes('pulls') ? A : args[1] === 'user' ? 'mallory' : '1');
+    expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ gh })).ok).toBe(false);
+    expect(posted(gh)).toBe(false);
+  });
   it('a missing or failed operator identity refuses and writes nothing', () => {
     const gh = vi.fn((args) => { if (args[1] === 'user') throw new Error('401'); return args[1]?.includes('pulls') ? A : '1'; });
     expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ gh })).ok).toBe(false);
@@ -46,7 +51,7 @@ describe('approve-head', () => {
     expect(posted(deps.gh)).toBe(false);
   });
   it('a missing App token writes nothing', () => {
-    const gh = vi.fn((args) => { if (args[1]?.includes('installation')) throw new Error('403'); return args[1] === 'user' ? 'op' : A; });
+    const gh = vi.fn((args) => { if (args[1]?.includes('installation')) throw new Error('403'); return args[1] === 'user' ? 'chalbert' : A; });
     expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ gh })).ok).toBe(false);
     expect(posted(gh)).toBe(false);
   });

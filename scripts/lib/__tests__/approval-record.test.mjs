@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { approvalCheckPayload, evaluateApprovalRecord, readApprovalRecord, writeApprovalRecord, APPROVAL_CHECK_NAME } from '../approval-record.mjs';
+import { approvalCheckPayload, evaluateApprovalRecord, readApprovalRecord, writeApprovalRecord, APPROVAL_CHECK_NAME, PINNED_APP_ID, OPERATOR_LOGINS } from '../approval-record.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -76,6 +76,18 @@ describe('readApprovalRecord', () => {
     expect(r.ok).toBe(false);
     expect(gh.mock.calls[0][1].throttle.noMemo).toBe(true);
   });
+  it('the trusted App is pinned in code: a settings or caller app id that differs refuses', () => {
+    const forged = run({ app: { id: 777 } });
+    const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [forged] }));
+    expect(readApprovalRecord({ repo: 'o/r', headSha: A, gh, resolveApp: () => ({ ok: true, appId: '777' }) }).ok).toBe(false);
+    expect(readApprovalRecord({ repo: 'o/r', headSha: A, gh, appId: 777 }).ok).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
+  });
+  it('an unreadable setting cannot widen or disable the pin: the pinned App still decides', () => {
+    const gh = () => JSON.stringify({ total_count: 1, check_runs: [run()] });
+    expect(readApprovalRecord({ repo: 'o/r', headSha: A, gh, resolveApp: () => ({ ok: false, reason: 'unset' }) }).ok).toBe(true);
+    expect(PINNED_APP_ID).toBe('5037855');
+  });
   it('a head that moved between read and land refuses', () => {
     const gh = () => JSON.stringify({ total_count: 1, check_runs: [run()] });
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh, recheckHead: () => B }).ok).toBe(false);
@@ -84,7 +96,7 @@ describe('readApprovalRecord', () => {
 });
 
 describe('writeApprovalRecord', () => {
-  const base = { repo: 'o/r', headSha: A, rulingId: 'R474', approver: 'op', rulingExists: () => true };
+  const base = { repo: 'o/r', headSha: A, rulingId: 'R474', approver: 'chalbert', rulingExists: () => true };
   it('an unknown ruling id writes nothing', () => {
     const gh = vi.fn();
     expect(writeApprovalRecord({ ...base, rulingExists: () => false, gh }).ok).toBe(false);
@@ -95,6 +107,12 @@ describe('writeApprovalRecord', () => {
     expect(writeApprovalRecord({ ...base, rulingId: 'nope', gh }).ok).toBe(false);
     expect(writeApprovalRecord({ ...base, headSha: 'abc', gh }).ok).toBe(false);
     expect(gh).not.toHaveBeenCalled();
+  });
+  it('a login outside the pinned operator allowlist writes nothing', () => {
+    const gh = vi.fn();
+    for (const approver of ['someone-else', 'chalbert-x', 'xchalbert', 'op']) expect(writeApprovalRecord({ ...base, approver, gh }).ok).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
+    expect(OPERATOR_LOGINS).toEqual(['chalbert']);
   });
   it('a missing approver identity writes nothing', () => {
     const gh = vi.fn();
@@ -112,7 +130,7 @@ describe('writeApprovalRecord', () => {
     const post = gh.mock.calls.find(c => c[0].includes('POST'));
     const payload = JSON.parse(post[1].input);
     expect(payload).toMatchObject({ name: APPROVAL_CHECK_NAME, head_sha: A, external_id: `R474@${A}`, conclusion: 'success' });
-    expect(payload).toEqual(approvalCheckPayload({ headSha: A, rulingId: 'R474', approver: 'op' }));
+    expect(payload).toEqual(approvalCheckPayload({ headSha: A, rulingId: 'R474', approver: 'chalbert' }));
     expect(post[1].env.WE_GH_AUTH_PERSONAL_FALLBACK).toBe('refuse');
   });
 });

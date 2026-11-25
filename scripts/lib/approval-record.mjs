@@ -11,6 +11,11 @@ import { runGhSync } from './gh-throttle.mjs';
 import { redTeamWriterEnv, requireRedTeamAppWriter, resolveWeAppId } from './red-team-check-run.mjs';
 
 export const APPROVAL_CHECK_NAME = 'operator-approval';
+/** The trust root, pinned in code under a protected path (REVIEW_AUTH_FLOOR): the WE App id that may author an
+ *  approval record, and the operator logins that may ask for one. A setting, env or argument can only NARROW these
+ *  (a different value refuses); nothing local can widen or replace them. Changing either is a reviewed code change. */
+export const PINNED_APP_ID = '5037855';
+export const OPERATOR_LOGINS = Object.freeze(['chalbert']);
 const ioOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] };
 const validHead = head => typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head);
 const validApp = id => /^[1-9]\d*$/.test(String(id ?? '')) && Number.isSafeInteger(Number(id));
@@ -49,9 +54,13 @@ export function evaluateApprovalRecord({ headSha, checkRuns, appId } = {}) {
 
 /** Read the record for `headSha` live. `recheckHead()` re-reads the current head right after the read; a move refuses. */
 export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env = process.env, recheckHead, resolveApp = resolveWeAppId } = {}) {
-  let id = appId;
-  // The trusted App comes from the setting only: a caller-set WE_APP_ID must never choose which App is trusted.
-  if (id === undefined) { const app = resolveApp({ env: { ...env, WE_APP_ID: undefined } }); if (app.ok !== true) return failure(app.reason); id = app.appId; }
+  // The App id is the pinned constant. A caller argument or the local setting may only narrow it: any value that
+  // differs refuses. An unreadable setting leaves the pin in force (it can never disable or widen the trust root).
+  const id = PINNED_APP_ID;
+  if (appId !== undefined && String(appId) !== id) return failure('approval app id differs from the pinned trust root');
+  let app = { ok: false };
+  try { app = resolveApp({ env: { ...env, WE_APP_ID: undefined } }); } catch { /* the pin stands */ }
+  if (app?.ok === true && String(app.appId) !== id) return failure('approval app setting differs from the pinned trust root');
   if (!validHead(headSha)) return failure('approval head missing or not a full 40-hex sha');
   let data;
   try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=${APPROVAL_CHECK_NAME}&filter=all&per_page=100`], { ...ioOptions, throttle: { noMemo: true, bin: 'gh' } })); }
@@ -71,6 +80,7 @@ export function writeApprovalRecord({ repo, headSha, rulingId, approver, rulingE
   if (!validRulingId(rulingId)) return failure('ruling id must look like R123 or R123+R124');
   if (typeof approver !== 'string' || !approver.trim() || approver.trim().toLowerCase() === 'unknown')
     return failure('operator identity missing; nothing written');
+  if (!OPERATOR_LOGINS.includes(approver.trim().toLowerCase())) return failure('login is not in the pinned operator allowlist; nothing written');
   if (typeof rulingExists !== 'function') return failure('no ruling verifier supplied');
   let known = false;
   try { known = rulingId.split('+').every(id => rulingExists(id) === true); } catch { known = false; }
