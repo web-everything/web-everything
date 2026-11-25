@@ -2941,14 +2941,16 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     [undefined, ['review:human', 'review:changes'], {}],
     [undefined, ['review:human', 'review:changes', 'red-team:blocked'], {}],
     [undefined, ['review:human', 'review:changes', 'red-team:pending'], {}, false],
-    [undefined, ['review:human', 'review:changes', 'review:held-mechanical'], {}, false],
+    [undefined, ['review:human', 'review:changes', 'review:held-mechanical'], {}],
     ['advisory-fix', ['review:human', 'advisory:changes'], {}],
     ['operator-send-back', ['review:human'], { operatorSendBack: { body: 'repair' } }],
     ['ruling-not-addressed', ['review:human'], { rulingNotAddressed: { matches: [] } }],
     ['block-ruled-referral', ['review:human'], { blockRuledReferrals: [{}] }],
     ['takeover', ['review:human'], { takeover: {} }],
-    ['scope-bloat-rebase', ['review:changes'], { scopeBloat: {} }],
-    ['stale-base-rebase', ['review:human'], { isConflict: true, staleBase: {} }],
+    ['scope-bloat-rebase', ['review:human'], { scopeBloat: {} }],
+    ['stale-base-rebase', ['review:human'], { staleBase: {} }],
+    ['stale-base-rebase', ['red-team:pending'], { staleBase: {} }],
+    [undefined, ['review:changes', 'review:held-mechanical'], {}],
     ['stacked-rebase', ['review:accepted'], { isConflict: true }],
     [undefined, ['review:human', CONFLICT_LABEL], { isConflict: true }],
     [undefined, ['review:changes', 'red-team:blocked'], {}],
@@ -2987,6 +2989,23 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   it.each([
+    [['red-team:pending'], { staleBase: {} }, null],
+    [['red-team:pending'], {}, { code: 'hold-label', reason: 'red-team:pending' }],
+    [['red-team:pending'], { mode: 'stale-base-rebase' }, { code: 'hold-label', reason: 'red-team:pending' }],
+    [['review:held-mechanical', 'review:changes'], { labels: ['review:held-mechanical', 'review:changes'] }, null],
+    [['review:held-mechanical'], { labels: ['review:held-mechanical', 'review:changes'] },
+      { code: 'hold-label', reason: 'review:held-mechanical' }],
+    [['review:held-mechanical', 'review:changes'], undefined, { code: 'hold-label', reason: 'review:held-mechanical' }],
+  ])('live hold repair authorization (%j, %j)', (labels, repair, expected) => {
+    expect(readLivePushHold({ repo: 'we', pr: 1764, repair }, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) })).toEqual(expected);
+  });
+
+  it.each([
+    [['red-team:pending', 'review:human'], { staleBase: {}, labels: ['red-team:pending'] }],
+    [['red-team:pending', 'review:held-mechanical'], { staleBase: {}, labels: ['red-team:pending'] }],
+    [['review:held-mechanical', 'review:changes'], { labels: ['review:changes'] }],
+    [['review:held-mechanical', 'review:changes', 'red-team:pending'], { labels: ['review:held-mechanical', 'review:changes'] }],
     [['review:human', 'review:changes'], { labels: ['review:changes'] }],
     [['review:human'], { labels: ['review:human', 'review:changes'] }],
     [['review:human'], { mode: 'advisory-fix', labels: ['review:human'] }],

@@ -79,6 +79,9 @@ export default {
       [['review:changes', 'review:human'], [{
         body: '🔁 human review — changes requested\n\nRepair the admitted finding.',
       }], undefined],
+      [['review:changes', 'review:held-mechanical'], [{
+        body: '🔁 human review — changes requested\n\nRepair the admitted finding.',
+      }], undefined],
       [['review:human', 'advisory:changes'], [{ author: { login: 'web-everything' },
         body: `${ADVISORY_NOTE_MARKER}\n\nRepair the admitted finding.` }], 'advisory-fix'],
       [['review:changes', 'red-team:blocked'], [sendBack], undefined],
@@ -95,6 +98,23 @@ export default {
       const outcome = pass(plan.dispatch, () => labels);
       log?.(JSON.stringify({ labels, launches: outcome.launches, refusals: outcome.result.refusals }));
       if (outcome.launches.join(',') !== '1764') violations.push(`owed repair stalled on ${labels.join(',')}`);
+    }
+    const staleLabels = ['review:accepted', 'ready-to-merge', 'red-team:pending'];
+    const stalePr = { number: 1764, state: 'OPEN', isDraft: false, headRefName: 'topic', headRefOid: head,
+      baseRefName: 'main', labels: staleLabels.map(name => ({ name })), comments: [], mergeStateStatus: 'CLEAN',
+      rowsComplete: true, rowsHead: head, reviewTiming: { startAfter: 'fast-checks', fastChecks: ['gate', 'standards'] },
+      statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: head }] };
+    const stalePlan = planReconcile({ prs: [stalePr], agents: [], now, requiredChecks: ['gate'] });
+    if (!stalePlan.dispatch.some(entry => entry.kind === 'fix' && entry.staleBase)) {
+      violations.push('queued red-team fixture did not reach stale-base repair');
+    } else {
+      const staleOutcome = pass(stalePlan.dispatch, () => staleLabels);
+      log?.(JSON.stringify({ labels: staleLabels, launches: staleOutcome.launches, refusals: staleOutcome.result.refusals }));
+      if (staleOutcome.launches.join(',') !== '1764') violations.push('queued red-team stale-base repair stalled');
+      const heldOutcome = pass(stalePlan.dispatch, () => [...staleLabels, 'review:human']);
+      if (heldOutcome.launches.length || !heldOutcome.result.refusals.some(row => row.kind === 'push-hold')) {
+        violations.push('stale-base repair bypassed a newly added human hold');
+      }
     }
     const entries = [1764, 1765].map(prNumber => ({ kind: 'fix', prNumber, headRefName: `topic-${prNumber}` }));
     const outcome = pass(entries, pr => pr === 1764 ? ['review:human'] : [], 1);

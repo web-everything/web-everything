@@ -108,8 +108,9 @@ export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermet
   if (view.state !== 'OPEN') return { code: 'pr-not-open', reason: 'PR is not open' };
   const labels = view.labels.map(l => l.name);
   // These labels hold landing/review, but the planner can owe a repair while they remain present.
-  // Only exempt a hold already carried by that repair; a newly added hold still stops it. MQ refresh
-  // supplies no repair context and never receives these exceptions. Check every remaining hold too.
+  // Exempt carried holds or the pending red-team check that stale-base repair unblocks. A newly added
+  // unrelated hold still stops it. MQ refresh supplies no repair context and receives no exceptions.
+  // Check every remaining hold too.
   // An ordinary review:changes bounce owes a repair without any special mode; the human landing hold stays.
   const humanRepair = (repair?.reviewHuman === true || repair?.labels?.includes('review:human'))
     && (labels.includes('review:changes')
@@ -118,6 +119,8 @@ export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermet
       || repair.takeover || repair.scopeBloat || repair.staleBase || repair.isConflict);
   const label = labels.find(name => PUSH_HOLD_LABELS.includes(name)
     && !(name === 'review:human' && humanRepair)
+    && !(name === 'red-team:pending' && repair?.staleBase)
+    && !(name === 'review:held-mechanical' && repair?.labels?.includes(name) && labels.includes('review:changes'))
     && !(name === 'red-team:blocked' && repair?.labels?.includes(name)
       && (labels.includes('review:changes') || humanRepair)));
   return label ? { code: 'hold-label', reason: label } : null;
