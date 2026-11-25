@@ -102,6 +102,7 @@ import { countRearmComments } from './rearm-review.mjs';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { resolveStandDownHoldsAcrossHeads } from './stand-down.mjs';
 import { enrichPrsWithStandDownAutoProceed } from './stand-down-auto-proceed-io.mjs';
+import { enrichPrsWithNoCodeOwedRearm } from './stand-down-no-code-owed.mjs';
 import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, startedAtMs, resolveOperatorRulingExtraRounds, resolveRoundExtensionAnchor } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -1797,6 +1798,8 @@ export function runReconcilePass({
   // Standing-ruling round grants (operator option B, 2026-10-20): verify the ruling + cited heads at read time.
   enrichStandingRulingGrants = enrichPrsWithStandingRulingGrants,
   enrichStandDownAutoProceed = enrichPrsWithStandDownAutoProceed,
+  // STANDDOWN-EMPTY-ROUND: one mechanical re-review for a "no code defect" stand-down (same write gate as R123).
+  enrichNoCodeOwedRearm = enrichPrsWithNoCodeOwedRearm,
   // Planning/read-only callers must never create cursors, reservations or operator answers.
   allowStandDownAutoProceed = false,
   // Pass-local orphan holds must retain unanswered stand-downs, before any R123 IO.
@@ -1901,9 +1904,12 @@ export function runReconcilePass({
   console.error(`check-evidence-coverage: ${covered}/${hydrated.prs.length} PRs rowsComplete===true && rowsHead===headRefOid`);
   // Evidence is applied before every downstream CI reader, including main-red attribution.
   const answerablePrs = skipStandDownPrs ? hydrated.prs.filter(pr => !skipStandDownPrs(pr)) : hydrated.prs;
-  const answeredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(answerablePrs, {
+  const ciAnsweredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichStandDownAutoProceed(answerablePrs, {
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
   }) : answerablePrs;
+  const answeredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichNoCodeOwedRearm(ciAnsweredPrs, {
+    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, env,
+  }) : ciAnsweredPrs;
   const answeredByNumber = new Map(answeredPrs.map(pr => [pr.number, pr]));
   const autoProceedPrs = skipStandDownPrs
     ? hydrated.prs.map(pr => answeredByNumber.get(pr.number) ?? pr) : answeredPrs;
