@@ -169,17 +169,20 @@ describe('runner freshness CLI', () => {
 
 import { FRESHNESS_CACHE, FRESHNESS_TTL } from '../runner-freshness.mjs';
 
-// The fixture symlinks the REAL node_modules, and the recursive walk can follow it. Any vitest run in this
-// checkout (a sibling in the same shard) writes `node_modules/.vite/` whenever it finishes, so that one
-// directory is not evidence about the command under test.
+// The fixture symlinks the REAL node_modules, and CI's recursive walk follows it. Any vitest run in this
+// checkout (a sibling in the same shard) writes this one file when it finishes, so it is not evidence about
+// the command under test. Exactly this file: anything else new must still fail the snapshot.
+const VITEST_RESULTS = join('clone', 'node_modules', '.vite', 'vitest', 'results.json');
+
 function treeFiles(root) {
   return readdirSync(root, { recursive: true, withFileTypes: true })
     .filter(e => e.isFile()).map(e => join(e.parentPath ?? e.path, e.name))
-    .filter(path => !path.includes('/node_modules/.vite/')).sort();
+    .filter(path => path !== join(root, VITEST_RESULTS)).sort();
 }
 
 describe('runner freshness real repository witnesses', () => {
-  it('the new-files snapshot ignores only the test runner\'s own cache behind node_modules', async () => {
+  // Exercises the snapshot filter on plain directories, so it never writes into the shared node_modules.
+  it('the new-files snapshot ignores only vitest\'s results file behind node_modules', async () => {
     await withBareOrigin(async ctx => {
       const before = treeFiles(ctx.tmp);
       const put = rel => {
@@ -191,7 +194,7 @@ describe('runner freshness real repository witnesses', () => {
       // A concurrent vitest run finishing writes this into the shared node_modules.
       put('node_modules/.vite/vitest/results.json');
       expect(treeFiles(ctx.tmp)).toEqual(before);
-      const added = [put('node_modules/.cache/new.json'), put('.vite/new.json')];
+      const added = [put('node_modules/.cache/new.json'), put('node_modules/.vite/vitest/other.json'), put('.vite/new.json')];
       expect(treeFiles(ctx.tmp)).toEqual([...before, ...added].sort());
     });
   }, 120_000);
