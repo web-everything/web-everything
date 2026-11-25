@@ -256,7 +256,7 @@ export function readSharedOpenPrs({
   if (exec === undefined) exec = execFileSyncThrottled;
   const servable = () => {
     const snap = readSnapshotFile(path);
-    if (staleOkMs && !cacheOnly && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
+    if (staleOkMs && !cacheOnly && latestDirtyMs(root, repo) !== Infinity && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
       if (now() - snap.fetchedAtMs >= ttl && !injectedExec
         && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
         refreshStarted.add(snapshotKey(repo));

@@ -264,8 +264,9 @@ export function isTransientGhFailure(text) {
 
 /** PURE: both PR identity stamps and the heavy-field age must still be fresh. */
 export function heavyIsFresh(cached, row, { nowMs, maxAgeMs }) {
-  return !!cached && cached.updatedAt === row.updatedAt && cached.headRefOid === row.headRefOid
-    && nowMs - cached.fetchedAtMs < maxAgeMs;
+  if (!cached || cached.updatedAt !== row.updatedAt || cached.headRefOid !== row.headRefOid) return false;
+  const age = nowMs - cached.fetchedAtMs; // missing/NaN/future timestamps are never fresh
+  return Number.isFinite(age) && age >= 0 && age < maxAgeMs;
 }
 
 function readPage({ repo, exec, query, page, pageRetries, execOpts }) {
@@ -313,7 +314,7 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
       throw new Error('missing PR heavy-field data');
     }
     // Hydrated data must be for the listing head; a differing head is a mid-flight push, refuse not stamp.
-    if (Object.hasOwn(data, 'headRefOid') && data.headRefOid !== row.headRefOid) {
+    if (data.headRefOid !== row.headRefOid) {
       throw new Error('hydrated PR head differs from listing head');
     }
     return data;
@@ -378,8 +379,11 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
     const live = byNumber.get(row.number);
     if (!live || row.updatedAt !== live.updatedAt || row.headRefOid !== live.headRefOid || !hasFields(row)
       || (hasFields(working[row.number]) && heavyIsFresh(working[row.number], live, { nowMs, maxAgeMs }))) continue;
-    working[row.number] = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: nowMs,
+    // A seed keeps its OWN fetch time and passes the same predicate as a cache hit; it is never renewed.
+    const seeded = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: row.fetchedAtMs,
       ...Object.fromEntries(heavyFields.map(field => [field, row[field]])) };
+    if (!heavyIsFresh(seeded, live, { nowMs, maxAgeMs })) continue;
+    working[row.number] = seeded;
   }
   const need = light.rows.filter(needsHeavy);
   let rows = light.rows, hydrated = 0, reused = 0;

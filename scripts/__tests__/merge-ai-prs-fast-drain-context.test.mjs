@@ -502,6 +502,18 @@ test('freshness uses the oldest rows.fetchedAtMs, and a too-old final replacemen
     // A fresh source is published with the source age, not the observation time.
     const ok = await readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(99_000) });
     assert.ok(ok.snapshots.get(repo));
+    // The persisted evidence time is the SOURCE age, not the observation time.
+    const { readFileSync } = await import('node:fs');
+    assert.equal(JSON.parse(readFileSync(base.path, 'utf8')).writtenAt, 99_000);
+    // Reuse across the expiry boundary: at 160s the persisted pass (99s) is past the 60s bound, so it republishes.
+    let locked = 0;
+    await readFastDrainPassInventory({ ...base, now: () => 160_000, readSnapshot: () => withAge(159_000),
+      lock: async fn => { locked++; return { ok: true, value: await fn(() => true) }; } });
+    assert.equal(locked, 1);
+    assert.equal(JSON.parse(readFileSync(base.path, 'utf8')).writtenAt, 159_000);
+    // Future-dated source rows are refused, not clamped to the observation time.
+    await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(200_000), path: join(dir, 'round3.json') }),
+      /expired|retry next pass/);
     // A replacement that is too old is refused even when the cached pass is valid.
     let calls = 0;
     await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => (calls++ === 0 ? withAge(99_000) : withAge(1_000)),

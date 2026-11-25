@@ -545,6 +545,7 @@ for (const phase of ['cold', 'direct hit', 'locked hit']) {
     it(`source refresh during ${phase} membership replaces ${invalid} pass rows with fresh cache-only evidence`, async () => {
       const f = pass();
       let now = 20_000, refreshes = 0;
+      f.options.now = () => now; // one clock for the pass and the source snapshots (source age is now bounded)
       const env = { WE_PR_SNAPSHOT_DIR: dirname(f.options.path), WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_TTL_MS: '75000' };
       const sourcePath = snapshotPath(env.WE_PR_SNAPSHOT_DIR, repo);
       const publish = (prs, fetchedAtMs) => writeFileSync(sourcePath, JSON.stringify({ v: PR_SNAPSHOT_VERSION,

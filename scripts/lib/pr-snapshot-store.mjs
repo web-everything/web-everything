@@ -20,7 +20,8 @@ import { existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSyn
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-export const PR_SNAPSHOT_VERSION = 2;
+// v3: heavy entries carry head-verified provenance; older snapshots stamped the listing head unverified.
+export const PR_SNAPSHOT_VERSION = 3;
 export const PR_SNAPSHOT_DIR_ENV = 'WE_PR_SNAPSHOT_DIR';
 export const PR_SNAPSHOT_DISABLE_ENV = 'WE_PR_SNAPSHOT';
 const ALL_DIRTY = '_all';
