@@ -79,7 +79,8 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
-import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT } from '../conveyor/stand-down-answer-core.mjs';
+import { readLiveFixClaim, readLiveDrainClaim } from '../conveyor/fix-procedure.mjs';
+import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT, parseNoCodeRearmReceipt } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -291,6 +292,7 @@ export function runReconcilePromoteDraftDispatch({
   })) }),
   postComment = ({ repoSlug, prNumber, comment }) => createGhProvider().postComment(repoSlug, prNumber, comment),
   rearm = defaultNoCodeRearm,
+  readClaim = readLiveFixClaim,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
@@ -487,8 +489,15 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
-  // One receipt spends one ruling before the child runs. No retries, cursor or deadline in this half.
-  for (const entry of (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code')) {
+  // Finish each entry atomically; defer the remaining entries when the tick must yield.
+  const rearmEntries = (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code');
+  for (const [index, entry] of rearmEntries.entries()) {
+    yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
+      deferred.push(...rearmEntries.slice(index).map(row => row.prNumber));
+      break;
+    }
+    handled += 1;
     const prNumber = entry.prNumber;
     let comments, labels;
     try {
@@ -505,7 +514,29 @@ export function runReconcilePromoteDraftDispatch({
       continue;
     }
     try {
-      postComment({ repoSlug, prNumber, comment: NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead) });
+      const claim = readClaim({ repo: repoKey, pr: prNumber });
+      // The planner's reader is tolerant of corrupt/missing storage. Reuse the existing
+      // fail-closed store probe before treating its null result as proof of no claim.
+      if (readClaim === readLiveFixClaim && readLiveDrainClaim({ repo: repoKey, pr: prNumber })?.uncertain) {
+        throw Error('fix claim store unreadable; operator must inspect the claim store');
+      }
+      if (claim) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-claimed', why: 'a live fix claim appeared; wait for its owner to finish' });
+        continue;
+      }
+    } catch (e) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
+      continue;
+    }
+    try {
+      const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
+      const priorIds = new Set(comments.map(c => c.id));
+      postComment({ repoSlug, prNumber, comment: receipt });
+      const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+      if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
+        && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
+        throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
+      }
     } catch (e) {
       refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
       continue;

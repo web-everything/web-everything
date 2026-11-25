@@ -703,10 +703,52 @@ Fix defect`);
   const entry = { kind: 'rearm-no-code', prNumber: 42, expectHead: head, answerId: 'answer' };
   const json = labels => JSON.stringify({ ok: true, labelsObserved: true, labels });
   function setup(over = {}) {
-    const postComment = vi.fn(), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
-    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => thread(), postComment, rearm, ...over };
+    const posted = [];
+    const postComment = vi.fn(({ comment }) => posted.push(c('receipt', comment))), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm, ...over };
     return { options, postComment, rearm, run: () => runReconcilePromoteDraftDispatch(options) };
   }
+  it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {
+    const readClaim = vi.fn(() => { if (mode === 'unreadable') throw Error('store unreadable'); return { meta: { who: 'fixer' } }; });
+    const s = setup({ readClaim });
+    const result = s.run();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: mode === 'live' ? 'rearm-no-code-claimed' : 'rearm-no-code-unreadable' }));
+    expect(readClaim).toHaveBeenCalledWith({ repo: 'we', pr: 42 });
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['outsider', 'unknown', 'unreadable', 'missing'])('receipt author %s refuses without spawning or spending the ruling', mode => {
+    const posted = [];
+    const s = setup({
+      postComment: vi.fn(({ comment }) => posted.push({ id: 'new-receipt', body: comment, ...(mode === 'unknown' ? {} : { author: { login: 'outsider' } }) })),
+      readThread: vi.fn(() => {
+        if (posted.length && mode === 'unreadable') throw Error('readback failed');
+        return [...thread(), ...(mode === 'missing' ? [] : posted)];
+      }),
+    });
+    const result = s.run();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-receipt-failed' }));
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['deadline', 'adoption'])('rearm loop defers remaining entries on %s and counts handled entries', mode => {
+    let time = 0, yieldNow = false;
+    const s = setup({ now: () => time, deadlineAt: 10, shouldYield: () => yieldNow,
+      reconcile: () => ({ dispatch: [entry, { ...entry, prNumber: 43 }], refusals: [] }),
+      rearm: vi.fn(() => { time = 11; yieldNow = mode === 'adoption'; return { status: 0, stdout: json(['review:pending']) }; }),
+    });
+    const result = s.run();
+    expect(result).toMatchObject({ handled: 1, deferred: [43] });
+    if (mode === 'adoption') expect(result.yieldedForAdoption).toBe(true);
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+  });
+  it('rearm loop defers every entry when planning exhausts the deadline', () => {
+    let time = 0;
+    const s = setup({ now: () => time, deadlineAt: 10, reconcile: () => { time = 11; return { dispatch: [entry], refusals: [] }; } });
+    expect(s.run()).toMatchObject({ handled: 0, deferred: [42] });
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
   it.each(['review:pending', 'review:human'])('confirms exactly once from observed %s and pins the head', label => {
     const s = setup({ rearm: vi.fn(() => ({ status: 0, stdout: `diagnostic\n${json([label])}\n` })) });
     expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
@@ -786,7 +828,7 @@ Fix defect`);
         const page = Number(/page=(\d+)$/.exec(args[1])[1]);
         return comments.slice((page - 1) * 100, page * 100);
       } }), readPrLabels: () => labels,
-      postComment: vi.fn(({ comment }) => comments.push(c('receipt', comment))),
+      postComment: vi.fn(({ comment }) => { comments.push(c('receipt', comment)); }),
       rearm: vi.fn(() => { labels = ['review:pending']; comments.push(c('rearmed', '🔧 conveyor fix — re-armed for re-review')); return { status: 0, stdout: json(labels) }; }),
     });
     const first = s.run(), second = s.run(), third = plan();

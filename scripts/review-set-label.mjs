@@ -2482,7 +2482,7 @@ export function runReviewLabelCli({
   } else try {
     const readback = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name));
     newLabels = readback.filter(Boolean);
-    labelsObserved = readback.every(l => typeof l === 'string');
+    labelsObserved = readback.every(l => typeof l === 'string' && l.trim().length > 0);
   } catch {
     const names = (Array.isArray(currentLabels) ? currentLabels : [])
       .map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean)

@@ -52,6 +52,9 @@ describe('no-code rearm predicate', () => {
     const moved = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head: 'b'.repeat(40) }));
     expect(predicate({ headRefOid: 'b'.repeat(40), comments: [verdict, begin, moved, answer, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))] }).state).toBe('spent');
   });
+  it('receipt without poster identity cannot spend a ruling', () => {
+    expect(predicate({ comments: [...comments, { id: 'r', body: core.NO_CODE_REARM_RECEIPT('answer', HEAD) }] }).state).toBe('ready');
+  });
   it('untrusted receipt is ignored', () => expect(predicate({ comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD), 'outsider')] }).state).toBe('ready'));
   it('no review:changes resumes ordinary planning', () => expect(predicate({ labels: ['review:pending'] }).state).toBe('none'));
   it('later untrusted ordinary answer cannot override an eligible no-code ruling', () => {

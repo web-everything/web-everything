@@ -5120,6 +5120,10 @@ describe('generic label readback observation', () => {
     ['missing name', ['review:pending', {}], false],
     ['null entry', ['review:pending', null], false],
     ['numeric name', ['review:pending', { name: 7 }], false],
+    ['empty string', ['review:pending', ''], false],
+    ['blank string', ['review:pending', '  \t'], false],
+    ['empty label name', ['review:pending', { name: '' }], false],
+    ['blank label name', ['review:pending', { name: '  \t' }], false],
   ])('labelsObserved requires a complete string label readback: %s', (_name, readback, observed) => {
     const chunks = [];
     const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(Error('exit'), { exitCode: code }); });
