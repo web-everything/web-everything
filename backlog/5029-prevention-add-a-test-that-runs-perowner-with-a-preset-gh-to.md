@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/github-app-auth-env.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs-one-repo-listing-fails.test.mjs", "we:scripts/lib/__tests__/github-app-auth-env.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs"]
+
 dateOpened: "2026-10-03"
 tags: []
 ---
@@ -28,3 +28,12 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-24)
+
+The build-dispatch daemon held #5029 with:
+
+> worker-declined: Not prepared: #5029 — could-not-prepare. Requirement 5 leaves a credential-policy choice unresolved: should per-owner mode replace existing Git transport authentication with owner-specific App credentials, or refuse pushes that cannot establish that identity? The drain still inherits authentication for pushes at 'we:scripts/merge-ai-prs.mjs:4646' and 'we:scripts/merge-ai-prs.mjs:4673'. The shim explicitly excludes 'auth git-credential' at 'we:scripts/lib/gh-app-shim.mjs:896', so routing through that shim does not settle the choice. No files edited or stamps added. No tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
