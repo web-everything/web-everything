@@ -141,7 +141,7 @@ export async function readFastDrainFacts(items, concurrency, read) {
  * Rows are published only for the parent's existing snapshotFirst readiness check, not gate authority.
  */
 export async function readFastDrainPassInventory({ path, repos, targetRepo, snapshots, readSnapshot = repo => snapshots?.get(repo), readMain,
-  listLean, concurrency = 4, now = Date.now, write = writeJsonAtomic, env = process.env, log = () => {},
+  listLean, refreshSnapshot = null, concurrency = 4, now = Date.now, write = writeJsonAtomic, env = process.env, log = () => {},
   read = p => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('pass snapshot oversized'); return JSON.parse(readFileSync(p, 'utf8')); },
   lock = fn => withFastDrainRoundLock(path, fn),
 }) {
@@ -153,8 +153,11 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return Number.isFinite(age) && age >= 0 && age < ttlSec * 1000;
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
-  const readSources = () => new Map(repos.map(repo => {
-    const rows = readSnapshot(repo);
+  // `refresh` is only used while BUILDING a new round (never when reusing a published one): a stale
+  // cache-only source is refreshed once through the shared single-flight reader; any failure stays fail-closed.
+  const readSources = ({ refresh = false, onRefresh = () => {} } = {}) => new Map(repos.map(repo => {
+    let rows = readSnapshot(repo);
+    if (!Array.isArray(rows) && refresh && typeof refreshSnapshot === 'function') { onRefresh(); rows = refreshSnapshot(repo); }
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
   }));
@@ -185,7 +188,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     validateLeanOpenPrs(inventory, OPEN_PR_LIST_LIMIT, repo);
     return [repo, inventory];
   }));
-  const revalidateAfterMembership = async writtenAt => {
+  const revalidateAfterMembership = async (writtenAt, { refresh = false } = {}) => {
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
@@ -193,7 +196,8 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
     // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    return readSources();
+    // Building a new round: concurrent mutations dirty the source within seconds, so re-read through the same refresh path.
+    return readSources({ refresh });
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -209,10 +213,13 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    readSources();
+    // Include main-read/lock wait time in the freshness bound. A cold source refresh can itself outlast the TTL, so the
+    // bound then starts when it ends (heads were read just before it and are re-checked after membership).
+    let refreshed = false;
+    readSources({ refresh: true, onRefresh: () => { refreshed = true; } });
+    const writtenAt = refreshed ? now() : observedAt;
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt);
+    const snapshots = await revalidateAfterMembership(writtenAt, { refresh: true });
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });

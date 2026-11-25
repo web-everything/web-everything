@@ -9,7 +9,8 @@ import { overlapYieldWaits } from '../conveyor/land-overlap-yield.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import fixture from './fixtures/fast-drain-18-prs.json';
 import recorded from './fixtures/fast-drain-18-prs.recorded.json';
-import { it, expect } from 'vitest';
+import { it, expect, describe } from 'vitest';
+import { classifyChildFailure } from '../lib/child-failure-class.mjs';
 import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
 
 it('negative first: catch-up retains a review:changes block under narrowed reads', () => {
@@ -659,3 +660,51 @@ for (const number of [7, 8]) {
     }
   });
 }
+
+describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain-crash)', () => {
+  it('builds the round by refreshing a stale source snapshot once, then serves the rest from the round', async () => {
+    const f = pass();
+    let refreshes = 0;
+    const options = { ...f.options, readSnapshot: () => null,
+      refreshSnapshot: () => { refreshes++; return rows; } };
+    try {
+      const first = await readFastDrainPassInventory(options);
+      expect(first.snapshots.get(repo)).toEqual(rows);
+      expect(refreshes).toBe(2); // the source read and the post-membership re-read, both while building the round
+      // A later child with a stale source must NOT refresh while reusing the published round.
+      await expect(readFastDrainPassInventory({ ...options, refreshSnapshot: () => { refreshes++; return rows; } })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
+      expect(refreshes).toBe(2);
+    } finally { f.close(); }
+  });
+
+  it('a refresh slower than the pass TTL still builds a round (bound starts after it); membership read after the bound still fails closed', async () => {
+    const f = pass();
+    let t = 1000;
+    const slow = { ...f.options, now: () => t, readSnapshot: () => null, refreshSnapshot: () => { if (t === 1000) t += 90_000; return rows; } };
+    try {
+      await expect(readFastDrainPassInventory(slow)).resolves.toBeTruthy();
+      const late = pass();
+      let u = 1000;
+      await expect(readFastDrainPassInventory({ ...late.options, now: () => u, readSnapshot: () => null, refreshSnapshot: () => rows,
+        listLean: async () => { u += 90_000; return inventory(rows); } })).rejects.toThrow('expired while reading');
+      late.close();
+    } finally { f.close(); }
+  });
+
+  for (const bad of ['null', 'throws', 'not-array']) {
+    it(`stays fail-closed and publishes no round when the refresh is ${bad}`, async () => {
+      const f = pass();
+      const refreshSnapshot = () => { if (bad === 'throws') throw new Error('pr list unreadable'); return bad === 'null' ? null : {}; };
+      try {
+        await expect(readFastDrainPassInventory({ ...f.options, readSnapshot: () => null, refreshSnapshot })).rejects.toThrow(/snapshot unavailable|pr list unreadable/);
+        expect(existsSync(f.options.path)).toBe(false);
+      } finally { f.close(); }
+    });
+  }
+
+  it('classifies the incomplete pass context failure instead of "unknown"', () => {
+    expect(classifyChildFailure('merge-ai-prs Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'))
+      .toBe('incomplete-context');
+    expect(classifyChildFailure('something else entirely')).toBe('unknown');
+  });
+});
