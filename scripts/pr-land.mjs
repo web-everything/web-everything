@@ -765,20 +765,23 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
   return reconcileRoster({ preRegistered, recomputed, mode: timing });
 }
 
-/** Finish-guard marker read: retain local precedence, otherwise consult the exact consumer policy and head. */
-export function readFinishGuardMarker({ gitDir, headSha, remote, runGit, env = process.env,
+/** Finish-guard marker read: retain local precedence, otherwise consult the exact consumer policy, head and merge base. */
+export function readFinishGuardMarker({ gitDir, headSha, remote, base, runGit, env = process.env,
   coordRoot = resolveCoordinationRoot({ env }), log = text => process.stderr.write(`${text}\n`) }) {
   const local = readVerifyMarker(gitDir);
   const policyKey = verifyPolicyKey(env);
   const logInputs = () => log(`pr-land: shared verification unavailable; policyKey=${policyKey} inputs=${JSON.stringify(verifyPolicyInputs(env))}; re-verify under these inputs`);
-  if (local && (local.sha === headSha || local.corrupt)) {
+  if (local && (local.corrupt || local.status !== 'green' || local.sha === headSha)) {
     if (local.corrupt || local.status !== 'green') logInputs();
     return local;
   }
+  let mergeBase;
+  try { mergeBase = runGit(['merge-base', headSha, `${remote}/${base}`]).trim(); }
+  catch { logInputs(); return local; } // No computed base means shared evidence is absent.
   let shared;
   try {
     const repo = repoSlugFromRemote(runGit(['remote', 'get-url', remote]));
-    shared = readSharedGreen({ coordRoot, repo, sha: headSha, policyKey });
+    shared = readSharedGreen({ coordRoot, repo, sha: headSha, mergeBase, policyKey });
   } catch { shared = { corrupt: true }; }
   const marker = resolveMarkerWithShared({ local, shared, headSha });
   if (marker?.sharedFrom) log(`pr-land: verification sharedFrom ${JSON.stringify(marker.sharedFrom)}`);
@@ -1069,7 +1072,7 @@ async function runCli() {
     // own source-text wiring assertions.
     const finishArgs = {
       ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC,
-      readMarker: gitDir => readFinishGuardMarker({ gitDir, headSha: refSha, remote: REMOTE, runGit: gitC }),
+      readMarker: gitDir => readFinishGuardMarker({ gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC }),
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     };
     const gate = resolveFinishGuardVerdict({ ...finishArgs });

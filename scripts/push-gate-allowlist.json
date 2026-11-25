@@ -47,7 +47,7 @@
     "scripts/operations/migrate-raised-by.mjs": {"status":"pending-migration","reason":"S6: lease-publish raised-by migrations and roll back when approval cannot carry.","sites":12},
     "scripts/operations/record-verdict-io.mjs": {"status":"pending-migration","reason":"S5: synchronize the fetched source ref onto the verdict transport branch.","sites":2},
     "scripts/operations/review-prep-io.mjs": {"status":"pending-migration","reason":"S5: publish prepared review evidence and report an owed push on failure.","sites":4},
-    "scripts/pr-land.mjs": {"status":"pending-migration","reason":"S3: publish source lane commits and authorized main landings. Site 24 is the read-only runGit(['remote','get-url',remote]) in readFinishGuardMarker, flagged only because the remote name is dynamic.","sites":24},
+    "scripts/pr-land.mjs": {"status":"pending-migration","reason":"S3: publish source lane commits and authorized main landings. Sites 24–25 are the read-only runGit remote get-url and merge-base calls in readFinishGuardMarker, flagged because the remote, head and base arguments are dynamic.","sites":25},
     "scripts/push-if-green.mjs": {"status":"pending-migration","reason":"S3: publish the selected source only after green verification.","sites":7},
     "scripts/session-replay.mjs": {"status":"pending-migration","reason":"S6: publish seeded replay fixtures to ephemeral main.","sites":2},
     "scripts/audit-backlog-health.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},

@@ -1,5 +1,9 @@
 import { beforeEach, afterEach, it, expect } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, statSync, symlinkSync, rmSync, readdirSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { loadVerifySettingsFile, resolveVerifySettings } from '../lib/verify-settings.mjs';
+import { createHash } from 'node:crypto';
+import { resolveBuildPolicy } from '../lib/build-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
@@ -42,7 +46,7 @@ const source = readFileSync(join(process.cwd(), 'scripts/verify-lane.mjs'), 'utf
 const sharedPath = join(process.cwd(), 'scripts/lib/verify-shared-marker.mjs');
 // On the red run, each guarantee fails explicitly at its missing API, rather than failing test collection.
 const store = existsSync(sharedPath) ? await import(sharedPath) : {};
-let root, coordRoot, laneA, sha;
+let root, coordRoot, laneA, sha, mergeBase;
 const repo = 'example/project';
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', maxBuffer: 2 * 1024 * 1024,
   env: laneGitHardeningEnv(process.env), stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -51,17 +55,19 @@ beforeEach(() => {
   coordRoot = join(root, 'coord');
   laneA = join(root, 'lane-A');
   mkdirSync(laneA);
-  git(laneA, ['init', '-q']);
+  git(laneA, ['init', '-q', '-b', 'main']);
   git(laneA, ['remote', 'add', 'origin', 'https://github.com/example/project.git']);
   writeFileSync(join(laneA, 'code.txt'), 'committed\n', { mode: 0o644 });
   git(laneA, ['add', '.']);
   git(laneA, ['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'fixture']);
   sha = git(laneA, ['rev-parse', 'HEAD']);
+  mergeBase = sha;
+  git(laneA, ['update-ref', 'refs/remotes/origin/main', sha]);
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 const key = env => gate.verifyPolicyKey(env ?? {});
-const args = (extra = {}) => ({ coordRoot, repo, sha, policyKey: key(), ...extra });
-const record = (extra = {}) => ({ v: 1, writer: 'verify-lane', repo, sha, policyKey: key(), status: 'green', exitCode: 0,
+const args = (extra = {}) => ({ coordRoot, repo, sha, mergeBase, policyKey: key(), ...extra });
+const record = (extra = {}) => ({ v: 1, writer: 'verify-lane', repo, sha, mergeBase, revertRed: null, policyKey: key(), status: 'green', exitCode: 0,
   executedGate: 'npm run test:unit', selectionMode: 'pr', deltaBase: null, finishedAt: new Date().toISOString(), lane: 'lane-A', ...extra });
 function publish(extra = {}) { return store.publishGreen({ ...args(), record: record(), ...extra }); }
 function rawRecord(value) {
@@ -81,10 +87,10 @@ function producer(overrides = {}) {
   const context = { ...store, shouldRecordGreen, repoSlugFromRemote, laneGitHardeningEnv, hardenLaneGitArgs,
     isAllowlistedLitterPath, gateCommandsEqual: gate.gateCommandsEqual, verifyPolicyKey: gate.verifyPolicyKey,
     execFileSync, basename, join, REPO: laneA, headSha: sha, GATE: resolved.command, resolvedGate: resolved,
-    resolveBuildDefaultGate: () => resolved, flags: {}, FORCE_LOCAL: false, admissionFallback: false,
+    resolveBuildDefaultGate: () => resolved, flags: {}, FORCE_LOCAL: false, admissionFallback: false, revertRed: null,
     resolveCoordinationRoot: () => coordRoot, process: { env: process.env, stderr: { write: s => notes.push(s) } },
     ...overrides };
-  runInNewContext(`${source.slice(start, end)}\nmaybePublishSharedGreen({status:'green', treeHash:'stable'});`, context);
+  runInNewContext(`${source.slice(start, end)}\nmaybePublishSharedGreen({status:'green', treeHash:'stable', revertRed});`, context);
   return notes.join('');
 }
 
@@ -94,7 +100,7 @@ it('a green published in lane A opens the PR from lane B at the same sha and pol
   git(root, ['clone', '-q', laneA, laneB]);
   git(laneB, ['remote', 'set-url', 'origin', 'https://github.com/example/project.git']);
   const logs = [];
-  const readMarker = gitDir => land.readFinishGuardMarker({ gitDir, headSha: sha, remote: 'origin',
+  const readMarker = gitDir => land.readFinishGuardMarker({ gitDir, headSha: sha, remote: 'origin', base: 'main',
     runGit: a => git(laneB, a), coordRoot, env: {}, log: s => logs.push(s) });
   const result = land.resolveFinishGuardVerdict({ gitDir: join(laneB, '.git'), headSha: sha, remote: 'origin', base: 'main',
     runGit: a => git(laneB, a), readMarker });
@@ -202,9 +208,9 @@ it('a killed writer temp is ignored and cannot open the guard', () => {
 });
 
 const schemaMutations = [
-  ...['v', 'writer', 'repo', 'sha', 'policyKey', 'status', 'exitCode', 'executedGate', 'selectionMode', 'deltaBase', 'finishedAt', 'lane']
+  ...['v', 'writer', 'repo', 'sha', 'mergeBase', 'revertRed', 'policyKey', 'status', 'exitCode', 'executedGate', 'selectionMode', 'deltaBase', 'finishedAt', 'lane']
     .map(field => [`missing ${field}`, r => { delete r[field]; }]),
-  ...Object.entries({ v: 2, writer: 'other', repo: 'other/repo', sha: 'f'.repeat(40), policyKey: 'f'.repeat(64), status: 'red',
+  ...Object.entries({ v: 2, writer: 'other', repo: 'other/repo', sha: 'f'.repeat(40), mergeBase: 'f'.repeat(40), revertRed: { mode: 'warn', status: 'flagged' }, policyKey: 'f'.repeat(64), status: 'red',
     exitCode: 1, executedGate: '', selectionMode: 'unknown', deltaBase: 'f'.repeat(40), finishedAt: 'invalid', lane: null })
     .map(([field, value]) => [`invalid ${field}`, r => { r[field] = value; }]),
   ['future finishedAt', r => { r.finishedAt = new Date(Date.now() + 301_000).toISOString(); }],
@@ -212,6 +218,11 @@ const schemaMutations = [
   ['whitespace executedGate', r => { r.executedGate = '  '; }],
   ['delta without base', r => { r.selectionMode = 'since-last-green'; }],
   ['delta with malformed base', r => { r.selectionMode = 'since-last-green'; r.deltaBase = 'bad'; }],
+  ['malformed mergeBase', r => { r.mergeBase = 'bad'; }],
+  ['revertRed extra field', r => { r.revertRed = { mode: 'warn', status: 'clean', extra: true }; }],
+  ['revertRed missing mode', r => { r.revertRed = { status: 'clean' }; }],
+  ['revertRed invalid mode', r => { r.revertRed = { mode: 'unknown', status: 'clean' }; }],
+  ['revertRed non-object', r => { r.revertRed = []; }],
   ['extra key', r => { r.extra = true; }],
 ];
 it.each(schemaMutations)('strict schema refuses %s', (_, mutate) => {
@@ -237,7 +248,8 @@ it.each(['red', 'running', 'green'])('precedence preserves local %s at head over
   const local = { sha, status }, shared = { sha, status: 'green', sharedFrom: { lane: 'other' } };
   expect(store.resolveMarkerWithShared({ local, shared, headSha: sha })).toBe(local);
 });
-it.each(['red', 'running', 'green'])('precedence lets exact shared head beat stale local %s', status => {
+it('precedence lets exact shared head beat stale local green', () => {
+  const status = 'green';
   const local = { sha: 'f'.repeat(40), status }, shared = { sha, status: 'green' };
   expect(store.resolveMarkerWithShared({ local, shared, headSha: sha })).toBe(shared);
 });
@@ -256,4 +268,115 @@ it('ciOnly remains unchanged and never substitutes for a shared green', () => {
     runGit: a => git(laneA, a), readMarker: () => store.readSharedGreen(args()), ciOnly });
   expect(result).toMatchObject({ ok: true, status: 'green' });
   expect(result).not.toBe(ciOnly);
+});
+
+
+it.each(['finalGate', 'finalGateStandards'])('policy provenance refuses reuse for the same %s value from env', field => {
+  const envKey = field === 'finalGate' ? 'WE_BUILD_FINAL_GATE' : 'WE_BUILD_FINAL_GATE_STANDARDS';
+  const defaults = resolveBuildPolicy({ env: {} });
+  const env = { [envKey]: defaults[field] };
+  expect(gate.verifyPolicyInputs({}).sources?.[field]).toBe(defaults.sources[field]);
+  expect(gate.verifyPolicyInputs(env).sources?.[field]).toBe('env');
+  expect(key(env)).not.toBe(key({}));
+  publish();
+  expect(store.readSharedGreen(args({ policyKey: key(env) }))).toBeNull();
+});
+// Exercise the actual policy functions in fresh process-like contexts, with only filesystem IO injected.
+// This also checks that verifier paths derive from the module URL, independently of the target checkout.
+const policySource = readFileSync(join(process.cwd(), 'scripts/lib/verify-lane-gate.mjs'), 'utf8');
+const policyStart = policySource.indexOf('let verifier;');
+const policyEnd = policySource.indexOf('/**\n * PR 7008', policyStart);
+function policyProcess({ readFile = readFileSync, buildPolicy = resolveBuildPolicy } = {}) {
+  expect(policyStart).toBeGreaterThan(-1);
+  expect(policyEnd).toBeGreaterThan(policyStart);
+  const functions = policySource.slice(policyStart, policyEnd).replace(/\bexport /g, '').replaceAll('import.meta.url', 'moduleUrl');
+  return runInNewContext(`${functions}\n({verifyPolicyInputs, verifyPolicyKey});`, {
+    moduleUrl: pathToFileURL(join(process.cwd(), 'scripts/lib/verify-lane-gate.mjs')).href,
+    fileURLToPath, dirname, join, createHash, readFileSync: readFile, resolveBuildPolicy: buildPolicy,
+    defaultFileConfig: loadVerifySettingsFile(), resolveVerifySettings, SELECTION_FLAG: 'WE_DIFF_TEST_SELECTION',
+    process: { env: {} },
+  });
+}
+it('standard-sourced full cannot reuse env-sourced full even with identical effective gate values', () => {
+  const isolated = policyProcess({ buildPolicy: ({ env }) => resolveBuildPolicy({ env, tool: {}, platform: {} }) });
+  const env = { WE_BUILD_FINAL_GATE: 'full', WE_BUILD_FINAL_GATE_STANDARDS: 'always' };
+  expect(isolated.verifyPolicyInputs({})).toMatchObject({ finalGate: 'full', finalGateStandards: 'always',
+    sources: { finalGate: 'standard', finalGateStandards: 'standard' } });
+  expect(isolated.verifyPolicyInputs(env)).toMatchObject({ finalGate: 'full', finalGateStandards: 'always',
+    sources: { finalGate: 'env', finalGateStandards: 'env' } });
+  expect(isolated.verifyPolicyKey({})).not.toBe(isolated.verifyPolicyKey(env));
+});
+const verifierFiles = ['scripts/verify-lane.mjs', 'scripts/lib/verify-lane-gate.mjs',
+  'scripts/lib/verify-shared-marker.mjs', 'scripts/lib/verify-settings.mjs', 'scripts/lib/build-policy.mjs'];
+it.each(verifierFiles)('verifier identity refuses reuse after different running-checkout bytes in %s', changed => {
+  let changedBytes = false;
+  const reads = [];
+  const readFile = (file, ...rest) => {
+    reads.push(file);
+    const bytes = readFileSync(file, ...rest);
+    return changedBytes && file === join(process.cwd(), changed)
+      ? Buffer.concat([bytes, Buffer.from('\n// changed verifier\n')]) : bytes;
+  };
+  const first = policyProcess({ readFile });
+  const firstKey = first.verifyPolicyKey({});
+  expect(firstKey).toBe(key({})); // the extracted functions match the imported production module
+  const expected = createHash('sha256');
+  for (const file of verifierFiles) expected.update(readFileSync(join(process.cwd(), file)));
+  expect(first.verifyPolicyInputs({}).verifier).toBe(expected.digest('hex'));
+  changedBytes = true;
+  expect(first.verifyPolicyKey({})).toBe(firstKey); // cached for this loaded verifier
+  expect(reads).toEqual(verifierFiles.map(f => join(process.cwd(), f)));
+  const secondKey = policyProcess({ readFile }).verifyPolicyKey({});
+  expect(secondKey).not.toBe(firstKey);
+  publish({ policyKey: firstKey, record: record({ policyKey: firstKey }) });
+  expect(store.readSharedGreen(args({ policyKey: secondKey }))).toBeNull();
+});
+it('base binding refuses reuse for another merge base and validates caller input', () => {
+  expect(publish()).toBe(true);
+  expect(store.sharedMarkerPath(args())).toBe(join(coordRoot, 'verify-shared', 'example__project', sha, mergeBase, `${key()}.json`));
+  expect(store.readSharedGreen(args({ mergeBase: 'e'.repeat(40) }))).toBeNull();
+  expect(store.readSharedGreen(args({ mergeBase: 'bad' }))).toEqual({ corrupt: true });
+  expect(store.sharedMarkerPath(args({ mergeBase: 'bad' }))).toBeNull();
+  for (let dir = dirname(store.sharedMarkerPath(args())); dir !== coordRoot; dir = dirname(dir)) {
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+  }
+});
+it('producer refuses publication when merge-base cannot be computed', () => {
+  git(laneA, ['update-ref', '-d', 'refs/remotes/origin/main']);
+  expect(producer()).toMatch(/shared.*skip.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it.each(['red', 'running', 'unknown', undefined])('precedence refuses stale local non-green %s despite exact shared green', status => {
+  const local = { sha: 'e'.repeat(40), status }, shared = { sha, status: 'green' };
+  expect(store.resolveMarkerWithShared({ local, shared, headSha: sha })).toBe(local);
+});
+it.each(['warn', 'enforce'].flatMap(mode => ['skipped', 'unproven', 'flagged'].map(status => [mode, status])))
+  ('revert-red %s/%s refuses shared publication', (mode, status) => {
+    expect(producer({ revertRed: { mode, status } })).toMatch(/shared.*skip.*re-verify/);
+    expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+  });
+it.each([null, { mode: 'off', status: 'skipped' }, { mode: 'warn', status: 'clean' }, { mode: 'enforce', status: 'clean' }])
+  ('producer records only clean or absent revert-red evidence %j', revertRed => {
+    producer({ revertRed });
+    const file = store.sharedMarkerPath(args({ policyKey: key(process.env) }));
+    expect(JSON.parse(readFileSync(file, 'utf8')).revertRed).toEqual(revertRed?.mode === 'off' ? null : revertRed);
+    expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toMatchObject({ status: 'green' });
+  });
+it.each([
+  ['card-only echo', 'echo card-only skip'],
+  ['no-suite echo with standards', 'echo no tests && npm run check:standards'],
+  ['empty selection', 'npx vitest run --passWithNoTests'],
+  ['empty selection with standards', 'npx vitest related --run --passWithNoTests && npm run check:standards'],
+  ['no test invocation', 'node scripts/other-check.mjs'],
+  ['test name without invocation', 'node scripts/vitest-report.mjs'],
+])('zero tests refuses publication for %s', (_kind, command) => {
+  const resolved = { command, decision: { selectionMode: { mode: 'pr' }, selection: { tests: [] } } };
+  expect(producer({ GATE: command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved })).toMatch(/shared.*skip.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it('nonempty selected test invocation remains eligible for publication', () => {
+  const command = 'npx vitest run scripts/example.test.mjs --passWithNoTests';
+  const resolved = { command, decision: { selectionMode: { mode: 'pr' }, selection: { tests: ['scripts/example.test.mjs'] } } };
+  producer({ GATE: command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved });
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toMatchObject({ status: 'green' });
 });

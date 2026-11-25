@@ -380,12 +380,18 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
     process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);
   }
 }
-function maybePublishSharedGreen({ status, treeHash, skipped = null }) {
+function maybePublishSharedGreen({ status, treeHash, skipped = null, revertRed = null }) {
   const skip = reason => process.stderr.write(`verify shared: skip (${reason}); re-verify for shared reuse\n`);
   try {
     if (typeof flags.gate === 'string' || FORCE_LOCAL) return skip('explicit gate or local run');
     const ours = resolveBuildDefaultGate(process.env);
     if (!resolvedGate || !gateCommandsEqual(ours.command, GATE) || !gateCommandsEqual(resolvedGate.command, GATE)) return skip('executed gate differs from own env plan');
+    const command = resolvedGate.command;
+    const hasTestFiles = /(?:^|[\s'"])[^\s'"]+\.(?:test|spec)\.[cm]?[jt]sx?(?=$|[\s'"])/.test(command);
+    if (command.startsWith('echo ') || (command.includes('--passWithNoTests') && !hasTestFiles)
+      || !/(?:^|&&\s*|--\s+)(?:npx vitest(?:\s|$)|npm run (?:test:unit|check:standards)(?:\s|$)|node scripts\/check-standards\.mjs(?:\s|$))/.test(command)) return skip('executed gate has no test evidence');
+    if (revertRed && revertRed.mode !== 'off' && revertRed.status !== 'clean') return skip('revert-red is not proven clean');
+    const revertRedEvidence = !revertRed || revertRed.mode === 'off' ? null : { mode: revertRed.mode, status: revertRed.status };
     const sharedGit = args => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, env: laneGitHardeningEnv(process.env) });
     const statusOut = sharedGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all']);
@@ -393,15 +399,17 @@ function maybePublishSharedGreen({ status, treeHash, skipped = null }) {
     if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree, skipped })) return skip('not a stable clean default-gate green');
     if (sharedGit(['ls-files', '-v']).split('\n').some(line => /^[a-zS] /.test(line))) return skip('assume-unchanged or skip-worktree entries');
     const repo = repoSlugFromRemote(sharedGit(['remote', 'get-url', 'origin']).trim());
+    const mergeBase = sharedGit(['merge-base', 'HEAD', 'origin/main']).trim();
+    if (!/^[0-9a-f]{40}$/.test(mergeBase)) return skip('merge-base unavailable');
     const policyKey = verifyPolicyKey(process.env), coordRoot = resolveCoordinationRoot();
     const selectionMode = resolvedGate.decision?.selectionMode?.mode;
     const deltaBase = selectionMode === 'since-last-green' ? resolvedGate.decision.selectionMode.base : null;
     if (selectionMode === 'since-last-green') {
-      const base = readSharedGreen({ coordRoot, repo, sha: deltaBase, policyKey });
+      const base = readSharedGreen({ coordRoot, repo, sha: deltaBase, mergeBase, policyKey });
       if (!base || base.corrupt) return skip('delta base has no valid shared green under this policy');
     }
-    if (!publishGreen({ coordRoot, repo, sha: headSha, policyKey, record: { v: 1, writer: 'verify-lane', repo,
-      sha: headSha, policyKey, status: 'green', exitCode: 0, executedGate: resolvedGate.command, selectionMode, deltaBase,
+    if (!publishGreen({ coordRoot, repo, sha: headSha, mergeBase, policyKey, record: { v: 1, writer: 'verify-lane', repo,
+      sha: headSha, mergeBase, policyKey, revertRed: revertRedEvidence, status: 'green', exitCode: 0, executedGate: resolvedGate.command, selectionMode, deltaBase,
       finishedAt: new Date().toISOString(), lane: basename(REPO) } })) return skip('store publication failed');
   } catch { return skip('publication checks failed'); }
 }
@@ -1392,7 +1400,7 @@ const finished = verifyFinishBody(startBody, {
 });
 writeMarker({ ...finished, ...(FORCE_LOCAL ? { local: true } : {}), ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
-maybePublishSharedGreen({ status: finished.status, treeHash: finished.treeHash });
+maybePublishSharedGreen({ status: finished.status, treeHash: finished.treeHash, revertRed });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);

@@ -67,6 +67,7 @@ import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings
 import { resolveBuildPolicy } from './build-policy.mjs';
 
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { relative, sep, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
@@ -82,11 +83,27 @@ import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDept
 
 const defaultFileConfig = loadVerifySettingsFile();
 
+// Bind to the verifier actually running, even when it verifies a different target checkout. Cache per process.
+let verifier;
+function verifierIdentity() {
+  if (verifier === undefined) {
+    const root = join(dirname(fileURLToPath(import.meta.url)), '../..');
+    const hash = createHash('sha256');
+    for (const file of ['scripts/verify-lane.mjs', 'scripts/lib/verify-lane-gate.mjs',
+      'scripts/lib/verify-shared-marker.mjs', 'scripts/lib/verify-settings.mjs', 'scripts/lib/build-policy.mjs']) {
+      hash.update(readFileSync(join(root, file)));
+    }
+    verifier = hash.digest('hex');
+  }
+  return verifier;
+}
+
 /** The consumer resolves these inputs itself, never from a producer's marker. Also used in refusal logs. */
 export function verifyPolicyInputs(env = process.env) {
-  const { finalGate, finalGateStandards } = resolveBuildPolicy({ env });
+  const { finalGate, finalGateStandards, sources } = resolveBuildPolicy({ env });
   return { v: 1, verify: resolveVerifySettings({ fileConfig: defaultFileConfig, env }).values,
-    finalGate, finalGateStandards, diffTestSelection: String(env?.[SELECTION_FLAG] ?? '') === '0' ? '0' : '1' };
+    verifier: verifierIdentity(), finalGate, finalGateStandards,
+    sources: { finalGate: sources.finalGate, finalGateStandards: sources.finalGateStandards }, diffTestSelection: String(env?.[SELECTION_FLAG] ?? '') === '0' ? '0' : '1' };
 }
 
 /** Canonical JSON (sorted object keys, preserved array order), hashed over every effective verify value. */

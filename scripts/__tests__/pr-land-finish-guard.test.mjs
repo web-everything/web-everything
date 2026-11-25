@@ -221,15 +221,17 @@ describe('finish-guard shared readMarker wiring', () => {
   const setup = () => {
     writeAndAdd('code.txt', 'base\n'); commit('base');
     runGit(['remote', 'add', 'origin', 'https://github.com/example/project.git']);
-    const sha = headSha(), coordRoot = join(dir, 'coord');
+    const sha = headSha();
+    runGit(['update-ref', 'refs/remotes/origin/main', sha]);
+    const mergeBase = sha, coordRoot = join(dir, 'coord');
     const policyKey = verifyGate.verifyPolicyKey({});
-    const record = { v: 1, writer: 'verify-lane', repo: 'example/project', sha, policyKey, status: 'green', exitCode: 0,
+    const record = { v: 1, writer: 'verify-lane', repo: 'example/project', sha, mergeBase, revertRed: null, policyKey, status: 'green', exitCode: 0,
       executedGate: 'npm run test:unit', selectionMode: 'pr', deltaBase: null, finishedAt: new Date().toISOString(), lane: 'lane-A' };
-    expect(sharedStore.publishGreen({ coordRoot, repo: record.repo, sha, policyKey, record })).toBe(true);
+    expect(sharedStore.publishGreen({ coordRoot, repo: record.repo, sha, mergeBase, policyKey, record })).toBe(true);
     const logs = [];
-    const read = (env = {}, head = sha) => land.readFinishGuardMarker({ gitDir: gitDirOf(dir), headSha: head,
-      remote: 'origin', runGit, coordRoot, env, log: text => logs.push(text) });
-    return { sha, read, logs };
+    const read = (env = {}, head = sha, base = 'main', runner = runGit) => land.readFinishGuardMarker({ gitDir: gitDirOf(dir), headSha: head,
+      remote: 'origin', base, runGit: runner, coordRoot, env, log: text => logs.push(text) });
+    return { sha, read, logs, coordRoot, policyKey, record };
   };
   it('reads the exact consumer SHA and computed policy, logs sharedFrom on acceptance and key inputs on refusal', () => {
     const { sha, read, logs } = setup();
@@ -253,11 +255,42 @@ describe('finish-guard shared readMarker wiring', () => {
     expect(read()).toMatchObject({ sha, sharedFrom: { lane: 'lane-A' } });
     expect(read({ WE_BUILD_FINAL_GATE: 'none' })).toMatchObject(stale);
   });
+  it.each(['red', 'running', 'unknown'])('stale local %s refuses despite exact shared head', status => {
+    const { read } = setup();
+    const stale = { sha: 'e'.repeat(40), status, suites: 'old' };
+    writeFileSync(join(gitDirOf(dir), '.lane-verify'), JSON.stringify(stale));
+    expect(read()).toMatchObject(stale);
+    expect(resolveFinishGuardVerdict({ gitDir: gitDirOf(dir), headSha: headSha(), remote: 'origin', base: 'main',
+      runGit, readMarker: () => read() }).ok).toBe(false);
+  });
+  it('another consumer merge base cannot reuse shared green and the CLI base selects the ref', () => {
+    const { sha, read, coordRoot, policyKey, record } = setup();
+    runGit(['update-ref', 'refs/remotes/origin/release', sha]);
+    writeAndAdd('code.txt', 'next\n'); commit('next');
+    const head = headSha();
+    expect(sharedStore.publishGreen({ coordRoot, repo: record.repo, sha: head, mergeBase: sha, policyKey,
+      record: { ...record, sha: head } })).toBe(true);
+    expect(read({}, head)).toMatchObject({ sha: head, sharedFrom: { lane: 'lane-A' } });
+    runGit(['update-ref', 'refs/remotes/origin/main', head]);
+    expect(read({}, head)).toBeNull(); // same head, newly advanced base: the old record is absent
+    const calls = [];
+    expect(read({}, head, 'release', argv => { calls.push(argv); return runGit(argv); })).toMatchObject({ sharedFrom: { lane: 'lane-A' } });
+    expect(calls).toContainEqual(['merge-base', head, 'origin/release']);
+  });
+  it('failed merge-base computation treats shared as absent and preserves local carry-forward evidence', () => {
+    const { read } = setup();
+    const failed = argv => { if (argv[0] === 'merge-base') throw new Error('unavailable base'); return runGit(argv); };
+    expect(read({}, headSha(), 'main', failed)).toBeNull();
+    const stale = { sha: 'e'.repeat(40), status: 'green', suites: 'old' };
+    writeFileSync(join(gitDirOf(dir), '.lane-verify'), JSON.stringify(stale));
+    expect(read({}, headSha(), 'main', failed)).toMatchObject(stale);
+  });
   it('CLI finish guard actually supplies the shared reader with refSha and its git runner', () => {
     const source = readFileSync(join(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
     const finishArgs = source.slice(source.indexOf('const finishArgs ='), source.indexOf('const gate = resolveFinishGuardVerdict', source.indexOf('const finishArgs =')));
     expect(finishArgs).toMatch(/readMarker:.*readFinishGuardMarker/s);
     expect(finishArgs).toMatch(/headSha: refSha/);
     expect(finishArgs).toMatch(/runGit: gitC/);
+    expect(finishArgs).toMatch(/headSha: refSha, remote: REMOTE, base: BASE/);
   });
 });
