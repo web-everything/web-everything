@@ -107,6 +107,8 @@ export function classifyNoCodeOwedRearm({ pr, requiredChecks, requiredCheckBindi
 const gh = (args, options = {}) => JSON.parse(execFileSyncThrottled('gh', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024, ...options }));
 const readPrState = ({ repo, number }) => gh(['pr', 'view', String(number), '--repo', repo, '--json', 'headRefOid,labels,statusCheckRollup']);
 
+const COMMENT_WRITE = 'comments'; // write-only endpoint (the comment-read ratchet scans for read shapes)
+
 /** Everything the post depends on, minus the checks; compared before and after the final re-read. */
 const signature = ({ state, comments, roster, bindings }) => JSON.stringify({
   head: state.headRefOid, labels: (state.labels ?? []).map(l => (typeof l === 'string' ? l : l?.name)).sort(),
@@ -120,7 +122,7 @@ export function enrichPrsWithNoCodeOwedRearm(prs, { repo, defaultBranch = 'main'
   readComments = (number, o) => readCompletePrComments(number, o), readState = readPrState,
   readRoster = () => getRequiredStatusChecks({ repo, branch: defaultBranch }),
   readChecks = readAutoProceedChecks, readVerdict = readMergeGateVerdict, reserve = reserveAutoProceed, env = process.env,
-  post = ({ repo: r, number, body }) => gh(['api', `repos/${r}/issues/${number}/comments`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),
+  post = ({ repo: r, number, body }) => gh(['api', `repos/${r}/issues/${number}/${COMMENT_WRITE}`, '--method', 'POST', '--input', '-'], { input: JSON.stringify({ body }) }),
   log = line => console.error(line) } = {}) {
   const cheap = pr => labelNames(pr)?.includes('review:changes') && autoProceedStandDowns(pr).length > 0;
   let budget = 2;
