@@ -86,7 +86,7 @@ import { publicationTitle, readMainCard } from './operations/machine-pr-title.mj
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
 import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, appendFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -143,6 +143,8 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { ciOnlyDecision, recordCiOnly } from './lib/verify-ci-only.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
+import { readSharedGreen, resolveMarkerWithShared } from './lib/verify-shared-marker.mjs';
+import { verifyPolicyKey, verifyPolicyInputs, verifySetting, verifySettingSource } from './lib/verify-lane-gate.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
@@ -763,6 +765,49 @@ export function resolveRosterReconcile({ careLevel, changedFiles = [], preRegist
   return reconcileRoster({ preRegistered, recomputed, mode: timing });
 }
 
+/** Finish-guard marker read: retain local precedence, otherwise consult the exact consumer policy, head and merge base. */
+export function readFinishGuardMarker({ gitDir, headSha, remote, base, runGit, env = process.env,
+  coordRoot = resolveCoordinationRoot({ env }), log = text => process.stderr.write(`${text}\n`) }) {
+  const local = readVerifyMarker(gitDir);
+  let policyOptions;
+  try { policyOptions = { root: runGit(['rev-parse', '--show-toplevel']).trim() }; }
+  catch { policyOptions = { aliasInputs: null }; }
+  const sharedRead = () => {
+  const policyKey = verifyPolicyKey(env, policyOptions);
+  const logInputs = () => log(`pr-land: shared verification unavailable; policyKey=${policyKey} inputs=${JSON.stringify(verifyPolicyInputs(env, policyOptions))}; re-verify under these inputs`);
+  if (local && (local.corrupt || local.status !== 'green' || local.sha === headSha)) {
+    if (local.corrupt || local.status !== 'green') logInputs();
+    return local;
+  }
+  if (!policyKey) { logInputs(); return local; }
+  let mergeBase;
+  try { mergeBase = runGit(['merge-base', headSha, `${remote}/${base}`]).trim(); }
+  catch { logInputs(); return local; } // No computed base means shared evidence is absent.
+  let shared;
+  try {
+    const repo = repoSlugFromRemote(runGit(['remote', 'get-url', remote]));
+    shared = readSharedGreen({ coordRoot, repo, sha: headSha, mergeBase, policyKey });
+  } catch { shared = { corrupt: true }; }
+  const marker = resolveMarkerWithShared({ local, shared, headSha });
+  if (marker?.sharedFrom) log(`pr-land: verification sharedFrom ${JSON.stringify(marker.sharedFrom)}`);
+  else logInputs();
+  return marker;
+  };
+  let marker;
+  try { marker = sharedRead(); } catch { marker = local; }
+  const enabled = verifySetting('sharedGreenReuse', env);
+  log(`pr-land: sharedGreenReuse=${enabled} (${verifySettingSource('sharedGreenReuse', env)})`);
+  if (enabled) return marker;
+  const verdict = marker?.sharedFrom ? 'would-accept' : 'would-refuse';
+  const reason = marker?.sharedFrom ? `sharedFrom ${JSON.stringify(marker.sharedFrom)}` : 'local precedence or shared evidence unavailable';
+  log(`pr-land: shared-reuse shadow: ${verdict} (${reason})`);
+  try {
+    appendFileSync(resolve(coordRoot, 'verify-shared-shadow.log'), `${JSON.stringify({ at: new Date().toISOString(),
+      sha: headSha, verdict, reason, localStatus: local?.status ?? null, localSha: local?.sha ?? null, sharedFrom: marker?.sharedFrom ?? null })}\n`, { mode: 0o600 });
+  } catch { /* Shadow telemetry must never change main's local-marker decision. */ }
+  return local;
+}
+
 /**
  * #2833's finish-guard decision, extracted so it is directly testable with a real (or fake) git runner instead
  * of only through source-text regex assertions on the CLI (converge round 1, correctness/security/standards-
@@ -1045,7 +1090,8 @@ async function runCli() {
     // a real or fake git runner (see `scripts/__tests__/pr-land-finish-guard.test.mjs`), not only via the CLI's
     // own source-text wiring assertions.
     const finishArgs = {
-      ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
+      ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC,
+      readMarker: gitDir => readFinishGuardMarker({ gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC }),
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     };
     const gate = resolveFinishGuardVerdict({ ...finishArgs });

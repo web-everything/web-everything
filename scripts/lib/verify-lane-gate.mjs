@@ -64,8 +64,13 @@ import { hostSaturation } from './verify-ci-only.mjs';
 import { repoKeyForSlug, DEFAULT_REPO_KEY } from './constellation-repos.mjs';
 import { canonicalRepoSlug } from './lane-alternates.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
+import { resolveBuildPolicy } from './build-policy.mjs';
 
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
+import { SIBLING_PATHS } from '../readiness/forge-exec-siblings.mjs';
+import { readFileSync } from 'node:fs';
 import { relative, sep, join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // Absolute path of the wrapper beside this module: a daemon verifies a lane checkout that may not contain it yet.
@@ -80,6 +85,74 @@ import { scanCommands } from './repo-scan-tests.mjs';
 import { buildReverseImportGraph, selectRelatedTests, isVitestTestFile, testDepths } from './related-test-selection.mjs';
 
 const defaultFileConfig = loadVerifySettingsFile();
+
+const TOOLING_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../..');
+// One bounded, hardened read port for startup identity and external alias evidence.
+function policyGit(args, cwd) {
+  return execFileSync('git', hardenLaneGitArgs(args), { cwd, encoding: 'utf8',
+    env: laneGitHardeningEnv(process.env), stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5000, maxBuffer: 8 * 1024 * 1024 }).trim();
+}
+export function captureVerifierIdentity({ root = TOOLING_ROOT, runGit = policyGit } = {}) {
+  try {
+    const sha = runGit(['rev-parse', 'HEAD'], root);
+    const scriptsClean = runGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all', '--', 'scripts/'], root) === ''
+      && !runGit(['ls-files', '-v', '--', 'scripts/'], root).split('\n').some(line => /^[a-zS] /.test(line));
+    return Object.freeze({ sha: /^[0-9a-f]{40}$/.test(sha) ? sha : null, scriptsClean });
+  } catch { return Object.freeze({ sha: null, scriptsClean: false }); }
+}
+// Captured during module initialization, before CLI parsing, admission or gate execution. Never refreshed.
+export const VERIFIER_AT_START = captureVerifierIdentity();
+
+// Exact names only; unknown matching names always enter the digest. Every exception needs a reason.
+export const NON_POLICY_ENV = Object.freeze({
+  WE_VERIFY_SHARED_GREEN_REUSE: 'Consumer rollout switch only; does not change verification or publication.',
+  WE_LANE_SESSION: 'Per-process lane session identity, independent of test behavior.',
+  WE_HEAVY_SESSION: 'Per-process admission log identity, independent of test behavior.',
+  WE_VERIFY_MARKER_NONCE: 'Per-process marker receipt nonce, removed before child execution.',
+});
+export function policyEnvironmentDigest(env = process.env) {
+  const entries = Object.keys(env).filter(name => /^(WE_|GIT_|NODE_|VITEST|npm_config_)/.test(name)
+    && !Object.hasOwn(NON_POLICY_ENV, name) && env[name] !== undefined).sort()
+    .map(name => `${name}=${String(env[name])}`);
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+}
+
+/** These paths are the same source roots used by vitest.shared.ts's weAlias. Unknown evidence refuses reuse. */
+export function aliasPolicyInputs({ root = TOOLING_ROOT, aliasPaths = Object.values(SIBLING_PATHS), runGit = policyGit } = {}) {
+  try {
+    const inputs = [];
+    for (const path of [...new Set(aliasPaths)].sort()) {
+      const aliasRoot = join(root, path);
+      const rel = relative(root, aliasRoot);
+      if (rel !== '..' && !rel.startsWith(`..${sep}`)) continue;
+      const sha = runGit(['rev-parse', 'HEAD'], aliasRoot);
+      if (!/^[0-9a-f]{40}$/.test(sha)
+        || runGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all'], aliasRoot) !== ''
+        || runGit(['ls-files', '-v', '--', ':/'], aliasRoot).split('\n').some(line => /^[a-zS] /.test(line))) return null;
+      inputs.push({ path: relative(root, aliasRoot).split(sep).join('/'), sha });
+    }
+    return inputs;
+  } catch { return null; }
+}
+
+/** The consumer resolves these inputs itself, never from a producer's marker. Also used in refusal logs. */
+export function verifyPolicyInputs(env = process.env, { root = TOOLING_ROOT, aliasInputs = aliasPolicyInputs({ root }), verifier = VERIFIER_AT_START } = {}) {
+  const { finalGate, finalGateStandards, sources } = resolveBuildPolicy({ env });
+  const verify = resolveVerifySettings({ fileConfig: defaultFileConfig, env }).values;
+  delete verify.sharedGreenReuse; // Consumer-only switch, evaluated exclusively by readFinishGuardMarker.
+  return { v: 2, verify, verifier, aliases: aliasInputs, environmentDigest: policyEnvironmentDigest(env), finalGate, finalGateStandards,
+    sources: { finalGate: sources.finalGate, finalGateStandards: sources.finalGateStandards }, diffTestSelection: String(env?.[SELECTION_FLAG] ?? '') === '0' ? '0' : '1' };
+}
+
+/** Canonical JSON (sorted object keys, preserved array order), hashed over every effective verify value. */
+export function verifyPolicyKey(env = process.env, options) {
+  const inputs = verifyPolicyInputs(env, options);
+  if (inputs.aliases === null || !inputs.verifier.sha) return null;
+  const canonical = value => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(k => [k, canonical(value[k])])) : value;
+  return createHash('sha256').update(JSON.stringify(canonical(inputs))).digest('hex');
+}
 
 /**
  * PR 7008 — decode one line of Git path output. With the default `core.quotePath`, Git wraps a path holding a
