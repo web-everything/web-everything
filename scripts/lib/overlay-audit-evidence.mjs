@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { readPlatformPreferences } from './policy-cascade.mjs';
+import { scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
 import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
 import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead } from '../operations/prototype-load.mjs';
@@ -35,7 +36,7 @@ export function mainCovers(base, { cwd = process.cwd(), env = process.env } = {}
   if (!fullSha(base)) return false;
   try {
     const result = spawnSync('git', ['merge-base', '--is-ancestor', base, 'origin/main'], {
-      cwd, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
+      cwd, env: { ...scrubGitRepoEnv(env), GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
       encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
     });
     return !result.error && result.status === 0;

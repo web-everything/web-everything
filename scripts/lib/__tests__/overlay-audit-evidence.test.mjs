@@ -1,7 +1,7 @@
 import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 import assert from 'node:assert/strict';
-import { auditEvidenceFor, loadAuditEvidence, describeMissing } from '../overlay-audit-evidence.mjs';
+import { auditEvidenceFor, loadAuditEvidence, describeMissing, mainCovers } from '../overlay-audit-evidence.mjs';
 import { QUESTION_HASH } from '../../operations/codex-audit.mjs';
 import { loadRuledWeakened } from '../../operations/prototype-load-io.mjs';
 import { readyEvidence, canonicalAuditEvidence } from '../../operations/prototype-load.mjs';
@@ -11,6 +11,76 @@ const covers = () => true;
 const valid = { questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z', findings: [] };
 const waiver = { ref, sha: 'a'.repeat(40), ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' };
 const sha = 'a'.repeat(40), base = 'b'.repeat(40);
+import { spawnSync } from 'node:child_process';
+
+test('real mainCovers refuses non-ancestor, missing main, invalid base and unknown Git state', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'overlay-ancestry-'));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  const git = args => {
+    const result = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.test', '-c', 'commit.gpgsign=false', ...args],
+      { cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    git(['init', '-q']); git(['commit', '--allow-empty', '-qm', 'base']);
+    const ancestor = git(['rev-parse', 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/main', ancestor]);
+    assert.equal(mainCovers(ancestor, { cwd, env }), true);
+    assert.equal(mainCovers('HEAD', { cwd, env }), false, 'resolvable non-40-hex input is refused');
+    git(['commit', '--allow-empty', '-qm', 'outside main']);
+    const outside = git(['rev-parse', 'HEAD']);
+    const evidence = { auditRecords: [{ ...valid, head: sha, base: outside, verdict: 'NOT WEAKENED' }], covers: value => mainCovers(value, { cwd, env }) };
+    assert.equal(mainCovers(outside, { cwd, env }), false);
+    assert.equal(auditEvidenceFor(sha, evidence).ok, false);
+    git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    assert.equal(mainCovers(ancestor, { cwd, env }), false);
+    assert.equal(auditEvidenceFor(sha, { ...evidence, auditRecords: [{ ...valid, head: sha, base: ancestor, verdict: 'NOT WEAKENED' }] }).ok, false);
+    assert.equal(mainCovers(ancestor, { cwd: join(cwd, 'missing'), env }), false, 'spawn error');
+    assert.equal(mainCovers(ancestor, { cwd: {}, env }), false, 'thrown spawn error');
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('partly corrupt audit and waiver ledgers grant nothing', () => {
+  const env = { HOME: '/fixture' };
+  const pass = { ...valid, head: sha, base, verdict: 'NOT WEAKENED' };
+  for (const layer of ['audit', 'store', 'unreadable-store']) {
+    const fs = { readFileSync(path) {
+      if (path.endsWith('/audits.jsonl')) return layer === 'audit' ? JSON.stringify(pass) + '\n{"verdict":"WEAKENED"' : '';
+      if (path.endsWith('/ruled-weakened.jsonl')) {
+        if (layer === 'unreadable-store') throw Object.assign(Error('denied'), { code: 'EACCES' });
+        return JSON.stringify(waiver) + (layer === 'store' ? '\n{torn' : '\n');
+      }
+      throw Object.assign(Error('absent'), { code: 'ENOENT' });
+    } };
+    const result = loadAuditEvidence({ env, fs });
+    if (layer === 'audit') assert.deepEqual(result.auditRecords, []);
+    else assert.deepEqual(result.waivers, []);
+    assert.equal(auditEvidenceFor(sha, { ...result, covers, ref }).ok, false, layer);
+  }
+});
+
+test('mainCovers isolates ancestry from inherited repository and config overrides', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'overlay-git-env-'));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+  const git = args => {
+    const result = spawnSync('git', ['-c', 'user.name=test', '-c', 'user.email=test@example.test', '-c', 'commit.gpgsign=false', ...args],
+      { cwd, env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    git(['init', '-q']); git(['commit', '--allow-empty', '-qm', 'base']);
+    const base = git(['rev-parse', 'HEAD']);
+    git(['update-ref', 'refs/remotes/origin/main', base]);
+    for (const override of [
+      { GIT_DIR: join(cwd, 'missing') }, { GIT_COMMON_DIR: join(cwd, 'missing') },
+      { GIT_OBJECT_DIRECTORY: join(cwd, 'missing') }, { GIT_SHALLOW_FILE: join(cwd, 'missing') },
+      { GIT_CONFIG_PARAMETERS: "'core.repositoryformatversion=999'" },
+      { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.repositoryformatversion', GIT_CONFIG_VALUE_0: '999' },
+    ]) assert.equal(mainCovers(base, { cwd, env: { ...env, ...override } }), true, JSON.stringify(override));
+  } finally { rmSync(cwd, { recursive: true, force: true }); }
+});
 test('loads tool waivers from the running checkout in the DOM test environment, independent of the candidate cwd', () => {
   const toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../settings/prototype-load.json');
   const reads = [];

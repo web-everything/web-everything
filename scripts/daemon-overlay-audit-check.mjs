@@ -7,12 +7,13 @@
  * Never fetches, changes Git refs, or writes state.
  */
 import { readdirSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { basename, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { stripVTControlCharacters } from 'node:util';
 import { overlayDir, readInventoryState, auditEvidenceFor, loadAuditEvidence, mainCovers } from './lib/overlay-audit-evidence.mjs';
 import { safeRegistrationRef } from './operations/prototype-load.mjs';
+import { scrubGitRepoEnv } from './lib/lane-git-hardening.mjs';
+import { isDirectEntry } from './lib/direct-entry-guard.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
 const clean = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
@@ -37,7 +38,7 @@ export function checkOverlays({ states, evidence, resolveSha, covers, now = new 
 function localSha(clone, ref, env) {
   if (!safeRegistrationRef(ref)) return null;
   const result = spawnSync('git', ['-C', clone, 'rev-parse', '--verify', `refs/remotes/origin/${ref}`], {
-    env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
+    env: { ...scrubGitRepoEnv(env), GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
     encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
   });
   return result.status === 0 && !result.error ? result.stdout.trim() : null;
@@ -78,4 +79,4 @@ export function main(argv = process.argv.slice(2), env = process.env) {
   return unreadable || results.some(entry => !entry.ok) ? 1 : 0;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) process.exitCode = main();
+if (isDirectEntry(import.meta.url)) process.exitCode = main();

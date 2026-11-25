@@ -15,12 +15,86 @@ test('gone refs fail closed even with a stored SHA', () => {
   assert.equal(result[1].ageDays, 12);
 });
 
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, chmodSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 const cli = fileURLToPath(new NodeURL('../daemon-overlay-audit-check.mjs', import.meta.url));
+test('CLI treats a missing inventory directory as empty', () => {
+  const home = mkdtempSync(join(tmpdir(), 'overlay-missing-'));
+  try {
+    const result = spawnSync(process.execPath, [cli, '--json', `--overlay-dir=${join(home, 'missing')}`], {
+      env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), []);
+    assert.doesNotMatch(result.stderr, /UNREADABLE/);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+test('CLI refuses an inventory directory that is a regular file', () => {
+  const home = mkdtempSync(join(tmpdir(), 'overlay-not-directory-'));
+  try {
+    const file = join(home, 'file');
+    writeFileSync(file, 'unchanged');
+    for (const flags of [[], ['--json']]) {
+      const result = spawnSync(process.execPath, [cli, ...flags, `--overlay-dir=${file}`], {
+        env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+      });
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(flags.length ? result.stderr : result.stdout, /UNREADABLE/);
+      assert.doesNotMatch(result.stdout, /OK/);
+      if (flags.length) assert.deepEqual(JSON.parse(result.stdout), []);
+    }
+    assert.equal(readFileSync(file, 'utf8'), 'unchanged');
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+test('CLI executes through symlinked file and checkout paths', () => {
+  const home = mkdtempSync(join(tmpdir(), 'overlay-symlink-'));
+  try {
+    const link = join(home, 'check.mjs'), checkout = join(home, 'scripts');
+    symlinkSync(cli, link);
+    symlinkSync(fileURLToPath(new NodeURL('../', import.meta.url)), checkout, 'dir');
+    for (const entry of [link, join(checkout, 'daemon-overlay-audit-check.mjs')]) {
+      const result = spawnSync(process.execPath, [entry, '--bogus'], {
+        env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+      });
+      assert.equal(result.status, 2, result.stderr);
+      assert.match(result.stderr, /usage:/);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('CLI resolves the registered clone despite inherited Git repository overrides', () => {
+  const home = mkdtempSync(join(tmpdir(), 'overlay-foreign-repo-'));
+  const clone = join(home, 'clone'), foreign = join(home, 'foreign'), dir = join(home, 'states');
+  const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), HOME: home };
+  const git = (cwd, args) => {
+    const result = spawnSync('git', ['-C', cwd, '-c', 'user.name=test', '-c', 'user.email=test@example.test', '-c', 'commit.gpgsign=false', ...args],
+      { env, encoding: 'utf8', timeout: 15000, maxBuffer: 65536 });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  try {
+    mkdirSync(clone); mkdirSync(foreign); mkdirSync(dir);
+    const tips = [clone, foreign].map(repo => {
+      git(repo, ['init', '-q']); git(repo, ['commit', '--allow-empty', '-qm', repo === clone ? 'registered' : 'foreign']);
+      const sha = git(repo, ['rev-parse', 'HEAD']);
+      git(repo, ['update-ref', 'refs/remotes/origin/lane/fix', sha]);
+      return sha;
+    });
+    assert.notEqual(tips[0], tips[1]);
+    writeFileSync(join(dir, '0123456789abcdef.json'), JSON.stringify({ clone, overlays: [{ ref: 'lane/fix' }] }));
+    const before = [clone, foreign].map(repo => git(repo, ['show-ref']));
+    const result = spawnSync(process.execPath, [cli, '--json', `--overlay-dir=${dir}`], {
+      env: { ...env, GIT_DIR: join(foreign, '.git'), GIT_WORK_TREE: foreign, GIT_COMMON_DIR: join(foreign, '.git') },
+      encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout)[0].sha, tips[0]);
+    assert.deepEqual([clone, foreign].map(repo => git(repo, ['show-ref'])), before);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 test('CLI temp HOME smoke: legacy file, JSON, corruption and zero writes', () => {
   const home = mkdtempSync(join(tmpdir(), 'overlay-check-'));
   const dir = join(home, '.claude/daemon-overlays');
