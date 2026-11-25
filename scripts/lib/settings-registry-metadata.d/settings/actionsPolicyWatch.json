@@ -1,0 +1,6 @@
+{
+  "description": "Read-only Actions policy expectations and changelog feed matching for the policy watcher.",
+  "owner": "scripts/settings/actions-policy-watch.json",
+  "changeVia": "pr",
+  "instant": false
+}

@@ -14,7 +14,7 @@
  *   H. land-advance must preserve a known head from planning through admission and launch.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -142,13 +142,7 @@ export default {
     paths: ['scripts/operations/review-job.mjs', 'skills-src/conveyor/review-daemon.mjs', 'scripts/lib/review-red-team-on-skip.mjs'],
   },
   // Decided by git ancestry of the fix commit (a removable export marker would let a regression hide itself).
-  // Expected-fail while the required-expectedHead refusal is temporarily reverted: re-armed by SMOKE-GUARD-RELAND
-  // (which removes the TEMPORARY marker in review-dispatch.mjs). Deleting the marker re-arms the break, never hides it.
   fixPresent(root) {
-    try {
-      const src = readFileSync(join(root, 'scripts/operations/review-dispatch.mjs'), 'utf8');
-      if (src.includes('TEMPORARY (SMOKE-GUARD-RELAND)')) return false;
-    } catch { /* unreadable source: fall through to the ancestry decision */ }
     try {
       execFileSync('git', ['merge-base', '--is-ancestor', 'fcc398bb1c', 'HEAD'], { cwd: root, stdio: 'ignore' });
       return true;

@@ -57,6 +57,8 @@ import { homedir, tmpdir } from 'node:os';
 import {
   closeSync, constants, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync,
 } from 'node:fs';
+import { admitHotpatch as realAdmitHotpatch } from './hotpatch-guards.mjs';
+import { createHotpatchReaders } from './hotpatch-readers.mjs';
 import { readHeadSha, isSafeBranchName } from './daemon-self-sync.mjs';
 import { gitRun } from './main-staleness.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
@@ -78,16 +80,38 @@ import {
  * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
  * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
  */
-export async function guardedRegister({ root, ref, pr, env, gate, register }) {
+/**
+ * RS-HP-3 (the ONE door): a hotpatch/* ref registers only when the hotpatch admission (CI receipt + own-sha audit) passes
+ * for the exact candidate sha the merge check fetched, and origin/<ref> is still that sha afterwards. Fail closed.
+ * Shared by guardedRegister and `daemon-overlay add/replace`; non-hotpatch refs pass untouched.
+ * @returns {Promise<{ok:true}|{ok:false, reason:string}>}
+ */
+export async function admitHotpatchRef({ root, ref, candSha, env = process.env, admitHotpatch = null, tipOf = null }) {
+  if (typeof ref !== 'string' || !ref.startsWith('hotpatch/')) return { ok: true };
+  const refused = (reason) => ({ ok: false, reason });
+  try {
+    if (typeof candSha !== 'string' || !/^[a-f0-9]{40}$/.test(candSha)) return refused('hotpatch-not-admitted');
+    const admit = admitHotpatch ?? (async (sha) => realAdmitHotpatch(sha, createHotpatchReaders({ cwd: root, env })));
+    if ((await admit(candSha, { root, ref, env }))?.outcome !== 'pass') return refused('hotpatch-not-admitted');
+    // Lazy import avoids the cycle: daemon-overlay imports this module's safety settings.
+    const readTip = tipOf ?? ((r) => import('../daemon-overlay.mjs').then(({ remoteTip }) => remoteTip({ root, ref: r, env })));
+    const tip = await readTip(ref);
+    return tip === candSha ? { ok: true } : refused('hotpatch-sha-moved');
+  } catch { return refused('hotpatch-not-admitted'); }
+}
+
+export async function guardedRegister({ root, ref, pr, env, gate, register, admitHotpatch = null, checkFn = null, tipOf = null }) {
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
-  const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
+  const { stackAwareOverlayCheck, withAddGuardLock, remoteTip } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
     const st = readOverlayState(root, { env });
     if (st.corrupt) return { registered: false, reason: 'overlay-store-corrupt' };
-    const check = await stackAwareOverlayCheck({
+    const check = await (checkFn ?? stackAwareOverlayCheck)({
       root, ref, pr, existingOverlays: st.overlays.filter((o) => o?.ref !== ref), env,
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
+    const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch, tipOf: tipOf ?? ((r) => remoteTip({ root, ref: r, env })) });
+    if (!hp.ok) return { registered: false, reason: hp.reason, check };
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
     register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
     return { registered: true, check };

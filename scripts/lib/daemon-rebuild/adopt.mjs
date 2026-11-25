@@ -14,6 +14,7 @@ import { ensureSafeToMove, knownInputsOf } from './local-state.mjs';
 import { revokedAppliedTips, tipInMain as gitTipInMain, pathBEvidenceGit } from './audited-tip.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
+import { readForceWatch } from '../daemon-force-adopt.mjs';
 
 const AUTOMATIC_RETIREMENT_REASONS = Object.freeze([
   'in-main', 'pr-merged', 'pr-squash-merged', 'redundant-merge-sibling', 'superseded', 'urgent-failed', 'pr-closed',
@@ -516,9 +517,15 @@ async function finalizeRebuildLocked({
   }
 
   // unaudited-tip — the plan was minted BEFORE the (unlocked, minutes-long) smoke, so a red fix-ready record appended for a tip it
-  // applies during that window would still be adopted here. Only the direct smoke path passes the gate (a ready-candidate
+  // applies during that window would still be adopted here. The direct smoke and force-watch rollback paths pass the gate (a ready-candidate
   // adoption was already judged by matchReadyCandidate under this same lock); no gate (follow mode) revokes nothing.
-  if (typeof auditedTip === 'function') {
+  // RS-HP-3 (FLOW-DMN-048): only a rollback whose target IS the recorded previous generation (the force watch's lastGood, re-read
+  // now) skips the revoked-evidence check. The lease token alone proves nothing; any other target gets the full check.
+  let toRecordedLastGood = false;
+  if (isRollback) {
+    try { toRecordedLastGood = Boolean(plan.finalSha) && readForceWatch(root, stEnv)?.lastGood?.head === plan.finalSha; } catch { toRecordedLastGood = false; }
+  }
+  if (typeof auditedTip === 'function' && !toRecordedLastGood) {
     const revoked = revokedAppliedTips({
       applied: plan.applied, auditedTip, prevHead, mainSha: plan.mainSha, auditAdopted: plan.auditAdopted,
       carries: (sha, build) => git(['merge-base', '--is-ancestor', sha, build]).status === 0,
