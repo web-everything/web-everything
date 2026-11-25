@@ -5,23 +5,22 @@
  * failed filing leaves the state as it was) — the end-to-end negatives live in review-loop-cli.test.mjs
  * ("error-class" describe); this file pins the classifier and the static ban on `.message` in output.
  */
-import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync } from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
+import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync, openSync, fstatSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 
 import * as cli from '../review-loop-cli.mjs';
 
-// Vitest snapshots named builtin imports, so syncBuiltinESMExports alone does not
-// make the CLI observe spies on the default fs object. Forward these named calls
-// through that same object; unspied calls still use the real, hermetic filesystem.
+// Install stable mocks before the CLI captures named builtin imports. Configure
+// those same functions below; default-fs spies and syncBuiltinESMExports cannot
+// replace references already captured by Vitest. Unmocked calls remain hermetic.
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
   return {
     ...actual,
     ...Object.fromEntries(['openSync', 'fstatSync', 'closeSync']
-      .map(key => [key, (...args) => actual.default[key](...args)])),
+      .map(key => [key, vi.fn(actual[key])])),
   };
 });
 
@@ -87,14 +86,13 @@ describe('debug log fails closed', () => {
     chmodSync(replacement, 0o644);
     const actualOpen = fs.openSync;
     let openedFd;
-    const open = vi.spyOn(fs, 'openSync').mockImplementation((target, ...args) => {
+    const open = vi.mocked(openSync).mockClear().mockImplementationOnce((target, ...args) => {
       if (target === path) renameSync(replacement, path);
       const fd = actualOpen(target, ...args);
       if (target === path) openedFd = fd;
       return fd;
     });
-    const close = vi.spyOn(fs, 'closeSync');
-    syncBuiltinESMExports();
+    const close = vi.mocked(closeSync).mockClear();
     const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
     process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
     try {
@@ -107,7 +105,6 @@ describe('debug log fails closed', () => {
     } finally {
       open.mockRestore();
       close.mockRestore();
-      syncBuiltinESMExports();
       if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
       else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
     }
@@ -118,15 +115,14 @@ describe('debug log fails closed', () => {
     const path = join(dir, 'debug.log');
     writeFileSync(path, 'orig', { mode: 0o600 });
     const actualStat = fs.fstatSync;
-    const stat = vi.spyOn(fs, 'fstatSync').mockImplementationOnce((fd) => {
+    const stat = vi.mocked(fstatSync).mockClear().mockImplementationOnce((fd) => {
       if (kind === 'stat-failure') throw new Error('descriptor unavailable');
       const st = actualStat(fd);
       if (kind === 'non-regular') st.isFile = () => false;
       else st.uid = process.getuid() + 1;
       return st;
     });
-    const close = vi.spyOn(fs, 'closeSync');
-    syncBuiltinESMExports();
+    const close = vi.mocked(closeSync).mockClear();
     const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
     process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
     try {
@@ -137,7 +133,6 @@ describe('debug log fails closed', () => {
     } finally {
       stat.mockRestore();
       close.mockRestore();
-      syncBuiltinESMExports();
       if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
       else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
     }
