@@ -124,7 +124,7 @@
  * defect class this item closes is a default that reads as "allow" when the answer is unknown.
  */
 import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
-import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { constants } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -228,6 +228,63 @@ export function readVerifyMarker(gitDir) {
   } catch {
     return { corrupt: true };
   }
+}
+
+/**
+ * VERIFY-MARKER-PER-SHA — the SHARED marker store. The lane marker above lives in one clone's `.git/`, so a green
+ * verified in lane A was refused as unverified by open-pr run from lane B at the same sha. The shared copy is keyed on
+ * repo + exact 40-hex sha + gate name (`<dir>/<repo>/<gate>/<sha>.json`, mode 0600, owned by the user) and carries the
+ * writer's lane and time. The READER recomputes the tree hash itself and refuses on any mismatch, so a dirty tree never
+ * passes as the same sha. Unreadable, foreign-owned, running or wrong-key records never pass: they come back as
+ * `{ corrupt: true }` / the stored `running` record, which the gate refuses.
+ */
+export const VERIFY_SHARED_DIRNAME = 'verify-shared';
+const KEY_PART_RE = /^[A-Za-z0-9._-]+$/;
+
+export function sharedMarkerDir({ env = process.env, coordinationRoot }) {
+  const override = env?.WE_VERIFY_SHARED_DIR?.trim();
+  return override || join(coordinationRoot, VERIFY_SHARED_DIRNAME);
+}
+
+function sharedMarkerPath({ dir, repo, gate, sha }) {
+  const repoKey = String(repo ?? '').replace(/\//g, '__');
+  if (!SHA_RE.test(String(sha)) || !KEY_PART_RE.test(repoKey) || !KEY_PART_RE.test(String(gate ?? ''))) return null;
+  return join(dir, repoKey, gate, `${sha}.json`);
+}
+
+/** Write the shared copy (atomic temp + rename, 0600). Best-effort: false on any failure, never throws. */
+export function writeSharedVerifyMarker({ dir, repo, gate = 'default', record, lane = null, nowIso = new Date().toISOString() }) {
+  const file = sharedMarkerPath({ dir, repo, gate, sha: record?.sha });
+  if (!file || !record || typeof record.treeHash !== 'string' || !record.treeHash) return false;
+  try {
+    mkdirSync(join(file, '..'), { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify({ ...record, sharedFrom: { lane, at: nowIso } }, null, 2)}\n`, { mode: 0o600 });
+    renameSync(tmp, file);
+    return true;
+  } catch { return false; }
+}
+
+/** Read the shared copy for exactly `sha`; `treeHash` is the READER's own recomputed tree hash. Absent file → null. */
+export function readSharedVerifyMarker({ dir, repo, gate = 'default', sha, treeHash, uid = process.getuid?.() }) {
+  const file = sharedMarkerPath({ dir, repo, gate, sha });
+  if (!file || !existsSync(file)) return null;
+  try {
+    if (uid !== undefined && statSync(file).uid !== uid) return { corrupt: true };
+    const rec = normalizeVerifyRecord(JSON.parse(readFileSync(file, 'utf8')));
+    if (rec.corrupt || rec.sha !== sha) return { corrupt: true };
+    if (rec.status === 'running') return rec;
+    if (typeof treeHash !== 'string' || !treeHash || rec.treeHash !== treeHash) return { corrupt: true };
+    return rec;
+  } catch { return { corrupt: true }; }
+}
+
+/** The marker a gate should judge: the lane's own marker when it is for `sha`, else the shared copy. Pure given its deps. */
+export function resolveMarkerWithShared({ local, headSha, readShared }) {
+  if (local && !local.corrupt && local.sha === headSha) return local;
+  if (local?.corrupt) return local;
+  const shared = readShared();
+  return shared ?? local;
 }
 
 /**

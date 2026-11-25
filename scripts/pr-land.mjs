@@ -86,7 +86,7 @@ import { publicationTitle, readMainCard } from './operations/machine-pr-title.mj
 import { producerBuildContext, checkpointBuildPr } from './operations/build-pr-authorship.mjs';
 import { execFileSync } from 'node:child_process';
 import { hasClosingKeywordRef } from './lib/commit-message-safety.mjs';
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync, lstatSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -144,12 +144,12 @@ import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — t
 import { ciOnlyDecision, recordCiOnly } from './lib/verify-ci-only.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
-import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
+import { resolveMarkerWithShared, readSharedVerifyMarker, sharedMarkerDir, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
 import { readApprovalRecord } from './lib/approval-record.mjs'; // AUTH-BOUND-APPROVAL — the head-bound operator approval record replaces the forgeable body line
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
-import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
+import { laneRelevantChangeSinceForRecord, computeWorkingTreeHash } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
 // ── flag parsing (mirrors push-if-green.mjs) ──────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -1045,7 +1045,19 @@ async function runCli() {
     // a real or fake git runner (see `scripts/__tests__/pr-land-finish-guard.test.mjs`), not only via the CLI's
     // own source-text wiring assertions.
     const finishArgs = {
-      ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: readVerifyMarker,
+      ciOnly, gitDir, headSha: refSha, remote: REMOTE, base: BASE, runGit: gitC, readMarker: (dir) => {
+        // VERIFY-MARKER-PER-SHA: a marker for another sha (or none) falls back to the shared per-sha copy, which the
+        // reader only honours at an identical, recomputed working-tree hash.
+        const local = readVerifyMarker(dir);
+        return resolveMarkerWithShared({ local, headSha: refSha, readShared: () => {
+          try {
+            const repoSlug = repoSlugFromRemote(gitC(['remote', 'get-url', REMOTE]));
+            if (!repoSlug) return null;
+            const treeHash = computeWorkingTreeHash({ base: `${REMOTE}/${BASE}`, runGit: gitC, fileMode: (f) => lstatSync(join(REPO, f)).mode });
+            return readSharedVerifyMarker({ dir: sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repo: repoSlug, sha: refSha, treeHash });
+          } catch { return null; }
+        } });
+      },
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     };
     const gate = resolveFinishGuardVerdict({ ...finishArgs });

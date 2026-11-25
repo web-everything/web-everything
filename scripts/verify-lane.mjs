@@ -86,10 +86,10 @@ import * as nodeFs from 'node:fs';
 import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlinkSync, lstatSync, mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
 import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger, writeSharedVerifyMarker, sharedMarkerDir, repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
@@ -203,6 +203,20 @@ function writeMarker(record) {
   const tmp = `${MARKER}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n');
   renameSync(tmp, MARKER);
+  writeSharedCopy(record);
+}
+
+// VERIFY-MARKER-PER-SHA — a default-gate record is mirrored into the shared per-sha store (any lane at the same sha and
+// tree can use it). `running` goes first and green/red last, because every write of this function passes through here.
+function writeSharedCopy(record) {
+  try {
+    if (!record?.sha || !record.treeHash || record.corrupt || record.gateExplicit) return;
+    if (typeof record.suites === 'string' && record.suites.includes('local gate skipped')) return;
+    if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
+    const repoSlug = repoSlugFromRemote(git(['remote', 'get-url', 'origin']));
+    if (!repoSlug) return;
+    writeSharedVerifyMarker({ dir: sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repo: repoSlug, record, lane: basename(REPO) });
+  } catch { /* best-effort: the lane-local marker stays authoritative for this lane */ }
 }
 
 // #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
