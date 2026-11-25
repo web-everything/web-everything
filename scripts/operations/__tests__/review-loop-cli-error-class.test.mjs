@@ -5,24 +5,23 @@
  * failed filing leaves the state as it was) — the end-to-end negatives live in review-loop-cli.test.mjs
  * ("error-class" describe); this file pins the classifier and the static ban on `.message` in output.
  */
-import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync, openSync, fstatSync, closeSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect, vi } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import { describe, it, expect } from 'vitest';
 
 import * as cli from '../review-loop-cli.mjs';
 
-// Install stable mocks before the CLI captures named builtin imports. Configure
-// those same functions below; default-fs spies and syncBuiltinESMExports cannot
-// replace references already captured by Vitest. Unmocked calls remain hermetic.
-vi.mock('node:fs', async importOriginal => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    ...Object.fromEntries(['openSync', 'fstatSync', 'closeSync']
-      .map(key => [key, vi.fn(actual[key])])),
-  };
-});
+// Run fault injection against native ESM bindings in a fresh process. Vitest's
+// builtin-module cache can leave the CLI using different bindings from its mocks.
+const DEBUG_LOG_PROBE = fileURLToPath(new URL('./fixtures/review-loop-debug-log-probe.mjs', import.meta.url));
+function probeDebugLog(path, kind, replacement = '') {
+  return JSON.parse(execFileSync(process.execPath, [DEBUG_LOG_PROBE, path, kind, replacement], {
+    encoding: 'utf8', timeout: 15_000, maxBuffer: 64 * 1024,
+  }));
+}
 
 const SOURCE = readFileSync(join(process.cwd(), 'scripts/operations/review-loop-cli.mjs'), 'utf8');
 const CLASSES = ['auth', 'network', 'rate-limit', 'not-found', 'parse', 'unknown'];
@@ -84,58 +83,29 @@ describe('debug log fails closed', () => {
     const replacement = join(dir, 'replacement.log');
     writeFileSync(replacement, 'orig', { mode: 0o644 });
     chmodSync(replacement, 0o644);
-    const actualOpen = fs.openSync;
-    let openedFd;
-    const open = vi.mocked(openSync).mockClear().mockImplementationOnce((target, ...args) => {
-      if (target === path) renameSync(replacement, path);
-      const fd = actualOpen(target, ...args);
-      if (target === path) openedFd = fd;
-      return fd;
-    });
-    const close = vi.mocked(closeSync).mockClear();
-    const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
-    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
-    try {
-      expect(cli.describeErrorClass('filing-failed', new Error('Bearer race-secret'))).toBe('filing-failed:auth');
-      expect(open).toHaveBeenCalledWith(path, expect.any(Number), 0o600);
-      expect(openedFd).toEqual(expect.any(Number));
-      expect(close).toHaveBeenCalledWith(openedFd);
-      expect(statSync(path).mode & 0o777).toBe(0o644);
-      expect(readFileSync(path, 'utf8')).toBe('orig');
-    } finally {
-      open.mockRestore();
-      close.mockRestore();
-      if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
-      else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
-    }
+    const probe = probeDebugLog(path, 'race', replacement);
+    expect(probe.output).toBe('filing-failed:auth');
+    expect(probe.openCalls).toEqual([[path, expect.any(Number), 0o600]]);
+    expect(probe.openedFd).toEqual(expect.any(Number));
+    expect(probe.statFds).toEqual([probe.openedFd]);
+    expect(probe.closedFds).toEqual([probe.openedFd]);
+    expect(probe.writeFds).toEqual([]);
+    expect(statSync(path).mode & 0o777).toBe(0o644);
+    expect(readFileSync(path, 'utf8')).toBe('orig');
   });
 
   it.each(['non-regular', 'wrong-owner', 'stat-failure'])('rejects an opened debug destination with %s metadata', (kind) => {
     const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-fd-'));
     const path = join(dir, 'debug.log');
     writeFileSync(path, 'orig', { mode: 0o600 });
-    const actualStat = fs.fstatSync;
-    const stat = vi.mocked(fstatSync).mockClear().mockImplementationOnce((fd) => {
-      if (kind === 'stat-failure') throw new Error('descriptor unavailable');
-      const st = actualStat(fd);
-      if (kind === 'non-regular') st.isFile = () => false;
-      else st.uid = process.getuid() + 1;
-      return st;
-    });
-    const close = vi.mocked(closeSync).mockClear();
-    const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
-    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
-    try {
-      expect(cli.describeErrorClass('filing-failed', new Error('Bearer metadata-secret'))).toBe('filing-failed:auth');
-      expect(stat).toHaveBeenCalledTimes(1);
-      expect(close).toHaveBeenCalledWith(stat.mock.calls[0][0]);
-      expect(readFileSync(path, 'utf8')).toBe('orig');
-    } finally {
-      stat.mockRestore();
-      close.mockRestore();
-      if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
-      else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
-    }
+    const probe = probeDebugLog(path, kind);
+    expect(probe.output).toBe('filing-failed:auth');
+    expect(probe.openCalls).toEqual([[path, expect.any(Number), 0o600]]);
+    expect(probe.openedFd).toEqual(expect.any(Number));
+    expect(probe.statFds).toEqual([probe.openedFd]);
+    expect(probe.closedFds).toEqual([probe.openedFd]);
+    expect(probe.writeFds).toEqual([]);
+    expect(readFileSync(path, 'utf8')).toBe('orig');
   });
 
   it('never appends through a symlink or into a group/world-readable file', () => {
