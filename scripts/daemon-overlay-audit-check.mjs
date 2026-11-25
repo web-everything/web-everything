@@ -36,10 +36,7 @@ export function checkOverlays({ states, evidence, resolveSha, covers, now = new 
 
 function localSha(clone, ref, env) {
   if (!safeRegistrationRef(ref)) return null;
-  // Read-only rev-parse only; the argv is built here so the push-gate lint sees no git literal to pin.
-  const argv = ['-C', clone, 'rev-parse', '--verify', `refs/remotes/origin/${ref}`];
-  const bin = 'git';
-  const result = spawnSync(bin, argv, {
+  const result = spawnSync('git', ['-C', clone, 'rev-parse', '--verify', `refs/remotes/origin/${ref}`], {
     env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
     encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
   });

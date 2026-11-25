@@ -34,9 +34,7 @@ export function describeMissing(sha) {
 export function mainCovers(base, { cwd = process.cwd(), env = process.env } = {}) {
   if (!fullSha(base)) return false;
   try {
-    // Read-only ancestry probe; argv is built here so the push-gate lint sees no git literal to pin.
-    const bin = 'git', argv = ['merge-base', '--is-ancestor', base, 'origin/main'];
-    const result = spawnSync(bin, argv, {
+    const result = spawnSync('git', ['merge-base', '--is-ancestor', base, 'origin/main'], {
       cwd, env: { ...env, GIT_NO_LAZY_FETCH: '1', GIT_OPTIONAL_LOCKS: '0' },
       encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
     });
