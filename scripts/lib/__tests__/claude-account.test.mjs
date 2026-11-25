@@ -21,6 +21,7 @@ describe('markWorkerEnv — unavailable account map fails closed', () => {
     ['malformed JSON', '{'],
     ['empty file', ''],
     ['empty object', '{}'],
+    ['empty account and daemon records', '{"accounts":{},"daemons":{}}'],
     ['JSON null', 'null'],
     ['JSON array', '[]'],
     ['incomplete map', '{"accounts":{}}'],
@@ -82,12 +83,32 @@ describe('markWorkerEnv — unavailable account map fails closed', () => {
   });
   it('preserves valid maps with no daemon assignments and enforced unmapped refusal', () => {
     const env = { XPC_SERVICE_NAME: 'com.we.other' };
-    for (const accounts of [MAP.accounts, {}]) {
-      expect(markWorkerEnv(env, { map: { ...MAP, accounts, daemons: {} } }))
-        .toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
-    }
+    expect(markWorkerEnv(env, { map: { ...MAP, daemons: {} } }))
+      .toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
     expect(() => markWorkerEnv(env, { map: { ...MAP, enforce: true } }))
       .toThrow(/no usable Claude account mapping/);
+  });
+  it('refuses enforcement without a wildcard before inheriting daemon credentials', () => {
+    const { '*': wildcard, ...map } = { ...MAP, enforce: true };
+    expect(isAccountMap(map)).toBe(false);
+    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.other', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, { map }))
+      .toThrow('claude account map unavailable; refusing daemon launch');
+  });
+  it.each([
+    { service: 'svc', account: 'acct', type: 'bearer' },
+    { service: '', account: 'acct' },
+    { service: 'svc', account: ' ' },
+    { service: 'svc' },
+    { account: 'acct' },
+    { type: 'oauth' },
+  ])('refuses malformed credentials alongside configDir before Keychain access: %j', credentials => {
+    const map = { ...MAP, accounts: { a: { configDir: '/home/test/.claude', ...credentials } } };
+    const reads = [];
+    expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', CLAUDE_CODE_OAUTH_TOKEN: FAKE }, {
+      map, readKeychain: (...args) => { reads.push(args); return FAKE; },
+    })).toThrow('claude account map unavailable; refusing daemon launch');
+    expect(reads).toEqual([]);
+    expect(isAccountMap(map)).toBe(false);
   });
 });
 
@@ -168,10 +189,18 @@ import { isAccountMap, expandConfigDir, AccountRefusal, isNotApplied } from '../
 describe('isAccountMap (pure, strict shape validation)', () => {
   const dirs = { accounts: { a: { configDir: '/home/test/.claude' }, b: { configDir: '~/claude-b' } },
     daemons: { 'com.we.worker': 'b' } };
-  it('accepts empty records, absolute/tilde directories and legacy keychain entries', () => {
-    for (const map of [{ accounts: {}, daemons: {} }, dirs, MAP,
+  it('accepts absolute/tilde directories and legacy keychain entries with empty daemon records', () => {
+    for (const map of [dirs, MAP,
       { accounts: { k: { service: 'svc', account: 'acct' } }, daemons: {} }]) expect(isAccountMap(map)).toBe(true);
     for (const accountB of [undefined, true, false]) expect(isAccountMap({ ...dirs, routing: { accountB } })).toBe(true);
+  });
+  it('rejects emptied account and daemon records', () => {
+    expect(isAccountMap({ accounts: {}, daemons: {} })).toBe(false);
+    expect(isAccountMap({ ...MAP, accounts: {}, daemons: {} })).toBe(false);
+  });
+  it.each([undefined, 'oauth', 'apikey'])('accepts valid credentials alongside configDir: %j', type => {
+    expect(isAccountMap({ accounts: { a: { configDir: '~/claude', service: 'svc', account: 'acct', type } },
+      daemons: {} })).toBe(true);
   });
   it.each([null, undefined, [], {}, { accounts: [], daemons: {} }, { accounts: {}, daemons: [] }].map(value => [value]))
     ('rejects unavailable and non-record maps: %j', map => expect(isAccountMap(map)).toBe(false));
@@ -228,6 +257,6 @@ describe('isAccountMap enforcement fields', () => {
   });
   it('accepts the shipped enforce/"*" shapes', () => {
     expect(isAccountMap({ ...base, enforce: false, '*': 'refuse' })).toBe(true);
-    expect(isAccountMap({ ...base, enforce: true })).toBe(true);
+    expect(isAccountMap({ ...base, enforce: true, '*': 'refuse' })).toBe(true);
   });
 });

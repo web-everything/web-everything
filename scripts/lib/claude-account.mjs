@@ -26,14 +26,21 @@ const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 /** Strict validation of account-map evidence before daemon credential resolution. */
 export function isAccountMap(map) {
   if (!record(map) || !record(map.accounts) || !record(map.daemons)) return false;
+  if (Object.keys(map.accounts).length === 0) return false;
   if (map.enforce !== undefined && typeof map.enforce !== 'boolean') return false;
   if (map['*'] !== undefined && map['*'] !== 'refuse') return false;
+  if (map.enforce === true && map['*'] !== 'refuse') return false;
   if (map.routing !== undefined && (!record(map.routing)
     || (map.routing.accountB !== undefined && typeof map.routing.accountB !== 'boolean'))) return false;
-  if (!Object.values(map.accounts).every(entry => record(entry) && (Object.hasOwn(entry, 'configDir')
-    ? expandConfigDir(entry.configDir, '/') !== null
-    : nonempty(entry.service) && nonempty(entry.account)
-      && (entry.type === undefined || entry.type === 'oauth' || entry.type === 'apikey')))) return false;
+  if (!Object.values(map.accounts).every(entry => {
+    if (!record(entry)) return false;
+    const hasConfigDir = Object.hasOwn(entry, 'configDir');
+    if (hasConfigDir && expandConfigDir(entry.configDir, '/') === null) return false;
+    // A directory selector does not exempt credentials consumed by accountEnv from validation.
+    const hasCredentials = ['service', 'account', 'type'].some(key => Object.hasOwn(entry, key));
+    return hasConfigDir && !hasCredentials || nonempty(entry.service) && nonempty(entry.account)
+      && (entry.type === undefined || entry.type === 'oauth' || entry.type === 'apikey');
+  })) return false;
   return Object.values(map.daemons).every(account => typeof account === 'string' && Object.hasOwn(map.accounts, account));
 }
 
