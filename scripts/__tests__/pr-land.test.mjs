@@ -1145,19 +1145,24 @@ describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail close
   const cfg = { guardConfigPaths: ['scripts/settings/prototype-load.json'] };
   const guard = ['scripts/settings/prototype-load.json'];
   const marker = 'x\nOperator-pre-approved: R474\n';
-  it('marker AND a diff confined to guard-config paths opens ready', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, ...cfg })).toMatchObject({ ready: true, why: 'pre-approved-guard-config' });
+  const approval = { ok: true, rulingId: 'R474' };
+  it('a body line Operator-pre-approved no longer makes a PR ready', () => {
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, approval: { ok: false, reason: 'no record' }, ...cfg }).ready).toBe(false);
   });
-  it('a marker with any other file, or guard-config without a marker, stays a draft', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: [...guard, 'x.mjs'], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: '', changedFiles: guard, ...cfg }).ready).toBe(false);
-    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: guard, ...cfg }).ready).toBe(false);
+  it('a head-bound approval record AND a diff confined to guard-config paths opens ready', () => {
+    expect(decideReadyOnOpen({ approval, changedFiles: guard, ...cfg })).toMatchObject({ ready: true, why: 'pre-approved-guard-config' });
+  });
+  it('a record with any other file in the diff, or no record, stays a draft', () => {
+    expect(decideReadyOnOpen({ approval, changedFiles: [...guard, 'x.mjs'], ...cfg })).toMatchObject({ ready: false, why: 'approval-outside-guard-config' });
+    expect(decideReadyOnOpen({ approval, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ changedFiles: guard, ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval: { ok: true }, changedFiles: guard, ...cfg }).ready).toBe(false);
   });
   it('no changed files, unreadable settings or no paths fail closed', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: [], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: [], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: guard }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
   });
   it('resolveDraft opens ready regardless of readyOnOpen', () => {
     expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: true })).toBe(false);
