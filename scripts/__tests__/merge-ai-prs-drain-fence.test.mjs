@@ -7,7 +7,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireDrainLease, handoverDrainLease, heartbeatDrainLease, releaseDrainLease } from '../readiness/drain-lock.mjs';
-import { checkDrainFence } from '../readiness/drain-fence.mjs';
+import { spawnSync } from 'node:child_process';
+import { checkDrainFence, resolveDrainFence } from '../readiness/drain-fence.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'drain-fence-')); });
@@ -51,6 +52,25 @@ describe('checkDrainFence', () => {
     expect(heartbeatDrainLease(root, 'blue', { pid: 1, expectFence: 1 })).toBe(false);
     expect(releaseDrainLease(root, 'blue', { expectFence: 1 })).toBe(false);
     expect(heartbeatDrainLease(root, 'blue', { pid: 1, expectFence: 3 })).toBe(true);
+  });
+
+  it('with fencing required, a missing fence refuses', () => {
+    acquireDrainLease(root, 'blue', { pid: 1 });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: null, require: true })).toMatchObject({ ok: false, reason: 'fence-required' });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: 1, require: true })).toMatchObject({ ok: true });
+  });
+
+  it('resolveDrainFence: absent=null, malformed=-1, valid=n, never silently null when a flag was given', () => {
+    expect(resolveDrainFence(undefined)).toBeNull();
+    expect(resolveDrainFence('3')).toBe(3);
+    for (const bad of ['abc', '0', '-2', '1.5', '', true]) expect(resolveDrainFence(bad)).toBe(-1);
+  });
+
+  // The merge-ai-prs CALLER: with --require-fence and no (or a bad) --fence the process refuses before any gh call.
+  it.each([[[]], [['--fence=abc']], [['--fence=0']]])('merge-ai-prs --under-lease --require-fence %j exits non-zero with drain-fence-required', (extra) => {
+    const r = spawnSync(process.execPath, [join(import.meta.dirname, '..', 'merge-ai-prs.mjs'), '--under-lease=blue', '--require-fence', ...extra], { encoding: 'utf8', env: { ...process.env, HOME: root }, timeout: 60_000 });
+    expect(r.status).not.toBe(0);
+    expect(`${r.stdout}${r.stderr}`).toContain('drain-fence-required');
   });
 
   it('an unreadable or absent lease refuses (lease-unknown)', () => {

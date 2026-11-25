@@ -181,7 +181,7 @@ import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBase
 import { mergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
 import { DERIVED_REGEN, DERIVED_OUTPUT_PATHS, numberPendingHashes, isPostLandTreeDirty, landedNumberFor, resolveLandedItem } from './lane-drain.mjs'; // #2899 A5 — `resolveLandedItem` shares lane-drain's ONE resolve-on-land home, exactly as `numberPendingHashes` shares its numbering (never a fork)
 import { isHash } from './backlog/id.mjs'; // #2393 — a stackParent hash's bornAs-on-main lookup is hash-only
-import { checkDrainFence } from './readiness/drain-fence.mjs'; // BLUE-GREEN-SWAP S1.2 — per-merge lease-fence re-read
+import { checkDrainFence, resolveDrainFence } from './readiness/drain-fence.mjs'; // BLUE-GREEN-SWAP S1.2 — per-merge lease-fence re-read
 import { withNumberingLock, withLandWriteLock, acquireDrainLease, heartbeatDrainLease, releaseDrainLease, drainLeaseStatus, drainOwner, DRAIN_LOCK_ROOT, localRepoSlug } from './readiness/drain-lock.mjs'; // #2391 — numbering-critical-section mutex + (#2683) the merge-write mutex (withLandWriteLock, same lock key) + (#2395) whole-process drain lease a `--watch` monitor holds for its lifetime + (#3440) localRepoSlug keys that lease per-repo
 import { findDuplicateIds, summarizeDuplicates } from './lib/duplicate-id-tripwire.mjs';
 import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r — the strict #3916 auto-resolve backstop, run once per pass (see runStrandedSweepStep below); never a second resolver, shares resolveLandedItem via that module
@@ -5024,7 +5024,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (env.DRAIN_UNDER_LEASE || null);
   // BLUE-GREEN-SWAP S1.2 — `--fence=<n>`: the lease fence the daemon held when it started this child; re-read before each merge.
   // Absent => null (legacy child, start gate only). Present but malformed => -1, which never matches a stored fence (fail closed).
-  const UNDER_FENCE = (UNDER_LEASE && flags.fence !== undefined) ? ((typeof flags.fence === 'string' && /^[1-9][0-9]*$/.test(flags.fence)) ? Number(flags.fence) : -1) : null;
+  // `--require-fence` (or DRAIN_REQUIRE_FENCE=1) turns fencing ON: a missing/malformed fence then refuses instead of skipping the check.
+  // A `--fence` given WITHOUT `--under-lease` also stays checked (owner null never matches), never silently dropped.
+  const REQUIRE_FENCE = !!flags['require-fence'] || env.DRAIN_REQUIRE_FENCE === '1';
+  const UNDER_FENCE = resolveDrainFence(flags.fence);
+  if (REQUIRE_FENCE && (UNDER_FENCE === null || UNDER_FENCE < 1)) {
+    process.stderr.write('merge-ai-prs · drain-fence-required: --require-fence needs a valid --fence=<n> — refusing before any work\n');
+    process.exit(2);
+  }
   // #2395 — `--max-runtime-min=N`: a wall-clock lifetime cap on a `--watch` monitor. The bounded-max-lifetime
   // backstop push-at-close needs: when its detached drain has no batch feed, `--until-batches-idle` is INERT
   // and would poll forever, so this hard-stops the watch after N minutes regardless of idle/feed state. 0/unset
@@ -5873,7 +5880,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: liveBranch });
       },
-      enqueue: (c, sha, entry) => { const fc = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, repoKey: localSlug }); if (!fc.ok) throw new Error(`drain lease fence refused (${fc.reason})`); return enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow); },
+      enqueue: (c, sha, entry) => { const fc = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, require: REQUIRE_FENCE, repoKey: localSlug }); if (!fc.ok) throw new Error(`drain lease fence refused (${fc.reason})`); return enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow); },
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });
@@ -7912,7 +7919,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           const landLock = withLandWriteLock(() => {
             // BLUE-GREEN-SWAP S1.2 (FLOW-DMN-012/013/014/015) — re-read the lease fence right before the write: a lease that
             // moved on (or is unreadable) refuses this merge; the PR rides the next pass.
-            const fenceCheck = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, repoKey: localSlug });
+            const fenceCheck = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, require: REQUIRE_FENCE, repoKey: localSlug });
             if (!fenceCheck.ok) return { skipped: 'drain-fence', reason: fenceCheck.reason };
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.

@@ -7,12 +7,19 @@
 import { readLockEntry, isLeaseExpired } from './file-locks.mjs';
 import { drainLeasePathFor, DRAIN_LOCK_ROOT, DRAIN_LEASE_MINUTES } from './drain-lock.mjs';
 
+/** Parse a `--fence` flag value: absent => null; a well-formed positive integer string => that number; ANYTHING else
+ *  (boolean, empty, 0, negative, fractional, junk) => -1, which never matches a stored fence (fail closed). */
+export function resolveDrainFence(raw) {
+  if (raw === undefined || raw === null) return null;
+  return typeof raw === 'string' && /^[1-9][0-9]*$/.test(raw) ? Number(raw) : -1;
+}
+
 /**
  * @param {{lockRoot?:string, owner:string, fence:number|null, repoKey?:string|null, read?:Function, nowMs?:number}} o
  * @returns {{ok:true, skipped?:true}|{ok:false, reason:'lease-unknown'|'owner-changed'|'fence-advanced'|'fence-mismatch'|'lease-expired'}}
  */
-export function checkDrainFence({ lockRoot = DRAIN_LOCK_ROOT, owner, fence, repoKey = null, read = readLockEntry, nowMs = Date.now() } = {}) {
-  if (fence == null) return { ok: true, skipped: true }; // legacy child: no fence declared, start gate only
+export function checkDrainFence({ lockRoot = DRAIN_LOCK_ROOT, owner, fence, repoKey = null, read = readLockEntry, nowMs = Date.now(), require = false } = {}) {
+  if (fence == null) return require ? { ok: false, reason: 'fence-required' } : { ok: true, skipped: true }; // fencing on => a missing fence refuses; off => legacy start gate only
   if (!Number.isInteger(fence) || fence < 1) return { ok: false, reason: 'fence-mismatch' };
   let entry;
   try { entry = read(lockRoot, drainLeasePathFor(repoKey)); } catch { return { ok: false, reason: 'lease-unknown' }; }

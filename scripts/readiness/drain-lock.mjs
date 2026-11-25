@@ -52,13 +52,13 @@
  * scripts/readiness/__tests__/drain-lock.test.mjs.
  */
 
-import { mkdirSync, writeFileSync, renameSync, appendFileSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, renameSync, appendFileSync, rmSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import {
-  reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired, DEFAULT_LEASE_MINUTES, lockDirFor, makeLockEntry,
+  reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired, DEFAULT_LEASE_MINUTES, lockDirFor, lockIdFor, makeLockEntry,
 } from './file-locks.mjs';
 
 /** Machine-global lock home — shared across every checkout on the host so lands in DIFFERENT clones contend
@@ -329,20 +329,61 @@ export function withPocLandLock(fn, { branch, repoKey = null, ...opts } = {}) {
  * lease, or reclaimed a STALE one via the TTL). `ok:false, reason:'held'` ⇒ a LIVE drain already holds it —
  * the caller must NO-OP (a second drain launch). Thin over file-locks `reserve`.
  */
-export function acquireDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, leaseMinutes = DRAIN_LEASE_MINUTES, nowMs = Date.now(), scope = null, repoKey = null } = {}) {
+export function acquireDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, leaseMinutes = DRAIN_LEASE_MINUTES, nowMs = Date.now(), scope = null, repoKey = null, mutexWaitMs = 2000 } = {}) {
   ensureRoot(lockRoot);
   const path = drainLeasePathFor(repoKey); // #3440 — per-repo lock dir; null repoKey ⇒ the legacy global path
   // #2458 — record THIS drain's repo scope in the lease so a differently-scoped launch can tell whether the
   // holder's next pass actually covers its repos, instead of blindly no-op'ing with a false coverage claim.
   // On a re-acquire of an OWN live lease (reserve's 'own' path is a heartbeat) a null `scope` carries the
   // existing recorded scope forward — mirrors heartbeatDrainLease so a re-acquire never silently drops it.
-  const cur = readLockEntry(lockRoot, path);
-  const keep = normalizeScope(scope) || (cur && cur.owner === owner && cur.meta && normalizeScope(cur.meta.scope)) || null;
-  // S1.2 — fence: an own re-acquire keeps the stored fence (and handover record); a fresh/reclaimed lease rises past any prior fence.
-  const prevFence = fenceOf(cur);
-  const fence = cur && cur.owner === owner && prevFence ? prevFence : prevFence + 1;
-  const handover = cur && cur.owner === owner && cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {};
-  return reserve(lockRoot, path, owner, nowMs, nowIsoFrom(nowMs), pid, 'unknown', leaseMinutes, { ...(keep ? { scope: keep } : {}), fence, ...handover });
+  // Round 3: the whole read-compute-write runs under the one drain mutex (shared with handover/heartbeat/release).
+  const r = withDrainMutex(lockRoot, repoKey, mutexWaitMs, () => {
+    const cur = readLockEntry(lockRoot, path);
+    const keep = normalizeScope(scope) || (cur && cur.owner === owner && cur.meta && normalizeScope(cur.meta.scope)) || null;
+    // S1.2 — fence: an own re-acquire keeps the stored fence (and handover record); a fresh/reclaimed lease rises past
+    // any prior fence AND the durable floor (so a release followed by a re-acquire never reuses an epoch).
+    const own = cur && cur.owner === owner && fenceOf(cur);
+    const fence = own ? own : Math.max(fenceOf(cur), readFenceFloor(lockRoot, repoKey)) + 1;
+    const handover = cur && cur.owner === owner && cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {};
+    const res = reserve(lockRoot, path, owner, nowMs, nowIsoFrom(nowMs), pid, 'unknown', leaseMinutes, { ...(keep ? { scope: keep } : {}), fence, ...handover });
+    if (res && res.ok) writeFenceFloor(lockRoot, repoKey, fence);
+    return res;
+  });
+  return r === MUTEX_BUSY ? { ok: false, reason: 'mutex-busy', heldBy: null } : r;
+}
+
+// ── Round 3 — one mutex for acquire/handover/heartbeat/release + a durable fence floor ─────────────────────────
+const MUTEX_BUSY = Symbol('drain-mutex-busy');
+const MUTEX_STALE_MS = 60_000;
+const lockIdOf = (repoKey) => lockIdFor(drainLeasePathFor(repoKey));
+/** The mutex directory every lease mutation takes (exported for tests). */
+export function drainMutexDirFor(lockRoot = DRAIN_LOCK_ROOT, repoKey = null) { return join(lockRoot, `drain-mutex-${lockIdOf(repoKey)}`); }
+function fenceFloorFileFor(lockRoot, repoKey) { return join(lockRoot, `drain-fence-floor-${lockIdOf(repoKey)}`); }
+/** Highest fence ever issued for this lease key (0 when none). Survives release (the lease dir is deletable; this is not). */
+function readFenceFloor(lockRoot, repoKey) {
+  try { const n = Number(readFileSync(fenceFloorFileFor(lockRoot, repoKey), 'utf8').trim()); return Number.isInteger(n) && n > 0 ? n : 0; } catch { return 0; }
+}
+function writeFenceFloor(lockRoot, repoKey, fence) {
+  if (fence <= readFenceFloor(lockRoot, repoKey)) return;
+  const file = fenceFloorFileFor(lockRoot, repoKey);
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${fence}\n`, 'utf8');
+  renameSync(tmp, file);
+}
+/** Run `fn` under the drain mutex (mkdir-atomic, stale after 60s). Returns {@link MUTEX_BUSY} if it cannot be taken within `waitMs`. */
+function withDrainMutex(lockRoot, repoKey, waitMs, fn) {
+  ensureRoot(lockRoot);
+  const dir = drainMutexDirFor(lockRoot, repoKey);
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    try { mkdirSync(dir); break; } catch (e) {
+      if (!e || e.code !== 'EEXIST') return MUTEX_BUSY;
+      try { if (Date.now() - statSync(dir).mtimeMs > MUTEX_STALE_MS) { rmSync(dir, { recursive: true, force: true }); continue; } } catch { continue; }
+      if (Date.now() >= deadline) return MUTEX_BUSY;
+      sleepSyncMs(10);
+    }
+  }
+  try { return fn(); } finally { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } }
 }
 
 /** The integer fence stored in a lease entry's meta (0 when absent/invalid). */
@@ -360,12 +401,18 @@ export function readDrainFence(lockRoot = DRAIN_LOCK_ROOT, { repoKey = null } = 
  * `handovers.jsonl` (ordered by fence). Every unreadable/mismatch case refuses. Rollback = the same call reversed.
  * @returns {{ok:true, fence:number}|{ok:false, reason:string}}
  */
-export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid = null, expectFence, gen = null, codeDigest = null, nowMs = Date.now(), repoKey = null } = {}, { beforeRename = null } = {}) {
+export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid = null, expectFence, gen = null, codeDigest = null, nowMs = Date.now(), repoKey = null, mutexWaitMs = 2000 } = {}, { beforeRename = null } = {}) {
+  const r = withDrainMutex(lockRoot, repoKey, mutexWaitMs, () => handoverLocked(lockRoot, { from, to, toPid, expectFence, gen, codeDigest, nowMs, repoKey }, beforeRename));
+  return r === MUTEX_BUSY ? { ok: false, reason: 'mutex-busy' } : r;
+}
+
+function handoverLocked(lockRoot, { from, to, toPid, expectFence, gen, codeDigest, nowMs, repoKey }, beforeRename) {
   const path = drainLeasePathFor(repoKey);
   let cur;
   try { cur = readLockEntry(lockRoot, path); } catch { return { ok: false, reason: 'lease-unknown' }; }
   if (!cur) return { ok: false, reason: 'no-lease' };
   if (cur.owner !== from) return { ok: false, reason: 'not-owner' };
+  if (isLeaseExpired(cur, nowMs, DRAIN_LEASE_MINUTES)) return { ok: false, reason: 'lease-expired' };
   const f = fenceOf(cur);
   if (!f || f !== expectFence) return { ok: false, reason: 'fence-mismatch' };
   const next = f + 1;
@@ -376,6 +423,7 @@ export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid
   const tmp = join(dir, `lock.json.handover-${process.pid}`);
   try {
     writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n', 'utf8');
+    writeFenceFloor(lockRoot, repoKey, next); // floor first: a crash after this only skips a fence number, never reuses one
     if (beforeRename) beforeRename();
     renameSync(tmp, join(dir, 'lock.json'));
     const back = readLockEntry(lockRoot, path);
@@ -391,24 +439,30 @@ export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid
  *  recorded repo `scope` (#2458) is PRESERVED across heartbeats: a caller-supplied scope refreshes it, else
  *  the existing lease's scope is carried forward (heartbeat rebuilds the entry, so it must be re-supplied).
  *  `repoKey` (#3440) MUST match the value passed to {@link acquireDrainLease} — it selects the same lock dir. */
-export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, nowMs = Date.now(), scope = null, repoKey = null, expectFence = null } = {}) {
+export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, nowMs = Date.now(), scope = null, repoKey = null, expectFence = null, mutexWaitMs = 2000 } = {}) {
   const path = drainLeasePathFor(repoKey);
-  const cur = readLockEntry(lockRoot, path);
-  if (!cur || cur.owner !== owner) return false;
-  if (expectFence != null && fenceOf(cur) !== expectFence) return false; // a stale generation never refreshes a newer one
-  const keep = normalizeScope(scope) || (cur.meta && normalizeScope(cur.meta.scope)) || null;
-  const fence = fenceOf(cur); // S1.2 — a heartbeat rewrite must carry the fence (and handover record) forward
-  const meta = { ...(keep ? { scope: keep } : {}), ...(fence ? { fence } : {}), ...(cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {}) };
-  return heartbeat(lockRoot, path, owner, nowIsoFrom(nowMs), pid, Object.keys(meta).length ? meta : null);
+  const r = withDrainMutex(lockRoot, repoKey, mutexWaitMs, () => {
+    const cur = readLockEntry(lockRoot, path);
+    if (!cur || cur.owner !== owner) return false;
+    if (expectFence != null && fenceOf(cur) !== expectFence) return false; // a stale generation never refreshes a newer one
+    const keep = normalizeScope(scope) || (cur.meta && normalizeScope(cur.meta.scope)) || null;
+    const fence = fenceOf(cur); // S1.2 — a heartbeat rewrite must carry the fence (and handover record) forward
+    const meta = { ...(keep ? { scope: keep } : {}), ...(fence ? { fence } : {}), ...(cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {}) };
+    return heartbeat(lockRoot, path, owner, nowIsoFrom(nowMs), pid, Object.keys(meta).length ? meta : null);
+  });
+  return r === MUTEX_BUSY ? false : r;
 }
 
 /** Release the drain lease, but ONLY if `owner` still holds it (never stomp a reclaimer). Idempotent.
  *  `repoKey` (#3440) MUST match the value passed to {@link acquireDrainLease}. */
-export function releaseDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { repoKey = null, expectFence = null } = {}) {
+export function releaseDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { repoKey = null, expectFence = null, mutexWaitMs = 2000 } = {}) {
   const path = drainLeasePathFor(repoKey);
-  const cur = readLockEntry(lockRoot, path);
-  if (cur && cur.owner === owner && (expectFence == null || fenceOf(cur) === expectFence)) { releaseLockDir(lockRoot, path); return true; }
-  return false;
+  const r = withDrainMutex(lockRoot, repoKey, mutexWaitMs, () => {
+    const cur = readLockEntry(lockRoot, path);
+    if (cur && cur.owner === owner && (expectFence == null || fenceOf(cur) === expectFence)) { releaseLockDir(lockRoot, path); return true; }
+    return false;
+  });
+  return r === MUTEX_BUSY ? false : r;
 }
 
 /**
