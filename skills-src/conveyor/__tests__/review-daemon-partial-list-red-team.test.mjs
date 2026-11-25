@@ -12,7 +12,9 @@ beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'partial-red-team-'));
   file = join(directory, 'queue.json');
   entries = Array.from({ length: 7 }, (_, i) => ({ key: `${repo}#${i + 1}`, repo, pr: i + 1,
-    head, enqueuedAt: 1, attempts: 0, ...(i === 6 ? {} : { blocked: 'planner-skip' }) }));
+    head, enqueuedAt: 1, attempts: 0, ...(i === 6 ? {} : {
+      blocked: 'planner-skip', blockedReason: 'planner deferred this reviewed head',
+    }) }));
   writeFileSync(file, JSON.stringify(entries));
   vi.stubEnv('WE_RED_TEAM_QUEUE_FILE', file);
   vi.stubEnv('WE_RED_TEAM_DISPATCH_QUEUE', 'on');

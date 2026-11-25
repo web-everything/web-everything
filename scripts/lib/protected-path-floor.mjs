@@ -165,6 +165,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
+  // Red-team reprobe requests dedupe across gate sources and restarts with an exclusive `wx` create.
+  'scripts/lib/red-team-queue-state.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
