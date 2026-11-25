@@ -5,7 +5,7 @@
  *   an unreadable repo is status "unknown", never healthy. Alerts fire only for repos with open PRs.
  *   CLI: prints one line per registry repo (one gh list call per repo), `--json` for machines.
  */
-import { execFileSync } from 'node:child_process';
+import { readGhJson } from '../lib/proc-read.mjs';
 import { fileURLToPath } from 'node:url';
 import { loadRepoRegistry } from '../lib/repo-registry.mjs';
 
@@ -48,9 +48,7 @@ export function formatHealthLine(h) {
   return `${h.repo}: ${oldest}, ${h.mergesLast24h} merged/24h, ${h.verdictsLanded} verdicts landed`;
 }
 
-function gh(args) {
-  return JSON.parse(execFileSync('gh', args, { encoding: 'utf8', timeout: 60000 }));
-}
+const gh = (args) => readGhJson(args, { timeout: 60000 });
 
 export function fetchFacts(slug) {
   const openPrs = gh(['pr', 'list', '-R', slug, '--state', 'open', '--limit', '100', '--json', 'number,createdAt']);
