@@ -487,7 +487,7 @@ describe('heavy hydration', () => {
     const result = hydrateHeavyFields({ repo, rows, exec, cache, nowMs: 10000, maxAgeMs: 1000 });
     expect(result).toMatchObject({ fetched: 4, reused: 0, rows: rows.map(r => ({ ...r, ...heavy })) });
     for (const [i, call] of exec.mock.calls.entries()) {
-      expect(call).toEqual(['gh', ['pr', 'view', String(i + 1), '--repo', repo, '--json', 'comments,body,files'], opts]);
+      expect(call).toEqual(['gh', ['pr', 'view', String(i + 1), '--repo', repo, '--json', 'comments,body,files,headRefOid'], opts]);
       expect(result.cache[i + 1]).toEqual(cached(rows[i], { fetchedAtMs: 10000 }));
     }
     expect(rows).toEqual(before);
@@ -591,7 +591,7 @@ describe('paged hydrated listing', () => {
     const result = list(exec, { cache, needsHeavy: r => r.number === 1, execOpts: { timeout: 123 } });
     expect(result.rows).toEqual([{ ...row(1), body: heavy.body, files: heavy.files }, row(2)]);
     expect(result).toMatchObject({ hydrated: 1, reused: 0 });
-    expect(exec.mock.calls[1]).toEqual(['gh', ['pr', 'view', '1', '--repo', repo, '--json', 'body,files'],
+    expect(exec.mock.calls[1]).toEqual(['gh', ['pr', 'view', '1', '--repo', repo, '--json', 'body,files,headRefOid'],
       { ...opts, timeout: 123 }]);
     expect(Object.keys(result.cache)).toEqual(['1', '2']);
     expect(result.cache[2]).toEqual(cache[2]);
@@ -872,4 +872,17 @@ it('listing hydrates heavy fields with bounded concurrency: async list retry pre
   const unreadable = vi.fn().mockRejectedValue(new PrListUnreadableError({ repo, stage: 'hydrate', number: 2, cause: new Error('missing data') }));
   await expect(withListRetryAsync(unreadable, options)).rejects.toBeInstanceOf(PrListUnreadableError);
   expect(unreadable).toHaveBeenCalledTimes(1);
+});
+
+describe('hydrated head provenance', () => {
+  it('hydrated data for a different head is refused, not stamped with the listing head', () => {
+    const r = row(1);
+    const stale = JSON.stringify({ ...heavy, headRefOid: 'f'.repeat(40) });
+    expect(() => hydrateHeavyFields({ repo, rows: [r], exec: () => stale, nowMs: 10000, maxAgeMs: 1000 }))
+      .toThrow(PrListUnreadableError);
+    const same = JSON.stringify({ ...heavy, headRefOid: r.headRefOid });
+    const ok = hydrateHeavyFields({ repo, rows: [r], exec: () => same, nowMs: 10000, maxAgeMs: 1000 });
+    expect(ok.cache[1].headRefOid).toBe(r.headRefOid);
+    expect(ok.cache[1]).not.toHaveProperty('headRefOid', 'f'.repeat(40));
+  });
 });

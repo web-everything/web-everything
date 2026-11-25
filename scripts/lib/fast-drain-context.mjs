@@ -153,6 +153,16 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return Number.isFinite(age) && age >= 0 && age < ttlSec * 1000;
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
+  // The evidence is as old as its oldest source rows: a snapshot-sourced array carries fetchedAtMs; an
+  // invalid one counts as stale (NaN fails the freshness check). Arrays without it keep the read time.
+  const oldestSource = (sources, floor) => {
+    let oldest = floor;
+    for (const rows of sources.values()) {
+      if (Object.hasOwn(rows, 'fetchedAtMs')) oldest = Number.isFinite(rows.fetchedAtMs) ? Math.min(oldest, rows.fetchedAtMs) : NaN;
+      if (Number.isNaN(oldest)) return NaN;
+    }
+    return oldest;
+  };
   const readSources = () => new Map(repos.map(repo => {
     const rows = readSnapshot(repo);
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
@@ -193,7 +203,9 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
     // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    return readSources();
+    const sources = readSources();
+    if (!fresh(oldestSource(sources, writtenAt))) throw new Error('pass source rows too old — retry next pass');
+    return sources;
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -209,8 +221,8 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    readSources();
+    // Include main-read/lock wait time and the source rows' own age in the freshness bound.
+    const writtenAt = oldestSource(readSources(), observedAt);
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt);
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');

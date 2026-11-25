@@ -303,7 +303,7 @@ export function listOpenPrsLightPaged({ repo, exec, pageSize, pageRetries = 1, m
   return { rows, pages, bytes, ms: Date.now() - started, truncated: hasNextPage && rows.length >= maxRows, totalCount };
 }
 
-const heavyArgs = (repo, row, fields) => ['pr', 'view', String(row.number), '--repo', repo, '--json', fields.join(',')];
+const heavyArgs = (repo, row, fields) => ['pr', 'view', String(row.number), '--repo', repo, '--json', [...fields, 'headRefOid'].join(',')];
 
 function readHeavy({ repo, row, exec, fields, execOpts }) {
   try {
@@ -311,6 +311,10 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
     const data = JSON.parse(String(text));
     if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))) {
       throw new Error('missing PR heavy-field data');
+    }
+    // Hydrated data must be for the listing head; a differing head is a mid-flight push, refuse not stamp.
+    if (Object.hasOwn(data, 'headRefOid') && data.headRefOid !== row.headRefOid) {
+      throw new Error('hydrated PR head differs from listing head');
     }
     return data;
   } catch (cause) {

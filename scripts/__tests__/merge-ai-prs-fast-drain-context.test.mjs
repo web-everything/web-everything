@@ -484,3 +484,27 @@ test('real fast drain with a null target base defers after both snapshot and liv
     if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
   }
 });
+
+test('freshness uses the oldest rows.fetchedAtMs, and a too-old final replacement is refused', async () => {
+  const { readFastDrainPassInventory } = await import('../lib/fast-drain-context.mjs');
+  const dir = mkdtempSync(join(process.env.TMPDIR || '/tmp', 'fast-prov-'));
+  const head = { sha: 'a'.repeat(40), defaultBranch: 'main' };
+  const rows = [pr(7), pr(8)];
+  const withAge = (ms) => Object.defineProperty([...rows], 'fetchedAtMs', { value: ms });
+  const base = { path: join(dir, 'round.json'), repos: [repo], targetRepo: repo, readMain: async () => head,
+    listLean: async () => inventory(rows.map(lean)), now: () => 100_000, env: {},
+    lock: async fn => ({ ok: true, value: await fn(() => true) }) };
+  try {
+    // Read at 100s, but rows were fetched at 1s: older than the 60s bound, so refused despite a fresh observedAt.
+    await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(1_000) }), /expired|retry next pass/);
+    // NaN age is stale, not fresh.
+    await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(NaN) }), /expired|retry next pass/);
+    // A fresh source is published with the source age, not the observation time.
+    const ok = await readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(99_000) });
+    assert.ok(ok.snapshots.get(repo));
+    // A replacement that is too old is refused even when the cached pass is valid.
+    let calls = 0;
+    await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => (calls++ === 0 ? withAge(99_000) : withAge(1_000)),
+      path: join(dir, 'round2.json') }), /expired|retry next pass/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
