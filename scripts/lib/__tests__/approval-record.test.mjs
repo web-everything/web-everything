@@ -1,12 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scanText as scanPrivacyText } from '../privacy-terms.mjs';
 import { approvalCheckPayload, evaluateApprovalRecord, readApprovalRecord, writeApprovalRecord, APPROVAL_CHECK_NAME, PINNED_APP_ID_SHA256, OPERATOR_LOGINS } from '../approval-record.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
-const APP = JSON.parse(readFileSync(new URL('../../settings/red-team.json', import.meta.url), 'utf8')).redTeamGate.appId;
+// Keep filesystem reads out of Vite's browser-asset URL rewriting in the DOM test environment.
+const TEST_FILE = fileURLToPath(import.meta.url);
+const TEST_DIR = dirname(TEST_FILE);
+const APP = JSON.parse(readFileSync(join(TEST_DIR, '../../settings/red-team.json'), 'utf8')).redTeamGate.appId;
 const OTHER_APP = APP + 1;
 const run = (over = {}) => ({ id: 10, name: APPROVAL_CHECK_NAME, head_sha: A, external_id: `R474@${A}`, app: { id: APP },
   status: 'completed', conclusion: 'success', ...over });
@@ -100,8 +105,8 @@ describe('readApprovalRecord', () => {
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, gh, resolveApp: () => ({ ok: false }) }).ok).toBe(true);
   });
   it('keeps operational account identifiers out of approval source and fixtures (R972)', () => {
-    for (const url of [new URL('../approval-record.mjs', import.meta.url), new URL(import.meta.url)]) {
-      expect(scanPrivacyText(readFileSync(url)).filter(hit => hit.pattern === 'account-id')).toEqual([]);
+    for (const file of [join(TEST_DIR, '../approval-record.mjs'), TEST_FILE]) {
+      expect(scanPrivacyText(readFileSync(file)).filter(hit => hit.pattern === 'account-id')).toEqual([]);
     }
   });
   it('a head that moved between read and land refuses', () => {
