@@ -5,16 +5,32 @@
  *   an unreadable repo is status "unknown", never healthy. Alerts fire only for repos with open PRs.
  *   CLI: prints one line per registry repo (one gh list call per repo), `--json` for machines.
  */
+import { REVIEW_LABELS } from '../lib/review-labels.mjs';
 import { readGhJson } from '../lib/proc-read.mjs';
 import { fileURLToPath } from 'node:url';
 import { loadRepoRegistry } from '../lib/repo-registry.mjs';
 
 const HOUR = 3600e3;
 
+/** Open PRs carrying a reviewer verdict label the review flow really sets (review-labels.mjs). */
+export function countVerdicts(prs) {
+  const verdict = new Set([REVIEW_LABELS.accepted, REVIEW_LABELS.changes]);
+  return prs.filter((p) => (p.labels ?? []).some((l) => verdict.has(l.name))).length;
+}
+
 export function computeRepoHealth({ repo, facts, error, now = Date.now(), thresholds }) {
-  if (!facts) return { repo: repo.name, status: 'unknown', error: error ?? 'no data' };
-  const open = [...(facts.openPrs ?? [])].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
-  const merges = (facts.merges ?? []).map((m) => Date.parse(m.mergedAt)).filter(Number.isFinite);
+  const unknown = (why) => ({ repo: repo.name, status: 'unknown', error: why });
+  if (!facts) return unknown(error ?? 'no data');
+  // Fail closed (SHIP-API-014): inconsistent evidence is unknown, never a number.
+  const th = thresholds ?? {};
+  if (![th.noMergeHours, th.oldPrHours].every((n) => Number.isFinite(n) && n > 0)) return unknown('invalid thresholds');
+  if (!Array.isArray(facts.openPrs) || !Array.isArray(facts.merges)) return unknown('incomplete facts');
+  const openTimes = facts.openPrs.map((p) => Date.parse(p?.createdAt));
+  const mergeTimes = facts.merges.map((m) => Date.parse(m?.mergedAt));
+  if ([...openTimes, ...mergeTimes].some((t) => !Number.isFinite(t))) return unknown('invalid timestamp');
+  if (mergeTimes.some((t) => t > now + 5 * 60e3)) return unknown('merge timestamp in the future');
+  const open = [...facts.openPrs].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+  const merges = mergeTimes;
   const lastMerge = merges.length ? Math.max(...merges) : null;
   return {
     repo: repo.name,
@@ -24,7 +40,7 @@ export function computeRepoHealth({ repo, facts, error, now = Date.now(), thresh
     mergesLast24h: merges.filter((t) => now - t <= 24 * HOUR).length,
     lastMergeAt: lastMerge ? new Date(lastMerge).toISOString() : null,
     lastMergeAgeHours: lastMerge ? (now - lastMerge) / HOUR : null,
-    verdictsLanded: (facts.verdicts ?? []).length,
+    verdictsLanded: countVerdicts(open),
     oldestAgeHours: open[0] ? (now - Date.parse(open[0].createdAt)) / HOUR : null,
   };
 }
@@ -51,11 +67,9 @@ export function formatHealthLine(h) {
 const gh = (args) => readGhJson(args, { timeout: 60000 });
 
 export function fetchFacts(slug) {
-  const openPrs = gh(['pr', 'list', '-R', slug, '--state', 'open', '--limit', '100', '--json', 'number,createdAt']);
+  const openPrs = gh(['pr', 'list', '-R', slug, '--state', 'open', '--limit', '100', '--json', 'number,createdAt,labels']);
   const merges = gh(['pr', 'list', '-R', slug, '--state', 'merged', '--limit', '50', '--json', 'number,mergedAt']);
-  const verdicts = gh(['pr', 'list', '-R', slug, '--state', 'open', '--limit', '100', '--json', 'number,labels'])
-    .filter((p) => (p.labels ?? []).some((l) => /^review:(approved|changes|human)/.test(l.name)));
-  return { openPrs, merges, verdicts };
+  return { openPrs, merges };
 }
 
 export function readAllHealth({ now = Date.now(), fetch = fetchFacts } = {}) {
@@ -70,4 +84,5 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const all = readAllHealth();
   if (process.argv.includes('--json')) console.log(JSON.stringify({ health: all, alerts: all.flatMap((h) => healthAlerts(h, loadRepoRegistry().health)) }, null, 2));
   else for (const h of all) console.log(formatHealthLine(h));
+  if (all.some((h) => h.status !== 'ok')) process.exitCode = 1;
 }
