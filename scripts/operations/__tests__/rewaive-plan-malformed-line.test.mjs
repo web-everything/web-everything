@@ -51,6 +51,10 @@ describe('rewaive-plan: a malformed waiver-log line', () => {
     const out = run(r);
     expect(out.state).toBe('refuse');
   });
+  it('a line truncated inside "WITHDRAWN", or an escaped malformed withdrawal, refuses', () => {
+    expect(run(mk([valid, '{"ruling":"WITH']))).toMatchObject({ state: 'refuse' });
+    expect(run(mk([valid, '{"ref":"lane\\/x","ruling":"WITHDRAWN","sha":']))).toMatchObject({ state: 'refuse' });
+  });
   it('a malformed line naming the planned ref refuses', () => {
     const r = mk([valid, `{"ref":"${REF}","sha":`]);
     expect(run(r).state).toBe('refuse');

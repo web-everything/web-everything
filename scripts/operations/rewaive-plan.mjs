@@ -133,6 +133,7 @@ export function runCli({ argv, repo = process.cwd(), env = process.env, loadReco
   const ref = flag('ref')?.split('=').slice(1).join('=');
   const out = runPlan({ repo, ref, env, loadRecords, loadWaivers, baseOk });
   const text = argv.includes('--json') ? JSON.stringify(out) : [`state: ${out.state}${out.reason ? ` (${out.reason})` : ''}`,
+    ...(out.malformed ? [`malformed waiver-log lines (ignored, grant nothing): ${out.malformed.join(', ')}`] : []),
     ...(out.command ? [out.command] : []), ...(out.table || []).map(t => `${t.class}\t${t.file ?? '-'}\tsameTextAsWaived=${t.sameTextAsWaived}`)].join('\n');
   stdout(`${text}\n`);
   if (!argv.includes('--file-request')) return { code: out.state === 'refuse' ? 1 : 0, plan: out };

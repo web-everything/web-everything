@@ -53,8 +53,10 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
     // Unparseable text: it may only block when it could be a revocation or names the scoped ref (fail closed); else it is unrelated.
     if (scopeRef !== undefined && !named) {
-      const raw = lines.slice(i, i + count).join('\n').toLowerCase();
-      other = !raw.includes('revok') && !raw.includes('withdrawn') && !raw.includes(String(scopeRef).toLowerCase());
+      const raw = lines.slice(i, i + count).join('\n').toLowerCase().replaceAll('\\', '');
+      // Could be a revocation: names revok/withdrawn, or is cut off inside "withdrawn" (e.g. a truncated "WITH").
+      const hint = /revok|withdraw/.test(raw) || /(?:^|[^a-z])w(?:i(?:t(?:h(?:d(?:r(?:a(?:w(?:n)?)?)?)?)?)?)?)?["'\s]*$/.test(raw);
+      other = !hint && !raw.includes(String(scopeRef).toLowerCase());
     }
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
