@@ -49,8 +49,8 @@ export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set() })
       : `orgs/${org}/actions/policies/${cfg.policyId}`;
     policy = evaluatePolicy(JSON.parse(await ghApi(endpoint)), cfg);
   } catch (e) {
-    policy = /404/.test(String(e?.message)) ? { status: 'missing', reason: `policy ${cfg.policyId} not found` }
-      : { status: 'unknown', reason: 'policy API unavailable or unreadable; check token org-admin read' };
+    // 403/404 (or any error) is unreadable, never ok and never a confirmed absence (SHIP-API-014).
+    policy = { status: 'unknown', reason: 'policy API unavailable or unreadable (403/404/other); check token admin:org read and the endpoint' };
   }
   let changelog = [];
   try { changelog = evaluateChangelog(await fetchFeed(cfg.changelogFeed), cfg, seen); } catch { /* feed is best effort */ }

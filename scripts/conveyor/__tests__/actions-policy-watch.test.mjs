@@ -30,6 +30,13 @@ describe('actions-policy-watch', () => {
     expect(r.policy.status).toBe('unknown');
     expect(r.alerts.length).toBe(1);
   });
+  it('a 403 or 404 from the API raises unknown, not ok or missing', async () => {
+    for (const msg of ['gh: Not Found (HTTP 404)', 'gh: Forbidden (HTTP 403)']) {
+      const r = await runWatch({ cfg, org: 'o', ghApi: async () => { throw new Error(msg); }, fetchFeed: async () => [] });
+      expect(r.policy.status).toBe('unknown');
+      expect(r.alerts.length).toBe(1);
+    }
+  });
   it('a changelog item naming the allow-policy sunset raises one alert', async () => {
     const items = [
       { id: 'a', title: 'Sunset of the Actions allow-policy', summary: '' },
