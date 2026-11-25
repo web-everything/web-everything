@@ -44,6 +44,35 @@ export function hasAutoProceedCandidate(pr) {
   return pending.length > 0 && pending.every(c => !isLoadFlakeStandDown(c) && ciReason(c) && standDownHead(c.body) === pr.headRefOid);
 }
 
+/**
+ * The shared exact-head evidence validation (also used by the no-code-owed re-review request): complete bound
+ * check history, suite identity, rerun lineage, completion times. Returns {runs, latest} or {hold}.
+ */
+export function latestRequiredRuns({ head, requiredChecks, requiredCheckBindings, checks } = {}) {
+  if (checks?.head !== head || checks?.complete !== true || !Array.isArray(checks.runs)) return { hold: hold('operator answer required: incomplete exact-head checks') };
+  if (checks.runs.length > 1000) return { hold: hold('operator answer required: check evidence exceeds 1000 runs') };
+  if (checks.runs.some(r => !Number.isSafeInteger(r?.id) || r.id < 1 || typeof r.name !== 'string'
+    || r.head_sha !== head) || new Set(checks.runs.map(r => r.id)).size !== checks.runs.length) return { hold: hold('operator answer required: invalid check evidence') };
+  const runs = boundAutoProceedRuns(checks.runs, requiredChecks, requiredCheckBindings);
+  if (runs === null) return { hold: hold('operator answer required: unreadable required-check integration policy') };
+  const requiredRuns = requiredChecks.map(name => runs.filter(r => r.name === name));
+  if (requiredRuns.some(history => history.some(r => checkIdentity(r) === null)
+    || new Set(history.map(checkIdentity)).size > 1)) return { hold: hold('operator answer required: ambiguous check identity') };
+  // App/suite/name is not a job identity. Only collapse a complete history when the
+  // Actions job reader proves one same-name job per attempt of a single workflow run.
+  if (requiredRuns.some(history => history.length > 1 && (
+    history.some(r => !Number.isSafeInteger(r.actions?.runId) || r.actions.runId < 1
+      || !Number.isSafeInteger(r.actions?.attempt) || r.actions.attempt < 1)
+    || new Set(history.map(r => r.actions?.runId)).size !== 1
+    || new Set(history.map(r => r.actions?.attempt)).size !== history.length
+  ))) return { hold: hold('operator answer required: ambiguous rerun lineage') };
+  const latest = requiredRuns.map(history => [...history].sort((a, b) => b.actions?.attempt - a.actions?.attempt)[0]);
+  const conclusion = r => String(r?.conclusion ?? '').toUpperCase();
+  if (latest.some(r => !r || String(r.status).toUpperCase() !== 'COMPLETED'
+    || !Number.isFinite(Date.parse(r.completed_at)) || !['SUCCESS', 'FAILURE', 'CANCELLED', 'SKIPPED'].includes(conclusion(r)))) return { hold: hold('operator answer required: missing, pending or unknown required check') };
+  return { runs, latest };
+}
+
 /** Evidence is a complete REST filter=all check-run feed fetched for `checks.head`, never a rollup. */
 export function classifyStandDownAutoProceed({ pr, requiredChecks, requiredCheckBindings, checks, redMainContext,
   prScopedChecks = DEFAULT_PR_SCOPED_CHECKS } = {}) {
@@ -57,27 +86,10 @@ export function classifyStandDownAutoProceed({ pr, requiredChecks, requiredCheck
     || !Number.isFinite(Date.parse(c.createdAt)))) return hold('operator answer required: missing stand-down identity/time');
   const target = pending.at(-1);
   if (!Array.isArray(requiredChecks) || !requiredChecks.length || requiredChecks.some(n => typeof n !== 'string' || !n)) return hold('operator answer required: unknown required checks');
-  if (checks?.head !== pr.headRefOid || checks?.complete !== true || !Array.isArray(checks.runs)) return hold('operator answer required: incomplete exact-head checks');
-  if (checks.runs.length > 1000) return hold('operator answer required: check evidence exceeds 1000 runs');
-  if (checks.runs.some(r => !Number.isSafeInteger(r?.id) || r.id < 1 || typeof r.name !== 'string'
-    || r.head_sha !== pr.headRefOid) || new Set(checks.runs.map(r => r.id)).size !== checks.runs.length) return hold('operator answer required: invalid check evidence');
-  const runs = boundAutoProceedRuns(checks.runs, requiredChecks, requiredCheckBindings);
-  if (runs === null) return hold('operator answer required: unreadable required-check integration policy');
-  const requiredRuns = requiredChecks.map(name => runs.filter(r => r.name === name));
-  if (requiredRuns.some(history => history.some(r => checkIdentity(r) === null)
-    || new Set(history.map(checkIdentity)).size > 1)) return hold('operator answer required: ambiguous check identity');
-  // App/suite/name is not a job identity. Only collapse a complete history when the
-  // Actions job reader proves one same-name job per attempt of a single workflow run.
-  if (requiredRuns.some(history => history.length > 1 && (
-    history.some(r => !Number.isSafeInteger(r.actions?.runId) || r.actions.runId < 1
-      || !Number.isSafeInteger(r.actions?.attempt) || r.actions.attempt < 1)
-    || new Set(history.map(r => r.actions?.runId)).size !== 1
-    || new Set(history.map(r => r.actions?.attempt)).size !== history.length
-  ))) return hold('operator answer required: ambiguous rerun lineage');
-  const latest = requiredRuns.map(history => [...history].sort((a, b) => b.actions?.attempt - a.actions?.attempt)[0]);
+  const evidence = latestRequiredRuns({ head: pr.headRefOid, requiredChecks, requiredCheckBindings, checks });
+  if (evidence.hold) return evidence.hold;
+  const { runs, latest } = evidence;
   const conclusion = r => String(r?.conclusion ?? '').toUpperCase();
-  if (latest.some(r => !r || String(r.status).toUpperCase() !== 'COMPLETED'
-    || !Number.isFinite(Date.parse(r.completed_at)) || !['SUCCESS', 'FAILURE', 'CANCELLED', 'SKIPPED'].includes(conclusion(r)))) return hold('operator answer required: missing, pending or unknown required check');
   const failures = latest.filter(r => conclusion(r) === 'FAILURE');
   const redMain = redMainContext?.config && Array.isArray(redMainContext.rows)
     && fixLoopRedMainLapse({ ...redMainContext, pr: pr.number, head: pr.headRefOid }) === true;

@@ -69,6 +69,7 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
     if (!flags[key]?.trim()) throw new Error(`--${key} is required and must be non-empty`);
   }
   if (!/^[\w.-]+\/[\w.-]+$/.test(flags.repo)) throw new Error('--repo must be owner/name');
+  if (flags.disposition === 'auto-rearm') throw new Error('--disposition=auto-rearm is the daemon\'s own request record; an operator uses rearm-review');
   // Validate the ceremony before any IO. --reason is deliberately never trimmed or paraphrased.
   buildOperatorAnswer({ standDownId: 'validation', ...flags });
   let snapshot;

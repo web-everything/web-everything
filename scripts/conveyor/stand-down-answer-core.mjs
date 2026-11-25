@@ -12,7 +12,11 @@ export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
  * `close-superseded` is executed mechanically by the conveyor, without dispatching a fixer.
  * `rearm-review` explicitly permits an unchanged-head rearm after the operator rules no code is owed.
  */
-export const DISPOSITIONS = Object.freeze(['close-superseded', 'rearm-review']);
+export const DISPOSITIONS = Object.freeze(['close-superseded', 'rearm-review', 'auto-rearm']);
+// `auto-rearm` is the daemon's recover-class request (SHIP-WM-139) for ONE fresh review of an unchanged head: it is
+// NOT an operator ruling, clears no hold, approves and waives nothing; the reviewer's new verdict decides.
+const AUTO_REARM_ACTOR = 'auto-rearm';
+export const isAutoRearmAnswer = (answer) => answer?.disposition === 'auto-rearm' && answer.actor === AUTO_REARM_ACTOR;
 
 /**
  * The disposition an answer carries: the explicit record field, or — for an answer recorded before the field
@@ -51,6 +55,11 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   // Encode the record separately so arbitrary operator prose cannot manufacture another marker.
   const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}), ...(supersedes !== undefined ? { supersedes } : {}), ...(noCodeOwed !== undefined ? { noCodeOwed } : {}) })).toString('base64');
   const surface = channel.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
+  if (disposition === 'auto-rearm') {
+    if (actor !== AUTO_REARM_ACTOR) throw new Error('auto-rearm is only valid for the daemon actor');
+    const why = reason.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').split('\n').map((line) => `> ${line}`).join('\n');
+    return `${OPERATOR_ANSWER_MARKER}\n## Auto re-review request (no code owed)\n\nPosted by the conveyor (${surface}), NOT an operator ruling. Refers to stand-down comment \`${standDownId}\`. This only asks the reviewer for one fresh verdict of the unchanged head: it clears no hold, approves nothing and waives nothing; the reviewer's new verdict decides.\n\n${why}\n\n**Disposition:** \`auto-rearm\` — a fresh review of the unchanged head was requested once.\n\n<!-- conveyor-stand-down-answer-record:${record} -->`;
+  }
   const quote = reason.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').split('\n').map((line) => `> ${line}`).join('\n');
   const dispositionText = disposition === 'rearm-review'
     ? 'operator ruled no code is owed; review may be re-armed on the unchanged head'
@@ -111,7 +120,7 @@ export function isOperatorAnswerStandDownSuperseded(comments, index) {
     // before the answer. A record posted AFTER the named one (a newer question the operator has not seen) stays.
     // `rearm-review` rules only the stand-down it names: it never reaches a newer or older unnamed record.
     const disposition = answerDisposition(answer);
-    if (disposition === 'rearm-review' ? index === named : (index <= named || disposition)) return true;
+    if (disposition === 'rearm-review' || disposition === 'auto-rearm' ? index === named : (index <= named || disposition)) return true;
   }
   return false;
 }
