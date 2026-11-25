@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from './git-bounded.mjs';
 import { NETWORK_GIT_TIMEOUT_MS } from './bounded-child.mjs';
+import { gitRun } from './git-run.mjs';
 import { CONSTELLATION_REPOS, repoKeyForDir, repoKeyForSlug } from './constellation-repos.mjs';
 
 /** Accept the shared keys, directory names and canonical/legacy slugs; refuse unknown repos. */
@@ -16,10 +17,13 @@ export function resolveSiblingRepoName(slugOrName) {
 const diagnostic = value => stripVTControlCharacters(String(value?.message ?? value))
   .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').slice(0, 500);
 
-const readOptions = cwd => ({ cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-  timeout: 5_000, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
-const readOrigin = cwd => execFileSync('git', ['remote', 'get-url', 'origin'], readOptions(cwd)).trim();
-const readShallow = cwd => execFileSync('git', ['rev-parse', '--is-shallow-repository'], readOptions(cwd)).trim();
+function readGitOutput(result) {
+  if (result.status !== 0) throw new Error(result.stderr || `git read failed (exit ${result.status})`);
+  return result.stdout.trim();
+}
+const readOptions = cwd => ({ cwd, timeoutMs: 5_000, maxBuffer: 1024 * 1024 });
+const readOrigin = cwd => readGitOutput(gitRun('git', ['remote', 'get-url', 'origin'], readOptions(cwd)));
+const readShallow = cwd => readGitOutput(gitRun('git', ['rev-parse', '--is-shallow-repository'], readOptions(cwd)));
 
 function originMatches(dir, slug, read) {
   try {
@@ -64,7 +68,7 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       const repo = CONSTELLATION_REPOS[repoKeyForSlug(name)];
       const primary = join(home, 'workspace', name);
       const url = `https://github.com/${repo.slug}.git`;
-      const runOptions = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      const runOptions = { stdio: ['ignore', 'ignore', 'inherit'],
         timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 };
       let fullPrimary = false;
       if (exists(join(primary, '.git'))) {

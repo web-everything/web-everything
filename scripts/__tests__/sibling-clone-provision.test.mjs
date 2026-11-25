@@ -7,10 +7,16 @@ import { boundedGitCommand, BOUNDED_GIT_GRACE_MS } from '../lib/git-bounded.mjs'
 import { NETWORK_GIT_TIMEOUT_MS } from '../lib/bounded-child.mjs';
 import { findRawPushes } from '../lib/push-gate-lint.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { gitRun } from '../lib/git-run.mjs';
 import { resolveSiblingRepoName, siblingCloneStatus, provisionMissingSiblingClones } from '../lib/sibling-clone-provision.mjs';
 
+vi.mock('../lib/git-run.mjs', () => ({ gitRun: vi.fn() }));
+
 const roots = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.mocked(gitRun).mockReset();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'sibling-clones-'));
   roots.push(root);
@@ -55,6 +61,7 @@ describe('sibling clone provisioning', () => {
     for (const [i, name] of ['frontierui', 'plateau-app'].entries()) {
       const bounded = boundedGitCommand(['clone', '--quiet', '-c', 'gc.auto=0', `https://github.com/${CONSTELLATION_REPOS[name].slug}.git`, resolve(options.cwd, '..', name)], NETWORK_GIT_TIMEOUT_MS);
       expect(options.run.mock.calls[i]).toEqual([bounded.file, bounded.args, expect.objectContaining({
+        stdio: ['ignore', 'ignore', 'inherit'],
         timeout: NETWORK_GIT_TIMEOUT_MS + BOUNDED_GIT_GRACE_MS, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
       })]);
     }
@@ -76,6 +83,20 @@ describe('sibling clone provisioning', () => {
     options.run.mockImplementationOnce(() => { throw new Error('permission denied'); });
     expect(provisionMissingSiblingClones(options)).toEqual({ provisioned: ['plateau-app'], failed: [{ name: 'frontierui', reason: 'permission denied' }] });
     expect(siblingCloneStatus(options)[0].present).toBe(false);
+  });
+
+  it('reports the clone exit error without captured stderr and removes its reserved directory', () => {
+    const options = fixture();
+    const message = 'Command failed: git clone (exit 128)';
+    options.run.mockImplementationOnce(() => {
+      throw Object.assign(new Error(message), { status: 128, stdout: null, stderr: null });
+    });
+    const log = vi.fn();
+    expect(provisionMissingSiblingClones({ ...options, log })).toEqual({
+      provisioned: ['plateau-app'], failed: [{ name: 'frontierui', reason: message }],
+    });
+    expect(log).toHaveBeenCalledWith(expect.stringContaining(`failed: ${message}; repair the sibling clone`));
+    expect(existsSync(resolve(options.cwd, '..', 'frontierui'))).toBe(false);
   });
 
   it('refuses to count a successful runner without .git as provisioned', () => {
@@ -131,6 +152,31 @@ describe('sibling clone provisioning', () => {
 
 
 describe('sibling clone audit boundaries', () => {
+  it.each([0, 1])('validates default origin reads through gitRun with exit status %s', status => {
+    const options = fixture();
+    const dir = resolve(options.cwd, '..', 'frontierui');
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    vi.mocked(gitRun).mockReturnValue({ status, stdout: 'https://github.com/frontier-ui/frontierui.git\n', stderr: '' });
+    expect(siblingCloneStatus({ ...options, read: undefined })[0].present).toBe(status === 0);
+    expect(gitRun).toHaveBeenCalledTimes(1);
+    expect(gitRun).toHaveBeenCalledWith('git', ['remote', 'get-url', 'origin'], {
+      cwd: dir, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
+    });
+  });
+
+  it.each([0, 1])('uses default shallow reads through gitRun and requires exit zero (%s)', status => {
+    const options = fixture();
+    const primary = join(options.home, 'workspace', 'frontierui');
+    mkdirSync(join(primary, '.git'), { recursive: true });
+    vi.mocked(gitRun).mockReturnValue({ status, stdout: 'false\n', stderr: 'read failed' });
+    expect(provisionMissingSiblingClones({ ...options, shallow: undefined }).failed).toEqual([]);
+    expect(options.run.mock.calls[0][1].includes('--reference')).toBe(status === 0);
+    expect(gitRun).toHaveBeenCalledTimes(1);
+    expect(gitRun).toHaveBeenCalledWith('git', ['rev-parse', '--is-shallow-repository'], {
+      cwd: primary, timeoutMs: 5_000, maxBuffer: 1024 * 1024,
+    });
+  });
+
   it.each(['https://github.com/frontier-ui/frontierui.git', 'git@github.com:frontier-ui/frontierui.git',
     'ssh://git@github.com/chalbert/frontierui.git', 'https://github.com/chalbert/frontierui'])('accepts expected origin %s', origin => {
     const options = fixture();
