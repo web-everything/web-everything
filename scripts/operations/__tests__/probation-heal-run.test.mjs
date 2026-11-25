@@ -3,8 +3,8 @@
  * arc of `probation-heal-run.mjs` over a fake `io` (no git, no gh, no model).
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import {
@@ -595,18 +595,28 @@ process.env.WE_ROUTING_BUILDER = 'codex';
 
 it('xp0lsdi: real backend holds expire independently, and selection preserves veto and simple-only rules', () => {
   const h = attemptHarness(), now = Date.parse('2026-10-02T12:00:00Z');
-  saveAgyHold({ requestedModel: 'claude-sonnet-4-6', servedBackend: 'anthropic', quotaState: 'exhausted', quotaResetsAt: new Date(now + 1000).toISOString() }, { dir: h.dir });
-  expect(readAgyHold('claude-sonnet-4-6', { dir: h.dir, now })).not.toBeNull();
-  expect(readAgyHold('gemini-3.1-pro', { dir: h.dir, now })).toBeNull();
-  expect(readAgyHold('claude-sonnet-4-6', { dir: h.dir, now: now + 1000 })).toBeNull();
-  const quota = { readScores: () => [], now, readHolds: (model, options) => readAgyHold(model, { ...options, dir: h.dir }) };
-  expect(routeAvailableCiHeal({ scope: ['we:src/a.ts'] }, quota).probationWorker.id).toBe('codex');
-  expect(routeAvailableCiHeal({ scope: ['we:src/a.ts'] }, { ...quota, now: now + 1000 }).probationWorker.id).toBe('antigravity-claude');
-  const common = { taskType: 'ci-heal', availability: { 'antigravity-claude': 'held' } };
-  const codex = selectProbationWorker(common).worker;
-  expect(selectProbationWorker({ ...common, vetoes: [{ provider: codex.provider, model: codex.model, taskType: 'ci-heal' }] }).worker).toBeNull();
-  const gemini = selectProbationWorker({ ...common, simple: true, vetoes: [{ provider: codex.provider, model: codex.model, taskType: 'ci-heal' }] }).worker;
-  expect(gemini).toMatchObject({ id: 'antigravity-gemini', checker: 'codex', supervision: 'full' });
+  // This quota test requires healthy auth; dispatch reads it from the hermetic HOME.
+  const authPath = join(homedir(), '.plateau', 'agy-auth-state.json');
+  mkdirSync(join(homedir(), '.plateau'), { recursive: true });
+  writeFileSync(authPath, JSON.stringify({ state: 'on', lastProbeAt: now }));
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    saveAgyHold({ requestedModel: 'claude-sonnet-4-6', servedBackend: 'anthropic', quotaState: 'exhausted', quotaResetsAt: new Date(now + 1000).toISOString() }, { dir: h.dir });
+    expect(readAgyHold('claude-sonnet-4-6', { dir: h.dir, now })).not.toBeNull();
+    expect(readAgyHold('gemini-3.1-pro', { dir: h.dir, now })).toBeNull();
+    expect(readAgyHold('claude-sonnet-4-6', { dir: h.dir, now: now + 1000 })).toBeNull();
+    const quota = { readScores: () => [], now, readHolds: (model, options) => readAgyHold(model, { ...options, dir: h.dir }) };
+    expect(routeAvailableCiHeal({ scope: ['we:src/a.ts'] }, quota).probationWorker.id).toBe('codex');
+    expect(routeAvailableCiHeal({ scope: ['we:src/a.ts'] }, { ...quota, now: now + 1000 }).probationWorker.id).toBe('antigravity-claude');
+    const common = { taskType: 'ci-heal', availability: { 'antigravity-claude': 'held' } };
+    const codex = selectProbationWorker(common).worker;
+    expect(selectProbationWorker({ ...common, vetoes: [{ provider: codex.provider, model: codex.model, taskType: 'ci-heal' }] }).worker).toBeNull();
+    const gemini = selectProbationWorker({ ...common, simple: true, vetoes: [{ provider: codex.provider, model: codex.model, taskType: 'ci-heal' }] }).worker;
+    expect(gemini).toMatchObject({ id: 'antigravity-gemini', checker: 'codex', supervision: 'full' });
+  } finally {
+    clock.mockRestore();
+    rmSync(authPath, { force: true });
+  }
 });
 
 
