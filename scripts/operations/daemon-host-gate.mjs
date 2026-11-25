@@ -169,7 +169,11 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
   const stop = (sig) => {
     if (!ended && child?.pid) {
       try { killGroup(child.pid, sig); } catch (error) {
-        if (error?.code !== 'ESRCH') throw error;
+        if (error?.code !== 'ESRCH') {
+          if (!env) throw error;
+          cleanupFailed = true;
+          log(`host-gate: process group ${child.pid} signal ${sig} failed (${error?.code ?? 'unknown'}); operator cleanup required`);
+        }
       }
     }
   };
@@ -218,8 +222,8 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     processSignals.removeListener('exit', onExit);
     void confirmGroupDeath().then((dead) => {
       if (dead) marker.clear();
-      cleanupFailed = !dead;
-      finish(dead ? code : 1);
+      cleanupFailed ||= !dead;
+      finish(cleanupFailed ? 1 : code);
     }).catch(() => {
       cleanupFailed = true;
       log(`host-gate: process group death confirmation failed; exiting 1, operator cleanup required`);
@@ -286,22 +290,28 @@ async function watchChild(child, ctx) {
 }
 
 /**
- * Swap-aware watch (BLUE-GREEN-SWAP S1.1). IPC reload requests start an inert green;
- * blue exit 76/77 promotes a live, ready candidate. Failed shadows are bounded.
+ * Swap-aware watch (BLUE-GREEN-SWAP S1.1). Requires explicit shadow capability
+ * and readiness validation. IPC reload leaves blue running; exit 76 ends blue
+ * before requesting a successor. Exit 76/77 can promote a validated live candidate.
+ * S1.4: green learns activation via the lease; no activation signal exists yet.
  */
 async function watchSwap(first, ctx) {
   const { thisHost, source, watchSleep, sleep, killGraceMs, log, spawnCandidate,
-    marker, greenMarker, candidateReady, greenCapable, shutdown, shuttingDown } = ctx;
+    marker, greenMarker, candidateReady, greenCapable, readinessTimeoutMs, shutdown, shuttingDown } = ctx;
   let active = first;
   let candidate = null;
   let gen = 1;
   let drops = 0;
   const stopSlots = async (slots) => {
     for (const c of slots) { c.revoke(); c.stop('SIGTERM'); }
-    const exited = await Promise.race([
-      Promise.all(slots.map((c) => c.done)).then(() => true),
-      sleep(killGraceMs).then(() => false),
-    ]);
+    const grace = new AbortController();
+    let exited;
+    try {
+      exited = await Promise.race([
+        Promise.all(slots.map((c) => c.done)).then(() => true),
+        sleep(killGraceMs, { signal: grace.signal }).then(() => false),
+      ]);
+    } finally { grace.abort(); }
     if (!exited) for (const c of slots) c.stop('SIGKILL');
     const codes = await Promise.all(slots.map((c) => c.done));
     if (slots.some((c) => c.cleanupFailed)) {
@@ -317,6 +327,28 @@ async function watchSwap(first, ctx) {
     log(`host-gate: blue asked for a successor; green gen=${gen + 1} started in shadow`);
   };
   let poll = watchSleep(POLL_MS);
+  const readyBeforeDeadline = async () => {
+    const deadline = new AbortController();
+    try {
+      const ready = Promise.resolve(candidateReady(gen + 1)).then((ok) => ({ who: 'ready', ok }));
+      const timeout = sleep(readinessTimeoutMs, { signal: deadline.signal }).then(() => ({ who: 'timeout' }));
+      while (true) {
+        const ev = await Promise.race([ready, timeout, poll.then(() => ({ who: 'poll' })),
+          shutdown.then(() => ({ who: 'shutdown' })), candidate.done.then(() => ({ who: 'exit' }))]);
+        if (ev.who === 'ready') return ev.ok === true;
+        if (ev.who !== 'poll') {
+          if (ev.who === 'timeout') log('host-gate: readiness deadline expired; stopping green, retaining blue exit code');
+          return false;
+        }
+        poll = watchSleep(POLL_MS);
+        const now = await pollRole(thisHost, source);
+        if (!now.active) {
+          log(`host-gate: owner=${now.owner} during readiness; stopping green`);
+          return false;
+        }
+      }
+    } finally { deadline.abort(); }
+  };
   while (true) {
     if (shuttingDown()) return await stopSlots(slots());
     const waits = [active.done.then((code) => ({ who: 'active', code })),
@@ -358,9 +390,13 @@ async function watchSwap(first, ctx) {
     }
     if (active.cleanupFailed) return await stopSlots(slots());
     try {
-      if (ev.code === EX_RELOAD && !candidate) startCandidate();
+      if (ev.code === EX_RELOAD && !candidate) {
+        const now = await pollRole(thisHost, source);
+        if (now.active) startCandidate();
+        else log(`host-gate: owner=${now.owner}; refusing successor after blue exit 76`);
+      }
       if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate && !candidate.exited
-          && await candidateReady(gen + 1) && !candidate.exited && !shuttingDown()) {
+          && await readyBeforeDeadline() && !candidate.exited && !shuttingDown()) {
         // Write before transferring cleanup ownership; failed promotion must still stop green.
         marker.track(candidate.pid);
         greenMarker.clear();
@@ -368,7 +404,8 @@ async function watchSwap(first, ctx) {
         active = candidate;
         candidate = null;
         gen += 1;
-        log(`host-gate: handover complete; green promoted to active gen=${gen}`);
+        drops = 0;
+        log(`host-gate: handover complete; green promoted to active gen=${gen}; no activation signal exists yet, green learns via lease (S1.4)`);
         continue;
       }
     } catch (error) {
@@ -410,9 +447,10 @@ export async function runGate(parsed, deps = {}) {
     killGraceMs = 30_000,
     markerPath: suppliedMarkerPath,
     markerFs = nodeFs,
-    greenCapable = true,
-    // S1.3/S1.4 wire this to validateReadyRecord; the gate cannot read green-ready itself.
-    candidateReady = () => true,
+    greenCapable,
+    // S1.3/S1.4 must supply shadow capability and a real ready-record validator.
+    candidateReady,
+    readinessTimeoutMs = 30_000,
     // Setting daemons.blueGreenSwap.<daemon>; absent = off (today's exit-and-restart path).
     swapEnabled = (daemon) => swapSettingOn({ daemons: platformPreference('daemons') }, daemon),
   } = deps;
@@ -440,11 +478,17 @@ export async function runGate(parsed, deps = {}) {
     return [sig, fn];
   });
   try {
+    try { greenMarker.check(); }
+    catch (error) {
+      log(`host-gate: green cleanup marker: ${error.message}; refusing to spawn, operator cleanup required`);
+      return 1;
+    }
     try { marker.check(); }
     catch (error) {
       log(`host-gate: cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
       return 1;
     }
+    let unwiredLogged = false;
     for (let poll = 0; poll < maxPolls; poll += 1) {
       if (shutdownCode !== null) return shutdownCode;
       const { active, owner } = await pollRole(thisHost, source);
@@ -463,14 +507,11 @@ export async function runGate(parsed, deps = {}) {
         log(`host-gate: cannot reserve cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
         return 1;
       }
-      const swap = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
-      if (swap) {
-        try { greenMarker.check(); }
-        catch (error) {
-          marker.clear();
-          log(`host-gate: green cleanup marker: ${error.message}; refusing to spawn, operator cleanup required`);
-          return 1;
-        }
+      const requested = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
+      const swap = requested && greenCapable === true && typeof candidateReady === 'function';
+      if (requested && !swap && !unwiredLogged) {
+        log('host-gate: swap is not wired (shadow capability and readiness required); using ordinary non-swap path');
+        unwiredLogged = true;
       }
       const child = startChild(parsed, {
         spawn, killGroup, processSignals, sleep, killGraceMs, log, marker,
@@ -479,12 +520,12 @@ export async function runGate(parsed, deps = {}) {
       const code = swap
         ? await watchSwap(child, {
           thisHost, source, watchSleep, sleep, killGraceMs, log, marker, greenMarker,
-          candidateReady, greenCapable, shuttingDown: () => shutdownCode !== null,
+          candidateReady, greenCapable, readinessTimeoutMs, shuttingDown: () => shutdownCode !== null,
           shutdown: new Promise((resolve) => {
             if (shutdown.signal.aborted) resolve();
             else shutdown.signal.addEventListener('abort', resolve, { once: true });
           }),
-          // The daemon MUST honour WE_DAEMON_ROLE to keep green inert (S1.3 follows).
+          // Explicit greenCapable attests shadow-role support; the gate itself cannot make a daemon inert.
           spawnCandidate: (gen) => {
             greenMarker.claim();
             return startChild(parsed, {

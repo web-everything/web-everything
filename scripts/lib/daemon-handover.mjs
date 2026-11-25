@@ -3,12 +3,13 @@
  * (BLUE-GREEN-SWAP S1.1; FLOW-DMN-026/029/045/049/050). Pure functions only.
  *
  * Exit codes a daemon uses toward the host gate when swap is enabled:
- *   EX_RELOAD (76)      blue asks the gate for a successor (green) and keeps running.
- *   EX_HANDED_OVER (77) blue finished the handover; the gate promotes green.
+ *   EX_RELOAD (76)      blue has exited and requests a successor (green).
+ *   EX_HANDED_OVER (77) blue has exited; the gate may promote a validated green.
+ * A running blue requests a successor through IPC {type: 'reload'}.
  */
 export const EX_RELOAD = 76;
 export const EX_HANDED_OVER = 77;
-/** Dropped greens (same digest) before the gate asks for the operator. */
+/** Dropped greens per active generation (reset on promotion; no digest tracking) before the gate asks for the operator. */
 export const MAX_GREEN_DROPS = 3;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -40,11 +41,11 @@ export function validateReadyRecord(rec, { gen, codeDigest, pid } = {}) {
  */
 export function probationVerdict({ startedAt, now, passExitCodes = [], lastHeartbeatAt, staleAfterMs, probationMs }) {
   if (![startedAt, now, staleAfterMs, probationMs].every(Number.isFinite)) return 'rollback';
-  if (!Array.isArray(passExitCodes) || Array.from(passExitCodes).some((c) => typeof c !== 'number' || c !== 0)) return 'rollback';
+  if (!Array.isArray(passExitCodes) || Array.from(passExitCodes).some((c) => c !== 0)) return 'rollback';
   if (now - startedAt >= probationMs) return 'rollback';
   if (!Number.isFinite(lastHeartbeatAt) || lastHeartbeatAt > now || now - lastHeartbeatAt > staleAfterMs) return 'rollback';
   if (passExitCodes.length > 0 && now - startedAt >= 0) return 'promote';
-  return now - startedAt >= probationMs ? 'rollback' : 'wait';
+  return 'wait';
 }
 
 /** Switch pause: handover instant to green's first pass start. null when either end is unknown or reversed. */

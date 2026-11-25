@@ -53,7 +53,7 @@ describe('probation audit regressions', () => {
   it('rejects future heartbeats', () => {
     expect(probationVerdict({ ...base, lastHeartbeatAt: 101 })).toBe('rollback');
   });
-  it.each([new Array(1), [0, , 0], ['0'], [undefined], null, { length: 1 }].map((passExitCodes) => ({ passExitCodes })))('rejects non-dense numeric pass arrays: $passExitCodes', ({ passExitCodes }) => {
+  it.each([new Array(1), [0, , 0], ['0'], [NaN], [false], [undefined], null, { length: 1 }].map((passExitCodes) => ({ passExitCodes })))('rejects non-dense numeric pass arrays: $passExitCodes', ({ passExitCodes }) => {
     expect(probationVerdict({ ...base, passExitCodes })).toBe('rollback');
   });
 });

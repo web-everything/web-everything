@@ -1,7 +1,10 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { runGate } from '../daemon-host-gate.mjs';
+
+vi.mock('../../lib/policy-cascade.mjs', () => ({ platformPreference: vi.fn() }));
+import { platformPreference } from '../../lib/policy-cascade.mjs';
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const parsed = { cmd: 'daemon', args: [], daemon: 'drain' };
@@ -29,6 +32,8 @@ function setup({ swap }) {
     sleep: async () => {},
     source: { readOwner: async () => { reads += 1; return { host: HOST_A, version: 'file' }; } },
     swapEnabled: () => swap,
+    greenCapable: true,
+    candidateReady: () => true,
     spawn: (cmd, args, opts) => {
       const c = new EventEmitter();
       c.pid = 2000 + children.length;
@@ -50,7 +55,7 @@ function setup({ swap }) {
 const tick = () => new Promise((r) => setTimeout(r, 5));
 
 describe('host gate swap', () => {
-  it('exit 76 spawns a candidate while active keeps running; exit 77 promotes without a standby poll', async () => {
+  it('IPC reload starts a shadow while blue runs; exit 77 promotes without a standby poll', async () => {
     const h = setup({ swap: true });
     const run = runGate(parsed, h.deps);
     await tick();
@@ -83,7 +88,7 @@ describe('host gate swap', () => {
     expect(await run).toBe(5);
   });
 
-  it('blue exiting 76 promotes a fresh green with no owner re-read', async () => {
+  it('blue exiting 76 rechecks ownership before starting a fresh ready green', async () => {
     const h = setup({ swap: true });
     const run = runGate(parsed, h.deps);
     await tick();
@@ -91,7 +96,7 @@ describe('host gate swap', () => {
     h.children[0].emit('exit', 76, null);
     await tick();
     expect(h.children).toHaveLength(2);
-    expect(h.reads()).toBe(readsBefore);
+    expect(h.reads()).toBe(readsBefore + 1);
     h.children[1].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
@@ -282,5 +287,139 @@ describe('swap request races', () => {
     await run;
     expect(h.logs.join(' ')).not.toContain('promoted');
     expect(h.children[1].kills).toContain('SIGTERM');
+  });
+});
+
+
+describe('closed swap wiring and bounded handover', () => {
+  it.each(['candidateReady', 'greenCapable'])('missing %s falls back once to ordinary non-swap execution', async (key) => {
+    const h = setup({ swap: true });
+    delete h.deps[key];
+    const run = runGate(parsed, h.deps);
+    await tick();
+    h.children[0].emit('message', { type: 'reload' });
+    await tick();
+    h.children[0].emit('exit', 76, null);
+    expect(await run).toBe(76);
+    expect(h.children).toHaveLength(1);
+    expect(h.spawns[0].opts.env).toBeUndefined();
+    expect(h.logs.filter((l) => l.includes('swap is not wired'))).toHaveLength(1);
+  });
+
+  it.each([undefined, {}, { blueGreenSwap: { drain: 'off' } }, { blueGreenSwap: { drain: 'true' } },
+    { blueGreenSwap: { drain: true } }, { blueGreenSwap: { drain: 'on' } }])('default platform setting %j', async (prefs) => {
+    platformPreference.mockReturnValue(prefs);
+    const h = setup({ swap: false });
+    delete h.deps.swapEnabled;
+    const run = runGate(parsed, h.deps);
+    await tick();
+    const enabled = [true, 'on'].includes(prefs?.blueGreenSwap?.drain);
+    expect(platformPreference).toHaveBeenLastCalledWith('daemons');
+    expect(h.spawns[0].opts.env?.WE_DAEMON_ROLE).toBe(enabled ? 'blue' : undefined);
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+  });
+
+  it('checks a retained green marker even with swap off', async () => {
+    const h = setup({ swap: false });
+    h.files.set('state/m.json.green', JSON.stringify({ pgid: 999, time: 1 }));
+    const kill = h.deps.killGroup;
+    h.deps.killGroup = (pid, sig) => { if (pid === 999) return; return kill(pid, sig); };
+    const run = runGate(parsed, h.deps);
+    await tick();
+    h.children.forEach((c) => c.emit('exit', 0, null));
+    expect(await run).toBe(1);
+    expect(h.children).toHaveLength(0);
+    expect(h.logs.join(' ')).toContain('green cleanup marker');
+  });
+
+  it.each(['SIGINT', 'SIGHUP'])('candidate starts shutdown with TERM on wrapper %s', async (sig) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    const { run } = await shadow(h);
+    h.deps.processSignals.emit(sig);
+    await run;
+    expect(h.children[1].kills[0]).toBe('SIGTERM');
+    expect(h.children[1].kills).not.toContain(sig);
+  });
+
+  it('exit 76 refuses a successor after ownership changes', async () => {
+    const h = setup({ swap: true });
+    const run = runGate(parsed, h.deps);
+    await tick();
+    h.deps.source.readOwner = async () => null;
+    h.children[0].emit('exit', 76, null);
+    await tick();
+    h.children.slice(1).forEach((c) => c.emit('exit', 0, null));
+    expect(await run).toBe(76);
+    expect(h.children).toHaveLength(1);
+  });
+
+  it.each(['deadline', 'ownership'])('pending readiness yields to %s', async (mode) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    h.deps.candidateReady = () => new Promise(() => {});
+    let deadline;
+    h.deps.sleep = (ms, opts) => ms === 123 ? new Promise((r) => { deadline = r; }) : Promise.resolve();
+    h.deps.readinessTimeoutMs = 123;
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 77, null);
+    await tick();
+    if (mode === 'deadline') deadline?.();
+    else { h.deps.source.readOwner = async () => null; h.wake(); }
+    await tick();
+    expect(h.children[1].kills).toContain('SIGTERM');
+    expect(await run).toBe(77);
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it('tries every slot when the first TERM throws', async () => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    const kill = h.deps.killGroup;
+    h.deps.killGroup = (pid, sig) => { if (pid === 2000 && sig === 'SIGTERM') throw Object.assign(new Error('denied'), { code: 'EPERM' }); return kill(pid, sig); };
+    const { run } = await shadow(h);
+    h.deps.source.readOwner = async () => null;
+    const result = run.catch(() => 'escaped');
+    h.wake();
+    await tick();
+    expect(h.children[1].kills).toContain('SIGTERM');
+    expect(await result).toBe(1);
+  });
+
+  it('cancels the multi-slot grace timer when all slots exit early', async () => {
+    const h = setup({ swap: true });
+    const signals = [];
+    h.deps.sleep = (ms, { signal } = {}) => { signals.push(signal); return new Promise(() => {}); };
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 0, null);
+    await tick();
+    h.children[1].emit('exit', 0, null);
+    await run;
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every((s) => s?.aborted)).toBe(true);
+  });
+
+  it('resets drops on promotion and logs lease-based activation (S1.4)', async () => {
+    const h = setup({ swap: true });
+    const { run } = await shadow(h);
+    h.children[1].emit('exit', 1, null);
+    await tick();
+    h.children[0].emit('message', { type: 'reload' });
+    await tick();
+    h.children[0].emit('exit', 77, null);
+    await tick();
+    const active = h.children[2];
+    for (let i = 0; i < 3; i += 1) {
+      active.emit('message', { type: 'reload' });
+      await tick();
+      expect(h.children).toHaveLength(4 + i);
+      h.children.at(-1).emit('exit', 1, null);
+      await tick();
+    }
+    expect(h.logs.join(' ')).toContain('no activation signal');
+    expect(h.logs.join(' ')).toContain('lease');
+    active.emit('exit', 0, null);
+    expect(await run).toBe(0);
   });
 });
