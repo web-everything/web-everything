@@ -2,6 +2,7 @@
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { standDownComments, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
+import { REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER } from './rearm-round-count.mjs';
 
 export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
 
@@ -199,4 +200,33 @@ export function isCloseSupersededExecuted(comments) {
   if (answerAt < 0) return false;
   return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
     && c.body.trimStart().startsWith(CLOSE_SUPERSEDED_MARKER));
+}
+
+/** STANDDOWN-EMPTY-ROUND (D2): the orchestrator's `rearm-review --no-code-owed` ruling, executed once by the conveyor. */
+export const isNoCodeRearmAnswer = (answer) => answerDisposition(answer) === 'rearm-review' && answer?.noCodeOwed === true;
+
+/**
+ * True once a TRUSTED re-arm marker (success) or empty-round note (the guard refused) postdates the latest answer.
+ * Either one spends the ruling: the conveyor never retries it, so a refused rearm cannot loop (bounded at one).
+ */
+export function isNoCodeRearmExecuted(comments) {
+  if (!Array.isArray(comments)) return false;
+  let answerAt = -1;
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    const answer = parseOperatorAnswer(comments[i]);
+    if (answer && answersEarlierStandDown(comments, i, answer)) { answerAt = i; break; }
+  }
+  if (answerAt < 0) return false;
+  return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
+    && [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some((m) => c.body.trimStart().startsWith(m)));
+}
+
+/** The comment id of the same "latest answer" `latestOperatorAnswer` returns (null when absent or unnumbered). */
+export function latestOperatorAnswerCommentId(comments) {
+  if (!Array.isArray(comments)) return null;
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    const answer = parseOperatorAnswer(comments[i]);
+    if (answer && answersEarlierStandDown(comments, i, answer)) return comments[i]?.id != null ? String(comments[i].id) : null;
+  }
+  return null;
 }

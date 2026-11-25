@@ -32,7 +32,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
 import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
-import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
 // fix-agent brief's entrypoint and the pinned tests keep importing it from here (it is single-sourced next door).
@@ -137,7 +137,7 @@ export function conflictFixTargetTrailer(ref, sha) {
 }
 
 /** Stable first line of the "empty fix round" comment. Deliberately NOT {@link REARM_COMMENT_MARKER}: it must never be counted as a round. */
-export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made — fix still owed';
+export { NO_CHANGE_COMMENT_MARKER };
 
 const FIX_BEGIN_FIRST_LINE = '🔒 conveyor fix-begin — fix claim held';
 

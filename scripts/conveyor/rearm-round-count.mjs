@@ -3,6 +3,8 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 // Durable protocol strings: preserve existing PR comment history when changing their readers.
 export const REARM_COMMENT_MARKER = '🔧 conveyor fix — re-armed for re-review';
+/** Stable first line of the "empty fix round" comment. Deliberately NOT {@link REARM_COMMENT_MARKER}: it must never be counted as a round. */
+export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made — fix still owed';
 export const SAME_HEAD_WAKE_TRAILER = '<!-- same-head-pause-wake -->';
 
 /** A trusted re-arm closes a fix round; a same-head wake only requests another review. */

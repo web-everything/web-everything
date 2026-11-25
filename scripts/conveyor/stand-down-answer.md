@@ -37,6 +37,10 @@ while `red-team:blocked` stands (a security fix is owed), or when labels cannot 
 Only one cap override is available per changes-verdict window. After it is spent, both a fresh answer
 and a retry superseding an ignored answer refuse before posting; a new changes verdict resets it.
 The CLI uses the reader's `rearmWindow().wouldHonour(answer)` for both paths.
+A no-code rearm ruling (`--disposition=rearm-review --no-code-owed`) is executed by the conveyor, once,
+and never by a fixer: the reconcile planner emits one `rearm-no-code` row and promote-draft-pr-dispatch runs
+`rearm-review.mjs --expect-head=<head>` itself. Any later fix-begin, a red-team label, a moved head or an
+already-spent ruling refuses with a note (`no-code-rearm-held` / `no-code-rearm-spent`); re-answer to retry.
 The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
 we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-command workflow,
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.

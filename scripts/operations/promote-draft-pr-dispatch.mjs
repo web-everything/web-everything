@@ -64,6 +64,7 @@ import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
+import { spawnSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
@@ -183,6 +184,22 @@ export function defaultClosePr({ repoSlug, prNumber, comment, runGh = runGhSync 
 }
 
 /**
+ * STANDDOWN-EMPTY-ROUND (D2) — run the orchestrator's no-code rearm ruling through the one sanctioned writer.
+ * rearm-review.mjs keeps every guard of its own (head pin via --expect-head, decideSetLabel, the empty-round
+ * check, `review:human` kept). One attempt per tick; a non-zero exit throws and the caller refuses.
+ */
+export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, run = spawnSync } = {}) {
+  const script = new URL('../conveyor/rearm-review.mjs', import.meta.url).pathname;
+  const result = run(process.execPath, [script, String(prNumber), `--repo=${repoSlug}`, `--expect-head=${expectHead}`,
+    `--actor=conveyor (operator no-code ruling ${answerId ?? 'unknown'})`],
+  { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 });
+  if (result?.status !== 0) {
+    throw new Error(String(result?.stderr || result?.stdout || result?.error?.message || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
+  }
+  return String(result.stdout ?? '');
+}
+
+/**
  * #3850 — the PR's backlog cards that ALREADY exist on the default branch. Closing the PR discards a card the PR
  * itself introduced; a card that is on main would stay open and needs a backlog edit (there is no sanctioned
  * "superseded" status in `backlog.mjs`), so the executor refuses rather than closing half the ruling. Only the PR's
@@ -286,6 +303,8 @@ export function runReconcilePromoteDraftDispatch({
   addLabel = defaultAddLabel,
   // #3850 — the close-superseded disposition's two IO seams (a test injects both).
   closePr = defaultClosePr,
+  // STANDDOWN-EMPTY-ROUND (D2): the no-code rearm ruling's one write (a test injects it).
+  rearm = defaultRearmNoCode,
   readCardsOnMain = defaultReadCardsOnMain,
   // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
   // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
@@ -487,6 +506,16 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
+  // ── rearm-no-code half (STANDDOWN-EMPTY-ROUND D2): the orchestrator's no-code ruling, executed once, never a fixer.
+  // ONE attempt per tick, no retry: either rearm-review marker (re-armed, or the empty-round note) spends the ruling.
+  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code')) {
+    try {
+      rearm({ repoSlug, prNumber: entry.prNumber, expectHead: entry.expectHead, answerId: entry.answerId });
+      dispatched.push({ pr: entry.prNumber, kind: 'rearm-no-code' });
+    } catch (e) {
+      refusals.push({ pr: entry.prNumber, kind: 'rearm-no-code-failed', why: String((e && e.message) || e).split('\n')[0] });
+    }
+  }
   return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
 }
 
@@ -512,7 +541,7 @@ if (IS_CLI) {
     } else {
       const lines = [`promote-draft-pr-dispatch — ${result.dispatched.length} promoted, ${result.refusals.length} refusal(s)`];
       // Name what was actually done: a close-superseded entry once printed "promoted … to ready-for-review" (live #4734).
-      const done = { 'close-superseded': 'closed PR #%s as superseded (operator disposition)', 'restore-review-label': 'restored the review label on PR #%s' };
+      const done = { 'close-superseded': 'closed PR #%s as superseded (operator disposition)', 'rearm-no-code': 're-armed PR #%s for review (operator no-code ruling)', 'restore-review-label': 'restored the review label on PR #%s' };
       for (const p of result.dispatched) lines.push(`  → ${(done[p.kind] ?? (p.stackedOn ? `promoted stacked PR #%s to ready-for-review while its base ${p.stackedOn} is open (own required checks green)` : 'promoted PR #%s to ready-for-review (required checks green)')).replace('%s', p.pr)}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.pr} — ${r.why}`);
       process.stdout.write(`${lines.join('\n')}\n`);
