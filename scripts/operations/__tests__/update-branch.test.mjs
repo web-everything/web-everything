@@ -3,6 +3,8 @@ import { createUpdateBranchSinks } from '../update-branch-io.mjs';
 import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
+// Collect the operation registry before the per-test deadline, like the other CLI wiring suites.
+import { resolveOperation } from '../run.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -160,7 +162,6 @@ describe('update-branch', () => {
   });
 
   it('declares required CLI inputs and prints exactly one JSON line through the engine', async () => {
-    const { resolveOperation } = await import('../run.mjs');
     const { declaration, registry, finish, sinks } = resolveOperation(UPDATE_BRANCH_OP);
     expect(declaration.name).toBe(updateBranchOperation().name);
     expect(typeof sinks[UPDATE_BRANCH_OP]).toBe('function');
