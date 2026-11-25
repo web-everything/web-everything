@@ -4,7 +4,7 @@
  *   file. "In flight" still means a live claim or a higher-ranked waiter; the new AGING OVERRIDE admits a waiter
  *   whose episode is older than the bound past them — never past a fix accepted earlier in the same pass.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   filterFixesByInFlightScope, resolveScopeOverlapMaxWaitMinutes, DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES,
 } from '../reconcile-fix-dispatch.mjs';
@@ -68,5 +68,103 @@ describe('#3881 — scope-overlap aging override', () => {
     expect(resolveScopeOverlapMaxWaitMinutes({ WE_SCOPE_OVERLAP_MAX_WAIT_MINUTES: '0' })).toBeNull();
     expect(resolveScopeOverlapMaxWaitMinutes({ WE_SCOPE_OVERLAP_MAX_WAIT_MINUTES: 'off' })).toBeNull();
     expect(resolveScopeOverlapMaxWaitMinutes({ WE_SCOPE_OVERLAP_MAX_WAIT_MINUTES: 'junk' })).toBe(DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES);
+  });
+});
+
+
+// Landing holds use the production aging bound, and a separate per-pair observation clock.
+import { resolveFixScopePolicy } from '../fix-scope-policy.mjs';
+import * as dispatchApi from '../reconcile-fix-dispatch.mjs';
+import { noteEpisodeKey, noteHeadline } from '../reconcile-note-comment.mjs';
+const isoAgo = minutes => new Date(NOW - minutes * 60000).toISOString();
+const holder = { pr: 90, scope: [FILE], headRefOid: 'holder-head' };
+const oldWaiter = { pr: 80, scope: [FILE], waitingSince: isoAgo(120) };
+const landingPolicy = resolveFixScopePolicy({ env: {}, platform: {}, readTool: () => ({ fixScope: { priorityBypass: false } }) });
+function landingGate(options = {}, planned = [oldWaiter], claims = []) {
+  return filterFixesByInFlightScope(planned, [], claims, {
+    now: NOW, maxWaitMinutes: DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES, rebaseExempt: null,
+    policy: landingPolicy, regionOverlap: () => ({ overlap: true, conflict: true, why: 'trial merge conflicts' }),
+    holderState: () => ({ labels: ['review:accepted'] }), landingHolders: [holder],
+    landingBlockedSince: new Map([['80:90', isoAgo(61)]]), ...options,
+  });
+}
+describe('landing holder aging protection', () => {
+  it.each([{ labels: ['review:accepted'] }, { inMergeQueue: true }])('aging never releases a confirmed conflict with a landing holder (%j)', state => {
+    const out = landingGate({ holderState: () => state });
+    expect(out.planned).toEqual([]);
+    expect(out.scopeDecisions[0]).toMatchObject({ decision: 'blocked', why: expect.stringContaining('escalated, not released') });
+    expect(out.refusals[0].kind).toBe('scope-overlap');
+  });
+  it('unreadable holder state stays held at 500 minutes and escalates fail closed', () => {
+    const out = landingGate({ holderState: () => null, landingBlockedSince: new Map([['80:90', isoAgo(500)]]) }, [{ ...oldWaiter, waitingSince: isoAgo(500) }]);
+    expect(out.planned).toEqual([]);
+    expect(out.landingEscalations[0]).toMatchObject({ holder: 90, failedClosed: true, waitedMinutes: 500 });
+  });
+  it('non-landing confirmed conflicts dispatch in parallel', () => {
+    expect(landingGate({ holderState: () => ({ labels: [] }) }).planned.map(e => e.pr)).toEqual([80]);
+  });
+  it.each([null, 59, 61])('pair clock ignores a ten-day-old waiter; pair age %s', age => {
+    const out = landingGate({ landingBlockedSince: new Map(age === null ? [] : [['80:90', isoAgo(age)]]) }, [{ ...oldWaiter, waitingSince: isoAgo(14400) }]);
+    expect(out.landingHolds).toEqual([{ pr: 80, holder: 90, holderHead: 'holder-head', since: age === null ? new Date(NOW).toISOString() : isoAgo(age), failedClosed: false }]);
+    expect(out.landingEscalations).toHaveLength(age === 61 ? 1 : 0);
+  });
+  it('off keeps holds visible with no escalation', () => {
+    const out = landingGate({ maxWaitMinutes: null });
+    expect(out.planned).toEqual([]); expect(out.landingHolds).toHaveLength(1); expect(out.landingEscalations).toEqual([]);
+  });
+  it('same pass accepts exactly the first of two old overlapping waiters', () => {
+    const out = landingGate({ landingHolders: [], holderState: () => ({ labels: ['review:accepted'] }) }, [oldWaiter, { ...oldWaiter, pr: 81 }]);
+    expect(out.planned.map(e => e.pr)).toEqual([80]);
+  });
+  it('mixed blockers release the live fixer and escalate only the landing holder', () => {
+    const out = landingGate({ regionOverlap: (_e, c) => ({ overlap: true, conflict: c.pr === 90, why: 'shared region' }) }, [oldWaiter], [{ meta: { pr: 91, scope: [FILE] } }]);
+    expect(out.planned).toEqual([]);
+    expect(out.scopeDecisions.find(d => d.holder === 91).decision).toBe('admitted');
+    expect(out.landingEscalations.map(e => e.holder)).toEqual([90]);
+  });
+  it('groups multiple waiters into one holder escalation using the earliest clock', () => {
+    const out = landingGate({ landingBlockedSince: new Map([['80:90', isoAgo(70)], ['81:90', isoAgo(61)]]) }, [oldWaiter, { ...oldWaiter, pr: 81 }]);
+    expect(out.landingEscalations).toEqual([{ holder: 90, holderHead: 'holder-head', waiters: [80, 81], since: isoAgo(70), waitedMinutes: 70, maxWaitMinutes: DEFAULT_SCOPE_OVERLAP_MAX_WAIT_MINUTES, failedClosed: false }]);
+  });
+  it('a cleared holder dispatches the waiter on the next pass', () => {
+    expect(landingGate({ holderState: () => ({ labels: [] }) }).landingHolds).toEqual([]);
+    expect(landingGate({ landingHolders: [] }).planned.map(e => e.pr)).toEqual([80]);
+  });
+});
+describe('landing-holder-stuck reconcile notes', () => {
+  const escalation = { holder: 90, holderHead: 'h1', waiters: [80, 81], since: isoAgo(61), waitedMinutes: 61, maxWaitMinutes: 60, failedClosed: false };
+  it('keys and headlines the holder head episode', () => {
+    const note = { kind: 'landing-holder-stuck', prNumber: 90, holderHead: 'h1' };
+    expect(noteEpisodeKey(note)).toBe('landing-holder-stuck:90:h1');
+    expect(noteHeadline(note)).toBe('needs your decision: a landing PR has held conflicting fixes past the aging bound');
+  });
+  it('posts once on the holder, notifies once, and posts again for a new head', () => {
+    const comments = [], postComment = vi.fn(({ body }) => { comments.push({ body, viewerDidAuthor: true }); return { ok: true }; }), notify = vi.fn();
+    const run = e => dispatchApi.recordLandingHolderEscalation({ escalation: e, repo: 'owner/repo', readPrComments: () => comments, postComment, notify });
+    run(escalation); run(escalation); run({ ...escalation, holderHead: 'h2' });
+    expect(postComment).toHaveBeenCalledTimes(2); expect(notify).toHaveBeenCalledTimes(2);
+    expect(postComment.mock.calls[0][0]).toMatchObject({ pr: 90, body: expect.stringContaining('#80, #81') });
+    expect(postComment.mock.calls[0][0].body).toContain('61 minutes');
+    expect(postComment.mock.calls[0][0].body).toContain('/finish');
+  });
+  it.each([() => null, () => { throw new Error('unreadable'); }])('unreadable history fails closed without posting or notifying', readPrComments => {
+    const postComment = vi.fn(), notify = vi.fn();
+    expect(() => dispatchApi.recordLandingHolderEscalation({ escalation, readPrComments, postComment, notify })).not.toThrow();
+    expect(postComment).not.toHaveBeenCalled(); expect(notify).not.toHaveBeenCalled();
+  });
+  it('unknown holder head fails closed without reading or posting', () => {
+    const readPrComments = vi.fn(), postComment = vi.fn(), notify = vi.fn();
+    expect(dispatchApi.recordLandingHolderEscalation({ escalation: { ...escalation, holderHead: null }, readPrComments, postComment, notify })).toEqual({ headUnknown: true });
+    expect(readPrComments).not.toHaveBeenCalled(); expect(postComment).not.toHaveBeenCalled(); expect(notify).not.toHaveBeenCalled();
+  });
+  it('an untrusted marker cannot suppress the holder escalation', () => {
+    const postComment = vi.fn(() => ({ ok: true })), notify = vi.fn();
+    dispatchApi.recordLandingHolderEscalation({ escalation, readPrComments: () => [{ body: '<!-- conveyor-note-key: landing-holder-stuck:90:h1 -->', author: { login: 'untrusted-outsider' } }], postComment, notify });
+    expect(postComment).toHaveBeenCalledOnce(); expect(notify).toHaveBeenCalledOnce();
+  });
+  it('failed posting never notifies and can be retried', () => {
+    const notify = vi.fn();
+    dispatchApi.recordLandingHolderEscalation({ escalation, readPrComments: () => [], postComment: () => ({ ok: false }), notify });
+    expect(notify).not.toHaveBeenCalled();
   });
 });
