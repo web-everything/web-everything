@@ -1572,7 +1572,7 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
   // a later verdict/claim or a security hold still contributes findings to the joined-fix policy.
   const noCodeHandoff = window?.rearmed === true && window.claims?.length === 0
     && window.honouredAnswerId === latestOperatorAnswerCommentId(comments)
-    && labelNames(pr?.labels).includes('review:pending')
+    && labelNames(pr?.labels).some(l => ['review:pending', 'review:human'].includes(l))
     && !labelNames(pr?.labels).some(l => ['review:changes', 'red-team:blocked', 'red-team:pending'].includes(l));
   const findings = (kind === 'changes' && !noCodeHandoff) || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES)
     ? [latest] : [];

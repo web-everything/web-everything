@@ -1108,7 +1108,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * capability, never supply a verdict (PR #1056 review, B2).
  * @param {{argv?:string[], fixedTo?:string|null, defaultActor:string, repoOptional?:boolean, usage:string,
  *   allowClearHuman?:boolean,
- *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,
+ *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,comments:object[]|null,
  *     humanClearance?:{actor:string,sha:string,sourceId?:string}|null})=>string,
  *   successResult:(o:{pr:number,to:string,decision:object,labels:string[]})=>object,
  *   refusalResult:(o:{pr:number,decision:object})=>object,
@@ -1974,6 +1974,7 @@ export function runReviewLabelCli({
   }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
+    comments: rearmThread, // Full, validated rearm thread; render no-code handoffs from the writer's evidence.
   }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.

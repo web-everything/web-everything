@@ -13,6 +13,8 @@ import { decideSetLabel, runReviewLabelCli } from '../../review-set-label.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 import { buildNoChangeComment, buildRearmComment, decideRearm } from '../rearm-review.mjs';
 import { runReconcilePromoteDraftDispatch, defaultRearmNoCode } from '../../operations/promote-draft-pr-dispatch.mjs';
+import { replayNoCodeHandoff } from '../soak/breaks/no-code-rearm-handoff.mjs';
+import { NO_CODE_REARM_TRAILER, REARM_COMMENT_MARKER, isFixRoundRearmComment } from '../rearm-round-count.mjs';
 
 const BOT = { login: 'web-everything' };
 const HEAD = '93ff74ce966785fe5844fa63f2be9b8ed091aa52';
@@ -34,6 +36,66 @@ const receipt = (state, head = HEAD, answerId = 'IC_200') => ({ id: `IC_${state}
   body: `<!-- no-code-rearm ${state === 'failed' ? 'attempt' : 'state'}=${state} answer=${answerId} head=${head} -->` });
 
 describe('review recovery regressions', () => {
+  it.each([false, true])('retires waived structured findings after the real label writer handoff (human=%s)', human => {
+    const { first, second, snapshot } = replayNoCodeHandoff({ human });
+    expect(first.dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(first.refusals).toEqual([]);
+    expect(second.dispatch.map(d => d.kind)).toEqual(['ci-heal']);
+    expect(second.dispatch[0].joinedInputs?.reviewFindings ?? []).toEqual([]);
+    expect(snapshot.labels.some(l => l.name === 'review:human')).toBe(human);
+    expect(snapshot.labels.some(l => l.name === 'review:pending')).toBe(!human);
+  });
+  it.each([4, 5, 6])('no-code handoff preserves %s spent rounds and review eligibility at the cap', rounds => {
+    const { first, second, attempts } = replayNoCodeHandoff({ rounds, red: false });
+    expect(first.dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(first.refusals).toEqual([]);
+    expect(attempts).toBe(rounds);
+    expect(second.dispatch.map(d => d.kind)).toEqual(rounds <= 5 ? ['review'] : []);
+    expect(second.refusals.some(r => r.kind === 'cap-exhausted')).toBe(rounds > 5);
+  });
+  it('the shared writer retains the no-code exemption when the initial empty-round read fails', () => {
+    const { attempts, second } = replayNoCodeHandoff({ rounds: 5, red: false, guardUnreadable: true });
+    expect(attempts).toBe(5);
+    expect(second.dispatch.map(d => d.kind)).toEqual(['review']);
+  });
+  it.each([
+    ['later fix claim', s => s.comments.push(begin('IC_later'))],
+    ['later verdict', s => s.comments.push({ ...s.comments[0], id: 'IC_later' })],
+    ['wrong-head receipts', s => { s.comments = s.comments.filter(c => !c.body.startsWith(REARM_COMMENT_MARKER))
+      .map(c => c.body.startsWith('<!-- no-code-rearm ') ? { ...c, body: c.body.replace(HEAD, 'b'.repeat(40)) } : c); }],
+    ...['review:changes', 'red-team:blocked', 'red-team:pending'].map(name => [name, s => s.labels.push({ name })]),
+  ])('human hold still joins review findings after %s invalidates the handoff', (_why, mutate) => {
+    const { snapshot, planNext } = replayNoCodeHandoff({ human: true });
+    mutate(snapshot);
+    const next = planNext();
+    // review:changes with a spent ruling is an operator hold; a later verdict/claim or security label
+    // invalidates the waiver and resumes the ordinary fixer policy.
+    if (_why === 'review:changes') expect(next.dispatch).toEqual([]);
+    else expect(next.dispatch).toContainEqual(expect.objectContaining({ kind: 'fix',
+      joinedInputs: expect.objectContaining({ reviewFindings: [expect.stringContaining('Repair required.')] }) }));
+  });
+  it.each([
+    ['missing thread', null, HEAD],
+    ['missing head', base, undefined],
+    ['moved head', base, 'b'.repeat(40)],
+    ['plain rearm answer', [...base.slice(0, -1), answer({ noCodeOwed: false })], HEAD],
+    ['later claim', [...base, begin('IC_later')], HEAD],
+    ['unparseable claim', [...base, { ...begin('IC_bad'), body: '🔒 conveyor fix-begin — fix claim held' }], HEAD],
+    ['later verdict', [...base, verdict], HEAD],
+    ['untrusted answer', [...base.slice(0, -1), { ...answer(), author: { login: 'outsider' } }], HEAD],
+    ['ignored answer', [...base, answer({}, 'IC_ignored')], HEAD],
+  ])('no-code round exemption refuses %s evidence', (_why, comments, headSha) => {
+    const body = buildRearmComment({ actor: 'conveyor (operator no-code ruling IC_200)', decision: {}, comments, headSha });
+    expect(isFixRoundRearmComment({ author: BOT, body })).toBe(true);
+  });
+  it('normalizes REST comment identities for the head-bound no-code round exemption', () => {
+    const comments = base.map(({ author, id, ...c }) => ({ ...c, user: author, node_id: id, id: 123 }));
+    const body = buildRearmComment({ actor: 'conveyor', decision: {}, comments, headSha: HEAD });
+    expect(isFixRoundRearmComment({ author: BOT, body })).toBe(false);
+  });
+  it.each([`> ${NO_CODE_REARM_TRAILER}`, `quoted ${NO_CODE_REARM_TRAILER}`, ` ${NO_CODE_REARM_TRAILER}`])('quoted exemption %s still counts a repair round', marker => {
+    expect(isFixRoundRearmComment({ author: BOT, body: `${REARM_COMMENT_MARKER}\n\n${marker}` })).toBe(true);
+  });
   it.each([
     [{ headRefOid: 'abc1234' }, 'held', 'the live head is not a full sha'],
     [{ labels: [{ id: 1 }] }, 'held', 'the label list is incomplete'],

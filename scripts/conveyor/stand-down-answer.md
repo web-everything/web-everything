@@ -54,8 +54,11 @@ fresh attempt on the same stand-down and head. This supersedes the spent answer,
 still cannot be replayed. The deterministic test `%s on review:changes waits without fix or CI healing
 and accepts a fresh CLI answer` in `scripts/conveyor/__tests__/no-code-rearm.test.mjs` covers all three
 receipt states and legacy rearm/empty-round notes through the CLI and back into planning.
-After the label handoff, remaining red required checks resume ordinary `ci-heal` planning. The tests
-`incident #%s ruling rearms once with no refusals, then resumes required-check CI healing` cover both
+After the label handoff, remaining red required checks resume ordinary `ci-heal` planning, including
+a `review:human` handoff, which preserves the human hold without adding `review:pending`.
+The handoff comment records the honoured no-code ruling without spending another repair round, so
+the requested review remains eligible when the existing repair count is exactly at its cap.
+The tests `incident #%s ruling rearms once with no refusals, then resumes required-check CI healing` cover both
 incident IDs with reconstructed required-check evidence; captured real-state rollups were unavailable
 in the offline repair context.
 The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
