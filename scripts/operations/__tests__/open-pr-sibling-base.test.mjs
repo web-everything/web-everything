@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { checkSiblingBase } from '../../lib/sibling-base-check.mjs';
 import { createGitReader } from '../../lib/pr-size-admission.mjs';
@@ -21,15 +21,15 @@ vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-function fixture(source) {
+function fixture(source, { blobless = false } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'sibling-base-'));
   dirs.push(dir);
   const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-  if (source) git('clone', source, '.');
+  if (source) git('clone', ...(blobless ? ['--filter=blob:none'] : []), source, '.');
   else git('init', '-b', 'main');
   git('config', 'user.email', 'fixture@example.test');
   git('config', 'user.name', 'Fixture');
-  git('remote', source ? 'set-url' : 'add', 'origin', `https://github.com/${ghRepoSlug('we')}.git`);
+  if (!blobless) git('remote', source ? 'set-url' : 'add', 'origin', `https://github.com/${ghRepoSlug('we')}.git`);
   const commit = name => {
     writeFileSync(join(dir, name), name + '\n');
     git('add', name); git('commit', '-m', name);
@@ -51,7 +51,51 @@ function fixture(source) {
   return { dir, git, commit, sibling, check, openPrs };
 }
 
+function bloblessFixture() {
+  const upstream = fixture();
+  upstream.commit('hot.txt');
+  upstream.git('config', 'uploadpack.allowFilter', 'true');
+  upstream.git('config', 'uploadpack.allowAnySHA1InWant', 'true');
+  const f = fixture(`file://${upstream.dir}`, { blobless: true });
+  expect(f.git('config', 'remote.origin.partialclonefilter')).toBe('blob:none');
+  const pr = f.sibling(236);
+  f.git('checkout', '-b', 'lane/child');
+  writeFileSync(join(f.dir, 'hot.txt'), 'branch changes the hot file\n');
+  f.git('add', 'hot.txt'); f.git('commit', '-m', 'branch change');
+  writeFileSync(join(upstream.dir, 'hot.txt'), 'main changes the hot file\n');
+  upstream.git('add', 'hot.txt'); upstream.git('commit', '-m', 'main advanced');
+  const missingBlob = upstream.git('rev-parse', 'HEAD:hot.txt');
+  f.git('fetch', 'origin');
+  const missingObjects = () => f.git('rev-list', '--objects', '--all', '--missing=print');
+  expect(missingObjects()).toContain(`?${missingBlob}`);
+  return { f, pr, missingBlob, missingObjects };
+}
+
 describe('sibling base admission', () => {
+  it.each([false, true])('handles advanced main in a blobless clone (incorporated sibling: %s)', incorporated => {
+    const { f, pr, missingBlob, missingObjects } = bloblessFixture();
+    expect(f.check({ openPrs: incorporated ? [pr] : [] })).toEqual(incorporated
+      ? [{ number: 236, headRefName: pr.headRefName, count: 1 }] : []);
+    const siblingBase = opts => f.check({ ...opts, openPrs: incorporated ? [pr] : [] });
+    expect(runner(f, { siblingBase })({ argv: ['--ref=lane/child', '--check'] }))
+      .toMatchObject(incorporated ? { outcome: 'refused', reason: 'sibling-base' } : { outcome: 'checked', reason: 'check-ok' });
+    // A clean branch needs no patch comparison or blob download; a real overlap does.
+    expect(missingObjects().includes(`?${missingBlob}`)).toBe(!incorporated);
+  });
+
+  it('refuses a custom promisor uploadpack before it can execute during hydration', () => {
+    const { f, pr, missingBlob, missingObjects } = bloblessFixture();
+    // Git runs uploadpack through a shell. The marker stays fixture-local.
+    f.git('config', 'remote.origin.uploadpack', 'touch hydration-ran; git-upload-pack');
+    expect(f.check()).toMatchObject({ reason: 'sibling-base-unreadable', detail: expect.stringContaining('hydrate the blobs separately') });
+    expect(existsSync(join(f.dir, 'hydration-ran'))).toBe(false);
+    expect(missingObjects()).toContain(`?${missingBlob}`);
+    // Prehydrating through a trusted transport makes the documented fallback usable.
+    f.git('-c', 'remote.origin.uploadpack=git-upload-pack', 'cherry', 'refs/remotes/origin/main', 'HEAD');
+    expect(f.check()).toEqual([{ number: pr.number, headRefName: pr.headRefName, count: 1 }]);
+    expect(existsSync(join(f.dir, 'hydration-ran'))).toBe(false);
+  });
+
   it('the production default runner invokes sibling admission', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/child'); f.commit('child');
@@ -65,6 +109,86 @@ describe('sibling base admission', () => {
     expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
     expect(result.detail).toContain('#236');
     expect(runGhSync).toHaveBeenCalledOnce();
+  });
+
+  it.each(['empty', 'unrelated', 'landed', 'base', 'descendant'])('skips patch reads without a non-exempt shared commit (%s)', kind => {
+    const f = fixture(), pr = f.sibling(236);
+    f.git('checkout', '-b', 'lane/proposed'); f.commit('proposed');
+    const opts = { branch: 'lane/proposed' };
+    if (kind === 'empty') opts.openPrs = [];
+    if (kind === 'unrelated') opts.openPrs = [{ ...pr, headRefOid: 'f'.repeat(40) }];
+    if (kind === 'landed') f.git('update-ref', 'refs/remotes/origin/main', pr.headRefOid);
+    if (kind === 'base') opts.base = pr.headRefName;
+    if (kind === 'descendant') pr.baseRefName = opts.branch;
+    const real = createGitReader(f.dir);
+    const git = vi.fn((args, options) => {
+      if (args[0] === 'cherry') throw new Error('patch read must not be needed');
+      return real(args, options);
+    });
+    expect(f.check({ ...opts, git })).toEqual([]);
+    expect(git.mock.calls.some(([args]) => args[0] === 'cherry')).toBe(false);
+  });
+
+  it('computes patch evidence once for multiple incorporated siblings', () => {
+    const f = fixture(); f.sibling(236); f.sibling(237); f.commit('proposed');
+    const real = createGitReader(f.dir), git = vi.fn((...args) => real(...args));
+    expect(f.check({ git })).toHaveLength(2);
+    expect(git.mock.calls.filter(([args]) => args[0] === 'cherry')).toHaveLength(1);
+  });
+
+  it.each(['unavailable', 'malformed'])('refuses %s patch evidence for an incorporated sibling', failure => {
+    const f = fixture(); f.sibling(236); f.commit('child');
+    const real = createGitReader(f.dir);
+    const git = (args, opts) => {
+      if (args[0] === 'cherry') {
+        if (failure === 'unavailable') throw new Error('promisor unavailable');
+        return `? ${f.openPrs[0].headRefOid}\n`;
+      }
+      return real(args, opts);
+    };
+    expect(f.check({ git })).toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it.each([
+    ['missing head oid', { headRefOid: undefined }],
+    ['empty head oid', { headRefOid: '' }],
+    ['short head oid', { headRefOid: 'abcdef1' }],
+    ['invalid PR number', { number: 0 }],
+    ['invalid head name', { headRefName: 'lane/bad~3' }],
+  ])('refuses one corrupt PR metadata field: %s', (_name, corrupt) => {
+    const f = fixture(), pr = f.sibling(236);
+    expect(f.check({ openPrs: [{ ...pr, ...corrupt }] })).toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it.each(['base', 'branch'])('refuses revision syntax in the %s name before resolution', field => {
+    const f = fixture(); f.sibling(236);
+    const real = createGitReader(f.dir), git = vi.fn((...args) => real(...args));
+    expect(f.check({ [field]: 'main~0', git })).toMatchObject({ reason: 'sibling-base-unreadable' });
+    expect(git.mock.calls.some(([args]) => args[0] === 'rev-parse' && args.includes('refs/remotes/origin/main~0^{commit}'))).toBe(false);
+  });
+
+  it('exempts an incorporated same-repository declared descendant', () => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    f.git('checkout', parent.headRefName); f.git('merge', '--ff-only', child.headRefName);
+    expect(f.check({ branch: parent.headRefName, openPrs: [{ ...child, baseRefName: parent.headRefName }] })).toEqual([]);
+    expect(f.check({ branch: parent.headRefName, openPrs: [child] }))
+      .toEqual([{ number: child.number, headRefName: child.headRefName, count: 2 }]);
+  });
+
+  it('retains incorporated merge commits as unlanded', () => {
+    const f = fixture(), pr = f.sibling(236), first = pr.headRefOid;
+    f.git('checkout', '-b', 'lane/side', 'main'); const second = f.commit('side');
+    f.git('checkout', pr.headRefName); f.git('merge', '--no-ff', 'lane/side', '-m', 'sibling merge');
+    pr.headRefOid = f.git('rev-parse', 'HEAD');
+    f.git('checkout', '-b', 'lane/child'); f.commit('child');
+    f.git('checkout', 'main');
+    f.git('merge', '--squash', first); f.git('commit', '-m', 'land first patch');
+    f.git('merge', '--squash', second); f.git('commit', '-m', 'land second patch');
+    f.git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+    expect(f.git('cherry', 'main', 'lane/child')).toContain(`- ${first}`);
+    expect(f.git('cherry', 'main', 'lane/child')).toContain(`- ${second}`);
+    expect(f.git('cherry', 'main', 'lane/child')).not.toContain(pr.headRefOid);
+    expect(f.check({ sha: 'lane/child' })).toEqual([{ number: pr.number, headRefName: pr.headRefName, count: 1 }]);
   });
 
   it('refuses a branch whose history holds commits that belong to another open lane', () => {
