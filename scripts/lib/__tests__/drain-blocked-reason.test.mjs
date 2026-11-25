@@ -10,6 +10,10 @@ import { classifyStall } from '../../conveyor/pr-stall-classify.mjs';
 import soakBreak from '../../conveyor/soak/breaks/drain-blocked-reason-names-failed-check.mjs';
 import { FAILED_CHECK_CONCLUSIONS } from '../rollup-collapse.mjs';
 
+// Hermetic: the default job-log reader would call gh; unreadable evidence must keep today's send-back.
+vi.mock('../merge-gate-hold-class.mjs', async importOriginal => ({ ...await importOriginal(),
+  readMergeGateVerdict: () => ({ error: 'hermetic: no job log' }) }));
+
 const head = 'a'.repeat(40);
 const requiredChecks = ['test', 'merge-gate'];
 const row = (name, conclusion = 'SUCCESS', extra = {}) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion,
@@ -352,5 +356,56 @@ describe('audit safeguards', () => {
     expect(classifyStall({ row: { ...row, stalled: false }, head })).toBeNull();
     expect(classifyStall({ row: { ...row, liveJob: 'ci' }, head })).toBeNull();
     expect(classifyStall({ row: { ...row, actor: 'operator' }, head }).reason).toContain('does not fit');
+  });
+});
+
+describe('D1: review-owned merge-gate red is never sent back', () => {
+  const gateRow = () => row('merge-gate', 'FAILURE', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/555' });
+  const prWith = (rows, extra = {}) => fixture({ statusCheckRollup: rows, ...extra });
+  const verdict = results => ({ num: 7196, head_sha: head, ok: false, results });
+  const hold = (id, status = 'hold') => ({ id, status, reason: 'x' });
+  const run = (pr, readVerdict, extra = {}) => {
+    const directory = mkdtempSync(join(tmpdir(), 'drain-d1-'));
+    const exec = cliExec(() => ({ status: 0 }));
+    try {
+      const out = sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath: join(directory, 'l.json'),
+        readVerdict, mergeGateSetting: 'on', exec, ...extra });
+      return { out, exec };
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  };
+  const sentBack = r => r.exec.mock.calls.some(([, argv]) => argv.some(a => String(a).includes('--to=changes')));
+  it.each([['review-hold-labels'], ['review-acceptance']])('does not send back when the only blocking row is %s', id => {
+    const r = run(prWith([row('test'), gateRow()]), () => verdict([hold(id)]));
+    expect(r.out.sent).toBe(false);
+    expect(r.out.reason).toContain('review-owned');
+    expect(sentBack(r)).toBe(false);
+  });
+  it.each([['freeze', 'hold'], ['review-acceptance', 'fail-closed'], ['required-ci', 'fail']])('still sends back a real %s/%s failure', (id, status) => {
+    const r = run(prWith([row('test'), gateRow()]), () => verdict([hold(id, status)]));
+    expect(r.out.sent).toBe(true);
+  });
+  it('still sends back when test failed alongside a review-owned gate, naming only test', () => {
+    let body = '';
+    const exec = cliExec((_c, argv) => { body = readFileSync(argv.find(a => a.startsWith('--body-file=')).slice(12), 'utf8'); return { status: 0 }; });
+    const r = run(prWith([row('test', 'FAILURE'), gateRow()]), () => verdict([hold('review-acceptance')]), { exec });
+    expect(r.out.sent).toBe(true);
+    expect(body).toContain('"test"');
+    expect(body).not.toContain('merge-gate');
+  });
+  it.each([
+    ['unreadable verdict', () => ({ error: 'no log' })],
+    ['head mismatch', () => ({ ...verdict([hold('review-acceptance')]), head_sha: 'b'.repeat(40) })],
+    ['throwing reader', () => { throw Error('boom'); }],
+  ])('keeps today\'s send-back on %s', (_n, reader) => {
+    expect(run(prWith([row('test'), gateRow()]), reader).out.sent).toBe(true);
+  });
+  it('keeps today\'s send-back when the setting is off', () => {
+    expect(run(prWith([row('test'), gateRow()]), () => verdict([hold('review-acceptance')]), { mergeGateSetting: 'off' }).out.sent).toBe(true);
+  });
+  it('decideGateSendBack reports the review-owned reason and keeps merge-gate failed in the rollup', () => {
+    const pr = prWith([row('test'), { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555 } }]);
+    expect(decideGateSendBack({ pr, headSha: head, requiredChecks, ledger: {} }))
+      .toMatchObject({ send: false, reason: expect.stringContaining('review-owned (review-acceptance)') });
+    expect(pr.statusCheckRollup[1].conclusion).toBe('FAILURE');
   });
 });

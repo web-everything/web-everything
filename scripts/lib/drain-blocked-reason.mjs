@@ -1,6 +1,7 @@
 /** Required-check diagnostics and a strictly changes-only, head-deduplicated send-back. */
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
+import { excusePrMergeGateHolds, readMergeGateVerdict, loadMergeGateHoldSetting } from './merge-gate-hold-class.mjs';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, openSync, closeSync, statSync, accessSync, constants, fsyncSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -23,7 +24,7 @@ export function describeBlockedChecks(pr, requiredChecks) {
     const rollup = pr.statusCheckRollup.map(row => ({ ...row,
       ...(!(Number.isSafeInteger(Number(row.id)) && Number(row.id) > 0) && Number.isInteger(row.checkRunId)
         ? { id: row.checkRunId } : {}) }));
-    const failed = [], waiting = [];
+    const failed = [], waiting = [], reviewOwned = [];
     for (const name of new Set(requiredChecks)) {
       // Keep the shared run-ID/rollup ordering: queued replacements have no timestamps yet.
       const row = latestCheckNamed(rollup, name);
@@ -31,14 +32,17 @@ export function describeBlockedChecks(pr, requiredChecks) {
       if (!row) { waiting.push(`waiting on required check ${label} (absent)`); continue; }
       const conclusion = String(row.conclusion || row.state || '').toUpperCase();
       const status = String(row.status || row.state || '').toUpperCase();
-      if (isFailedCheckRow(row)) {
+      if (isFailedCheckRow(row) && (row.mergeGateReviewHold || row.mergeGateHoldExcused)) {
+        // Review-owned merge-gate red (proved from the head-bound job log): review work, not a code finding.
+        reviewOwned.push(...(row.mergeGateReviewHold?.holds ?? row.mergeGateHoldExcused?.holds ?? []).map(String));
+      } else if (isFailedCheckRow(row)) {
         const detail = firstLine(row);
         failed.push(`required check ${label} ${conclusion}${detail ? `: ${detail}` : ''}`);
       } else if (['IN_PROGRESS', 'QUEUED', 'PENDING'].includes(status)) {
         waiting.push(`waiting on required check ${label} (${status})`);
       } else if (!['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(conclusion)) return null;
     }
-    return { failed, waiting, text: [...failed, ...waiting].join('; ') };
+    return { failed, waiting, ...(reviewOwned.length ? { reviewOwned } : {}), text: [...failed, ...waiting].join('; ') };
   } catch { return null; }
 }
 
@@ -52,7 +56,11 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
       || !validLedger(ledger) || ledger[headSha.toLowerCase()]
       || !Array.isArray(pr.labels) || !pr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'ready-to-merge')) return { send: false };
     const description = describeBlockedChecks(pr, requiredChecks);
-    if (!description?.failed.length) return { send: false };
+    if (!description?.failed.length) {
+      return description?.reviewOwned?.length
+        ? { send: false, reason: `merge-gate red is review-owned (${[...new Set(description.reviewOwned)].join(', ')}); no code finding to send back` }
+        : { send: false };
+    }
     return { send: true, body: description.failed.join('; ') };
   } catch { return { send: false }; }
 }
@@ -60,7 +68,8 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
 /** CLI uses argv/body-file, never a shell. Persist only AFTER the sanctioned label writer succeeds.
  * An unreadable ledger refuses send-back; the drain still skips the red PR and logs the retry reason.
  */
-export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, exec = (command, args, options) => command === 'gh'
+export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync,
+  readVerdict = readMergeGateVerdict, readFreeze = () => ({ error: 'freeze not read' }), mergeGateSetting = loadMergeGateHoldSetting(), exec = (command, args, options) => command === 'gh'
     ? spawnSync(process.execPath, [new URL('./gh-throttle.mjs', import.meta.url).pathname, ...args], options)
     : spawnSync(command, args, options) } = {}) {
   let temp, lockPath, lockFd, refusalPath;
@@ -94,8 +103,14 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     catch (error) { if (error.code !== 'ENOENT') throw error; ledger = {}; }
     if (!record(ledger) || !Object.values(ledger).every(validLedger)) throw Error('unreadable send-back ledger');
     const key = `${repo}#${pr.number}`;
-    const decision = decideGateSendBack({ pr, headSha, requiredChecks, ledger: ledger[key] || {} });
-    if (!decision.send) return { sent: false };
+    // D1: a review-owned merge-gate red (proved from the head-bound job log) is review work, never a code finding.
+    // Any unreadable/mismatched/off evidence leaves the rows unchanged, so the send-back behaves as before.
+    let gatePr = pr;
+    try {
+      gatePr = excusePrMergeGateHolds([pr], { repo, readMergeGateVerdict: readVerdict, readFreeze, mergeGateSetting })[0] ?? pr;
+    } catch { gatePr = pr; }
+    const decision = decideGateSendBack({ pr: gatePr, headSha, requiredChecks, ledger: ledger[key] || {} });
+    if (!decision.send) return decision.reason ? { sent: false, reason: decision.reason } : { sent: false };
     refusalPath = `${ledgerPath}.${headSha.toLowerCase()}.refused`;
     try {
       readFileSync(refusalPath, 'utf8');
