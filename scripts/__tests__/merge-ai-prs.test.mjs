@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
+import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
 
@@ -570,9 +571,9 @@ describe('round listing freshness at the CLI boundary', () => {
     const dir = mkdtempSync(join(tmpdir(), 'drain-round-cli-'));
     try {
       const row = (number, item, blockedBy = []) => ({ number, title: `PR ${number}`, state: 'OPEN',
-        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', updatedAt: '2026-01-01T00:00:00Z',
+        headRefName: `lane/leaf-${number}`, headRefOid: number.toString(16).padStart(40, '0'), baseRefName: 'main', baseRefOid: 'b'.repeat(40), updatedAt: '2026-01-01T00:00:00Z',
         isDraft: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', files: [],
-        labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', checkSuite: { workflowRun: { workflow: { name: 'test' } } } }],
+        labels: [{ name: 'ready-to-merge' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }],
         body: manifestBodyBlock(buildManifest({ item, blockedBy, repos: [{ repo: 'we', ref: `lane/leaf-${number}` }] })) });
       const target = row(42, 42, ['43']);
       const sibling = row(43, 43);
@@ -588,6 +589,7 @@ describe('round listing freshness at the CLI boundary', () => {
       writeFileSync(join(dir, 'merge-settings.json'), JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
       writeFileSync(join(dir, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 fs.appendFileSync(process.env.CALL_LOG, JSON.stringify(a) + '\\n');
 const rows = JSON.parse(fs.readFileSync(process.env.ROWS_FILE, 'utf8'));
@@ -606,8 +608,7 @@ else if (a[0] === 'api' && a[1] === 'graphql') {
   } else {
     if (process.env.FAIL_LISTING === '1') { fs.writeSync(2, 'fixture live listing unavailable'); process.exit(1); }
     const local = a.some(v => v.includes('repository(owner:"web-everything",name:"web-everything")'));
-    const nodes = (local ? rows : []).map(r => ({ ...r, labels: { nodes: r.labels }, commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: r.statusCheckRollup } } } }] } }));
-    out = { data: { repository: { pullRequests: { nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null } } } } };
+    out = openPrPageFixture(local ? rows : [], q);
   }
 }
 if (a[0] === 'pr' && a[1] === 'view' && a.includes('id')) out = { id: 'PR_43' };

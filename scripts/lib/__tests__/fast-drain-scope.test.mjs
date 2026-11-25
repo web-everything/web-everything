@@ -6,6 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 import { PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
+import { openPrPageFixture } from '../../__tests__/fixtures/open-pr-page-fixture.mjs';
 import { buildManifest, embedManifestInBody, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { fetchPrReadsCached, prReadCacheIdentity, reduceOpenPrContext, planDrainPass } from '../../merge-ai-prs.mjs';
 import {
@@ -234,10 +235,10 @@ describe('snapshot fast drain CLI dependency context', () => {
   const repo = 'fixture/repo';
   const pr = (number, item, blockedBy = []) => ({
     number, title: `fixture ${number}`, state: 'OPEN', headRefName: `lane/${item}`, headRefOid: number.toString(16).padStart(40, '0'),
-    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', isDraft: false,
+    updatedAt: '2026-10-14T00:00:00Z', baseRefName: 'main', baseRefOid: 'b'.repeat(40), isDraft: false,
     mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [],
-    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'test' }],
     body: embedManifestInBody('fixture', buildManifest({ item, blockedBy,
       repos: [{ repo: 'we', ref: `lane/${item}` }] })),
   });
@@ -263,6 +264,7 @@ describe('snapshot fast drain CLI dependency context', () => {
       writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/repo.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
 const fs = require('node:fs');
+const openPrPageFixture = ${openPrPageFixture};
 const a = process.argv.slice(2);
 const f = JSON.parse(fs.readFileSync(process.env.CONTEXT_FIXTURE, 'utf8'));
 fs.appendFileSync(process.env.CONTEXT_LOG, JSON.stringify(a) + '\\n');
@@ -271,10 +273,7 @@ if (a[0] === 'repo' && a[1] === 'view') { fs.writeSync(1, 'main'); process.exit(
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   if (f.failPage === true || f.failPage === process.env.GH_REPO) { fs.writeSync(2, 'fixture listing unreadable'); process.exit(1); }
   const rows = process.env.GH_REPO === 'fixture/repo' ? f.live : (f.extraLive[process.env.GH_REPO] || []);
-  output({data:{repository:{pullRequests:{totalCount:rows.length,
-    pageInfo:{hasNextPage:false,endCursor:null},nodes:rows.map(p => ({...p, labels:{nodes:p.labels},
-      commits:{nodes:[{commit:{oid:p.headRefOid,statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false},
-        totalCount:p.statusCheckRollup.length,nodes:p.statusCheckRollup.map(c => ({...c,__typename:'CheckRun'}))}}}}]}}))}}}});
+  output(openPrPageFixture(rows, a.find(v => v.includes('pullRequests(states:OPEN'))));
 }
 if (a[0] === 'pr' && a[1] === 'list') output([]);
 if (a[0] === 'pr' && a[1] === 'view') {
@@ -421,14 +420,14 @@ output({});
     expect(r.calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '8')).toBe(true);
   }, 30_000);
 
-  it('drops a closed sibling and reuses unchanged heavy fields without another target hydration', () => {
+  it('drops a closed sibling and pins candidate heavy fields despite an unchanged snapshot identity', () => {
     const b = pr(7, 'xbbbbbb', ['xaaaaaa']);
     const r = run({ snapshot: [b, pr(8, 'xaaaaaa')], live: [b] });
     expect(r.status, r.stderr).toBe(0);
     expect(r.payload.deferred).toEqual([]);
     expect(r.payload.toMerge).toEqual(expect.arrayContaining([expect.objectContaining({ num: 7 })]));
     const heavyReads = r.calls.filter(a => a[0] === 'pr' && a[1] === 'view'
-      && a[a.indexOf('--json') + 1] === 'body,files');
-    expect(heavyReads).toEqual([]);
+      && a[a.indexOf('--json') + 1] === 'number,headRefOid,baseRefOid,baseRefName,updatedAt,body,files');
+    expect(heavyReads.map(a => a[2])).toEqual(['7']);
   }, 30_000);
 });
