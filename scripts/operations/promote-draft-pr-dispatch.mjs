@@ -375,7 +375,7 @@ export function runReconcilePromoteDraftDispatch({
   }
   let handled = 0;
   // Each bounded phase makes at least one unit of progress when planning consumed its budget.
-  const deadlineReachedAfterProgress = completed => completed > 0 && deadlineAt != null && now() > deadlineAt;
+  const deadlineReachedAfterProgress = completed => deadlineAt != null && now() > deadlineAt && completed > 0;
   let deferred = [];
   const dispatched = [];
   const refusals = [];

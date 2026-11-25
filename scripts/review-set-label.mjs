@@ -2086,6 +2086,14 @@ export function runReviewLabelCli({
       fresh = provider.readPrState(repo, pr);
       assertPinnedRearmHead(fresh);
     } catch (e) { return readError(e); }
+    // Unreadable rollback evidence is a read error, not a policy refusal. Validate
+    // it before the security guard so the pinned plain re-arm keeps that contract.
+    if (pinnedPlainRearm && (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
+      const name = typeof l === 'string' ? l : l?.name;
+      return typeof name === 'string' && name.length > 0;
+    }))) {
+      return readError(new Error('pre-swap labels unreadable — cannot guarantee re-arm rollback'));
+    }
     if (pinnedRearm) {
       const security = pinnedRearmSecurityRefusal(fresh.labels);
       if (security) return refuse(security);
@@ -2241,12 +2249,6 @@ export function runReviewLabelCli({
     if (to === 'rearm') {
       const { fresh } = recheckRearmClearance();
       if (pinnedPlainRearm) {
-        if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
-          const name = typeof l === 'string' ? l : l?.name;
-          return typeof name === 'string' && name.length > 0;
-        })) {
-          fail('pre-swap labels unreadable — cannot guarantee re-arm rollback', 1);
-        }
         preSwapLabels = fresh.labels.map(l => typeof l === 'string' ? l : l.name);
       }
     }
