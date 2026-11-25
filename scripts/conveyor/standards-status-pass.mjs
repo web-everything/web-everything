@@ -62,13 +62,32 @@ function defaultSpawn({ cmd, args, cwd, env, timeoutMs }) {
   });
 }
 
+/** Hash of every file under the validator's drafts folder (the tools folder's parent: rules, schemas, vectors, config),
+ * skipping node_modules. It THROWS when a file cannot be read, so an unreadable input never becomes a reusable value. */
 const defaultValidatorHash = validatorPath => {
-  const dir = dirname(validatorPath);
+  const root = dirname(dirname(validatorPath));
   const hash = createHash('sha256');
-  try { for (const name of readdirSync(dir).filter(n => n.endsWith('.mjs')).sort()) hash.update(name).update(readFileSync(join(dir, name))); }
-  catch { return 'unreadable'; }
+  let files = 0;
+  const walk = dir => {
+    for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (entry.name === 'node_modules' || entry.name === '.git') continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && ++files <= 5000) hash.update(full.slice(root.length)).update(readFileSync(full));
+    }
+  };
+  walk(root);
   return hash.digest('hex').slice(0, 8);
 };
+
+/** macOS sandbox for the harness child: the harness imports `rules.mjs` from the PR head, so head code runs. No
+ * network, no file writes outside the scratch dirs and /dev/null, no reads of the operator's secret folders. */
+export function sandboxProfile({ writable = [], home = homedir() } = {}) {
+  const quote = value => `"${String(value).replace(/["\\]/g, '')}"`;
+  return ['(version 1)', '(allow default)', '(deny network*)', '(deny file-write*)',
+    '(allow file-write* (literal "/dev/null"))', ...writable.map(dir => `(allow file-write* (subpath ${quote(dir)}))`),
+    `(deny file-read* ${['.secrets', '.ssh', '.config/gh', '.aws', '.gnupg', '.claude'].map(p => `(subpath ${quote(join(home, p))})`).join(' ')})`].join('\n');
+}
 
 function readStatuses({ repo, head, gh, env }) {
   const page = (kind, n) => `repos/${repo}/commits/${head}/${kind}?per_page=100${n > 1 ? `&page=${n}` : ''}`;
@@ -89,7 +108,7 @@ function readStatuses({ repo, head, gh, env }) {
  */
 export async function runStandardsStatusPass({
   repos = [], dryRun = false, env = process.env, gh = runGhSync, git = defaultGit, spawn = defaultSpawn,
-  validatorPath = '', validatorHash, appWriterProbe, exists = existsSync, runId = () => randomBytes(4).toString('hex'),
+  validatorPath = '', validatorHash, appWriterProbe, sandbox = process.platform === 'darwin', exists = existsSync, runId = () => randomBytes(4).toString('hex'),
   makeDir = label => mkdtempSync(join(tmpdir(), `standards-${label}-`)), runTimeoutMs = 120_000,
   mirrorRoot = join(homedir(), '.local', 'state', 'we', 'standards-status'), log = () => {},
 } = {}) {
@@ -100,7 +119,9 @@ export async function runStandardsStatusPass({
   const writerEnv = redTeamWriterEnv(env);
   const probe = requireRedTeamAppWriter({ gh, env, appWriterProbe });
   if (!probe.ok) { log(`standards-status: ${probe.reason}`); return { ...result, refused: `WE App token unavailable: ${probe.reason}` }; }
-  const hash = validatorHash ?? defaultValidatorHash(validatorPath);
+  let hash;
+  try { hash = validatorHash ?? defaultValidatorHash(validatorPath); }
+  catch (error) { return { ...result, refused: `validator inputs unreadable: ${String(error?.message ?? error).slice(0, 120)}` }; }
   const post = (repo, head, payload) =>
     gh(['api', `repos/${repo}/statuses/${head}`, '--method', 'POST', '--input', '-'], { ...ioOptions, input: JSON.stringify(payload), env: writerEnv });
 
@@ -108,6 +129,11 @@ export async function runStandardsStatusPass({
     let prs;
     try { prs = JSON.parse(gh(['api', `repos/${repo}/pulls?state=open&per_page=100`], { ...ioOptions, env })); if (!Array.isArray(prs)) throw Error('pulls unreadable'); }
     catch (error) { result.errors.push({ repo, error: String(error?.message ?? error) }); continue; }
+    // The cache key covers the validator inputs AND the main harness sha, so fixing either re-runs every open head.
+    let mainNow;
+    try { mainNow = String(gh(['api', `repos/${repo}/git/ref/heads/main`, '--jq', '.object.sha'], { ...ioOptions, env })).trim(); if (!validHead(mainNow)) throw Error('main sha unreadable'); }
+    catch (error) { result.errors.push({ repo, error: String(error?.message ?? error) }); continue; }
+    const key = `${hash}.${mainNow.slice(0, 8)}`;
     for (const pr of prs) {
       const head = pr?.head?.sha; const number = pr?.number;
       if (!validHead(head) || !Number.isSafeInteger(number)) { result.skipped.push({ repo, pr: number, reason: 'invalid head' }); continue; }
@@ -119,7 +145,7 @@ export async function runStandardsStatusPass({
         const { combined, history, complete } = readStatuses({ repo, head, gh, env });
         const seen = evaluateStandardsStatus({ combined, history, historyComplete: complete, head });
         const done = seen.latestTrusted;
-        if (done && done.id === seen.newestId && String(done.description ?? '').includes(`validator ${hash} `)) {
+        if (done && done.id === seen.newestId && String(done.description ?? '').includes(`validator ${key} `)) {
           result.skipped.push({ repo, pr: number, reason: `already ${done.state} for this validator` }); continue;
         }
         if (dryRun) { result.wouldPost.push({ repo, pr: number, head }); continue; }
@@ -147,13 +173,17 @@ export async function runStandardsStatusPass({
         let verdict;
         if (!validatorPath || !exists(validatorPath)) verdict = { state: 'failure', reason: 'validator missing on the Studio' };
         else {
-          const run = await spawn({ cmd: process.execPath, cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs,
-            args: [join(mainTree, HARNESS), `--root=${headTree}`, `--standards-validator=${validatorPath}`] });
+          // The harness's --root is the protocols folder (its default is `../` of the tools folder), not the repo root.
+          const harnessArgs = [join(mainTree, HARNESS), `--root=${join(headTree, 'protocols')}`, `--standards-validator=${validatorPath}`];
+          const run = await spawn(sandbox
+            ? { cmd: '/usr/bin/sandbox-exec', cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs,
+              args: ['-p', sandboxProfile(), process.execPath, ...harnessArgs] }
+            : { cmd: process.execPath, cwd: mainTree, env: childEnv(env), timeoutMs: runTimeoutMs, args: harnessArgs });
           verdict = runVerdict(run);
         }
         const live = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}`], { ...ioOptions, env }))?.head?.sha;
         if (live !== head) { result.skipped.push({ repo, pr: number, reason: 'head moved during the run' }); continue; }
-        post(repo, head, statusPayload({ state: verdict.state, runId: id, validatorHash: hash, reason: verdict.reason }));
+        post(repo, head, statusPayload({ state: verdict.state, runId: id, validatorHash: `${hash}.${mainSha.slice(0, 8)}`, reason: verdict.reason }));
         result.posted.push({ repo, pr: number, head, state: verdict.state });
       } catch (error) {
         result.errors.push({ repo, pr: number, error: String(error?.message ?? error).slice(0, 200) });

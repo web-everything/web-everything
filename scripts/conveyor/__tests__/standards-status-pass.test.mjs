@@ -14,15 +14,16 @@ const PASS = { status: 0, stdout: 'ok\nStandards validator exit status: 0\n' };
 
 function harness({ prs = [{ number: 7, head: { sha: HEAD } }], liveHead = HEAD, statuses = [], spawnResult = PASS,
   probeOk = true, fetched = HEAD, postFails = 0, env = { PATH: '/bin', CI: 'true', GITHUB_ACTIONS: 'true', PLATEAU_PROTOCOLS_HERMETIC: '1' } } = {}) {
-  const calls = { posts: [], spawns: [], git: [], removed: [], dirs: [] };
+  const calls = { posts: [], postEnvs: [], spawns: [], git: [], removed: [], dirs: [] };
   let failuresLeft = postFails;
   const gh = (args, opts = {}) => {
     const path = args[1];
     if (path.includes('/pulls?')) return JSON.stringify(prs);
+    if (path.endsWith('/git/ref/heads/main')) return `${MAIN}\n`;
     if (/\/pulls\/\d+$/.test(path)) return JSON.stringify({ head: { sha: liveHead } });
     if (path.includes('/statuses/') && args.includes('POST')) {
       if (failuresLeft-- > 0) throw new Error('HTTP 502');
-      calls.posts.push(JSON.parse(opts.input)); return '{}';
+      calls.posts.push(JSON.parse(opts.input)); calls.postEnvs.push(opts.env); return '{}';
     }
     if (path.includes('/status?')) {
       const newest = statuses.filter(s => s.context === STANDARDS_CONTEXT).sort((a, b) => b.id - a.id)[0];
@@ -43,10 +44,11 @@ function harness({ prs = [{ number: 7, head: { sha: HEAD } }], liveHead = HEAD, 
   const spawn = call => { calls.spawns.push(call); return spawnResult; };
   const deps = { repos: [REPO], gh, git, spawn, env, validatorPath: '/studio/validate.mjs', validatorHash: 'abcd1234',
     appWriterProbe: () => { if (!probeOk) throw new Error('403'); }, exists: () => true, runId: () => 'run1',
-    makeDir: label => `/scratch/${label}`, log: () => {} };
+    makeDir: label => `/scratch/${label}`, log: () => {}, sandbox: false };
   return { calls, deps };
 }
-const trusted = (id, state, description = 'run old · validator abcd1234 · x') =>
+const KEY = `abcd1234.${MAIN.slice(0, 8)}`;
+const trusted = (id, state, description = `run old · validator ${KEY} · x`) =>
   ({ id, state, context: STANDARDS_CONTEXT, description, creator: { ...TRUSTED_BOT } });
 
 describe('runStandardsStatusPass', () => {
@@ -55,7 +57,14 @@ describe('runStandardsStatusPass', () => {
     const result = await runStandardsStatusPass(deps);
     expect(calls.posts.map(p => p.state)).toEqual(['pending', 'success']);
     expect(calls.posts.every(p => p.context === STANDARDS_CONTEXT)).toBe(true);
-    expect(calls.posts[1].description).toContain('validator abcd1234');
+    expect(calls.posts[1].description).toContain(`validator ${KEY}`);
+    // Posts go out under the App writer env: legacy App role, daemon caller, no inherited personal token.
+    for (const postEnv of calls.postEnvs) {
+      expect(postEnv.WE_GITHUB_APP_ROLE).toBe('legacy');
+      expect(postEnv.WE_GH_AUTH_PERSONAL_FALLBACK).toBe('refuse');
+      expect(postEnv.GH_TOKEN).toBeUndefined();
+      expect(postEnv.GITHUB_TOKEN).toBeUndefined();
+    }
     expect(calls.removed.length).toBe(2);
     expect(result.posted).toHaveLength(1);
   });
@@ -155,7 +164,7 @@ describe('runStandardsStatusPass', () => {
   });
 
   it('re-runs when the validator hash changed', async () => {
-    const { calls, deps } = harness({ statuses: [trusted(5, 'success', 'run old · validator 0000ffff · x')] });
+    const { calls, deps } = harness({ statuses: [trusted(5, 'success', 'run old · validator 0000ffff.cccccccc · x')] });
     await runStandardsStatusPass(deps);
     expect(calls.posts.map(p => p.state)).toEqual(['pending', 'success']);
   });
@@ -226,5 +235,38 @@ describe('verify tick wiring', () => {
     expect(calls).toBe(0);
     await runVerifyDispatch({ dryRun: false, poolRoot, standardsStatusPass });
     expect(calls).toBe(1);
+  });
+});
+
+describe('hardening from the first audit', () => {
+  it('re-runs when the main harness sha changed (cache key includes it)', async () => {
+    const { calls, deps } = harness({ statuses: [trusted(5, 'success', 'run old · validator abcd1234.deadbeef · x')] });
+    await runStandardsStatusPass(deps);
+    expect(calls.posts.map(p => p.state)).toEqual(['pending', 'success']);
+  });
+
+  it('points --root at the head protocols folder, not the repo root', async () => {
+    const { calls, deps } = harness();
+    await runStandardsStatusPass(deps);
+    expect(calls.spawns[0].args).toContain('--root=/scratch/head-wt/protocols');
+  });
+
+  it('runs the harness inside a network-denied, write-denied sandbox when enabled', async () => {
+    const { calls, deps } = harness();
+    await runStandardsStatusPass({ ...deps, sandbox: true });
+    const [spawned] = calls.spawns;
+    expect(spawned.cmd).toBe('/usr/bin/sandbox-exec');
+    expect(spawned.args[0]).toBe('-p');
+    expect(spawned.args[1]).toContain('(deny network*)');
+    expect(spawned.args[1]).toContain('(deny file-write*)');
+    expect(spawned.args[1]).toContain('.secrets');
+    expect(spawned.args.join(' ')).toContain('validate-protocols.mjs');
+  });
+
+  it('an unreadable validator input refuses the pass instead of reusing a value', async () => {
+    const { calls, deps } = harness();
+    const result = await runStandardsStatusPass({ ...deps, validatorHash: undefined, validatorPath: '/nonexistent/tools/validate.mjs' });
+    expect(result.refused).toMatch(/unreadable/);
+    expect(calls.posts).toEqual([]);
   });
 });
