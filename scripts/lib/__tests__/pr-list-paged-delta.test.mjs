@@ -107,11 +107,14 @@ describe('DRAIN-LIST-DELTA', () => {
     expect(second.rows[0].body).toBe('body-0');
   });
 
-  it('past the backstop an unchanged non-candidate is re-read', () => {
+  it('a tighter backstop (300 s) is enforced below the 600 s age limit', () => {
     const state = { nodes: [baseNode(1)], views: [] };
-    const first = run(state);
+    const tight = { paging: { heavyBackstopSeconds: 300 } };
+    const first = run(state, tight);
     state.views.length = 0;
-    const second = run(state, { cache: first.cache, nowMs: 1_000_000 + 3_700_000 });
+    run(state, { ...tight, cache: first.cache, nowMs: 1_000_000 + 200_000 });
+    expect(state.views).toEqual([]);
+    const second = run(state, { ...tight, cache: first.cache, nowMs: 1_000_000 + 400_000 });
     expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
     expect(second.stats.byReason.backstop).toBe(2);
   });
@@ -305,5 +308,21 @@ describe('DRAIN-LIST-DELTA round 5', () => {
       fields: ['body', 'files'], nowMs: 1000 + 700_000, maxAgeMs: 600_000, cache,
       delta: { isCandidate: () => false, backstopMs: 3_600_000, maxAgeMs: 900_000 } });
     expect(out.rows[0].body).toBe('fresh');
+  });
+});
+
+describe('DRAIN-LIST-DELTA round 6', () => {
+  it('a non-finite maxAgeMs (NaN) forces a read, never a silent drop', async () => {
+    const { hydrateHeavyFields } = await import('../pr-list-paged.mjs');
+    const row1 = { number: 1, updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' };
+    const cache = { 1: { body: 'old', files: [], stamps: {
+      body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
+      files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } } } };
+    for (const [maxAgeMs, dm] of [[NaN, undefined], [600_000, NaN]]) {
+      const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [] }),
+        fields: ['body', 'files'], nowMs: 2000, maxAgeMs, cache,
+        delta: { isCandidate: () => false, backstopMs: 3_600_000, maxAgeMs: dm } });
+      expect(out.rows[0].body).toBe('fresh');
+    }
   });
 });

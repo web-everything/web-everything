@@ -59,8 +59,10 @@ function normalizeDelta(delta, nowMs, maxAgeMs) {
   if (typeof delta?.isCandidate !== 'function') {
     throw new TypeError('delta hydration requires an isCandidate predicate (it never defaults to false)');
   }
-  const bounds = [delta.backstopMs, delta.maxAgeMs, maxAgeMs].filter(Number.isFinite);
-  const backstopMs = Number.isFinite(delta.backstopMs) ? Math.min(...bounds) : delta.backstopMs;
+  // An absent bound (undefined/null) is skipped; a PRESENT but non-finite one (NaN, a string) forces a read.
+  const present = [delta.backstopMs, delta.maxAgeMs, maxAgeMs].filter(v => v != null);
+  const backstopMs = !Number.isFinite(delta.backstopMs) ? delta.backstopMs
+    : present.every(Number.isFinite) ? Math.min(...present) : NaN;
   return { ...delta, backstopMs, nowMs };
 }
 function staleFields(entry, row, fields, delta) {
