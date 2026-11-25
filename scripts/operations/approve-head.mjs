@@ -46,5 +46,5 @@ export function runApproveHead(argv, { gh = runGhSync, env = process.env, readRu
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const result = runApproveHead(process.argv.slice(2));
   console.log(JSON.stringify(result));
-  process.exit(result.ok ? 0 : 1);
+  process.exitCode = result.ok ? 0 : 1;
 }
