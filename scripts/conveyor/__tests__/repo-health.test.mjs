@@ -8,6 +8,7 @@ import { REVIEW_LABELS } from '../../lib/review-labels.mjs';
 import { loadRepoRegistry } from '../../lib/repo-registry.mjs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 // Keep the pre-fix/revert-red path hermetic even when fetchFacts ignores injected IO.
 vi.mock('../../lib/proc-read.mjs', () => ({ readGhJson: () => { throw new Error('unexpected uninjected gh read'); } }));
@@ -111,7 +112,8 @@ describe('repo health', () => {
     }`;
     const preload = `import { register } from 'node:module'; register(${JSON.stringify(`data:text/javascript,${encodeURIComponent(loader)}`)}, import.meta.url);`;
     const child = spawnSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`,
-      fileURLToPath(new URL('../repo-health.mjs', import.meta.url))], {
+      // Keep this a filesystem path: Vite rewrites new URL(relative, import.meta.url) as a browser asset.
+      join(dirname(fileURLToPath(import.meta.url)), '..', 'repo-health.mjs')], {
       encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024,
       env: { ...process.env, HEALTH_TEST_FAIL: String(fail) },
     });
