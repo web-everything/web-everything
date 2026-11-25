@@ -110,6 +110,7 @@ export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = f
     if (strict && head.status !== 0) return { offline: true };
     onBase = head.status === 0 && head.stdout.trim() === base;
   }
+  if (strict && cleanOnly && (dirty || !onBase)) return { offline: true };
   const cls = classifyStaleness({ behind, ahead, dirty, autoFf, base, cleanOnly, onBase });
   if (cls.action === 'auto-ff') {
     const synced = cleanOnly ? run(['merge', '--ff-only', `origin/${base}`]) : run(['pull', '--ff-only', '--autostash']);

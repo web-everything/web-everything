@@ -115,6 +115,8 @@ import { assertMainNotStale, dispatchReview, expectedHeadRefusal, isReviewCodePa
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
+import { workerTierFor } from '../lib/provider-routing.mjs';
+import { careLevelFromReasons } from '../lib/review-core.mjs';
 import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
@@ -629,10 +631,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null }) => {
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
+        ...(reviewModel ? [`--model=${reviewModel}`] : []),
       ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
         status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
@@ -1299,7 +1302,7 @@ function finalHeadSeatsGate(input, io) {
 export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
+  pr, repo, expectedHead, reviewModel = null, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1559,7 +1562,8 @@ function runReviewArc({
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null,
+      ...(reviewModel ? { reviewModel } : {}) });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
@@ -1619,6 +1623,8 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
+  careLevel = 'none', scopePaths = [], escalationReason = [],
+  leaseHeld = () => true,
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
@@ -1627,7 +1633,11 @@ export function dispatchReviewJob({
   resolveSettingsEnv = () => resolveGhShimSettingsEnv(undefined, { env }),
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
+  ...unsupported
 } = {}) {
+  if (Object.keys(unsupported).length) throw Error(`unsupported review job option: ${Object.keys(unsupported).join(', ')}`);
+  const tier = workerTierFor({ kind: 'review', scopePaths,
+    risk: careLevel === 'high' || careLevelFromReasons(escalationReason) === 'high' ? 'high' : undefined }).tier;
   const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io, { required: true });
   if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
@@ -1662,8 +1672,10 @@ export function dispatchReviewJob({
   // job mints its own per round.
   delete childEnv[ACTOR_ENV];
   mkdirSync(dir, { recursive: true });
+  if (leaseHeld() !== true) throw Error('dispatch lease lost');
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+      ...(tier === 'opus' ? ['--review-model=opus'] : []),
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
@@ -1839,6 +1851,8 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
     try {
       if (rest.some(arg => arg === '--red-team-plan' || arg.startsWith('--red-team-plan='))) throw Error('removed --red-team-plan; recovery is decided by the job');
       const lane = Number(flag('prefer-lane'));
+      const reviewModel = flag('review-model');
+      if (reviewModel !== undefined && reviewModel !== 'opus') throw Error('unsupported review model');
       // Bare legacy flag selects recovery automatically; explicit modes stay strict.
       const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
@@ -1849,6 +1863,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
         return;
       }
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
+        ...(reviewModel ? { reviewModel } : {}),
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
       onSessionSlug?.(out.sessionSlug);

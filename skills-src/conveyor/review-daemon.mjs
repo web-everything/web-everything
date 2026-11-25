@@ -152,7 +152,7 @@ import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '..
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
 import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
-import { saveFastPlan, runFastPassCli, readRemoteMainSha } from '../../scripts/lib/review-fast-pass-cli.mjs';
+import { saveFastPlan, runFastPassCli, readRemoteMainSha, withReviewDispatchLease } from '../../scripts/lib/review-fast-pass-cli.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -413,6 +413,7 @@ export function runReviewTick({
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
   // the real daemon wires {@link defaultReviewHostAdmission} (host load + memory headroom, cascade-sourced).
   hostAdmission = () => ({ admitted: true, reason: 'not checked', maxPerTick: Infinity }),
+  leaseHeld = () => true,
   // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
   // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
   liveReviewBudget = null,
@@ -832,6 +833,7 @@ export function runReviewTick({
   const refused = [];
   const attention = [];
   for (const d of reviews) {
+    if (leaseHeld() !== true) { failed.push({ prNumber: d.prNumber, error: 'dispatch lease lost' }); break; }
     if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
     // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
@@ -1532,7 +1534,7 @@ export function runAutoAuditShadow({ repo, rawPrs, mode, check, seen = autoAudit
   } catch { /* Audit observation must never block the capacity queue. */ }
 }
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr, leaseHeld = () => true } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   const livePrs = new Map();
   const readQueuePr = args => {
@@ -1631,9 +1633,10 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       } catch { /* Audit observation must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
         dispatch: d => {
+          if (!leaseHeld()) throw Error('dispatch lease lost');
           const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });
           if (refusal) return { skipped: refusal.why };
-          return dispatchReviewJob(d);
+          return dispatchReviewJob({ ...d, leaseHeld });
         }, log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
@@ -2070,8 +2073,22 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
     } };
 }
 
+export function runReviewDispatchPass({ owner, lockRoot = RUNNER_LOCK_ROOT, log = console,
+  reviewTickOpts = cliReviewTickOpts, tick = runReviewTick, factCache = null, ...opts } = {}) {
+  return withReviewDispatchLease(leaseHeld => {
+    const options = reviewTickOpts({ log, factCache, leaseHeld });
+    const dispatch = options.dispatch ?? dispatchReviewByMode;
+    options.dispatch = args => {
+      if (!leaseHeld()) throw Error('dispatch lease lost');
+      return dispatch({ ...args, leaseHeld });
+    };
+    return runReviewTickAllRepos({ tick, ...options, ...opts, leaseHeld });
+  }, { lockRoot, owner, log: line => log.error(line) });
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
+  dispatchLockRoot = RUNNER_LOCK_ROOT,
   reapSessions = defaultReapSessions,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
@@ -2086,7 +2103,7 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
+  runReview = opts => runReviewDispatchPass({ owner, lockRoot: dispatchLockRoot, log, reviewTickOpts, tick, factCache, ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).

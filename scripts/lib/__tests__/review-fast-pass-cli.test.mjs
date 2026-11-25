@@ -8,7 +8,8 @@ import * as profile from '../repo-profile.mjs';
 import * as leases from '../../../skills-src/conveyor/runner-lock.mjs';
 import * as selfSync from '../daemon-self-sync.mjs';
 import * as githubAuth from '../github-app-auth-env.mjs';
-import { REVIEW_FAST_PASS_LEASE_KEY, fastPassOptions, runFastPassCli, saveFastPlan } from '../review-fast-pass-cli.mjs';
+import { dispatchReviewByMode } from '../../operations/review-job.mjs';
+import { REVIEW_FAST_PASS_LEASE_KEY, REVIEW_DISPATCH_LEASE_KEY, withReviewDispatchLease, fastPassOptions, runFastPassCli, saveFastPlan } from '../review-fast-pass-cli.mjs';
 afterEach(() => vi.restoreAllMocks());
 
 function adapter() {
@@ -123,4 +124,35 @@ it('forces job mode and refuses an explicit session-mode dispatch', () => {
   expect(dispatch).not.toHaveBeenCalled();
   o.dispatch({ pr: 1, expectedHead: 'a'.repeat(40) });
   expect(dispatch.mock.calls[0][0].mode).toBe('job');
+});
+
+it('the CLI dispatch wires strict stack evidence through dispatchReviewByMode', () => {
+  const stackCheck = vi.fn(({ strict }) => { if (strict) throw Error('stack leaf unreadable'); return { base: null }; });
+  const o = fastPassOptions({ repo: 'fixture/repo', options: { dispatch: args => dispatchReviewByMode({ ...args, stackCheck }) },
+    io: { readLivePr: () => ({ headRefOid: 'a'.repeat(40) }) } });
+  expect(() => o.dispatch({ pr: 1, expectedHead: 'a'.repeat(40) })).toThrow('stack leaf unreadable');
+  expect(stackCheck).toHaveBeenCalledWith(expect.objectContaining({ strict: true }));
+});
+it('the CLI dispatch requests strict read-only clean freshness evidence', () => {
+  const staleness = vi.fn(() => ({ fresh: true }));
+  const o = fastPassOptions({ repo: 'fixture/repo', options: { dispatch: args => args.checkStaleness('/fixture') },
+    io: { readLivePr: () => ({ headRefOid: 'a'.repeat(40) }), staleness } });
+  o.dispatch({ pr: 1, expectedHead: 'a'.repeat(40) });
+  expect(staleness).toHaveBeenCalledWith(expect.objectContaining({ strict: true, cleanOnly: true, autoFf: false }));
+});
+it('CLI stops dispatch when the real dispatch-lease heartbeat loses ownership', async () => {
+  const { exerciseFastCli } = await import('./fixtures/review-fast-cli-integration.mjs');
+  expect(await exerciseFastCli(['lease-lost'])).toEqual({ violations: [] });
+});
+it('an expired dispatch holder cannot resume or release its successor', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'expired-dispatch-'));
+  const key = REVIEW_DISPATCH_LEASE_KEY;
+  try {
+    await withReviewDispatchLease(leaseHeld => {
+      leases.heartbeatRunnerLease(root, 'old-owner', { key, nowMs: 1 });
+      expect(leases.acquireRunnerLease(root, 'new-owner', { key }).ok).toBe(true);
+      expect(leaseHeld()).toBe(false);
+    }, { lockRoot: root, owner: 'old-owner' });
+    expect(leases.runnerLeaseStatus(root, { key })).toMatchObject({ held: true, owner: 'new-owner' });
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

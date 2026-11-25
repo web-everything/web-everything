@@ -1348,10 +1348,11 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
     vi.stubEnv('WE_REVIEW_FACTS', '0');
     // Hermetic: the real CPU-idle reading must not raise the per-tick cap in this wiring test.
     vi.stubEnv('WE_RED_TEAM_QUEUE_REVIEW_STARTS_WHILE_IDLE', '0');
+    const dispatchLockRoot = mkdtempSync(join(tmpdir(), 'ordinary-dispatch-'));
     try {
       const seen = [];
       const tick = vi.fn((o) => { seen.push(o); return { reviewsOwed: 0, dispatched: [], failed: [], refusals: 0 }; });
-      const effects = buildCliDaemonEffects({ owner: 'test', log: { error: () => {} }, reapSessions: () => null,
+      const effects = buildCliDaemonEffects({ owner: 'test', dispatchLockRoot, log: { error: () => {} }, reapSessions: () => null,
         runPrepReview: noPrepReview, convertAdvisoryEnabled: false,
         reviewTickOpts: (args) => ({ ...cliReviewTickOpts({ ...args, listCommands: () => '' }), tick, repos: ['web-everything/web-everything'], authGateOverride: () => ({ paused: false, reason: null }) }) });
       await effects.tickOnce();
@@ -1363,7 +1364,7 @@ describe('runReviewTick — #3383 bug 3: dispatch is capped by acquirableLanes, 
       vi.stubEnv('WE_TEST_HOST_LOAD1', '0');
       vi.stubEnv('WE_TEST_HOST_MEMORY_MB', '10');
       expect(defaultReviewHostAdmission()).toMatchObject({ admitted: false, reason: expect.stringContaining('host memory headroom 10MB') });
-    } finally { vi.unstubAllEnvs(); }
+    } finally { vi.unstubAllEnvs(); rmSync(dispatchLockRoot, { recursive: true, force: true }); }
   });
 
   it.each([[1, 3, 1], [3, 1, 1], [2, 2, 2]])('combines the host per-tick cap %i and live-review capacity %i across repos', (maxPerTick, left, expected) => {

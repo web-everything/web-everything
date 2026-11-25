@@ -15,8 +15,19 @@ import { planClaudeAuthDispatchGate } from '../conveyor/claude-auth-health.mjs';
 import { withGithubAppAuth, FLEET_APP_AUTH_OPTS } from './github-app-auth-env.mjs';
 import { RUNNER_LOCK_ROOT, makeOwner, acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned } from '../../skills-src/conveyor/runner-lock.mjs';
 
-const DISPATCH_LEASE_KEY = '<conveyor:review-daemon-lease>';
+export const REVIEW_DISPATCH_LEASE_KEY = '<conveyor:review-dispatch-lease>';
 export const REVIEW_FAST_PASS_LEASE_KEY = '<conveyor:review-fast-pass-lease>';
+/** Serialize capacity discovery and starts, independently of either daemon's lifetime lease. */
+export async function withReviewDispatchLease(run, { lockRoot = RUNNER_LOCK_ROOT, owner = makeOwner('review-dispatch'), log = console.error } = {}) {
+  const key = REVIEW_DISPATCH_LEASE_KEY;
+  if (!acquireRunnerLease(lockRoot, owner, { key }).ok) {
+    log('review-dispatch: dispatch mutex held; deferred to next tick');
+    return { dispatched: [], failed: [], deferred: true, skipped: true, reason: 'dispatch mutex held' };
+  }
+  const leaseHeld = () => heartbeatRunnerLease(lockRoot, owner, { key }) === true;
+  try { return await run(leaseHeld); }
+  finally { releaseRunnerLeaseIfOwned(lockRoot, owner, { key }); }
+}
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const fastPlanPath = repo => join(root, '.conveyor', `review-fast-plan-${encodeURIComponent(repo)}.json`);
 export function saveFastPlan({ repo, plan, rawPrs, mainSha }, { path = fastPlanPath(repo), now = Date.now } = {}) {
@@ -53,9 +64,9 @@ export function fastPassOptions({ repo, options, budget = options.liveReviewBudg
     },
     readAgents: () => options.readAgents({ readOnly: true }), readJobs: () => readJobs({ readOnly: true }),
     starts, budget, acquirableLanes: options.acquirableLanes,
-    liveCap: ({ jobs }) => {
+    liveCap: ({ jobs, unobservedStarts = 0 }) => {
       log(`review-fast-pass: ${budget.reason}`);
-      return Math.min(budget.max ?? 0, jobs.length + starts.count + Math.max(0, budget.left - (budget.reserve ?? 0)));
+      return Math.min(budget.max ?? 0, jobs.length + unobservedStarts + Math.max(0, budget.left - (budget.reserve ?? 0)));
     },
     planOne: ({ pr, agents }) => {
       const authGate = auth();
@@ -96,21 +107,14 @@ export async function runFastPassCli({ repos, cliReviewTickOpts, sharedHostBudge
   process.once('SIGINT', stop); process.once('SIGTERM', stop);
   try {
     const effects = appAuth({
-      tickOnce: async () => {
-        if (!acquireRunnerLease(lockRoot, owner, { key: DISPATCH_LEASE_KEY }).ok) {
-          log('review-fast-pass: ordinary dispatch lease held; deferred to normal tick');
-          return;
-        }
-        try {
-          const options = cliReviewTickOpts();
-          options.hostAdmission = sharedHostBudget(options.hostAdmission, log);
-          const starts = { count: 0 };
-          let results = [];
-          for (const repo of repos) results = [...results, await runFastPass({ ...fastPassOptions({ repo, options, starts, log, io: optionsIo }),
-            leaseHeld: () => heartbeatRunnerLease(lockRoot, owner, { key: DISPATCH_LEASE_KEY }) === true })];
-          return { failed: results.flatMap(r => r.failed.map(f => ({ error: f.reason }))) };
-        } finally { releaseRunnerLeaseIfOwned(lockRoot, owner, { key: DISPATCH_LEASE_KEY }); }
-      },
+      tickOnce: () => withReviewDispatchLease(async leaseHeld => {
+        const options = cliReviewTickOpts();
+        options.hostAdmission = sharedHostBudget(options.hostAdmission, log);
+        const starts = { count: 0 };
+        const results = [];
+        for (const repo of repos) results.push(await runFastPass({ ...fastPassOptions({ repo, options, starts, log, io: optionsIo }), leaseHeld }));
+        return { failed: results.flatMap(r => r.failed.map(f => ({ error: f.reason }))) };
+      }, { lockRoot, owner, log }),
       intervalMs: setting.value.intervalMs, maxTicks: once ? 1 : Infinity,
       sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
       heartbeat: () => heartbeatRunnerLease(lockRoot, owner, { key }),

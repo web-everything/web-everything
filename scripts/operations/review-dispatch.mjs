@@ -617,6 +617,7 @@ export function dispatchReview({
   checkStaleness,
   judgeProvider = 'claude',
   careLevel = 'none', escalationReason = [], scopePaths = [],
+  leaseHeld = () => true,
   checkoutExists = existsSync, home = homedir(),
   // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — THIS FUNCTION NEVER
   // WIRED THE GH-APP-SHIM AT ALL. `dispatch-lane-io.mjs#createDispatchSinks` resolves it for the conveyor's
@@ -717,6 +718,7 @@ export function dispatchReview({
   const spawnRefusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo },
     { liveHead: readExpectedHead }, { required: true });
   if (spawnRefusal) return { pr: planned.pr, repo: planned.repo, ...spawnRefusal };
+  if (leaseHeld() !== true) throw Error('dispatch lease lost');
   if (wrapReview) {
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,

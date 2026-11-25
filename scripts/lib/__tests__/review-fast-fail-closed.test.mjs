@@ -42,6 +42,9 @@ describe('review fast path fails closed', () => {
     expect(reviewDispatchContext({ body: '' })).toMatchObject({ careLevel: 'high', scopePaths: [] });
     expect(reviewDispatchContext({ body: '', files: [{ path: 'a' }] }).careLevel).toBeUndefined();
   });
+  it.each([[99, undefined], [100, 'high'], [101, 'high']])('file evidence boundary: %i files requires %s care', (count, care) => {
+    expect(reviewDispatchContext({ files: Array.from({ length: count }, (_, i) => ({ path: `docs/${i}.md` })) }).careLevel).toBe(care);
+  });
   it('a failed file read refuses the PR; a present file list keeps normal routing', async () => {
     const o = base(); o.readPr = ({ pending }) => { if (pending) return []; throw Error('files read failed'); };
     await runFastPass(o);

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { runFastPass } from '../review-fast-pass.mjs';
+import { fastPassOptions } from '../review-fast-pass-cli.mjs';
 
 const head = 'a'.repeat(40);
 const pr = { number: 12, state: 'OPEN', headRefOid: head, labels: ['review:pending'], statusCheckRollup: [], comments: [] };
@@ -15,6 +16,43 @@ function fixture() {
     acquirableLanes: () => [1, 2], mainSha: () => 'main', log: vi.fn(), now: () => 10,
   };
 }
+it.each([false, true])('fills exactly three free seats with refreshed inventory=%s', async refresh => {
+  const o = fixture(), jobs = [], starts = { count: 0 }, budget = { max: 3, left: 3, reserve: 0 };
+  const prs = Array.from({ length: 4 }, (_, i) => ({ ...pr, number: i + 1 }));
+  o.readLastPlan = () => ({ plan: { dispatch: [] }, rawPrs: [], mainSha: 'main', savedAt: 1 });
+  o.readPr = ({ pending, pr: n }) => pending ? prs : prs.find(p => p.number === n);
+  o.planOne = ({ pr }) => ({ dispatch: [{ kind: 'review', prNumber: pr.number }] });
+  o.readJobs = () => [...jobs];
+  o.acquirableLanes = () => [1, 2, 3].filter(n => !jobs.some(j => j.lane === n));
+  o.hostAdmission = () => ({ admitted: true, maxPerTick: 4 });
+  o.dispatch = vi.fn(({ pr, preferLane }) => {
+    if (refresh) jobs.push({ repo: o.repo, pr, pid: pr, lane: preferLane });
+    return { jobPid: pr };
+  });
+  o.liveCap = fastPassOptions({ repo: o.repo, options: {}, starts, budget, log: () => {} }).liveCap;
+  const out = await runFastPass({ ...o, starts, budget });
+  expect(out.dispatched).toHaveLength(3);
+  expect(o.dispatch.mock.calls.map(([a]) => a.preferLane)).toEqual([1, 2, 3]);
+  expect(budget.left).toBe(0);
+});
+it.each([{ skipped: 'lane-cooloff' }, { refused: true, reason: 'head moved' }])('refunds confirmed no-start capacity: %s', async refusal => {
+  const o = fixture(), starts = { count: 0 }, budget = { left: 1 };
+  o.readLastPlan = () => ({ plan: { dispatch: [row, { ...row, prNumber: 13 }] }, rawPrs: [pr], mainSha: 'main', savedAt: 1 });
+  o.readPr = ({ pending, pr: number }) => pending ? [] : { ...pr, number };
+  o.planOne = ({ pr }) => ({ dispatch: [{ ...row, prNumber: pr.number }] });
+  o.dispatch.mockReturnValueOnce(refusal);
+  o.hostAdmission = () => ({ admitted: true, maxPerTick: 1 });
+  expect((await runFastPass({ ...o, starts, budget })).dispatched.map(p => p.prNumber)).toEqual([13]);
+  expect(starts.count).toBe(1);
+});
+it('stops all remaining candidates after losing the lease even if it later recovers', async () => {
+  const o = fixture(), held = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+  o.readLastPlan = () => ({ plan: { dispatch: [row, { ...row, prNumber: 13 }] }, rawPrs: [pr], mainSha: 'main', savedAt: 1 });
+  o.readPr = vi.fn(({ pending, pr: number }) => pending ? [] : { ...pr, number });
+  await runFastPass({ ...o, leaseHeld: held });
+  expect(o.readPr).toHaveBeenCalledTimes(2);
+  expect(o.dispatch).not.toHaveBeenCalled();
+});
 describe('fast review admission negatives', () => {
   it.each(['operator', 'referral', 'ledger', 'review:human', 'fix-claim'])('refuses a fresh %s hold', async hold => {
     const o = fixture();

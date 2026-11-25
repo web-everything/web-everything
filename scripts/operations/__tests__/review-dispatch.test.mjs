@@ -16,6 +16,56 @@ import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
+import { dispatchReviewJob, runReviewJob, runReviewJobCli, createReviewJobIo } from '../review-job.mjs';
+import * as childProcess from 'node:child_process';
+it('job CLI forwards its high-care model and the loop spawns with that model', () => {
+  const runJob = vi.fn(() => ({ refused: true }));
+  const previousExit = process.exitCode;
+  const stdout = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+  try {
+    runReviewJobCli(['run', '--pr=1', '--repo=web-everything/web-everything', `--expected-head=${'a'.repeat(40)}`, '--review-model=opus'], { runJob });
+    expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ reviewModel: 'opus' }));
+    const spawn = vi.spyOn(childProcess, 'spawnSync').mockReturnValue({ status: 0, stdout: '', stderr: '' });
+    createReviewJobIo({ root: '/fixture', env: {} }).runLoop({ pr: 1, repo: 'fixture/repo', lanePath: '/lane', reviewModel: 'opus' });
+    expect(spawn.mock.calls.at(-1)[1]).toContain('--model=opus');
+  } finally { process.exitCode = previousExit; stdout.mockRestore(); vi.restoreAllMocks(); }
+});
+
+it.each([{ careLevel: 'high' }, { escalationReason: ['statute'] }, { scopePaths: ['docs/agent/platform-decisions.md'] }])('job dispatch carries high-care model to the child: %j', signals => {
+  const dir = mkdtempSync(join(tmpdir(), 'review-routing-'));
+  try {
+    const spawnJob = vi.fn(() => 123);
+    dispatchReviewJob({ pr: 1, repo: 'web-everything/web-everything', root: '/daemon', dir,
+      expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) },
+      ciGate: () => ({ allowed: true }), checkStaleness: () => ({ fresh: true }),
+      readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob, ...signals });
+    expect(spawnJob.mock.calls[0][0].argv).toContain('--review-model=opus');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+it('job dispatch rejects unsupported options before effects', () => {
+  expect(() => dispatchReviewJob({ unsupportedRouting: 'high' })).toThrow('unsupported review job option');
+});
+it('job arc preserves the high-care model through lane acquisition', () => {
+  const runLoop = vi.fn(() => ({ status: 1, stdout: '', stderr: 'fixture stop' }));
+  const io = { root: '/daemon', now: () => 1000, newActorId: () => 'fixture', readPrevCompletion: () => null,
+    report: () => {}, claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {},
+    prepareLane: () => ({ head: 'a'.repeat(40) }), acquireLane: () => ({ lanePath: '/fixture-lane' }),
+    liveHead: () => 'a'.repeat(40), runLoop, releaseLane: () => {}, log: () => {} };
+  runReviewJob({ pr: 1, repo: 'web-everything/web-everything', expectedHead: 'a'.repeat(40), reviewModel: 'opus' }, io);
+  expect(runLoop).toHaveBeenCalledWith(expect.objectContaining({ reviewModel: 'opus' }));
+});
+it('job rechecks dispatch ownership after slow CI evidence, immediately before spawn', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'job-fence-'));
+  let held = true;
+  const spawnJob = vi.fn();
+  try {
+    expect(() => dispatchReviewJob({ pr: 1, repo: 'web-everything/web-everything', root: '/daemon', dir,
+      expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) }, leaseHeld: () => held,
+      ciGate: () => { held = false; return { allowed: true }; }, checkStaleness: () => ({ fresh: true }),
+      readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob })).toThrow('dispatch lease lost');
+    expect(spawnJob).not.toHaveBeenCalled();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import {
@@ -195,6 +245,15 @@ describe('dispatchReview — the composition: plan → fill → mint → spawn',
     const argv = spawnAgent.mock.calls[0][0];
     expect(argv.filter(a => a === '--model')).toHaveLength(1);
     expect(argv[argv.indexOf('--model') + 1]).toBe(model);
+  });
+
+  it.each([false, true])('lost dispatch ownership refuses session spawn with wrapped=%s', wrapReview => {
+    const spawnAgent = vi.fn(), launchWrapped = vi.fn();
+    expect(() => dispatchReview({ ciGate: GREEN_CI, pr: 1234, repo: 'web-everything/web-everything', root: '/repo',
+      readBrief: () => REAL_TEMPLATE_STUB, checkStaleness: FRESH, spawnAgent, launchWrapped, wrapReview,
+      ensureSessionCwd: d => d, resolveSettingsEnv: () => null, isolateSession: () => ({ worktreeSettings: null }),
+      leaseHeld: () => false })).toThrow('dispatch lease lost');
+    expect(spawnAgent).not.toHaveBeenCalled(); expect(launchWrapped).not.toHaveBeenCalled();
   });
 
   // #x8mpubm follow-up (live-caught 2026-09-24, review-2591/2593/2600/2599/2594/2582) — this dispatch NEVER

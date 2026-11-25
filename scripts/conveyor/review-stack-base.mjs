@@ -437,7 +437,7 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
   const out = new Map();
   let rows = [];
   let failure = 'refs-read-threw';
-  const diagnose = (pr, cause) => { if (strict) throw Error(`stack evidence unknown: ${cause}`); try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
+  const diagnose = (pr, cause) => { if (strict && (requirePr === null || pr === requirePr)) throw Error(`stack evidence unknown: ${cause}`); try { diag?.set(pr, { cause }); } catch { /* best effort */ } };
   const diagnoseAll = (cause) => {
     for (const row of rows) if (!out.has(row.pr) && LANE_REF.test(row.baseRefName ?? '')) diagnose(row.pr, cause);
   };
@@ -471,6 +471,9 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
     const tips = readLanes(root);
     if (!tips) { if (strict) throw Error('stack tips unreadable'); diagnoseAll(failure); return out; }
     rows = flagUntrustedStackRows(rows, tips);
+    if (strict && requirePr !== null && rows.find(row => row.pr === requirePr)?.untrusted) {
+      throw Error('stack evidence unknown: target-head-untrusted');
+    }
     const rowsByPr = new Map(rows.map((row) => [row.pr, row]));
     const openBases = new Map();
     for (const [pr, ref] of refs) {
@@ -498,7 +501,9 @@ export function readStackBases({ strict = false, root = ROOT, env = process.env,
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }
     }
     const sets = readOffMainSets(heads.map((r) => r.headRefOid), { root, run });
-    if (strict && trusted.some(row => !sets.has(row.headRefOid))) throw Error('stack heads unreadable');
+    if (strict && trusted.some(row => !sets.has(row.headRefOid)
+      && (requirePr === null || row.pr === requirePr
+        || rows.find(target => target.pr === requirePr)?.baseRefName === row.headRefName))) throw Error('stack heads unreadable');
     const bases = findStackBases(trusted, sets, { log });
     for (const top of rows) {
       if (!LANE_REF.test(top.baseRefName ?? '')) continue;

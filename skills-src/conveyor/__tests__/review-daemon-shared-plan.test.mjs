@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { saveFastPlan } from '../../../scripts/lib/review-fast-pass-cli.mjs';
+import { saveFastPlan, REVIEW_DISPATCH_LEASE_KEY } from '../../../scripts/lib/review-fast-pass-cli.mjs';
+import { acquireRunnerLease, releaseRunnerLeaseIfOwned } from '../runner-lock.mjs';
 vi.mock('../../../scripts/lib/review-facts.mjs', async (original) => ({
   ...await original(), warmReviewFacts: async () => ({ skipped: 'test' }),
 }));
@@ -19,6 +20,36 @@ const empty = () => ({ dispatch: [], refusals: [] });
 const reviewOpts = { holdReconcile: () => [], statusCandidates: () => [], readMainSha: () => 'a'.repeat(40) };
 const authGateOverride = () => ({ paused: false, reason: null });
 afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+it('ordinary CLI acquires the shared dispatch mutex before reading its capacity and releases on throw', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ordinary-mutex-'));
+  const key = REVIEW_DISPATCH_LEASE_KEY;
+  const factory = vi.fn(() => {
+    expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(false);
+    throw Error('fixture capacity unreadable');
+  });
+  const effects = buildCliDaemonEffects({ owner: 'ordinary', dispatchLockRoot: root, reviewTickOpts: factory,
+    reapSessions: () => null, runPrepReview: () => null, convertAdvisoryEnabled: false, log: { error: () => {} } });
+  try {
+    acquireRunnerLease(root, 'competitor', { key });
+    const deferred = await effects.tickOnce();
+    expect(deferred).toMatchObject({ skipped: true, reason: 'dispatch mutex held' });
+    expect(factory).not.toHaveBeenCalled();
+    expect(() => effects.onTick(deferred)).not.toThrow();
+    releaseRunnerLeaseIfOwned(root, 'competitor', { key });
+    await expect(effects.tickOnce()).rejects.toThrow('fixture capacity unreadable');
+    expect(factory).toHaveBeenCalledOnce();
+    expect(acquireRunnerLease(root, 'competitor', { key }).ok).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+it('ordinary dispatch stops the remaining candidates on lost ownership', () => {
+  const dispatch = vi.fn();
+  const out = runReviewTick({ ...reviewOpts, repo, dispatch, leaseHeld: () => false,
+    dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
+    reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'review', prNumber })), refusals: [] }) });
+  expect(out.failed).toContainEqual({ prNumber: 1, error: 'dispatch lease lost' });
+  expect(dispatch).not.toHaveBeenCalled();
+});
 
 describe('review tick plan sharing', () => {
   it('snapshots the final replacement plan and withholds it when promotion replanning fails, leaving onPlan unchanged', () => {
