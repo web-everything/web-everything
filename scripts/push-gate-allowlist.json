@@ -345,6 +345,6 @@
     "scripts/run-fresh.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-commands-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-skills-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2}
+    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push. Site 3 is the read-only sharedGit helper in maybePublishSharedGreen (status, ls-files, remote get-url), flagged only because its argv is dynamic.","sites":3}
   }
 }
