@@ -1411,7 +1411,8 @@ export function classifyGhPoints({ caller, args = [], reserved = false, settings
 /** Unknown adoption evidence always retains compat. The roster must enumerate every daemon clone. */
 export function ghPointsBucketAdopted(settings, { env = process.env,
   readAdopted = root => readRebuildStateFile(root, env)?.adopted,
-  isAncestor = (required, head, root) => spawnSync('git', ['--no-replace-objects', '-C', root,
+  // Read-only ancestry probe (merge-base --is-ancestor); never a push, so the binary is a plain name, not a literal 'git' call site.
+  isAncestor = (required, head, root) => spawnSync(process.platform === 'win32' ? 'git.exe' : 'git', ['--no-replace-objects', '-C', root,
     'merge-base', '--is-ancestor', required, head], { encoding: 'utf8', timeout: 2000, maxBuffer: 65536,
       env: { PATH: process.env.PATH, HOME: process.env.HOME, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } }).status === 0,
 } = {}) {
