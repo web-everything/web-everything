@@ -172,6 +172,7 @@ const remainingUnguardedWrites = [
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Same-pass draft promotion via promoteDraftsGuarded -> runDraftPromotionStep -> ready without review capability admission","call":"promoteDraftsThenReplan"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish referral pause notice","call":"notifyReferral"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish juror-timeout hold notice (same writer as the referral pause notice)","call":"notifyReferral"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish scope-refresh result marker","call":"postRefreshMarker"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish dispatched review round","call":"tagRound"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
