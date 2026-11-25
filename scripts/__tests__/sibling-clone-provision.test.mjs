@@ -9,12 +9,19 @@ import { findRawPushes } from '../lib/push-gate-lint.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { gitRun } from '../lib/git-run.mjs';
 import { resolveSiblingRepoName, siblingCloneStatus, provisionMissingSiblingClones } from '../lib/sibling-clone-provision.mjs';
+import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
+import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
+import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 
 vi.mock('../lib/git-run.mjs', () => ({ gitRun: vi.fn() }));
 
 const roots = [];
 afterEach(() => {
   vi.mocked(gitRun).mockReset();
+  vi.doUnmock('node:child_process');
+  vi.doUnmock('../lib/sibling-clone-provision.mjs');
+  vi.doUnmock('../readiness/drain-lock.mjs');
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 function fixture() {
@@ -85,6 +92,17 @@ describe('sibling clone provisioning', () => {
     expect(siblingCloneStatus(options)[0].present).toBe(false);
   });
 
+  it('continues provisioning when the logger throws and returns both sibling outcomes', () => {
+    const options = fixture();
+    options.run.mockImplementationOnce(() => { throw new Error('clone failed'); });
+    const log = vi.fn(() => { throw new Error('log sink closed'); });
+    expect(provisionMissingSiblingClones({ ...options, log })).toEqual({
+      provisioned: ['plateau-app'], failed: [{ name: 'frontierui', reason: 'clone failed' }],
+    });
+    expect(options.run).toHaveBeenCalledTimes(2);
+    expect(log).toHaveBeenCalledTimes(3);
+  });
+
   it('reports the clone exit error without captured stderr and removes its reserved directory', () => {
     const options = fixture();
     const message = 'Command failed: git clone (exit 128)';
@@ -147,6 +165,79 @@ describe('sibling clone provisioning', () => {
     const exists = path => { if (path.endsWith('.git')) throw new Error('unreadable'); return false; };
     expect(provisionMissingSiblingClones({ ...options, exists }).failed).toHaveLength(2);
     expect(options.run).not.toHaveBeenCalled();
+  });
+});
+
+describe('main sibling provisioning lifecycle', () => {
+  async function startup({ dryRun = false, testMarker = null, mainCalls = 1, leaseRefused = false, failClone = false } = {}) {
+    vi.doUnmock('../lib/git-run.mjs');
+    vi.doMock('node:child_process', () => childProcessMock);
+    const options = fixture();
+    if (failClone) options.run.mockImplementationOnce(() => { throw new Error('clone failed'); });
+    const provision = vi.fn(args => provisionMissingSiblingClones({ ...options, ...args }));
+    vi.doMock('../lib/sibling-clone-provision.mjs', async importOriginal => ({
+      ...await importOriginal(), provisionMissingSiblingClones: provision,
+    }));
+    if (leaseRefused) {
+      vi.doMock('../readiness/drain-lock.mjs', async importOriginal => ({
+        ...await importOriginal(),
+        drainLeaseStatus: () => ({ held: true, stale: false, owner: 'fixture:other', scope: null }),
+      }));
+    }
+    let result;
+    const world = createPrestageWorld((argv, config) => {
+      // The fixture owns this parent. Keep siblings absent so a missing dryRun
+      // forwarding argument reaches the fake clone runner instead of being masked.
+      rmSync(resolve(config.cwd, '..', 'frontierui'), { recursive: true, force: true });
+      rmSync(resolve(config.cwd, '..', 'plateau-app'), { recursive: true, force: true });
+      const ports = {
+        ...prestagePorts,
+        git(args, env) {
+          // Also refuse clones that bypass the injected provisioner.
+          if (args.includes('clone')) throw new Error('unexpected CLI git clone');
+          return prestagePorts.git(args, env);
+        },
+      };
+      return runInProcess(leaseRefused ? ['--this-repo', '--json'] : argv, {
+        ...config, env: { ...config.env, WE_UNDER_TEST: undefined, WE_TEST_HERMETIC: undefined,
+          ...(testMarker ? { [testMarker]: '1' } : {}) }, ports, mainCalls,
+      }).then(value => {
+        result = value;
+        // Each main call emits its own JSON report; the world fixture consumes one.
+        return { ...value, stdout: value.stdout.trim().split('\n').at(-1) + '\n' };
+      });
+    });
+    await world(async ({ run }) => { await run(false, { args: dryRun ? ['--dry-run'] : [] }); },
+      { slug: 'web-everything/web-everything' });
+    return { provision, clone: options.run, result };
+  }
+
+  it.each(['WE_UNDER_TEST', 'WE_TEST_HERMETIC'])('keeps non-dry-run test CLIs status-only with %s without any clone attempt', async testMarker => {
+    const { provision, clone, result } = await startup({ testMarker });
+    expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+    expect(clone).not.toHaveBeenCalled();
+    expect(result.stderr).toContain(`${testMarker}=1`);
+  });
+
+  it('forwards CLI dry-run to the real provisioner without invoking a clone runner', async () => {
+    const { provision, clone } = await startup({ dryRun: true });
+    expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+    expect(clone).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('provisions siblings only once across repeated main calls (clone failure: %s)', async failClone => {
+    const { provision, clone, result } = await startup({ mainCalls: 2, failClone });
+    expect(result.stdout.trim().split('\n').map(JSON.parse)).toHaveLength(2);
+    expect(provision).toHaveBeenCalledTimes(1);
+    expect(provision).toHaveBeenCalledWith(expect.objectContaining({ dryRun: false }));
+    expect(clone).toHaveBeenCalledTimes(2);
+  });
+
+  it('makes zero provisioning calls when the drain lease is refused', async () => {
+    const { provision, clone, result } = await startup({ leaseRefused: true });
+    expect(JSON.parse(result.stdout).skipped).toBe('drain-in-progress');
+    expect(provision).not.toHaveBeenCalled();
+    expect(clone).not.toHaveBeenCalled();
   });
 });
 

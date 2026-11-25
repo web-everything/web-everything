@@ -8402,7 +8402,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // Check once per process, before any sweep; dry runs only report missing-clone status.
   if (!siblingClonesChecked) {
     siblingClonesChecked = true;
-    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN,
+    // Vitest setup marks this process and its spawned CLIs. Incidental startup
+    // checks must never clone beside a fixture (which may live in shared tmpdir).
+    // Some CLI fixtures clear WE_UNDER_TEST to exercise production readers but
+    // retain the inherited hermetic marker. Either marker forbids startup clones.
+    const testStatusOnly = ['WE_UNDER_TEST', 'WE_TEST_HERMETIC'].find(key => env[key] === '1');
+    if (testStatusOnly) process.stderr.write(`sibling clones: status-only (${testStatusOnly}=1, test environment)\n`);
+    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN || Boolean(testStatusOnly),
       log: line => process.stderr.write(`${line}\n`) }).failed;
   }
 
