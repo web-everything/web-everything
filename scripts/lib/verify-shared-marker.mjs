@@ -11,7 +11,7 @@
  * Only a fresh verify run publishes: a "green, no new run needed" reuse of the lane marker writes nothing.
  */
 import { mkdirSync, openSync, writeFileSync, fsyncSync, closeSync, linkSync, unlinkSync, lstatSync, fstatSync, readFileSync, constants } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const SHA = /^[0-9a-f]{40}$/;
@@ -40,6 +40,20 @@ export function executedTestCount(reportText) {
     const executed = total - pending - todo;
     return executed >= 0 && executed === passed + failed ? executed : null;
   } catch { return null; }
+}
+
+/** Full phase only: every config-enumerated file must contain a passed/failed assertion in THIS report. */
+export function fullPhaseInventory({ reportText, files, cwd }) {
+  try {
+    if (!Array.isArray(files) || files.length < 1 || files.some(file => typeof file !== 'string' || !isAbsolute(file))
+      || executedTestCount(reportText) === null) return false;
+    const report = JSON.parse(reportText);
+    if (!Array.isArray(report.testResults)) return false;
+    const executed = new Set(report.testResults.filter(file => typeof file?.name === 'string'
+      && file.assertionResults.some(test => ['passed', 'failed'].includes(test.status)))
+      .map(file => resolve(cwd, file.name)));
+    return files.every(file => executed.has(resolve(file)));
+  } catch { return false; }
 }
 
 export function sharedMarkerPath({ coordRoot, repo, sha, mergeBase, policyKey }) {

@@ -22,12 +22,13 @@ const sharedPath = join(process.cwd(), 'scripts/lib/verify-shared-marker.mjs');
 const sharedStore = existsSync(sharedPath) ? await import(sharedPath) : {};
 import { readVerifyMarker } from '../lib/lane-verify.mjs';
 
-let dir;
+let dir, fixtureRoot;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'pr-land-finish-guard-'));
+  fixtureRoot = mkdtempSync(join(tmpdir(), 'pr-land-finish-guard-'));
+  dir = join(fixtureRoot, 'checkout'); mkdirSync(dir);
   execFileSync('git', ['init', '-q'], { maxBuffer: 2 * 1024 * 1024, cwd: dir });
 });
-afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { rmSync(fixtureRoot, { recursive: true, force: true }); });
 
 const gitDirOf = (d) => join(d, '.git');
 const runGit = (args) => execFileSync('git', args, { maxBuffer: 2 * 1024 * 1024, cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -224,15 +225,49 @@ describe('finish-guard shared readMarker wiring', () => {
     const sha = headSha();
     runGit(['update-ref', 'refs/remotes/origin/main', sha]);
     const mergeBase = sha, coordRoot = join(dir, 'coord');
-    const policyKey = verifyGate.verifyPolicyKey({});
+    const sibling = join(fixtureRoot, 'frontierui');
+    execFileSync('git', ['clone', '-q', dir, sibling], { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
+    mkdirSync(join(sibling, 'plugs')); mkdirSync(join(sibling, 'webtheme'));
+    const policyKey = verifyGate.verifyPolicyKey({}, { root: dir });
     const record = { v: 1, writer: 'verify-lane', repo: 'example/project', sha, mergeBase, revertRed: null, policyKey, status: 'green', exitCode: 0,
       executedGate: 'npm run test:unit', selectionMode: 'pr', deltaBase: null, finishedAt: new Date().toISOString(), lane: 'lane-A' };
     expect(sharedStore.publishGreen({ coordRoot, repo: record.repo, sha, mergeBase, policyKey, record })).toBe(true);
     const logs = [];
     const read = (env = {}, head = sha, base = 'main', runner = runGit) => land.readFinishGuardMarker({ gitDir: gitDirOf(dir), headSha: head,
-      remote: 'origin', base, runGit: runner, coordRoot, env, log: text => logs.push(text) });
+      remote: 'origin', base, runGit: runner, coordRoot, env: { WE_VERIFY_SHARED_GREEN_REUSE: '1', ...env }, log: text => logs.push(text) });
     return { sha, read, logs, coordRoot, policyKey, record };
   };
+  it('F8 default-off shared reuse preserves the exact local read and records shadow acceptance', () => {
+    const { read, logs, coordRoot } = setup();
+    expect(read({ WE_VERIFY_SHARED_GREEN_REUSE: '0' })).toEqual(readVerifyMarker(gitDirOf(dir)));
+    expect(logs.join('\n')).toMatch(/shared-reuse shadow: would-accept \(sharedFrom /);
+    expect(JSON.parse(readFileSync(join(coordRoot, 'verify-shared-shadow.log'), 'utf8').trim())).toMatchObject({ verdict: 'would-accept' });
+  });
+  it.each(['red', 'running', 'corrupt', 'stale-green', 'exact-green'])
+    ('F8 default-off returns the unchanged local %s evidence and logs refusal or acceptance', kind => {
+      const { sha, read, logs, coordRoot } = setup();
+      writeFileSync(join(gitDirOf(dir), '.lane-verify'), kind === 'corrupt' ? '{bad' : JSON.stringify({
+        sha: kind === 'stale-green' ? 'e'.repeat(40) : sha, status: kind.endsWith('green') ? 'green' : kind, suites: 'local',
+      }));
+      const local = readVerifyMarker(gitDirOf(dir));
+      expect(read({ WE_VERIFY_SHARED_GREEN_REUSE: '0' })).toEqual(local);
+      expect(logs.join('\n')).toMatch(kind === 'stale-green' ? /shared-reuse shadow: would-accept/ : /shared-reuse shadow: would-refuse/);
+      const line = JSON.parse(readFileSync(join(coordRoot, 'verify-shared-shadow.log'), 'utf8').trim());
+      expect(line.verdict).toBe(kind === 'stale-green' ? 'would-accept' : 'would-refuse');
+    });
+  it('F8 shadow append failures preserve main local behavior and never throw', () => {
+    const { read, coordRoot, logs } = setup();
+    mkdirSync(join(coordRoot, 'verify-shared-shadow.log'));
+    expect(read({ WE_VERIFY_SHARED_GREEN_REUSE: '0' })).toBeNull();
+    expect(logs.join('\n')).toMatch(/shared-reuse shadow: would-accept/);
+  });
+  it('F8 absent shared evidence logs a one-line shadow refusal', () => {
+    const { read, logs } = setup();
+    expect(read({ WE_VERIFY_SHARED_GREEN_REUSE: '0', WE_NEW_POLICY_KNOB: 'different' })).toBeNull();
+    expect(logs.filter(line => line.includes('shared-reuse shadow:'))).toEqual([
+      'pr-land: shared-reuse shadow: would-refuse (local precedence or shared evidence unavailable)',
+    ]);
+  });
   it('reads the exact consumer SHA and computed policy, logs sharedFrom on acceptance and key inputs on refusal', () => {
     const { sha, read, logs } = setup();
     expect(read()).toMatchObject({ sha, status: 'green', suites: 'npm run test:unit', sharedFrom: { lane: 'lane-A' } });

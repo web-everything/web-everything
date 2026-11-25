@@ -102,8 +102,8 @@ import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
-import { publishGreen, readSharedGreen, executedTestCount } from './lib/verify-shared-marker.mjs';
-import { verifyPolicyKey } from './lib/verify-lane-gate.mjs';
+import { publishGreen, executedTestCount, fullPhaseInventory } from './lib/verify-shared-marker.mjs';
+import { verifyPolicyKey, VERIFIER_AT_START } from './lib/verify-lane-gate.mjs';
 import { repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { basename } from 'node:path';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
@@ -383,15 +383,16 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
 function maybePublishSharedGreen({ status, treeHash, skipped = null, revertRed = null }) {
   const skip = reason => process.stderr.write(`verify shared: skip (${reason}); re-verify for shared reuse\n`);
   try {
+    if (!VERIFIER_AT_START.sha || !VERIFIER_AT_START.scriptsClean) return skip('tooling scripts dirty or unreadable at process start');
+    if (Object.keys(process.env).some(name => /^(?:GIT_DIR|GIT_WORK_TREE|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_COMMON_DIR)$/.test(name) || name.startsWith('GIT_CONFIG'))) return skip('inherited git environment');
     if (typeof flags.gate === 'string' || FORCE_LOCAL) return skip('explicit gate or local run');
     const ours = resolveBuildDefaultGate(process.env);
     if (!resolvedGate || !gateCommandsEqual(ours.command, GATE) || !gateCommandsEqual(resolvedGate.command, GATE)) return skip('executed gate differs from own env plan');
     if (resolvedGate.command.includes('--passWithNoTests')) return skip('gate permits no tests');
-    const decision = resolvedGate.decision, selection = decision?.selection;
-    if (decision?.forceFallback || selection?.forceFallback
-      || (decision?.mode !== 'full' || selection != null) && (!selection || selection.status !== 'complete'
-        || !Number.isSafeInteger(selection.fullTestCount) || selection.fullTestCount < 1
-        || selection.selectedTestCount !== selection.fullTestCount || selection.droppedCount !== 0)) return skip('incomplete selection');
+    const decision = resolvedGate.decision;
+    if (decision?.mode !== 'full' || decision?.forceFallback || decision?.selection != null
+      || decision?.selectionMode?.mode === 'since-last-green') return skip('incomplete selection: whole full tier required');
+    if (!sharedFullPhaseComplete) return skip('full-phase runner file inventory incomplete or unavailable');
     if (!sharedTestCounts.length || sharedTestCounts.some(n => !Number.isSafeInteger(n) || n < 0)
       || sharedTestCounts.reduce((sum, n) => sum + n, 0) < 1) return skip('runner execution count unavailable or zero');
     if (decision?.standards?.run === false || !phaseResults.some(p => p.phase === 'standards'
@@ -399,18 +400,21 @@ function maybePublishSharedGreen({ status, treeHash, skipped = null, revertRed =
     if (revertRed && revertRed.mode !== 'off' && revertRed.status !== 'clean') return skip('revert-red is not proven clean');
     const revertRedEvidence = !revertRed || revertRed.mode === 'off' ? null : { mode: revertRed.mode, status: revertRed.status };
     const sharedGit = args => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, env: laneGitHardeningEnv(process.env) });
+      stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 5000, env: laneGitHardeningEnv(process.env) });
+    try {
+      if (sharedGit(['config', '--get-regexp', '^filter\\.']).trim()) return skip('git filter configuration');
+    } catch (error) { if (error.status !== 1) throw error; }
+    const attributes = sharedGit(['ls-files', '-z', '--', '.gitattributes', '**/.gitattributes']).split('\0').filter(Boolean);
+    for (const file of attributes) {
+      if (/(?:^|\s)filter=/.test(sharedGit(['show', `HEAD:${file}`]))) return skip('gitattributes filter');
+    }
     if (sharedGit(['ls-files', '-v']).split('\n').some(line => /^[a-zS] /.test(line))) return skip('assume-unchanged or skip-worktree entries');
     const repo = repoSlugFromRemote(sharedGit(['remote', 'get-url', 'origin']).trim());
     const mergeBase = sharedGit(['merge-base', 'HEAD', 'origin/main']).trim();
     if (!/^[0-9a-f]{40}$/.test(mergeBase)) return skip('merge-base unavailable');
-    const policyKey = verifyPolicyKey(process.env), coordRoot = resolveCoordinationRoot();
-    const selectionMode = resolvedGate.decision?.selectionMode?.mode;
-    const deltaBase = selectionMode === 'since-last-green' ? resolvedGate.decision.selectionMode.base : null;
-    if (selectionMode === 'since-last-green') {
-      const base = readSharedGreen({ coordRoot, repo, sha: deltaBase, mergeBase, policyKey });
-      if (!base || base.corrupt) return skip('delta base has no valid shared green under this policy');
-    }
+    const policyKey = verifyPolicyKey(process.env, { root: REPO }), coordRoot = resolveCoordinationRoot();
+    if (!policyKey) return skip('external alias or policy input unavailable');
+    const selectionMode = 'full', deltaBase = null;
     const statusOut = sharedGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all']);
     const cleanTree = statusOut.split('\n').filter(Boolean).every(line => line.startsWith('?? ') && isAllowlistedLitterPath(line.slice(3)));
     if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree, skipped })) return skip('not a stable clean default-gate green');
@@ -749,8 +753,9 @@ const ADMISSION_TIMEOUT_MS = resolveTimeoutMs(process.env);
 const laneMatch = /lane-(\d+)/.exec(REPO);
 // #verify-phase-admission — acquire the first phase before dispatch's execution marker.
 const retryableGate = isSelectedTestCommand(resolvedGate?.testCommand ?? '');
-// Only the known default full command is separable; arbitrary shell commands remain opaque.
-const fullRetryGate = verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full'
+// Separate the proven full command for its own runner receipt, including when retries are disabled.
+// Arbitrary shell commands remain opaque.
+const fullRetryGate = resolvedGate?.decision?.mode === 'full'
   && /^npm run test:unit(?: && npm run check:standards)?$/.test(resolvedGate.command)
   && checkoutHasRetryableTestUnit(REPO);
 if (verifySetting('retryFailed', process.env) > 0 && resolvedGate?.decision?.mode === 'full' && !fullRetryGate) {
@@ -1153,6 +1158,7 @@ const loggedFlakeFiles = new Set();
 process.stderr.write(`verify-lane: retryFailed=${retryFailed} (${verifySettingSource('retryFailed', process.env)})\n`);
 const phaseResults = [];
 const sharedTestCounts = [];
+let sharedFullPhaseComplete = false;
 // The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
 // proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
 // silently while the rest still pass). Removed in the gate's `finally`.
@@ -1162,25 +1168,41 @@ const alwaysRun = guardGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
-// Only direct, single Vitest commands can safely receive a new reporter. Shard wrappers and opaque npm
-// scripts have no aggregate runner receipt here: retain null evidence and refuse shared publication.
+// Direct Vitest and the proven hook-free full npm wrapper can receive a phase-owned JSON reporter.
+// Shard wrappers and opaque npm scripts retain null evidence and cannot authorize shared publication.
 // Existing guard/retry reports are reused so their execution-inventory consumers keep the same file.
-async function runCountedTestGate(phase, command, args, { reportFile = null, ...options } = {}) {
+async function runCountedTestGate(phase, command, args, { reportFile = null, fullPhase = false, ...options } = {}) {
   let reportDir = null;
-  const direct = args ? command === 'npx' && args[0] === 'vitest' && ['run', 'related'].includes(args[1])
-    : /^npx vitest (?:run|related)(?:\s|$)/.test(command) && !/[;&|<>`\r\n]/.test(command);
+  const knownNpm = fullPhase && !args && command === 'npm run test:unit' && checkoutHasRetryableTestUnit(REPO);
+  const direct = knownNpm || (args ? command === 'npx' && args[0] === 'vitest' && ['run', 'related'].includes(args[1])
+    : /^npx vitest (?:run|related)(?:\s|$)/.test(command) && !/[;&|<>`\r\n]/.test(command));
   try {
+    let fullFiles = null;
+    if (fullPhase) {
+      sharedFullPhaseComplete = false;
+      try {
+        // Use Vitest's own config-aware enumeration, under this phase's admission slot.
+        const listing = execFileSync(process.execPath, [fileURLToPath(new URL('./readiness/forge-vitest-select.mjs', import.meta.url)),
+          JSON.stringify({ options: {}, filters: [] })], { cwd: REPO, env: process.env, encoding: 'utf8',
+          timeout: 60_000, maxBuffer: MAX_TIMEOUT_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'] });
+        fullFiles = JSON.parse(listing);
+      } catch { /* Unknown inventory only disables shared publication; local verification still runs. */ }
+    }
     if (!reportFile && direct) {
       reportDir = mkdtempSync(join(tmpdir(), 'verify-test-count-'));
       reportFile = join(reportDir, 'results.json');
       const flags = ['--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
       if (args) args = [...args, ...flags];
-      else command += ` --reporter=default --reporter=json --outputFile.json=${shellQuote(reportFile)}`;
+      else command += `${knownNpm ? ' --' : ''} --reporter=default --reporter=json --outputFile.json=${shellQuote(reportFile)}`;
     }
     const result = await timedRunGate(phase, command, args, options);
     let count = null;
     try {
-      if (reportFile && nodeFs.statSync(reportFile).size <= MAX_TIMEOUT_LOG_BYTES) count = executedTestCount(readFileSync(reportFile, 'utf8'));
+      if (reportFile && nodeFs.statSync(reportFile).size <= MAX_TIMEOUT_LOG_BYTES) {
+        const reportText = readFileSync(reportFile, 'utf8');
+        count = executedTestCount(reportText);
+        if (fullPhase) sharedFullPhaseComplete = fullPhaseInventory({ reportText, files: fullFiles, cwd: realpathSync(REPO) });
+      }
     } catch { /* Missing, remote-only or oversized reports cannot authorize shared reuse. */ }
     sharedTestCounts.push(count);
     return { ...result, executedTests: count };
@@ -1240,7 +1262,7 @@ try {
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
-    phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE));
+    phasedTestGate ? resolvedGate.testCommand : (resolvedGate?.command ?? GATE), undefined, { fullPhase: resolvedGate?.decision?.mode === 'full' });
   if (retryFailed === 0 && retryableGate && vitestAdmittedLocally && isolatedRetryMode !== 'off' && result.exitCode !== 0 && !verificationInfrastructureFailure(result) && result.output) {
     // Edits during admission or test execution must also count as the change's own files.
     const changedNow = localChangedSet({ runGit: git });

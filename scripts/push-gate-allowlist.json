@@ -264,7 +264,7 @@
     "scripts/lib/validate-rules-anchors.cjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/verdict-ledger-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/verify-base-rerun.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/lib/verify-lane-gate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":14},
+    "scripts/lib/verify-lane-gate.mjs": {"status":"pending-migration","reason":"S2: existing unresolved git reads plus the bounded hardened policyGit port and six injected Git reads for startup identity and sibling alias evidence.","sites":21},
     "scripts/lib/verify-revert-red.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/we-scan-cache.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
     "scripts/lint-locus-prefix.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
@@ -345,6 +345,6 @@
     "scripts/run-fresh.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-commands-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-skills-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push. Site 3 is the read-only sharedGit helper in maybePublishSharedGreen (status, ls-files, remote get-url), flagged only because its argv is dynamic.","sites":3}
+    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: existing unresolved calls; sharedGit is a bounded hardened read port. The added HEAD:.gitattributes show uses an enumerated tracked path, never a transport or write.","sites":4}
   }
 }
