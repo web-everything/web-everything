@@ -9,7 +9,7 @@
  *   after confirming that its watcher has stopped; locks are never stolen from a slow live watcher.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, mkdirSync, rmdirSync } from 'node:fs';
+import { readFileSync, mkdirSync, rmdirSync, realpathSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
@@ -48,7 +48,8 @@ export function evaluatePolicy(policy, cfg) {
       || !Array.isArray(rule.workflows) || !rule.workflows.every((w) => typeof w === 'string' && w.trim())) {
       return { status: 'unknown', reason: 'malformed policy rule or workflows list' };
     }
-    if (rule?.event !== cfg.event) continue;
+    if (rule.event !== cfg.event && rule.event !== '*') continue;
+    if (rule.workflows.length === 0) return { status: 'unknown', reason: 'empty workflows list for a matching policy rule' };
     allowed.push(...rule.workflows);
   }
   if (allowed.length === 0) return { status: 'missing', reason: `policy ${cfg.policyId} allows no ${cfg.event} workflow` };
@@ -273,6 +274,13 @@ export async function main({ argv = process.argv.slice(2), exec = execFileSync, 
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+const isEntrypoint = (() => {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+if (isEntrypoint) {
   process.exitCode = await main();
 }

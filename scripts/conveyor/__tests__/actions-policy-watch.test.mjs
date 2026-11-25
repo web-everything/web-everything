@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, rmdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync, rmdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -441,11 +441,44 @@ describe('actions-policy-watch production regressions', () => {
     expect(child.status).toBe(1);
     expect(child.stderr).toMatch(/needs-you:.*invalid organization/);
   });
+  it('runs the executable through a symlink and reports a failing fixture without invoking gh', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy symlink '));
+    try {
+      const link = join(dir, 'watch policy.mjs');
+      symlinkSync(fileURLToPath(new NodeURL('../actions-policy-watch.mjs', import.meta.url)), link);
+      const child = spawnSync(process.execPath, [link, '--org=../invalid'],
+        { encoding: 'utf8', timeout: 5_000 });
+      expect(child.error).toBeUndefined();
+      expect(child.status).toBe(1);
+      expect(child.stderr).toMatch(/needs-you:.*invalid organization/);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
 });
 
 describe('actions-policy-watch', () => {
   it('is ok when the policy allows only merge-gate.yml', () => {
     expect(evaluatePolicy(policy(['.github/workflows/merge-gate.yml']), cfg).status).toBe('ok');
+  });
+  it.each(['pull_request_target', '*'])('rejects an empty %s workflow list even alongside a valid rule', (event) => {
+    const empty = { event, workflows: [] };
+    expect(evaluatePolicy({ ...policy([]), rules: [empty] }, cfg).status).not.toBe('ok');
+    const value = policy([cfg.expectedWorkflowPath]);
+    value.rules.push(empty);
+    expect(evaluatePolicy(value, cfg).status).toBe('unknown');
+  });
+  it.each([false, true])('counts wildcard event workflows when checking drift (explicit rule=%s)', async (explicit) => {
+    const value = policy(explicit ? [cfg.expectedWorkflowPath] : []);
+    value.rules = explicit ? value.rules : [];
+    value.rules.push({ event: '*', workflows: ['.github/workflows/other.yml'] });
+    const result = await runWatch({ cfg, org: 'o',
+      ghApi: async () => JSON.stringify(value), fetchFeed: async () => [] });
+    expect(result.policy.status).toBe('drift');
+    expect(result.alerts).toEqual([expect.stringMatching(/needs-you:.*other\.yml/)]);
+  });
+  it('accepts a non-empty wildcard event rule limited to merge-gate.yml', () => {
+    const value = policy([cfg.expectedWorkflowPath]);
+    value.rules[0].event = '*';
+    expect(evaluatePolicy(value, cfg).status).toBe('ok');
   });
   it('alerts when policy 17152 allows pull_request_target for a second workflow', () => {
     const r = evaluatePolicy(policy(['.github/workflows/merge-gate.yml', '.github/workflows/other.yml']), cfg);
