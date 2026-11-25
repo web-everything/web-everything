@@ -62,6 +62,7 @@
  */
 import { hostSaturation } from './verify-ci-only.mjs';
 import { repoKeyForSlug, DEFAULT_REPO_KEY } from './constellation-repos.mjs';
+import { canonicalRepoSlug } from './lane-alternates.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
@@ -449,10 +450,10 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
 /** True only when `origin` resolves to a known constellation repo other than WE (plateau-app, frontierui). */
 function isKnownSiblingCheckout(runGit) {
   try {
-    const url = String(runGit(['remote', 'get-url', 'origin'])).trim();
-    const m = /[:/]([^/:]+\/[^/]+?)(?:\.git)?$/.exec(url);
-    // GitHub owner/repo names are case-insensitive; retain the shared legacy-slug normalization too.
-    const key = m ? repoKeyForSlug(m[1].toLowerCase()) : null;
+    // Share origin normalization (transport, case, .git and trailing slashes) with lane identity checks.
+    const slug = canonicalRepoSlug(String(runGit(['remote', 'get-url', 'origin'])));
+    // Only GitHub constellation origins qualify; local paths and lookalikes keep mandatory standards.
+    const key = slug?.startsWith('github.com/') ? repoKeyForSlug(slug.slice('github.com/'.length)) : null;
     return key !== null && key !== DEFAULT_REPO_KEY;
   } catch { return false; }
 }
