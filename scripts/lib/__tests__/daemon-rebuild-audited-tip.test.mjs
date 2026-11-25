@@ -12,6 +12,7 @@ import { readyBuildVerified, matchReadyCandidate, finalizeRebuild } from '../dae
 import { makeAuditedTipGate } from '../daemon-rebuild/audited-tip.mjs';
 import { addOverlay, resolveOverlayFollowTip } from '../daemon-overlays.mjs';
 import { rebuildClone } from '../daemon-rebuild.mjs';
+import { watchPath } from '../daemon-force-adopt.mjs';
 import { readReadyCandidateStrict, readReadyCandidate, writeReadyCandidate, assertReadyCandidatePins, StaleReadyPinError } from '../daemon-rebuild/state.mjs';
 import { appendEntry, storePath } from '../../operations/ruled-weakened-store.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
@@ -1066,3 +1067,37 @@ it.each(['early', 'recovery', 'tick-start'])('%s refuses malformed pins and defe
   expect(matchReadyCandidate({ ...args, ready: { ...ready, adopt: { ...plan, applied: [{ ref, sha: f.b }] } } }).reason)
     .toBe('ready-audit-revoked');
 }, 180_000); // six real rebuild checks over real git fixtures: far slower than the default under host load
+
+describe('RS-HP-3: rollback skips the revoked-evidence check only for the recorded last-good', () => {
+  const finalizeWith = async (lastGoodHead) => {
+    const f = await fixture();
+    f.save(record(f.a), record(f.b));
+    const built = await f.plan();
+    f.save(record(f.a), record(f.b), { ...record(f.b), tests: 'red' }); // revoked while the smoke ran
+    gitOk(f.root, ['checkout', '-q', '--detach', f.base]);
+    const env = { ...process.env, ...f.env, WE_DAEMON_STATE_DIR: join(f.dir, 'state') };
+    if (lastGoodHead !== null) {
+      mkdirSync(join(f.dir, 'state'), { recursive: true });
+      writeFileSync(watchPath(f.root, env), JSON.stringify({ daemon: 'd', sha: f.base, lastGood: { head: lastGoodHead === 'target' ? built.finalSha : f.base }, ticksLeft: 3, bad: 0 }));
+    }
+    const run = (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' });
+    const done = await finalizeRebuild({
+      root: f.root, env, log: { error() {} }, run, now: () => Date.now(),
+      lease: { token: 'force-adopt-rollback' }, prevHead: f.base, plan: built, auditedTip: makeAuditedTipGate(f.env),
+    });
+    return Object.assign(done, { headNow: gitOk(f.root, ['rev-parse', 'HEAD']), base: f.base, target: built.finalSha });
+  };
+  it('the token with a non-last-good target is refused', async () => {
+    expect(await finalizeWith('other')).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+  });
+  it('the token with no recorded last-good is refused', async () => {
+    expect(await finalizeWith(null)).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
+  });
+  it('the recorded last-good target is allowed even with a revoked audit', async () => {
+    const done = await finalizeWith('target');
+    expect(done).toMatchObject({ moved: true, adopted: true });
+    expect(done.reason).not.toBe('ready-audit-revoked');
+    expect(done.headNow).toBe(done.target); // HEAD really moved to the recorded last-good
+    expect(done.headNow).not.toBe(done.base);
+  });
+});

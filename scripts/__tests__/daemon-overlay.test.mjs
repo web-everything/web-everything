@@ -98,6 +98,17 @@ function overlayStateFile(overlayDir, cloneDir) {
   return names.length ? JSON.parse(readFileSync(join(overlayDir, names[0]), 'utf8')) : null;
 }
 
+describe('daemon-overlay.mjs add — hotpatch/* has one door (RS-HP-3)', () => {
+  it('refuses to register a hotpatch ref that has no admission evidence', () => {
+    const f = makeFixture();
+    pushBranch(f.originDir, 'hotpatch/x', (dir) => writeFile(dir, 'hp.txt', 'hp\n'));
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=hotpatch/x', '--json'], { ...asGhLogin(f.env, 'nobody'), WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(3);
+    expect(r.stderr).toMatch(/hotpatch-not-admitted/);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+});
+
 describe('daemon-overlay.mjs add — expected SHA admission', () => {
   it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {
     const f = makeFixture();

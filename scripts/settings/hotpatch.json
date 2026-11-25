@@ -1,0 +1,6 @@
+{
+  "liveWhen": "after-receipt-and-audit",
+  "auditBar": "no-pr-introduced-security",
+  "receiptSource": "ci-full-suite",
+  "parallel": true
+}
