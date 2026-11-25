@@ -473,6 +473,13 @@ describe('createEnqueueOnEvent', () => {
     expect(line).not.toContain('\u001b');
   });
 
+  it('firstStderrErrorLine surfaces the script failure line behind policy preamble (DRAIN-FASTDRAIN-CRASH)', () => {
+    const preamble = '(node:1) DeprecationWarning: x\ngithub-app-auth-env: WARNING — personal login\npolicy · drain.x=on (source: default)\n';
+    const tail = 'merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass\n    at readFastDrainContext (x.mjs:1:1)\n';
+    expect(enqueueModule.firstStderrErrorLine(preamble + tail)).toBe('merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'.replace(/[^\x20-\x7e]/g, ' '));
+    expect(enqueueModule.firstStderrErrorLine(preamble + 'opaque')).toBe('[unclassified stderr; see local log]');
+  });
+
   it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {
     const noise = '(node:1) DeprecationWarning: The `punycode` module is deprecated.\n(Use `node --trace-deprecation ...` to show where)\n(node:1) ExperimentalWarning: x\n';
     expect(enqueueModule.firstStderrErrorLine(`${noise}TypeError: x`)).toBe('TypeError: x');
