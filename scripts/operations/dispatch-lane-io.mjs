@@ -2021,6 +2021,7 @@ export function defaultClaudeProvider(request, {
     const launched = launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
+      route: request.route ?? { provider: 'claude', reason: 'dispatch-lane-io: claude launcher, no resolved route on request' },
     });
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).

@@ -514,3 +514,14 @@ it.each([false, true])('scoped inheritance cannot discard parent disabledProvide
   expect(() => resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', gateClosed, policy }))
     .toThrow(/inherited route cannot enforce disabled providers; configure an explicit provider and fallback/);
 });
+
+describe('checkClaudeLaunchRoute (DIRECT-EXEC-GUARD)', () => {
+  it('allows claude, a reasoned claude fallback; refuses the rest', async () => {
+    const { checkClaudeLaunchRoute } = await import('../dispatch-routing-policy.mjs');
+    expect(checkClaudeLaunchRoute({ provider: 'claude' }).ok).toBe(true);
+    expect(checkClaudeLaunchRoute({ provider: 'codex', fallbackProvider: 'claude', reason: 'quota' }).ok).toBe(true);
+    for (const r of [null, undefined, {}, 'claude', { provider: 'codex' }, { provider: 'agy-claude', reason: 'x' }, { provider: 'codex', fallbackProvider: 'claude' }]) {
+      expect(checkClaudeLaunchRoute(r).ok).toBe(false);
+    }
+  });
+});

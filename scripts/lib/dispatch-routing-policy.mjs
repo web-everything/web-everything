@@ -231,3 +231,16 @@ export function resolvePolicyModel(provider, model, policy = DEFAULT_ROUTING_POL
 }
 
 export const DEFAULT_ROUTING_POLICY = validateRoutingPolicy(defaults);
+
+/**
+ * PURE — may a Claude worker launch run for this resolved route? (DIRECT-EXEC-GUARD.) Allowed only when the route is
+ * Claude, or when Claude is the DOCUMENTED fallback (`fallbackProvider: 'claude'`) with a recorded non-empty `reason`.
+ * A missing, malformed or other-provider route refuses (fail closed).
+ * @returns {{ok: true}|{ok: false, reason: string}}
+ */
+export function checkClaudeLaunchRoute(route) {
+  if (!route || typeof route !== 'object' || typeof route.provider !== 'string' || !route.provider) return { ok: false, reason: 'route-mismatch: no resolved route' };
+  if (route.provider === 'claude') return { ok: true };
+  if (route.fallbackProvider === 'claude' && typeof route.reason === 'string' && route.reason.trim()) return { ok: true };
+  return { ok: false, reason: `route-mismatch: resolved route is ${route.provider}, refusing a claude launch` };
+}

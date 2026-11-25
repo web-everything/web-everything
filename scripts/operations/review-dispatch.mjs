@@ -711,6 +711,7 @@ export function dispatchReview({
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+      route: { provider: 'claude', reason: 'review-dispatch: claude review launch' },
     });
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,

@@ -81,7 +81,7 @@ describe('launchWrappedClaudeWorker', () => {
   it('passes the wrapper spec to the injected launcher and returns a pid handle', () => {
     const specDir = tmp();
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
-    const options = { role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'], pr: 12, sessionId: SESSION_ID, env: {}, specDir, launch };
+    const options = { role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'], pr: 12, sessionId: SESSION_ID, env: {}, specDir, launch, route: { provider: 'claude', reason: 'test' } };
     expect(launchWrappedClaudeWorker(options)).toMatchObject({ handle: 'pid:4321', wrapperPid: 4321, sessionId: SESSION_ID });
     expect(launch).toHaveBeenCalledTimes(1);
     expect(launch).toHaveBeenCalledWith(expect.objectContaining({
@@ -229,5 +229,38 @@ describe('wrapped await rows and resume requests', () => {
     const specDir = tmp();
     expect(requestWrappedResume({ session: { ...row(), ...over }, prompt: 'x', specDir })).toMatchObject({ resumed: false, reason: expect.any(String) });
     expect(readdirSync(specDir)).toEqual([]);
+  });
+});
+
+describe('launchWrappedClaudeWorker route guard (DIRECT-EXEC-GUARD)', () => {
+  const base = () => ({ role: 'fix', session: 'fix-12', bgArgv: ['--bg', '-n', 'fix-12', 'PROMPT'], pr: 12, sessionId: SESSION_ID, env: {}, specDir: tmp() });
+  it('refuses a claude launch when the resolved route is codex', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 1 }));
+    const r = launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'codex', reason: 'routing-policy' } });
+    expect(launch).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ handle: 'refused:route-mismatch', wrapperPid: null, argv: [] });
+    expect(r.refused).toMatch(/route-mismatch/);
+  });
+  it('refuses a claude launch when the resolved route is agy', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 1 }));
+    expect(launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'agy-claude', reason: 'x' } }).handle).toBe('refused:route-mismatch');
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it('a launch with no resolved route refuses', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 1 }));
+    expect(launchWrappedClaudeWorker({ ...base(), launch }).handle).toBe('refused:route-mismatch');
+    expect(launchWrappedClaudeWorker({ ...base(), launch, route: {} }).handle).toBe('refused:route-mismatch');
+    expect(launch).not.toHaveBeenCalled();
+  });
+  it('claude fallback with a recorded reason is allowed', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 7 }));
+    const r = launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'codex', fallbackProvider: 'claude', reason: 'codex unavailable: quota' } });
+    expect(r.handle).toBe('pid:7');
+    expect(launch).toHaveBeenCalledTimes(1);
+  });
+  it('claude fallback without a reason refuses', () => {
+    const launch = vi.fn(() => ({ wrapperPid: 7 }));
+    expect(launchWrappedClaudeWorker({ ...base(), launch, route: { provider: 'codex', fallbackProvider: 'claude', reason: '  ' } }).handle).toBe('refused:route-mismatch');
+    expect(launch).not.toHaveBeenCalled();
   });
 });

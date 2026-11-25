@@ -1728,6 +1728,7 @@ export function dispatchFix(planned, {
       const launched = launchWrapped({
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
         model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+        route: { provider: 'claude', reason: 'reconcile-fix-dispatch: claude fix launch' },
       });
       if (launched.wrapperPid) {
         try { stampRunner({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, pid: launched.wrapperPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
