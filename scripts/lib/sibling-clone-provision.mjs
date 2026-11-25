@@ -46,11 +46,12 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       if (exists(dir)) throw new Error(`existing directory at ${dir}; ${status.reason}; repair it manually and restart the drain`);
       const repo = CONSTELLATION_REPOS[repoKeyForSlug(name)];
       const primary = join(home, 'workspace', name);
-      const reference = exists(join(primary, '.git')) ? ['--reference', primary] : [];
-      run('git', ['clone', '--quiet', '-c', 'gc.auto=0', ...reference,
-        `https://github.com/${repo.slug}.git`, dir], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, maxBuffer: 1024 * 1024,
-      });
+      const url = `https://github.com/${repo.slug}.git`;
+      const runOptions = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, maxBuffer: 1024 * 1024 };
+      const cloneArgs = exists(join(primary, '.git'))
+        ? ['clone', '--quiet', '-c', 'gc.auto=0', '--reference', primary, url, dir]
+        : ['clone', '--quiet', '-c', 'gc.auto=0', url, dir];
+      run('git', cloneArgs, runOptions);
       if (!exists(join(dir, '.git'))) throw new Error(`no .git at ${dir}`);
       result.provisioned.push(name);
     } catch (error) {
