@@ -81,7 +81,7 @@ export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env =
 }
 
 /** Write the record. Verifies the ruling and the App token BEFORE any write; no personal fallback. */
-export function writeApprovalRecord({ repo, headSha, rulingId, approver, rulingExists, gh = runGhSync, env = process.env } = {}) {
+export function writeApprovalRecord({ repo, headSha, rulingId, approver, rulingExists, gh = runGhSync, env = process.env, dryRun = false } = {}) {
   if (!validHead(headSha)) return failure('head must be a full 40-hex sha');
   if (!validRulingId(rulingId)) return failure('ruling id must look like R123 or R123+R124');
   if (typeof approver !== 'string' || !approver.trim() || approver.trim().toLowerCase() === 'unknown')
@@ -93,6 +93,7 @@ export function writeApprovalRecord({ repo, headSha, rulingId, approver, rulingE
   if (!known) return failure(`unknown ruling ${rulingId}; nothing written`);
   const writer = requireRedTeamAppWriter({ gh, env });
   if (writer.ok !== true) return failure('approver App token unavailable, no personal fallback; nothing written');
+  if (dryRun) return { ok: true, rulingId, headSha, dryRun: true };
   try {
     gh(['api', `repos/${repo}/check-runs`, '--method', 'POST', '--input', '-'],
       { ...ioOptions, input: JSON.stringify(approvalCheckPayload({ headSha, rulingId, approver })), env: redTeamWriterEnv(env) });

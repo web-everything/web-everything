@@ -368,6 +368,21 @@ export function decideReadyOnOpen({ approval = null, changedFiles = [], guardCon
   return marked && confined ? { ready: true, why: 'pre-approved-guard-config' } : { ready: false, why: marked ? 'approval-outside-guard-config' : 'not-flagged' };
 }
 
+/** Acquire readiness evidence only when it can affect draft state. Injection keeps the production call path testable. */
+export function classifyReadyOnOpen({ repo, headSha, remote, base,
+  active = resolveDraft({ readyOnOpen: false }) !== resolveDraft({ readyOnOpen: true }) } = {},
+{ runGit, reader = readApprovalRecord } = {}) {
+  if (!active) return { ready: false, why: 'readiness-inactive' };
+  if (!repo || !/^[a-f0-9]{40}$/i.test(headSha ?? '')) return { ready: false, why: 'approval-identity-unresolved' };
+  try {
+    // The branch cannot authorise itself; disabling rename detection preserves BOTH sides of a rename.
+    const guardConfigPaths = JSON.parse(runGit(['show', `${remote}/${base}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
+    const changedFiles = String(runGit(['diff', '--name-only', '--no-renames', `${remote}/${base}...${headSha}`])).split('\n').filter(Boolean);
+    const approval = reader({ repo, headSha });
+    return decideReadyOnOpen({ approval, changedFiles, guardConfigPaths });
+  } catch { return { ready: false, why: 'classification-unavailable' }; }
+}
+
 /** R502 item 2 — apply a label with bounded retries (a single transient gh failure left #6339/#6343 with no review
  *  label). Never throws; reports the last error so the caller can say the label is missing. Pure but for `add`. */
 export function applyLabelWithRetry(add, { attempts = 3 } = {}) {
@@ -937,14 +952,8 @@ async function runCli() {
   // All modes open ready for review; parked PRs carry their review hold label.
   let readyOnOpen = false;
   try {
-    // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
-    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
-    let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
-    // The record is read for the exact pinned `refSha`, so a different head never matches it.
     const slug = repoSlugFromRemote(tryGit(['remote', 'get-url', REMOTE]));
-    const approval = !slug ? { ok: false, reason: 'repo slug unresolved' } : readApprovalRecord({ repo: slug, headSha: refSha });
-    readyOnOpen = decideReadyOnOpen({ approval, changedFiles, guardConfigPaths }).ready;
+    readyOnOpen = classifyReadyOnOpen({ repo: slug, headSha: refSha, remote: REMOTE, base: BASE }, { runGit: gitC }).ready;
   } catch { /* classification unavailable */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
   // Existing PRs keep their title even when their latest commit is a merge/repair. Only CREATE (or its

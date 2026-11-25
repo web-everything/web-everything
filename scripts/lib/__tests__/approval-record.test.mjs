@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanText as scanPrivacyText } from '../privacy-terms.mjs';
+import { REVIEW_AUTH_FLOOR } from '../protected-path-floor.mjs';
 import { approvalCheckPayload, evaluateApprovalRecord, readApprovalRecord, writeApprovalRecord, APPROVAL_CHECK_NAME, PINNED_APP_ID_SHA256, OPERATOR_LOGINS } from '../approval-record.mjs';
 
 const A = 'a'.repeat(40);
@@ -65,6 +66,15 @@ describe('evaluateApprovalRecord (negative tests first)', () => {
 });
 
 describe('readApprovalRecord', () => {
+  it('refuses a truncated check-run page that could hide a newer revocation', () => {
+    const gh = vi.fn(() => JSON.stringify({ total_count: 101, check_runs: [run()] }));
+    expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh }))
+      .toMatchObject({ ok: false, reason: 'approval record unreadable or incomplete' });
+  });
+  it('pins the approval trust root and writer on REVIEW_AUTH_FLOOR', () => {
+    expect(REVIEW_AUTH_FLOOR).toContain('scripts/lib/approval-record.mjs');
+    expect(REVIEW_AUTH_FLOOR).toContain('scripts/operations/approve-head.mjs');
+  });
   it('a gh failure or malformed payload refuses (never fail-open)', () => {
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh: () => { throw new Error('boom'); } }).ok).toBe(false);
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh: () => 'not json' }).ok).toBe(false);
@@ -118,6 +128,13 @@ describe('readApprovalRecord', () => {
 
 describe('writeApprovalRecord', () => {
   const base = { repo: 'o/r', headSha: A, rulingId: 'R474', approver: 'chalbert', rulingExists: () => true };
+  it('one known plus one unknown ruling writes nothing in either order', () => {
+    const gh = vi.fn();
+    for (const rulingId of ['R474+R999999', 'R999999+R474']) {
+      expect(writeApprovalRecord({ ...base, rulingId, rulingExists: id => id === 'R474', gh }).ok).toBe(false);
+    }
+    expect(gh).not.toHaveBeenCalled();
+  });
   it('an unknown ruling id writes nothing', () => {
     const gh = vi.fn();
     expect(writeApprovalRecord({ ...base, rulingExists: () => false, gh }).ok).toBe(false);
