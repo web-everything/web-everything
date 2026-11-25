@@ -5023,7 +5023,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const NO_DRAIN_LEASE = !!flags['no-drain-lease'];
   const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (env.DRAIN_UNDER_LEASE || null);
   // BLUE-GREEN-SWAP S1.2 — `--fence=<n>`: the lease fence the daemon held when it started this child; re-read before each merge.
-  const UNDER_FENCE = (UNDER_LEASE && Number.isInteger(Number(flags.fence)) && flags.fence !== true && flags.fence !== '') ? Number(flags.fence) : null;
+  // Absent => null (legacy child, start gate only). Present but malformed => -1, which never matches a stored fence (fail closed).
+  const UNDER_FENCE = (UNDER_LEASE && flags.fence !== undefined) ? ((typeof flags.fence === 'string' && /^[1-9][0-9]*$/.test(flags.fence)) ? Number(flags.fence) : -1) : null;
   // #2395 — `--max-runtime-min=N`: a wall-clock lifetime cap on a `--watch` monitor. The bounded-max-lifetime
   // backstop push-at-close needs: when its detached drain has no batch feed, `--until-batches-idle` is INERT
   // and would poll forever, so this hard-stops the watch after N minutes regardless of idle/feed state. 0/unset
@@ -5872,7 +5873,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         } catch { /* Timing only. */ }
         return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: liveBranch });
       },
-      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
+      enqueue: (c, sha, entry) => { const fc = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, repoKey: localSlug }); if (!fc.ok) throw new Error(`drain lease fence refused (${fc.reason})`); return enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow); },
       recordLanded: recordLandedLedgerFacts,
       requiredCheck: REQUIRED,
     });

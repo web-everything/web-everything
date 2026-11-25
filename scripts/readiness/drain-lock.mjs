@@ -380,8 +380,9 @@ export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid
     renameSync(tmp, join(dir, 'lock.json'));
     const back = readLockEntry(lockRoot, path);
     if (!back || back.owner !== to || fenceOf(back) !== next) return { ok: false, reason: 'verify-failed' };
-    try { appendFileSync(join(lockRoot, 'handovers.jsonl'), JSON.stringify({ fence: next, from, to, fromFence: f, gen, codeDigest, at }) + '\n'); } catch { /* the lease record is the truth; the log is advisory */ }
-    return { ok: true, fence: next };
+    let logged = true;
+    try { appendFileSync(join(lockRoot, 'handovers.jsonl'), JSON.stringify({ fence: next, from, to, fromFence: f, gen, codeDigest, at }) + '\n'); } catch { logged = false; /* the lease record is the truth; surfaced as logged:false */ }
+    return { ok: true, fence: next, logged };
   } catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } return { ok: false, reason: 'write-failed' }; }
 }
 
@@ -390,10 +391,11 @@ export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid
  *  recorded repo `scope` (#2458) is PRESERVED across heartbeats: a caller-supplied scope refreshes it, else
  *  the existing lease's scope is carried forward (heartbeat rebuilds the entry, so it must be re-supplied).
  *  `repoKey` (#3440) MUST match the value passed to {@link acquireDrainLease} — it selects the same lock dir. */
-export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, nowMs = Date.now(), scope = null, repoKey = null } = {}) {
+export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { pid = process.pid, nowMs = Date.now(), scope = null, repoKey = null, expectFence = null } = {}) {
   const path = drainLeasePathFor(repoKey);
   const cur = readLockEntry(lockRoot, path);
   if (!cur || cur.owner !== owner) return false;
+  if (expectFence != null && fenceOf(cur) !== expectFence) return false; // a stale generation never refreshes a newer one
   const keep = normalizeScope(scope) || (cur.meta && normalizeScope(cur.meta.scope)) || null;
   const fence = fenceOf(cur); // S1.2 — a heartbeat rewrite must carry the fence (and handover record) forward
   const meta = { ...(keep ? { scope: keep } : {}), ...(fence ? { fence } : {}), ...(cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {}) };
@@ -402,10 +404,10 @@ export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwn
 
 /** Release the drain lease, but ONLY if `owner` still holds it (never stomp a reclaimer). Idempotent.
  *  `repoKey` (#3440) MUST match the value passed to {@link acquireDrainLease}. */
-export function releaseDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { repoKey = null } = {}) {
+export function releaseDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner(), { repoKey = null, expectFence = null } = {}) {
   const path = drainLeasePathFor(repoKey);
   const cur = readLockEntry(lockRoot, path);
-  if (cur && cur.owner === owner) { releaseLockDir(lockRoot, path); return true; }
+  if (cur && cur.owner === owner && (expectFence == null || fenceOf(cur) === expectFence)) { releaseLockDir(lockRoot, path); return true; }
   return false;
 }
 

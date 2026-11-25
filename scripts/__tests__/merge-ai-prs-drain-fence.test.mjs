@@ -6,7 +6,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireDrainLease, handoverDrainLease } from '../readiness/drain-lock.mjs';
+import { acquireDrainLease, handoverDrainLease, heartbeatDrainLease, releaseDrainLease } from '../readiness/drain-lock.mjs';
 import { checkDrainFence } from '../readiness/drain-fence.mjs';
 
 let root;
@@ -34,6 +34,23 @@ describe('checkDrainFence', () => {
     handoverDrainLease(root, { from: 'blue', to: 'green', toPid: 2, expectFence: 1 });
     handoverDrainLease(root, { from: 'green', to: 'blue', toPid: 1, expectFence: 2 });
     expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: 1 })).toMatchObject({ ok: false, reason: 'fence-advanced' });
+  });
+
+  it('refuses a future/mismatched fence, a malformed fence, and an expired lease', () => {
+    acquireDrainLease(root, 'blue', { pid: 1 });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: 999 })).toMatchObject({ ok: false, reason: 'fence-mismatch' });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: NaN })).toMatchObject({ ok: false });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: -1 })).toMatchObject({ ok: false });
+    expect(checkDrainFence({ lockRoot: root, owner: 'blue', fence: 1, nowMs: Date.now() + 3 * 3600_000 })).toMatchObject({ ok: false, reason: 'lease-expired' });
+  });
+
+  it('heartbeat and release with a stale expectFence are refused', () => {
+    acquireDrainLease(root, 'blue', { pid: 1 });
+    handoverDrainLease(root, { from: 'blue', to: 'green', toPid: 2, expectFence: 1 });
+    handoverDrainLease(root, { from: 'green', to: 'blue', toPid: 1, expectFence: 2 });
+    expect(heartbeatDrainLease(root, 'blue', { pid: 1, expectFence: 1 })).toBe(false);
+    expect(releaseDrainLease(root, 'blue', { expectFence: 1 })).toBe(false);
+    expect(heartbeatDrainLease(root, 'blue', { pid: 1, expectFence: 3 })).toBe(true);
   });
 
   it('an unreadable or absent lease refuses (lease-unknown)', () => {
