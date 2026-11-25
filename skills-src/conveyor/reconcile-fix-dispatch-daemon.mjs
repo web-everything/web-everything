@@ -1702,6 +1702,9 @@ export function formatPromoteActionLine(d) {
   if (d?.kind === 'close-superseded') {
     return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent`;
   }
+  if (d?.kind === 'rearm-no-code') {
+    return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} for review once — operator no-code ruling (rearm-no-code), no fix agent`;
+  }
   if (d?.kind === 'restore-review-label') {
     return `reconcile-fix-dispatch-daemon: labelled ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} ${d?.label ?? 'review:pending'} — open lane PR, all required checks green, no review:* label (restore-review-label)`;
   }

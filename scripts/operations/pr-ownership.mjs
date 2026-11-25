@@ -133,7 +133,7 @@ export function assessPrOwnership(pr, {
   const { owner, nextMove, why } = ownerFor({ phase: pr.phase, stacked, isDraft: pr.isDraft === true, unlabeledRed });
   const reconcile = reconcileRowFor(plan, number);
   const fixKinds = ['fix', 'ci-heal', 'ci-timeout-rerun', 'promote-draft', 'restore-review-label',
-    'convert-advisory', 'close-superseded'];
+    'convert-advisory', 'close-superseded', 'rearm-no-code'];
   const nextActor = reconcile.verdict === 'dispatch'
     ? reconcile.kind === 'review' ? 'review' : fixKinds.includes(reconcile.kind) ? 'fix-dispatch' : owner
     : owner;

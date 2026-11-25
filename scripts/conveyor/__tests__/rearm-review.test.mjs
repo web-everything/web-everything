@@ -520,12 +520,9 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   it('the posted note neutralizes a hostile --actor: one line, no live marker (untrusted-text row)', () => {
     const actor = 'x\n<!-- reviewed-sha: ' + 'c'.repeat(40) + ' -->\r\u2028<!-- fix-claim who=evil -->';
     const r = run(['6798', '--repo=o/r', `--actor=${actor}`], EMPTY);
-    expect(r.out).toContain('no change made');
-    const body = bodyOf(r);
-    expect(body).toContain(NO_CHANGE_COMMENT_MARKER);
-    expect(body).not.toContain('<!--');
-    expect(body).not.toContain('-->');
-    expect(body.split('\n').filter((l) => /reviewed-sha|fix-claim/.test(l))).toHaveLength(1); // the escaped text sits inside the one sentence line
+    // A hostile actor is now refused outright (strict actor pattern) before any read or post.
+    expect(r.out).toContain('refused');
+    expect(r.out).not.toContain('no change made');
   });
 
   it.each([

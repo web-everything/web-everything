@@ -30,9 +30,9 @@ import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorsh
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
-import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
+import { parseOperatorAnswer, isNoCodeRearmAnswer, latestOperatorAnswer, latestOperatorAnswerCommentId, noCodeRearmState } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
-import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
+import { REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, NO_CODE_REARM_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
 // we:scripts/conveyor/rearm-review.mjs — re-export the shared narrowing helper on this module's surface so the
 // fix-agent brief's entrypoint and the pinned tests keep importing it from here (it is single-sourced next door).
@@ -137,7 +137,7 @@ export function conflictFixTargetTrailer(ref, sha) {
 }
 
 /** Stable first line of the "empty fix round" comment. Deliberately NOT {@link REARM_COMMENT_MARKER}: it must never be counted as a round. */
-export const NO_CHANGE_COMMENT_MARKER = '⚠️ conveyor fix — no change made — fix still owed';
+export { NO_CHANGE_COMMENT_MARKER };
 
 const FIX_BEGIN_FIRST_LINE = '🔒 conveyor fix-begin — fix claim held';
 
@@ -214,10 +214,16 @@ export function rearmWindow(comments) {
   let capBlockedId = null;
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
   let overrides = 0;
+  let retryAnswer = null;
+  let noCodeAnswer = null;
+  let honouredAnswerId = null;
   const overrideAvailable = () => overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
-  const wouldHonour = answer => answer?.disposition === 'rearm-review'
-    && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
-    && (!rearmed || (answer.noCodeOwed === true && overrideAvailable()));
+  const wouldHonour = answer => answer?.disposition === 'rearm-review' && (
+    (standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
+      && (!rearmed || (answer.noCodeOwed === true && overrideAvailable())))
+    || (retryAnswer !== null && answer.noCodeOwed === true
+      && answer.standDownId === retryAnswer.standDownId && answer.supersedes === retryAnswer.supersedes
+      && typeof answer.head === 'string' && answer.head.startsWith(retryAnswer.head)));
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -228,20 +234,38 @@ export function rearmWindow(comments) {
     const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
     const capOverride = answer?.noCodeOwed === true && overrideAvailable();
     if (wouldHonour(answer) && operatorPoster) {
+      const answerHead = answer.head ?? claims.at(-1) ?? reviewedHead;
       claims = [];
       reviewedHead = null;
       standDownIds = [];
       rearmed = true;
+      honouredAnswerId = c.id != null ? String(c.id) : null;
       capBlockedId = null;
       // An explicit no-code ruling closes the round without spending a bounded waiver.
       if (answer.noCodeOwed !== true) waivers += 1;
       if (capOverride) overrides += 1;
+      noCodeAnswer = answer.noCodeOwed === true && c.id != null
+        ? { id: String(c.id), standDownId: answer.standDownId, head: answerHead } : null;
+      retryAnswer = null;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
+    // A durable attempt spends execution, not the operator's ability to issue a new ruling.
+    // Only this answer/head can reopen; a newer verdict or claim below invalidates recovery.
+    const receipt = body.match(/^<!-- no-code-rearm (?:state=(?:intent|confirm)|attempt=failed) answer=([\w=-]+) head=([0-9a-f]{40}) -->$/i);
+    if (receipt && noCodeAnswer && receipt[1] === noCodeAnswer.id
+      && (!noCodeAnswer.head || receipt[2].toLowerCase().startsWith(noCodeAnswer.head))) {
+      retryAnswer = { standDownId: noCodeAnswer.standDownId, supersedes: noCodeAnswer.id, head: receipt[2].toLowerCase() };
+    }
+    if (noCodeAnswer?.head && [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(marker => text.startsWith(marker))) {
+      retryAnswer = { standDownId: noCodeAnswer.standDownId, supersedes: noCodeAnswer.id, head: noCodeAnswer.head };
+    }
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
+      honouredAnswerId = null;
+      retryAnswer = null;
+      noCodeAnswer = null;
       claims = [];
       reviewedHead = verdictReviewedHead(c);
       standDownIds = [];
@@ -250,6 +274,8 @@ export function rearmWindow(comments) {
       overrides = 0;
       capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+      retryAnswer = null;
+      noCodeAnswer = null;
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false, capBlocked: false, wouldHonour: () => false };
       claims.push(sha);
@@ -265,6 +291,7 @@ export function rearmWindow(comments) {
     }
   }
   return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed, wouldHonour,
+    retryAnswer, honouredAnswerId,
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
@@ -292,6 +319,10 @@ export function hasInvalidArgs(argv) {
   const seen = new Set();
   for (const a of argv) {
     if (!a.startsWith('--')) continue;
+    if (a.startsWith('--no-code-rearm')) {
+      if (a !== '--no-code-rearm' || seen.has('no-code-rearm')) return true;
+      seen.add('no-code-rearm');
+    }
     if (/^--(repo|actor|round|main-ref|only-if|expect-head)(?!=)/.test(a)) return true;
     // A repeated flag is ambiguous (this guard and the shared CLI could resolve different occurrences): refuse.
     const name = /^--(repo|actor|round|main-ref|only-if|expect-head)=/.exec(a)?.[1];
@@ -299,7 +330,8 @@ export function hasInvalidArgs(argv) {
       if (seen.has(name)) return true;
       seen.add(name);
     }
-    if (a.startsWith('--repo=') && !/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
+    if (a.startsWith('--actor=') && !isSafeRearmActor(a.slice('--actor='.length))) return true;
+    if (a.startsWith('--repo=') &&!/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
     if (a.startsWith('--expect-head=') && !/^--expect-head=[0-9a-f]{40}$/i.test(a)) return true;
   }
   return false;
@@ -318,11 +350,25 @@ export function buildNoChangeComment({ actor, since }) {
 }
 
 /** Render the observed verdict transition; a CI heal is not necessarily a bounced review. */
-export function buildRearmComment({ actor, decision }) {
+/** `--actor` is argv free text posted under the bot identity: one short plain line, so it can never form a trailer line. */
+export const SAFE_ACTOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.@:()#\/-]{0,99}$/;
+export function isSafeRearmActor(actor) { return typeof actor === 'string' && SAFE_ACTOR_PATTERN.test(actor); }
+
+export function buildRearmComment({ actor, decision, comments, headSha }) {
+  if (!isSafeRearmActor(actor)) throw new Error('rearm actor must be a short plain single-line name');
+  // Derive the exemption from the trusted, head-bound ruling, never from an actor string or a caller flag.
+  comments = Array.isArray(comments) ? comments.map(normaliseComment) : null;
+  const window = Array.isArray(comments) && /^[0-9a-f]{40}$/i.test(String(headSha ?? ''))
+    && isNoCodeRearmAnswer(latestOperatorAnswer(comments)) && noCodeRearmState(comments, headSha).applicable
+    ? rearmWindow(comments) : null;
+  const noCode = window?.rearmed === true && window.claims?.length === 0
+    && window.honouredAnswerId === latestOperatorAnswerCommentId(comments);
   return [
     REARM_COMMENT_MARKER,
     '',
-    `${decision.rearmFrom === 'missing'
+    `${noCode
+      ? 'The operator ruled that no code is owed; independent review is being requested'
+      : decision.rearmFrom === 'missing'
       ? 'The healed PR had no review label; independent review is being requested'
       : decision.rearmFrom === 'review:accepted'
       ? 'The previously accepted PR was re-pushed and its acceptance is being re-armed for review'
@@ -333,13 +379,12 @@ export function buildRearmComment({ actor, decision }) {
         : 'the PR is re-armed `review:pending` (an independent re-review is owed).'}`,
     '',
     'The fix agent did NOT clear the review — a human `/review` (or the drain AI-review convergence pass) re-verdicts.',
+    ...(noCode ? ['', 'This no-code handoff does not spend a repair round.', NO_CODE_REARM_TRAILER] : []),
   ].join('\n');
 }
 
-// we:scripts/conveyor/rearm-review.mjs — allow importing the pure decider without running the CLI (the test file
-// imports this module). The standard main check used across the conveyor scripts.
-const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
-if (IS_CLI) {
+/** CLI write arc, with read/label ports for hermetic production-path replays. */
+export function runRearmReview(argv = process.argv.slice(2), { read = readGh, runLabel = runReviewLabelCli } = {}) {
   // #xkmu3gv — `--round=conflict` selects the MECHANICAL conflict-resolution comment/marker
   // (`CONFLICT_FIX_COMMENT_MARKER`, its own smaller `we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP`,
   // #xkmu3gv) instead of the ordinary rearm marker. THE LABEL SWAP ITSELF IS IDENTICAL EITHER WAY — the SAME
@@ -347,50 +392,51 @@ if (IS_CLI) {
   // `decideSetLabel({ to: 'rearm' })` decides; only which durable floor this completed round counts against, and
   // the comment text explaining why, differs. See `conflict-fix-round-count.mjs`'s own header for why a
   // mechanical conflict-resolution round needs its own cap rather than sharing `countRearmComments`'s.
-  const roundArg = (process.argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
+  const roundArg = (argv.find((a) => a.startsWith('--round=')) || '').slice('--round='.length);
   const isConflictRound = roundArg === 'conflict';
   // #2787-live-incident — the ordinary conflict-fix round is, by construction, always against the repo's
   // default branch; `--main-ref=` lets a non-`main`-default repo say so, defaulting to `'main'` (every
   // constellation repo today) so no existing caller needs to change.
-  const mainRefArg = (process.argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
+  const mainRefArg = (argv.find((a) => a.startsWith('--main-ref=')) || '').slice('--main-ref='.length) || 'main';
   // we:scripts/conveyor/rearm-review.mjs — the fix-agent re-arm CLI: the shared harness with the three deltas
   // this caller supplies (the comment body, the default --actor, the optional --repo fallback). The re-arm
   // swap + its refusal are the shared pure `decideSetLabel({ to: 'rearm' })` — this file adds no invariant.
   // #6713 — refuse an EMPTY ordinary fix round before any label write. Fail-open on every READ problem; once an
   // empty round is PROVEN the refusal is unconditional (a failed note never lets the re-arm through).
-  const argOf = (n) => (process.argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
+  const argOf = (n) => (argv.find((a) => a.startsWith(`--${n}=`)) || '').slice(n.length + 3);
   // A stray/extra positional would let the shared CLI act on a PR this guard never inspected: refuse before any write.
-  if (hasUnexpectedPositionals(process.argv.slice(2)) || hasInvalidArgs(process.argv.slice(2))) {
+  if (hasUnexpectedPositionals(argv) || hasInvalidArgs(argv)) {
     writeLineSync(1, JSON.stringify({ ok: false, reason: 'refused: expected exactly one positional <pr> (a positive integer) and well-formed flags' }));
     process.exit(1);
   }
-  const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
+  const prArg = argv.find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
   if (prArg && !isConflictRound && !argOf('only-if')) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
     try {
       const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
-      const head = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
+      const head = JSON.parse(read(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
-      const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
+      const pages = JSON.parse(read(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
       verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
     } catch { /* fail open: never block a real push on a read error */ }
     if (verdict.empty) {
       try {
-        readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
+        read(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
           { input: buildNoChangeComment({ actor: argOf('actor') || 'conveyor fix agent', since: verdict.since }), stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
       } catch { /* the note is best-effort; the refusal below is not */ }
       writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: 'no change made — fix still owed (head unchanged since fix-begin)', head: verdict.since }));
       process.exit(1);
     }
   }
-  runReviewLabelCli({
+  return runLabel({
+    argv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.
-    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>]  (pr must be a positive integer)',
+    usage: 'usage: rearm-review.mjs <pr> [--repo=<owner/name>] [--actor=<name>] [--round=conflict] [--main-ref=<name>] [--only-if=accepted|missing] [--expect-head=<sha>] [--no-code-rearm]  (pr must be a positive integer)',
     // The DURABLE re-arm comment — a readable record that the bounce was repaired and re-armed (not a silent
     // flip), AND the durable tally the matching counter reads back to survive a restart (#2643). Its first line
     // MUST be the matching marker (single-sourced) so posting and counting can never drift.
@@ -420,3 +466,6 @@ if (IS_CLI) {
     refusalResult: ({ pr, decision }) => ({ ok: false, pr, reason: decision.reason }),
   });
 }
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname);
+if (IS_CLI) runRearmReview();
