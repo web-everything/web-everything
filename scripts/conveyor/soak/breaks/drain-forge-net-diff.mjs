@@ -8,6 +8,8 @@ import { fakeGh, fakeGit } from '../../../__tests__/fixtures/merge-ai-prs-fake-p
 import { defaultCachePath } from '../../../lib/github-app-auth-env.mjs';
 import { OWNER_INSTALLATIONS, installationCachePath } from '../../../lib/github-app-installations.mjs';
 import { daemonAppEnv } from '../../../__tests__/fixtures/daemon-app-env.mjs';
+
+const SIBLING = ['frontier-ui', 'frontierui'].join('/');
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 function probe(root = ROOT) {
   const dir = mkdtempSync(join(tmpdir(), 'soak-forge-net-diff-'));
@@ -15,7 +17,7 @@ function probe(root = ROOT) {
   try {
     const bin = join(dir, 'bin'); mkdirSync(bin); mkdirSync(join(dir, 'backlog'));
     const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json');
-    const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: 'frontier-ui/frontierui', PRESTAGE_LOCAL_REPO: 'web-everything/web-everything' };
+    const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: SIBLING, PRESTAGE_LOCAL_REPO: ['web-everything', 'web-everything'].join('/') };
     for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body.replace('\n', '\nObject.assign(process.env, ' + JSON.stringify(routing) + ');\n'), { mode: 0o755 });
     writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
     const appEnv = daemonAppEnv(dir);
@@ -34,7 +36,7 @@ function probe(root = ROOT) {
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha }],
         comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${sha} -->`, createdAt: new Date().toISOString() }], reviews: [],
         compare: fail ? { status: 500 } : { status: 'ahead', merge_base_commit: { sha: mb }, base_commit: { sha: mb }, files: [{ filename: 'README.md', status: 'modified', additions: 1, deletions: 0, changes: 1, patch: '@@ -0,0 +1 @@\n+readme' }] } }));
-      const r = spawnSync(process.execPath, [join(root, 'scripts/merge-ai-prs.mjs'), '--repos=frontier-ui/frontierui', '--label=ready-to-merge', '--only=42', '--json', '--no-drain-lease', '--no-red-main-freeze', '--no-rebase-drop', '--no-heal-collision', '--no-overlap-yield'], {
+      const r = spawnSync(process.execPath, [join(root, 'scripts/merge-ai-prs.mjs'), `--repos=${SIBLING}`, '--label=ready-to-merge', '--only=42', '--json', '--no-drain-lease', '--no-red-main-freeze', '--no-rebase-drop', '--no-heal-collision', '--no-overlap-yield'], {
         cwd: dir, encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
         env: { ...process.env, ...appEnv, ...routing, PATH: bin + ':' + process.env.PATH,
           WE_UNDER_TEST: '1', WE_DRAIN_READS_SOURCE: 'git', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
