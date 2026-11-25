@@ -192,7 +192,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
             || !query && args.some(a => ['-f', '-F', '--field', '--raw-field', '--input'].includes(a))) refuse('api');
         } else if (args[0] === 'run') {
           if (!['view', 'list'].includes(args[1])) refuse('workflow-run');
-        } else if (!(args[0] === 'repo' && args[1] === 'view') && !['pr', 'search'].includes(args[0])) refuse('gh');
+        } else if (!(args[0] === 'repo' && args[1] === 'view') && args[0] !== 'pr' && args[0] !== 'search') refuse('gh');
       } else refuse('exec');
       return run(file, args, options);
     },
