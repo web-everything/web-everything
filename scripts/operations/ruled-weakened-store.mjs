@@ -50,7 +50,12 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   // A damaged line only blocks when it names scopeRef or its ref cannot be read (fail closed); others use warnOther.
   const damaged = (i, count, request) => {
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
-    const other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
+    let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
+    // Unparseable text: it may only block when it could be a revocation or names the scoped ref (fail closed); else it is unrelated.
+    if (scopeRef !== undefined && !named) {
+      const raw = lines.slice(i, i + count).join('\n').toLowerCase();
+      other = !raw.includes('revok') && !raw.includes('withdrawn') && !raw.includes(String(scopeRef).toLowerCase());
+    }
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
   };

@@ -65,7 +65,7 @@ export function classifyFindings(findings, { changed = [], added = [] } = {}, wa
   });
 }
 
-function defaultLoaders({ env, repo }) {
+function defaultLoaders({ env, repo, ref, malformed }) {
   const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
   const full = { ...env, HOME: home };
   const tool = readAuditSettings();
@@ -77,7 +77,9 @@ function defaultLoaders({ env, repo }) {
     const platform = readPlatformPreferences({ env: full, readFile: readFileSync, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
     const list = loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
-      fs: { readFileSync }, env: full, warn });
+      fs: { readFileSync }, env: full, warn, scopeRef: ref,
+      // An unrelated damaged line is reported (line number) and never grants a carry; it does not refuse this ref.
+      warnOther: m => { const n = /line(?:s)? (\d+)/.exec(String(m)); malformed.push(n ? Number(n[1]) : String(m).slice(0, 80)); } });
     if (warnings.length) throw new Error(`waiver evidence warnings: ${warnings[0].slice(0, 100)}`);
     return list;
   };
@@ -88,7 +90,10 @@ function defaultLoaders({ env, repo }) {
 export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSync, loadRecords, loadWaivers, revoked, baseOk: baseOkIn, maxWalk = MAX_WALK }) {
   try {
     if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(String(ref)) || String(ref).includes('..')) return refuse('bad-ref');
-    const loaders = loadRecords && loadWaivers ? { loadRecords, loadWaivers } : defaultLoaders({ env, repo });
+    const malformed = [];
+    const defaults = loadRecords && loadWaivers ? {} : defaultLoaders({ env, repo, ref, malformed });
+    const loaders = { loadRecords: loadRecords || defaults.loadRecords, loadWaivers: loadWaivers || defaults.loadWaivers };
+    const done = out => (malformed.length ? { ...out, malformed } : out);
     const base = { PATH: env.PATH, HOME: env.HOME, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
     const gitDir = String(proc('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { env: base, encoding: 'utf8' })).trim();
     const genv = { ...base, GIT_DIR: gitDir, GIT_WORK_TREE: repo };
@@ -106,7 +111,7 @@ export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSyn
     try { query('fetch', '--quiet', 'origin', 'main'); } catch { /* an unrefreshed main only makes baseOk stricter */ }
     const baseOk = baseOkIn || (b => { try { query('merge-base', '--is-ancestor', b, 'origin/main'); return true; } catch { return false; } });
     const first = planRewaive({ ref, tip, chain, merges: [], records, waivers, revoked, baseOk });
-    if (!first.basis) return first;
+    if (!first.basis) return done(first);
     const merges = query('rev-list', '--merges', `${first.basis}..${tip}`).split('\n').filter(Boolean);
     const out = planRewaive({ ref, tip, chain, merges, records, waivers, revoked, baseOk });
     if (out.state === 'request') {
@@ -116,7 +121,7 @@ export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSyn
       out.table = classifyFindings(out.request.findings, { changed: names(), added: names('--diff-filter=A') },
         baseRecs[baseRecs.length - 1].findings);
     }
-    return out;
+    return done(out);
   } catch (error) {
     return refuse('error', { detail: String(error?.message || error).slice(0, 200) });
   }
