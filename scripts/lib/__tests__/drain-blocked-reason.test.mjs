@@ -357,6 +357,28 @@ describe('audit safeguards', () => {
 
 describe('stale merge-gate run vs later review verdict', () => {
   const runUrl = 'https://github.com/o/r/actions/runs/45545719563/job/1';
+  it('a refused re-run falls back to the send-back and leaves no marker', () => withDir(ledgerPath => {
+    const ex = vi.fn((command, argv) => command === 'gh' && argv[0] === 'run' ? { status: 1 }
+      : command === 'gh' ? { status: 0, stdout: JSON.stringify({ headRefOid: head }) } : { status: 0 });
+    const comments = [{ id: 'C_1', body: '✅ review — accepted', createdAt: '2026-11-25T07:30:00Z', viewerDidAuthor: true }];
+    const pr = fixture({ statusCheckRollup: [row('test'), restRow('merge-gate', 'failure', { detailsUrl: runUrl, completedAt: '2026-11-25T04:18:00Z' })] });
+    expect(sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: ex, readComments: () => comments }).sent).toBe(true);
+  }));
+  it.each([
+    ['newest verdict is changes-requested', [{ id: 'A', body: '✅ review — accepted', createdAt: '2026-11-25T06:00:00Z' }, { id: 'B', body: '🔁 review — changes requested', createdAt: '2026-11-25T07:00:00Z' }]],
+    ['a trusted verdict has an unreadable time', [{ id: 'A', body: '✅ review — accepted', createdAt: '2026-11-25T06:00:00Z' }, { id: 'B', body: '🔁 review — changes requested', createdAt: 'x' }]],
+  ])('no suppression: %s', (_n, list) => withDir(ledgerPath => {
+    const writes = [];
+    const ex = exec(list.map(c => ({ ...c, viewerDidAuthor: true })), writes);
+    expect(go(ledgerPath, ex, prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('a run URL from another repo sends back as today', () => withDir(ledgerPath => {
+    const writes = [];
+    const pr = prWith(gate({ detailsUrl: 'https://github.com/evil/x/actions/runs/1/job/2' }));
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), pr).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
   const gate = (extra = {}) => restRow('merge-gate', 'failure', { detailsUrl: runUrl, completedAt: '2026-11-25T04:18:00Z', ...extra });
   const prWith = (g = gate(), more = []) => fixture({ statusCheckRollup: [row('test'), g, ...more] });
   const verdictAt = (createdAt, body = '✅ review — accepted') => ({ id: 'C_1', body, createdAt, viewerDidAuthor: true });
