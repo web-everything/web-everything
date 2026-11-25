@@ -41,8 +41,11 @@ export function heavyFieldReason(entry, row, field, { nowMs, backstopMs, candida
   if (candidate) return 'candidate';
   const stamp = entry?.stamps?.[field];
   if (!stamp || !Object.hasOwn(entry, field) || !HEAVY_VALIDATORS[field]) return 'new';
-  for (const key of HEAVY_VALIDATORS[field]) if (stamp[key] !== row[key]) return VALIDATOR_REASON[key];
-  if (!Number.isFinite(backstopMs) || !(nowMs - stamp.fetchedAtMs < backstopMs)) return 'backstop';
+  for (const key of HEAVY_VALIDATORS[field]) {
+    if (row[key] == null || row[key] === '' || stamp[key] !== row[key]) return VALIDATOR_REASON[key];
+  }
+  const age = nowMs - stamp.fetchedAtMs;
+  if (!Number.isFinite(backstopMs) || !(age >= 0 && age < backstopMs)) return 'backstop';
   return null;
 }
 const stampFor = (field, row, nowMs) => ({ fetchedAtMs: nowMs,
@@ -337,7 +340,8 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
   try {
     const text = exec('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
     const data = JSON.parse(String(text));
-    if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))) {
+    if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))
+      || (fields.includes('files') && !Array.isArray(data.files)) || (fields.includes('body') && typeof data.body !== 'string')) {
       throw new Error('missing PR heavy-field data');
     }
     return data;
@@ -438,9 +442,12 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
       if (!live || row.updatedAt !== live.updatedAt || row.headRefOid !== live.headRefOid) continue;
       for (const field of heavyFields) {
         if (!HEAVY_VALIDATORS[field] || !Object.hasOwn(row, field) || Object.hasOwn(working[row.number] ?? {}, field)) continue;
+        // A seed is usable only with its own real retrieval time, and (for files) the base it was read under.
+        if (!Number.isFinite(row.heavyFetchedAtMs)) continue;
+        if (HEAVY_VALIDATORS[field].includes('baseRefName') && row.baseRefName !== live.baseRefName) continue;
         const entry = working[row.number] = { ...working[row.number], stamps: { ...working[row.number]?.stamps } };
         entry[field] = row[field];
-        entry.stamps[field] = stampFor(field, live, nowMs);
+        entry.stamps[field] = stampFor(field, live, row.heavyFetchedAtMs);
       }
       continue;
     }

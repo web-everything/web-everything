@@ -110,7 +110,7 @@ describe('DRAIN-LIST-DELTA', () => {
 
   it('same head, changed check result: gate fields come from the live page, never the seed or cache', () => {
     const state = { nodes: [baseNode(1, { mergeStateStatus: 'BLOCKED' })], views: [] };
-    const seed = [{ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', body: 'seedbody', files: [],
+    const seed = [{ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main', heavyFetchedAtMs: 999_000, body: 'seedbody', files: [],
       statusCheckRollup: [{ name: 'x', conclusion: 'SUCCESS', foreignApp: 1 }], mergeStateStatus: 'CLEAN' }];
     const out = run(state, { seed, isCandidate: () => false });
     expect(out.rows[0].mergeStateStatus).toBe('BLOCKED');
@@ -151,5 +151,41 @@ describe('DRAIN-LIST-DELTA call sites', () => {
     const src = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
     expect(src.match(/delta: \{ isCandidate: operatorSelects \}/g)).toHaveLength(2);
     expect(src).not.toMatch(/needsHeavy: RECONCILE \? \(\) => true/);
+  });
+});
+
+describe('DRAIN-LIST-DELTA audit hardening', () => {
+  const seedRow = (extra = {}) => ({ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main',
+    heavyFetchedAtMs: 999_000, body: 'seedbody', files: [{ path: 's' }], ...extra });
+  it('a seed with the wrong base or no retrieval time is ignored for files', () => {
+    for (const extra of [{ baseRefName: 'release' }, { heavyFetchedAtMs: undefined }]) {
+      const state = { nodes: [baseNode(1)], views: [] };
+      run(state, { seed: [seedRow(extra)] });
+      expect(state.views.some(v => v.fields.includes('files'))).toBe(true);
+    }
+  });
+  it('a seed keeps its real age: an old seed past the backstop is re-read', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    run(state, { seed: [seedRow({ heavyFetchedAtMs: 1_000_000 - 4_000_000 })] });
+    expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
+  });
+  it('missing validators and future timestamps fail closed', () => {
+    const state = { nodes: [baseNode(1, { headRefOid: undefined })], views: [] };
+    const first = run(state);
+    state.views.length = 0;
+    run(state, { cache: first.cache, nowMs: 1_001_000 });
+    expect(state.views.some(v => v.fields.includes('files'))).toBe(true);
+    const s2 = { nodes: [baseNode(2)], views: [] };
+    const f2 = run(s2, { nowMs: 5_000_000 });
+    s2.views.length = 0;
+    run(s2, { cache: f2.cache, nowMs: 1_000_000 });
+    expect(s2.views).toEqual([{ number: 2, fields: ['body', 'files'] }]);
+  });
+  it('malformed heavy data (null body or files) is unreadable', () => {
+    const exec = (_c, args) => args[0] === 'api'
+      ? JSON.stringify({ data: { repository: { pullRequests: { nodes: [baseNode(1)], pageInfo: { hasNextPage: false, endCursor: null }, totalCount: 1 } } } })
+      : JSON.stringify({ body: null, files: null });
+    expect(() => listOpenPrsPagedHydrated({ repo, exec, paging: paging(), heavyFields: ['body', 'files'],
+      delta: { isCandidate: () => false }, cache: {}, nowMs: 1_000_000, seed: [] })).toThrow(PrListUnreadableError);
   });
 });
