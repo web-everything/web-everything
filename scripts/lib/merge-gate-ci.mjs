@@ -94,8 +94,7 @@ export function duplicateIdText(d) {
   return typeof d === 'string' ? d : JSON.stringify(d);
 }
 
-// `humanOnly`: the hold can be cleared only by a human ceremony; shadow mode must never turn it into exit 0.
-const r = (id, status, reason, humanOnly = false) => ({ id, status, reason, humanOnly });
+const r = (id, status, reason) => ({ id, status, reason });
 
 let loggedCarryApproval = false;
 const defaultProveCarry = ({ evidence }) => proveHumanClearanceCarry({
@@ -115,7 +114,7 @@ const defaultProveCarry = ({ evidence }) => proveHumanClearanceCarry({
 export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true, mergeEvent = null, carrySetting = undefined, proveCarry = undefined, write = (s) => process.stderr.write(s) } = {}) {
   const num = Number(facts?.pr?.number ?? facts?.num);
   const out = new Map();
-  const set = (id, status, reason, humanOnly = false) => out.set(id, r(id, status, reason, humanOnly));
+  const set = (id, status, reason) => out.set(id, r(id, status, reason));
   for (const g of DRAIN_GATES) if (g.where !== 'merge-gate') set(g.id, g.where, g.note || `${g.where}-owned`);
 
   const mergeGateIds = DRAIN_GATES.filter((g) => g.where === 'merge-gate').map((g) => g.id);
@@ -189,7 +188,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   // reviewed sha IS the pinned head can. An unread or missing change list fails closed.
   const sig = facts.netSignals;
   const wf = workflowEditFact({ ...facts, acceptance });
-  if (wf) set('review-acceptance', wf.status, wf.reason, true);
+  if (wf) set('review-acceptance', wf.status, wf.reason);
   else if (facts.manifest?.error) set('review-acceptance', 'fail-closed', `manifest read failed: ${facts.manifest.error}`);
   else if (!sig || (!sig.scored && !sig.fallbackFiles)) set('review-acceptance', 'fail-closed', `net diff unreadable: ${sig?.error || 'not computed'}`);
   else {
@@ -309,7 +308,7 @@ function finish(num, out, policy, mergeEvent) {
   const results = DRAIN_GATES.map((g) => {
     const res = out.get(g.id) || r(g.id, 'fail-closed', 'not evaluated');
     if (g.where === 'merge-gate' && drainMerges && placementOf(policy, g.id) === 'drain') {
-      return r(g.id, 'skipped-by-policy', `placement drain (drain-direct merges): ${res.reason}`, res.humanOnly === true);
+      return r(g.id, 'skipped-by-policy', `placement drain (drain-direct merges): ${res.reason}`);
     }
     return res;
   });
@@ -470,6 +469,33 @@ function loadGateSetting(key, envName, { env = process.env, platformPath = PLATF
 }
 
 /**
+ * The CLOSED allow-list of failure kinds shadow mode may turn into exit 0 (PRT-SHADOW-HOLD). Only `red-main-freeze`
+ * (set in evaluatePrGates: no shared freeze source yet / main red), the advisory rule shadow mode exists to observe.
+ * Everything else, an unknown or missing id included, keeps the gate failing.
+ */
+export const SHADOW_ADVISORY_IDS = Object.freeze(['red-main-freeze']);
+
+/**
+ * True only when EVERY reason the report fails is an allow-listed advisory row. Fails closed on an empty or stripped
+ * report, a failed workflow self-check, a group/membership failure (those change `reason` away from the PR-derived
+ * one), a verdict that disagrees with its rows, or any blocking row outside the allow-list. Pure.
+ */
+function shadowMaskable(report) {
+  if (report.workflowCheck?.ok !== true || !report.prs.length) return false;
+  let blockingRows = 0;
+  for (const p of report.prs) {
+    if (typeof p?.ok !== 'boolean' || !Array.isArray(p.results) || !p.results.length) return false;
+    const blocking = p.results.filter((x) => BLOCKING.has(x?.status));
+    if (p.ok !== (blocking.length === 0)) return false;
+    if (blocking.some((x) => !SHADOW_ADVISORY_IDS.includes(x.id))) return false;
+    blockingRows += blocking.length;
+  }
+  if (!blockingRows) return false;
+  const bad = report.prs.filter((p) => !p.ok).map((p) => `#${p.num}`).join(', ');
+  return report.reason === 'held' || report.reason === `held: ${bad}`;
+}
+
+/**
  * Apply the mode to one merge-gate-check.mjs run. `report` is its parsed `--json` output (or null), `childStatus`
  * its exit code. A verdict is trusted only when the report is well-formed AND agrees with the exit code (ok ↔ 0,
  * hold ↔ 1); anything else is "no verdict" and its non-zero exit passes through in both modes. Pure.
@@ -484,17 +510,15 @@ export function applyGateMode({ mode, source, childStatus, report }) {
     const line = `merge-gate: no verdict (exit ${childStatus}, ${wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
     return { exitCode, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
   }
-  const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
-  const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
-  // A human-only hold is never masked: a blocking result is shadow-maskable only when it says `humanOnly === false`
-  // (a missing field counts as human-only, fail closed).
-  const humanOnlyHold = !report.ok && report.prs.some((p) => (p.results || []).some((x) => BLOCKING.has(x.status) && x.humanOnly !== false));
-  const shadowMasked = !report.ok && mode === 'shadow' && !humanOnlyHold;
-  const exitCode = report.ok || shadowMasked ? 0 : 1;
-  const shadowLine = shadowMasked ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
-  const humanLine = humanOnlyHold && mode === 'shadow' ? 'human-only-hold: shadow mode does not mask a human-only hold; failing' : null;
-  const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}${humanLine ? `${humanLine}\n` : ''}`;
-  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}${humanLine ? `**${humanLine}**\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
+  const fmt = (p) => { try { return formatPrResult(p); } catch { return `#${p?.num}: unreadable PR result`; } };
+  const rowsOf = (p) => (Array.isArray(p?.results) ? p.results : []);
+  const table = [...report.prs.map(fmt), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
+  const holds = [...new Set(report.prs.flatMap((p) => rowsOf(p).filter((x) => BLOCKING.has(x?.status)).map((x) => x?.id)))];
+  const masked = !report.ok && mode === 'shadow' && shadowMaskable(report);
+  const shadowLine = masked ? `SHADOW: would HOLD on ${holds.join(', ')}` : null;
+  const exitCode = report.ok || masked ? 0 : 1;
+  const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
+  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
   return { exitCode, holds, text, summary };
 }
 
