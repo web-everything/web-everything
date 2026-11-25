@@ -1079,14 +1079,19 @@ legacy state immediately restores compat. Old processes' uncharged timeout execu
 invisible to both ledgers; no total-execution bound is claimed during mixed-version operation.
 
 `ghThrottle.pointsAlgorithm` defaults to `bucket`; `window` restores the legacy path.
-It and `pointsClasses.batch` resolve standard → platform → tool (`scripts/settings/gh-throttle.json`)
-→ environment (`WE_GH_THROTTLE_POINTS_ALGORITHM`, `WE_GH_THROTTLE_POINTS_BATCH`, JSON array).
+It resolves standard → platform → tool (`scripts/settings/gh-throttle.json`)
+→ environment (`WE_GH_THROTTLE_POINTS_ALGORITHM`). `pointsClasses.batch` resolves through
+settings only (standard → platform → tool); environment values cannot reclassify callers.
 Invalid values retain the lower layer; provenance is logged in `points-admission-settings.jsonl`. Settings are
 read on every admission decision, so running waiters observe rollback. Algorithm switches
 retain each ledger; the charged bound applies only within intervals without a switch.
 Test with injected clocks, sleep and jitter, temporary roots, seeded property arrivals, and
 real child processes sharing the mutex, including an old-code ledger simulator. Run only
 scoped throttle suites through the host heavy queue; never use live GitHub quota for scarcity.
+Adoption fixtures inject `testOnlyAdoptionCheck` through the separate second argument of
+`acquireGhPointsSync`; production wrappers always use real evidence. Roster holes, malformed
+entries and non-string heads retain compat. Pending-charge repair treats an existing corrupt
+legacy ledger as full for a fresh window; only an absent ledger can recover from the journal alone.
 
 ## GitHub priority admission
 

@@ -15,7 +15,7 @@ const load = file => JSON.parse(readFileSync(file, 'utf8'));
 const state = (extra = {}) => ({ tokens: 60, lastRefillMs: clock, batchLog: [], tickets: [], mode: 'compat', legacyWindowStartMs: clock, legacyChargedByNew: 0, ...extra });
 const env = () => ({ WE_PLATFORM_PREFERENCES_FILE: join(root, 'absent'), WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_NO_BUDGET_PROBE: '1' });
 const options = (extra = {}) => ({ lockRoot: root, owner: 'test', now: () => clock, sleep: ms => { clock += ms; }, jitter: () => 0, budgetPerMin: 300, pollMs: 1000, env: env(), ...extra });
-const acquire = (extra = {}) => gh.acquireGhPointsSync(options(extra));
+const acquire = ({ testOnlyAdoptionCheck, ...extra } = {}) => gh.acquireGhPointsSync(options(extra), { testOnlyAdoptionCheck });
 const decide = (extra = {}) => gh.decideGhBucketSpend({ state: state(), points: 1, pointClass: 'standard', nowMs: clock, budgetPerMin: 300, owner: 'test', pid: process.pid, startedAt: clock, isPidAlive: () => true, ...extra });
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'gh-points-bucket-')); clock = 1_000_000; });
 afterEach(() => { vi.restoreAllMocks(); rmSync(root, { recursive: true, force: true }); });
@@ -35,6 +35,20 @@ it('settings-cascade-and-provenance', () => {
   expect(gh.resolveGhPointsSettings(e, { tool: {} })).toMatchObject({ pointsAlgorithm: 'window', source: { pointsAlgorithm: 'platform' } });
   expect(gh.resolveGhPointsSettings(e, { tool: { pointsAlgorithm: 'bucket' } }).source.pointsAlgorithm).toBe('tool');
   expect(gh.resolveGhPointsSettings({ ...e, WE_GH_THROTTLE_POINTS_ALGORITHM: 'window' }, { tool: { pointsAlgorithm: 'bucket' } }).source.pointsAlgorithm).toBe('env');
+});
+describe.each(['standard', 'platform', 'tool'])('batch-patterns-from-%s-settings-only', layer => {
+  it.each(['[]', '["^other"]', '', 'garbage', 'null', '{}'])('environment-%j-cannot-empty-or-reclassify-batch', value => {
+    const patterns = layer === 'standard' ? ['^rebuild-smoke'] : ['^custom'];
+    const platform = join(root, 'platform.json');
+    save(platform, { ghThrottle: layer === 'platform' ? { pointsClasses: { batch: patterns } } : {} });
+    const toolFile = join(root, 'settings.json');
+    save(toolFile, { ghThrottle: layer === 'tool' ? { pointsClasses: { batch: patterns } } : {} });
+    const settings = gh.resolveGhPointsSettings({ ...env(), WE_PLATFORM_PREFERENCES_FILE: platform, WE_GH_THROTTLE_POINTS_BATCH: value }, { toolFile });
+    expect(settings.pointsClasses.batch).toEqual(patterns);
+    expect(settings.source['pointsClasses.batch']).toBe(layer);
+    expect(gh.classifyGhPoints({ caller: layer === 'standard' ? 'rebuild-smoke' : 'custom', settings })).toBe('batch');
+    expect(gh.classifyGhPoints({ caller: 'other', settings })).toBe('standard');
+  });
 });
 it('refill-and-cap', () => {
   expect(decide({ state: state({ tokens: 0, lastRefillMs: clock - 1000 }), pointClass: 'priority' }).nextState.tokens).toBe(4);
@@ -152,10 +166,60 @@ it('one-daemon-on-old-code-keeps-compat-mode', () => {
   expect(gh.ghPointsBucketAdopted({ ...adoption, daemons: ['new'] }, { readAdopted: () => ({ head: 'a'.repeat(40) }), isAncestor: (a, b) => a === b })).toBe(true);
   expect(gh.ghPointsBucketAdopted({ requiredHead: 'a'.repeat(40), daemons: [] })).toBe(false);
 });
+it.each([undefined, null, {}, 42, '', ' ', ['daemon']])('malformed-roster-entry-%j-prevents-adoption-even-with-positive-evidence', entry => {
+  expect(gh.ghPointsBucketAdopted({ requiredHead: 'a'.repeat(40), daemons: ['known', entry] }, {
+    readAdopted: () => ({ head: 'b'.repeat(40) }), isAncestor: () => true,
+  })).toBe(false);
+});
+it('sparse-roster-entry-prevents-adoption', () => {
+  const daemons = ['known']; daemons.length = 2;
+  expect(gh.ghPointsBucketAdopted({ requiredHead: 'a'.repeat(40), daemons }, {
+    readAdopted: () => ({ head: 'b'.repeat(40) }), isAncestor: () => true,
+  })).toBe(false);
+});
+it.each(['unknown', 'missing', 'unreadable', 'malformed', 'not-descendant'])('every-roster-daemon-needs-readable-descendant-evidence-%s', failure => {
+  const requiredHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const readAdopted = name => {
+    if (name === 'known') return { head };
+    if (failure === 'unreadable') throw Error('unreadable');
+    return failure === 'unknown' ? undefined : failure === 'missing' ? null : failure === 'malformed' ? { head: '?' } : { head };
+  };
+  expect(gh.ghPointsBucketAdopted({ requiredHead, daemons: ['known', 'other'] }, {
+    readAdopted, isAncestor: (_required, _head, name) => name === 'known',
+  })).toBe(false);
+});
+it.each([
+  ['empty-roster', { requiredHead: 'a'.repeat(40), daemons: [] }],
+  ['missing-roster', { requiredHead: 'a'.repeat(40) }],
+  ['missing-required-head', { daemons: ['known'] }],
+  ['coerced-required-head', { requiredHead: ['a'.repeat(40)], daemons: ['known'] }],
+])('incomplete-adoption-%s-stays-closed', (_label, settings) => {
+  expect(gh.ghPointsBucketAdopted(settings, { readAdopted: () => ({ head: 'b'.repeat(40) }), isAncestor: () => true })).toBe(false);
+});
+it('non-string-adopted-head-cannot-coerce-to-valid-evidence', () => {
+  expect(gh.ghPointsBucketAdopted({ requiredHead: 'a'.repeat(40), daemons: ['known'] }, {
+    readAdopted: () => ({ head: ['b'.repeat(40)] }), isAncestor: () => true,
+  })).toBe(false);
+});
+it('every-daemon-descendant-is-required-and-sufficient-for-adoption', () => {
+  const requiredHead = 'a'.repeat(40), head = 'b'.repeat(40);
+  const isAncestor = vi.fn(() => true);
+  expect(gh.ghPointsBucketAdopted({ requiredHead, daemons: ['one', 'two'] }, { readAdopted: () => ({ head }), isAncestor })).toBe(true);
+  expect(isAncestor.mock.calls).toEqual([[requiredHead, head, 'one'], [requiredHead, head, 'two']]);
+});
+it.each(['no-injection', 'old-override', 'env-and-settings'])('production-adoption-%s-without-evidence-stays-compat', source => {
+  const toolFile = join(root, 'settings.json');
+  save(toolFile, { ghThrottle: { pointsBucketAdoption: { requiredHead: '', daemons: [] }, adoptionCheck: true, pointsAdoptionCheck: true } });
+  save(bucketFile(), state());
+  const e = { ...env(), WE_DAEMON_STATE_DIR: join(root, 'missing-evidence') };
+  if (source === 'env-and-settings') e.WE_GH_THROTTLE_POINTS_ADOPTION_CHECK = 'true';
+  expect(acquire({ toolFile, env: e, ...(source === 'old-override' ? { adoptionCheck: () => true } : {}) }).ok).toBe(true);
+  expect(load(bucketFile()).mode).toBe('compat');
+});
 it('switches-to-bucket-only-with-adoption-and-old-spend-reverts-to-compat', () => {
-  save(bucketFile(), state()); acquire({ adoptionCheck: () => true }); expect(load(bucketFile()).mode).toBe('bucket');
+  save(bucketFile(), state()); acquire({ testOnlyAdoptionCheck: () => true }); expect(load(bucketFile()).mode).toBe('bucket');
   save(legacyFile(), { windowStartMs: clock, spent: 300 });
-  expect(acquire({ pointClass: 'batch', timeoutMs: 0, adoptionCheck: () => true }).ok).toBe(false);
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
   expect(load(bucketFile()).mode).toBe('compat');
 });
 it('running-process-observes-window-rollback', () => {
@@ -179,9 +243,25 @@ it('crash-after-legacy-rename-repair-is-idempotent', () => {
   expect(load(bucketFile()).tokens).toBe(58); expect(load(legacyFile()).spent).toBe(2);
   expect(load(bucketFile()).pendingLegacy).toBeUndefined();
 });
+describe.each([0, 60000])('pending-charge-repair-with-%ims-old-journal', age => {
+  it.each([
+    ['NaN', 'NaN'], ['infinite', '1e999'], ['non-numeric', '"garbage"'], ['numeric-string', '"1"'],
+    ['negative', '-1'], ['null', 'null'], ['boolean', 'true'], ['object', '{}'], ['array', '[]'], ['missing', undefined],
+  ])('corrupt-legacy-spent-%s-means-full-and-never-serializes-null', (_label, raw) => {
+    save(bucketFile(), state({ pendingLegacy: { windowStartMs: clock - age, spent: 1 } }));
+    writeFileSync(legacyFile(), `{"windowStartMs":${clock - age}${raw === undefined ? '' : `,"spent":${raw}`}}`);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
+      expect(load(legacyFile())).toEqual({ windowStartMs: clock, spent: 300 });
+      expect(readFileSync(legacyFile(), 'utf8')).not.toContain('null');
+      expect(load(bucketFile()).mode).toBe('compat');
+      expect(load(bucketFile()).pendingLegacy).toBeUndefined();
+    }
+  });
+});
 it('corrupt-legacy-refuses-batch-and-restores-compat', () => {
   save(bucketFile(), state({ mode: 'bucket' })); writeFileSync(legacyFile(), '{');
-  expect(acquire({ pointClass: 'batch', timeoutMs: 0, adoptionCheck: () => true }).ok).toBe(false);
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
   expect(load(bucketFile())).toMatchObject({ mode: 'compat', tokens: 60 });
 });
 it('deadlines-refuse-batch-even-if-capacity-arrives-at-60s', () => {
@@ -210,6 +290,15 @@ describe.each(['sync', 'cli'])('%s closed execution paths', mode => {
   const invoke = throttle => mode === 'sync'
     ? gh.runGhSync(['api', 'user'], { throttle })
     : gh.runGhCliPassthrough(['api', 'user'], { throttle, spawn: throttle.exec });
+  it('production-wrapper-cannot-forward-a-true-adoption-override', () => {
+    save(bucketFile(), state());
+    const exec = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok') }));
+    const pointsAdoptionCheck = vi.fn(() => true);
+    invoke(options({ caller: 'ordinary', exec, pointsAdoptionCheck, warn: vi.fn() }));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(pointsAdoptionCheck).not.toHaveBeenCalled();
+    expect(load(bucketFile()).mode).toBe('compat');
+  });
   it.each(['lock-root-failure', 'gate-exception', 'held-lock-timeout', 'slot-ungated-override'])('batch-%s-never-executes', failure => {
     const exec = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok') }));
     const throttle = options({ caller: 'rebuild-smoke.mjs:we', exec, cap: 1, warn: vi.fn(), acquireTimeoutMs: 5, env: { ...env(), WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' } });
@@ -300,6 +389,6 @@ it('old-timeout-execution-is-not-detectable-from-ledger', async () => {
 it('old-child-spend-reverts-bucket-mode-at-the-next-decision', async () => {
   save(bucketFile(), state({ mode: 'bucket' })); save(legacyFile(), { windowStartMs: clock, spent: 0 });
   expect((await child(true)).ok).toBe(true);
-  acquire({ adoptionCheck: () => true });
+  acquire({ testOnlyAdoptionCheck: () => true });
   expect(load(bucketFile()).mode).toBe('compat'); expect(load(legacyFile()).spent).toBe(2);
 });
