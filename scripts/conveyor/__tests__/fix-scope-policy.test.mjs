@@ -55,7 +55,7 @@ describe('live region head freshness', () => {
 
 describe('defaults and cascade', () => {
   it('exports and resolves standard defaults', () => {
-    expect(policy().value).toEqual({ holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20, priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: ['fast-track', 'priority:urgent'], waitForLandingHolder: { enabled: true, holderStates: ['review:accepted', 'in-merge-queue'] } });
+    expect(policy().value).toEqual({ holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20, priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: ['fast-track', 'priority:urgent'], waitForLandingHolder: { enabled: true, holderStates: ['review:accepted', 'in-merge-queue'], maxWaitMinutes: 60 } });
     expect(policy().value).toEqual(policyApi.FIX_SCOPE_DEFAULTS);
   });
   it('resolves each env override', () => {
@@ -206,7 +206,7 @@ describe('planner label forwarding', () => {
 describe('landing holder policy', () => {
   it('cascades nested leaves and validates their shapes', () => {
     const p = policy({ waitForLandingHolder: { holderStates: ['review:accepted'] } });
-    expect(p.value.waitForLandingHolder).toEqual({ enabled: true, holderStates: ['review:accepted'] });
+    expect(p.value.waitForLandingHolder).toEqual({ enabled: true, holderStates: ['review:accepted'], maxWaitMinutes: 60 });
     expect(p.sources).toMatchObject({ 'waitForLandingHolder.enabled': 'standard', 'waitForLandingHolder.holderStates': 'tool' });
     for (const bad of [{ enabled: 'yes', holderStates: [] }, { enabled: ['x'] }, { holderStates: true }]) {
       const resolved = policy({ waitForLandingHolder: bad });
@@ -291,7 +291,7 @@ describe('wait only for a landing holder', () => {
     const out = run({ labels: ['review:pending'] });
     expect(out.planned.map(e => e.pr)).toEqual([2]);
     expect(out.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'admitted', why: expect.stringContaining('not near landing') });
-    expect(out.scopeDecisions[0].setting).toBe('fixScope.waitForLandingHolder.enabled=true (standard), fixScope.waitForLandingHolder.holderStates=["review:accepted","in-merge-queue"] (standard)');
+    expect(out.scopeDecisions[0].setting).toBe('fixScope.waitForLandingHolder.enabled=true (standard), fixScope.waitForLandingHolder.holderStates=["review:accepted","in-merge-queue"] (standard), fixScope.waitForLandingHolder.maxWaitMinutes=60 (standard)');
   });
   it('holds a waiter behind an accepted holder', () => {
     const out = run({ labels: ['review:accepted'] });
@@ -317,6 +317,31 @@ describe('wait only for a landing holder', () => {
   });
   it('ignores landing holders in file mode', () => {
     expect(run({ inMergeQueue: true }, { overlapGranularity: 'file' }, { landingHolders: [{ pr: 1, scope: [F] }] }, []).planned).toHaveLength(1);
+  });
+  const minutesAgo = m => new Date(NOW - m * 60000).toISOString();
+  it('admits a waiter past a landing holder after maxWaitMinutes', () => {
+    const out = run({ labels: ['review:accepted'] }, {}, {}, [claim(1)]);
+    expect(out.planned).toEqual([]);
+    const late = gate([entry(2, { waitingSince: minutesAgo(61) })], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(late.planned.map(e => e.pr)).toEqual([2]);
+    expect(late.scopeDecisions[0]).toMatchObject({ rule: 'waitForLandingHolder', decision: 'admitted', why: expect.stringContaining('maxWaitMinutes') });
+    expect(late.scopeDecisions[0].setting).toContain('fixScope.waitForLandingHolder.maxWaitMinutes=60 (standard)');
+  });
+  it('keeps the hold just under maxWaitMinutes', () => {
+    const early = gate([entry(2, { waitingSince: minutesAgo(59) })], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(early.planned).toEqual([]);
+  });
+  it('keeps the hold when waitingSince is unparseable (fail closed)', () => {
+    const bad = gate([entry(2, { waitingSince: 'not-a-date' })], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(bad.planned).toEqual([]);
+    expect(bad.scopeDecisions[0].why).toContain('waitingSince unknown');
+  });
+  it('honours a configured maxWaitMinutes and rejects invalid values', () => {
+    const tuned = gate([entry(2, { waitingSince: minutesAgo(11) })], [claim(1)], { overlapGranularity: 'region', waitForLandingHolder: { maxWaitMinutes: 10 } }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(tuned.planned.map(e => e.pr)).toEqual([2]);
+    const p = policy({ waitForLandingHolder: { enabled: true, holderStates: ['review:accepted'], maxWaitMinutes: -5 } });
+    expect(p.value.waitForLandingHolder.maxWaitMinutes).toBe(60);
+    expect(p.invalid).toContain('tool.waitForLandingHolder.maxWaitMinutes=-5');
   });
   it('deduplicates claims and exempts self and stack ancestors', () => {
     const landingHolders = [{ pr: 1, scope: [F] }, { pr: 2, scope: [F] }];

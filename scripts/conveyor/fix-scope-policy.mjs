@@ -15,12 +15,12 @@ export function stripProseScope(scope) {
 
 export const FIX_SCOPE_DEFAULTS = Object.freeze({
   holdMode: 'active-session', overlapGranularity: 'region', regionMarginLines: 20,
-  waitForLandingHolder: Object.freeze({ enabled: true, holderStates: Object.freeze(['review:accepted', 'in-merge-queue']) }),
+  waitForLandingHolder: Object.freeze({ enabled: true, holderStates: Object.freeze(['review:accepted', 'in-merge-queue']), maxWaitMinutes: 60 }),
   priorityBypass: true, stalledAfterMinutes: 30, fastTrackLabels: Object.freeze(['fast-track', 'priority:urgent']),
 });
 const validHolderStates = v => Array.isArray(v) && v.length > 0 && v.every(s => typeof s === 'string' && s.trim() !== '');
 const valid = {
-  waitForLandingHolder: v => typeof v === 'boolean' || validHolderStates(v),
+  waitForLandingHolder: v => typeof v === 'boolean' || validHolderStates(v) || (typeof v === 'number' && Number.isFinite(v) && v > 0),
   holdMode: v => ['active-session', 'pr-lifetime'].includes(v),
   overlapGranularity: v => ['region', 'file'].includes(v),
   regionMarginLines: v => Number.isInteger(v) && v >= 0 && v <= 10000,
@@ -45,8 +45,10 @@ export function resolveFixScopePolicy({ env = process.env, readTool = readSettin
   resolved.value.waitForLandingHolder = {
     enabled: setting?.enabled,
     holderStates: setting?.holderStates,
+    maxWaitMinutes: setting?.maxWaitMinutes,
   };
-  for (const [leaf, check] of [['enabled', v => typeof v === 'boolean'], ['holderStates', validHolderStates]]) {
+  for (const [leaf, check] of [['enabled', v => typeof v === 'boolean'], ['holderStates', validHolderStates],
+    ['maxWaitMinutes', v => typeof v === 'number' && Number.isFinite(v) && v > 0]]) {
     const path = `waitForLandingHolder.${leaf}`;
     if (check(resolved.value.waitForLandingHolder[leaf])) continue;
     resolved.invalid.push(`${resolved.sources[path] ?? 'tool'}.${path}=${JSON.stringify(resolved.value.waitForLandingHolder[leaf])}`);
@@ -70,12 +72,22 @@ const matchedHolderStates = (state, holderStates) => typeof state.baseRefName ==
   || (state.labels ?? []).some(label => (typeof label === 'string' ? label : label?.name) === s));
 
 /** PURE: only a holder near landing can use a real conflict to serialize fixers. */
-export function landingHolderDecision({ state, setting }) {
+export function landingHolderDecision({ state, setting, waitingSince, now }) {
   if (setting?.enabled !== true) return { hold: true, why: 'trial merge conflicts' };
   if (state == null) return { hold: true, failedClosed: true, why: 'trial merge conflicts; holder state unreadable, retaining hold' };
   const matched = matchedHolderStates(state, setting.holderStates);
-  if (matched.length) return { hold: true, landing: true,
-    why: `trial merge conflicts; holder is landing (${matched.join(', ')}) — waiting until it merges` };
+  if (matched.length) {
+    const since = Date.parse(waitingSince);
+    const bound = setting.maxWaitMinutes;
+    if (Number.isFinite(bound) && Number.isFinite(now)) {
+      if (!Number.isFinite(since)) return { hold: true, landing: true,
+        why: `trial merge conflicts; holder is landing (${matched.join(', ')}) — waiting until it merges (waitingSince unknown, maxWaitMinutes bound not applied)` };
+      if (now - since >= bound * 60000) return { hold: false,
+        why: `trial merge conflicts; holder is landing (${matched.join(', ')}) but waiter waited over maxWaitMinutes=${bound} — dispatching anyway, land-time conflict handling resolves it` };
+    }
+    return { hold: true, landing: true,
+      why: `trial merge conflicts; holder is landing (${matched.join(', ')}) — waiting until it merges` };
+  }
   return { hold: false, why: 'trial merge conflicts; holder not near landing — dispatching in parallel, land-time conflict handling resolves it' };
 }
 
