@@ -91,7 +91,12 @@ describe('sibling base admission', () => {
     expect(existsSync(join(f.dir, 'hydration-ran'))).toBe(false);
     expect(missingObjects()).toContain(`?${missingBlob}`);
     // Prehydrating through a trusted transport makes the documented fallback usable.
-    f.git('-c', 'remote.origin.uploadpack=git-upload-pack', 'cherry', 'refs/remotes/origin/main', 'HEAD');
+    // cherry delegates lazy fetching to another Git process. Select upload-pack
+    // on an explicit fetch, and prevent any additional implicit hydration.
+    f.git('--no-lazy-fetch', 'fetch', '--upload-pack=git-upload-pack', '--no-filter',
+      '--no-tags', '--no-write-fetch-head', 'origin', missingBlob);
+    expect(existsSync(join(f.dir, 'hydration-ran'))).toBe(false);
+    expect(missingObjects()).not.toContain(`?${missingBlob}`);
     expect(f.check()).toEqual([{ number: pr.number, headRefName: pr.headRefName, count: 1 }]);
     expect(existsSync(join(f.dir, 'hydration-ran'))).toBe(false);
   });
