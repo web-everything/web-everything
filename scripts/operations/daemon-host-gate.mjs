@@ -21,6 +21,8 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
+import { EX_RELOAD, EX_HANDED_OVER, MAX_GREEN_DROPS, swapEnabled as swapSettingOn } from '../lib/daemon-handover.mjs';
+import { platformPreference } from '../lib/policy-cascade.mjs';
 
 export const POLL_MS = 60_000;
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
@@ -151,11 +153,13 @@ function cleanupMarker(markerPath, fs, killGroup) {
   };
 }
 
-function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs, log, marker }) {
+function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, killGraceMs, log, marker, env }) {
   let child;
   let finish;
   let ended = false;
   let stopping = false;
+  let requestReload;
+  const reload = new Promise((resolve) => { requestReload = resolve; });
   let cleanupFailed = false;
   let revoking = false; // set by the wrapper before it stops the child for revocation
   let completedCode = null; // the command's own exit code, recorded when it ends without a wrapper stop
@@ -221,14 +225,19 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     });
   };
   try {
-    child = spawn(cmd, args, { stdio: 'inherit', detached: true });
+    // Swap children get an IPC channel: a running blue sends {type:'reload'} to ask for a successor and keep acting.
+    child = spawn(cmd, args, env
+      ? { stdio: ['inherit', 'inherit', 'inherit', 'ipc'], detached: true, env: { ...process.env, ...env } }
+      : { stdio: 'inherit', detached: true });
+    child.on?.('message', (m) => { if (m?.type === 'reload') requestReload(); });
     // A failed spawn has no exit event; errors on a live child must not release it.
     child.on('error', () => { if (!child.pid) end(127); });
     child.on('exit', (code, signal) => end(signal ? 128 + (SIGNUM[signal] ?? 15) : (code ?? 1)));
     if (child.pid) marker.track(child.pid);
   } catch { end(127); }
   return {
-    done, stop,
+    done, stop, reload,
+    get pid() { return child?.pid; },
     revoke() { revoking = true; },
     get completedCode() { return completedCode; },
     get cleanupFailed() { return cleanupFailed; },
@@ -268,6 +277,74 @@ async function watchChild(child, ctx) {
 }
 
 /**
+ * Swap-aware watch (BLUE-GREEN-SWAP S1.1). Active (blue) exit 76 spawns a candidate (green) beside it while blue
+ * keeps running; blue exit 77 promotes green with no owner re-read from cold (the periodic poll keeps revoking
+ * both slots as before). A green that dies in shadow is dropped; MAX_GREEN_DROPS drops raise needs-you.
+ * Any other blue exit ends the gate as today; a stray 76 with no way to spawn also ends it.
+ */
+async function watchSwap(first, ctx) {
+  const { thisHost, source, watchSleep, sleep, killGraceMs, log, spawnCandidate, marker } = ctx;
+  let active = first;
+  let candidate = null;
+  let gen = 1;
+  let drops = 0;
+  let revoked = false;
+  let reloadSeen = false;
+  const stopAll = async () => {
+    const slots = [active, candidate].filter(Boolean);
+    for (const c of slots) { c.revoke(); c.stop('SIGTERM'); }
+    const exited = await Promise.race([Promise.all(slots.map((c) => c.done)).then(() => true), sleep(killGraceMs).then(() => false)]);
+    if (!exited) for (const c of slots) c.stop('SIGKILL');
+    const codes = await Promise.all(slots.map((c) => c.done));
+    return slots.some((c) => c.cleanupFailed) ? codes[0] : null;
+  };
+  let poll = watchSleep(POLL_MS).then(() => 'poll');
+  while (!revoked) {
+    const waits = [active.done.then((code) => ({ who: 'active', code })), poll.then(() => ({ who: 'poll' }))];
+    if (!candidate && !reloadSeen) waits.push(active.reload.then(() => ({ who: 'reload' })));
+    if (candidate) waits.push(candidate.done.then((code) => ({ who: 'candidate', code })));
+    const ev = await Promise.race(waits);
+    if (ev.who === 'poll') {
+      poll = watchSleep(POLL_MS).then(() => 'poll');
+      const now = await pollRole(thisHost, source);
+      if (active.completedCode !== null) return await active.done;
+      if (now.active) continue;
+      log(`host-gate: owner=${now.owner} self=${thisHost}; stopping daemon, back to standby`);
+      revoked = true;
+      return await stopAll();
+    }
+    if (ev.who === 'candidate') {
+      candidate = null;
+      drops += 1;
+      log(`host-gate: green gen=${gen + 1} dropped (exit ${ev.code}), drop ${drops}/${MAX_GREEN_DROPS}; blue keeps running`);
+      if (drops >= MAX_GREEN_DROPS) log(`host-gate: needs-you: green dropped ${drops} times, no more successors until blue exits`);
+      continue;
+    }
+    if (ev.who === 'reload') {
+      reloadSeen = true;
+      if (drops >= MAX_GREEN_DROPS) continue;
+      candidate = spawnCandidate(gen + 1);
+      log(`host-gate: blue asked for a successor; green gen=${gen + 1} started in shadow`);
+      continue;
+    }
+    // Blue is gone (76: asked for a successor then exited; 77: handed over). Never a cold owner re-read.
+    if (ev.code === EX_RELOAD && !candidate && drops < MAX_GREEN_DROPS) candidate = spawnCandidate(gen + 1);
+    if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate) {
+      active = candidate;
+      candidate = null;
+      reloadSeen = false;
+      gen += 1;
+      marker.track(active.pid);
+      log(`host-gate: handover complete; green promoted to active gen=${gen}`);
+      continue;
+    }
+    if (candidate) { candidate.revoke(); candidate.stop('SIGTERM'); await candidate.done; }
+    return ev.code;
+  }
+  return null;
+}
+
+/**
  * Resolves to the daemon's exit code, or 75 after maxPolls standby polls (tests only).
  * While the child runs the owner is re-read every poll: any non-active result
  * (other, unset, unreadable or invalid input) immediately stops the daemon process group
@@ -293,6 +370,8 @@ export async function runGate(parsed, deps = {}) {
     killGraceMs = 30_000,
     markerPath: suppliedMarkerPath,
     markerFs = nodeFs,
+    // Setting daemons.blueGreenSwap.<daemon>; absent = off (today's exit-and-restart path).
+    swapEnabled = (daemon) => swapSettingOn({ daemons: platformPreference('daemons') }, daemon),
   } = deps;
   let markerPath;
   try { markerPath = suppliedMarkerPath ?? defaultMarkerPath(parsed); }
@@ -340,8 +419,22 @@ export async function runGate(parsed, deps = {}) {
         log(`host-gate: cannot reserve cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
         return 1;
       }
-      const child = startChild(parsed, { spawn, killGroup, processSignals, sleep, killGraceMs, log, marker });
-      const code = await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log });
+      const swap = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
+      const child = startChild(parsed, {
+        spawn, killGroup, processSignals, sleep, killGraceMs, log, marker,
+        env: swap ? { WE_DAEMON_ROLE: 'blue', WE_DAEMON_GEN: '1' } : undefined,
+      });
+      const code = swap
+        ? await watchSwap(child, {
+          thisHost, source, watchSleep, sleep, killGraceMs, log, marker,
+          // The cleanup marker tracks the active slot only; a shadow green must not rewrite or clear it.
+          spawnCandidate: (gen) => startChild(parsed, {
+            spawn, killGroup, processSignals, sleep, killGraceMs, log,
+            marker: { track() {}, clear() {} },
+            env: { WE_DAEMON_ROLE: 'green', WE_DAEMON_GEN: String(gen) },
+          }),
+        })
+        : await watchChild(child, { thisHost, source, watchSleep, sleep, killGraceMs, log });
       // Revocation discards the exit code, but must not discard wrapper shutdown.
       if (shutdownCode !== null) return await child.done;
       if (code !== null) return code;
