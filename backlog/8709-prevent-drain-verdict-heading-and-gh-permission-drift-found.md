@@ -1,4 +1,5 @@
 ---
+bornAs: x59d72k
 kind: story
 size: 3
 status: open
