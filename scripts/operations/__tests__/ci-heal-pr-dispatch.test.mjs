@@ -1004,12 +1004,14 @@ describe('xng7q1p retry reservation and restart soak', () => {
     expect(poll).toHaveBeenCalledTimes(1);
     expect(readState(dir, e)).toMatchObject({ retired: { reason: 'aged-out' }, requests: [{ status: 'pending' }] });
   }));
-  it('a retired state still keeps the heal hold', async () => harness(async (dir) => {
+  it('a retired state keeps the heal hold with an explicit needs-human reason', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
     await flushTimeoutFollowups({ dir, repo: e.repo, now: () => t0,
       effects: { observe: (...args) => ({ ...observe(...args), open: false }) } });
-    expect(readTimeoutHold({ ...e, dir })).toEqual({ status: 'refused', reason: 'retry-outcome-pending' });
-    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true, pendingSince: expect.any(String) });
+    expect(readTimeoutHold({ ...e, dir, now: () => t0 })).toEqual({ status: 'refused', reason: 'timeout-retry-needs-human',
+      why: `PR #${e.pr}: timeout retry needs your decision — timeout-state-retired:pr-closed; no further rerun or heal is safe` });
+    expect(readTimeoutBudget({ ...e, dir })).toEqual({ confirmed: 0, rejected: 0, pending: true,
+      pendingSince: new Date(t0).toISOString(), retired: true, reason: 'timeout-state-retired:pr-closed' });
   }));
   it('confirms the last closed-PR observation and still retries owed filing after retirement', async () => harness(async (dir) => {
     const e = evidence(); await reservePending(dir, e);
