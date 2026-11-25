@@ -5,6 +5,10 @@
  *   shelled — `reconcile` and `provider` are injected, mirroring `ci-heal-pr-dispatch.test.mjs`'s own shape.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fixDispatchClaimRoot, fixDispatchResource } from '../../conveyor/fix-claim-store.mjs';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
 import { runReconcilePromoteDraftDispatch, defaultNoCodeRearm, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
 
 const FRESH = () => ({ fresh: true, behind: 0 });
@@ -716,6 +720,30 @@ Fix defect`);
     expect(readClaim).toHaveBeenCalledWith({ repo: 'we', pr: 42 });
     expect(s.postComment).not.toHaveBeenCalled();
     expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['fix', 'ci-heal'])('a dispatched %s claim refuses with zero writes', kind => {
+    if (!process.env.TMPDIR) throw Error('This fixture requires the task TMPDIR');
+    const root = mkdtempSync(join(process.env.TMPDIR, 'rearm-claims-'));
+    const previousRoot = process.env.WE_COORDINATION_ROOT;
+    process.env.WE_COORDINATION_ROOT = root;
+    try {
+      const dir = lockDirFor(fixDispatchClaimRoot(), fixDispatchResource({ repo: 'we', pr: 42, kind }));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'lock.json'), JSON.stringify({
+        owner: 'dispatched-session', heartbeatAt: new Date().toISOString(),
+        meta: { repo: 'we', pr: 42, kind },
+      }));
+      const s = setup({ readClaim: undefined });
+      const result = s.run();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-claimed' }));
+      expect(result.dispatched).toEqual([]);
+      expect(s.postComment).not.toHaveBeenCalled();
+      expect(s.rearm).not.toHaveBeenCalled();
+    } finally {
+      if (previousRoot === undefined) delete process.env.WE_COORDINATION_ROOT;
+      else process.env.WE_COORDINATION_ROOT = previousRoot;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
   it.each(['outsider', 'unknown', 'unreadable', 'missing'])('receipt author %s refuses without spawning or spending the ruling', mode => {
     const posted = [];

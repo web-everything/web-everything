@@ -79,7 +79,7 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
-import { readLiveFixClaim, readLiveDrainClaim } from '../conveyor/fix-procedure.mjs';
+import { readLiveDrainClaim } from '../conveyor/fix-procedure.mjs';
 import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT, parseNoCodeRearmReceipt } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
@@ -292,7 +292,7 @@ export function runReconcilePromoteDraftDispatch({
   })) }),
   postComment = ({ repoSlug, prNumber, comment }) => createGhProvider().postComment(repoSlug, prNumber, comment),
   rearm = defaultNoCodeRearm,
-  readClaim = readLiveFixClaim,
+  readClaim = readLiveDrainClaim,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
@@ -515,9 +515,7 @@ export function runReconcilePromoteDraftDispatch({
     }
     try {
       const claim = readClaim({ repo: repoKey, pr: prNumber });
-      // The planner's reader is tolerant of corrupt/missing storage. Reuse the existing
-      // fail-closed store probe before treating its null result as proof of no claim.
-      if (readClaim === readLiveFixClaim && readLiveDrainClaim({ repo: repoKey, pr: prNumber })?.uncertain) {
+      if (claim?.uncertain) {
         throw Error('fix claim store unreadable; operator must inspect the claim store');
       }
       if (claim) {
