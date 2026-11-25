@@ -30,12 +30,6 @@ function fixture(replies, options = {}) {
 function writes(f) { return f.gh.mock.calls.filter(([args]) => args.includes('PUT')); }
 
 describe('update-branch', () => {
-  let resolveOperation;
-  // Load the CLI registry in bounded setup, preserving each test's five-second deadline.
-  beforeAll(async () => {
-    ({ resolveOperation } = await import('../run.mjs'));
-  }, 60_000);
-
   it('refuses a closed PR without comparing or writing and logs the refusal', async () => {
     const f = fixture([{ ...pull, state: 'closed' }]);
     const result = await f.run();
@@ -164,6 +158,12 @@ describe('update-branch', () => {
       expect(result.actor).toBe('filesystem-operator');
     });
   });
+
+  // Cold import of run.mjs loads the whole operations registry; keep it out of the test body's 5000 ms budget.
+  let resolveOperation;
+  beforeAll(async () => {
+    ({ resolveOperation } = await import('../run.mjs'));
+  }, 60000);
 
   it('declares required CLI inputs and prints exactly one JSON line through the engine', async () => {
     const { declaration, registry, finish, sinks } = resolveOperation(UPDATE_BRANCH_OP);
