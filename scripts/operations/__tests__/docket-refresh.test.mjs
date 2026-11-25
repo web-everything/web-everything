@@ -36,6 +36,8 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 import { importGraph } from './import-graph.mjs';
 import { git as realGit, withBareOrigin } from './helpers/real-repo.mjs';
+// Static on purpose: loading the whole operations registry must not count against a test's 5 s timeout.
+import { resolveOperation } from '../run.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-09-21T13:00:00.000Z';
@@ -386,8 +388,7 @@ describe('docket-refresh (real git, real reader and sink)', () => {
     expect(clean(ws.primary)).toBe('');
   }));
 
-  it('is registered on the command line under its name', async () => {
-    const { resolveOperation } = await import('../run.mjs');
+  it('is registered on the command line under its name', () => {
     expect(resolveOperation(DOCKET_REFRESH_OP).declaration.name).toBe(DOCKET_REFRESH_OP);
   });
 });

@@ -6,6 +6,8 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+// Static on purpose: loading the whole operations registry must not count against a test's 5 s timeout.
+import { resolveOperation } from '../run.mjs';
 
 const repo = 'web-everything/web-everything';
 const head = 'a'.repeat(40), base = 'b'.repeat(40), newHead = 'c'.repeat(40);
@@ -160,7 +162,6 @@ describe('update-branch', () => {
   });
 
   it('declares required CLI inputs and prints exactly one JSON line through the engine', async () => {
-    const { resolveOperation } = await import('../run.mjs');
     const { declaration, registry, finish, sinks } = resolveOperation(UPDATE_BRANCH_OP);
     expect(declaration.name).toBe(updateBranchOperation().name);
     expect(typeof sinks[UPDATE_BRANCH_OP]).toBe('function');
