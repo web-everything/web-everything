@@ -61,6 +61,8 @@
  * The broad idle-host fallback bypasses this script lookup: direct Vitest plus mandatory direct standards.
  */
 import { hostSaturation } from './verify-ci-only.mjs';
+import { repoKeyForSlug, DEFAULT_REPO_KEY } from './constellation-repos.mjs';
+import { canonicalRepoSlug } from './lane-alternates.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings.mjs';
 
 import { createHash } from 'node:crypto';
@@ -445,6 +447,17 @@ export function resolvePushDefaultGate(options, resolveGate = resolveDefaultGate
   }
 }
 
+/** True only when `origin` resolves to a known constellation repo other than WE (plateau-app, frontierui). */
+function isKnownSiblingCheckout(runGit) {
+  try {
+    // Share origin normalization (transport, case, .git and trailing slashes) with lane identity checks.
+    const slug = canonicalRepoSlug(String(runGit(['remote', 'get-url', 'origin'])));
+    // Only GitHub constellation origins qualify; local paths and lookalikes keep mandatory standards.
+    const key = slug?.startsWith('github.com/') ? repoKeyForSlug(slug.slice('github.com/'.length)) : null;
+    return key !== null && key !== DEFAULT_REPO_KEY;
+  } catch { return false; }
+}
+
 function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip, saturation }) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
@@ -499,12 +512,22 @@ function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoF
     if (!optOut && host?.saturated === false && host.known === true) {
       // package.json is itself a broad trigger: neither script presence nor its body is trusted here.
       const testCommand = 'npx vitest run';
-      const standardsCommand = 'node scripts/check-standards.mjs';
-      const reason = 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission';
-      return { command: `${testCommand} && ${standardsCommand}`, testCommand, standardsCommand, scanCommands: [],
+      // Sibling repos (plateau-app, frontierui) do not contain WE's check-standards script: when the caller can
+      // tell the file is absent, use the checkout's own `check:standards` script, else skip with a logged reason.
+      // Callers that cannot tell (no fileExists) keep the WE-shaped mandatory command.
+      // Fail closed: only a checkout whose origin is a KNOWN non-WE constellation repo may skip or substitute;
+      // WE, unknown or unreadable identity keeps the mandatory WE command (a deleted validator then fails loudly).
+      const knownSibling = isKnownSiblingCheckout(runGit);
+      const hasWeStandards = !knownSibling || typeof fileExists !== 'function' || fileExists('scripts/check-standards.mjs');
+      const ownScript = !hasWeStandards && scripts != null && [...scripts].includes('check:standards');
+      const standardsCommand = hasWeStandards ? 'node scripts/check-standards.mjs' : ownScript ? 'npm run check:standards' : null;
+      const reason = standardsCommand
+        ? 'broad selection on an unsaturated host — full suite plus mandatory unscoped standards through heavy admission'
+        : 'broad selection on an unsaturated host — full suite; standards step SKIPPED: this checkout has no scripts/check-standards.mjs and no check:standards script';
+      return { command: standardsCommand ? `${testCommand} && ${standardsCommand}` : testCommand, testCommand, standardsCommand, scanCommands: [],
         gateReasons: [reason], decision: {
           ...local, reasons: [...local.reasons, reason], changedFiles, settingsSource, relatedMode,
-          standards: { ...standards, run: true, scoped: false, reason },
+          standards: { ...standards, run: Boolean(standardsCommand), scoped: false, reason },
         } };
     }
     return blocked([
