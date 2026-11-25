@@ -1926,12 +1926,17 @@ function readDispatchLogReason(entry, logRoot) {
   try {
     const path = join(logRoot, '.operations', 'delivery-dispatch-logs', `prepare-item-${normNum(num)}.log`);
     if (!existsSync(path)) return null;
+    // The log is shared by every attempt on the card: a line written before this attempt started is another
+    // attempt's, so it never counts when the attempt's start is known and the file was not touched since.
+    const startedMs = Date.parse(entry.startedAt ?? entry.payload?.startedAt ?? '');
+    if (Number.isFinite(startedMs) && statSync(path).mtimeMs < startedMs) return null;
     for (const line of readFileSync(path, 'utf8').split('\n').reverse()) {
       let row;
       try { row = JSON.parse(line); } catch { continue; }
       if (!row || typeof row !== 'object') continue;
-      const reason = row.detail ?? row.error ?? row.reason ?? row.outcome ?? null;
-      return reason ? String(reason) : null;
+      // Only the dispatch wrapper's terminal shape counts: a string outcome plus a string detail. Any other JSON
+      // diagnostic is not terminal evidence.
+      return typeof row.outcome === 'string' && typeof row.detail === 'string' && row.detail ? row.detail : null;
     }
   } catch { /* an unreadable log leaves the evidence as it was */ }
   return null;

@@ -602,3 +602,20 @@ describe('cliPrepareFailureEvidence for a pid: handle', () => {
     } finally { rmSync(logRoot, { recursive: true, force: true }); }
   });
 });
+
+describe('cliPrepareFailureEvidence dispatch-log guards', () => {
+  it('ignores a stale log from before the attempt and JSON that is not the terminal shape', async () => {
+    const { cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs');
+    const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-guard-'));
+    try {
+      const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
+      execFileSync('mkdir', ['-p', logs]);
+      const file = join(logs, 'prepare-item-7001.log');
+      writeFileSync(file, '{"outcome":"escalated-needs-human","detail":"old transient error"}\n');
+      const entry = { handle: 'pid:1', payload: { num: '7001' }, startedAt: new Date(Date.now() + 3_600_000).toISOString() };
+      expect(cliPrepareFailureEvidence(entry, { logRoot }).error).toBeNull();
+      writeFileSync(file, '{"detail":"diagnostic only"}\n{"note":"x","error":"not terminal"}\n');
+      expect(cliPrepareFailureEvidence({ handle: 'pid:1', payload: { num: '7001' } }, { logRoot }).error).toBeNull();
+    } finally { rmSync(logRoot, { recursive: true, force: true }); }
+  });
+});
