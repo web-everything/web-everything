@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { URL as NodeURL, fileURLToPath } from 'node:url';
 import * as watcher from '../actions-policy-watch.mjs';
 import { evaluatePolicy, evaluateChangelog, runWatch, parseFeed, fetchFeedText, ghReadArgs } from '../actions-policy-watch.mjs';
 
@@ -211,7 +211,7 @@ describe('actions-policy-watch production regressions', () => {
   });
   it('the executable entrypoint preserves a nonzero main exit code without invoking gh', () => {
     const child = spawnSync(process.execPath,
-      [fileURLToPath(new URL('../actions-policy-watch.mjs', import.meta.url)), '--org=../invalid'],
+      [fileURLToPath(new NodeURL('../actions-policy-watch.mjs', import.meta.url)), '--org=../invalid'],
       { encoding: 'utf8', timeout: 5_000 });
     expect(child.status).toBe(1);
     expect(child.stderr).toMatch(/needs-you:.*invalid organization/);
