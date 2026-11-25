@@ -4467,6 +4467,7 @@ describe('xu1nixv — the red-main fix PR is first, never a waiting draft, never
 
 
 describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
+  const now = Date.parse('2026-10-09T19:20:00Z');
   const head = 'c'.repeat(40);
   const repo = 'o/r';
   const url = (run, job) => `https://github.com/${repo}/actions/runs/${run}/job/${job}`;
@@ -4481,7 +4482,7 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
     ],
     timeoutRetry: retry, timeoutRetryBudget: { confirmed: 0, pending: false }, ...extra });
   const plan = (extra = {}) => planReconcile({ prs: [pr(extra)], agents: [], durableCounts: {},
-    now: Date.parse('2026-10-09T19:20:00Z'), requiredChecks: ['test', 'soak-replay-gate'] });
+    now, requiredChecks: ['test', 'soak-replay-gate'] });
 
   it('dispatches one mechanical blocked-cancelled rerun capped at two per head', () => {
     const result = plan();
@@ -4500,9 +4501,18 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
   });
 
   it('refuses another rerun while one is in flight', () => {
-    const result = plan({ timeoutRetryBudget: { pending: true } });
+    const result = plan({ timeoutRetryBudget: { pending: true, pendingSince: new Date(now - 60_000).toISOString() } });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight', prNumber: 4651 }));
+  });
+
+  it('escalates an unstamped pending request instead of holding it in flight', () => {
+    const result = plan({ timeoutRetryBudget: { pending: true } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 4651,
+      why: expect.stringContaining('without a usable timestamp') }));
+    expect(result.refusals.some(r => r.kind === 'ci-timeout-rerun-in-flight')).toBe(false);
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
 
   it('owes nothing when the same green-by-completedAt PR is CLEAN', () => {
