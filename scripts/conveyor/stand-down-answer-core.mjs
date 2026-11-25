@@ -1,6 +1,6 @@
 /** Operator ceremony record for we:scripts/conveyor/stand-down-answer.mjs. Pure readers. */
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
-import { standDownComments, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
+import { standDownComments, standDownHead, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
 import { rearmWindow, REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER } from './rearm-review.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 
@@ -236,10 +236,13 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   const held = why => result('held', why, answerId);
   if (!/^[\w=-]+$/.test(answerId) || /[\r\n]/.test(answerId)) return held('answer id unreadable');
   if (typeof headRefOid !== 'string' || headRefOid.length !== 40 || !/^[a-f0-9]{40}$/i.test(headRefOid)) return held('head unreadable');
+  const ruledHead = standDownHead(comments[namedStandDownIndex(comments, answerAt, answer)].body);
+  if (ruledHead && ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return held('stand-down head differs from current head');
   if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
   if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
   if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
   if (!rearmWindow(comments.slice(0, answerAt)).wouldHonour(answer)) return held('answer does not clear the rearm window');
+  if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
   const after = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
   if (after.some(c => /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
     || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) return held('fix claim or changes verdict after answer');

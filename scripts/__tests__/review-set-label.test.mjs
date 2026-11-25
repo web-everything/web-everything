@@ -5113,14 +5113,22 @@ describe('new-head rearm merge clearance', () => {
 });
 
 describe('generic label readback observation', () => {
-  it.each([true, false])('labelsObserved is present only on successful readLabels: %s', observed => {
+  it.each([
+    ['strings', ['review:pending'], true],
+    ['named labels', [{ name: 'review:pending' }], true],
+    ['read failure', null, false],
+    ['missing name', ['review:pending', {}], false],
+    ['null entry', ['review:pending', null], false],
+    ['numeric name', ['review:pending', { name: 7 }], false],
+  ])('labelsObserved requires a complete string label readback: %s', (_name, readback, observed) => {
     const chunks = [];
     const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(Error('exit'), { exitCode: code }); });
     try {
-      try { runReviewLabelCliRaw({ argv: ['42', '--repo=o/n'], fixedTo: 'rearm', defaultActor: 'test', usage: 'test', buildComment: () => 'rearm', successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: line => chunks.push(line), provider: { readPrState: () => ({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: ['review:changes'], comments: [] }), setLabels: () => {}, postComment: () => {}, readLabels: () => { if (!observed) throw Error('readback unavailable'); return ['review:pending']; } } }); } catch (e) { expect(e.exitCode).toBe(0); }
+      try { runReviewLabelCliRaw({ argv: ['42', '--repo=o/n'], fixedTo: 'rearm', defaultActor: 'test', usage: 'test', buildComment: () => 'rearm', successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: line => chunks.push(line), provider: { readPrState: () => ({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: ['review:changes'], comments: [] }), setLabels: () => {}, postComment: () => {}, readLabels: () => { if (readback === null) throw Error('readback unavailable'); return readback; } } }); } catch (e) { expect(e.exitCode).toBe(0); }
     } finally { exit.mockRestore(); }
     const result = JSON.parse(chunks.join(''));
-    expect(result).toMatchObject({ ok: true, labels: ['review:pending'] });
+    expect(result.ok).toBe(true);
+    if (observed || readback === null) expect(result.labels).toEqual(['review:pending']);
     if (observed) expect(result.labelsObserved).toBe(true);
     else expect(result).not.toHaveProperty('labelsObserved');
   });

@@ -696,8 +696,7 @@ describe('operator no-code rearm executor', () => {
 **Branch:** \`lane/x\` at \`${head}\``);
   const verdict = c('verdict', `🔁 review — changes requested
 
-Fix defect
-<!-- reviewed-sha: ${head} -->`);
+Fix defect`);
   const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }));
   const answer = c('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }));
   const thread = () => [verdict, begin, stop, answer];
@@ -781,7 +780,7 @@ Fix defect
   it('101st-comment answer executes once over two ticks; tick 3 resumes ordinary review', () => {
     const comments = [...Array.from({ length: 97 }, (_, i) => c(`f${i}`, 'filler')), ...thread()];
     let labels = ['review:changes'];
-    const plan = () => planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ number: 42, state: 'OPEN', headRefName: 'lane/test', headRefOid: head, labels, comments, commentsComplete: true, mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }] }] });
+    const plan = () => planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ number: 42, state: 'OPEN', headRefName: 'lane/test', headRefOid: head, rowsHead: head, rowsComplete: true, labels, comments, commentsComplete: true, mergeStateStatus: 'CLEAN', statusCheckRollup: ['gate', 'standards', 'test-shard (1)'].map(name => ({ name, status: 'completed', conclusion: 'success' })) }] });
     const s = setup({ reconcile: plan, readThread: (number, opts) => readCompletePrComments(number, { ...opts, gh: args => {
         if (args[1] === 'graphql') return { data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } };
         const page = Number(/page=(\d+)$/.exec(args[1])[1]);
@@ -794,6 +793,7 @@ Fix defect
     expect([...first.dispatched, ...second.dispatched].map(d => d.kind)).toEqual(['rearm-no-code']);
     expect(s.options.postComment).toHaveBeenCalledTimes(1);
     expect(s.options.rearm).toHaveBeenCalledTimes(1);
+    expect(third.dispatch.length).toBeGreaterThan(0);
     expect(third.dispatch.every(d => d.kind === 'review')).toBe(true);
   });
   it('head-of-list promote failure still runs restore-review-label and rearm-no-code', () => {

@@ -35,6 +35,17 @@ describe('no-code rearm predicate', () => {
     ['ineligible window', { comments: [stop, answer] }],
     ['poster is not operator', { comments: [...comments.slice(0, -1), { ...answer, author: { login: 'outsider' } }] }],
   ])('holds when %s', (_, over) => expect(predicate(over).state).toBe('held'));
+  it('holds when an unanswered terminal stand-down follows the operator answer', () => {
+    const newer = c('newer', buildStandDownComment({ reason: 'needs-judgment', detail: 'A new question' }));
+    expect(predicate({ comments: [...comments, newer] })).toMatchObject({ state: 'held', answerId: 'answer' });
+  });
+  it.each([[HEAD, 'ready'], ['b'.repeat(40), 'held']])('binds the ruling to stand-down head %s: %s', (head, state) => {
+    const pinned = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head }));
+    expect(predicate({ comments: [verdict, begin, pinned, answer] }).state).toBe(state);
+  });
+  it('keeps an unheaded stand-down eligible after the head moves', () => {
+    expect(predicate({ headRefOid: 'b'.repeat(40) }).state).toBe('ready');
+  });
   it.each([REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER])('legacy marker spends ruling: %s', marker => expect(predicate({ comments: [...comments, c('legacy', marker)] }).state).toBe('spent'));
   it('trusted receipt spends the answer even if the head moved', () => expect(predicate({ headRefOid: 'b'.repeat(40), comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))] }).state).toBe('spent'));
   it('untrusted receipt is ignored', () => expect(predicate({ comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD), 'outsider')] }).state).toBe('ready'));

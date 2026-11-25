@@ -2480,8 +2480,9 @@ export function runReviewLabelCli({
         || decision.removeLabels.some(l => newLabels.includes(l))) throw new Error('label transition was not observed');
     } catch (e) { fail(`missing review handoff could not be verified: ${e.message}`, 1); }
   } else try {
-    newLabels = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean);
-    labelsObserved = true;
+    const readback = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name));
+    newLabels = readback.filter(Boolean);
+    labelsObserved = readback.every(l => typeof l === 'string');
   } catch {
     const names = (Array.isArray(currentLabels) ? currentLabels : [])
       .map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean)
