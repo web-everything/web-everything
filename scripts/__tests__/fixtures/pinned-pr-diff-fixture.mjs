@@ -3,6 +3,19 @@ import { createHash } from 'node:crypto';
 /** Give descriptive fixture heads the full commit identity required by pinned reads. */
 export const fixtureOid = value => createHash('sha1').update(value).digest('hex');
 
+/** Forge shim response for the same PR files used by the pinned Git fixture. Self-contained for executable shims. */
+export function comparePrDiffFixture(pr) {
+  return {
+    status: 'ahead', merge_base_commit: { sha: 'b'.repeat(40) }, base_commit: { sha: 'b'.repeat(40) },
+    files: pr.files.map(f => ({
+      filename: f.path, status: f.changeType.toLowerCase(), additions: f.additions, deletions: f.deletions,
+      changes: f.additions + f.deletions,
+      patch: '@@ -' + (f.deletions ? '1,' + f.deletions : '0,0') + ' +' + (f.additions ? '1,' + f.additions : '0,0') + ' @@\n'
+        + '-previous fixture line\n'.repeat(f.deletions) + '+updated fixture line\n'.repeat(f.additions),
+    })),
+  };
+}
+
 /** Git shim fragment; `diffPrs` contains {headRefName, headRefOid, files} rows. */
 export const pinnedPrDiffFixture = String.raw`
 const gitArgs = a.slice();

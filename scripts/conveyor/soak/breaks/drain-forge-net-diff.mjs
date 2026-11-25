@@ -1,6 +1,6 @@
 /** Non-local net-diff admission must use fresh forge evidence in the real drain CLI. */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +29,7 @@ function probe(root = ROOT) {
     const sha = 'a'.repeat(40), mb = 'b'.repeat(40);
     for (const fail of [false, true]) {
       writeFileSync(log, '');
+      rmSync(fixture + '.queued', { force: true });
       writeFileSync(fixture, JSON.stringify({ number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
         headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
         labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], files: [{ path: 'README.md', changeType: 'MODIFIED' }],
@@ -47,12 +48,14 @@ function probe(root = ROOT) {
       });
       if (r.status !== 0) { violations.push(`CLI failed (${fail}): ${r.error?.message ?? r.stderr}`); continue; }
       const report = JSON.parse(r.stdout), calls = readFileSync(log, 'utf8');
+      // The hermetic gh shim writes this receipt only after queue admission succeeds.
+      const delivered = existsSync(fixture + '.queued') || calls.includes('"pr","merge"');
       if (fail) {
         if (!report.parked?.some(p => p.humanRequired && p.reasons?.some(s => s.includes('net diff unverified (forge-api-http-500); ')))) violations.push('500 did not produce the named human hold');
-        if (calls.includes('enqueuePullRequest') || calls.includes('"pr","merge"')) violations.push('500 attempted delivery');
+        if (delivered) violations.push('500 attempted delivery');
       } else {
         if (!r.stderr.includes(`net-diff #42: base=${mb} head=${sha} (forge)`)) violations.push(`clean compare not scored via forge: ${r.stderr} ${r.stdout}`);
-        if (!calls.includes('enqueuePullRequest') && !calls.includes('"pr","merge"')) violations.push('clean compare did not attempt delivery');
+        if (!delivered) violations.push('clean compare did not attempt delivery');
       }
     }
   } finally { rmSync(dir, { recursive: true, force: true }); }

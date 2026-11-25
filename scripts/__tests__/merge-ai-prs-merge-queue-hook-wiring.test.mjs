@@ -12,12 +12,25 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
-import { fixtureOid, pinnedPrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
+import { fixtureOid, pinnedPrDiffFixture, comparePrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
+import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
+import { OWNER_INSTALLATIONS, installationCachePath } from '../lib/github-app-installations.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const TIMEOUT_SCALE = 3; // Allow extra time for CLI subprocesses on loaded shards.
 const NOW = Date.now();
 const iso = (minAgo) => new Date(NOW - minAgo * 60_000).toISOString();
+
+function mqAppEnv(dir) {
+  const env = daemonAppEnv(dir);
+  // Pinned safety reads scrub installation overrides; seed the canonical owner routes as well.
+  const cachePath = defaultCachePath(dir);
+  const cached = JSON.parse(readFileSync(cachePath, 'utf8'));
+  for (const installationId of Object.values(OWNER_INSTALLATIONS)) {
+    writeFileSync(installationCachePath(cachePath, installationId), JSON.stringify({ ...cached, installationId }));
+  }
+  return env;
+}
 
 const fakeGh = `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -26,7 +39,8 @@ const a = process.argv.slice(2);
 const F = process.env.MQ_FIXTURE;
 const prs = JSON.parse(fs.readFileSync(F, 'utf8'));
 const landed = n => fs.existsSync(F + '.merged-' + n);
-const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const comparePrDiffFixture = ${comparePrDiffFixture};
 const completeCheckReadFixture = ${completeCheckReadFixture};
 const checkPages = completeCheckReadFixture(prs, a);
 if (checkPages !== undefined) out(checkPages);
@@ -81,6 +95,11 @@ if (a[0] === 'api') {
       protection: { required_status_checks: { contexts: ['smoke'] } } });
   }
   let m;
+  if ((m = /compare\\/main\\.\\.\\.([0-9a-f]{40})(?:\\?|$)/.exec(path))) {
+    const p = prs.find(p => p.headRefOid === m[1]);
+    if (!p) process.exit(1);
+    out(comparePrDiffFixture(p));
+  }
   if ((m = /commits\\/([0-9a-f]{40})\\/check-runs/.exec(path))) {
     const p = prs.find(p => p.headRefOid === m[1]);
     out([{ check_runs: [{ id: 7, name: 'test', head_sha: m[1], status: 'completed', conclusion: 'success',
@@ -111,9 +130,9 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
-    // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
-    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
+    // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
+    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code.replace('\n', '\nprocess.env.MQ_FIXTURE = ' + JSON.stringify(fixture) + ';\n'), { mode: 0o755 });
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : fixtureOid(`sha-${number}`);
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
     const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
@@ -146,7 +165,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     const mainFixFile = join(dir, 'main-red-priority.json');
     if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], firstRedSha: 'red', reason: 'owns the red-main fix', setAt: NOW, expiresAt: NOW + 3_600_000 }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
-    const appEnv = daemonAppEnv(dir);
+    const appEnv = mqAppEnv(dir);
     if (capabilityOff) appEnv.WE_GITHUB_APP_INSTALLATIONS = JSON.stringify({
       ...JSON.parse(appEnv.WE_GITHUB_APP_INSTALLATIONS), longshoreai: appEnv.WE_GITHUB_APP_INSTALLATION_ID,
     });
@@ -314,7 +333,8 @@ const ri = a.indexOf('--repo');
 const slugOf = () => (ri >= 0 ? a[ri + 1] : process.env.GH_REPO || db.local);
 const prsOf = (slug) => db.repos[slug] || [];
 const mark = (slug, n) => F + '.merged-' + slug.replace(/\\//g, '_') + '-' + n;
-const out = x => { fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\\n\\n'); fs.writeSync(1, JSON.stringify(x)); process.exit(0); };
+const comparePrDiffFixture = ${comparePrDiffFixture};
 const completeCheckReadFixture = ${completeCheckReadFixture};
 const checkPages = completeCheckReadFixture(prsOf((a.find(v => v.startsWith('repos/')) || '').split('/').slice(1, 3).join('/')), a);
 if (checkPages !== undefined) out(checkPages);
@@ -339,9 +359,14 @@ if (a[0] === 'pr' && a[1] === 'view') {
 if (a[0] === 'pr' && a[1] === 'merge') { const s = slugOf(); fs.appendFileSync(F + '.attempts', s + '#' + a[2] + '\\n'); fs.writeFileSync(mark(s, a[2]), ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
 if (a[0] === 'api') {
-  const path = a[1];
+  const path = a.find(v => v.startsWith('repos/')) || a[1];
   fs.appendFileSync(F + '.api', path + '\\n');
   let m;
+  if ((m = /repos\\/(.+?)\\/compare\\/main\\.\\.\\.([0-9a-f]{40})(?:\\?|$)/.exec(path))) {
+    const p = prsOf(m[1]).find(p => p.headRefOid === m[2]);
+    if (!p) process.exit(1);
+    out(comparePrDiffFixture(p));
+  }
   if ((m = /repos\\/(.+?)\\/commits\\/([0-9a-f]+)\\/check-runs/.exec(path))) {
     const p = prsOf(m[1]).find(p => p.headRefOid === m[2]);
     // the Nth read of this head's pass sees the Nth age in passAtSeq (the last one repeats): a pass that ages out mid-pass
@@ -369,11 +394,13 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
   try {
     const cwd = join(dir, 'local');
     mkdirSync(cwd);
-    // The hardened scorer needs a clone for each member; all Git IO still uses the shims.
+    // Sibling clones serve rebase plumbing; net-diff admission uses the forge shim.
     for (const name of ['frontierui', 'plateau-app']) mkdirSync(join(dir, name, '.git'), { recursive: true });
     const bin = join(dir, 'bin');
     mkdirSync(bin);
-    for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
+    const fixture = join(dir, 'prs.json');
+    // Safety reads intentionally scrub MQ_*; keep fixture routing inside the executable shims.
+    for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code.replace('\n', '\nprocess.env.MQ_FIXTURE = ' + JSON.stringify(fixture) + ';\n'), { mode: 0o755 });
     const manifest = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' },
       ...(secondImplPassAges ? [{ repo: 'plateau-app', ref: 'lane/xcarr01-pa' }] : [])], blockedBy: [], stackParents: [] };
     const body = `A real summary.\n\n<!-- lane-manifest:begin -->\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n<!-- lane-manifest:end -->\n`;
@@ -389,7 +416,6 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
       files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }], ...extra,
     });
-    const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify({ local: LOCAL, repos: {
       [LOCAL]: [pr(4001, 'lane/xcarr01-we', carrierPassAges, { body, ...accepted(4001) })],
       [FUI]: [pr(501, 'lane/xcarr01-fui', implPassAges)],
@@ -402,7 +428,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd, encoding: 'utf8', timeout: COUPLE_RUN_TIMEOUT_MS,
-      env: { ...process.env, ...daemonAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
+      env: { ...process.env, ...mqAppEnv(dir), WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: 'off', PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord,
         // Carrier pre-check and impl revalidation each retry; keep their real reads, omit production waits.
         WE_DRAIN_MERGEABLE_UNKNOWN_REPOLL_SEC: '0', ...extraEnv },
     });
@@ -423,8 +449,10 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
   }, COUPLE_TEST_TIMEOUT_MS);
 
   it('both halves fresh: the impl half lands, then its carrier (control — the gate does not block a healthy couple)', () => {
-    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
+    const { attempts, stderr, api } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
     expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
+    expect(api).toContain(`repos/${FUI}/compare/main...${String(501).padStart(40, 'a')}?per_page=100&page=1`);
+    expect(stderr).toMatch(/net-diff #501: base=[0-9a-f]{40} head=[0-9a-f]{40} \(forge\)/);
   }, COUPLE_TEST_TIMEOUT_MS);
 
   it('the carrier pass ages out between the pre-check and its own turn: the couple still lands together, never split', () => {
