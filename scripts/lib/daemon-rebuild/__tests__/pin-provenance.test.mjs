@@ -28,9 +28,10 @@ function fixture(pinnedFrom = pin) {
     adopt: { finalSha: 'target', inputsKey: 'inputs', mainSha: main, applied: [{ ref, pr: 42, sha, pinnedFrom }] } };
   writeFileSync(readyCandidatePath(root, env), JSON.stringify(ready));
   // All history proofs succeed, isolating the independent audit membership requirement.
-  const run = vi.fn(args => ({ status: 0, stdout: args[0] === 'log'
+  const run = vi.fn(args => args[0] === 'merge-base' ? { status: 1, stdout: '' } : ({ status: 0, stdout: args[0] === 'log'
     ? `${main} ${sha}\t${REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL}\tdaemon-rebuild: merge overlay ${ref} (PR #42) onto main\n`
     : args.includes('HEAD') ? head : typeof pinnedFrom === 'string' ? pinnedFrom : pin }));
+  // The tip is unrelated to the pin by default; ancestry must be proven, never assumed.
   return { root, env, ready, run };
 }
 

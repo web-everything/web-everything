@@ -234,7 +234,8 @@ export function assertReadyCandidatePins(root, r, env = process.env, read = read
     try { registry = JSON.parse(read(overlayFilePath(root, env), 'utf8')); }
     catch (error) { if (error.code !== 'ENOENT') throw error; registry = { overlays: [] }; }
     if (!Array.isArray(registry?.overlays)) throw new Error('Invalid ready pin registry');
-    const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0' },
+    const git = args => run(args, { cwd: root, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: '0',
+        GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' },
       encoding: 'utf8', timeout: 60_000, maxBuffer: 8 * 1024 * 1024, killSignal: 'SIGKILL' });
     const head = verifyRev(git, 'HEAD');
     if (!head) throw new Error('Unreadable ready pin head');
@@ -261,8 +262,16 @@ export function assertReadyCandidatePins(root, r, env = process.env, read = read
       // Audit the applied SHA; pinnedFrom is the held tip, proved by registration below.
       if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.sha) !== true) throw new StaleReadyPinError('Unaudited ready pin');
       const registration = registry.overlays?.find(o => o.ref === pin.ref);
-      if (!registration || (registration.pr ?? null) !== (pin.pr ?? null)
-        || verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`) !== pin.pinnedFrom) throw new StaleReadyPinError('Unproven ready pin registration');
+      // A pin means pin: the build applies pin.sha, so a branch that only fast-forwarded past the held tip
+      // keeps the proof. Ancestry is re-derived from git (never from labels); a force-push or any git error stays stale.
+      const tip = verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`);
+      const ancestor = (a, b) => {
+        try { return git(['merge-base', '--is-ancestor', a, b]).status === 0; } catch { return false; }
+      };
+      if (!registration || (registration.pr ?? null) !== (pin.pr ?? null) || !tip
+        || (tip !== pin.pinnedFrom && !(ancestor(pin.pinnedFrom, tip) && ancestor(pin.sha, tip)))) {
+        throw new StaleReadyPinError('Unproven ready pin registration');
+      }
       const recorded = String(history.stdout).split('\n').find(line => {
         const [parents, committer, subject] = line.split('\t');
         const hit = subject?.match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
