@@ -4,8 +4,8 @@
   "repos": [
     {
       "name": "web-everything",
-      "slug": "chalbert/web-everything",
-      "aliases": ["web-everything/web-everything"],
+      "slug": "web-everything/web-everything",
+      "aliases": ["chalbert/web-everything"],
       "ownerPath": "webeverything",
       "daemons": ["review", "fix", "build", "verify", "drain"],
       "mergePath": "merge-queue drain",
@@ -22,8 +22,8 @@
     },
     {
       "name": "frontierui",
-      "slug": "chalbert/frontierui",
-      "aliases": [],
+      "slug": "frontier-ui/frontierui",
+      "aliases": ["chalbert/frontierui"],
       "ownerPath": "frontierui",
       "daemons": [],
       "mergePath": "normal PR",
