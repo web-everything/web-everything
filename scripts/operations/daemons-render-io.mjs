@@ -69,8 +69,9 @@ export function readInstalled(label, { home = process.env.HOME, exec = execFileS
     // Only a genuinely absent path is "not installed"; EACCES, dangling symlinks etc. stay unreadable evidence.
     let absent = false;
     try { lstatSync(path); } catch (statError) { absent = statError.code === 'ENOENT'; }
-    if (absent) throw Object.assign(new Error('plist not installed'), { code: 'ENOENT' });
-    throw error;
+    if (absent) throw Object.assign(new Error('plist not installed'), { code: 'PLIST_NOT_INSTALLED' });
+    // Foreign ENOENT codes can mean plutil failed to spawn, rather than a missing plist.
+    throw new Error('installed plist unreadable', { cause: error });
   }
 }
 
@@ -100,7 +101,7 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
       try {
         const installed = installedReader(task.label, { home: checkHome });
         if (installed === null || typeof installed !== 'object' || Array.isArray(installed)) unreadable.push(task);
-      } catch (error) { (error.code === 'ENOENT' ? notInstalled : unreadable).push(task); }
+      } catch (error) { (error.code === 'PLIST_NOT_INSTALLED' ? notInstalled : unreadable).push(task); }
     }
     for (const task of notInstalled) log(`not installed: ${terminal(task.label)}${task.manifestPass ? ` (pass ${terminal(task.manifestPass)})` : ''}`);
     for (const task of unreadable) log(`installed evidence unreadable: ${terminal(task.label)}`);
@@ -123,7 +124,7 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
         const differences = diffPlists(file.xml, installedReader(file.label, { home }));
         log(`${terminal(file.file)}: differences: ${differences.map(terminal).join(', ') || 'none'}`);
       } catch (error) {
-        if (error.code === 'ENOENT') {
+        if (error.code === 'PLIST_NOT_INSTALLED') {
           const repo = (DAEMON_MANIFEST[file.manifestPass]?.args ?? []).find(arg => arg.startsWith('--repo='));
           log(`${terminal(file.file)}: not installed: would create${repo ? ` (scoped to ${terminal(repo.slice(7))})` : ''}`);
           notInstalled += 1;
