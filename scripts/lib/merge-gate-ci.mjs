@@ -36,6 +36,7 @@ import { classifyPr, buildDrainVerdicts, drainGateInputs, isCodeQLFailed } from 
 import { formatPrResult } from './merge-gate-verdict.mjs';
 export { formatPrResult } from './merge-gate-verdict.mjs';
 import { DRAIN_GATES } from './merge-gate-inventory.mjs';
+import { VERDICT_STATUSES } from './merge-gate-verdict.mjs';
 import { placementOf, PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
 import { proveHumanClearanceCarry } from './human-clearance-carry.mjs';
@@ -475,18 +476,42 @@ function loadGateSetting(key, envName, { env = process.env, platformPath = PLATF
  */
 export const SHADOW_ADVISORY_IDS = Object.freeze(['red-main-freeze']);
 
+const isObj = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+
+/**
+ * Structural validity of a child report, checked in EVERY mode and for ok:true as well as ok:false. Returns the
+ * first problem, or null. Invalid means the verdict cannot be trusted: workflowCheck not ok, no PRs, a PR entry
+ * that is not an object or lacks a boolean ok / a results array, a row that is not an object or has an unknown
+ * status, any DRAIN_GATES id missing from a PR's rows, a PR whose ok disagrees with its blocking rows, or an
+ * overall ok that disagrees with its PRs. Pure.
+ */
+export function reportProblem(report) {
+  if (!isObj(report) || typeof report.ok !== 'boolean' || !Array.isArray(report.prs)) return 'report is not well-formed';
+  if (report.workflowCheck?.ok !== true) return 'workflowCheck is not ok';
+  if (!report.prs.length) return 'no PR results';
+  for (const p of report.prs) {
+    if (!isObj(p)) return 'a PR entry is not an object';
+    if (typeof p.ok !== 'boolean' || !Array.isArray(p.results)) return `PR #${p.num}: ok/results missing`;
+    if (p.results.some((x) => !isObj(x) || typeof x.id !== 'string' || !VERDICT_STATUSES.includes(x.status))) return `PR #${p.num}: a row is malformed or has an unknown status`;
+    const ids = new Set(p.results.map((x) => x.id));
+    const missing = DRAIN_GATES.filter((g) => !ids.has(g.id)).map((g) => g.id);
+    if (missing.length) return `PR #${p.num}: gate result(s) missing: ${missing.join(', ')}`;
+    if (p.ok !== !p.results.some((x) => BLOCKING.has(x.status))) return `PR #${p.num}: ok disagrees with its rows`;
+  }
+  if (report.ok && !report.prs.every((p) => p.ok)) return 'overall ok disagrees with its PRs';
+  return null;
+}
+
 /**
  * True only when EVERY reason the report fails is an allow-listed advisory row. Fails closed on an empty or stripped
  * report, a failed workflow self-check, a group/membership failure (those change `reason` away from the PR-derived
  * one), a verdict that disagrees with its rows, or any blocking row outside the allow-list. Pure.
  */
 function shadowMaskable(report) {
-  if (report.workflowCheck?.ok !== true || !report.prs.length) return false;
+  if (reportProblem(report)) return false;
   let blockingRows = 0;
   for (const p of report.prs) {
-    if (typeof p?.ok !== 'boolean' || !Array.isArray(p.results) || !p.results.length) return false;
-    const blocking = p.results.filter((x) => BLOCKING.has(x?.status));
-    if (p.ok !== (blocking.length === 0)) return false;
+    const blocking = p.results.filter((x) => BLOCKING.has(x.status));
     if (blocking.some((x) => !SHADOW_ADVISORY_IDS.includes(x.id))) return false;
     blockingRows += blocking.length;
   }
@@ -510,10 +535,13 @@ export function applyGateMode({ mode, source, childStatus, report }) {
     const line = `merge-gate: no verdict (exit ${childStatus}, ${wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
     return { exitCode, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
   }
-  const fmt = (p) => { try { return formatPrResult(p); } catch { return `#${p?.num}: unreadable PR result`; } };
-  const rowsOf = (p) => (Array.isArray(p?.results) ? p.results : []);
-  const table = [...report.prs.map(fmt), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
-  const holds = [...new Set(report.prs.flatMap((p) => rowsOf(p).filter((x) => BLOCKING.has(x?.status)).map((x) => x?.id)))];
+  const problem = reportProblem(report);
+  if (problem) {
+    const line = `merge-gate: invalid report (${problem}) — not masked in any mode; failing closed`;
+    return { exitCode: 1, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
+  }
+  const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
+  const holds = [...new Set(report.prs.flatMap((p) => p.results.filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
   const masked = !report.ok && mode === 'shadow' && shadowMaskable(report);
   const shadowLine = masked ? `SHADOW: would HOLD on ${holds.join(', ')}` : null;
   const exitCode = report.ok || masked ? 0 : 1;

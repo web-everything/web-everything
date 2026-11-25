@@ -1428,12 +1428,55 @@ describe('applyGateMode changes only the exit code', () => {
   const shadowExit = (rep) => applyGateMode({ mode: 'shadow', source: 'repo', childStatus: 1, report: rep }).exitCode;
   const row = (id, status = 'hold') => ({ id, status, reason: 'x' });
   const pr = (rows, num = 1) => ({ num, ok: !rows.some((x) => ['hold', 'fail-closed'].includes(x.status)), results: rows, blocking: [] });
+  // The full DRAIN_GATES inventory, every row passing, with per-id status overrides.
+  const full = (over = {}) => DRAIN_GATES.map((g) => row(g.id, over[g.id] ?? 'pass'));
   const rep = (prs, extra = {}) => ({ ok: false, reason: 'held', workflowCheck: { ok: true }, prs, ...extra });
 
   it('shadow still masks the allow-listed advisory failure (red-main-freeze), and only that', () => {
-    expect(shadowExit(rep([pr([row('red-main-freeze', 'fail-closed')])]))).toBe(0);
-    expect(shadowExit(rep([pr([row('red-main-freeze', 'hold')])]))).toBe(0);
+    expect(shadowExit(rep([pr(full({ 'red-main-freeze': 'fail-closed' }))]))).toBe(0);
+    expect(shadowExit(rep([pr(full({ 'red-main-freeze': 'hold' }))]))).toBe(0);
     expect(shadowExit(rep([held]))).toBe(0);
+  });
+
+  // Round 3 fix list (operator ruling 2026-11-24), one negative per item.
+  it('(1) shadow fails a report that omits any DRAIN_GATES id, even with only red-main present', () => {
+    expect(shadowExit(rep([pr([row('red-main-freeze')])]))).toBe(1);
+    for (const g of DRAIN_GATES) {
+      const rows = full({ 'red-main-freeze': 'hold' }).filter((x) => x.id !== g.id);
+      expect(shadowExit(rep([pr(rows)])), g.id).toBe(1);
+    }
+  });
+
+  it('(2) a non-object row or an unknown status is a blocker (never masked, never a pass)', () => {
+    for (const bad of [null, 'x', 7, [], { id: 'review-acceptance', status: 'HOLD' }, { id: 'review-acceptance', status: 'bogus' }, { id: 'review-acceptance' }, { status: 'hold' }]) {
+      const rows = [...full({ 'red-main-freeze': 'hold' }).filter((x) => x.id !== 'review-acceptance'), bad];
+      expect(shadowExit(rep([{ num: 1, ok: false, results: rows }])), JSON.stringify(bad)).toBe(1);
+      const okRows = [...full().filter((x) => x.id !== 'review-acceptance'), bad];
+      expect(applyGateMode({ mode: 'shadow', source: 'repo', childStatus: 0, report: { ok: true, reason: 'all pass', workflowCheck: { ok: true }, prs: [{ num: 1, ok: true, results: okRows }] } }).exitCode, JSON.stringify(bad)).toBe(1);
+    }
+    expect(shadowExit(rep([pr([...full({ 'red-main-freeze': 'hold' }), null])]))).toBe(1);
+  });
+
+  it('(3) a null or non-object entry in prs is a failure, never a display fallback', () => {
+    for (const bad of [null, undefined, 'x', 3, []]) {
+      expect(shadowExit(rep([held, bad]))).toBe(1);
+      expect(applyGateMode({ mode: 'shadow', source: 'repo', childStatus: 0, report: { ok: true, reason: 'all pass', workflowCheck: { ok: true }, prs: [bad] } }).exitCode, String(bad)).toBe(1);
+      expect(applyGateMode({ mode: 'enforce', source: 'repo', childStatus: 0, report: { ok: true, reason: 'all pass', workflowCheck: { ok: true }, prs: [passing, bad] } }).exitCode, String(bad)).toBe(1);
+    }
+  });
+
+  it('(4) ok:true is validated too: workflowCheck, per-PR consistency, empty prs, all modes', () => {
+    const okRep = (extra = {}, prs = [passing]) => ({ ok: true, reason: 'all pass', workflowCheck: { ok: true }, prs, ...extra });
+    for (const mode of ['shadow', 'enforce']) {
+      const run = (rp) => applyGateMode({ mode, source: 'repo', childStatus: 0, report: rp }).exitCode;
+      expect(run(okRep()), mode).toBe(0);
+      expect(run(okRep({ workflowCheck: { ok: false, reason: 'x' } })), mode).toBe(1);
+      expect(run(okRep({ workflowCheck: undefined })), mode).toBe(1);
+      expect(run(okRep({}, [pr(full({ 'review-acceptance': 'hold' }))])), mode).toBe(1);
+      expect(run(okRep({}, [{ ...passing, ok: false }])), mode).toBe(1);
+      expect(run(okRep({}, [{ ...held, ok: true }])), mode).toBe(1);
+      expect(run(okRep({}, [])), mode).toBe(1);
+    }
   });
 
   it('shadow mode keeps a human-only workflow-edit hold failing (real evaluatePrGates)', () => {
