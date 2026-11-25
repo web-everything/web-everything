@@ -264,3 +264,32 @@ describe('DRAIN-LIST-DELTA round 3', () => {
     expect(second.stats.candidates).toBe(1);
   });
 });
+
+describe('DRAIN-LIST-DELTA round 4: direct hydrator callers', () => {
+  const row1 = { number: 1, updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' };
+  const exec = () => JSON.stringify({ body: 'fresh', files: [] });
+  const entry = (extra = {}) => ({ body: 'old', files: [], stamps: {
+    body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
+    files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } }, ...extra });
+  it('both hydrators throw on a missing isCandidate in delta mode', async () => {
+    const { hydrateHeavyFields, hydrateHeavyFieldsAsync } = await import('../pr-list-paged.mjs');
+    expect(() => hydrateHeavyFields({ repo, rows: [row1], exec, fields: ['body', 'files'], delta: { backstopMs: 1e6 } }))
+      .toThrow(/isCandidate/);
+    await expect(hydrateHeavyFieldsAsync({ repo, rows: [row1], execAsync: async () => ({ stdout: exec() }),
+      fields: ['body', 'files'], delta: { backstopMs: 1e6 } })).rejects.toThrow(/isCandidate/);
+  });
+  it('delta hydration honours maxAgeMs as an upper bound over a longer backstop', async () => {
+    const { hydrateHeavyFields } = await import('../pr-list-paged.mjs');
+    const out = hydrateHeavyFields({ repo, rows: [row1], exec, fields: ['body', 'files'], nowMs: 1000 + 700_000, maxAgeMs: 600_000,
+      cache: { 1: entry() }, delta: { isCandidate: () => false, backstopMs: 3_600_000 } });
+    expect(out.fetched).toBe(1);
+    expect(out.rows[0].body).toBe('fresh');
+  });
+  it('an invalid cached value (stamped body null) is re-read, not reused', async () => {
+    const { hydrateHeavyFields } = await import('../pr-list-paged.mjs');
+    const out = hydrateHeavyFields({ repo, rows: [row1], exec, fields: ['body', 'files'], nowMs: 2000,
+      cache: { 1: entry({ body: null }) }, delta: { isCandidate: () => false, backstopMs: 3_600_000 } });
+    expect(out.rows[0].body).toBe('fresh');
+    expect(out.stats.byReason.new).toBe(1);
+  });
+});

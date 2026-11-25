@@ -43,7 +43,7 @@ export const heavyValueValid = (field, value) => field === 'body' ? typeof value
 export function heavyFieldReason(entry, row, field, { nowMs, backstopMs, candidate }) {
   if (candidate) return 'candidate';
   const stamp = entry?.stamps?.[field];
-  if (!stamp || !Object.hasOwn(entry, field) || !HEAVY_VALIDATORS[field]) return 'new';
+  if (!stamp || !Object.hasOwn(entry, field) || !HEAVY_VALIDATORS[field] || !heavyValueValid(field, entry[field])) return 'new';
   for (const key of HEAVY_VALIDATORS[field]) {
     if (row[key] == null || row[key] === '' || stamp[key] !== row[key]) return VALIDATOR_REASON[key];
   }
@@ -53,8 +53,19 @@ export function heavyFieldReason(entry, row, field, { nowMs, backstopMs, candida
 }
 const stampFor = (field, row, nowMs) => ({ fetchedAtMs: nowMs,
   ...Object.fromEntries((HEAVY_VALIDATORS[field] || []).map(key => [key, row[key]])) });
+/** Throws unless the delta options are usable: a predicate (never defaulting to false) and, when an age bound
+ *  is given, an effective backstop no longer than it. Every delta entry point goes through this. */
+function normalizeDelta(delta, nowMs, maxAgeMs) {
+  if (typeof delta?.isCandidate !== 'function') {
+    throw new TypeError('delta hydration requires an isCandidate predicate (it never defaults to false)');
+  }
+  const bound = Number.isFinite(delta.maxAgeMs) ? delta.maxAgeMs : maxAgeMs;
+  const backstopMs = Number.isFinite(delta.backstopMs) && Number.isFinite(bound) ? Math.min(delta.backstopMs, bound)
+    : delta.backstopMs;
+  return { ...delta, backstopMs, nowMs };
+}
 function staleFields(entry, row, fields, delta) {
-  const candidate = !!delta.isCandidate?.(row);
+  const candidate = !!delta.isCandidate(row);
   const reasons = {};
   for (const field of fields) {
     const reason = heavyFieldReason(entry, row, field, { nowMs: delta.nowMs, backstopMs: delta.backstopMs, candidate });
@@ -356,7 +367,7 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
 /** SYNC: return new rows and a cache containing only PRs still in the current list. */
 export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.now(), maxAgeMs,
   fields = HEAVY_FIELDS, execOpts = {}, delta }) {
-  if (delta) return hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta });
+  if (delta) return hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta: normalizeDelta(delta, nowMs, maxAgeMs) });
   const nextCache = {};
   let fetched = 0, reused = 0;
   const hydrated = rows.map(row => {
@@ -378,7 +389,7 @@ export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.
 /** SYNC delta hydration: each row re-reads only the fields whose own validator changed (candidates re-read all).
  *  The cache is written only after a successful read; a failed read throws unreadable. Gate fields never enter it. */
 function hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta }) {
-  const d = { ...delta, nowMs };
+  const d = delta; // already normalized by hydrateHeavyFields
   const nextCache = {};
   const stats = { fetched: 0, reused: 0, candidates: 0, byReason: { new: 0, head: 0, base: 0, updatedAt: 0, backstop: 0, candidate: 0 } };
   const hydrated = rows.map(row => {
@@ -406,7 +417,7 @@ function hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta 
  * throwing so a retry cannot overlap outstanding reads. The sync hydrator owns validation/cache rules. */
 export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {}, nowMs = Date.now(), maxAgeMs,
   fields = HEAVY_FIELDS, execOpts = {}, delta }) {
-  const d = delta && { ...delta, nowMs };
+  const d = delta && normalizeDelta(delta, nowMs, maxAgeMs);
   const fieldsOf = row => d ? staleFields(cache[row.number], row, fields, d).fields : fields;
   const pending = d ? rows.filter(row => fieldsOf(row).length) : rows.filter(row => !heavyIsFresh(cache[row.number], row, { nowMs, maxAgeMs }));
   const reads = await mapWithConcurrency(pending, 6, async row => {
