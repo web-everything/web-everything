@@ -92,6 +92,12 @@ import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, 
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
 import { execFileSyncThrottled, runGhSync } from '../lib/gh-throttle.mjs';
 import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
+import { isSmokeSentinelPr } from '../lib/smoke-real-worker.mjs';
+
+/** Old daemon smoke runners set this marker even when empty. Reads only; never authorizes a launch. */
+export function isSmokeDryRunPr(pr, env = process.env) {
+  return isSmokeSentinelPr(pr) && env.WE_SMOKE_DRYRUN_ONLY !== undefined;
+}
 
 /**
  * PUSH-GATE-S4 — the live hold read at the spawn site. Reads labels and state fresh (no memo), right before a
@@ -100,7 +106,7 @@ import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
  * Hermetic under a test runner unless a test injects its own reader.
  */
 export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
-  if (hermetic) return null;
+  if (hermetic || isSmokeDryRunPr(pr)) return null;
   const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
@@ -1574,7 +1580,7 @@ export function dispatchFix(planned, {
   // #3850 — re-grant trust after a trust refusal (the scratch ROOT, via `grantDispatchTrust`); a test stubs it.
   healTrust = (d) => grantDispatchTrust(d),
   // fix procedure — injectable live fix-claim read (`fix-procedure.mjs#readLiveFixClaim`); a test stubs it.
-  readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
+  readFixClaim = ({ repo: r, pr }) => isSmokeDryRunPr(pr) ? null : readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
   // The ruling-not-addressed send-back's durable notice (once per head). Injectable so a test posts nothing.
   postNotice = postRulingNotice,
   // advisor trial (#x331b7u) — the per-run sampling decision and its ledger row; a test stubs both.
@@ -1584,7 +1590,7 @@ export function dispatchFix(planned, {
   // marker post (the one-per-PR/head bound). All injectable so a test reads and posts nothing.
   fixSettings = resolveFixSettings(),
   // Hermetic under a test runner: a test that wants history injects its own reader.
-  readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
+  readHistoryInputs = ({ repo: r, pr }) => ((isUnderTestEnv() || isSmokeDryRunPr(pr)) ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
   // Card xrbu1bp — the fixer ladder, read only when a round reaches `fix.strongerModelFromRound`.
   loadLadder = () => loadFixerLadder(),

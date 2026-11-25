@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold,fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -3193,5 +3193,39 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     expect(dispatch).not.toHaveBeenCalled();
     expect(readPushHold).not.toHaveBeenCalled();
     expect(result.dispatched).toEqual([]);
+  });
+});
+
+
+describe('candidate-side old smoke read isolation', () => {
+  it.each(['', 'reconcile-fix-pass'])('sentinel PR + smoke marker %j skips the live hold read, gh never called', marker => {
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', marker);
+    const run = vi.fn(() => { throw Error('must not call gh'); });
+    try {
+      expect(isSmokeDryRunPr(900002)).toBe(true);
+      expect(readLivePushHold({ repo: 'we', pr: 900002 }, { run, hermetic: false })).toBeNull();
+      expect(run).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('sentinel PR without the marker still reads live and refuses unreadable evidence', () => {
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', '');
+    delete process.env.WE_SMOKE_DRYRUN_ONLY;
+    const run = vi.fn(() => JSON.stringify({}));
+    try {
+      expect(isSmokeDryRunPr(900002)).toBe(false);
+      expect(readLivePushHold({ repo: 'we', pr: 900002 }, { run, hermetic: false }))
+        .toMatchObject({ code: 'unreadable' });
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('a smoke marker never exempts a non-sentinel PR or a near-match', () => {
+    for (const pr of [1764, 90000, 9000000, '900002x']) expect(isSmokeDryRunPr(pr, { WE_SMOKE_DRYRUN_ONLY: '' })).toBe(false);
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', '');
+    const run = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }));
+    try {
+      expect(readLivePushHold({ repo: 'we', pr: 1764 }, { run, hermetic: false }))
+        .toEqual({ code: 'hold-label', reason: 'review:human' });
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
   });
 });
