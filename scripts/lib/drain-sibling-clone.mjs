@@ -22,6 +22,7 @@ import { join, resolve } from 'node:path';
 /** Do not retry a failed clone for this long (ms). */
 export const CLONE_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 const CLONE_TIMEOUT_MS = 5 * 60 * 1000;
+const POOL_SIBLINGS = ['frontierui', 'plateau-app'];
 const failures = new Map();
 
 /**
@@ -48,6 +49,9 @@ export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = 
   // (no suite may reach the network by accident).
   const mode = env.WE_DRAIN_SIBLING_CLONE;
   if (mode === 'off' || (env.VITEST && mode !== 'on')) return null;
+  // Only provision into a real lane-pool root: one that already holds ANOTHER constellation sibling clone. A scratch
+  // or temp parent (a test fixture, a one-off checkout) is never a drain pool, and must never trigger a network clone.
+  if (!POOL_SIBLINGS.some((s) => s !== name && exists(join(parentDir, s, '.git')))) return null;
   const key = `${dir}\0${slug}`;
   const failedAt = failures.get(key);
   if (failedAt !== undefined && now() - failedAt < CLONE_RETRY_COOLDOWN_MS) return null;

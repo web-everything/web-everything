@@ -52,12 +52,14 @@ describe('siblingCloneUrl', () => {
   });
 });
 
+const poolHas = (p) => p === '/x/pool/plateau-app/.git'; // a pool root that already holds another sibling clone
+
 describe('ensureSiblingClone fails closed', () => {
   beforeEach(() => resetSiblingCloneFailures());
   const base = { slug: 'o/frontierui', name: 'frontierui', parentDir: '/x/pool', localOrigin: 'git@github.com:o/we.git' };
   it('an unreadable remote yields null and is not retried inside the cooldown', () => {
     let calls = 0; let t = 1000;
-    const o = { ...base, exists: () => false, exec: () => { calls++; throw new Error('auth'); }, now: () => t };
+    const o = { ...base, exists: poolHas, exec: () => { calls++; throw new Error('auth'); }, now: () => t };
     expect(ensureSiblingClone(o)).toBeNull();
     expect(ensureSiblingClone(o)).toBeNull();
     expect(calls).toBe(1);
@@ -67,15 +69,20 @@ describe('ensureSiblingClone fails closed', () => {
   });
   it('no derivable url, or a squatting non-clone directory, never runs git and never clobbers', () => {
     let calls = 0;
-    expect(ensureSiblingClone({ ...base, localOrigin: null, exists: () => false, exec: () => { calls++; } })).toBeNull();
-    expect(ensureSiblingClone({ ...base, exists: (p) => !p.endsWith('.git'), exec: () => { calls++; } })).toBeNull();
+    expect(ensureSiblingClone({ ...base, localOrigin: null, exists: poolHas, exec: () => { calls++; } })).toBeNull();
+    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || p === "/x/pool/frontierui", exec: () => { calls++; } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('provisioning is off when disabled, and off under a test runner unless explicit', () => {
     let calls = 0;
-    const o = { ...base, exists: () => false, exec: () => { calls++; } };
+    const o = { ...base, exists: poolHas, exec: () => { calls++; } };
     expect(ensureSiblingClone({ ...o, env: { WE_DRAIN_SIBLING_CLONE: 'off' } })).toBeNull();
     expect(ensureSiblingClone({ ...o, env: { VITEST: 'true' } })).toBeNull();
+    expect(calls).toBe(0);
+  });
+  it('a parent that is not a lane pool (no other sibling clone) never triggers a clone', () => {
+    let calls = 0;
+    expect(ensureSiblingClone({ ...base, exists: () => false, exec: () => { calls++; } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('an existing clone is used as is', () => {
@@ -90,7 +97,7 @@ describe('the provisioned clone makes the drain read the diff (real git)', () =>
   function readThroughProvisionedClone(prFiles) {
     const { root, origin, head } = makeOrigin(prFiles);
     const pool = join(root, 'pool');
-    mkdirSync(pool);
+    mkdirSync(join(pool, 'plateau-app', '.git'), { recursive: true }); // a real pool root already holds a sibling
     // `localOrigin` points the derived url at the on-disk origin: <root>/<x>/<y> → <root>/origin
     const dir = ensureSiblingClone({ slug: 'owner/origin', name: 'frontierui', parentDir: pool, localOrigin: `file://${root}/owner/we` , exec: (cmd, args, opts) => {
       const i = args.findIndex((a) => a.startsWith('file://'));

@@ -16,10 +16,10 @@ function scenario(root) {
   const code = `const m = await import(${JSON.stringify(pathToFileURL(file).href)});
     const calls = [];
     const ok = m.ensureSiblingClone({ slug: 'o/frontierui', name: 'frontierui', parentDir: '/pool', localOrigin: 'git@github.com:o/we.git',
-      exists: (p) => p.endsWith('.git') ? calls.length > 0 : false, rename: () => {}, exec: (c, a) => { calls.push(a); } });
+      exists: (p) => /plateau-app\/\.git$/.test(p) || (p.endsWith('frontierui/.git') && calls.length > 0), rename: () => {}, exec: (c, a) => { calls.push(a); } });
     m.resetSiblingCloneFailures();
     const bad = m.ensureSiblingClone({ slug: 'o/frontierui', name: 'frontierui', parentDir: '/pool', localOrigin: 'git@github.com:o/we.git',
-      exists: () => false, exec: () => { throw new Error('auth'); } });
+      exists: (p) => /plateau-app\/\.git$/.test(p), exec: () => { throw new Error('auth'); } });
     const a = calls[0] || [];
     process.stdout.write(JSON.stringify({ ok, bad, blobless: a.includes('--filter=blob:none') && a.includes('--no-checkout'), url: a.find((x) => /frontierui/.test(x)) }));`;
   return execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, WE_DRAIN_SIBLING_CLONE: 'on' } }).trim();
