@@ -29,6 +29,50 @@ export const HEAVY_FIELDS = Object.freeze(['comments', 'body', 'files']);
 export const PAGED_LIGHT_FIELDS = Object.freeze(['number', 'title', 'url', 'isDraft', 'createdAt', 'updatedAt', 'headRefName',
   'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus', 'reviewDecision', 'labels', 'statusCheckRollup']);
 export const PR_LIST_PAGING_DEFAULTS = Object.freeze({ pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600 });
+/** SHIP-API-004: each heavy field is valid while ITS validators still equal the live page row (equality only, never order).
+ *  `files` changes only with head/base; `body` and `comments` can change under the same head, so updatedAt validates them. */
+export const HEAVY_VALIDATORS = Object.freeze({ files: Object.freeze(['headRefOid', 'baseRefName', 'baseRefOid']),
+  body: Object.freeze(['updatedAt', 'headRefOid']), comments: Object.freeze(['updatedAt', 'headRefOid']) });
+const VALIDATOR_REASON = Object.freeze({ headRefOid: 'head', baseRefName: 'base', baseRefOid: 'base', updatedAt: 'updatedAt' });
+/** PURE: the same shape check readHeavy applies, shared with seeded values. */
+export const heavyValueValid = (field, value) => field === 'body' ? typeof value === 'string'
+  : (field === 'files' || field === 'comments') ? Array.isArray(value) : true;
+
+/** PURE: why a cached field must be re-read, or null while it is valid. Delta mode only. `backstopMs` has no code
+ *  default: absent (null/undefined) re-reads (SHIP-API-006/-017). Candidates ignore the cache entirely. */
+export function heavyFieldReason(entry, row, field, { nowMs, backstopMs, candidate }) {
+  if (candidate) return 'candidate';
+  const stamp = entry?.stamps?.[field];
+  if (!stamp || !Object.hasOwn(entry, field) || !HEAVY_VALIDATORS[field] || !heavyValueValid(field, entry[field])) return 'new';
+  for (const key of HEAVY_VALIDATORS[field]) {
+    if (row[key] == null || row[key] === '' || stamp[key] !== row[key]) return VALIDATOR_REASON[key];
+  }
+  const age = nowMs - stamp.fetchedAtMs;
+  if (!Number.isFinite(backstopMs) || !(age >= 0 && age < backstopMs)) return 'backstop';
+  return null;
+}
+const stampFor = (field, row, nowMs) => ({ fetchedAtMs: nowMs,
+  ...Object.fromEntries((HEAVY_VALIDATORS[field] || []).map(key => [key, row[key]])) });
+/** Throws unless the delta options are usable: a predicate (never defaulting to false) and, when an age bound
+ *  is given, an effective backstop no longer than it. Every delta entry point goes through this. */
+function normalizeDelta(delta, nowMs, maxAgeMs) {
+  if (typeof delta?.isCandidate !== 'function') {
+    throw new TypeError('delta hydration requires an isCandidate predicate (it never defaults to false)');
+  }
+  const bound = Number.isFinite(delta.maxAgeMs) ? delta.maxAgeMs : maxAgeMs;
+  const backstopMs = Number.isFinite(delta.backstopMs) && Number.isFinite(bound) ? Math.min(delta.backstopMs, bound)
+    : delta.backstopMs;
+  return { ...delta, backstopMs, nowMs };
+}
+function staleFields(entry, row, fields, delta) {
+  const candidate = !!delta.isCandidate(row);
+  const reasons = {};
+  for (const field of fields) {
+    const reason = heavyFieldReason(entry, row, field, { nowMs: delta.nowMs, backstopMs: delta.backstopMs, candidate });
+    if (reason) reasons[field] = reason;
+  }
+  return { fields: fields.filter(field => reasons[field]), reasons, candidate };
+}
 export const PR_LIST_PAGE_SIZE_ENV = 'WE_PR_LIST_PAGE_SIZE';
 
 const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -62,7 +106,8 @@ export function resolvePrListPaging({ env = process.env, file } = {}) {
       env, standard: PR_LIST_PAGING_DEFAULTS, envValues: { pageSize },
       valid: { pageSize: n => Number.isInteger(n) && n >= 1 && n <= 100,
         pageRetries: n => Number.isInteger(n) && n >= 0 && n <= 3,
-        heavyMaxAgeSeconds: n => Number.isInteger(n) && n >= 0 && n <= 86400 },
+        heavyMaxAgeSeconds: n => Number.isInteger(n) && n >= 0 && n <= 86400,
+        heavyBackstopSeconds: n => Number.isInteger(n) && n >= 0 && n <= 604800 },
     });
     return { ...PR_LIST_PAGING_DEFAULTS, ...c.value, source: c.sources };
   } catch {
@@ -79,7 +124,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null, inventoryOn
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
+  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName baseRefOid isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
   return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{${fields}}}}}`;
 }
 
@@ -236,7 +281,7 @@ export function rollupEvidence(commit) {
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
-    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
+    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, ...(n.baseRefOid !== undefined ? { baseRefOid: n.baseRefOid } : {}), isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
     statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
@@ -309,7 +354,8 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
   try {
     const text = exec('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
     const data = JSON.parse(String(text));
-    if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))) {
+    if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))
+      || fields.some(field => !heavyValueValid(field, data[field]))) {
       throw new Error('missing PR heavy-field data');
     }
     return data;
@@ -320,7 +366,8 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
 
 /** SYNC: return new rows and a cache containing only PRs still in the current list. */
 export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.now(), maxAgeMs,
-  fields = HEAVY_FIELDS, execOpts = {} }) {
+  fields = HEAVY_FIELDS, execOpts = {}, delta }) {
+  if (delta) return hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta: normalizeDelta(delta, nowMs, maxAgeMs) });
   const nextCache = {};
   let fetched = 0, reused = 0;
   const hydrated = rows.map(row => {
@@ -339,13 +386,43 @@ export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.
 }
 
 
+/** SYNC delta hydration: each row re-reads only the fields whose own validator changed (candidates re-read all).
+ *  The cache is written only after a successful read; a failed read throws unreadable. Gate fields never enter it. */
+function hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta }) {
+  const d = delta; // already normalized by hydrateHeavyFields
+  const nextCache = {};
+  const stats = { fetched: 0, reused: 0, candidates: 0, byReason: { new: 0, head: 0, base: 0, updatedAt: 0, backstop: 0, candidate: 0 } };
+  const hydrated = rows.map(row => {
+    const old = cache[row.number];
+    const stale = staleFields(old, row, fields, d);
+    if (stale.candidate) stats.candidates++;
+    let entry = old;
+    if (stale.fields.length) {
+      const data = readHeavy({ repo, row, exec, fields: stale.fields, execOpts });
+      entry = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: nowMs, ...old,
+        stamps: { ...old?.stamps }, ...Object.fromEntries(stale.fields.map(field => [field, data[field]])) };
+      for (const field of stale.fields) {
+        entry.stamps[field] = stampFor(field, row, nowMs);
+        stats.byReason[stale.reasons[field]]++;
+      }
+      stats.fetched++;
+    } else stats.reused++;
+    nextCache[row.number] = entry;
+    return { ...row, ...Object.fromEntries(fields.map(field => [field, entry[field]])) };
+  });
+  return { rows: hydrated, cache: nextCache, fetched: stats.fetched, reused: stats.reused, stats };
+}
+
 /** Async exec follows promisified execFile's { stdout } shape. Join the bounded pool before
  * throwing so a retry cannot overlap outstanding reads. The sync hydrator owns validation/cache rules. */
 export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {}, nowMs = Date.now(), maxAgeMs,
-  fields = HEAVY_FIELDS, execOpts = {} }) {
-  const reads = await mapWithConcurrency(rows.filter(row => !heavyIsFresh(cache[row.number], row, { nowMs, maxAgeMs })), 6, async row => {
+  fields = HEAVY_FIELDS, execOpts = {}, delta }) {
+  const d = delta && normalizeDelta(delta, nowMs, maxAgeMs);
+  const fieldsOf = row => d ? staleFields(cache[row.number], row, fields, d).fields : fields;
+  const pending = d ? rows.filter(row => fieldsOf(row).length) : rows.filter(row => !heavyIsFresh(cache[row.number], row, { nowMs, maxAgeMs }));
+  const reads = await mapWithConcurrency(pending, 6, async row => {
     try {
-      const { stdout } = await execAsync('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
+      const { stdout } = await execAsync('gh', heavyArgs(repo, row, fieldsOf(row)), execOptions(execOpts));
       return { number: row.number, stdout };
     } catch (cause) {
       return { error: new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number, cause }) };
@@ -354,13 +431,13 @@ export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {
   const failed = reads.find(read => read.error);
   if (failed) throw failed.error;
   const byNumber = new Map(reads.map(read => [read.number, read.stdout]));
-  return hydrateHeavyFields({ repo, rows, cache, nowMs, maxAgeMs, fields, execOpts,
+  return hydrateHeavyFields({ repo, rows, cache, nowMs, maxAgeMs, fields, execOpts, delta,
     exec: (_cmd, args) => byNumber.get(Number(args[2])) });
 }
 
 /** Share seed preparation and final row/cache assembly between sync and async hydration. */
 function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => true,
-  cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {} }) {
+  cache = {}, seed = [], nowMs = Date.now(), maxRows = 500, execOpts = {}, delta }) {
   const light = listOpenPrsLightPaged({ repo, exec, pageSize: paging.pageSize,
     pageRetries: paging.pageRetries, maxRows, execOpts });
   if (light.deferred) throw new PrListUnreadableError({ repo, stage: 'page', page: 1,
@@ -370,22 +447,48 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
   const byNumber = new Map(light.rows.map(row => [row.number, row]));
   const maxAgeMs = paging.heavyMaxAgeSeconds * 1000;
   const hasFields = entry => !!entry && heavyFields.every(field => Object.hasOwn(entry, field));
+  if (delta && typeof delta.isCandidate !== 'function') {
+    throw new TypeError('delta hydration requires an isCandidate predicate (it never defaults to false)');
+  }
+  // heavyMaxAgeSeconds stays an upper bound in delta mode; the backstop may only tighten it. No backstop = re-read.
+  const deltaOpts = delta && { isCandidate: delta.isCandidate,
+    backstopMs: Number.isFinite(paging.heavyBackstopSeconds)
+      ? Math.min(paging.heavyBackstopSeconds, Number.isFinite(paging.heavyMaxAgeSeconds) ? paging.heavyMaxAgeSeconds : Infinity) * 1000 : null };
   for (const row of seed) {
     const live = byNumber.get(row.number);
+    if (deltaOpts) {
+      // Seed carries only fields declared in HEAVY_VALIDATORS, and only under the live row's updatedAt + head.
+      if (!live) continue;
+      for (const field of heavyFields) {
+        if (!HEAVY_VALIDATORS[field] || !Object.hasOwn(row, field) || Object.hasOwn(working[row.number] ?? {}, field)) continue;
+        // A seed is usable only with its own real retrieval time, every validator of the field equal to the live
+        // row (and present), and the same shape check readHeavy applies.
+        if (!Number.isFinite(row.heavyFetchedAtMs) || !heavyValueValid(field, row[field])) continue;
+        if (HEAVY_VALIDATORS[field].some(key => live[key] == null || live[key] === '' || row[key] !== live[key])) continue;
+        const entry = working[row.number] = { ...working[row.number], stamps: { ...working[row.number]?.stamps } };
+        entry[field] = row[field];
+        entry.stamps[field] = stampFor(field, live, row.heavyFetchedAtMs);
+      }
+      continue;
+    }
     if (!live || row.updatedAt !== live.updatedAt || row.headRefOid !== live.headRefOid || !hasFields(row)
       || (hasFields(working[row.number]) && heavyIsFresh(working[row.number], live, { nowMs, maxAgeMs }))) continue;
     working[row.number] = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: nowMs,
       ...Object.fromEntries(heavyFields.map(field => [field, row[field]])) };
   }
-  const need = light.rows.filter(needsHeavy);
-  let rows = light.rows, hydrated = 0, reused = 0;
+  const need = deltaOpts ? light.rows : light.rows.filter(needsHeavy);
+  let rows = light.rows, hydrated = 0, reused = 0, stats;
+  let hydrateMs = 0;
   if (heavyFields.length && need.length) {
     // A prior body-only pass cannot supply files; preserve untouched entries for other open rows.
-    for (const row of need) {
+    if (!deltaOpts) for (const row of need) {
       if (!hasFields(working[row.number])) delete working[row.number];
     }
+    const hydrateStart = Date.now();
     const result = yield { repo, rows: need, exec, cache: working, nowMs, maxAgeMs,
-      fields: heavyFields, execOpts };
+      fields: heavyFields, execOpts, delta: deltaOpts };
+    hydrateMs = Date.now() - hydrateStart;
+    stats = result.stats;
     const heavyByNumber = new Map(result.rows.map(row => [row.number, row]));
     rows = light.rows.map(row => heavyByNumber.get(row.number) || row);
     Object.assign(working, result.cache);
@@ -395,7 +498,8 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
   const nextCache = Object.fromEntries(light.rows.filter(row => working[row.number])
     .map(row => [row.number, working[row.number]]));
   return { rows, truncated: light.truncated, totalCount: light.totalCount, pages: light.pages,
-    ms: light.ms, hydrated, reused, cache: nextCache };
+    ms: light.ms, hydrated, reused, cache: nextCache,
+    ...(deltaOpts ? { stats, timing: { lightMs: light.ms, hydrateMs } } : {}) };
 }
 
 /** SYNC: page the live set, then hydrate selected rows; unreadable never means partial or empty. */

@@ -5587,7 +5587,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         let seed = [];
         try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
         const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
-          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+          heavyFields: ['body', 'files'], delta: { isCandidate: operatorSelects }, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
         drainHeavyCacheByRepo.set(repo, listed.cache);
         return resolveListedChecks(repo, listed.rows);
@@ -6068,9 +6068,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
           }
           listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
-            heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+            heavyFields, delta: { isCandidate: operatorSelects }, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
           drainHeavyCacheByRepo.set(repo, listed.cache);
+          if (listed.timing) process.stderr.write(`listing.pages.light=${listed.timing.lightMs}ms listing.pages.hydrate=${listed.timing.hydrateMs}ms hydrate=${JSON.stringify(listed.stats ?? {})}\n`);
         } else if (!slug) {
           // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
           const sized = candidateListLimit(repo);
