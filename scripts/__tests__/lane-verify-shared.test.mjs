@@ -18,6 +18,11 @@ import { isAllowlistedLitterPath } from '../lib/lane-litter.mjs';
 const producerEnv = () => Object.fromEntries(Object.entries(process.env).filter(([name]) =>
   !name.startsWith('GIT_CONFIG') && !['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_COMMON_DIR'].includes(name)));
 
+// Simulate an unconfigured verifier env without re-enabling the runner's system/global
+// filters at the real Git IO boundary. Keep all production hardening pins and local config.
+const producerGit = (command, argv, options) => execFileSync(command, argv, { ...options,
+  env: { ...options.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
+
 const source = readFileSync(join(process.cwd(), 'scripts/verify-lane.mjs'), 'utf8');
 const sharedPath = join(process.cwd(), 'scripts/lib/verify-shared-marker.mjs');
 // On the red run, each guarantee fails explicitly at its missing API, rather than failing test collection.
@@ -66,7 +71,7 @@ function producer(overrides = {}) {
   const context = { ...store, shouldRecordGreen, repoSlugFromRemote, laneGitHardeningEnv, hardenLaneGitArgs,
     isAllowlistedLitterPath, gateCommandsEqual: gate.gateCommandsEqual, verifyPolicyKey: key,
     VERIFIER_AT_START: { sha, scriptsClean: true }, sharedFullPhaseComplete: true,
-    execFileSync, basename, join, REPO: laneA, headSha: sha, GATE: resolved.command, resolvedGate: resolved,
+    execFileSync: producerGit, basename, join, REPO: laneA, headSha: sha, GATE: resolved.command, resolvedGate: resolved,
     resolveBuildDefaultGate: () => resolved, flags: {}, FORCE_LOCAL: false, admissionFallback: false, revertRed: null,
     sharedTestCounts: [1], phaseResults: [{ phase: 'standards', result: { exitCode: 0 } }],
     resolveCoordinationRoot: () => coordRoot, process: { env: producerEnv(), stderr: { write: s => notes.push(s) } },
@@ -76,7 +81,9 @@ function producer(overrides = {}) {
 }
 
 it('a green published in lane A opens the PR from lane B at the same sha and policy key', () => {
-  producer({ process: { env: {}, stderr: { write() {} } } });
+  const publishNotes = [];
+  producer({ process: { env: {}, stderr: { write: s => publishNotes.push(s) } } });
+  expect(publishNotes).toEqual([]);
   const laneB = join(root, 'lane-B');
   git(root, ['clone', '-q', laneA, laneB]);
   git(laneB, ['remote', 'set-url', 'origin', 'https://github.com/example/project.git']);
@@ -87,6 +94,19 @@ it('a green published in lane A opens the PR from lane B at the same sha and pol
     runGit: a => git(laneB, a), readMarker });
   expect(result).toMatchObject({ ok: true, status: 'green', reason: 'verified' });
   expect(logs.join('\n')).toMatch(/sharedFrom.*lane-A.*\d{4}-/);
+});
+
+it.each(['system', 'global'])('producer fixture isolates %s filters while production still refuses them', scope => {
+  const config = join(root, 'host.gitconfig');
+  writeFileSync(config, '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n');
+  const hostOptions = options => ({ ...options, env: { ...options.env, GIT_CONFIG_NOSYSTEM: '0',
+    GIT_CONFIG_SYSTEM: scope === 'system' ? config : '/dev/null',
+    GIT_CONFIG_GLOBAL: scope === 'global' ? config : '/dev/null' } });
+  expect(producer({ execFileSync: (command, argv, options) => execFileSync(command, argv, hostOptions(options)) }))
+    .toMatch(/shared.*skip.*git filter configuration/);
+  expect(store.readSharedGreen(args({ policyKey: key(producerEnv()) }))).toBeNull();
+  expect(producer({ execFileSync: (command, argv, options) => producerGit(command, argv, hostOptions(options)) })).toBe('');
+  expect(store.readSharedGreen(args({ policyKey: key(producerEnv()) }))).toMatchObject({ status: 'green' });
 });
 
 const policyVariations = {
@@ -146,7 +166,7 @@ it.each(['dirty tree', 'assume-unchanged', 'skip-worktree', 'chmod with core.fil
 it('commit check permits only untracked allowlisted lane litter and uses hardened bounded git', () => {
   writeFileSync(join(laneA, '.pr-body.md'), 'litter');
   const calls = [];
-  producer({ execFileSync: (command, argv, options) => { calls.push({ argv, options }); return execFileSync(command, argv, options); } });
+  expect(producer({ execFileSync: (command, argv, options) => { calls.push({ argv, options }); return producerGit(command, argv, options); } })).toBe('');
   expect(store.readSharedGreen(args({ policyKey: key(producerEnv()) }))).toMatchObject({ status: 'green' });
   for (const { options } of calls) {
     expect(options.maxBuffer).toBeGreaterThan(0);
@@ -268,11 +288,11 @@ it.each(['finalGate', 'finalGateStandards'])('policy provenance refuses reuse fo
 const policySource = readFileSync(join(process.cwd(), 'scripts/lib/verify-lane-gate.mjs'), 'utf8');
 const policyStart = policySource.indexOf('const TOOLING_ROOT');
 const policyEnd = policySource.indexOf('/**\n * PR 7008', policyStart);
-function policyProcess({ runGit = (args, cwd) => git(cwd, args), buildPolicy = resolveBuildPolicy } = {}) {
+function policyProcess({ runGit = (args, cwd) => git(cwd, args), buildPolicy = resolveBuildPolicy, initialize = true } = {}) {
   expect(policyStart).toBeGreaterThan(-1);
   expect(policyEnd).toBeGreaterThan(policyStart);
   const functions = policySource.slice(policyStart, policyEnd).replace(/\bexport /g, '').replaceAll('import.meta.url', 'moduleUrl');
-  return runInNewContext(`${functions}\n({verifyPolicyInputs, verifyPolicyKey});`, {
+  return runInNewContext(`${functions}\n${initialize ? 'initializeVerifierIdentity();' : ''}\n({verifyPolicyInputs, verifyPolicyKey, initializeVerifierIdentity});`, {
     moduleUrl: pathToFileURL(join(process.cwd(), 'scripts/lib/verify-lane-gate.mjs')).href,
     fileURLToPath, dirname, join, relative, sep, createHash, laneGitHardeningEnv, hardenLaneGitArgs, resolveBuildPolicy: buildPolicy,
     SIBLING_PATHS: { plugs: '../frontierui/plugs', webtheme: '../frontierui/webtheme' },
@@ -289,6 +309,31 @@ it('standard-sourced full cannot reuse env-sourced full even with identical effe
   expect(isolated.verifyPolicyInputs(env)).toMatchObject({ finalGate: 'full', finalGateStandards: 'always',
     sources: { finalGate: 'env', finalGateStandards: 'env' } });
   expect(isolated.verifyPolicyKey({})).not.toBe(isolated.verifyPolicyKey(env));
+});
+it('policy helper initialization defers Git until explicitly requested, then freezes identity', () => {
+  let calls = 0;
+  const isolated = policyProcess({ initialize: false, runGit: args => {
+    calls += 1;
+    return args.includes('rev-parse') ? 'a'.repeat(40) : '';
+  } });
+  expect(calls).toBe(0);
+  const identity = isolated.initializeVerifierIdentity();
+  expect(identity).toEqual({ sha: 'a'.repeat(40), scriptsClean: true });
+  const capturedCalls = calls;
+  expect(capturedCalls).toBeGreaterThan(0);
+  expect(isolated.initializeVerifierIdentity()).toBe(identity);
+  expect(calls).toBe(capturedCalls);
+  expect(Object.isFrozen(identity)).toBe(true);
+});
+it('entry points freeze verifier identity before repository work and after pr-land validation', () => {
+  const producerCapture = source.indexOf('const VERIFIER_AT_START = initializeVerifierIdentity();');
+  expect(producerCapture).toBeGreaterThan(-1);
+  expect(producerCapture).toBeGreaterThan(source.indexOf('  process.exit(0);'));
+  expect(producerCapture).toBeLessThan(source.indexOf('for (const a of process.argv.slice(2))'));
+  const landSource = readFileSync(join(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+  const capture = landSource.indexOf('  initializeVerifierIdentity();');
+  expect(capture).toBeGreaterThan(landSource.indexOf("reason: 'bad-delegation'"));
+  expect(capture).toBeLessThan(landSource.indexOf("const refSha = tryGit(['rev-parse', SRC])"));
 });
 it('F7 tooling identity is startup HEAD plus scripts cleanliness, independent of later changes', () => {
   let dirty = false, toolingHead = 'a'.repeat(40);
@@ -334,7 +379,7 @@ it.each(['warn', 'enforce'].flatMap(mode => ['skipped', 'unproven', 'flagged'].m
   });
 it.each([null, { mode: 'off', status: 'skipped' }, { mode: 'warn', status: 'clean' }, { mode: 'enforce', status: 'clean' }])
   ('producer records only clean or absent revert-red evidence %j', revertRed => {
-    producer({ revertRed });
+    expect(producer({ revertRed })).toBe('');
     const file = store.sharedMarkerPath(args({ policyKey: key(producerEnv()) }));
     expect(JSON.parse(readFileSync(file, 'utf8')).revertRed).toEqual(revertRed?.mode === 'off' ? null : revertRed);
     expect(store.readSharedGreen(args({ policyKey: key(producerEnv()) }))).toMatchObject({ status: 'green' });
@@ -601,7 +646,7 @@ it('F6 full npm phase appends its own reporter flags and proves all enumerated f
 it('F3 unreadable filter config fails closed and names re-verification', () => {
   const logs = producer({ execFileSync: (command, argv, options) => {
     if (argv.includes('--get-regexp')) throw Object.assign(new Error('unreadable config'), { status: 2 });
-    return execFileSync(command, argv, options);
+    return producerGit(command, argv, options);
   } });
   expect(logs).toMatch(/checks failed.*re-verify/);
   expect(store.readSharedGreen(args({ policyKey: key(producerEnv()) }))).toBeNull();

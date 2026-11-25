@@ -101,8 +101,12 @@ export function captureVerifierIdentity({ root = TOOLING_ROOT, runGit = policyGi
     return Object.freeze({ sha: /^[0-9a-f]{40}$/.test(sha) ? sha : null, scriptsClean });
   } catch { return Object.freeze({ sha: null, scriptsClean: false }); }
 }
-// Captured during module initialization, before CLI parsing, admission or gate execution. Never refreshed.
-export const VERIFIER_AT_START = captureVerifierIdentity();
+// Entry points initialize once before repository work/admission (pr-land validates flags first).
+// Importing policy helpers must not spawn Git (including for a refused CLI invocation).
+let verifierAtStart;
+export function initializeVerifierIdentity() {
+  return verifierAtStart ??= captureVerifierIdentity();
+}
 
 // Exact names only; unknown matching names always enter the digest. Every exception needs a reason.
 export const NON_POLICY_ENV = Object.freeze({
@@ -137,7 +141,7 @@ export function aliasPolicyInputs({ root = TOOLING_ROOT, aliasPaths = Object.val
 }
 
 /** The consumer resolves these inputs itself, never from a producer's marker. Also used in refusal logs. */
-export function verifyPolicyInputs(env = process.env, { root = TOOLING_ROOT, aliasInputs = aliasPolicyInputs({ root }), verifier = VERIFIER_AT_START } = {}) {
+export function verifyPolicyInputs(env = process.env, { root = TOOLING_ROOT, aliasInputs = aliasPolicyInputs({ root }), verifier = initializeVerifierIdentity() } = {}) {
   const { finalGate, finalGateStandards, sources } = resolveBuildPolicy({ env });
   const verify = resolveVerifySettings({ fileConfig: defaultFileConfig, env }).values;
   delete verify.sharedGreenReuse; // Consumer-only switch, evaluated exclusively by readFinishGuardMarker.

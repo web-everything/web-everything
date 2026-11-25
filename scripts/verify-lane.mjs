@@ -103,7 +103,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { publishGreen, executedTestCount, fullPhaseInventory } from './lib/verify-shared-marker.mjs';
-import { verifyPolicyKey, VERIFIER_AT_START } from './lib/verify-lane-gate.mjs';
+import { verifyPolicyKey, initializeVerifierIdentity } from './lib/verify-lane-gate.mjs';
 import { repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { basename } from 'node:path';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, heartbeatOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
@@ -114,6 +114,7 @@ import { startTreeWatchdog } from './lib/tree-watchdog.mjs';
 import { shellQuote, isShardWrapperCommand } from './lib/verify-lane-gate.mjs';
 import { randomBytes } from 'node:crypto';
 import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
+
 const verificationInfrastructureFailure = result => baseInfrastructureFailure(result) ?? remoteInfrastructureFailure(result);
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -135,6 +136,8 @@ Exit: 0 ok, 2 red, 3 usage/refused. Full docs: the header of scripts/verify-lane
 `);
   process.exit(0);
 }
+// Help is side-effect-free; verification freezes identity before parsing, admission or execution.
+const VERIFIER_AT_START = initializeVerifierIdentity();
 for (const a of process.argv.slice(2)) {
   if (a.startsWith('--')) {
     const eq = a.indexOf('=');
@@ -1458,9 +1461,9 @@ const finished = verifyFinishBody(startBody, {
 });
 writeMarker({ ...finished, ...(FORCE_LOCAL ? { local: true } : {}), ranOn: overallRunLocation(ranOnPhases), executedGate: resolvedGate?.command ?? GATE, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
-maybePublishSharedGreen({ status: finished.status, treeHash: finished.treeHash, revertRed });
 // R893 — an infra-failed/unsettled verify (never red) also records the distinct deferred-to-ci marker; red/green clear it.
 try { recordTerminalVerifyOutcome(GIT_DIR, finished); } catch { /* advisory record; never changes the verdict */ }
+maybePublishSharedGreen({ status: finished.status, treeHash: finished.treeHash, revertRed });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 

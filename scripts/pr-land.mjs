@@ -144,7 +144,7 @@ import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — t
 import { ciOnlyDecision, recordCiOnly } from './lib/verify-ci-only.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { readSharedGreen, resolveMarkerWithShared } from './lib/verify-shared-marker.mjs';
-import { verifyPolicyKey, verifyPolicyInputs, verifySetting, verifySettingSource } from './lib/verify-lane-gate.mjs';
+import { verifyPolicyKey, verifyPolicyInputs, verifySetting, verifySettingSource, initializeVerifierIdentity } from './lib/verify-lane-gate.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
@@ -964,6 +964,8 @@ async function runCli() {
 
   const ciOnly = ciOnlyDecision({ verify: flags.verify, mode: PLAN.mode });
   if (ciOnly && !ciOnly.ok) emit({ repo: REPO, merged: false, reason: ciOnly.reason, detail: ciOnly.detail }, 3);
+
+  initializeVerifierIdentity(); // Freeze once before repository work; invalid flags run no Git.
 
   // 1. Resolve the SOURCE commit to publish (the lane clone's HEAD, or an explicit --sha). No local
   //    branch is created (that's guarded) — the lane model pushes `<source>:lane/<n>` straight to origin.
