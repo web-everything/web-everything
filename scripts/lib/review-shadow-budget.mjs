@@ -2,7 +2,7 @@
  * Reservations count starts (including failures/retries), so crashed sessions cannot
  * overspend the cap. No read/modify/write race or lock requiring stale recovery.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { resolveShadowAgreementPath } from './review-shadow-agreement.mjs';
 
 export function shadowBudgetDay(now) {
@@ -18,9 +18,18 @@ export function reserveShadowSession({ dailyCap, now = Date.now(), path = resolv
     for (let slot = 0; slot < dailyCap; slot++) {
       try {
         writeFileSync(`${dir}/${slot}`, `${new Date(now).toISOString()}\n`, { flag: 'wx' });
-        return { allowed: true };
+        return { allowed: true, slot, day: shadowBudgetDay(now) };
       } catch (e) { if (e.code !== 'EEXIST') throw e; }
     }
     return { allowed: false, reason: 'daily cap reached' };
   } catch { return { allowed: false, reason: 'daily cap store unavailable' }; }
+}
+
+/** Free one reserved slot (a known-bad read_file void must not burn the day's cap). Returns false when nothing was freed. */
+export function releaseShadowSession({ slot, day, now = Date.now(), path = resolveShadowAgreementPath() } = {}) {
+  if (!Number.isSafeInteger(slot) || slot < 0) return false;
+  try {
+    unlinkSync(`${path}.sessions/${day ?? shadowBudgetDay(now)}/${slot}`);
+    return true;
+  } catch { return false; }
 }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { reserveShadowSession, shadowBudgetDay } from '../review-shadow-budget.mjs';
+import { releaseShadowSession, reserveShadowSession, shadowBudgetDay } from '../review-shadow-budget.mjs';
 import { resolveReviewSeatSafeguards } from '../review-seat-settings.mjs';
 import { loadReviewSeatSettings, seatProviderDirective } from '../review-seat-provider.mjs';
 import { buildShapePlan } from '../../review-core-cli.mjs';
@@ -153,5 +153,45 @@ describe('daily session cap', () => {
     expect(result.shadow.status).toBe(kind === 'cap' ? 'skipped' : 'failed');
     expect(logs.join(' ')).not.toContain('FALLING BACK');
     if (kind === 'cap') expect(logs.join(' ')).toContain('daily cap reached');
+  });
+});
+
+describe('agy Carbon seat slots (SHADOW-FIX-AGY-CARBON-SEATS)', () => {
+  it('a released reservation frees its slot for the next start', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shadow-slot-'));
+    try {
+      const path = join(dir, 'agree');
+      const first = reserveShadowSession({ dailyCap: 1, now: 1000, path });
+      expect(first.allowed).toBe(true);
+      expect(reserveShadowSession({ dailyCap: 1, now: 1000, path }).allowed).toBe(false);
+      expect(releaseShadowSession({ ...first, now: 1000, path })).toBe(true);
+      expect(reserveShadowSession({ dailyCap: 1, now: 1000, path }).allowed).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  const run = async (status, reasons, release) => {
+    const outcome = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode: 'shadow', model: 'm', dailyCap: 3 } }, {
+      cwd: '.', unwrap: x => x, wrap: value => value,
+      claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
+      reserveSession: () => ({ allowed: true, slot: 0, day: 'd' }), releaseSession: release,
+      agyJuror: async () => { if (status === 'throw') throw new Error('boom'); return { status, reasons }; },
+      appendRow: () => true, log: () => {},
+    });
+    return JSON.stringify(outcome);
+  };
+  it('releases the slot only for a read_file void', async () => {
+    const release = vi.fn();
+    await run('voided', ['read_file (missing or invalid in-lane path) [a.txt]'], release);
+    expect(release).toHaveBeenCalledTimes(1);
+    await run('voided', ['change outside the juror lane'], release);
+    await run('failed', ['killed after 1200000 ms'], release);
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+  it('the live decision is identical with the release on, off and throwing', async () => {
+    const reasons = ['read_file (missing or invalid in-lane path) [a.txt]'];
+    const on = await run('voided', reasons, vi.fn());
+    const off = await run('voided', reasons, undefined);
+    const throwing = await run('voided', reasons, () => { throw new Error('release failed'); });
+    expect(off).toBe(on);
+    expect(throwing).toBe(on);
   });
 });

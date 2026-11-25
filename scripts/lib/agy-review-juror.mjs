@@ -303,19 +303,27 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
     if (name === 'read_file') {
       const laneRoots = lanes.map(canonicalPath).filter(Boolean);
       const seenPaths = new Set();
+      const shown = new Set();
       // Judge each update independently, then their union: no update may omit or change the direct path.
       const invalid = step.updates.some(update => {
         let params = update;
         if (typeof params === 'string') { try { params = JSON.parse(params); } catch { params = null; } }
         const paths = params && typeof params === 'object' && !Array.isArray(params)
           ? Object.entries(params).filter(([key]) => PATH_PARAM_KEY.test(key)).map(([, value]) => value) : [];
-        for (const path of paths) seenPaths.add(path);
+        // Two spellings of one in-lane file (path + file_path) are ONE path: compare canonical locations.
+        for (const path of paths) {
+          const real = typeof path === 'string' && path.trim() && cwd && !path.includes('\0') ? canonicalPath(resolve(cwd, path)) : null;
+          seenPaths.add(real ?? path);
+          if (typeof path === 'string') shown.add(path.length > 120 ? `${path.slice(0, 120)}...` : path);
+        }
         return !cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
           || readsOutside(p, laneRoots, cwd))
           || pathLeaves(params, false).some(p => readsOutside(p, laneRoots, cwd));
       });
       if (invalid || seenPaths.size !== 1) {
-        out.push('read_file (missing or invalid in-lane path)');
+        // Name the offending path(s) so a void can be diagnosed; outside-lane values are not echoed.
+        const named = [...shown].map(p => (cwd && !readsOutside(p, laneRoots, cwd) ? p : '<outside lane>')).slice(0, 4);
+        out.push(`read_file (missing or invalid in-lane path)${named.length ? ` [${named.join(', ')}]` : ''}`);
       }
       continue;
     }
