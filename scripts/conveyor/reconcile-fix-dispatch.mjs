@@ -1942,6 +1942,7 @@ export function runReconcileFixDispatch({
   postQueueCapComment = postNoteComment,
   notifyQueueCapOperator = notifyDesktopChecked,
   landingBlockedState = undefined,
+  notesDryRun = landingNotesDryRun(),
   postLandingHolderComment = postNoteComment,
   notifyLandingHolderOperator = notifyDesktopChecked,
   // #4295 — live in-flight claims the scope-overlap filter reads; injectable so tests never touch the real sidecar.
@@ -2269,7 +2270,7 @@ export function runReconcileFixDispatch({
     catch (error) { console.error(`reconcile-fix-dispatch: landing holder clock write failed: ${String(error.message).split('\n')[0]}`); }
     for (const escalation of scopeFilter.landingEscalations) {
       recordLandingHolderEscalation({ escalation, repo: ghRepoSlug(repoKey), readPrComments,
-        postComment: postLandingHolderComment, notify: notifyLandingHolderOperator });
+        postComment: postLandingHolderComment, notify: notifyLandingHolderOperator, notesDryRun });
     }
   }
   for (const d of scopeFilter.scopeDecisions ?? []) {
@@ -2520,10 +2521,15 @@ export function planQueueCapRefusal({
 }
 
 /** Advisory IO after the scope refusal is decided. Unknown history never posts a duplicate. */
+// Same switch the notes daemon honours: an explicit WE_CONVEYOR_POST_NOTE_COMMENTS=0 is the diagnostic dry-run.
+export function landingNotesDryRun(env = process.env) {
+  return env?.WE_CONVEYOR_POST_NOTE_COMMENTS === '0';
+}
 export function recordLandingHolderEscalation({
   escalation, repo, readPrComments = defaultReadPrComments,
-  postComment = postNoteComment, notify = notifyDesktopChecked,
+  postComment = postNoteComment, notify = notifyDesktopChecked, notesDryRun = landingNotesDryRun(),
 } = {}) {
+  if (notesDryRun) return { dryRun: true };
   try {
     // Without an observed head there is no safe per-head episode identity; retry next pass.
     if (!escalation?.holderHead) return { headUnknown: true };
@@ -2979,7 +2985,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
           const previous = landingBlockedSince.get(`${entry.pr}:${c.pr}`);
           protectedHolds.set(c.id, { pr: entry.pr, holder: c.pr,
             holderHead: state?.headRefOid || c.headRefOid || null,
-            since: Number.isFinite(Date.parse(previous)) ? previous : new Date(now).toISOString(),
+            since: Number.isFinite(Date.parse(previous)) && Date.parse(previous) <= now ? previous : new Date(now).toISOString(),
             failedClosed: Boolean(d.failedClosed) });
           observation = { overlap: true, why: d.why, failedClosed: d.failedClosed, rule: 'waitForLandingHolder' };
         }

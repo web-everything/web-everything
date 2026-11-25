@@ -108,6 +108,11 @@ describe('landing holder aging protection', () => {
     expect(out.landingHolds).toEqual([{ pr: 80, holder: 90, holderHead: 'holder-head', since: age === null ? new Date(NOW).toISOString() : isoAgo(age), failedClosed: false }]);
     expect(out.landingEscalations).toHaveLength(age === 61 ? 1 : 0);
   });
+  it('a future-dated pair clock is clamped to now and never escalates', () => {
+    const out = landingGate({ landingBlockedSince: new Map([['80:90', isoAgo(-100 * 365 * 24 * 60)]]) }, [{ ...oldWaiter, waitingSince: isoAgo(500) }]);
+    expect(out.landingHolds[0].since).toBe(new Date(NOW).toISOString());
+    expect(out.landingEscalations).toEqual([]);
+  });
   it('off keeps holds visible with no escalation', () => {
     const out = landingGate({ maxWaitMinutes: null });
     expect(out.planned).toEqual([]); expect(out.landingHolds).toHaveLength(1); expect(out.landingEscalations).toEqual([]);
@@ -161,6 +166,16 @@ describe('landing-holder-stuck reconcile notes', () => {
     const postComment = vi.fn(() => ({ ok: true })), notify = vi.fn();
     dispatchApi.recordLandingHolderEscalation({ escalation, readPrComments: () => [{ body: '<!-- conveyor-note-key: landing-holder-stuck:90:h1 -->', author: { login: 'untrusted-outsider' } }], postComment, notify });
     expect(postComment).toHaveBeenCalledOnce(); expect(notify).toHaveBeenCalledOnce();
+  });
+  it('notesDryRun posts and notifies nothing', () => {
+    const postComment = vi.fn(() => ({ ok: true })), notify = vi.fn(), readPrComments = vi.fn(() => []);
+    const out = dispatchApi.recordLandingHolderEscalation({ escalation, notesDryRun: true, readPrComments, postComment, notify });
+    expect(out).toEqual({ dryRun: true });
+    expect(postComment).not.toHaveBeenCalled(); expect(notify).not.toHaveBeenCalled();
+  });
+  it('WE_CONVEYOR_POST_NOTE_COMMENTS=0 is the default for notesDryRun', () => {
+    expect(dispatchApi.landingNotesDryRun({ WE_CONVEYOR_POST_NOTE_COMMENTS: '0' })).toBe(true);
+    expect(dispatchApi.landingNotesDryRun({})).toBe(false);
   });
   it('failed posting never notifies and can be retried', () => {
     const notify = vi.fn();
