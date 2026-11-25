@@ -369,3 +369,10 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/settings/review.json',
   // The auditor itself and the modules it imports directly (see AUDITOR_FLOOR).
   ...AUDITOR_FLOOR, ...AUDITOR_IMPORTS])]);
+
+/** A waived delta must never change merge authorization or its evidence producers. */
+export const MERGE_PATH_FLOOR = Object.freeze([...GUARD_FLOOR, ...REVIEW_AUTH_FLOOR, ...AUDITOR_FLOOR,
+  'scripts/operations/canonical-audit-gate.mjs', 'scripts/operations/prototype-load*',
+  'scripts/operations/ruled-weakened-*', 'scripts/operations/fix-ready-record.mjs',
+  'scripts/operations/waiver-delta-carry.mjs', 'scripts/operations/open-pr*', 'scripts/pr-land*',
+  'scripts/lib/net-diff-fingerprint.mjs', 'scripts/lib/file-class-policy.mjs', '.github/**']);

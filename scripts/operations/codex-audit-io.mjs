@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
@@ -69,7 +70,18 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       if (!match) throw new Error('unreadable remote heads');
       return { sha: match[1], branch: match[2].slice('refs/heads/'.length) };
     });
+  const gitEnv = { ...process.env, GIT_NO_REPLACE_OBJECTS: '1' };
   return {
+    readWaivers(ref) {
+      const env = { ...process.env, HOME: home };
+      const warn = message => { throw new Error(message); };
+      const revoked = withdrawnRevocations({ env, fs, warn, scopeRef: ref, warnOther: () => {} });
+      const store = readStore({ path: storePath(env), fs, warn });
+      if (store.error) throw new Error('waiver store unreadable; restore readability and retry full audit');
+      return store.entries.filter(e => e.ref === ref && !revoked(e));
+    },
+    mergesBetween: (basis, head) => !!run('git', ['rev-list', '--merges', `${basis}..${head}`, '--'], 30_000, gitEnv).trim(),
+    mergeBaseOf: (ref, head) => run('git', ['merge-base', ref, head], 30_000, gitEnv).trim(),
     branchTip(branch) {
       const name = branch.replace(/^refs\/heads\//, '');
       const matches = remoteHeads(`refs/heads/${name}`).filter(entry => entry.branch === name);
@@ -85,11 +97,11 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
     isAncestor(basis, head) {
       if (basis === head) return false;
       const result = spawnSync('git', ['merge-base', '--is-ancestor', basis, head],
-        { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000 });
+        { cwd, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 30_000, env: gitEnv });
       if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('ancestry unavailable');
       return result.status === 0;
     },
-    diffFiles: (basis, head) => run('git', ['diff', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000)
+    diffFiles: (basis, head) => run('git', ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000, gitEnv)
       .split('\0').filter(Boolean),
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),

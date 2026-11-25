@@ -460,10 +460,10 @@ test('generated documentation retains rotation, rerun, audit debounce/delta, aud
   assert.equal(reviewAutoAudit.value.mode, 'shadow');
   const audit = registry.rows.find(row => row.key === 'audit');
   assert.deepEqual(audit.value.debounce, { minutes: 5 });
-  assert.deepEqual(audit.value.delta, { maxFiles: 0 });
+  assert.deepEqual(audit.value.delta, { maxFiles: 0, waivedCarry: { maxFiles: 40 } });
   const auditRow = doc.split('\n').find(line => line.startsWith('| audit |'));
   assert.ok(auditRow.includes('"debounce":{"minutes":5}'));
-  assert.ok(auditRow.includes('"delta":{"maxFiles":0}'));
+  assert.ok(auditRow.includes('"delta":{"maxFiles":0,"waivedCarr…'));
   // Forge host sizes are operator-private: the repo default names no hosts.
   assert.deepEqual(registry.rows.find(row => row.key === 'forgeSlots').value, { default: 8, hosts: {} });
   assert.ok(doc.split('\n').find(line => line.startsWith('| forgeSlots |')).includes('{"default":8,"hosts":{}}'));
