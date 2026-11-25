@@ -22,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as timerSleep } from 'node:timers/promises';
 import { getThisHost, resolveHostRole } from '../lib/daemon-host-guard.mjs';
 import { EX_RELOAD, EX_HANDED_OVER, MAX_GREEN_DROPS, swapEnabled as swapSettingOn } from '../lib/daemon-handover.mjs';
-import { platformPreference } from '../lib/policy-cascade.mjs';
+import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 
 export const POLL_MS = 60_000;
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
@@ -181,7 +181,7 @@ function startChild({ cmd, args }, { spawn, killGroup, processSignals, sleep, ki
     const fn = () => {
       const first = !stopping;
       stopping = true;
-      // Swap candidates always begin shutdown with TERM, including wrapper INT/HUP.
+      // Children spawned green begin shutdown with TERM, even after promotion and on wrapper INT/HUP.
       stop(env?.WE_DAEMON_ROLE === 'green' ? 'SIGTERM' : sig);
       if (first && !ended) {
         void sleep(killGraceMs, { signal: grace.signal }).then(() => {
@@ -297,7 +297,7 @@ async function watchChild(child, ctx) {
  */
 async function watchSwap(first, ctx) {
   const { thisHost, source, watchSleep, sleep, killGraceMs, log, spawnCandidate,
-    marker, greenMarker, candidateReady, greenCapable, readinessTimeoutMs, shutdown, shuttingDown } = ctx;
+    marker, greenMarker, candidateReady, readinessTimeoutMs, shutdown, shuttingDown } = ctx;
   let active = first;
   let candidate = null;
   let gen = 1;
@@ -322,19 +322,24 @@ async function watchSwap(first, ctx) {
   };
   const slots = () => [active, candidate].filter(Boolean);
   const startCandidate = () => {
-    if (shuttingDown() || !greenCapable || drops >= MAX_GREEN_DROPS) return;
+    if (shuttingDown() || drops >= MAX_GREEN_DROPS) return;
     candidate = spawnCandidate(gen + 1);
     log(`host-gate: blue asked for a successor; green gen=${gen + 1} started in shadow`);
   };
   let poll = watchSleep(POLL_MS);
   const readyBeforeDeadline = async () => {
     const deadline = new AbortController();
+    let expired = false;
     try {
-      const ready = Promise.resolve(candidateReady(gen + 1)).then((ok) => ({ who: 'ready', ok }));
-      const timeout = sleep(readinessTimeoutMs, { signal: deadline.signal }).then(() => ({ who: 'timeout' }));
+      const ready = Promise.resolve(candidateReady(candidate.pid, gen + 1)).then((ok) => ({ who: 'ready', ok }));
+      const timeout = sleep(readinessTimeoutMs, { signal: deadline.signal }).then(() => { expired = true; return { who: 'timeout' }; });
       while (true) {
         const ev = await Promise.race([ready, timeout, poll.then(() => ({ who: 'poll' })),
           shutdown.then(() => ({ who: 'shutdown' })), candidate.done.then(() => ({ who: 'exit' }))]);
+        if (expired) {
+          log('host-gate: readiness deadline expired; stopping green, retaining blue exit code');
+          return false;
+        }
         if (ev.who === 'ready') return ev.ok === true;
         if (ev.who !== 'poll') {
           if (ev.who === 'timeout') log('host-gate: readiness deadline expired; stopping green, retaining blue exit code');
@@ -353,7 +358,7 @@ async function watchSwap(first, ctx) {
     if (shuttingDown()) return await stopSlots(slots());
     const waits = [active.done.then((code) => ({ who: 'active', code })),
       poll.then(() => ({ who: 'poll' })), shutdown.then(() => ({ who: 'shutdown' }))];
-    if (!candidate && greenCapable && drops < MAX_GREEN_DROPS) waits.push(active.reload.then(() => ({ who: 'reload' })));
+    if (!candidate && drops < MAX_GREEN_DROPS) waits.push(active.reload.then(() => ({ who: 'reload' })));
     if (candidate) waits.push(candidate.done.then((code) => ({ who: 'candidate', code })));
     let ev = await Promise.race(waits);
     if (shuttingDown()) return await stopSlots(slots());
@@ -390,10 +395,17 @@ async function watchSwap(first, ctx) {
     }
     if (active.cleanupFailed) return await stopSlots(slots());
     try {
-      if (ev.code === EX_RELOAD && !candidate) {
+      if (ev.code === EX_RELOAD || ev.code === EX_HANDED_OVER) {
         const now = await pollRole(thisHost, source);
-        if (now.active) startCandidate();
-        else log(`host-gate: owner=${now.owner}; refusing successor after blue exit 76`);
+        if (!now.active) {
+          log(`host-gate: owner=${now.owner}; refusing successor after blue exit ${ev.code}`);
+          if (candidate) {
+            await stopSlots([candidate]);
+            if (candidate.cleanupFailed) return 1;
+          }
+          return ev.code;
+        }
+        if (ev.code === EX_RELOAD && !candidate) startCandidate();
       }
       if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate && !candidate.exited
           && await readyBeforeDeadline() && !candidate.exited && !shuttingDown()) {
@@ -452,7 +464,12 @@ export async function runGate(parsed, deps = {}) {
     candidateReady,
     readinessTimeoutMs = 30_000,
     // Setting daemons.blueGreenSwap.<daemon>; absent = off (today's exit-and-restart path).
-    swapEnabled = (daemon) => swapSettingOn({ daemons: platformPreference('daemons') }, daemon),
+    swapEnabled = (daemon) => {
+      try {
+        const { prefs, errors } = readPlatformPreferences();
+        return Array.isArray(errors) && errors.length === 0 && swapSettingOn(prefs, daemon);
+      } catch { return false; }
+    },
   } = deps;
   let markerPath;
   try { markerPath = suppliedMarkerPath ?? defaultMarkerPath(parsed); }
@@ -502,12 +519,12 @@ export async function runGate(parsed, deps = {}) {
       }
       log(`host-gate: active owner=${owner} self=${thisHost}`);
       if (shutdownCode !== null) return shutdownCode;
+      const requested = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
       try { marker.claim(); }
       catch (error) {
         log(`host-gate: cannot reserve cleanup marker ${markerPath}: ${error.message}; refusing to spawn, operator cleanup required`);
         return 1;
       }
-      const requested = Boolean(parsed.daemon) && swapEnabled(parsed.daemon);
       const swap = requested && greenCapable === true && typeof candidateReady === 'function';
       if (requested && !swap && !unwiredLogged) {
         log('host-gate: swap is not wired (shadow capability and readiness required); using ordinary non-swap path');
@@ -520,7 +537,7 @@ export async function runGate(parsed, deps = {}) {
       const code = swap
         ? await watchSwap(child, {
           thisHost, source, watchSleep, sleep, killGraceMs, log, marker, greenMarker,
-          candidateReady, greenCapable, readinessTimeoutMs, shuttingDown: () => shutdownCode !== null,
+          candidateReady, readinessTimeoutMs, shuttingDown: () => shutdownCode !== null,
           shutdown: new Promise((resolve) => {
             if (shutdown.signal.aborted) resolve();
             else shutdown.signal.addEventListener('abort', resolve, { once: true });

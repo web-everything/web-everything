@@ -1,5 +1,5 @@
 /**
- * Generic blue-green handover helpers shared by the host gate and the daemons
+ * Generic blue-green handover helpers; the host gate uses the setting and exit codes
  * (BLUE-GREEN-SWAP S1.1; FLOW-DMN-026/029/045/049/050). Pure functions only.
  *
  * Exit codes a daemon uses toward the host gate when swap is enabled:
@@ -21,6 +21,8 @@ export function swapEnabled(prefs, daemon) {
   const v = section[daemon];
   return v === true || v === 'on';
 }
+
+// S1.3/S1.4 will wire validateReadyRecord, probationVerdict and switchPauseMs into production handover.
 
 /** Ready record schema written by a green daemon. Returns {ok, reason}. A missing field refuses. */
 export function validateReadyRecord(rec, { gen, codeDigest, pid } = {}) {

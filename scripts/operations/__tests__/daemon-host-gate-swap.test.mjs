@@ -3,8 +3,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { runGate } from '../daemon-host-gate.mjs';
 
-vi.mock('../../lib/policy-cascade.mjs', () => ({ platformPreference: vi.fn() }));
-import { platformPreference } from '../../lib/policy-cascade.mjs';
+vi.mock('../../lib/policy-cascade.mjs', () => ({ readPlatformPreferences: vi.fn() }));
+import { readPlatformPreferences } from '../../lib/policy-cascade.mjs';
 
 const HOST_A = '11111111-1111-4111-8111-111111111111';
 const parsed = { cmd: 'daemon', args: [], daemon: 'drain' };
@@ -29,7 +29,8 @@ function setup({ swap }) {
     },
     thisHost: HOST_A,
     log: (l) => logs.push(l),
-    sleep: async () => {},
+    sleep: (ms) => ms === 123 ? new Promise(() => {}) : Promise.resolve(),
+    readinessTimeoutMs: 123,
     source: { readOwner: async () => { reads += 1; return { host: HOST_A, version: 'file' }; } },
     swapEnabled: () => swap,
     greenCapable: true,
@@ -55,7 +56,7 @@ function setup({ swap }) {
 const tick = () => new Promise((r) => setTimeout(r, 5));
 
 describe('host gate swap', () => {
-  it('IPC reload starts a shadow while blue runs; exit 77 promotes without a standby poll', async () => {
+  it('IPC reload starts a shadow while blue runs; exit 77 refreshes ownership before promotion', async () => {
     const h = setup({ swap: true });
     const run = runGate(parsed, h.deps);
     await tick();
@@ -70,7 +71,7 @@ describe('host gate swap', () => {
     h.children[0].emit('exit', 77, null);
     await tick();
     expect(h.children).toHaveLength(2); // no third spawn, gate did not exit
-    expect(h.reads()).toBe(readsBefore); // no cold owner re-read
+    expect(h.reads()).toBe(readsBefore + 1);
     h.children[1].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
@@ -132,14 +133,14 @@ describe('swap audit regressions', () => {
   it.each([76, 77])('exit %i refuses an unready candidate and stops it with escalation', async (code) => {
     const h = setup({ swap: true });
     const checked = [];
-    h.deps.candidateReady = (gen) => { checked.push(gen); return false; };
+    h.deps.candidateReady = (pid, gen) => { checked.push({ pid, gen }); return false; };
     autoExit(h);
     const { run } = await shadow(h);
     h.children[0].emit('exit', code, null);
     await tick();
     h.children[1].emit('exit', 0, null);
     expect(await run).toBe(code);
-    expect(checked).toEqual([2]);
+    expect(checked).toEqual([{ pid: 2001, gen: 2 }]);
     expect(h.children[1].kills).toContain('SIGTERM');
     expect(h.children[1].kills).toContain('SIGKILL');
     expect(h.logs.join(' ')).not.toContain('promoted');
@@ -177,7 +178,7 @@ describe('swap audit regressions', () => {
     expect(h.children).toHaveLength(2);
   });
 
-  it.each(['revoke', 'ordinary', 'signal'])('%s stops both slots with a deadline and reports any cleanup failure', async (mode) => {
+  it.each(['revoke', 'ordinary', 'signal'])('%s escalates candidate shutdown and reports its cleanup failure', async (mode) => {
     const h = setup({ swap: true });
     autoExit(h, 2001);
     const { run } = await shadow(h);
@@ -292,29 +293,38 @@ describe('swap request races', () => {
 
 
 describe('closed swap wiring and bounded handover', () => {
-  it.each(['candidateReady', 'greenCapable'])('missing %s falls back once to ordinary non-swap execution', async (key) => {
+  it.each(['candidateReady', 'greenCapable'])('missing %s logs fallback once across repeated spawn iterations', async (key) => {
     const h = setup({ swap: true });
     delete h.deps[key];
+    const kill = h.deps.killGroup;
+    h.deps.killGroup = (pid, sig) => {
+      kill(pid, sig);
+      if (sig === 'SIGTERM') {
+        h.children[0].emit('exit', 0, null);
+        h.deps.source.readOwner = async () => ({ host: HOST_A, version: 'file' });
+      }
+    };
     const run = runGate(parsed, h.deps);
     await tick();
-    h.children[0].emit('message', { type: 'reload' });
+    h.deps.source.readOwner = async () => null;
+    h.wake();
     await tick();
-    h.children[0].emit('exit', 76, null);
+    expect(h.children).toHaveLength(2);
+    h.children[1].emit('exit', 76, null);
     expect(await run).toBe(76);
-    expect(h.children).toHaveLength(1);
-    expect(h.spawns[0].opts.env).toBeUndefined();
+    expect(h.spawns.every(({ opts }) => opts.env === undefined)).toBe(true);
     expect(h.logs.filter((l) => l.includes('swap is not wired'))).toHaveLength(1);
   });
 
   it.each([undefined, {}, { blueGreenSwap: { drain: 'off' } }, { blueGreenSwap: { drain: 'true' } },
     { blueGreenSwap: { drain: true } }, { blueGreenSwap: { drain: 'on' } }])('default platform setting %j', async (prefs) => {
-    platformPreference.mockReturnValue(prefs);
+    readPlatformPreferences.mockReturnValue({ prefs: { daemons: prefs }, errors: [] });
     const h = setup({ swap: false });
     delete h.deps.swapEnabled;
     const run = runGate(parsed, h.deps);
     await tick();
     const enabled = [true, 'on'].includes(prefs?.blueGreenSwap?.drain);
-    expect(platformPreference).toHaveBeenLastCalledWith('daemons');
+    expect(readPlatformPreferences).toHaveBeenCalledWith();
     expect(h.spawns[0].opts.env?.WE_DAEMON_ROLE).toBe(enabled ? 'blue' : undefined);
     h.children[0].emit('exit', 0, null);
     expect(await run).toBe(0);
@@ -421,5 +431,139 @@ describe('closed swap wiring and bounded handover', () => {
     expect(h.logs.join(' ')).toContain('lease');
     active.emit('exit', 0, null);
     expect(await run).toBe(0);
+  });
+});
+
+describe('handover evidence regressions', () => {
+  it.each([76, 77])('exit %i refreshes ownership and refuses an existing candidate after revocation', async (code) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    const checked = vi.fn(() => true);
+    h.deps.candidateReady = checked;
+    const { run } = await shadow(h);
+    const readOwner = vi.fn(async () => null);
+    h.deps.source.readOwner = readOwner;
+    h.children[0].emit('exit', code, null);
+    await tick();
+    // Clean up a promoted candidate too, so a regression fails assertions without hanging.
+    h.children[1].emit('exit', 0, null);
+    expect(await run).toBe(code);
+    expect(readOwner).toHaveBeenCalledTimes(1);
+    expect(checked).not.toHaveBeenCalled();
+    expect(h.children[1].kills).toContain('SIGTERM');
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it('readiness cannot win after its deadline fires during an ownership read', async () => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    let ready, deadline, owner;
+    h.deps.candidateReady = () => new Promise((r) => { ready = r; });
+    h.deps.sleep = (ms) => ms === 123 ? new Promise((r) => { deadline = r; }) : Promise.resolve();
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 77, null);
+    await tick();
+    h.deps.source.readOwner = () => new Promise((r) => { owner = r; });
+    h.wake();
+    await tick();
+    deadline();
+    ready(true);
+    await tick();
+    owner({ host: HOST_A, version: 'file' });
+    await tick();
+    h.children[1].emit('exit', 0, null);
+    expect(await run).toBe(77);
+    expect(h.logs.join(' ')).toContain('readiness deadline expired');
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it('replacement readiness is bound to its pid and gen, refusing a predecessor record', async () => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    const checked = vi.fn((pid, gen) => pid === 2001 && gen === 2);
+    h.deps.candidateReady = checked;
+    const { run } = await shadow(h);
+    h.children[1].emit('exit', 1, null);
+    await tick();
+    h.children[0].emit('message', { type: 'reload' });
+    await tick();
+    h.children[0].emit('exit', 77, null);
+    await tick();
+    h.children[2].emit('exit', 0, null);
+    expect(await run).toBe(77);
+    expect(checked).toHaveBeenCalledWith(2002, 2);
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it.each([1, 'true', {}])('truthy non-true readiness %j refuses promotion', async (value) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    h.deps.candidateReady = () => value;
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 77, null);
+    expect(await run).toBe(77);
+    expect(h.children[1].kills).toContain('SIGTERM');
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it('swap children inherit the parent environment and receive an IPC channel', async () => {
+    const h = setup({ swap: true });
+    const { run } = await shadow(h);
+    for (const { opts } of h.spawns) {
+      expect(opts.stdio).toEqual(['inherit', 'inherit', 'inherit', 'ipc']);
+      expect(opts.env).toMatchObject(process.env);
+    }
+    h.children[1].emit('exit', 1, null);
+    h.children[0].emit('exit', 0, null);
+    expect(await run).toBe(0);
+  });
+
+  it('green cleanup marker reservation failure stops blue and returns 1', async () => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    const write = h.deps.markerFs.writeFileSync;
+    h.deps.markerFs.writeFileSync = (p, ...args) => {
+      if (p.endsWith('.green')) throw new Error('denied');
+      write(p, ...args);
+    };
+    const run = runGate(parsed, h.deps);
+    await tick();
+    h.children[0].emit('message', { type: 'reload' });
+    expect(await run).toBe(1);
+    expect(h.children).toHaveLength(1);
+    expect(h.children[0].kills).toContain('SIGTERM');
+    expect(h.logs.join(' ')).toContain('cannot reserve green cleanup marker');
+  });
+
+  it.each(['throw', 'reject'])('candidateReady %s fails closed and stops green', async (mode) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    h.deps.candidateReady = () => {
+      if (mode === 'throw') throw new Error('invalid readiness');
+      return Promise.reject(new Error('invalid readiness'));
+    };
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 77, null);
+    expect(await run).toBe(1);
+    expect(h.children[1].kills).toContain('SIGTERM');
+    expect(h.logs.join(' ')).not.toContain('promoted');
+  });
+
+  it.each(['reported', 'throw'])('preference read %s errors turn swap off before reserving the marker', async (mode) => {
+    const h = setup({ swap: true });
+    delete h.deps.swapEnabled;
+    let reservedAtRead;
+    readPlatformPreferences.mockImplementation(() => {
+      reservedAtRead = h.files.has('state/m.json');
+      if (mode === 'throw') throw new Error('unreadable override');
+      return { prefs: { daemons: { blueGreenSwap: { drain: 'on' } } }, errors: ['unreadable override'] };
+    });
+    const run = runGate(parsed, h.deps);
+    await tick();
+    expect(reservedAtRead).toBe(false);
+    expect(h.spawns[0]?.opts.env).toBeUndefined();
+    h.children[0]?.emit('exit', 76, null);
+    expect(await run).toBe(76);
+    expect(h.children).toHaveLength(1);
   });
 });

@@ -57,3 +57,15 @@ describe('probation audit regressions', () => {
     expect(probationVerdict({ ...base, passExitCodes })).toBe('rollback');
   });
 });
+
+describe('ready record field regressions', () => {
+  it.each(['gen', 'codeDigest', 'pid', 'smoke'])('missing %s refuses readiness', (field) => {
+    const record = { ...ready };
+    delete record[field];
+    expect(validateReadyRecord(record)).toEqual({ ok: false, reason: field });
+  });
+  it('a probation start later than now never promotes', () => {
+    expect(probationVerdict({ startedAt: 101, now: 100, lastHeartbeatAt: 90,
+      staleAfterMs: 50, probationMs: 1000, passExitCodes: [0] })).toBe('wait');
+  });
+});
