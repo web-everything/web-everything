@@ -1050,7 +1050,19 @@ export async function driveRun({
   // jury-core pulls in markdown-it; lightweight CLIs also import this adapter from
   // scripts-only clones. Load the verdict helper only for review seat observations.
   const deriveVerdict = run.op === 'review-pr' ? (await import('../lib/jury-core.mjs')).deriveVerdict : null;
+  const recordTimeout = (step, request, error) => {
+    if (error?.timedOut !== true) return;
+    current = { ...current, seatTimeouts: [...(current.seatTimeouts ?? []), {
+      step, lens: request?.lens ?? null,
+      provider: request?.providerName ?? judge.providerName ?? 'claude', model: request?.model ?? null,
+      timeoutMs: error.timeoutMs, wallMs: error.wallMs,
+      head: current.findings?.read?.netBasis?.rev ?? current.input?.head ?? null,
+      at: new Date(clock()).toISOString(),
+    }] };
+    store.write(current);
+  };
   const recordSeat = (seat) => {
+    if (seat.ok === false) recordTimeout(seat.step, seat.request, seat.error);
     if (current.op !== 'review-pr' || seat.request?.skipSpawn) return;
     const { value, telemetry } = seat.ok ? unwrapJudgeOutcome(seat.value) : { value: null, telemetry: null };
     current = withSeatTiming(current, seatTiming({
@@ -1180,6 +1192,7 @@ export async function driveRun({
           }
           current = saveRemainingSeats(current);
           store.write(current);
+          if (e?.timedOut === true) return { run: current, stopped: 'juror-timeout', error: e, applied };
           throw e;
         }
         returned = pre.value;
@@ -1200,10 +1213,12 @@ export async function driveRun({
           if (observation) recordSeat({ ...observation, ok: true, value: returned, finishedAt: clock() });
         } catch (e) {
           if (observation) recordSeat({ ...observation, ok: false, finishedAt: clock() });
+          recordTimeout(stepName, current.pending.request, e);
           if (e?.telemetry) {
             current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: current.pending.step, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
             store.write(current);
           }
+          if (e?.timedOut === true) return { run: current, stopped: 'juror-timeout', error: e, applied };
           throw e;
         }
       }

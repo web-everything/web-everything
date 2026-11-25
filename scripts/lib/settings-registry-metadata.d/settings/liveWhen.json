@@ -1,0 +1,6 @@
+{
+  "description": "Hotpatch loads require completed CI and canonical audit admission.",
+  "owner": "scripts/settings/hotpatch.json",
+  "changeVia": "pr",
+  "instant": true
+}
