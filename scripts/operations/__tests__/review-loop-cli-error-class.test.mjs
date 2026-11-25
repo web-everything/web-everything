@@ -5,10 +5,11 @@
  * failed filing leaves the state as it was) — the end-to-end negatives live in review-loop-cli.test.mjs
  * ("error-class" describe); this file pins the classifier and the static ban on `.message` in output.
  */
-import { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync } from 'node:fs';
+import fs, { readFileSync, writeFileSync, mkdtempSync, symlinkSync, chmodSync, statSync, renameSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import * as cli from '../review-loop-cli.mjs';
 
@@ -48,6 +49,88 @@ describe('classifyErrorClass', () => {
 });
 
 describe('debug log fails closed', () => {
+  it.each(['existing', 'missing'])('writes debug details to a safe %s destination with mode 0600', (initial) => {
+    const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-safe-'));
+    const path = join(dir, 'debug.log');
+    if (initial === 'existing') writeFileSync(path, 'orig\n', { mode: 0o600 });
+    const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
+    try {
+      expect(cli.describeErrorClass('filing-failed', new Error('Bearer safe-log-secret'))).toBe('filing-failed:auth');
+      expect(readFileSync(path, 'utf8')).toContain('Bearer safe-log-secret');
+      if (initial === 'existing') expect(readFileSync(path, 'utf8')).toMatch(/^orig\n/);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+      else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
+    }
+  });
+
+  it.each(['safe', 'missing'])('rejects an unsafe file substituted between lstat and open (%s path)', (initial) => {
+    const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-race-'));
+    const path = join(dir, 'debug.log');
+    if (initial === 'safe') writeFileSync(path, 'safe', { mode: 0o600 });
+    const replacement = join(dir, 'replacement.log');
+    writeFileSync(replacement, 'orig', { mode: 0o644 });
+    chmodSync(replacement, 0o644);
+    const actualOpen = fs.openSync;
+    let openedFd;
+    const open = vi.spyOn(fs, 'openSync').mockImplementation((target, ...args) => {
+      if (target === path) renameSync(replacement, path);
+      const fd = actualOpen(target, ...args);
+      if (target === path) openedFd = fd;
+      return fd;
+    });
+    const close = vi.spyOn(fs, 'closeSync');
+    syncBuiltinESMExports();
+    const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
+    try {
+      expect(cli.describeErrorClass('filing-failed', new Error('Bearer race-secret'))).toBe('filing-failed:auth');
+      expect(open).toHaveBeenCalledWith(path, expect.any(Number), 0o600);
+      expect(openedFd).toEqual(expect.any(Number));
+      expect(close).toHaveBeenCalledWith(openedFd);
+      expect(statSync(path).mode & 0o777).toBe(0o644);
+      expect(readFileSync(path, 'utf8')).toBe('orig');
+    } finally {
+      open.mockRestore();
+      close.mockRestore();
+      syncBuiltinESMExports();
+      if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+      else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
+    }
+  });
+
+  it.each(['non-regular', 'wrong-owner', 'stat-failure'])('rejects an opened debug destination with %s metadata', (kind) => {
+    const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-fd-'));
+    const path = join(dir, 'debug.log');
+    writeFileSync(path, 'orig', { mode: 0o600 });
+    const actualStat = fs.fstatSync;
+    const stat = vi.spyOn(fs, 'fstatSync').mockImplementationOnce((fd) => {
+      if (kind === 'stat-failure') throw new Error('descriptor unavailable');
+      const st = actualStat(fd);
+      if (kind === 'non-regular') st.isFile = () => false;
+      else st.uid = process.getuid() + 1;
+      return st;
+    });
+    const close = vi.spyOn(fs, 'closeSync');
+    syncBuiltinESMExports();
+    const prev = process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+    process.env.REVIEW_LOOP_CLI_DEBUG_LOG = path;
+    try {
+      expect(cli.describeErrorClass('filing-failed', new Error('Bearer metadata-secret'))).toBe('filing-failed:auth');
+      expect(stat).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledWith(stat.mock.calls[0][0]);
+      expect(readFileSync(path, 'utf8')).toBe('orig');
+    } finally {
+      stat.mockRestore();
+      close.mockRestore();
+      syncBuiltinESMExports();
+      if (prev === undefined) delete process.env.REVIEW_LOOP_CLI_DEBUG_LOG;
+      else process.env.REVIEW_LOOP_CLI_DEBUG_LOG = prev;
+    }
+  });
+
   it('never appends through a symlink or into a group/world-readable file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rlc-dbg-'));
     const target = join(dir, 'target.txt');

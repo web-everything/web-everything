@@ -57,7 +57,7 @@
  */
 
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync, existsSync, mkdirSync, lstatSync, openSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
+import { readdirSync, readFileSync, existsSync, mkdirSync, lstatSync, fstatSync, openSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -601,7 +601,13 @@ function writeErrorDebugLog(site, error, env = process.env) {
     if (st && (!st.isFile() || st.isSymbolicLink() || (st.mode & 0o077) !== 0
       || (typeof process.getuid === 'function' && st.uid !== process.getuid()))) return;
     const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW, 0o600);
-    try { writeSync(fd, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`); } // error-class-allowed
+    try {
+      // The path may have been replaced (or created) since lstat. Check the opened file before writing secrets.
+      const opened = fstatSync(fd);
+      if (!opened.isFile() || (opened.mode & 0o077) !== 0
+        || (typeof process.getuid === 'function' && opened.uid !== process.getuid())) return;
+      writeSync(fd, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`); // error-class-allowed
+    }
     finally { closeSync(fd); }
   } catch { /* debug log is best effort; skipping it never changes the printed class */ }
 }
