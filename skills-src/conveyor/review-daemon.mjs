@@ -85,7 +85,10 @@ import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
-import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { notifyReferralHold, readReviewRunEvidence, jurorTimeoutWoken } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { jurorTimeoutHold } from '../../scripts/operations/juror-timeout-route.mjs';
+import { createRedTeamIo } from '../../scripts/operations/review-extra-seats.mjs';
+import { providerQuotaHold } from '../../scripts/lib/provider-quota-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
 import { refreshOntoMain, defaultPostRebaseComment } from '../../scripts/conveyor/ci-red-recovery-watch.mjs';
@@ -401,6 +404,7 @@ export function runReviewTick({
   statusCandidates = selectStatusCandidates,
   holdReconcile = sweepReviewHolds,
   notifyReferral = notifyReferralHold,
+  readRuns = () => [], providerCapacity = () => null,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
   refreshScopeBloat = null,
@@ -748,7 +752,17 @@ export function runReviewTick({
   let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
-  for (const row of plan.refusals ?? []) {
+  const timeoutHolds = new Map();
+  for (const d of reviews) {
+    const subject = (rawPrs ?? []).find(p => Number(p.number) === Number(d.prNumber));
+    const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
+    const last = readRuns().filter(r => r.repo === repo && r.pr === Number(d.prNumber))
+      .sort((a, b) => b.startedAt - a.startedAt)[0];
+    if (last?.head !== head || !last?.jurorTimeout || jurorTimeoutWoken(subject ?? {}, last)) continue;
+    const hold = jurorTimeoutHold(last, providerCapacity);
+    if (hold) timeoutHolds.set(d.prNumber, hold);
+  }
+  for (const row of [...(plan.refusals ?? []), ...[...timeoutHolds].map(([prNumber, referralHold]) => ({ prNumber, referralHold }))]) {
     const hold = row.referralHold ?? row.reviewRefusal?.referralHold;
     if (!hold) continue;
     try {
@@ -850,6 +864,12 @@ export function runReviewTick({
       }
       // The head this review was planned against: the job refuses (no verdict) unless live head still matches it.
       const plannedHead = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
+      const timeoutHold = timeoutHolds.get(d.prNumber);
+      if (timeoutHold) {
+        if (reserved) liveReviewBudget.left++;
+        notStarted.push({ prNumber: d.prNumber, reason: timeoutHold.why });
+        continue;
+      }
       const result = dispatch({ pr: d.prNumber, repo,
         ...(plannedHead ? { expectedHead: plannedHead } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
@@ -1575,6 +1595,8 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
   };
   const options = {
     log: line => log.error(line),
+    readRuns: readReviewRunEvidence,
+    providerCapacity: provider => providerQuotaHold(createRedTeamIo().readRecords({ strict: true }), provider, Date.now()),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
     hostAdmission: defaultReviewHostAdmission,

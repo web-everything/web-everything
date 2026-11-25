@@ -649,7 +649,9 @@ export function resolveJudgeProvider(name) {
  */
 function stripForCodex(request) {
   if (!request) return request;
-  const { model: _unusedModel, allowedTools, ...rest } = request;
+  const { model, allowedTools, ...rest } = request;
+  // Keep an explicit Codex model (including a saved retry route); only foreign model names use its default.
+  if (typeof model === 'string' && /^(gpt-|codex)/.test(model)) rest.model = model;
   if (Array.isArray(allowedTools) && allowedTools.length === 0) return rest;
   return { ...rest, ...(allowedTools !== undefined ? { allowedTools } : {}) };
 }
@@ -724,6 +726,7 @@ function buildProviderRequest(effective, cwd, effectiveProviderName) {
     ...(effective.model !== undefined ? { model: effective.model } : {}),
     effort: effective.effort,
     budget: effective.budget,
+    ...(effective.timeoutMs !== undefined ? { timeoutMs: effective.timeoutMs } : {}),
     runId: effective.runId,
     lens: effective.lens,
     ...(effective.allowedTools ? { allowedTools: effective.allowedTools } : {}),
@@ -1040,13 +1043,21 @@ function stampFinish(run, stepIndex, clock) {
  *   from `{run, stopped, error, applied}` alone — see the file header and #3063 for why.
  */
 export async function driveRun({
-  run, registry, store, sinks, judge, resume = null, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now(),
+  run, registry, store, sinks, judge, resume = null, retrySeat = null, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now(),
   // `review.parallelSeats` — see `./parallel-judges.mjs`. OFF by default so every caller that does not ask keeps the
   // sequential drive; the review callers pass the resolved setting. `seatLanes` gives a further tool-bearing seat a
   // lane of its own (absent: it waits for the primary lane). `log` reports seat starts/ends (stderr by default).
   parallelJudges = false, seatLanes = null, log = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
 } = {}) {
   let current = run;
+  if (retrySeat) {
+    const { step, model, provider, timeoutMs } = retrySeat;
+    if (run.pending?.kind !== 'judge' || run.pending.step !== step || typeof model !== 'string'
+      || !JUDGE_PROVIDER_NAMES.includes(provider)
+      || !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 3600000) throw new Error('invalid pending juror retry');
+    current = { ...run, pending: { ...run.pending, request: { ...run.pending.request, providerName: provider, model, timeoutMs } } };
+    store.write(current);
+  }
   // jury-core pulls in markdown-it; lightweight CLIs also import this adapter from
   // scripts-only clones. Load the verdict helper only for review seat observations.
   const deriveVerdict = run.op === 'review-pr' ? (await import('../lib/jury-core.mjs')).deriveVerdict : null;

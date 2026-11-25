@@ -135,7 +135,7 @@ import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, loadConcurrentSeats, READ_SINK_ENV,
 } from '../lib/review-speculative-red-team.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
-import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
+import { UNATTENDED_REVIEW_ACTOR, defaultFindResumableRun } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 
@@ -420,6 +420,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
+  findResumableRun = defaultFindResumableRun,
+  spawnNode = spawnSync,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
   // Keep rollback authority in this process; the runner's admission file is untrusted.
@@ -430,7 +432,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnNode(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
@@ -636,8 +638,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
     runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
+      const resumeId = findResumableRun({ pr, repo, jurorOnly: true }, { env, readPr: () => JSON.parse(exec('gh',
+        ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })) });
       const r = node([
-        'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
+        'scripts/operations/review-loop-cli.mjs',
+        ...(resumeId ? [`--resume=${resumeId}`] : [`--pr=${pr}`, `--repo=${repo}`]), `--cwd=${lanePath}`,
         '--provider=claude', '--json',
       ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
