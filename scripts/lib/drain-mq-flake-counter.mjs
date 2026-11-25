@@ -1,14 +1,16 @@
 /**
  * Merge-queue flake counter (MQ-FLAKE-COUNTER). Pure decision: eject a PR only after N consecutive failures of the
- * same check (same merge-group head, check name and producer app). Default N=1 keeps today's behaviour; the shadow
- * field always records what the 3-failure rule would have done so turn-on can be proven first.
+ * same check (same merge-group head, check name, producer app and Actions run). Default N=1 keeps today's behaviour;
+ * the shadow field always records what the 3-failure rule would have done so turn-on can be proven first.
  * Merge-path: producer app bound (1), ordering by attempt number never timestamps (3), 40-hex head binding (5),
- * unreadable or absent evidence ejects (2, 7). Persist the count only after the rerun request succeeds (8).
+ * run binding (6), unreadable, absent or incomplete evidence ejects (2, 7). Persist the count only after the rerun
+ * request succeeds (8).
  */
 const SHADOW_THRESHOLD = 3;
 const HEAD_RE = /^[0-9a-f]{40}$/;
 const FINAL = new Set(['success', 'failure', 'cancelled', 'timed_out', 'neutral', 'skipped', 'action_required', 'stale']);
 const BAD = new Set(['failure', 'cancelled', 'timed_out', 'action_required', 'stale']);
+const stamp = v => typeof v === 'string' ? Date.parse(v) : NaN;
 
 const eject = reason => ({ action: 'eject', failures: 0, reason });
 
@@ -17,33 +19,41 @@ export function resolveEjectAfterFailures(settings) {
   return Number.isInteger(n) && n >= 1 && n <= 10 ? n : 1;
 }
 
-function decide({ checks, head, name, appId, threshold }) {
-  if (!HEAD_RE.test(head ?? '') || typeof name !== 'string' || !name || appId == null) return eject('unreadable binding');
+function decide({ checks, head, name, appId, runId, threshold }) {
+  if (!HEAD_RE.test(head ?? '') || typeof name !== 'string' || !name.trim() || !Number.isSafeInteger(appId) || appId < 1
+    || !Number.isSafeInteger(threshold) || threshold < 1) return eject('unreadable binding');
   if (!Array.isArray(checks)) return eject('unreadable attempts');
-  const mine = checks.filter(c => c && c.head_sha === head && c.name === name && c.app?.id === appId);
+  const mine = checks.filter(c => c && c.head_sha === head && c.name === name && c.app?.id === appId
+    && (runId === undefined || String(c.run_id) === String(runId)));
   if (!mine.length) return eject('no attempts for this head, check and app');
-  const seen = new Set();
-  for (const c of mine) {
-    if (!Number.isInteger(c.run_attempt) || c.run_attempt < 1 || seen.has(c.run_attempt)) return eject('unreadable attempt numbers');
-    seen.add(c.run_attempt);
-  }
+  if (runId === undefined && new Set(mine.map(c => c.run_id)).size > 1) return eject('attempts span several runs');
+  for (const c of mine) if (!Number.isInteger(c.run_attempt) || c.run_attempt < 1) return eject('unreadable attempt numbers');
   mine.sort((a, b) => a.run_attempt - b.run_attempt);
-  const latest = mine[mine.length - 1];
-  if (latest.status !== 'completed' || latest.conclusion == null) {
-    if (mine.some(c => c.conclusion != null && !FINAL.has(c.conclusion))) return eject('unknown conclusion');
-    return { action: 'wait', failures: 0, reason: 'latest attempt not complete' };
+  // Complete history only: attempts must be exactly 1..n.
+  if (mine.some((c, i) => c.run_attempt !== i + 1)) return eject('attempt history incomplete or duplicated');
+  for (let i = 0; i < mine.length; i++) {
+    const c = mine[i], last = i === mine.length - 1;
+    if (c.status === 'completed') {
+      if (!FINAL.has(c.conclusion) || !(stamp(c.started_at) <= stamp(c.completed_at))) return eject('unreadable completed attempt');
+    } else if (!last || (c.status !== 'in_progress' && c.status !== 'queued') || c.conclusion != null) {
+      return eject('unreadable or incomplete attempt');
+    }
   }
-  if (mine.some(c => c.conclusion != null && !FINAL.has(c.conclusion))) return eject('unknown conclusion');
-  let failures = 0;
-  for (let i = mine.length - 1; i >= 0 && BAD.has(mine[i].conclusion); i--) failures++;
-  if (!failures) return { action: 'pass', failures: 0, reason: 'latest attempt passed' };
-  return failures >= threshold
-    ? { action: 'eject', failures, reason: `${failures} consecutive failures` }
-    : { action: 'rerun', failures, reason: `${failures} of ${threshold} failures` };
+  const latest = mine[mine.length - 1];
+  if (latest.status !== 'completed') return { action: 'wait', failures: 0, reason: 'latest attempt not complete' };
+  let streak = 0, worst = 0;
+  for (const c of mine) {
+    if (BAD.has(c.conclusion)) worst = Math.max(worst, ++streak); else streak = 0;
+  }
+  // A threshold-reaching streak is head-failure evidence even if a later attempt went green.
+  if (worst >= threshold) return { action: 'eject', failures: worst, reason: `${worst} consecutive failures` };
+  if (latest.conclusion === 'success') return { action: 'pass', failures: 0, reason: 'latest attempt succeeded' };
+  if (!BAD.has(latest.conclusion)) return eject('latest attempt neither success nor failure');
+  return { action: 'rerun', failures: streak, reason: `${streak} of ${threshold} failures` };
 }
 
-export function evaluateMqFlakeCounter({ checks, head, name, appId, threshold = 1 }) {
-  const actual = decide({ checks, head, name, appId, threshold });
-  const shadow = decide({ checks, head, name, appId, threshold: SHADOW_THRESHOLD });
+export function evaluateMqFlakeCounter({ checks, head, name, appId, runId, threshold = 1 }) {
+  const actual = decide({ checks, head, name, appId, runId, threshold });
+  const shadow = decide({ checks, head, name, appId, runId, threshold: SHADOW_THRESHOLD });
   return { ...actual, shadow: { action: shadow.action, failures: shadow.failures, threshold: SHADOW_THRESHOLD } };
 }
