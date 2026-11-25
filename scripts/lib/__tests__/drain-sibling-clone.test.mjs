@@ -10,11 +10,14 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { ensureSiblingClone, siblingCloneUrl, resetSiblingCloneFailures, describeUnverifiedDiffHold, CLONE_RETRY_COOLDOWN_MS } from '../drain-sibling-clone.mjs';
+import { ensureSiblingClone as ensureRaw, siblingCloneUrl, resetSiblingCloneFailures, describeUnverifiedDiffHold, CLONE_RETRY_COOLDOWN_MS } from '../drain-sibling-clone.mjs';
 import { computeNetDiffSignals } from '../../merge-ai-prs.mjs';
 import { scanTestTampering } from '../pr-merge-gate.mjs';
 
-process.env.WE_DRAIN_SIBLING_CLONE = 'on'; // provisioning is off under vitest unless explicit; every exec below is injected or a local file:// origin
+// Provisioning is off under vitest unless explicit. Pass it per call: a process.env write would leak into other
+// suites sharing this worker and make them attempt real network clones.
+const ON = { ...process.env, WE_DRAIN_SIBLING_CLONE: 'on' };
+const ensureSiblingClone = (o) => ensureRaw({ env: ON, ...o });
 
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
