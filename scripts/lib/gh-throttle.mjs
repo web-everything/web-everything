@@ -248,6 +248,8 @@ export const GH_POINTS_WINDOW_MS = 60_000;
  * `gh.throttle.pointsBudgetPerMin` (integer 1..600), else 300. Env keeps its >=1
  * validation and fractional flooring; values above 600 warn and use 300.
  * Operator reads are lock-free; invalid/unreadable overrides use 300.
+ * Provenance and warnings go to `points-budget-settings.jsonl` under the throttle lock root,
+ * keeping stdout/stderr transparent for the shim and callers that parse GitHub errors.
  *
  * DERIVED 2026-09-22, from three inputs, not invented:
  *   1. GitHub's documented secondary ceiling — 900 REST points/minute, ACCOUNT-WIDE (this module header's own
@@ -271,8 +273,15 @@ export const GH_POINTS_WINDOW_MS = 60_000;
 export const DEFAULT_GH_POINTS_BUDGET_PER_MIN = 300;
 
 let pointsBudgetSourceLogged = false;
-export function resolveGhPointsBudgetPerMin(env = process.env, { overrideFile } = {}) {
-  const warn = message => { try { process.stderr.write(`${message}\n`); } catch { /* diagnostics only */ } };
+export function resolveGhPointsBudgetPerMin(env = process.env, { overrideFile, lockRoot } = {}) {
+  const log = entry => {
+    try {
+      const root = lockRoot || ghThrottleLockRoot(undefined, env);
+      mkdirSync(root, { recursive: true });
+      recordGhCallLogEntry(join(root, 'points-budget-settings.jsonl'), { op: 'points-budget', ...entry });
+    } catch { /* diagnostics never change a call or its output */ }
+  };
+  const warn = message => log({ outcome: 'settings_warning', message });
   const n = Number(env.WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN);
   let budget = DEFAULT_GH_POINTS_BUDGET_PER_MIN;
   let source = 'default';
@@ -291,7 +300,7 @@ export function resolveGhPointsBudgetPerMin(env = process.env, { overrideFile } 
   }
   if (!pointsBudgetSourceLogged) {
     pointsBudgetSourceLogged = true;
-    warn(`gh-throttle: pointsBudgetPerMin=${budget} source=${source}`);
+    log({ outcome: 'settings', pointsBudgetPerMin: budget, source });
   }
   return budget;
 }
@@ -2082,7 +2091,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env, { lockRoot });
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   // Header self-calibration is OPT-IN per call (see the module header) — OFF unless a caller explicitly asks,
@@ -2383,7 +2392,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const pid = throttle.pid || process.pid;
   const owner = throttle.owner || `${pid}:${randomUUID()}`;
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env, { lockRoot });
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
