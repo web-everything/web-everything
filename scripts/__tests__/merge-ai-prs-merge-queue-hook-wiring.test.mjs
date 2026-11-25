@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { completeCheckReadFixture } from './fixtures/complete-check-read-fixture.mjs';
 import { fixtureOid, pinnedPrDiffFixture, comparePrDiffFixture } from './fixtures/pinned-pr-diff-fixture.mjs';
+import { withFixtureEnv } from './fixtures/with-fixture-env.mjs';
 import { defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { OWNER_INSTALLATIONS, installationCachePath } from '../lib/github-app-installations.mjs';
 
@@ -132,7 +133,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     mkdirSync(bin);
     const fixture = join(dir, 'prs.json');
     // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
-    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), code.replace('\n', '\nprocess.env.MQ_FIXTURE = ' + JSON.stringify(fixture) + ';\n'), { mode: 0o755 });
+    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), withFixtureEnv(code, { MQ_FIXTURE: fixture }), { mode: 0o755 });
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : fixtureOid(`sha-${number}`);
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
     const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
@@ -400,7 +401,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
     mkdirSync(bin);
     const fixture = join(dir, 'prs.json');
     // Safety reads intentionally scrub MQ_*; keep fixture routing inside the executable shims.
-    for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code.replace('\n', '\nprocess.env.MQ_FIXTURE = ' + JSON.stringify(fixture) + ';\n'), { mode: 0o755 });
+    for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), withFixtureEnv(code, { MQ_FIXTURE: fixture }), { mode: 0o755 });
     const manifest = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' },
       ...(secondImplPassAges ? [{ repo: 'plateau-app', ref: 'lane/xcarr01-pa' }] : [])], blockedBy: [], stackParents: [] };
     const body = `A real summary.\n\n<!-- lane-manifest:begin -->\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n<!-- lane-manifest:end -->\n`;

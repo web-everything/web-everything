@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fakeGh, fakeGit } from '../../../__tests__/fixtures/merge-ai-prs-fake-ports.mjs';
+import { withFixtureEnv } from '../../../__tests__/fixtures/with-fixture-env.mjs';
 import { defaultCachePath } from '../../../lib/github-app-auth-env.mjs';
 import { OWNER_INSTALLATIONS, installationCachePath } from '../../../lib/github-app-installations.mjs';
 import { daemonAppEnv } from '../../../__tests__/fixtures/daemon-app-env.mjs';
@@ -21,7 +22,7 @@ function probe(root = ROOT) {
     const cwd = join(dir, 'local'); mkdirSync(cwd);
     const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json');
     const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: SIBLING, PRESTAGE_LOCAL_REPO: ['web-everything', 'web-everything'].join('/') };
-    for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body.replace('\n', '\nObject.assign(process.env, ' + JSON.stringify(routing) + ');\n'), { mode: 0o755 });
+    for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), withFixtureEnv(body, routing), { mode: 0o755 });
     writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
     const appEnv = daemonAppEnv(dir);
     // Safety reads scrub fixture installation overrides. Seed the canonical routes with fake tokens too,
