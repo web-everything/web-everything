@@ -37,7 +37,7 @@ function dataOnly(source) {
 describe('shared protected-path floor', () => {
   it.each(['scripts/ci/mq-result-reuse.mjs', 'scripts/ci-card-only.mjs', 'scripts/conveyor/soak/soak-scope.mjs'])(
     'protects the independently pinned CI skip-verdict producer %s', path => {
-      const workflow = readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8');
+      const workflow = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../.github/workflows/ci.yml'), 'utf8');
       expect(workflow).toContain(`node ${path}`);
       expect(matchesSome(path, shared.GUARD_FLOOR)).toBe(true);
     });
