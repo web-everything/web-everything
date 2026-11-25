@@ -48,9 +48,11 @@ function mqChain(checks, repo, commit, original, removedAt) {
 /** Only complete, commit-bound history can establish a flake or authorize a rerun. */
 export function inspectMqReruns({ checks, repo, commit, removedAt, maxFailures = 1 }) {
   const failed = checks.filter(check => check.conclusion === 'failure');
-  const unavailable = { checks, confirmed: false, candidates: [] };
+  // Beyond the single-rerun default, refused evidence must hold: a reason keeps the main-red fallback from retrying.
+  const refusal = maxFailures === 1 ? undefined : 'rerun chain evidence invalid or ambiguous; operator must inspect failed jobs and enqueue manually';
+  const unavailable = { checks, confirmed: false, candidates: [], reason: refusal };
   if (!Number.isSafeInteger(maxFailures) || maxFailures < 1 || maxFailures > 3) return unavailable;
-  if (!failed.length) return unavailable;
+  if (!failed.length) return { checks, confirmed: false, candidates: [] };
   const groups = new Map();
   for (const check of failed) {
     const job = mqActionsJob(check, repo);
