@@ -245,7 +245,8 @@ export const GH_POINTS_WINDOW_MS = 60_000;
  * `DEFAULT_GH_CONCURRENCY_CAP` above: that bounds how many calls run AT ONCE, this bounds how many POINTS are
  * spent over a rolling 60s window (see the module header's #3670 section). Overridable via
  * `WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN` (tests), then the operator capacity leaf
- * `gh.throttle.pointsBudgetPerMin`, then default 300. Both sources require integers 1..600;
+ * `gh.throttle.pointsBudgetPerMin`, then default 300. Operator overrides require integers 1..600;
+ * the env accepts zero (blocks reserved reads) and floors positive fractions, with a ceiling of 600;
  * invalid/unreadable evidence falls back to 300. Effective value/source logs once per process.
  *
  * DERIVED 2026-09-22, from three inputs, not invented:
@@ -274,8 +275,8 @@ function validPointsBudget(n) {
   return Number.isInteger(n) && n >= 1 && n <= 600;
 }
 function explicitPointsBudget(n) {
-  if (validPointsBudget(n)) return n;
-  try { process.stderr.write('gh-throttle: invalid throttle.budgetPerMin; expected an integer 1..600; falling back to 300\n'); } catch { /* diagnostics only */ }
+  if (Number.isFinite(n) && n >= 0 && n <= 600) return n;
+  try { process.stderr.write('gh-throttle: invalid throttle.budgetPerMin; expected a number 0..600; falling back to 300\n'); } catch { /* diagnostics only */ }
   return DEFAULT_GH_POINTS_BUDGET_PER_MIN;
 }
 /** Fresh lock-free operator read; invalid env falls through to the operator override. */
@@ -286,8 +287,9 @@ export function resolveGhPointsBudgetPerMinDetailed(env = process.env, { overrid
     const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
     // Leave at least 300 of GitHub's 900 points/minute for callers outside this wrapper
     // until the unmigrated-caller count is 0; do not raise this ceiling before then.
-    if (validPointsBudget(n)) result = { budget: n, source };
-    else warn(`gh-throttle: invalid ${source} gh.throttle.pointsBudgetPerMin; expected an integer 1..600; falling back to lower layer or 300`);
+    if (source === 'env' && Number.isFinite(n) && (n === 0 || n >= 1) && n <= 600) result = { budget: Math.floor(n), source };
+    else if (source === 'override' && validPointsBudget(n)) result = { budget: n, source };
+    else warn(`gh-throttle: invalid ${source} gh.throttle.pointsBudgetPerMin; expected 0 or a number 1..600 for env, an integer 1..600 for override; falling back to lower layer or 300`);
   };
   if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN')) {
     apply(env.WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN, 'env');
@@ -2260,8 +2262,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // `text` above is the STRIPPED stderr, so a response body mentioning a rate limit never classifies as one.
     const headers = parseGhDebugResponseHeaders(captured ? captured.rawStderrText : failure && failure.stderr);
     const signal = classifyRateLimitSignal(headers, text);
-    if (isWrite || (!primaryExhaustedResource(text) && !rateLimitRetryEligible(text, signal))) throw failure;
-    if (signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
+    if (!primaryExhaustedResource(text) && !rateLimitRetryEligible(text, signal)) throw failure;
+    if (!isWrite && signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
 
     // #gh-graphql-budget — a PRIMARY exhaustion cannot clear before the bucket's reset: record the shared block
     // and give up NOW instead of spending the retry ladder on calls GitHub will refuse.
@@ -2278,7 +2280,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
         const rec = writeBudgetBlock(lockRoot, identity, exhausted, { untilMs: until.untilMs, nowMs: now(), source: until.source, op: opLabel, caller });
         recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'budget_exhausted', resource: exhausted, until: rec.until, caller, w: isWrite, id: identity });
         recordGhThrottleMetric('gh.throttle.exhausted', 1, { op: opLabel, attempt, source: `primary-${exhausted}` });
-        if (usedPersonalToken) {
+        if (usedPersonalToken && !isWrite) {
           fallbackToOriginal(attempt, exhausted);
           continue;
         }
@@ -2286,7 +2288,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
       }
     }
 
-    if (!rateLimitRetryEligible(text, signal)) throw failure;
+    if (isWrite || !rateLimitRetryEligible(text, signal)) throw failure;
 
     // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
     if (attempt >= maxAttempts || reserved) {
@@ -2563,10 +2565,10 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     }
     const headers = parseGhDebugResponseHeaders(rawStderrText); // LAST response, pre-strip
     const signal = classifyRateLimitSignal(headers, stderrText);
-    if (!failed || isWrite || (!primaryExhaustedResource(stderrText) && !rateLimitRetryEligible(stderrText, signal))) {
+    if (!failed || (!primaryExhaustedResource(stderrText) && !rateLimitRetryEligible(stderrText, signal))) {
       return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
     }
-    if (signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
+    if (!isWrite && signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
     // #gh-graphql-budget — PRIMARY exhaustion → record the shared block and return now (see runGhSync).
     const exhausted = primaryExhaustedResource(stderrText) || (signal.kind === 'primary' ? resource : null);
     if (exhausted) {
@@ -2587,7 +2589,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         // we:backlog/xhcgdce — the PERSONAL bucket just ran dry mid-call (its block is recorded above, probed
         // under the personal token). Retry the read ONCE on the App — after checking the App's own block, same
         // as the rejected-token fallback (PR #2885 review).
-        if (usedPersonalToken && !appFallbackTried) {
+        if (usedPersonalToken && !appFallbackTried && !isWrite) {
           appFallbackTried = true;
           callEnv = env;
           usedPersonalToken = false;
@@ -2602,7 +2604,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         return { status: r.status == null ? 1 : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
       }
     }
-    if (!rateLimitRetryEligible(stderrText, signal)) return { status: r.status ?? 1, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
+    if (isWrite || !rateLimitRetryEligible(stderrText, signal)) return { status: r.status ?? 1, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
 
     // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
     if (attempt >= maxAttempts || reserved) {

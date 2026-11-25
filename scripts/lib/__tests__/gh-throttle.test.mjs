@@ -60,7 +60,9 @@ describe('resolveGhPointsBudgetPerMin — env override, clamped sane (#3670)', (
   });
   it('falls back on a non-finite or invalid value', () => {
     expect(resolveGhPointsBudgetPerMin({ WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN: 'nope' })).toBe(DEFAULT_GH_POINTS_BUDGET_PER_MIN);
-    expect(resolveGhPointsBudgetPerMin({ WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN: '0' })).toBe(DEFAULT_GH_POINTS_BUDGET_PER_MIN);
+  });
+  it('preserves an explicit zero budget', () => {
+    expect(resolveGhPointsBudgetPerMin({ WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN: '0' })).toBe(0);
   });
 });
 

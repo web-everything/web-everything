@@ -238,7 +238,7 @@ describe('reserved priority slot (drain freeze read)', () => {
   });
   it('a reserved read fails closed when the points budget does not clear inside its call bound', () => {
     const f = fullPool('red-main-freeze-read');
-    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 2000, throttle: { ...f.throttle, reservedSlot: true, budgetPerMin: 1, points: 2 } })).toThrow(/throttled/);
+    expect(() => runGhSync(FREEZE_ARGS, { encoding: 'utf8', timeout: 2000, throttle: { ...f.throttle, reservedSlot: true, budgetPerMin: 0 } })).toThrow(/throttled/);
     expect(f.throttle.exec).not.toHaveBeenCalled();
     expect(f.elapsed()).toBeLessThanOrEqual(2000);
   });

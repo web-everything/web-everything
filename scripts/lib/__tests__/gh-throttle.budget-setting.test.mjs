@@ -33,7 +33,7 @@ it('env wins over operator override; legacy resolver returns a number', () => {
   save(400);
   expect(resolve()).toEqual({ budget: 400, source: 'override' });
 });
-it.each(['bad', '0', '-1', '1.5', '', 'Infinity', '601'])('invalid env %s falls through to a valid override', value => {
+it.each(['bad', '-1', '', 'Infinity', '601'])('invalid env %s falls through to a valid override', value => {
   save(500);
   expect(resolve({ [ENV]: value })).toEqual({ budget: 500, source: 'override' });
   expect(stderr).toHaveBeenCalledWith(expect.stringContaining('invalid env'));
@@ -47,6 +47,11 @@ it.each([1, 300, 600])('accepts integer boundary/default %s from either source',
   save(budget);
   expect(resolve()).toEqual({ budget, source: 'override' });
   expect(resolve({ [ENV]: String(budget) })).toEqual({ budget, source: 'env' });
+});
+it('zero env wins over an override and positive env fractions retain main flooring', () => {
+  save(500);
+  expect(resolve({ [ENV]: '0' })).toEqual({ budget: 0, source: 'env' });
+  expect(resolve({ [ENV]: '1.5' })).toEqual({ budget: 1, source: 'env' });
 });
 it('absent, malformed and unreadable override stores fall back to 300', () => {
   expect(resolve()).toEqual({ budget: 300, source: 'default' });
@@ -128,6 +133,35 @@ describe.each(['sync', 'cli'])('%s secondary refusal accounting', mode => {
     expect(gh.readBudgetBlock(dir, gh.ghAuthIdentity({}), 'core', NOW)).not.toBeNull();
     expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW }).last60Min).toBe(0);
   });
+  it.each([
+    ['REST', ['api', '--method', 'POST', 'user'], 'core'],
+    ['GraphQL', ['api', 'graphql', '-f', 'query=mutation { test }'], 'graphql'],
+  ])('records primary exhaustion for a %s write without replaying it', (_kind, args, resource) => {
+    const text = `< HTTP/2.0 403 Forbidden\n< X-Ratelimit-Remaining: 0\n< X-Ratelimit-Reset: ${Math.floor(NOW / 1000) + 3600}\n\ngh: refused (HTTP 403)`;
+    const result = invoke(mode, [text, null], {}, args);
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(1);
+    expect(result.sleep).not.toHaveBeenCalled();
+    expect(gh.readBudgetBlock(dir, gh.ghAuthIdentity({}), resource, NOW)).not.toBeNull();
+  });
+  it.each(['explicit', 'env'])('a zero %s budget blocks a reserved read before execution', source => {
+    let clock = NOW;
+    const throttle = { lockRoot: dir, cap: 2, reservedSlot: true, caller: 'red-main-freeze-read',
+      env: { WE_GH_THROTTLE_NO_BUDGET_PROBE: '1', ...(source === 'env' ? { [ENV]: '0' } : {}) },
+      ...(source === 'explicit' ? { budgetPerMin: 0 } : {}),
+      now: () => clock, sleep: ms => { clock += ms; }, reservedTimeoutMs: 2000 };
+    const args = ['api', '-i', 'repos/o/r/git/ref/heads/main'];
+    const execute = vi.fn(() => mode === 'sync' ? '[]' : { status: 0, stdout: Buffer.from('[]'), stderr: Buffer.alloc(0) });
+    if (mode === 'sync') {
+      expect(() => gh.runGhSync(args, { timeout: 2000, throttle: { ...throttle, exec: execute } })).toThrow(/throttled/);
+    } else {
+      const result = gh.runGhCliPassthrough(args, { throttle, spawn: execute });
+      expect(result.status).toBe(1);
+      expect(result.stderr.toString()).toMatch(/throttled/);
+    }
+    expect(execute).not.toHaveBeenCalled();
+    expect(clock - NOW).toBeLessThanOrEqual(2000);
+  });
   it.each(['', 'nonsense'])('invalid Retry-After %s does not count as secondary', header => {
     const result = invoke(mode, [`< HTTP/2.0 403 Forbidden\n< Retry-After: ${header}\n\ngh: refused (HTTP 403)`, null]);
     expect(result.status).toBe(1);
@@ -146,7 +180,7 @@ describe.each(['sync', 'cli'])('%s secondary refusal accounting', mode => {
     expect(result.sleep).not.toHaveBeenCalled();
     expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW }).last60Min).toBe(0);
   });
-  it.each([601, 0, -1, 1.5, '500', NaN, null])('invalid explicit budget %s uses 300 and warns', budgetPerMin => {
+  it.each([601, -1, '500', NaN, null])('invalid explicit budget %s uses 300 and warns', budgetPerMin => {
     const result = invoke(mode, [null], { budgetPerMin, points: 300 });
     expect(result.status).toBe(0);
     expect(result.calls).toBe(1);
@@ -157,6 +191,13 @@ describe.each(['sync', 'cli'])('%s secondary refusal accounting', mode => {
     const next = invoke(mode, [null], { budgetPerMin, points: 1, now: () => clock, sleep });
     expect(next.status).toBe(0);
     expect(next.calls).toBe(1);
+    expect(sleep).toHaveBeenCalled();
+  });
+  it('keeps an explicit fractional budget without rounding it up to 300', () => {
+    let clock = NOW;
+    const sleep = vi.fn(ms => { clock += ms; });
+    expect(invoke(mode, [null], { budgetPerMin: 1.5, points: 1.5 }).calls).toBe(1);
+    expect(invoke(mode, [null], { budgetPerMin: 1.5, points: 1, now: () => clock, sleep }).calls).toBe(1);
     expect(sleep).toHaveBeenCalled();
   });
   it('counts the final refused attempt too', () => {
