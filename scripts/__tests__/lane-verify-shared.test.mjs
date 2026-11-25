@@ -23,7 +23,7 @@ export const POLICY_ENV_KEYS = Object.fromEntries([
   'WE_VERIFY_RUN_ALL_PHASES', 'WE_VERIFY_ISOLATED_RETRY', 'WE_VERIFY_RETRY_FAILED', 'WE_VERIFY_RELATED_MAX_TESTS',
   'WE_VERIFY_RELATED_DEPTH', 'WE_VERIFY_ALWAYS_RUN_TESTS', 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY', 'WE_VERIFY_REVERT_RED',
   'WE_VERIFY_REVERT_RED_SINCE', 'WE_VERIFY_REVERT_RED_MAX_FILES', 'WE_VERIFY_SELECTION', 'WE_VERIFY_PHASE_TIMEOUT_MS',
-  'WE_VERIFY_SLOT_HEARTBEAT_MS',
+  'WE_VERIFY_SLOT_HEARTBEAT_MS', 'WE_TEST_SANDBOX',
 ].map(name => [name, 'Resolved verify/build value or normalized selection is included in the policy key.']));
 export const NON_POLICY_ENV = {
   WE_REQUIRE_VERIFIED: 'Consumer admission option; does not select or execute tests.',
@@ -83,11 +83,12 @@ function producer(overrides = {}) {
   const end = source.indexOf('// The default gate\'s selected test half', start);
   expect(end).toBeGreaterThan(start);
   const notes = [];
-  const resolved = { command: 'npm run test:unit', decision: { selectionMode: { mode: 'pr' } } };
+  const resolved = { command: 'npm run test:unit', decision: { mode: 'full', selectionMode: { mode: 'pr' } } };
   const context = { ...store, shouldRecordGreen, repoSlugFromRemote, laneGitHardeningEnv, hardenLaneGitArgs,
     isAllowlistedLitterPath, gateCommandsEqual: gate.gateCommandsEqual, verifyPolicyKey: gate.verifyPolicyKey,
     execFileSync, basename, join, REPO: laneA, headSha: sha, GATE: resolved.command, resolvedGate: resolved,
     resolveBuildDefaultGate: () => resolved, flags: {}, FORCE_LOCAL: false, admissionFallback: false, revertRed: null,
+    sharedTestCounts: [1], phaseResults: [{ phase: 'standards', result: { exitCode: 0 } }],
     resolveCoordinationRoot: () => coordRoot, process: { env: process.env, stderr: { write: s => notes.push(s) } },
     ...overrides };
   runInNewContext(`${source.slice(start, end)}\nmaybePublishSharedGreen({status:'green', treeHash:'stable', revertRed});`, context);
@@ -178,7 +179,7 @@ it('delta chain refuses an absent or different-policy base and publishes only wi
   const deltaBase = sha;
   git(laneA, ['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-qm', 'delta']);
   sha = git(laneA, ['rev-parse', 'HEAD']);
-  const resolved = { command: 'npm run test:unit', decision: { selectionMode: { mode: 'since-last-green', base: deltaBase } } };
+  const resolved = { command: 'npm run test:unit', decision: { mode: 'full', selectionMode: { mode: 'since-last-green', base: deltaBase } } };
   const options = { resolvedGate: resolved, resolveBuildDefaultGate: () => resolved };
   expect(producer(options)).toMatch(/shared.*skip/i);
   publish({ sha: deltaBase, policyKey: key({ WE_VERIFY_RETRY_FAILED: '10' }),
@@ -374,9 +375,130 @@ it.each([
   expect(producer({ GATE: command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved })).toMatch(/shared.*skip.*re-verify/);
   expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
 });
-it('nonempty selected test invocation remains eligible for publication', () => {
+it('a filename with passWithNoTests never proves executed tests', () => {
   const command = 'npx vitest run scripts/example.test.mjs --passWithNoTests';
   const resolved = { command, decision: { selectionMode: { mode: 'pr' }, selection: { tests: ['scripts/example.test.mjs'] } } };
-  producer({ GATE: command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved });
+  expect(producer({ GATE: command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved })).toMatch(/shared.*skip.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+
+it('HEAD moved by a commit after capture refuses publication even with a clean tree', () => {
+  git(laneA, ['-c', 'user.name=test', '-c', 'user.email=test@example.com', 'commit', '--allow-empty', '-qm', 'moved after capture']);
+  expect(git(laneA, ['status', '--porcelain'])).toBe('');
+  expect(producer()).toMatch(/shared.*skip.*HEAD.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it.each(['NODE_OPTIONS', 'NODE_ENV', 'WE_TEST_SANDBOX'])('runtime policy %s cannot reuse a different value or unset green', name => {
+  expect(key({ [name]: 'a' })).not.toBe(key({ [name]: 'b' }));
+  expect(key({ [name]: '' })).not.toBe(key({}));
+  expect(gate.verifyPolicyInputs({}).runtimeEnv[name]).toBeNull();
+  expect(gate.verifyPolicyInputs({ [name]: 'a' }).runtimeEnv[name]).toBe('a');
+});
+it.each([
+  ['zero executed', [0]], ['unknown runner count', [null]], ['one unreported phase', [1, null]],
+  ['no runner reports', []], ['negative runner count', [-1]],
+])('%s refuses publication despite a test command', (_name, sharedTestCounts) => {
+  expect(producer({ sharedTestCounts })).toMatch(/shared.*skip.*runner.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it('standards-only gate never publishes', () => {
+  const resolved = { command: 'npm run check:standards', decision: { mode: 'full', selectionMode: { mode: 'pr' } } };
+  expect(producer({ GATE: resolved.command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved, sharedTestCounts: [] })).toMatch(/shared.*skip/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it.each([[[]], [[{ phase: 'standards', result: { exitCode: 1 } }]]])('tests without a passed standards phase never publish %j', phaseResults => {
+  expect(producer({ phaseResults })).toMatch(/shared.*skip.*standards.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+const completeSelection = { status: 'complete', tests: ['scripts/a.test.mjs'], selectedTestCount: 1, fullTestCount: 1, droppedCount: 0 };
+it.each([
+  ['capped-fallback', { ...completeSelection, status: 'capped-fallback' }],
+  ['graph-error fallback', { ...completeSelection, status: 'graph-error' }],
+  ['truncated selection', { ...completeSelection, status: 'selection-truncated' }],
+  ['null coverage', { ...completeSelection, fullTestCount: null }],
+  ['unknown coverage', { ...completeSelection, fullTestCount: undefined }],
+  ['missing selection', null], ['forced fallback', { ...completeSelection, forceFallback: true }],
+])('incomplete selection %s never publishes', (_name, selection) => {
+  const resolved = { command: 'npx vitest run scripts/a.test.mjs', decision: { mode: 'shrink', selectionMode: { mode: 'pr' }, selection } };
+  expect(producer({ GATE: resolved.command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved })).toMatch(/shared.*skip.*selection.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it('decision forceFallback never publishes even with a complete selection', () => {
+  const resolved = { command: 'npx vitest run scripts/a.test.mjs', decision: { mode: 'shrink', forceFallback: true, selectionMode: { mode: 'pr' }, selection: completeSelection } };
+  expect(producer({ GATE: resolved.command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved })).toMatch(/shared.*skip.*selection.*re-verify/);
+  expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toBeNull();
+});
+it('complete selection with runner counts and standards remains eligible', () => {
+  const resolved = { command: 'npx vitest run scripts/a.test.mjs', decision: { mode: 'shrink', selectionMode: { mode: 'pr' }, selection: completeSelection } };
+  producer({ GATE: resolved.command, resolvedGate: resolved, resolveBuildDefaultGate: () => resolved, sharedTestCounts: [0, 2, 3] });
   expect(store.readSharedGreen(args({ policyKey: key(process.env) }))).toMatchObject({ status: 'green' });
+});
+const runnerReport = extra => JSON.stringify({ numTotalTests: 6, numPendingTests: 2, numTodoTests: 1, numPassedTests: 2, numFailedTests: 1, ...extra });
+it('runner count excludes skipped and todo and includes passed plus failed', () => {
+  expect(typeof store.executedTestCount).toBe('function');
+  expect(store.executedTestCount(runnerReport())).toBe(3);
+});
+it.each([null, '{bad', '{}', runnerReport({ numTotalTests: 0 }), runnerReport({ numTotalTests: '6' }), runnerReport({ numPendingTests: -1 }), runnerReport({ numFailedTests: 0 })])
+  ('unreadable or inconsistent runner report fails closed %j', reportText => {
+    expect(typeof store.executedTestCount).toBe('function');
+    expect(store.executedTestCount(reportText)).toBeNull();
+  });
+it('skipped-only runner report proves zero execution', () => {
+  expect(typeof store.executedTestCount).toBe('function');
+  expect(store.executedTestCount(runnerReport({ numTotalTests: 3, numPassedTests: 0, numFailedTests: 0 }))).toBe(0);
+});
+
+it('skipped assertions cannot borrow the older Vitest inflated passed counter', () => {
+  expect(typeof store.executedTestCount).toBe('function');
+  const report = { numTotalTests: 2, numPendingTests: 0, numTodoTests: 1, numPassedTests: 2, numFailedTests: 0,
+    testResults: [{ assertionResults: [{ status: 'skipped' }, { status: 'todo' }] }] };
+  expect(store.executedTestCount(JSON.stringify(report))).toBe(0);
+});
+function countedRunner(run, { maxBytes = 1024 * 1024 } = {}) {
+  const start = source.indexOf('async function runCountedTestGate(');
+  expect(start, 'test phases must collect their own runner reports').toBeGreaterThan(-1);
+  const end = source.indexOf('// Retry commands use direct test-file filters', start);
+  expect(end).toBeGreaterThan(start);
+  const sharedTestCounts = [];
+  const runCounted = runInNewContext(`${source.slice(start, end)}\nrunCountedTestGate;`, {
+    sharedTestCounts, timedRunGate: run, mkdtempSync, join, tmpdir, rmSync, readFileSync,
+    nodeFs: { statSync }, MAX_TIMEOUT_LOG_BYTES: maxBytes, shellQuote: gate.shellQuote, executedTestCount: store.executedTestCount,
+  });
+  return { runCounted, sharedTestCounts };
+}
+it('counted runner reads JSON from direct shell and argv test phases and sums execution', async () => {
+  let index = 0;
+  const runner = countedRunner(async (_phase, command, argv) => {
+    const file = argv ? argv.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length)
+      : command.match(/--outputFile.json='([^']+)'/)[1];
+    writeFileSync(file, index++ ? runnerReport({ numTotalTests: 3, numPassedTests: 0, numFailedTests: 0 }) : runnerReport());
+    return { exitCode: 0 };
+  });
+  await runner.runCounted('vitestMs', 'npx vitest run scripts/a.test.mjs');
+  await runner.runCounted('vitestMs', 'npx', ['vitest', 'run', 'scripts/b.test.mjs']);
+  expect(runner.sharedTestCounts).toEqual([3, 0]);
+});
+it.each(['missing', 'oversized', 'sharded', 'opaque npm'])('counted runner fails closed for %s execution evidence', async kind => {
+  const runner = countedRunner(async (_phase, command) => {
+    if (kind === 'oversized') writeFileSync(command.match(/--outputFile.json='([^']+)'/)[1], 'x'.repeat(513));
+    return { exitCode: 0 };
+  }, { maxBytes: 512 });
+  await runner.runCounted('vitestMs', kind === 'sharded' ? 'node scripts/lib/verify-shard-run.mjs -- npx vitest run'
+    : kind === 'opaque npm' ? 'npm run test:unit' : 'npx vitest run');
+  expect(runner.sharedTestCounts).toEqual([null]);
+});
+it('counted runner reuses the always-run guard report without replacing its output path', async () => {
+  const reportFile = join(root, 'guards.json');
+  const runner = countedRunner(async (_phase, command) => {
+    expect(command).toBe('npx vitest run scripts/guard.test.mjs --reporter=json');
+    writeFileSync(reportFile, runnerReport());
+    return { exitCode: 0 };
+  });
+  await runner.runCounted('scanMs', 'npx vitest run scripts/guard.test.mjs --reporter=json', undefined, { reportFile });
+  expect(runner.sharedTestCounts).toEqual([3]);
+});
+it('every test phase uses counted execution while standards use their own outcome', () => {
+  const calls = [...source.matchAll(/await timedRunGate\(([^\n]+)/g)].map(m => m[1]);
+  expect(calls).toHaveLength(2); // the counted wrapper itself, and the standards half
+  expect(calls.some(c => c.includes("'standardsMs'"))).toBe(true);
 });

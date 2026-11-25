@@ -103,6 +103,8 @@ export function verifyPolicyInputs(env = process.env) {
   const { finalGate, finalGateStandards, sources } = resolveBuildPolicy({ env });
   return { v: 1, verify: resolveVerifySettings({ fileConfig: defaultFileConfig, env }).values,
     verifier: verifierIdentity(), finalGate, finalGateStandards,
+    runtimeEnv: Object.fromEntries(['NODE_OPTIONS', 'NODE_ENV', 'WE_TEST_SANDBOX']
+      .map(name => [name, env?.[name] == null ? null : String(env[name])])),
     sources: { finalGate: sources.finalGate, finalGateStandards: sources.finalGateStandards }, diffTestSelection: String(env?.[SELECTION_FLAG] ?? '') === '0' ? '0' : '1' };
 }
 

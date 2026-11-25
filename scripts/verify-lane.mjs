@@ -102,7 +102,7 @@ import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
 import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
-import { publishGreen, readSharedGreen } from './lib/verify-shared-marker.mjs';
+import { publishGreen, readSharedGreen, executedTestCount } from './lib/verify-shared-marker.mjs';
 import { verifyPolicyKey } from './lib/verify-lane-gate.mjs';
 import { repoSlugFromRemote } from './lib/lane-verify.mjs';
 import { basename } from 'node:path';
@@ -386,17 +386,20 @@ function maybePublishSharedGreen({ status, treeHash, skipped = null, revertRed =
     if (typeof flags.gate === 'string' || FORCE_LOCAL) return skip('explicit gate or local run');
     const ours = resolveBuildDefaultGate(process.env);
     if (!resolvedGate || !gateCommandsEqual(ours.command, GATE) || !gateCommandsEqual(resolvedGate.command, GATE)) return skip('executed gate differs from own env plan');
-    const command = resolvedGate.command;
-    const hasTestFiles = /(?:^|[\s'"])[^\s'"]+\.(?:test|spec)\.[cm]?[jt]sx?(?=$|[\s'"])/.test(command);
-    if (command.startsWith('echo ') || (command.includes('--passWithNoTests') && !hasTestFiles)
-      || !/(?:^|&&\s*|--\s+)(?:npx vitest(?:\s|$)|npm run (?:test:unit|check:standards)(?:\s|$)|node scripts\/check-standards\.mjs(?:\s|$))/.test(command)) return skip('executed gate has no test evidence');
+    if (resolvedGate.command.includes('--passWithNoTests')) return skip('gate permits no tests');
+    const decision = resolvedGate.decision, selection = decision?.selection;
+    if (decision?.forceFallback || selection?.forceFallback
+      || (decision?.mode !== 'full' || selection != null) && (!selection || selection.status !== 'complete'
+        || !Number.isSafeInteger(selection.fullTestCount) || selection.fullTestCount < 1
+        || selection.selectedTestCount !== selection.fullTestCount || selection.droppedCount !== 0)) return skip('incomplete selection');
+    if (!sharedTestCounts.length || sharedTestCounts.some(n => !Number.isSafeInteger(n) || n < 0)
+      || sharedTestCounts.reduce((sum, n) => sum + n, 0) < 1) return skip('runner execution count unavailable or zero');
+    if (decision?.standards?.run === false || !phaseResults.some(p => p.phase === 'standards'
+      && p.result.exitCode === 0 && !p.result.signal)) return skip('standards half did not pass');
     if (revertRed && revertRed.mode !== 'off' && revertRed.status !== 'clean') return skip('revert-red is not proven clean');
     const revertRedEvidence = !revertRed || revertRed.mode === 'off' ? null : { mode: revertRed.mode, status: revertRed.status };
     const sharedGit = args => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, env: laneGitHardeningEnv(process.env) });
-    const statusOut = sharedGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all']);
-    const cleanTree = statusOut.split('\n').filter(Boolean).every(line => line.startsWith('?? ') && isAllowlistedLitterPath(line.slice(3)));
-    if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree, skipped })) return skip('not a stable clean default-gate green');
     if (sharedGit(['ls-files', '-v']).split('\n').some(line => /^[a-zS] /.test(line))) return skip('assume-unchanged or skip-worktree entries');
     const repo = repoSlugFromRemote(sharedGit(['remote', 'get-url', 'origin']).trim());
     const mergeBase = sharedGit(['merge-base', 'HEAD', 'origin/main']).trim();
@@ -408,6 +411,10 @@ function maybePublishSharedGreen({ status, treeHash, skipped = null, revertRed =
       const base = readSharedGreen({ coordRoot, repo, sha: deltaBase, mergeBase, policyKey });
       if (!base || base.corrupt) return skip('delta base has no valid shared green under this policy');
     }
+    const statusOut = sharedGit(['-c', 'core.fileMode=true', 'status', '--porcelain', '--untracked-files=all']);
+    const cleanTree = statusOut.split('\n').filter(Boolean).every(line => line.startsWith('?? ') && isAllowlistedLitterPath(line.slice(3)));
+    if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree, skipped })) return skip('not a stable clean default-gate green');
+    if (sharedGit(['rev-parse', 'HEAD']).trim() !== headSha) return skip('HEAD moved since verification started');
     if (!publishGreen({ coordRoot, repo, sha: headSha, mergeBase, policyKey, record: { v: 1, writer: 'verify-lane', repo,
       sha: headSha, mergeBase, policyKey, revertRed: revertRedEvidence, status: 'green', exitCode: 0, executedGate: resolvedGate.command, selectionMode, deltaBase,
       finishedAt: new Date().toISOString(), lane: basename(REPO) } })) return skip('store publication failed');
@@ -1145,6 +1152,7 @@ const flakes = [];
 const loggedFlakeFiles = new Set();
 process.stderr.write(`verify-lane: retryFailed=${retryFailed} (${verifySettingSource('retryFailed', process.env)})\n`);
 const phaseResults = [];
+const sharedTestCounts = [];
 // The guard run writes vitest's JSON report here: the inventory of files that ACTUALLY executed, which is the only
 // proof every declared guard ran (vitest treats file arguments as filters, so a config-excluded guard is dropped
 // silently while the rest still pass). Removed in the gate's `finally`.
@@ -1154,6 +1162,32 @@ const alwaysRun = guardGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
+// Only direct, single Vitest commands can safely receive a new reporter. Shard wrappers and opaque npm
+// scripts have no aggregate runner receipt here: retain null evidence and refuse shared publication.
+// Existing guard/retry reports are reused so their execution-inventory consumers keep the same file.
+async function runCountedTestGate(phase, command, args, { reportFile = null, ...options } = {}) {
+  let reportDir = null;
+  const direct = args ? command === 'npx' && args[0] === 'vitest' && ['run', 'related'].includes(args[1])
+    : /^npx vitest (?:run|related)(?:\s|$)/.test(command) && !/[;&|<>`\r\n]/.test(command);
+  try {
+    if (!reportFile && direct) {
+      reportDir = mkdtempSync(join(tmpdir(), 'verify-test-count-'));
+      reportFile = join(reportDir, 'results.json');
+      const flags = ['--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
+      if (args) args = [...args, ...flags];
+      else command += ` --reporter=default --reporter=json --outputFile.json=${shellQuote(reportFile)}`;
+    }
+    const result = await timedRunGate(phase, command, args, options);
+    let count = null;
+    try {
+      if (reportFile && nodeFs.statSync(reportFile).size <= MAX_TIMEOUT_LOG_BYTES) count = executedTestCount(readFileSync(reportFile, 'utf8'));
+    } catch { /* Missing, remote-only or oversized reports cannot authorize shared reuse. */ }
+    sharedTestCounts.push(count);
+    return { ...result, executedTests: count };
+  } finally {
+    if (reportDir) rmSync(reportDir, { recursive: true, force: true });
+  }
+}
 // Retry commands use direct test-file filters, retain scan inputs, and write their own execution report.
 async function retryPhase(result, phase, previousOutcome, scanCommand) {
   if (phase === 'scan' && scanRetryCommand(scanCommand, ['npx', 'vitest', 'run']) === null) {
@@ -1177,8 +1211,8 @@ async function retryPhase(result, phase, previousOutcome, scanCommand) {
         const timeouts = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? verifySetting('testTimeoutFactor', process.env)).split(' ').filter(Boolean);
         const argv = isolatedRetryArgv(files, [...timeouts, '--reporter=default', '--reporter=json', `--outputFile.json=${report}`]);
         const retry = phase === 'scan'
-          ? await timedRunGate(`${phaseKind}Ms`, scanRetryCommand(scanCommand, argv), undefined, { outcomeKey: `${phase}-retry` })
-          : await timedRunGate(`${phaseKind}Ms`, argv[0], argv.slice(1), { outcomeKey: `${phase}-retry` });
+          ? await runCountedTestGate(`${phaseKind}Ms`, scanRetryCommand(scanCommand, argv), undefined, { outcomeKey: `${phase}-retry`, reportFile: report })
+          : await runCountedTestGate(`${phaseKind}Ms`, argv[0], argv.slice(1), { outcomeKey: `${phase}-retry`, reportFile: report });
         let retryReportText = null;
         try { if (nodeFs.statSync(report).size <= MAX_TIMEOUT_LOG_BYTES) retryReportText = readFileSync(report, 'utf8'); } catch { /* unproven execution stays red */ }
         return { ...retry, retryReportText };
@@ -1202,7 +1236,7 @@ async function retryPhase(result, phase, previousOutcome, scanCommand) {
 }
 const continueAfter = (r) => r.exitCode === 0 || (runAllPhases && !r.signal && !verificationInfrastructureFailure(r));
 try {
-  let result = await timedRunGate(phasedTestGate ? 'vitestMs' : null,
+  let result = await runCountedTestGate(phasedTestGate ? 'vitestMs' : null,
     // Item 59 (b) — a recognized default gate with a non-`vitest related` test half (a skipped-vitest echo)
     // runs the plan resolved under THIS (the daemon's) standards policy, not the requester's stamped command.
     // `GATE` stays the marker's `suites`, so the cache key still matches.
@@ -1222,7 +1256,7 @@ try {
       // load-slow file that passed the main run's 15 s budget times out again alone (ci-heal-4017: still-red at load 25).
       const timeoutFlags = scaledTimeoutFlags(resolvedGate.decision?.testTimeoutFactor ?? 1).split(' ').filter(Boolean);
       const retryArgv = isolatedRetryArgv(retriedFailures.map(f => f.file), timeoutFlags);
-      result = await timedRunGate('vitestMs', retryArgv[0], retryArgv.slice(1));
+      result = await runCountedTestGate('vitestMs', retryArgv[0], retryArgv.slice(1));
       isolatedRetry = result.exitCode === 0 && !result.signal ? FLAKY_OUTSIDE_DIFF : STILL_RED_IN_ISOLATION;
     }
   }
@@ -1234,7 +1268,7 @@ try {
     for (const scanCommand of resolvedGate.scanCommands ?? []) {
       process.stderr.write(`⏱ repo-scanning tests (scoped to changed files): ${scanCommand.replace(/^VERIFY_SCAN_FILES='[^']*'/, 'VERIFY_SCAN_FILES=<changed files>')}\n`);
       const previousOutcome = outcomes.scan;
-      let scan = await timedRunGate('scanMs', scanCommand);
+      let scan = await runCountedTestGate('scanMs', scanCommand);
       if (scan.exitCode !== 0) process.stderr.write(scanFailureDiagnostic(scan, scanCommand));
       if (retryFailed > 0) scan = await retryPhase(scan, 'scan', previousOutcome, scanCommand);
       phaseResults.push({ phase: 'scan', result: scan });
@@ -1246,7 +1280,7 @@ try {
   if (guardGate && alwaysRun.command && continueAfter(phaseResults.at(-1).result)) {
     process.stderr.write(`⏱ always-run guard tests (#99): ${alwaysRun.files.length} file(s)\n`);
     const started = performance.now();
-    let guard = await timedRunGate('scanMs', alwaysRun.command, undefined, { outcomeKey: 'guard' });
+    let guard = await runCountedTestGate('scanMs', alwaysRun.command, undefined, { outcomeKey: 'guard', reportFile: alwaysRunReport });
     alwaysRun.executed = true;
     alwaysRun.ms = performance.now() - started;
     {
@@ -1337,6 +1371,8 @@ if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, 
 
 const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
   alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
+builtPhases.executedTests = sharedTestCounts.length && sharedTestCounts.every(Number.isSafeInteger)
+  ? sharedTestCounts.reduce((sum, n) => sum + n, 0) : null;
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
 
 const retryAudit = isolatedRetryAudit(retriedFailures, isolatedRetry);

@@ -20,6 +20,28 @@ const REPO = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
 const FIELDS = ['v', 'writer', 'repo', 'sha', 'mergeBase', 'revertRed', 'policyKey', 'status', 'exitCode', 'executedGate', 'selectionMode', 'deltaBase', 'finishedAt', 'lane'].sort();
 const ownerOnly = (st, uid) => Number.isInteger(uid) && st.uid === uid && (st.mode & 0o077) === 0;
 
+/** Runner evidence only. null means absent, malformed or incomplete; zero is a proven no-test run. */
+export function executedTestCount(reportText) {
+  try {
+    const report = JSON.parse(reportText);
+    const counters = ['numTotalTests', 'numPendingTests', 'numTodoTests', 'numPassedTests', 'numFailedTests'];
+    if (!counters.every(k => Number.isSafeInteger(report?.[k]) && report[k] >= 0)) return null;
+    const { numTotalTests: total, numPendingTests: pending, numTodoTests: todo,
+      numPassedTests: passed, numFailedTests: failed } = report;
+    if (Array.isArray(report.testResults)) {
+      // Vitest 1.x includes skipped/todo in numPassedTests and omits skipped from numPendingTests.
+      // Its assertion inventory still reports their actual status: subtract those from the runner's total.
+      if (!report.testResults.every(file => Array.isArray(file?.assertionResults))) return null;
+      const assertions = report.testResults.flatMap(file => file.assertionResults);
+      if (assertions.length !== total || assertions.some(a => !['passed', 'failed', 'pending', 'skipped', 'todo'].includes(a?.status))) return null;
+      if (assertions.filter(a => a.status === 'failed').length !== failed) return null;
+      return total - assertions.filter(a => !['passed', 'failed'].includes(a.status)).length;
+    }
+    const executed = total - pending - todo;
+    return executed >= 0 && executed === passed + failed ? executed : null;
+  } catch { return null; }
+}
+
 export function sharedMarkerPath({ coordRoot, repo, sha, mergeBase, policyKey }) {
   if (typeof coordRoot !== 'string' || !coordRoot || typeof repo !== 'string' || !REPO.test(repo)
     || typeof sha !== 'string' || !SHA.test(sha) || typeof mergeBase !== 'string' || !SHA.test(mergeBase) || typeof policyKey !== 'string' || !POLICY.test(policyKey)) return null;
