@@ -5,6 +5,7 @@
 // Usage (CI): node scripts/ci/mq-result-reuse.mjs   env: GITHUB_SHA GITHUB_REPOSITORY GITHUB_TOKEN GITHUB_EVENT_NAME
 // Writes reuse=true|false to $GITHUB_OUTPUT and one summary line to $GITHUB_STEP_SUMMARY and stdout.
 import { appendFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const CI_WORKFLOW_ID = 382175354;
@@ -78,7 +79,23 @@ export function githubReads({ repo, token, fetchImpl = fetch }) {
     return res.json();
   };
   return {
-    listQueueRuns: async (sha) => (await api(`/repos/${repo}/actions/workflows/${CI_WORKFLOW_ID}/runs?event=merge_group&head_sha=${sha}&per_page=20`)).workflow_runs ?? [],
+    listQueueRuns: async (sha) => {
+      // Ruleset-pinned queue workflow IDs are not addressable via /actions/workflows/<id>/runs.
+      // Read the repository endpoint, then filter identity only after proving the listing complete.
+      const runs = [];
+      let total;
+      for (let page = 1; page <= 10; page += 1) {
+        const res = await api(`/repos/${repo}/actions/runs?event=merge_group&head_sha=${sha}&per_page=100&page=${page}`);
+        if (!Array.isArray(res.workflow_runs) || !Number.isInteger(res.total_count) || res.total_count < 0
+          || res.total_count > 1000 || (total !== undefined && total !== res.total_count)) throw new Error('incomplete runs listing');
+        total = res.total_count;
+        runs.push(...res.workflow_runs);
+        if (runs.length >= total || res.workflow_runs.length === 0) break;
+      }
+      if (runs.length !== total || runs.some(r => !Number.isSafeInteger(r?.id) || r.id <= 0)
+        || new Set(runs.map(r => r.id)).size !== total) throw new Error('runs listing incomplete');
+      return runs.filter(r => r.workflow_id === CI_WORKFLOW_ID);
+    },
     listRunJobs: async (runId) => {
       const jobs = [];
       let total = null;
@@ -97,8 +114,23 @@ export function githubReads({ repo, token, fetchImpl = fetch }) {
 
 /** Current quarantine guard; injected dependencies also exercise the real adapter without network access. */
 export async function quarantineClear({ readQuarantine, activeEntries, board = process.cwd(), run, now = Date.now() } = {}) {
-  readQuarantine ??= (await import('../lib/red-main-quarantine-io.mjs')).readQuarantine;
-  activeEntries ??= (await import('../lib/red-main-quarantine.mjs')).activeEntries;
+  const rules = await import('../lib/red-main-quarantine.mjs');
+  activeEntries ??= rules.activeEntries;
+  if (!readQuarantine) {
+    // This checkout-only job must not load the quarantine writer's npm dependencies.
+    // Reuse the shared transport and schema, with the same read timeout as the writer's reader.
+    const { readFromTransportBranch } = await import('../lib/git-transport-branch.mjs');
+    readQuarantine = ({ board, run = (args, options) => execFileSync('git', args, {
+      ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
+    }) }) => {
+      try {
+        const got = readFromTransportBranch({ board, branch: rules.QUARANTINE_BRANCH, paths: [rules.QUARANTINE_LIST_PATH], run });
+        const text = got[rules.QUARANTINE_LIST_PATH];
+        const list = text == null ? { version: 1, entries: [] } : JSON.parse(text);
+        return { ok: rules.validateQuarantineList(list).ok, list };
+      } catch { return { ok: false }; }
+    };
+  }
   const got = readQuarantine({ board, ...(run ? { run } : {}) });
   return got.ok === true && activeEntries(got.list, { now }).length === 0;
 }

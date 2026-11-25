@@ -248,8 +248,6 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
-  // The quarantine guard dynamically imports a lock holder, so the conservative source scan includes it.
-  'scripts/ci/mq-result-reuse.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
@@ -335,6 +333,8 @@ export const LOCK_USERS = Object.freeze([
 // blocks more, and the audit-verdict test lists that over-capture.
 // A Set: the lock users repeat a few modules other entries already name.
 export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
+  // The checkout-only reuse reader no longer imports a lock holder; its CI skip verdict remains protected.
+  'scripts/ci/mq-result-reuse.mjs',
   'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
   'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
   'scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs', 'scripts/lib/strict-utc-timestamp.mjs',

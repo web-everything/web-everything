@@ -19,14 +19,119 @@ const matrix = [
 const ok = (name) => ({ name, conclusion: 'success', steps: [{ name: RECEIPT, conclusion: 'success' }] });
 const fullJobs = () => [...matrix, ...required].map(ok);
 const workflow = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8'));
-const run = (over = {}) => ({ id: 7, head_sha: SHA, event: 'merge_group', status: 'completed', conclusion: 'success', ...over });
+const run = (over = {}) => ({ id: 7, workflow_id: 382175354, head_sha: SHA, event: 'merge_group', status: 'completed', conclusion: 'success', ...over });
 
 const go = (runs, jobs, extra = {}) =>
   decide({ listQueueRuns: async () => runs, listRunJobs: async () => jobs, sha: SHA, event: 'push', quarantineClear: async () => true, ...extra });
-const fakeFetch = (runs, body) => async (url) => ({ ok: true, json: async () => (String(url).includes('/jobs') ? body : { workflow_runs: runs }) });
+// Repository endpoint confirmed by review's live probe (run 45531076311, workflow_id 382175354).
+// The ruleset-pinned workflow ID does NOT resolve under actions/workflows/<id>/runs.
+const runsUrl = `https://api.github.com/repos/o/r/actions/runs?event=merge_group&head_sha=${SHA}&per_page=100&page=1`;
+const jobsUrl = 'https://api.github.com/repos/o/r/actions/runs/7/jobs?filter=latest&per_page=100&page=1';
+const response = (body, status = 200) => ({ ok: status === 200, status, json: async () => body });
+const fakeFetch = (runs, body) => async (url) => {
+  if (url === runsUrl) return response({ workflow_runs: runs, total_count: runs.length });
+  if (/^https:\/\/api\.github\.com\/repos\/o\/r\/actions\/runs\/7\/jobs\?filter=latest&per_page=100&page=\d+$/.test(url)) return response(body);
+  return response({ message: 'Not Found' }, 404);
+};
 const without = (name) => fullJobs().filter((j) => j.name !== name);
 
 describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha, full run)', () => {
+  it('uses the recorded repository runs endpoint and filters the queue workflow identity', async () => {
+    const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([
+      run(), run({ id: 99, workflow_id: 305968843, conclusion: 'failure' }),
+    ], { jobs: fullJobs(), total_count: fullJobs().length }) });
+    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true })).toMatchObject({ reuse: true, runId: 7 });
+    const unrelated = githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([run({ workflow_id: 1 })], {}) });
+    expect(await unrelated.listQueueRuns(SHA)).toEqual([]);
+  });
+  it.each(['runs', 'jobs'])('HTTP errors from either provider endpoint refuse an otherwise reusable run: %s', async endpoint => {
+    const good = fakeFetch([run()], { jobs: fullJobs(), total_count: fullJobs().length });
+    const fetchImpl = async url => url === (endpoint === 'runs' ? runsUrl : jobsUrl)
+      // Valid-looking bodies make removing the HTTP guard a discriminating mutation.
+      ? response(endpoint === 'runs' ? { workflow_runs: [run()], total_count: 1 } : { jobs: fullJobs(), total_count: fullJobs().length }, 503)
+      : good(url);
+    const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl });
+    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }))
+      .toEqual({ reuse: false, why: 'error: GitHub API 503' });
+  });
+  it('includes a newer failed queue run on a later repository page', async () => {
+    const pages = [Array.from({ length: 100 }, (_, i) => run({ id: i + 10, workflow_id: 1 })), [run(), run({ id: 9, conclusion: 'failure' })]];
+    const fetchImpl = async url => {
+      if (url.includes('/jobs?')) return response({ jobs: fullJobs(), total_count: fullJobs().length });
+      const page = Number(new URL(url).searchParams.get('page'));
+      return response({ workflow_runs: pages[page - 1] ?? [], total_count: 102 });
+    };
+    const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl });
+    expect(await decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }))
+      .toEqual({ reuse: false, why: 'run completed/failure' });
+  });
+  it.each([{}, { workflow_runs: [run()] }, { workflow_runs: [], total_count: 1 }, { workflow_runs: [run()], total_count: 1001 },
+    { workflow_runs: [run(), run()], total_count: 2 }, { workflow_runs: [run({ id: null })], total_count: 1 },
+  ])('refuses incomplete or oversized repository runs evidence: %j', async body => {
+    const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl: async () => response(body) });
+    await expect(reads.listQueueRuns(SHA)).rejects.toThrow(/runs listing/);
+  });
+  it('executes the checkout-only reuse script and dynamic quarantine imports without external packages', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mq-no-packages-'));
+    try {
+      const loader = join(dir, 'no-packages.mjs');
+      writeFileSync(loader, `export async function resolve(specifier, context, next) {
+        if (!specifier.startsWith('node:') && !specifier.startsWith('file:') && !specifier.startsWith('.') && !specifier.startsWith('/'))
+          throw new Error('checkout-only job cannot import package: ' + specifier);
+        const result = await next(specifier, context);
+        if (result.url.includes('/node_modules/')) throw new Error('checkout-only job cannot load node_modules');
+        return result;
+      }`);
+      const script = `import { main } from ${JSON.stringify(new URL('../mq-result-reuse.mjs', import.meta.url).href)};
+        await main({ env: ${JSON.stringify({ GITHUB_SHA: SHA, GITHUB_REPOSITORY: 'o/r', GITHUB_EVENT_NAME: 'push', GITHUB_OUTPUT: join(dir, 'output') })},
+          fetchImpl: async url => ({ ok: true, json: async () => url.includes('/jobs?')
+            ? ${JSON.stringify({ jobs: fullJobs(), total_count: fullJobs().length })}
+            : ${JSON.stringify({ workflow_runs: [run()], total_count: 1 })} }),
+          quarantineOptions: { run: args => {
+            if (args[0] === 'fetch') return '';
+            if (args[0] === 'ls-tree') return 'quarantine.json';
+            if (args[0] === 'show') return '{"version":1,"entries":[]}';
+            throw new Error('unexpected git operation: ' + args[0]);
+          } }
+        });`;
+      const result = spawnSync(process.execPath, ['--experimental-loader', loader, '--input-type=module', '-e', script], { cwd: dir, encoding: 'utf8', timeout: 15000 });
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(join(dir, 'output'), 'utf8'), result.stdout).toBe('reuse=true\n');
+      expect(result.stdout).toContain(`REUSING merge-queue run 7 for ${SHA}`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['summary', 'first-output'])('CLI catch writes a final reuse=false after %s write failure', kind => {
+    const dir = mkdtempSync(join(tmpdir(), 'mq-catch-'));
+    try {
+      const preload = join(dir, 'preload.mjs');
+      writeFileSync(preload, `import fs from 'node:fs'; import child from 'node:child_process'; import { syncBuiltinESMExports } from 'node:module';
+        globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('/jobs?')
+          ? ${JSON.stringify({ jobs: fullJobs(), total_count: fullJobs().length })}
+          : ${JSON.stringify({ workflow_runs: [run()], total_count: 1 })} });
+        child.execFileSync = (command, args) => {
+          if (command !== 'git') throw new Error('unexpected command');
+          if (args[0] === 'fetch') return '';
+          if (args[0] === 'ls-tree') return 'quarantine.json';
+          if (args[0] === 'show') return '{"version":1,"entries":[]}';
+          throw new Error('unexpected git operation: ' + args[0]);
+        };
+        const append = fs.appendFileSync; let first = true;
+        fs.appendFileSync = (...args) => {
+          if (${JSON.stringify(kind)} === 'first-output' && first) { first = false; throw new Error('first output refused'); }
+          return append(...args);
+        }; syncBuiltinESMExports();`);
+      const output = join(dir, 'output');
+      const result = spawnSync(process.execPath, ['--import', preload, new URL('../mq-result-reuse.mjs', import.meta.url).pathname], {
+        cwd: dir, encoding: 'utf8', timeout: 15000,
+        env: { ...process.env, GITHUB_EVENT_NAME: kind === 'summary' ? 'push' : 'pull_request', GITHUB_SHA: SHA,
+          GITHUB_REPOSITORY: 'o/r', GITHUB_OUTPUT: output, GITHUB_STEP_SUMMARY: dir },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('full run (error:');
+      if (kind === 'summary') expect(result.stdout).toContain('REUSING merge-queue run 7');
+      expect(readFileSync(output, 'utf8').trim().split('\n').at(-1)).toBe('reuse=false');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('reuses an identical full successful merge-queue run', async () => {
     const v = await go([run()], fullJobs());
     expect(v.reuse).toBe(true);
@@ -132,7 +237,7 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     expect(workflow.jobs.changes.outputs.reuse).toBe('${{ steps.reuse.outputs.reuse }}');
     expect(workflow.jobs['soak-shard'].if).toContain("needs.changes.outputs.reuse != 'true'");
   });
-  it.each(['active', 'expired', 'empty', 'unreadable'])('reads %s quarantine through the real IO adapter and predicate', async kind => {
+  it.each(['active', 'expired', 'empty', 'unreadable', 'absent', 'malformed', 'invalid'])('reads %s quarantine through the real IO adapter and predicate', async kind => {
     const dir = mkdtempSync(join(tmpdir(), 'mq-quarantine-'));
     const list = addEntries(null, { tests: ['scripts/a.test.mjs'], brokenSha: SHA, owner: 'fixture', reason: 'fixture', actor: 'operator', now: 1000, ttlMs: 1000 }).list;
     writeFileSync(join(dir, 'quarantine.json'), JSON.stringify(kind === 'empty' ? { version: 1, entries: [] } : list));
@@ -145,13 +250,13 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
           if (kind === 'unreadable') throw new Error('unreadable quarantine');
           return '';
         }
-        if (args[0] === 'ls-tree') return 'quarantine.json';
-        if (args[0] === 'show') return readFileSync(join(dir, 'quarantine.json'), 'utf8');
+        if (args[0] === 'ls-tree') return kind === 'absent' ? '' : 'quarantine.json';
+        if (args[0] === 'show') return kind === 'malformed' ? '{' : kind === 'invalid' ? '{"version":2,"entries":[]}' : readFileSync(join(dir, 'quarantine.json'), 'utf8');
         throw new Error(`unexpected transport command ${args[0]}`);
       } });
-      expect(clear).toBe(['empty', 'expired'].includes(kind));
+      expect(clear).toBe(['empty', 'expired', 'absent'].includes(kind));
       expect(calls[0]).toContain('+refs/heads/ops/quarantine:refs/remotes/origin/ops/quarantine');
-      if (kind !== 'unreadable') expect(calls.at(-1)).toEqual(['show', 'origin/ops/quarantine:quarantine.json']);
+      if (!['unreadable', 'absent'].includes(kind)) expect(calls.at(-1)).toEqual(['show', 'origin/ops/quarantine:quarantine.json']);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([
