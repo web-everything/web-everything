@@ -1521,7 +1521,10 @@ export function acquireGhPointsSync({
           if (decision.allowed) { writeGhPointsAtomic(legacyPath, decision.nextState); return { ok: true, waitedMs, timedOut: false }; }
         } else {
           let s = readGhPointsJson(bucketPath), legacy = readGhPointsJson(legacyPath);
-          if (!bucketStateValid(s)) { s = resetGhBucket(nowMs); log({ outcome: 'points_state_reset' }); }
+          // A never-written bucket is a first start: full bucket (compat still checks the legacy window).
+          // Only an existing but unreadable/invalid file is conservative (-60 tokens, batch cap full).
+          if (s == null && !existsSync(bucketPath)) s = { ...resetGhBucket(nowMs), tokens: 60, batchLog: [] };
+          else if (!bucketStateValid(s)) { s = resetGhBucket(nowMs); log({ outcome: 'points_state_reset' }); }
           if (s.pendingLegacy) {
             // A crash may precede OR follow the legacy rename. Max, never add, makes repair idempotent.
             const pending = s.pendingLegacy;

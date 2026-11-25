@@ -96,7 +96,12 @@ it('unreadable-state-never-adds-capacity', () => {
   mkdirSync(bucketFile());
   expect(() => acquire({ pointClass: 'batch', timeoutMs: 0 })).toThrow();
 });
-it('missing-state-default-is-conservative', () => {
+it('never-written-state-is-a-full-first-start-bucket', () => {
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0 }).ok).toBe(true);
+  expect(load(bucketFile()).tokens).toBe(60 - 1);
+});
+it('existing-corrupt-state-is-conservative-not-a-first-start', () => {
+  writeFileSync(bucketFile(), '{not json');
   expect(acquire({ pointClass: 'batch', timeoutMs: 0 }).ok).toBe(false);
   expect(load(bucketFile()).tokens).toBe(-60);
 });
