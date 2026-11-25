@@ -2,7 +2,7 @@ import { createHotpatchReaders, smokeHotpatchReaders } from '../hotpatch-readers
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { receiptGuard, auditGuard, ciDefinitionGuard, resolveHotpatchKnobs, admitHotpatch } from '../hotpatch-guards.mjs';
-import { hotpatchFixture, HP_SHA as SHA } from './fixtures/hotpatch.mjs';
+import { hotpatchFixture, ciControlFiles, HP_SHA as SHA } from './fixtures/hotpatch.mjs';
 import { resolvePriorQuestionHashes } from '../../operations/codex-audit.mjs';
 import { decideCiSkip, addEntries, setFixPrs } from '../red-main-quarantine.mjs';
 import { urgentMarker, urgentSignature, urgentFuiRepo, urgentLedger, urgentKeyPath } from '../../operations/urgent-verify-marker.mjs';
@@ -27,8 +27,28 @@ function signedUrgentEvidence() {
   return { marker, ledger, key };
 }
 describe('hotpatch admission', () => {
+  it('refuses the local import closure of CI commands, npm tests and tool configs (RS-HP-2 wiring condition)', async () => {
+    const controls = ciControlFiles();
+    for (const path of ['scripts/lib/write-all-sync.mjs', 'scripts/lib/test-result-cache.mjs',
+      'scripts/lib/trust-chain-tier.mjs', 'scripts/test-cache/trace-setup.mjs',
+      'scripts/readiness/forge-exec-siblings.mjs', 'eleventy/filters.cjs', '.nvmrc', '.eleventy.js']) {
+      expect(controls.has(path), `CI graph must include ${path}`).toBe(true);
+    }
+    const admitted = [];
+    for (const path of controls) {
+      const { data, readers } = hotpatchFixture(); data.paths = [path];
+      const decision = await ciDefinitionGuard(SHA, readers);
+      if (decision.outcome !== 'fail' || decision.detail !== 'hotpatch-ci-definition-change') admitted.push(path);
+    }
+    expect(admitted).toEqual([]);
+  });
   it('admits complete bound green CI and an own-sha canonical audit', async () => {
     expect(await admitHotpatch(SHA, hotpatchFixture().readers)).toMatchObject({ outcome: 'pass' });
+  });
+  it('keeps application and documentation changes eligible for hotpatch admission', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.paths = ['blocks/example.ts', 'src/css/site.css', 'docs/guide.md'];
+    expect(await admitHotpatch(SHA, readers)).toMatchObject({ outcome: 'pass', detail: 'hotpatch-admitted' });
   });
   it('a success test check from another app or an unbound workflow is not a receipt', async () => {
     for (const mutate of [d => { d.checks.check_runs[0].app.id = 1; }, d => { d.workflows.workflow_runs[0].path = '.github/workflows/other.yml'; }, d => { d.workflows.workflow_runs[0].head_sha = 'b'.repeat(40); }]) {
@@ -223,7 +243,9 @@ describe('hotpatch production readers', () => {
   });
   it.each(['scripts/conveyor/soak/shard-plan.mjs', 'scripts/conveyor/soak/shard-plan.settings.json',
     'scripts/conveyor/soak/new-selector.mjs', 'scripts/check-standards-rules.mjs',
-    'scripts/check-standards-rules/selection.mjs', '.npmrc', 'tsconfig.json', 'tsconfig.test.json'])(
+    'scripts/check-standards-rules/selection.mjs', '.npmrc', 'tsconfig.json', 'tsconfig.test.json',
+    'scripts/test-cache/trace-setup.mjs', 'scripts/lib/test-result-cache.mjs',
+    'scripts/lib/trust-chain-tier.mjs', 'scripts/lib/write-all-sync.mjs', '.nvmrc', '.eleventy.js'])(
     'production admission refuses CI execution control %s', async path => {
       const f = production(); f.evidence.diff = `${path}\0`;
       expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'fail', detail: 'hotpatch-ci-definition-change' });
