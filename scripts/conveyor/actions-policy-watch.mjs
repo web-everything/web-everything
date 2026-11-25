@@ -23,6 +23,7 @@ export function evaluatePolicy(policy, cfg) {
   if (typeof policy !== 'object' || Array.isArray(policy) || !Array.isArray(policy.rules)) {
     return { status: 'unknown', reason: 'unexpected policy response shape' };
   }
+  if (policy.id !== cfg.policyId) return { status: 'unknown', reason: `policy id ${policy.id} is not ${cfg.policyId}` };
   const allowed = [];
   for (const rule of policy.rules) {
     if (rule?.event !== cfg.event) continue;
@@ -52,22 +53,36 @@ export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set() })
     // 403/404 (or any error) is unreadable, never ok and never a confirmed absence (SHIP-API-014).
     policy = { status: 'unknown', reason: 'policy API unavailable or unreadable (403/404/other); check token admin:org read and the endpoint' };
   }
-  let changelog = [];
-  try { changelog = evaluateChangelog(await fetchFeed(cfg.changelogFeed), cfg, seen); } catch { /* feed is best effort */ }
+  // Policy alert is built first so a slow or failing feed can never withhold it.
   const alerts = [];
   if (policy.status !== 'ok') alerts.push(`needs-you: actions policy ${cfg.policyId} ${policy.status}: ${policy.reason}`);
+  let changelog = [];
+  let feed = { status: 'ok' };
+  try { changelog = evaluateChangelog(await fetchFeed(cfg.changelogFeed), cfg, seen); } catch (e) {
+    feed = { status: 'unknown', reason: String(e?.message ?? e).slice(0, 120) };
+    alerts.push(`needs-you: changelog feed unreadable (${feed.reason}); sunset posts are unwatched`);
+  }
   for (const i of changelog) alerts.push(`needs-you: changelog "${i.title}" mentions the allow-policy (${i.id})`);
-  return { policy, changelog, alerts };
+  return { policy, feed, changelog, alerts };
 }
 
-async function fetchFeedText(url) {
-  const res = await fetch(url);
-  const xml = await res.text();
-  return [...xml.matchAll(/<(?:item|entry)>([\s\S]*?)<\/(?:item|entry)>/g)].map((m) => {
-    const tag = (n) => (m[1].match(new RegExp(`<${n}[^>]*>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${n}>`)) ?? [])[1] ?? '';
+/** Pure: RSS or Atom text -> items. Throws when the text is not a feed. */
+export function parseFeed(xml) {
+  if (typeof xml !== 'string' || !/<(?:rss|feed)\b/.test(xml)) throw new Error('response is not an RSS/Atom feed');
+  return [...xml.matchAll(/<(item|entry)\b[^>]*>([\s\S]*?)<\/\1>/g)].map((m) => {
+    const tag = (n) => (m[2].match(new RegExp(`<${n}\\b[^>]*>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${n}>`)) ?? [])[1] ?? '';
     return { id: tag('guid') || tag('id') || tag('link'), title: tag('title'), summary: tag('description') || tag('summary') };
   });
 }
+
+export async function fetchFeedText(url, fetchImpl = fetch) {
+  const res = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+  return parseFeed(await res.text());
+}
+
+/** The only gh invocation: a plain GET (no method, field or input flags). */
+export const ghReadArgs = (endpoint) => ['api', endpoint];
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const argv = process.argv.slice(2);
@@ -77,7 +92,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     || JSON.parse(execFileSync('gh', ['repo', 'view', '--json', 'owner'], { encoding: 'utf8', maxBuffer: 1024 * 1024 })).owner.login;
   const result = await runWatch({
     cfg, org, fetchFeed: fetchFeedText,
-    ghApi: async (endpoint) => execFileSync('gh', ['api', endpoint], { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
+    ghApi: async (endpoint) => execFileSync('gh', ghReadArgs(endpoint), { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
   });
   process.stdout.write(argv.includes('--json') ? `${JSON.stringify(result)}\n` : `${result.alerts.join('\n') || 'ok'}\n`);
   process.exitCode = result.alerts.length ? 1 : 0;

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { evaluatePolicy, evaluateChangelog, runWatch } from '../actions-policy-watch.mjs';
+import { evaluatePolicy, evaluateChangelog, runWatch, parseFeed, fetchFeedText, ghReadArgs } from '../actions-policy-watch.mjs';
 
 const cfg = {
   policyId: 17152,
@@ -49,6 +49,29 @@ describe('actions-policy-watch', () => {
       fetchFeed: async () => items,
     });
     expect(r.alerts.length).toBe(1);
+  });
+  it('a policy with a wrong or absent id is unknown, not ok', () => {
+    expect(evaluatePolicy({ id: 1, rules: [{ event: 'pull_request_target', workflows: ['.github/workflows/merge-gate.yml'] }] }, cfg).status).toBe('unknown');
+    expect(evaluatePolicy({ rules: [{ event: 'pull_request_target', workflows: ['.github/workflows/merge-gate.yml'] }] }, cfg).status).toBe('unknown');
+  });
+  it('parses Atom entries with attributes and rejects non-feed responses', async () => {
+    const atom = '<feed xmlns="x"><entry xml:lang="en"><id>z1</id><title xml:lang="en">Allow-policy sunset</title></entry></feed>';
+    expect(parseFeed(atom)).toEqual([{ id: 'z1', title: 'Allow-policy sunset', summary: '' }]);
+    expect(() => parseFeed('<html>503</html>')).toThrow();
+    const res = (ok, status, body) => async () => ({ ok, status, text: async () => body });
+    await expect(fetchFeedText('u', res(false, 503, '<html/>'))).rejects.toThrow(/503/);
+    expect((await fetchFeedText('u', res(true, 200, atom))).length).toBe(1);
+  });
+  it('a failed feed raises a feed alert and never hides the policy alert', async () => {
+    const r = await runWatch({
+      cfg, org: 'o', ghApi: async () => JSON.stringify(policy(['.github/workflows/merge-gate.yml', 'x.yml'])),
+      fetchFeed: async () => { throw new Error('feed HTTP 503'); },
+    });
+    expect(r.alerts.length).toBe(2);
+    expect(r.feed.status).toBe('unknown');
+  });
+  it('the production gh invocation is a plain GET', () => {
+    expect(ghReadArgs('orgs/o/actions/policies/17152')).toEqual(['api', 'orgs/o/actions/policies/17152']);
   });
   it('is read-only: only GET-style endpoint reads reach the client', async () => {
     const calls = [];
