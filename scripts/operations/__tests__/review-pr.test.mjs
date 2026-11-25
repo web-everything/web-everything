@@ -54,6 +54,7 @@ import {
   overridesJuror,
   reviewPrOperation as buildReviewPrOperation,
   shapeReadFinding,
+  buildCodexCorrectnessJudgeRequest,
   REVIEW_JUROR_TOOLS,
   JUDGE_STEPS,
   SECURITY_LENS,
@@ -4803,7 +4804,7 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
   describe('the adapter honours a no-spawn answer', () => {
     it('a request carrying skipSpawn.answer is answered without ever reaching a provider; an ordinary request still does', async () => {
       const provider = vi.fn(async () => ({ value: { summary: 'spawned', results: [] } }));
-      const judge = createDefaultJudge({ provider });
+      const judge = createDefaultJudge({ resolveProvider: () => provider });
       const read = shapeReadFinding(stubReader({ netRev: PINNED_HEAD })({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
       const none = buildReviewReferralVerifierJudgeRequest({ read, candidates: [] });
       expect(unwrapJudgeOutcome(await judge(none)).value).toEqual({ summary: 'nothing to verify', results: [] });
@@ -5053,10 +5054,10 @@ describe('review.seatRouting.correctness=B through the real roster builder', () 
       if (prev === undefined) delete process.env.WE_REVIEW_SEAT_ROUTING_CORRECTNESS; else process.env.WE_REVIEW_SEAT_ROUTING_CORRECTNESS = prev;
     }
   }
-  it('a Claude-built PR gets a codex correctness seat with the same tools, security stays Claude, not an advisory seat', () => {
+  it('a Claude-built PR gets a codex correctness seat with the no tools, security stays Claude, not an advisory seat', () => {
     const { run, requests } = routed({ commitMessages: CLAUDE_TRAILER });
     expect(requests.judge.providerName).toBe('codex');
-    expect(requests.judge.allowedTools).toEqual(['Bash', 'Read', 'Grep', 'Glob']);
+    expect(requests.judge.allowedTools).toBeUndefined();
     expect(requests.judgeSecurity.providerName).toBeUndefined();
     expect(requests.judgeSecurity.allowedTools).toEqual(['Bash', 'Read', 'Grep', 'Glob']);
     expect(run.findings.read.correctnessVendor).toBe('codex');
@@ -5070,5 +5071,18 @@ describe('review.seatRouting.correctness=B through the real roster builder', () 
   it('mode A never moves the seat; a missing commit read keeps Claude', () => {
     expect(routed({ commitMessages: CLAUDE_TRAILER, mode: 'A' }).requests.judge.providerName).toBeUndefined();
     expect(routed({ commitMessages: undefined }).requests.judge.providerName).toBeUndefined();
+  });
+});
+
+describe('mode B correctness request through the real judge boundary', () => {
+  it('createDefaultJudge accepts the Codex correctness request, runs it on codex, and still refuses a tool-bearing one', async () => {
+    const read = shapeReadFinding(stubReader()({ pr: 7, repo: 'o/n' }), { pr: 7, repo: 'o/n' });
+    const request = buildCodexCorrectnessJudgeRequest(read, '');
+    expect(request.allowedTools).toBeUndefined();
+    const provider = vi.fn(async () => ({ value: CLEAN_ANSWER }));
+    const judge = createDefaultJudge({ resolveProvider: () => provider });
+    await expect(judge(request)).resolves.toBeDefined();
+    expect(provider).toHaveBeenCalledTimes(1);
+    await expect(judge({ ...request, allowedTools: ['Read'] })).rejects.toThrow();
   });
 });

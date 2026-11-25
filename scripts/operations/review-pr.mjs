@@ -1622,13 +1622,14 @@ export function buildCardOnlyJudgeRequest(read, aim = '') {
 }
 
 /**
- * review.seatRouting.correctness=B — the MANDATORY correctness seat on Codex. Same recipe and the SAME
- * `allowedTools` as the Claude seat (`buildReviewJudgeRequest`); only the vendor (`providerName`) and the
- * sandbox correction differ. It is a mandatory seat, never an advisory one: it does not count toward
+ * review.seatRouting.correctness=B — the MANDATORY correctness seat on Codex. Same recipe as the Claude seat
+ * (`buildReviewJudgeRequest`) minus `allowedTools`: Codex is tool-free by contract (it always gets its own
+ * read-only shell) and `createDefaultJudge` refuses a tool-bearing codex request, exactly as for
+ * {@link buildCardOnlyJudgeRequest}. It is a mandatory seat, never an advisory one: it does not count toward
  * `minNonClaudeSeats`.
  */
 export function buildCodexCorrectnessJudgeRequest(read, aim = '') {
-  const { model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
+  const { allowedTools, model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
   return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION };
 }
 
