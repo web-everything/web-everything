@@ -303,7 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
-  'fix-join-wait', 'no-code-rearm-held', 'no-code-rearm-spent', 'no-code-rearm-failed',
+  'fix-join-wait', 'no-code-rearm-held', 'comments-unreadable', 'no-code-rearm-spent', 'no-code-rearm-failed',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
@@ -2500,6 +2500,13 @@ export function planReconcile({
     // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
     // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
+    // Fail closed: on a bounced (review:changes) open PR a missing or non-array thread hides any no-code ruling,
+    // so nothing is planned on it (ordinary healing would otherwise run past the ruling).
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && !pr?.isDraft && !Array.isArray(pr?.comments)
+      && labelNames(pr?.labels).includes('review:changes')) {
+      refuse('comments-unreadable', { why: 'the comment thread is missing or unreadable, so an operator ruling (incl. a no-code rearm) cannot be ruled out; nothing is decided on this view' });
+      continue;
+    }
     if (threadMayBeTruncated(pr)) {
       refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
       continue;

@@ -330,7 +330,8 @@ export function hasInvalidArgs(argv) {
       if (seen.has(name)) return true;
       seen.add(name);
     }
-    if (a.startsWith('--repo=') && !/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
+    if (a.startsWith('--actor=') && !isSafeRearmActor(a.slice('--actor='.length))) return true;
+    if (a.startsWith('--repo=') &&!/^--repo=[\w.-]+\/[\w.-]+$/.test(a)) return true;
     if (a.startsWith('--expect-head=') && !/^--expect-head=[0-9a-f]{40}$/i.test(a)) return true;
   }
   return false;
@@ -349,7 +350,12 @@ export function buildNoChangeComment({ actor, since }) {
 }
 
 /** Render the observed verdict transition; a CI heal is not necessarily a bounced review. */
+/** `--actor` is argv free text posted under the bot identity: one short plain line, so it can never form a trailer line. */
+export const SAFE_ACTOR_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 _.@:()#\/-]{0,99}$/;
+export function isSafeRearmActor(actor) { return typeof actor === 'string' && SAFE_ACTOR_PATTERN.test(actor); }
+
 export function buildRearmComment({ actor, decision, comments, headSha }) {
+  if (!isSafeRearmActor(actor)) throw new Error('rearm actor must be a short plain single-line name');
   // Derive the exemption from the trusted, head-bound ruling, never from an actor string or a caller flag.
   comments = Array.isArray(comments) ? comments.map(normaliseComment) : null;
   const window = Array.isArray(comments) && /^[0-9a-f]{40}$/i.test(String(headSha ?? ''))

@@ -497,6 +497,8 @@ export function runReconcilePromoteDraftDispatch({
   }
   // ── restore-review-label half: green, open, label-less lane PRs get `review:pending` (see reconcile-core).
   for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label')) {
+    if (deadlineReachedAfterProgress(handled)) { deferred.push(entry.prNumber); continue; }
+    handled += 1;
     let labels;
     try {
       labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }))
@@ -525,6 +527,8 @@ export function runReconcilePromoteDraftDispatch({
   }
   // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.
   for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'close-superseded')) {
+    if (deadlineReachedAfterProgress(handled)) { deferred.push(entry.prNumber); continue; }
+    handled += 1;
     let onMain;
     try { onMain = readCardsOnMain({ repoSlug, prNumber: entry.prNumber }); } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'close-unreadable', why: String(e?.message ?? e).split('\n')[0] });
@@ -546,7 +550,7 @@ export function runReconcilePromoteDraftDispatch({
   const rearms = (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code');
   for (const [index, entry] of rearms.entries()) {
     yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if (yieldedForAdoption || deadlineReachedAfterProgress(index)) {
+    if (yieldedForAdoption || deadlineReachedAfterProgress(handled)) {
       deferred.push(...rearms.slice(index).map(row => row.prNumber));
       break;
     }

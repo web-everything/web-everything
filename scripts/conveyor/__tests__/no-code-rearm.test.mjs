@@ -402,6 +402,37 @@ describe('round-1 negative regressions', () => {
     expect(r.deferred).toEqual([2, 7448]);
     expect(r.refusals.some(r => r.kind === 'rearm-no-code-failed')).toBe(false);
   });
+  it('a deadline spent by earlier phases defers every rearm (cumulative handled work, not the rearm-local index)', () => {
+    let spent = false;
+    const r2 = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      provider: { ready: () => {} }, readPrLabels: () => [], readComments: () => [],
+      readHeadCheckState: () => ({ state: 'green', counts: {} }), clearAwaitingCi: () => {},
+      addLabel: () => { spent = true; }, deadlineAt: 10, now: () => spent ? 11 : 0,
+      reconcile: () => ({ dispatch: [
+        { kind: 'restore-review-label', prNumber: 1, label: 'review:pending' },
+        { kind: 'rearm-no-code', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200' },
+      ] }),
+      rearm: () => { throw new Error('must not launch past the deadline'); },
+    });
+    expect(r2.deferred).toContain(7448);
+    expect(r2.dispatched.some(d => d.kind === 'rearm-no-code')).toBe(false);
+  });
+  it('an unreadable comment thread holds the PR instead of planning ordinary work', () => {
+    for (const comments of [undefined, null, 'x']) {
+      const p = plan({ comments });
+      expect(p.dispatch.filter(d => ['fix', 'ci-heal', 'review', 'rearm-no-code'].includes(d.kind))).toEqual([]);
+      expect(refusalKinds(p)).toContain('comments-unreadable');
+    }
+  });
+  it('--actor free text can never form the no-code trailer or evade the round cap', () => {
+    const forged = `x\n${NO_CODE_REARM_TRAILER}`;
+    expect(hasInvalidArgs(['7448', `--actor=${forged}`])).toBe(true);
+    expect(hasInvalidArgs(['7448', '--actor=conveyor (operator no-code ruling IC_200)'])).toBe(false);
+    expect(() => buildRearmComment({ actor: forged, decision: decideRearm({ currentLabels: ['review:changes'] }) })).toThrow();
+    for (const bad of [`a\r${NO_CODE_REARM_TRAILER}`, `a ${NO_CODE_REARM_TRAILER}`, NO_CODE_REARM_TRAILER, '']) {
+      expect(() => buildRearmComment({ actor: bad, decision: decideRearm({ currentLabels: ['review:changes'] }) })).toThrow();
+    }
+  });
   it('planning that exceeds the deadline still handles the first rearm to prevent starvation', () => {
     let planned = false;
     const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
