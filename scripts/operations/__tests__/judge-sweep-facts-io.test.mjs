@@ -44,7 +44,7 @@ it.each([
       calls.push(args);
       if (args[0] !== 'pr' || !['list', 'view'].includes(args[1])) throw new Error('unexpected extra GitHub read');
       const value = { number: 1, title: 'scope fixture', headRefOid: head,
-        labels: [], assignees: [], updatedAt: at, body: '', createdAt: at, statusCheckRollup: [], commits: [] };
+        labels: [], assignees: [], updatedAt: at, body: '', createdAt: at, statusCheckRollup: [], commits: [], mergeable: 'MERGEABLE' };
       return JSON.stringify(args[1] === 'list' ? [value] : value);
     },
     now: () => Date.parse(at), baseCap,
@@ -61,7 +61,7 @@ it.each([
 
 const pr = (extra = {}) => ({ number: 1, title: 'IO fixture', headRefOid: head,
   baseRefOid: 'b'.repeat(40), labels: [], assignees: [], updatedAt: at,
-  body: '<!-- authored-by-actor: author -->', createdAt: at, statusCheckRollup: [], commits: [], ...extra });
+  body: '<!-- authored-by-actor: author -->', createdAt: at, statusCheckRollup: [], commits: [], mergeable: 'MERGEABLE', ...extra });
 const options = (extra = {}) => {
   const opts = ({
   findSuspendedRuns: () => [],
@@ -1069,4 +1069,31 @@ it.each([
     expect(gh).toHaveBeenCalledTimes(failDetail ? 2 : 1);
     expect(buildJudgeSweepBundle({ prs: [facts] }).prs[0].needsJudgment).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each([['CONFLICTING', 'CONFLICTING'], ['MERGEABLE', 'MERGEABLE']])(
+  'reads the PR merge state into the facts (%s)', (mergeable, expected) => {
+    const gh = vi.fn(() => JSON.stringify([pr({ mergeable, isDraft: false })]));
+    const reader = createJudgeSweepFactsReader(options({ gh }));
+    const row = reader({ repo }).prs[0];
+    expect(row.mergeable).toBe(expected);
+    expect(row.evidenceErrors).not.toContain('merge state unavailable; inspect PR mergeability');
+    expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false,
+      nextOwner: mergeable === 'CONFLICTING' ? 'fixer' : 'nobody' });
+    expect(gh.mock.calls[0][0].at(-1)).toContain('mergeable');
+  });
+it.each([[undefined], [null], ['UNKNOWN']])('an unknown or missing merge state is not a judgment issue (%s)', mergeable => {
+  const row = read({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
+  expect(row.mergeable).toBeNull();
+  expect(row.evidenceErrors).toEqual([]);
+  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({ needsJudgment: false, nextOwner: 'nobody' });
+  expect(buildJudgeSweepBundle({ prs: [{ ...row, labels: ['review:human'],
+    latestVerdict: { accepted: true }, redTeam: { state: 'clear' }, openReferrals: [], openSendBacks: [] }] }).prs[0])
+    .toMatchObject({ needsJudgment: true, reason: 'clean-and-owed-approval' });
+});
+it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('records an evidence error for an invalid merge state (%s)', mergeable => {
+  const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
+  const row = createJudgeSweepFactsReader(options({ gh }))({ repo }).prs[0];
+  expect(row.mergeable).toBeNull();
+  expect(row.evidenceErrors).toContain('merge state unavailable; inspect PR mergeability');
 });

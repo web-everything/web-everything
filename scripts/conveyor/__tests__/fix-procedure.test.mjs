@@ -703,6 +703,17 @@ describe('fixBegin / fixEnd — the IO shell', () => {
     expect(readLiveFixClaim({ repo: 'we', pr: 2811, lockRoot: root, nowMs: T0 + 2 * MIN })).toBeNull();
   });
 
+  it.each([true, false])('records draft ownership only for a claim conversion (already draft=%s)', async isDraft => {
+    const { gh, calls } = fakeGh({ headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft, state: 'OPEN', labels: [] });
+    const options = { repo: 'we', pr: 2899, who: 'owner', sessionId: 'draft-owner', draft: true,
+      reason: 'scope-change', gh, labels: fakeLabels(), lockRoot: root, nowMs: T0 };
+    expect(await fixBegin(options)).toMatchObject({ ok: true });
+    const entry = readLiveFixClaim({ repo: 'we', pr: 2899, lockRoot: root, nowMs: T0 });
+    expect(entry.sidecarAt).toBe(isDraft ? undefined : new Date(T0).toISOString());
+    expect(entry.meta).not.toHaveProperty('draftedByClaim');
+    expect(calls.filter(a => a[1] === 'ready')).toHaveLength(isDraft ? 0 : 1);
+  });
+
   it('fix-begin --draft --reason=scope-change: claim → `gh pr ready --undo` → draft-scope-change label → marker; fix-end leaves it draft (relies on draft-first promotion)', async () => {
     const { gh, calls } = fakeGh({ headRefName: BRANCH, headRefOid: 'a'.repeat(40), isDraft: false, state: 'OPEN', labels: [] });
     const labels = fakeLabels();

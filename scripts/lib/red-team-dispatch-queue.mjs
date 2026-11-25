@@ -2,8 +2,8 @@ import { failClosedCapacity, OPERATOR_CAPACITY_MAX } from './operator-override-r
 import { readOperatorPolicy } from './policy-cascade.mjs';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { boundedReason, defaultQueueFile } from './red-team-queue-state.mjs';
-export { defaultQueueFile } from './red-team-queue-state.mjs';
+import { boundedReason, defaultQueueFile, assertBlockReason, readReprobeRequests, markReprobeConsumed } from './red-team-queue-state.mjs';
+export { defaultQueueFile, requestRedTeamReprobe, assertBlockReason, BLOCK_REASON_CODES } from './red-team-queue-state.mjs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { isRealHead } from './red-team-skip-outcome.mjs';
@@ -70,6 +70,13 @@ const probeCap = (value, log, source = 'direct argument') => {
 // probed in fair, bounded turns, without occupying a capacity-bound admission.
 const NON_RUNNABLE_REASONS = new Set(['review-unfinished', 'planner-skip']);
 const copy = entries => entries.map(entry => ({ ...entry }));
+/** The ONE writer of a skip/blocked state: throws without a closed-list code and evidence. True when it changed. */
+export function writeBlock(entry, reason) {
+  const { code, evidence } = assertBlockReason(reason);
+  const changedBlock = entry.blocked !== code || entry.blockedReason !== evidence;
+  entry.blocked = code; entry.blockedReason = evidence;
+  return changedBlock;
+}
 const advanceProbeTurns = (mine, selected) => {
   let turn = mine.reduce((max, entry) => Math.max(max, entry.lastProbeTurn ?? 0), 0);
   if (turn > Number.MAX_SAFE_INTEGER - selected.length) {
@@ -176,10 +183,12 @@ export function applyRedTeamQueueFloor(capacity, { floor, cpuIdlePct, log = () =
 /** Synchronous IO matches the daemon's tick; admission never dequeues a PR. */
 export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile = readFileSync,
   writeFile = writeFileSync, rename = renameSync, unlink = unlinkSync, now = Date.now, log = () => {}, maxAttempts = 3, readLivePr = readLiveRedTeamPr,
+  reprobeDir = writeFile === writeFileSync ? join(dirname(file), 'red-team-reprobe-requests') : null,
   ...recoveryReaders } = {}) {
   let entries = [];
   let live = new Map(), waiting = new Set(), decided = new Set();
   let pending = null;
+  const consumedPending = []; // inbox requests consumed inside a staged tick: finalized only when the tick commits
   let stale = false; // true after a failed persist, until a later write succeeds
   const limit = Number.isInteger(maxAttempts) && maxAttempts > 0 ? maxAttempts : 3;
   try {
@@ -196,6 +205,13 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       return true;
     })) throw new Error('invalid persisted entries');
     entries = copy(restored);
+    // Complete mediation on read: a skip with no recorded reason is not a skip. Fail open toward running the red team.
+    for (const entry of entries) {
+      if (entry.blocked && !boundedReason(entry.blockedReason)) {
+        note(log, `redteam-skip-unreasoned ${entry.key}: stored ${entry.blocked} block has no reason; treating as not skipped`);
+        delete entry.blocked; delete entry.blockedReason; delete entry.lastProbeTurn;
+      }
+    }
   } catch (error) {
     if (error?.code !== 'ENOENT') {
       // Keep the bad file for inspection instead of silently overwriting its ordering/attempt history.
@@ -229,6 +245,11 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
   };
   const queue = {
     entries: () => copy(entries),
+    holdCauses() {
+      const causes = new Map(entries.filter(entry => entry.blocked).map(entry => [entry.key, entry.blocked]));
+      for (const key of waiting) causes.set(key, 'evidence-unreadable');
+      return causes;
+    },
     // Incomplete discovery authorizes only a live, same-head probe of an existing blocked entry.
     // This read never evicts, re-keys, syncs or admits a new PR.
     confirmedBlocked({ repo, readLivePr: read = readLivePr } = {}) {
@@ -266,7 +287,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         if (persisted.has(entry) && pr.headRefOid !== entry.head) {
           // Re-key in place, preserving FIFO position; stale planner rows are deferred until they match.
           entry.head = pr.headRefOid; entry.attempts = 0;
-          delete entry.blocked; delete entry.lastProbeTurn;
+          delete entry.blocked; delete entry.blockedReason; delete entry.lastProbeTurn;
           changed(`re-key ${entry.key}: live head changed; position preserved`);
         }
         if (!Array.isArray(pr.comments)) {
@@ -278,6 +299,20 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           head: pr.headRefOid, comments: pr.comments, labels: pr.labels })) {
           decided.add(entry.key);
           if (persisted.has(entry)) remove(entry, `red-team result already on head ${pr.headRefOid}`);
+        }
+      }
+      // Re-requests from the drain: not an unblock. The held entry moves to the front of the bounded probe order
+      // (no admission bypass); the planner then re-decides it and settle() records the new outcome.
+      if (reprobeDir) {
+        for (const request of readReprobeRequests(reprobeDir)) {
+          const entry = entries.find(candidate => candidate.key === `${request.repo}#${request.pr}`);
+          if (entry && entry.head === request.head && entry.blocked === 'planner-skip' && boundedReason(entry.blockedReason)) {
+            entry.lastProbeTurn = 0;
+            entry.reprobeReason = boundedReason(entry.blockedReason);
+            entry.reprobeRequestedAt = now();
+            changed(`reprobe requested ${entry.key} (planner-skip: ${entry.reprobeReason})`);
+          } else note(log, `reprobe request for ${request.repo}#${request.pr} ignored: no matching planner-skip entry on that head`);
+          if (pending) consumedPending.push(request.path); else markReprobeConsumed(request.path);
         }
       }
       return live;
@@ -325,7 +360,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
       const admitted = mine.filter(entry => probes.has(entry.key) || keys.has(entry.key));
       for (const entry of mine) {
         if (NON_RUNNABLE_REASONS.has(entry.blocked) && !probes.has(entry.key)) {
-          note(log, `hold ${entry.key}: ${allowProbes && validCount ? 'waiting for a probe turn' : 'probes disabled'}`);
+          note(log, `hold ${entry.key}: ${entry.blocked} (${allowProbes && validCount ? 'waiting for a probe turn' : 'probes disabled'})`);
           continue;
         }
         note(log, `${probes.has(entry.key) ? 'probe' : keys.has(entry.key) ? 'admit' : 'hold'} ${entry.key}: capacity ${bound}; head=${entry.head}`);
@@ -348,17 +383,21 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         else if (failure) {
           if (failure.reason === 'no review capacity left') continue;
           if (nonRunnable(failure)) {
-            // New blocks join the probe tail; an already-blocked probe keeps admit's turn.
-            if (!entry.blocked || entry.lastProbeTurn === undefined) {
-              advanceProbeTurns(entries.filter(candidate => candidate.repo === repo), [entry]);
+            const code = failure.skipped ? 'planner-skip' : failure.reason;
+            const evidence = failure.skipped ? failure.reason : (failure.why ?? failure.detail ?? row?.why
+              ?? (code === 'review-unfinished' ? 'review of this head has not finished' : undefined));
+            if (!boundedReason(evidence)) {
+              // A skip with no reason is never recorded: the head stays runnable (fail open toward running the red team).
+              note(log, `redteam-skip-unreasoned ${entry.key}: ${code} without evidence; not skipped`);
+              if (entry.blocked) { delete entry.blocked; delete entry.blockedReason; delete entry.lastProbeTurn; changed(`unblocked ${entry.key}`); }
+            } else {
+              // New blocks join the probe tail; an already-blocked probe keeps admit's turn.
+              if (!entry.blocked || entry.lastProbeTurn === undefined) {
+                advanceProbeTurns(entries.filter(candidate => candidate.repo === repo), [entry]);
+              }
+              const blockChanged = writeBlock(entry, { code, evidence });
+              if (blockChanged) changed(`blocked ${entry.key}: ${entry.blockedReason}`);
             }
-            const blocked = failure.skipped ? 'planner-skip' : failure.reason;
-            const reason = boundedReason(failure.reason);
-            const blockChanged = entry.blocked !== blocked || (entry.blockedReason ?? null) !== reason;
-            entry.blocked = blocked;
-            if (reason) entry.blockedReason = reason;
-            else delete entry.blockedReason;
-            if (blockChanged) changed(`blocked ${entry.key}: ${reason ?? 'reason missing; inspect planner logs'}`);
           }
           const detail = nonRunnable(failure) ? '' : `: ${boundedReason(failure.reason) ?? 'reason missing'}`;
           entry.attempts++;
@@ -392,6 +431,7 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
         const mutations = pending.length || !stale ? pending
           : [{ data: JSON.stringify(entries), message: 'rewrite stale queue file' }];
         pending = null;
+        const consumed = consumedPending.splice(0);
         // The runner has already started its jobs: a failed write must never discard its result or roll
         // memory back (the settled entries stay in memory, so the next tick does not re-offer a started PR).
         // Each staged item is a full snapshot, so a later successful write repairs an earlier failed one.
@@ -399,8 +439,10 @@ export function createRedTeamDispatchQueue({ file = defaultQueueFile(), readFile
           try { persist(data); note(log, message); }
           catch (error) { note(log, `persist failed (queue file left stale, in-memory state kept): ${error?.message ?? error}`); }
         }
+        for (const path of consumed) markReprobeConsumed(path);
       },
       abort() {
+        consumedPending.length = 0;
         entries = before;
         live = previousLive; waiting = previousWaiting; decided = previousDecided;
         admissions.clear();
@@ -523,8 +565,13 @@ export function runWithRedTeamQueue({ queue, repo, plan, rawPrs, capacity: rawCa
     const held = new Set((plan?.refusals ?? []).filter(row => row.kind === 'already-reviewed-head'
       && (managed.has(Number(row.prNumber)) || isRealHead(row.headSha ?? rawPrs?.find(pr => Number(pr.number) === Number(row.prNumber))?.headRefOid))
       && !allowed.has(Number(row.prNumber)) && !bypassed.has(Number(row.prNumber))).map(row => Number(row.prNumber)));
-    const blocked = new Set(queue.entries().filter(entry => entry.repo === repo && NON_RUNNABLE_REASONS.has(entry.blocked)).map(entry => entry.pr));
-    for (const pr of held) note(log, `hold ${repo}#${pr}: ${blocked.has(pr) ? readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled' : 'capacity'}; waiting for a later tick`);
+    const causes = queue.holdCauses();
+    for (const pr of held) {
+      const cause = causes.get(`${repo}#${pr}`) ?? 'capacity';
+      const detail = NON_RUNNABLE_REASONS.has(cause)
+        ? ` (${readableCapacity(capacity) ? 'waiting for a probe turn' : 'probes disabled'})` : '';
+      note(log, `hold ${repo}#${pr}: ${cause}${detail}; waiting for a later tick`);
+    }
     // Bypassed card-only rows go last so queued code PRs claim the runner's capacity first.
     const kept = (plan?.refusals ?? []).filter(row => !held.has(Number(row.prNumber)));
     const refusals = [...kept.filter(row => !bypassed.has(Number(row.prNumber))), ...kept.filter(row => bypassed.has(Number(row.prNumber)))];

@@ -3,11 +3,14 @@ bornAs: xljqux3
 kind: decision
 parent: "2445"
 size: 3
-status: parked
-parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
+status: resolved
+reopenedReason: "resolved-not-closed-so-2469-blockedBy-stays-valid"
+dateReopened: "2026-11-23"
 priority: low
 dateOpened: "2026-07-11"
+dateResolved: "2026-11-23"
+graduatedTo: 5488
+codifiedIn: docs/agent/platform-decisions.md#devtools-placement
 preparedDate: "2026-07-28"
 researchTopic: delivery-coordinator-placement
 relatedReport: reports/2026-07-12-delivery-coordinator-placement.md
@@ -320,3 +323,5 @@ Related priors: #1565 (devtool placement), #1579 (dev-panel relocation), #1747 (
 relocated into plateau-app), #2241 (constellation transport parity), #2448 (gate-self re-anchoring),
 #554 (hosted-suite / SaaS trigger), #1788 (reusable → neutral home), and the
 [delivery-coordinator-placement](/research/delivery-coordinator-placement/) research topic.
+
+Resolved 2026-11-22 (PL-2446): overtaken by #5488 (resolved, not closed, so #2469's blockedBy edge on this card stays valid). The constellation split (#5488, #5484) and the existing plateau-ops repo already answer where Plateau Loop lives, so the placement record now lives on #5488.

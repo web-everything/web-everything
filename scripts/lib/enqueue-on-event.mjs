@@ -756,11 +756,76 @@ export function extractPassTimings(stderr) {
   return timings;
 }
 
+const STDERR_LINE_MAX = 200;
+/** Node warning preamble lines that would otherwise hide the real first error. */
+const NODE_WARNING_NOISE = /^(?:\(node:\d+\) (?:\[DEP\d+\] )?(?:Deprecation|Experimental)Warning:|\(Use `node --trace-(?:deprecation|warnings)\b)/;
+const KNOWN_ERROR_SHAPE = /^(?:\w*Error\b|error:|npm ERR!|ERR!|ERR_\w+|FAIL\b|fatal:|✗|×)/i;
+// The ✗ marker is already blanked by the printable-ASCII allowlist when this runs: "merge-ai-prs ✗ Error: x" is "merge-ai-prs   Error: x".
+// Only the drain's own top-level handler line (fixed prefix), never an arbitrary "<word>  Error:" line.
+const SCRIPT_FAILURE_LINE = /^merge-ai-prs {2,}Error: fast-drain: [\w :,/()-]{1,160}$/;
+const UNCLASSIFIED_STDERR ='[unclassified stderr; see local log]';
+const SECRET_LINE =/gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
+const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert|session/i;
+const SECRET_ASSIGNMENT_KEY = /(?:^|[_.-])(?:session|token|secret|key|pass|auth)(?:$|[_.-])/i;
+// Allowlist: only printable ASCII survives; every other code point (controls, separators, bidi/zero-width marks) becomes a space.
+const UNSAFE_LOG_CHARS = /[^\x20-\x7e]/g;
+const URL_USERINFO =/:\/\/[^/\s]*@/;
+
+/** Scan each key/token once: overlapping wildcard regexes can stall on long untrusted stderr. */
+function hasSecretAssignmentOrJwt(line) {
+  for (const match of line.matchAll(/[\w.-]+/g)) {
+    const parts = match[0].split('.');
+    if (parts.some((part, index) => {
+      const prefix = part.search(/\beyJ/i);
+      return prefix >= 0 && part.length - prefix >= 8 && index + 2 < parts.length
+        && /^[\w-]{5,}$/.test(parts[index + 1]);
+    })) return true;
+    if (!SECRET_ASSIGNMENT_KEY.test(match[0])) continue;
+    let index = match.index + match[0].length;
+    // The caller has already converted all non-printable characters to ASCII spaces.
+    while (line[index] === ' ') index += 1;
+    if (line[index] !== '=' && line[index] !== ':') continue;
+    const separator = line[index];
+    index += 1;
+    while (line[index] === ' ') index += 1;
+    // A bare pass count is ordinary drain status; assignments and namespaced PASS keys remain sensitive.
+    if (/^pass$/i.test(match[0]) && separator === ':' && /^\d+(?: failed)?$/.test(line.slice(index))) continue;
+    if (index < line.length) return true;
+  }
+  return false;
+}
+
+/** First non-empty stderr line, control characters stripped, capped, credential-looking lines redacted. PURE.
+ * NON-CLAIMS: redaction is a best-effort blacklist plus env-value match, NOT a secret filter. It does not catch
+ * opaque credentials under unrecognised env names, values under 3 chars, or escaped/ANSI-interrupted values.
+ * The spec (DRAIN-POSTMERGE-PROBE) deliberately publishes one sanitised first line.
+ * WHY: a failed fast drain logged only exit/bytes/class, so the real error text was lost (PR 7380 drain, 2026-11-24). */
+export function firstStderrErrorLine(stderr, env = {}) {
+  const raw = String(stderr ?? '');
+  const lines = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).filter(Boolean);
+  // A script's own failure line ("merge-ai-prs ✗ Error: ...") is the real cause: it comes after policy/warning preamble, so prefer it
+  // over the first line (DRAIN-FASTDRAIN-CRASH: four fast drains logged "unclassified" while the cause sat in the tail).
+  // An earlier genuine error line wins: the tail never hides the original diagnostic.
+  const firstReal = lines.find(l => !NODE_WARNING_NOISE.test(l));
+  const failure = firstReal && KNOWN_ERROR_SHAPE.test(firstReal) ? undefined : lines.find(l => SCRIPT_FAILURE_LINE.test(l));
+  const line = failure ?? lines.find(l => !NODE_WARNING_NOISE.test(l));
+  if (!line) return '';
+  // After skipping warning noise the picked line is not the formerly protected first line: allowlist known error shapes only.
+  if (!failure && lines[0] !== line && !KNOWN_ERROR_SHAPE.test(line)) return UNCLASSIFIED_STDERR;
+  if (SECRET_LINE.test(line) || hasSecretAssignmentOrJwt(line) || URL_USERINFO.test(line)) return '[redacted]';
+  // Compare against the RAW stream (before splitting/sanitising) so multiline or control-containing values still match.
+  for (const [k, v] of Object.entries(env ?? {})) {
+    if (!SECRET_ENV_KEY.test(k) || typeof v !== 'string') continue;
+    for (const part of v.split(/\r?\n/)) if (part.trim().length >= 3 && raw.includes(part)) return '[redacted]';
+  }
+  return line.length > STDERR_LINE_MAX ? `${line.slice(0, STDERR_LINE_MAX)}...` : line;
+}
+
 function runChild({ args, cwd, env, spawnImpl, timeoutMs, onChild = () => {} }) {
   return new Promise((resolveRun) => {
     let stdout = ''; let stderr = ''; let timedOut = false;
     const output = () => ({
-      stdout, stderrBytes: stderr.length, errorClass: classifyChildFailure(stderr, { timedOut }),
+      stdout, stderrBytes: stderr.length, stderrFirstLine: firstStderrErrorLine(stderr, env), errorClass: classifyChildFailure(stderr, { timedOut }),
       passTimings: extractPassTimings(stderr), timedOut,
     });
     let child;
@@ -1203,7 +1268,7 @@ export function createEnqueueOnEvent({
         const exitFailed = !r.timedOut && r.code !== 0;
         // A failed child cannot supply success or permanent-decline evidence.
         const json = exitFailed ? null : lastJsonLine(r.stdout);
-        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}`;
+        const diagnostic = `exit ${r.code ?? 'none'}, ${r.stderrBytes}B stderr, class=${r.errorClass}${r.code !== 0 && r.stderrFirstLine ? `, first error: ${r.stderrFirstLine}` : ''}`;
         const spawnFailed = r.errorClass === 'spawn-error';
         let what = r.timedOut ? `timed out after ${childTimeoutMs / 1000}s with no JSON result` : spawnFailed ? `could not run (${diagnostic})` : summarizeFastDrain(json, p.num);
         const summary = what;

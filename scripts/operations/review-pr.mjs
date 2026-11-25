@@ -12,6 +12,7 @@ import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisory
   uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective, shadowSeatStatus } from '../lib/review-seat-provider.mjs';
+import { correctnessSeatVendor, resolveCorrectnessSeatRouting } from '../lib/review-seat-routing.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
@@ -1621,6 +1622,18 @@ export function buildCardOnlyJudgeRequest(read, aim = '') {
 }
 
 /**
+ * review.seatRouting.correctness=B — the MANDATORY correctness seat on Codex. Same recipe as the Claude seat
+ * (`buildReviewJudgeRequest`) minus `allowedTools`: Codex is tool-free by contract (it always gets its own
+ * read-only shell) and `createDefaultJudge` refuses a tool-bearing codex request, exactly as for
+ * {@link buildCardOnlyJudgeRequest}. It is a mandatory seat, never an advisory one: it does not count toward
+ * `minNonClaudeSeats`.
+ */
+export function buildCodexCorrectnessJudgeRequest(read, aim = '') {
+  const { allowedTools, model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
+  return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION };
+}
+
+/**
  * #xqa9ttq — CORRECTS `buildMandate`'s "if you have no tools at all, you cannot run or clone anything" branch
  * (`we:scripts/lib/review-core.mjs`) FOR THIS SEAT SPECIFICALLY. That branch is accurate for a genuinely
  * zero-tool Claude juror (`--tools ''`), but this seat runs on Codex, which ALWAYS gets `-s read-only` —
@@ -2667,10 +2680,18 @@ export function reviewPrOperation({
         // narrower question than the floor above (see `assertSeatSpentOnMandatoryLens`) and does not weaken
         // it: both run, in this order, and #3344's is still the one that can never be satisfied by an input.
         assertSeatSpentOnMandatoryLens({ lens: view.input.lens, careLevel: view.input.careLevel });
+        const rawRead = readPr({ pr: view.input.pr, repo: view.input.repo });
         const finding = shapeReadFinding(
-          readPr({ pr: view.input.pr, repo: view.input.repo }),
+          rawRead,
           { pr: view.input.pr, repo: view.input.repo, careLevel: view.input.careLevel },
         );
+        // review.seatRouting.correctness: recorded ON the read finding so a resume never re-derives it. Only the
+        // correctness seat's vendor moves; an unknown builder stays on claude.
+        const routing = resolveCorrectnessSeatRouting();
+        finding.correctnessRouting = routing;
+        finding.correctnessVendor = !cardOnlyLight && view.input.lens === 'correctness'
+          ? correctnessSeatVendor({ mode: routing.value, commitMessages: rawRead?.commitMessages })
+          : 'claude';
         if (cardOnlyLight && (view.input.lens !== 'correctness' || !isCardOnlyDiff([...finding.netChangedFiles, ...finding.netRenameSources]))) {
           throw new Error('card-only light lane contradicted by pinned net diff or lens');
         }
@@ -2692,7 +2713,8 @@ export function reviewPrOperation({
     // `buildReviewJudgeRequest`, shared with the `judgeSecurity` seat below so the two differ in one field.
     judge: judgeStep({
       reads: ['input.lens', 'input.aim', 'findings.read'],
-      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
+      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim)
+        : view.findings.read?.correctnessVendor === 'codex' ? buildCodexCorrectnessJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
         read: view.findings.read,
         lens: view.input.lens,
         // #3094 — the caller's aim rides in the MANDATE, beside the goal. `input.aim` is DECLARED in `reads`
@@ -2892,7 +2914,7 @@ export function reviewPrOperation({
         // act on.
         const seats = [
           // `tools: true` (#4815) — the panel jurors are tool-bearing (`allowedTools: REVIEW_JUROR_TOOLS`), so they bypass the confirmation turn.
-          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight ? { provider: 'codex' } : {}) },
+          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight ? { provider: 'codex' } : read.correctnessVendor === 'codex' ? { provider: 'codex', routedMandatory: true } : {}) },
           ...(securitySeat !== false ? [{ step: SECURITY_SEAT_STEP, lens: SECURITY_LENS, answer: view.findings.judgeSecurity, tools: true }] : []),
           // #xqa9ttq — THE THIRD SEAT, ONLY WHEN SEATED. `ADVISORY_JUDGE_LENS` is a LITERAL here, exactly
           // like `SECURITY_LENS` above, for the same reason: it is not caller-negotiable. `provider: 'codex'`
@@ -3073,7 +3095,7 @@ export function reviewPrOperation({
         // #xqa9ttq — WHICH LENS RAN ON A NON-CLAUDE PROVIDER, keyed the same way as `lensVerdicts` so the
         // renderer can zip the two together. Built straight off `seats` (never re-derived from the lens name),
         // so a future non-codex provider seat carries its own label for free.
-        const nonClaudeSeats = seats.filter((s) => s.provider?.startsWith('codex') && s.answer
+        const nonClaudeSeats = seats.filter((s) => s.provider?.startsWith('codex') && !s.routedMandatory && s.answer
           && !s.answer.skipped && typeof s.answer.summary === 'string' && s.answer.summary.trim()
           && Array.isArray(s.answer.findings)).length;
         const nonClaudeSeatShortfall = nonClaudeSeats < minNonClaudeSeats

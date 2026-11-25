@@ -135,3 +135,26 @@ it('the red-team reserve soak uses a repository-neutral fixture and preserves fi
   const { default: scenario } = await import('../conveyor/soak/breaks/red-team-reserve-first-tick.mjs');
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000);
+
+it('the no-code-owed soak uses a repository-neutral fixture and still refuses exhausted overrides', async () => {
+  const file = 'scripts/conveyor/soak/breaks/no-code-owed-exhausted-override.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/no-code-owed-exhausted-override.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);
+
+it('the orphan pagination soak resolves its repository and preserves incomplete-listing recovery', async () => {
+  const file = 'scripts/conveyor/soak/breaks/orphan-guard-lists-past-200.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/orphan-guard-lists-past-200.mjs');
+  const report = await scenario.run();
+  expect(scenario.judge(report)).toEqual([]);
+  expect(report.got).toEqual([201]);
+}, 30_000);
+
+it('the pending-overdue soak resolves its registered repository and preserves the cached-draft replay', async () => {
+  const file = 'scripts/conveyor/soak/breaks/red-team-pending-overdue.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/red-team-pending-overdue.mjs');
+  expect(scenario.judge(await scenario.run())).toEqual([]);
+}, 30_000);

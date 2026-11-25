@@ -34,3 +34,5 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+Superseded by plan step DZ-SHELL (PL-WIP-CLEANUP, 2026-11-22): the DZ-SHELL mobile bottom bar replaces a /wip navigation menu. Unfinished acceptance (a mobile navigation menu) is carried by DZ-SHELL.

@@ -296,7 +296,7 @@ test('exhausted and held providers are excluded from the first and escalation ru
   assert.deepEqual(chain([cap('codex', 27, 2), cap('claude', 98, 120)]), ['codex', 'codex-alt']);
   assert.deepEqual(chain([cap('codex', 98, 2), cap('claude', 98, 120)]), []);
   assert.equal(pickChainRung({ chain: [] }).executor, null);
-  assert.equal(pickChainRung({ chain: ['codex'], critical: true, criticalClaudeFromRung: 1 }).executor, 'codex');
+  assert.equal(pickChainRung({ chain: ['codex'], critical: true }).executor, 'codex');
 });
 test('tier minimum excludes lower-tier provider and unknown usage never beats known', () => {
   const cs = [cap('codex', 27, 2), cap('claude', 10, 120)];
@@ -514,14 +514,19 @@ test('capacity receipt names confine even directly injected account paths and di
     assert.equal(readdirSync(join(dir, 'state')).filter(file => /^capacity-[a-f0-9]{64}$/.test(file)).length, 4);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-test('critical takeover and send-back refuse when exhausted Claude has been removed', () => {
+test('critical takeover and send-back use eligible codex-alt when exhausted Claude has been removed', () => {
   const value = chain([cap('codex', 27, 2), cap('claude', 98, 120)]);
+  assert.deepEqual(value, ['codex', 'codex-alt']);
   for (const trigger of ['takeover', 'ruling-not-addressed']) {
     const decision = pickChainRung({ chain: value, critical: true, trigger });
-    assert.equal(decision.executor, null);
-    assert.match(decision.reason, /critical escalation requires Claude/);
-    assert.equal(pickChainRung({ chain: ['codex', 'claude'], critical: true, trigger,
-      launcherAvailable: executor => executor !== 'claude' }).executor, null);
+    assert.equal(decision.executor, 'codex');
+    assert.equal(decision.rung, 'codex-alt');
+    assert.equal(decision.requiresReview, true);
+    assert.equal(pickChainRung({ chain: value, critical: true, trigger,
+      launcherAvailable: () => false }).executor, null);
+    const exhausted = pickChainRung({ chain: value, critical: true, trigger, codexUnproductive: 3 });
+    assert.equal(exhausted.executor, null);
+    assert.match(exhausted.reason, /escalation requires Claude.*filtered out/);
   }
 });
 test('operator readings expire at configured age despite a future reset and unavailable live quota', () => {
@@ -549,15 +554,20 @@ test('escalation enforces the configured fix minimum tier on known and unknown r
 });
 
 
-test('filtered Claude refuses critical threshold and unproductive escalation after twenty runs', () => {
+test('filtered Claude permits critical stronger-model on codex-alt but refuses exhausted escalation', () => {
   const value = chain([cap('codex', 27, 2), cap('claude', 98, 120)]);
   assert.deepEqual(value, ['codex', 'codex-alt']);
   for (const critical of [false, true]) {
-    const picked = pickChainRung({ chain: value, critical, criticalClaudeFromRung: 1, codexUnproductive: 20 });
-    assert.equal(picked.executor, null);
-    assert.match(picked.reason, /escalation requires Claude.*filtered out/);
+    const next = pickChainRung({ chain: value, critical, trigger: 'stronger-model' });
+    assert.equal(next.executor, 'codex');
+    assert.equal(next.rung, 'codex-alt');
+    assert.equal(next.requiresReview === true, critical);
+    for (const codexUnproductive of [3, 20]) {
+      const picked = pickChainRung({ chain: value, critical, codexUnproductive });
+      assert.equal(picked.executor, null);
+      assert.match(picked.reason, /escalation requires Claude.*filtered out/);
+    }
   }
-  assert.equal(pickChainRung({ chain: value, critical: true, criticalClaudeFromRung: 1, trigger: 'stronger-model' }).executor, null);
 });
 
 test('multi-account routing scores only the live reader account and logs attribution without an account route', () => {

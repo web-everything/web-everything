@@ -5,8 +5,9 @@ size: 8
 parent: "2804"
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
-blockedBy: ["2809", "2810"]
+maturityTrigger: "adoptionSignal: the board is mounted in the new shell (plan step PD-BOARD), so the real-route oracle has a final route."
+dateParked: "2026-11-22"
+blockedBy: ["2809", "2810", "8703"]
 scope:
   - plateau-app:tests/visual/real-route-fidelity.spec.ts
 dateOpened: "2026-08-01"
@@ -29,3 +30,7 @@ real failure:
   as the acceptance gate for the eventual console-board remediation.
 - Must render the **real route in the host shell**, both themes, empty + overflow seeds. No `?demo=1`.
 - `render-slice`: resolve gates on the rendered red→green proof, human-reviewed.
+
+Parked 2026-11-22 (plateau ruling, master plan). Unpark when: the board is mounted in the new shell (plan step PD-BOARD) so the real-route oracle has a final route. Parked, not blockedBy, because the trigger is a plan step.
+
+Acceptance order (audit fix): the failing oracle is the FIRST acceptance item and is not deferred. The real-route conformance check must be written and shown RED against the current `/console-board` before any board remediation (#2834) starts. Only the remaining work (running it on the final route in the new shell, red to green) waits on the PD-BOARD trigger.

@@ -1,4 +1,37 @@
 {
-  "$comment": "The repair fallback chain advances through codex (task default), codex-alt (Astra high), and claude (the existing Claude launcher). Argon is opt-in in custom chains, but its launcher remains unavailable until a confined repair adapter exists; unavailable rungs are skipped. Settings cascade from the standard default to platform fixExecutor.fallbackChain, this file, then env WE_FIX_EXECUTOR_FALLBACK_CHAIN (comma list or JSON array). [\"codex\",\"claude\"] restores the pre-chain behaviour; fixExecutor.criticalClaudeFromRung follows the same cascade (env WE_FIX_EXECUTOR_CRITICAL_CLAUDE_FROM_RUNG): integer >=1, default 2, a zero-based chain index threshold for critical work to reach Claude. Index 1 stays on codex-alt by default; setting 1 restores the previous critical escalation behaviour.",
-  "fixExecutor": { "fallbackChain": ["codex", "codex-alt", "claude"], "criticalClaudeFromRung": 3 }
+  "$comment": "fixSeatMix aliases fallbackChain (gemini = argon); WE_FIX_EXECUTOR_FALLBACK_CHAIN wins. Gemini requires admitted confinement. executionMode defaults to direct; executionModeByRole overrides fix or ci-heal. criticalGlobs, curated from critical-work policy homes and never-spot-check boundaries, requires review without changing providers.",
+  "fixExecutor": {
+    "fixSeatMix": ["codex", "codex-alt", "gemini", "claude"],
+    "criticalGlobs": [
+      "**/*credential*", "**/*credential*/**", "**/*secret*", "**/.env*",
+      "scripts/lib/lane-git-hardening.mjs", "scripts/lib/drain-red-team-evidence.mjs", "scripts/lib/red-team-check-run.mjs", "scripts/lib/seat-assessment.mjs",
+      "scripts/lib/seat-ac-rubric.mjs", "scripts/lib/__tests__/seat-assessment.test.mjs", "scripts/lib/__tests__/seat-ac-rubric.test.mjs", "scripts/settings/card-ledger-trust.json",
+      "scripts/settings/card-ledger-legacy-identities.json", "webeverything.config.json", "config/deliveryPolicyDefaults.ts", "scripts/lib/review-escalation.mjs",
+      "scripts/lib/review-core.mjs", "scripts/lib/review-policy.contract.json", "scripts/lib/review-policy.mjs", "scripts/drain-gate-settings.json",
+      "scripts/lib/drain-workflow-edit-hold.mjs", "scripts/lib/disposition-land-seam.mjs", "scripts/lib/auto-land-seam.mjs", "scripts/lib/__tests__/review-policy.conformance.test.mjs",
+      "scripts/lib/review-runner-core.mjs", "scripts/review-runner.mjs", "scripts/check-standards.contract.json", "scripts/lib/__tests__/check-standards.conformance.test.mjs",
+      "scripts/lib/review-independence.mjs", "scripts/lib/gate-config.mjs", "scripts/lib/__tests__/gate-invariants.test.mjs", "docs/agent/**",
+      "AGENTS.md", "CLAUDE.md", "scripts/check-standards**", "scripts/guard-**",
+      "scripts/verify-lane**", "scripts/lib/provider-routing**", "scripts/lib/model-capability-ratings**", "scripts/lib/dispatch-**",
+      "scripts/conveyor/run-scorecard**", "scripts/lib/poc-branches.json", ".claude/**", ".github/workflows/**",
+      "scripts/pr-land**", "scripts/merge-ai-prs**", "scripts/operations/poc-land**", "scripts/operations/dispatch-lane**",
+      "scripts/lane-pool**", "scripts/operations/fix-run.mjs", "scripts/conveyor/reconcile-fix-dispatch.mjs", "scripts/conveyor/fix-executor-routing.mjs",
+      "scripts/lib/fix-slot-borrow.mjs", "scripts/lib/fix-executor-chain.mjs", "scripts/operations/dispatch-providers/fix.mjs", "scripts/lib/agy-confined-build.mjs",
+      "scripts/lib/agy-sandbox.mjs", "scripts/lib/agy-fix-admission.mjs", "scripts/operations/agy-fix-provider.mjs", "scripts/gemini-direct-task.mjs",
+      "scripts/lib/agy-review-juror.mjs", "scripts/lib/antigravity-judge-spawn.mjs", "scripts/lib/antigravity-model-effort.mjs", "scripts/lib/antigravity-run-evidence.mjs",
+      "scripts/lib/judge-spawn.mjs", "scripts/lib/policy-cascade.mjs", "scripts/lib/mandate-fence.mjs", "scripts/lib/critical-work.mjs",
+      "scripts/lib/provider-quota-hold.mjs", "scripts/lib/secret-scrub.mjs", "scripts/lib/bounded-child.mjs", "scripts/lib/dispatch-routing-policy.mjs",
+      "scripts/lib/dispatch-routing-policy.json", "scripts/lib/provider-routing.mjs", "scripts/lib/dispatch-routing-policy-source.mjs", "scripts/check-review-gate**",
+      "scripts/lib/gate-**", "scripts/review-set-label.mjs", "scripts/review-core-cli.mjs", "scripts/lib/review-policy**",
+      "scripts/lib/advisory-labels.mjs", "scripts/lib/verdict-ledger**", "scripts/operations/review-pr**", "scripts/conveyor/advisory-label-sweep.mjs",
+      "scripts/conveyor/advisory-fix-mark.mjs", "scripts/lib/dispatch-contracts.mjs", "scripts/lib/dispatch-thresholds.mjs", "scripts/lib/dispatch-routing-policy**",
+      "scripts/review-runner**", "scripts/lib/review-label-provider.mjs", "scripts/lib/review-loop-policy.mjs", "scripts/lib/review-skill-guard.mjs",
+      "scripts/lane-drain.mjs", "scripts/converge-daemon-pass.mjs", "scripts/converge-daemon-install.mjs", "scripts/lib/pr-merge-gate.mjs",
+      "scripts/lib/required-status-checks.mjs", "scripts/lib/verify-lane-gate.mjs", "scripts/lib/github-app-**", "scripts/lib/forge-land-provider.mjs",
+      "scripts/operations/land-advance**", "scripts/operations/pr-land-reasons.mjs", "scripts/lib/ai-pr-authorship.mjs", "scripts/lib/marker-authorship.mjs",
+      "scripts/lib/verdict-totality.mjs", "scripts/lib/trust-chain-tier.mjs", "scripts/conveyor/hiccup-approve.mjs", "scripts/lib/agy-confined-**",
+      "scripts/settings/agy-build.json", "scripts/lib/__tests__/agy-confined-**", "scripts/lib/__tests__/agy-sandbox.test.mjs", "scripts/lib/__tests__/agy-fix-admission.test.mjs",
+      "scripts/lib/__tests__/fixtures/**", ".githooks/**", "**/required-status-checks*", "**/branch-protection*", "scripts/lib/__tests__/agy-**", "**/drain-**"
+    ]
+  }
 }

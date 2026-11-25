@@ -12,6 +12,7 @@ import { dispatchFix, launchTableFor } from '../reconcile-fix-dispatch.mjs';
 import { resolveFixSettings } from '../fix-takeover.mjs';
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, resolvePolicyModel, validateRoutingPolicy } from '../../lib/dispatch-routing-policy.mjs';
 import * as routingPolicyIO from '../../lib/dispatch-routing-policy-io.mjs';
+import * as fixExecutorChain from '../../lib/fix-executor-chain.mjs';
 
 import { PROVIDER_DEFAULTS } from '../../lib/provider-capacity.mjs';
 const fixCapacity = { ...PROVIDER_DEFAULTS, enabled: true, claudeUsageAccount: 'claude-a' };
@@ -44,7 +45,7 @@ describe('daemon Claude fix models', () => {
       expect(resolve({ ...layers, env: { WE_FIX_CLAUDE_ESCALATION_MODEL: 'haiku', WE_POLICY_CASCADE_LOG: '1' } }))
         .toMatchObject({ claudeEscalationModel: 'haiku', sources: { claudeEscalationModel: 'env' } });
       expect(log.mock.calls.flat().join('\n')).toContain('claudeEscalationModel="haiku" (env)');
-      // Opus is reserved for the critical-work verdict, never a non-critical setting override.
+      // The terminal Claude repair rung allows Sonnet or Haiku, including critical work.
       expect(resolve({ env: { WE_FIX_CLAUDE_ESCALATION_MODEL: 'opus' } }).claudeEscalationModel).toBe('sonnet');
       expect(launchTableFor(ordinary, ruling, { fixSettings: resolve({ platform: { claudeEscalationModel: 'haiku' } }) }).model)
         .toBe(DEFAULT_ROUTING_POLICY.aliases.claude.haiku);
@@ -58,10 +59,41 @@ describe('daemon Claude fix models', () => {
     ['operator send-back', { openOperatorSendBacks: [] }, null],
     ['block-ruled fix', { blockRuledReferrals: [] }, null],
     ['takeover', { takeover: ruling }, null],
-  ])('%s gets Sonnet; only a critical-work verdict selects Opus', (_name, extra, escalation) => {
+  ])('%s: the claude-last rung (codex → codex-alt → gemini → claude) uses configured Sonnet even for critical work', (_name, extra, escalation) => {
     expect(launchTableFor({ ...ordinary, ...extra }, escalation)?.model).toBe(DEFAULT_ROUTING_POLICY.aliases.claude.sonnet);
     expect(launchTableFor({ ...ordinary, ...extra, scope: ['we:scripts/lib/provider-routing.mjs'] }, escalation)?.model)
-      .toBe(DEFAULT_ROUTING_POLICY.aliases.claude.opus);
+      .toBe(DEFAULT_ROUTING_POLICY.aliases.claude.sonnet);
+  });
+
+  it.each([
+    ['qualified case-insensitive path', ['we:./SCRIPTS/LIB/PROVIDER-ROUTING.MJS'], 'sonnet'],
+    ['root dotfile', ['we:.env.local'], 'sonnet'],
+    ['nested wildcard', ['we:app/nested/credentials.json'], 'sonnet'],
+    ['missing scope', undefined, 'sonnet'],
+    ['empty scope', [], 'sonnet'],
+    ['ordinary scope', ordinary.scope, 'haiku'],
+  ])('critical glob matching guards the capacity model override: %s', (_name, scope, model) => {
+    expect(launchTableFor({ ...ordinary, scope }, null, {
+      fixSettings: { claudeEscalationModel: 'sonnet' },
+      capacityRoute: { provider: 'claude', model: DEFAULT_ROUTING_POLICY.aliases.claude.haiku },
+    })).toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude[model], effort: 'high' });
+  });
+
+  it.each([
+    ['brace-expanded lib scope', 'scripts/{lib,conveyor}/**', 'we:scripts/lib/provider-routing.mjs', 'sonnet'],
+    ['brace-expanded conveyor scope', 'scripts/{lib,conveyor}/**', 'we:scripts/conveyor/repair.mjs', 'sonnet'],
+    ['character-class scope', 'scripts/[lc]ib/**', 'we:scripts/lib/provider-routing.mjs', 'sonnet'],
+    ['outside brace-expanded scope', 'scripts/{lib,conveyor}/**', 'we:scripts/other/repair.mjs', 'haiku'],
+    ['outside character-class scope', 'scripts/[lc]ib/**', 'we:scripts/lab/repair.mjs', 'haiku'],
+  ])('configured critical globs refuse capacity overrides only on matching paths: %s', (_name, glob, path, model) => {
+    // Isolate the configured pattern: no shipped critical glob can mask a matcher regression.
+    const criticalGlobs = vi.spyOn(fixExecutorChain, 'resolveFixCriticalGlobs').mockReturnValue([glob]);
+    try {
+      expect(launchTableFor({ ...ordinary, scope: [path] }, null, {
+        fixSettings: { claudeEscalationModel: 'sonnet' },
+        capacityRoute: { provider: 'claude', model: DEFAULT_ROUTING_POLICY.aliases.claude.haiku },
+      })).toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude[model], effort: 'high' });
+    } finally { criticalGlobs.mockRestore(); }
   });
 
   it.each([false, true])('applies and logs Sonnet at the actual Claude launch (wrapped=%s)', (wrapped) => {
@@ -83,7 +115,7 @@ describe('daemon Claude fix models', () => {
     } finally { log.mockRestore(); }
   });
 
-  it.each(['inherited', 'missing', 'inherited-no-opus-alias', 'missing-no-opus-alias'])('critical fixes retain a critical model with a %s policy route', (variant) => {
+  it.each(['inherited', 'missing', 'inherited-no-opus-alias', 'missing-no-opus-alias'])('critical fixes use the configured repair model with a %s critical-work policy route', (variant) => {
     const input = structuredClone(DEFAULT_ROUTING_POLICY);
     if (variant.startsWith('inherited')) input.operations['fix:critical-work'] = { inherit: true };
     else delete input.operations['fix:critical-work'];
@@ -95,9 +127,13 @@ describe('daemon Claude fix models', () => {
       .mockImplementation((provider, model) => resolvePolicyModel(provider, model, policy));
     try {
       expect(resolveOperationRoute({ operation: 'fix', taskType: 'critical-work', policy })).toBeNull();
+      // Direct-exec routing keeps critical review requirements separate from the final Claude repair model.
       for (const escalation of [null, ruling]) {
-        expect(launchTableFor({ ...ordinary, scope: ['we:scripts/lib/provider-routing.mjs'] }, escalation))
-          .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude.opus, effort: 'high' });
+        for (const model of ['sonnet', 'haiku']) {
+          expect(launchTableFor({ ...ordinary, scope: ['we:scripts/lib/provider-routing.mjs'] }, escalation,
+            { fixSettings: { claudeEscalationModel: model } }))
+            .toMatchObject({ model: DEFAULT_ROUTING_POLICY.aliases.claude[model], effort: 'high' });
+        }
       }
     } finally { resolveRoute.mockRestore(); resolveModel.mockRestore(); }
   });

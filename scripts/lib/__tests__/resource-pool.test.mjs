@@ -41,6 +41,23 @@ it('allows bounded class1 overdraw only for class1', () => {
   expect(grantDecision({ ...request, size: 3 }).decision).toBe('hold');
   expect(grantDecision({ ...request, class: 2 }).decision).toBe('hold');
 });
+it('class-1 overdraw grant refused when it would drop builders below the floor', () => {
+  // budget 5, nothing held: a size-2 class-1 grant leaves 3 free < floor 4; overdraw must not hide that.
+  expect(grantDecision({ ...base, budget: 5, class: 1 })).toMatchObject({ decision: 'hold', reason: 'builder floor' });
+  expect(grantDecision({ ...base, budget: 6, class: 1 }).decision).toBe('grant');
+  expect(grantDecision({ ...base, budget: 5, class: 1, size: 1 }).decision).toBe('grant');
+  // overdraw still works once builders already hold the floor
+  expect(grantDecision({ ...base, budget: 4, class: 1, held: [h(4, 4)] }).decision).toBe('grant');
+  expect(grantDecision({ ...base, budget: 4, class: 1, size: 4, held: [h(4, 4)] }).decision).toBe('hold');
+});
+it('property: a grant never leaves builders (free + held builders) below the floor', () => {
+  for (let budget = 0; budget <= 12; budget++) for (const cls of [1, 2, 3]) for (let size = 1; size <= 4; size++)
+    for (let b = 0; b <= 6; b++) {
+      const held = b ? [h(4, b)] : [];
+      const d = grantDecision({ ...base, budget, class: cls, size, held });
+      if (d.decision === 'grant' && b < 4) expect(b + (budget - b - size)).toBeGreaterThanOrEqual(4);
+    }
+});
 it('never preempts or mutates holders when capacity shrinks below current usage', () => {
   const held = Object.freeze([Object.freeze(h(4, 10))]);
   expect(grantDecision({ ...base, held, budget: 0, class: 1 }).decision).toBe('hold');

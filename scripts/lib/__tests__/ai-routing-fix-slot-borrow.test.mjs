@@ -18,10 +18,21 @@ describe('aiRouting fix executor chain at the borrow router', () => {
     const picked = choose(chainOf({ aiRouting: ['codex-alt', 'claude'] }));
     expect(picked).toMatchObject({ executor: 'codex', rung: 'codex-alt', source: 'aiRouting' });
   });
-  it('aiRouting cannot override the critical decision', () => {
+  it('critical work follows aiRouting directly and retains its review requirement through escalation', () => {
+    const chain = chainOf({ aiRouting: ['codex', 'codex-alt', 'argon', 'claude'] });
+    expect(choose(chain, { takeover: true, critical: true }))
+      .toMatchObject({ executor: 'codex', rung: 'codex-alt', mode: 'direct', requiresReview: true });
+    expect(choose(chain, { codexUnproductive: 3, critical: true }))
+      .toMatchObject({ executor: 'antigravity', rung: 'argon', mode: 'direct', requiresReview: true });
+    expect(choose(chain, { codexUnproductive: 4, critical: true }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', mode: 'direct', requiresReview: true });
+  });
+  it('legacy two-rung aiRouting chains still reach Claude on critical escalation', () => {
     const chain = chainOf({ aiRouting: ['codex', 'claude'] });
-    expect(choose(chain, { takeover: true, critical: true })).toMatchObject({ executor: 'claude' });
-    expect(choose(chain, { codexUnproductive: 3, critical: true })).toMatchObject({ executor: 'claude' });
+    expect(choose(chain, { takeover: true, critical: true }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', requiresReview: true });
+    expect(choose(chain, { codexUnproductive: 3, critical: true }))
+      .toMatchObject({ executor: 'claude', rung: 'claude', requiresReview: true });
   });
   it('aiRouting cannot override the builder strip', () => {
     const chain = chainOf({ aiRouting: ['codex', 'claude'], repo: { routing: { builder: 'claude' } } });

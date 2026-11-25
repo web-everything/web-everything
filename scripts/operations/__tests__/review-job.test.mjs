@@ -26,6 +26,8 @@ import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
 
 const REPO = 'web-everything/web-everything';
+const HEAD = 'a'.repeat(40);
+const headFixture = (head = HEAD) => ({ expectedHead: head, io: { liveHead: () => head } });
 // Landing-freeze fix (lane-leftover-reclaim) — `we`'s lane-pool `--repo=` value is now ALWAYS an absolute path
 // (see `repo-profile.mjs`'s own docblock: the literal `.` broke for a dispatched session, whose cwd is a
 // scratch directory outside the checkout, not the checkout itself).
@@ -290,7 +292,7 @@ describe('runReviewJob — the arc, no Claude wrapper session', () => {
 });
 
 describe('dispatchReviewJob — what the daemon calls', () => {
-  const base = { ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', checkStaleness: FRESH, readCompletion: () => null };
+  const base = { ...headFixture(), ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root: '/daemon', checkStaleness: FRESH, readCompletion: () => null };
 
   it.each(['WE_REVIEW_EXTRA_SEATS_DAILY_CAP', 'WE_REVIEW_SEAT_CAP_CODEX',
     'WE_REVIEW_SEAT_CAP_AGY_CLAUDE', 'WE_REVIEW_SEAT_CAP_AGY_GEMINI'])(
@@ -419,7 +421,7 @@ describe('dispatchReviewJob — what the daemon calls', () => {
     });
     expect(out).toMatchObject({ mode: 'job', pr: 10, sessionSlug: 'review-10', agentId: null, jobPid: 4242 });
     expect(spawned).toHaveLength(1);
-    expect(spawned[0].argv.slice(1)).toEqual(['run', '--pr=10', `--repo=${REPO}`]);
+    expect(spawned[0].argv.slice(1)).toEqual(['run', '--pr=10', `--repo=${REPO}`, `--expected-head=${HEAD}`]);
     expect(spawned[0].env.PATH).toBe('/shim:/usr/bin');
     expect(spawned[0].env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
     expect(readJobRecord('review-10', dir)).toMatchObject({ slug: 'review-10', pid: 4242, pr: 10 });
@@ -470,7 +472,7 @@ describe('dispatchReviewJob — a managed clone behind origin/main (the default 
     prevEnv = process.env.WE_DAEMON_MANAGED_CLONE; process.env.WE_DAEMON_MANAGED_CLONE = '1';
   }
   afterEach(() => { if (prevEnv === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE; else process.env.WE_DAEMON_MANAGED_CLONE = prevEnv; prevEnv = undefined; });
-  const go = () => dispatchReviewJob({
+  const go = () => dispatchReviewJob({ ...headFixture(),
     ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }), pr: 10, repo: REPO, root, dir: join(dir, 'jobs'),
     readCompletion: () => null, resolveSettingsEnv: () => null, spawnJob: () => 77,
   });
@@ -520,7 +522,7 @@ describe('dispatch mode', () => {
   });
 
   it('dispatchReviewByMode routes job mode to the job dispatch', () => {
-    const out = dispatchReviewByMode({
+    const out = dispatchReviewByMode({ ...headFixture(),
       mode: 'job', ciGate: () => ({ allowed: true }), pr: 10, repo: REPO, root: '/daemon', dir, checkStaleness: FRESH, readCompletion: () => null,
       resolveSettingsEnv: () => null, spawnJob: () => 31,
     });
@@ -584,7 +586,7 @@ describe('x6n7c2p required checks before review — fresh dispatch boundary', ()
           { rowsComplete: state !== 'incomplete', rowsHead: state === 'wrong-head' ? 'c'.repeat(40) : headSha });
       },
     });
-    const out = dispatchReviewJob({ pr: 3432, repo: REPO, root: '/daemon', dir, ciGate,
+    const out = dispatchReviewJob({ ...headFixture(), pr: 3432, repo: REPO, root: '/daemon', dir, ciGate,
       checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
       spawnJob: () => { spawns++; return 4242; } });
     expect(readJobRecord('review-3432', dir) !== null).toBe(state === 'green');
@@ -607,7 +609,7 @@ it('x6n7c2p required checks before review — default job four-tick soak spends 
       reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2 }], refusals: [] }),
       readPrs: () => [{ number: 3432, labels: [{ name: 'review:pending' }] }], readAgents: () => [],
       acquirableLanes: () => 1, tagRound: row => rounds.push(row.round), tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
-      dispatch: options => dispatchReviewByMode({ ...options, mode: 'job', root: '/daemon', dir,
+      dispatch: options => dispatchReviewByMode({ ...options, mode: 'job', ...headFixture(head.repeat(40)), root: '/daemon', dir,
         checkStaleness: FRESH, readCompletion: () => null, resolveSettingsEnv: () => ({}),
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green', startEarly: 'off' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
@@ -669,20 +671,20 @@ describe('preferred review lanes', () => {
 
   it.each([5, null, 0, 'x', -1, 1.5, '5'])('dispatchReviewJob passes --prefer-lane=<n> only for a positive integer: %s', preferLane => {
     const spawnJob = vi.fn(() => null);
-    dispatchReviewJob({ pr: 10, repo: REPO, preferLane, root: '/daemon', dir,
+    dispatchReviewJob({ ...headFixture(), pr: 10, repo: REPO, preferLane, root: '/daemon', dir,
       ciGate: () => ({ allowed: true }), checkStaleness: FRESH, readCompletion: () => null,
       resolveSettingsEnv: () => null, spawnJob });
     expect(spawnJob.mock.calls[0][0].argv.slice(1)).toEqual([
-      'run', '--pr=10', `--repo=${REPO}`, ...(preferLane === 5 ? ['--prefer-lane=5'] : []),
+      'run', '--pr=10', `--repo=${REPO}`, `--expected-head=${HEAD}`, ...(preferLane === 5 ? ['--prefer-lane=5'] : []),
     ]);
   });
 
   it('dispatchReviewByMode session mode never forwards preferLane to dispatchReview', () => {
     const dispatch = vi.spyOn(reviewDispatch, 'dispatchReview').mockReturnValue({ agentId: 'session' });
     try {
-      dispatchReviewByMode({ mode: 'session', pr: 10, repo: REPO, preferLane: 7 });
+      dispatchReviewByMode({ mode: 'session', pr: 10, repo: REPO, preferLane: 7, ...headFixture() });
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: REPO });
+      expect(dispatch).toHaveBeenCalledWith({ pr: 10, repo: REPO, expectedHead: HEAD, io: expect.objectContaining({ liveHead: expect.any(Function) }) });
     } finally { dispatch.mockRestore(); }
   });
 });
@@ -758,4 +760,12 @@ describe('CLI exit evidence', () => {
     setSlug('../invalid');
     expect(() => proc.emit('exit', 1)).not.toThrow();
   });
+});
+
+it('classifies juror-timeout and writes the named seat to the ended record', () => {
+  const payload = { stopped: 'juror-timeout', runId: 'timeout-run', lens: 'correctness', provider: 'claude', model: 'sonnet', head: HEAD, timeoutMs: 5, wallMs: 6 };
+  const writeEnded = vi.fn();
+  const { io } = fakeIo({ writeEnded, runLoop: () => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }) });
+  expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
+  expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
 });

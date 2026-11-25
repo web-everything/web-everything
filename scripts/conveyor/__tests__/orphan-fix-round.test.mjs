@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   planOrphanFixRound, runOrphanFixRoundPass, formatOrphanFixRoundLines, buildOrphanGuardComment, verdictReviewedHead,
-  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultRearm, defaultRedispatch,
+  ORPHAN_GUARD_MARKER, CHANGES_VERDICT_PREFIX, DEFAULT_ORPHAN_GRACE_MS, defaultListBounced, defaultRearm, defaultRedispatch,
 } from '../orphan-fix-round.mjs';
 import * as fixDispatch from '../reconcile-fix-dispatch.mjs';
 import * as reconcilePass from '../reconcile-pass.mjs';
@@ -43,6 +43,12 @@ it('recovers a concurrent same-head send-back after the pinned re-arm marker and
 it('replays same-second operator rulings and malformed history through the orphan IO shell (PR #5925)', async () => {
   const { default: scenario } = await import('../soak/breaks/automation-operator-ruling-orphan.mjs');
   const report = await scenario.run({ log: line => console.log(line) });
+  expect(scenario.judge(report)).toEqual([]);
+});
+
+it('holds failed listings and processes complete listings beyond the 500-PR boundary (PR #7429)', async () => {
+  const { default: scenario } = await import('../soak/breaks/orphan-guard-lists-past-200.mjs');
+  const report = await scenario.run({});
   expect(scenario.judge(report)).toEqual([]);
 });
 
@@ -96,6 +102,225 @@ describe('verdict-bound orphan re-arm markers', () => {
 
   it('preserves chronological handling of historical unbound markers', () => {
     expect(plan('\n\nHistorical re-arm').reason).toBe('already re-armed after the latest verdict');
+  });
+});
+
+describe('defaultListBounced', () => {
+  const restPr = number => ({ number, labels: [], head: { sha: HEAD }, draft: false,
+    body: `PR ${number}`, created_at: '2026-10-09T22:42:48Z' });
+
+  it.each([501, 600, 1101])('keeps orphan processing live with %s open PRs', async count => {
+    const prs = Array.from({ length: count }, (_, i) => restPr(count - i));
+    prs[0].labels = prs[count - 1].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_command, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    const rearm = vi.fn(async () => ({ ok: true }));
+    const result = await runOrphanFixRoundPass({
+      repos: [{ key: 'test', slug: `o/large-${count}` }], env: {}, nowMs: NOW,
+      listBounced: slug => defaultListBounced(slug, { exec }),
+      readComments: async () => [VERDICT, EVIDENCE, END], rearm,
+      isOwned: async () => false, postComment: () => {},
+    });
+    expect(result.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ pr: count, decision: 'rearm', result: 're-armed' }),
+      expect.objectContaining({ pr: 1, decision: 'rearm', result: 're-armed' }),
+    ]));
+    expect(result.rows.some(row => row.decision === 'error')).toBe(false);
+    expect(rearm).toHaveBeenCalledTimes(2);
+  });
+
+  it('lists a bounced PR past the newest 200 within the newest 500', () => {
+    const prs = Array.from({ length: 250 }, (_, i) => restPr(250 - i));
+    prs[249].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn()
+      .mockReturnValueOnce(JSON.stringify(prs.slice(0, 100)))
+      .mockReturnValueOnce(JSON.stringify(prs.slice(100, 200)))
+      .mockReturnValueOnce(JSON.stringify(prs.slice(200)));
+    expect(defaultListBounced('o/n', { exec })).toEqual([{
+      number: 1, labels: [{ name: 'review:changes' }], headRefOid: HEAD, isDraft: false,
+      body: 'PR 1', createdAt: prs[249].created_at,
+    }]);
+    expect(exec).toHaveBeenCalledTimes(3);
+    for (const [i, [command, args, opts]] of exec.mock.calls.entries()) {
+      expect(command).toBe('gh');
+      expect(args).toEqual(['api', `repos/o/n/pulls?state=open&sort=created&direction=desc&per_page=100&page=${i + 1}`]);
+      expect(opts).toMatchObject({ encoding: 'utf8', timeout: expect.any(Number), maxBuffer: 16 * 1024 * 1024 });
+    }
+  });
+
+  it.each([499, 500])('accepts a complete listing of %s PRs including the newest and oldest bounced PRs', count => {
+    const prs = Array.from({ length: count }, (_, i) => restPr(count - i));
+    prs[0].labels = prs[count - 1].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_command, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    expect(defaultListBounced('o/boundary', { exec }).map(pr => pr.number)).toEqual([count, 1]);
+    expect(exec).toHaveBeenCalledTimes(count === 500 ? 6 : 5);
+  });
+
+  it.each(['http', 'json', 'shape', 'null', 'buffer', 'deadline'].flatMap(kind => [500, 600].map(count => [kind, count])))
+  ('holds a failed %s read after %s PRs and accepts a complete retry', async (kind, count) => {
+    const prs = Array.from({ length: count }, (_, i) => restPr(count - i));
+    prs[0].labels = [{ name: 'review:changes' }];
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    let failing = true;
+    const exec = vi.fn((_command, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      if (failing && page === count / 100 + 1) {
+        if (kind === 'json') return '{';
+        if (kind === 'shape') return '{"length":0}';
+        if (kind === 'null') return 'null';
+        throw new Error(kind === 'http' ? 'HTTP 503' : 'ENOBUFS');
+      }
+      if (failing && kind === 'deadline' && page === count / 100) clock.mockReturnValue(1000);
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    const readComments = vi.fn(async () => [VERDICT, EVIDENCE, END]);
+    const rearm = vi.fn(async () => ({ ok: true }));
+    const options = { repos: [{ key: 'test', slug: 'o/boundary' }], env: {}, nowMs: NOW,
+      listBounced: slug => defaultListBounced(slug, { exec, deadlineAt: 1000 }),
+      readComments, rearm, isOwned: async () => false, postComment: () => {} };
+    try {
+      const failed = await runOrphanFixRoundPass({ ...options, cursor: { 'o/boundary': 1 } });
+      expect(failed.rows).toEqual([{ repo: 'o/boundary', decision: 'error', reason: expect.stringContaining('listing failed:') }]);
+      expect(failed.repoCursors).toEqual({ 'o/boundary': 1 });
+      expect(exec).toHaveBeenCalledTimes(count / 100 + (kind === 'deadline' ? 0 : 1));
+      expect(readComments).not.toHaveBeenCalled();
+      expect(rearm).not.toHaveBeenCalled();
+      failing = false;
+      clock.mockReturnValue(0);
+      const retried = await runOrphanFixRoundPass({ ...options, cursor: failed.repoCursors });
+      expect(retried.rows).toEqual([expect.objectContaining({ pr: count, decision: 'rearm', result: 're-armed' })]);
+      expect(readComments).toHaveBeenCalledOnce();
+      expect(rearm).toHaveBeenCalledOnce();
+    } finally {
+      clock.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it('bounds the whole listing even when the caller supplies no deadline', () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const exec = vi.fn((_command, _args, opts) => {
+      clock.mockReturnValue(opts.timeout);
+      return JSON.stringify(Array.from({ length: 100 }, (_, i) => restPr(i + 1)));
+    });
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => defaultListBounced('o/capped', { exec })).toThrow('listing deadline reached');
+      expect(exec).toHaveBeenCalledOnce();
+      expect(exec.mock.calls[0][2].timeout).toBeGreaterThan(0);
+      expect(Number.isFinite(exec.mock.calls[0][2].timeout)).toBe(true);
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning.mock.calls[0][0]).toContain('listing deadline reached');
+      expect(warning.mock.calls[0][0]).not.toMatch(/[\r\n]/);
+    } finally {
+      clock.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it('starts at page one on every pass and includes bounced PRs across the old cap', () => {
+    const prs = Array.from({ length: 501 }, (_, i) => restPr(501 - i));
+    prs[499].labels = [{ name: 'review:changes' }];
+    prs[500].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn((_command, args) => {
+      const page = Number(new URLSearchParams(args[1].split('?')[1]).get('page'));
+      return JSON.stringify(prs.slice((page - 1) * 100, page * 100));
+    });
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      for (let pass = 0; pass < 2; pass++) {
+        expect(defaultListBounced('o/stateless', { exec }).map(pr => pr.number)).toEqual([2, 1]);
+      }
+      expect(exec).toHaveBeenCalledTimes(12);
+      expect(exec.mock.calls.map(([, args]) => Number(new URLSearchParams(args[1].split('?')[1]).get('page'))))
+        .toEqual([1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6]);
+      expect(warning).not.toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('shares the remaining deadline with every page request', () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(0);
+    const exec = vi.fn(() => {
+      const call = exec.mock.calls.length;
+      clock.mockReturnValue(call * 100);
+      return JSON.stringify(call < 3 ? Array.from({ length: 100 }, (_, i) => restPr(i + 1)) : []);
+    });
+    try {
+      expect(defaultListBounced('o/budget', { exec, deadlineAt: 1000 })).toEqual([]);
+      expect(exec.mock.calls.map(([, , opts]) => opts.timeout)).toEqual([1000, 900, 800]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('stops paging at the deadline but always fetches the first page', () => {
+    const prs = Array.from({ length: 100 }, (_, i) => restPr(100 - i));
+    prs[0].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn(() => JSON.stringify(prs));
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => defaultListBounced('o/deadline', { exec, deadlineAt: 1000 })).toThrow('listing deadline reached');
+      expect(exec).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledWith('orphan-guard: listing deadline reached; older PRs not scanned this pass');
+    } finally {
+      clock.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it.each([true, false])('rejects incomplete listings after a later page fails (bounced=%s)', bounced => {
+    const prs = Array.from({ length: 100 }, (_, i) => restPr(100 - i));
+    if (bounced) prs[0].labels = [{ name: 'review:changes' }];
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(prs)).mockImplementationOnce(() => { throw new Error('unreadable'); });
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => defaultListBounced('o/partial', { exec })).toThrow('unreadable');
+      expect(exec).toHaveBeenCalledTimes(2);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('rethrows a first-page failure without claiming an empty listing', () => {
+    const error = new Error('unreadable');
+    const exec = vi.fn(() => { throw error; });
+    expect(() => defaultListBounced('o/unreadable', { exec })).toThrow(error);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a complete empty first page even when the deadline has expired', () => {
+    const exec = vi.fn(() => '[]');
+    expect(defaultListBounced('o/empty', { exec, deadlineAt: 0 })).toEqual([]);
+    expect(exec).toHaveBeenCalledOnce();
+  });
+
+  it.each(['http', 'json', 'buffer'])('reports a later-page %s failure to the guard and preserves its retry cursor', async kind => {
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => restPr(i + 2))))
+      .mockImplementationOnce(() => {
+        if (kind === 'json') return '{';
+        throw new Error(kind === 'http' ? 'HTTP 503' : 'ENOBUFS');
+      });
+    const readComments = vi.fn();
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = await runOrphanFixRoundPass({ repos: [{ key: 'test', slug: 'o/partial' }], env: {},
+        cursor: { 'o/partial': 1 }, listBounced: slug => defaultListBounced(slug, { exec }), readComments });
+      expect(result.rows).toEqual([{ repo: 'o/partial', decision: 'error', reason: expect.stringContaining('listing failed:') }]);
+      expect(result.repoCursors).toEqual({ 'o/partial': 1 });
+      expect(readComments).not.toHaveBeenCalled();
+    } finally {
+      warning.mockRestore();
+    }
   });
 });
 
@@ -486,6 +711,33 @@ describe('runOrphanFixRoundPass — IO shell', () => {
     expect(result.deferredSettled).toEqual([]);
     expect(result.newlySettled).toEqual([{ repo: repos[0].slug, pr: 4715 }]);
     expect(settled.get(`${repos[0].slug}#4715`)).toEqual({ head: HEAD, at: NOW });
+  });
+
+  describe('settled cache: removing the head or TTL check fails a test', () => {
+    const probe = async cached => {
+      const readComments = vi.fn(async () => [VERDICT]);
+      await runOrphanFixRoundPass(seams([], {
+        settled: new Map([[`${repos[0].slug}#4715`, cached]]), readComments,
+        listBounced: () => [pr4715([]), pr4715([], { number: 5000 })],
+        isOwned: async (_repo, number) => number === 5000,
+        deadlineAt: 0, now: () => 0,
+      }));
+      return readComments;
+    };
+
+    it('reads a matching head with stale TTL', async () => {
+      const readComments = await probe({ head: HEAD, at: NOW - 6 * 60 * 60 * 1000 });
+      expect(readComments.mock.calls).toEqual([[4715, repos[0].slug]]);
+    });
+
+    it('reads a different head with fresh TTL', async () => {
+      const readComments = await probe({ head: 'other', at: NOW });
+      expect(readComments.mock.calls).toEqual([[4715, repos[0].slug]]);
+    });
+
+    it('does not read a matching head with fresh TTL when the budget is spent', async () => {
+      expect(await probe({ head: HEAD, at: NOW })).not.toHaveBeenCalled();
+    });
   });
 
   it('uses leftover budget to read cached PRs oldest first after all uncached PRs', async () => {

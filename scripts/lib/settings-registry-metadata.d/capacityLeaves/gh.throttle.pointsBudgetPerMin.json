@@ -1,0 +1,5 @@
+{
+  "description": "Host-shared GitHub points budget; retains at least 300 points/minute for callers outside the wrapper.",
+  "range": "integer 1–600; default and invalid/unreadable fallback 300",
+  "unit": "points/minute"
+}

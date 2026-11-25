@@ -231,3 +231,37 @@ export function resolvePolicyModel(provider, model, policy = DEFAULT_ROUTING_POL
 }
 
 export const DEFAULT_ROUTING_POLICY = validateRoutingPolicy(defaults);
+
+/**
+ * PURE — may a Claude worker launch run for this resolved route? (DIRECT-EXEC-GUARD.) Allowed only when the route is
+ * Claude, or when Claude is the DOCUMENTED fallback (`fallbackProvider: 'claude'`) with a recorded non-empty `reason`.
+ * A missing, malformed or other-provider route refuses (fail closed).
+ * @returns {{ok: true}|{ok: false, reason: string}}
+ */
+export function checkClaudeLaunchRoute(route) {
+  if (!route || typeof route !== 'object' || typeof route.provider !== 'string' || !route.provider) return { ok: false, reason: 'route-mismatch: no resolved route' };
+  if (!Object.hasOwn(CATALOG, route.provider)) return { ok: false, reason: `route-mismatch: unknown provider ${JSON.stringify(route.provider)}` };
+  if (route.provider === 'claude') return { ok: true };
+  if (route.fallbackProvider === 'claude' && typeof route.reason === 'string' && route.reason.trim()) return { ok: true };
+  return { ok: false, reason: `route-mismatch: resolved route is ${route.provider}, refusing a claude launch` };
+}
+
+/**
+ * PURE — the route a Claude launch is checked against, derived from the dispatcher's own evidence.
+ * A configured fallback chain is not a fallback decision. Only an explicitly selected Claude route or a
+ * fallbackProvider with its own recorded reason can authorize Claude. An inherited route uses the actual executor.
+ */
+export function claudeLaunchRouteFor({ policyRoute = null, executor = null, reason = '' } = {}) {
+  if (policyRoute != null) {
+    if (!object(policyRoute)) return null;
+    if (policyRoute.provider === 'claude') return { provider: 'claude', reason: policyRoute.reason || reason || 'policy route claude' };
+    return { provider: policyRoute.provider, fallbackProvider: policyRoute.fallbackProvider, reason: policyRoute.reason };
+  }
+  return executor === 'claude' ? { provider: 'claude', reason: reason || 'executor claude' } : null;
+}
+
+/** A wrapped external task intentionally runs under a separate Claude supervisor, not a provider fallback. */
+export function claudeSupervisorRouteFor({ executor, mode } = {}) {
+  if (mode !== 'wrapped' || !['codex', 'antigravity'].includes(executor)) return null;
+  return { provider: 'claude', reason: `wrapped ${executor} task: Claude supervisor` };
+}

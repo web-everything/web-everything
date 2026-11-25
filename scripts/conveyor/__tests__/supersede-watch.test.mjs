@@ -2,8 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildSupersededStandDownComment } from '../stand-down.mjs';
 import { setMarkdownLoader } from '../supersede-rule.mjs';
-import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadBodyEdit } from '../supersede-watch.mjs';
+import { runSupersedeWatch, formatSupersedeLines, defaultReadMergedPrs, defaultReadOpenNumbers, defaultReadBodyEdit } from '../supersede-watch.mjs';
 import { runTickAllRepos, runSupersedeAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
@@ -27,8 +28,18 @@ describe('runSupersedeWatch', () => {
   it('rechecks whether the candidate is still open', () => {
     const opts = fakes();
     opts.readPr.mockReturnValue({ ...fixture.open, state: 'CLOSED' });
-    expect(runSupersedeWatch(opts).holds).toEqual([]);
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ holds: [], applied: [] });
     expect(opts.postHold).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty('blocked');
+  });
+  it.each([undefined, null, 42, {}])('blocks dispatch when a candidate state is unreadable: %j', state => {
+    const opts = fakes();
+    opts.readPr.mockReturnValue({ ...fixture.open, state });
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ blocked: true, error: expect.stringMatching(/unreadable/), holds: [], applied: [] });
+    expect(opts.postHold).not.toHaveBeenCalled();
+    expect(formatSupersedeLines({ repos: [result] }).join('')).toContain('retried next tick');
   });
   // PR #4560 advisory (security): the marker is read only from a trusted author's merged PR.
   it('an untrusted merged PR author plans no hold, reads no candidate and posts nothing', () => {
@@ -93,12 +104,90 @@ describe('runSupersedeWatch', () => {
     expect(defaultReadBodyEdit({ repo, pr: 4532, exec: answer({ lastEditedAt: null, editor: null }) })).toEqual({ lastEditedAt: null, editor: null });
     expect(() => defaultReadBodyEdit({ repo, pr: 4532, exec: answer(null) })).toThrow(/no pull request #4532/);
   });
-  it('asks gh for the merged PR author and keeps it on the rows it returns', () => {
-    const exec = vi.fn(() => JSON.stringify([{ ...fixture.merged, mergedAt: '2026-10-09T01:52:13Z' }]));
-    const rows = defaultReadMergedPrs({ repo, lookbackDays: 14, now: Date.parse('2026-10-10T00:00:00Z'), exec });
-    const args = exec.mock.calls[0][1];
-    expect(args[args.indexOf('--json') + 1].split(',')).toContain('author');
-    expect(rows[0].author).toEqual({ is_bot: true, login: 'app/web-everything' });
+  it('reads every page of open and merged PRs past the 200 limit', () => {
+    const all = Array.from({ length: 203 }, (_, i) => ({ number: i + 1, body: '',
+      state: 'closed', merged_at: '2026-10-09T01:52:13Z', updated_at: '2026-10-09T02:00:00Z',
+      user: { login: 'web-everything[bot]' } }));
+    const exec = vi.fn((_cmd, args) => {
+      expect(args[0]).toBe('api');
+      const url = new URL(args[1], 'https://api.github.com');
+      expect(url.searchParams.get('per_page')).toBe('100');
+      const page = Number(url.searchParams.get('page'));
+      return JSON.stringify(all.slice((page - 1) * 100, page * 100));
+    });
+    expect(defaultReadOpenNumbers({ repo, exec })).toEqual(all.map(p => p.number));
+    const merged = defaultReadMergedPrs({ repo, lookbackDays: 14,
+      now: Date.parse('2026-10-10T00:00:00Z'), exec });
+    expect(merged.map(p => p.number)).toEqual(all.map(p => p.number));
+    expect(merged[0]).toMatchObject({ author: { login: 'web-everything[bot]' },
+      state: 'MERGED', mergedAt: all[0].merged_at });
+    expect(exec).toHaveBeenCalledTimes(6);
+  });
+  it('stops merged pagination at an old updated page, not an old merge updated recently', () => {
+    const recent = '2026-10-09T00:00:00Z', old = '2026-01-01T00:00:00Z';
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+      number: i + 1, body: null, state: 'closed', merged_at: i === 0 ? old : recent, updated_at: recent, user: { login: 'bot' },
+    })))).mockReturnValueOnce(JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+      number: i + 101, body: '', state: 'closed', merged_at: old, updated_at: old, user: { login: 'bot' },
+    }))));
+    const rows = defaultReadMergedPrs({ repo, lookbackDays: 14,
+      now: Date.parse('2026-10-10T00:00:00Z'), exec });
+    expect(rows).toHaveLength(99);
+    expect(exec).toHaveBeenCalledTimes(2);
+  });
+  it.each([defaultReadOpenNumbers, defaultReadMergedPrs])('refuses incomplete lists at the page cap with an operator fallback (%s)', read => {
+    const exec = vi.fn(() => JSON.stringify(Array.from({ length: 100 }, (_, i) => ({
+      number: i + 1, body: '', state: 'closed', user: { login: 'bot' }, merged_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z',
+    }))));
+    expect(() => read({ repo, exec, lookbackDays: 14, now: Date.parse('2026-10-10T00:00:00Z') }))
+      .toThrow(/page cap.*operator/i);
+    expect(exec.mock.calls.length).toBeLessThanOrEqual(100);
+  });
+  it.each([{ body: undefined }, { body: 42 }, { user: undefined }, { user: {} }])('rejects incomplete merged evidence and blocks dispatch: %j', fields => {
+    const row = { number: 4532, body: '', state: 'closed', user: { login: 'bot' },
+      merged_at: '2026-10-09T00:00:00Z', updated_at: '2026-10-09T00:00:00Z', ...fields };
+    const readMergedPrs = () => defaultReadMergedPrs({ repo, lookbackDays: 14,
+      now: Date.parse('2026-10-10T00:00:00Z'), exec: () => JSON.stringify([row]) });
+    expect(readMergedPrs).toThrow(/unreadable/);
+    const opts = { ...fakes(), readMergedPrs };
+    expect(runSupersedeWatch(opts)).toMatchObject({ blocked: true, error: expect.stringMatching(/unreadable/), holds: [] });
+    expect(opts.postHold).not.toHaveBeenCalled();
+  });
+  it.each([null, { message: 'not a list' }])('rejects an unreadable list: %j', answer => {
+    for (const read of [defaultReadOpenNumbers, defaultReadMergedPrs]) {
+      expect(() => read({ repo, lookbackDays: 14, exec: () => JSON.stringify(answer) })).toThrow();
+    }
+  });
+  it('a GraphQL answer with errors or missing fields counts as a failed read', () => {
+    for (const [pullRequest, errors] of [
+      [{ lastEditedAt: null, editor: null }, [{ message: 'partial failure' }]],
+      [null, undefined], [{ editor: null }, undefined], [{ lastEditedAt: null }, undefined],
+    ]) {
+      const exec = () => JSON.stringify({ data: { repository: { pullRequest } }, errors });
+      expect(() => defaultReadBodyEdit({ repo, pr: 4532, exec })).toThrow();
+    }
+  });
+  it.each(['returned', 'thrown'])('a hold that fails to apply is reported, not dropped (%s)', mode => {
+    const opts = fakes();
+    opts.postHold.mockImplementation(() => {
+      if (mode === 'thrown') throw new Error('denied');
+      return { ok: false, error: 'denied' };
+    });
+    const result = runSupersedeWatch(opts);
+    expect(result).toMatchObject({ holds: [hold], applied: [{ ...hold, ok: false, error: 'denied' }] });
+    expect(result).not.toHaveProperty('error');
+    expect(result).not.toHaveProperty('blocked');
+    expect(formatSupersedeLines({ repos: [result] }).join('')).toContain('FAILED (denied)');
+  });
+  it('posts nothing on a second pass when the thread already holds', () => {
+    const opts = fakes();
+    expect(runSupersedeWatch(opts).applied).toHaveLength(1);
+    opts.readPr.mockReturnValue({ ...fixture.open, state: 'OPEN', comments: [
+      ...fixture.open.comments, { author: { login: 'web-everything' },
+        body: buildSupersededStandDownComment(hold) },
+    ] });
+    expect(runSupersedeWatch(opts).applied).toEqual([]);
+    expect(opts.postHold).toHaveBeenCalledTimes(1);
   });
   it('off skips every read and write', () => {
     const opts = fakes();

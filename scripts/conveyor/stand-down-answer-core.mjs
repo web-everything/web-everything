@@ -32,12 +32,15 @@ export function answerDisposition(answer) {
     && !/\b(?:continue|keep|retain|but|however|instead)\b/.test(head) ? 'close-superseded' : null;
 }
 
-export function buildOperatorAnswer({ standDownId, reason, actor, channel, disposition, supersedes }) {
+export function buildOperatorAnswer({ standDownId, reason, actor, channel, disposition, supersedes, noCodeOwed }) {
   for (const [key, value] of Object.entries({ standDownId, reason, actor, channel })) {
     if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} must be non-empty`);
   }
   if (disposition !== undefined && !DISPOSITIONS.includes(disposition)) {
     throw new Error(`disposition must be one of: ${DISPOSITIONS.join(', ')}`);
+  }
+  if (noCodeOwed !== undefined && (typeof noCodeOwed !== 'boolean' || disposition !== 'rearm-review')) {
+    throw new Error('noCodeOwed must be boolean and is only valid with --disposition=rearm-review');
   }
   if (!/^[\w=-]+$/.test(standDownId)) throw new Error('invalid stand-down comment id');
   if (supersedes !== undefined && (disposition !== 'rearm-review' || !/^[\w=-]+$/.test(String(supersedes)))) {
@@ -46,13 +49,13 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   if (!/^[\w-]+$/.test(actor)) throw new Error('actor must be a GitHub login');
   if (/[\r\n]/.test(channel)) throw new Error('channel must be one line');
   // Encode the record separately so arbitrary operator prose cannot manufacture another marker.
-  const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}), ...(supersedes !== undefined ? { supersedes } : {}) })).toString('base64');
+  const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}), ...(supersedes !== undefined ? { supersedes } : {}), ...(noCodeOwed !== undefined ? { noCodeOwed } : {}) })).toString('base64');
   const surface = channel.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
   const quote = reason.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').split('\n').map((line) => `> ${line}`).join('\n');
   const dispositionText = disposition === 'rearm-review'
     ? 'operator ruled no code is owed; review may be re-armed on the unchanged head'
     : 'executed mechanically by the conveyor; no fix agent is dispatched.';
-  return `${OPERATOR_ANSWER_MARKER}\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @${actor}, via ${surface}.\nSupersedes stand-down comment \`${standDownId}\`. This answers the escalation; it does not clear review gates.\n${supersedes !== undefined ? `Supersedes the earlier operator answer \`${supersedes}\` (stand-down still unaddressed after it).\n` : ''}\n${quote}\n\n${disposition ? `**Disposition:** \`${disposition}\` — ${dispositionText}\n\n` : ''}<!-- conveyor-stand-down-answer-record:${record} -->`;
+  return `${OPERATOR_ANSWER_MARKER}\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @${actor}, via ${surface}.\nSupersedes stand-down comment \`${standDownId}\`. This answers the escalation; it does not clear review gates.\n${supersedes !== undefined ? `Supersedes the earlier operator answer \`${supersedes}\` (stand-down still unaddressed after it).\n` : ''}\n${quote}\n\n${noCodeOwed !== undefined ? `**No code owed:** \`${noCodeOwed}\`\n\n` : ''}${disposition ? `**Disposition:** \`${disposition}\` — ${dispositionText}\n\n` : ''}<!-- conveyor-stand-down-answer-record:${record} -->`;
 }
 
 export function parseOperatorAnswer(comment) {

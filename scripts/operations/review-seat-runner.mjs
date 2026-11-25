@@ -25,7 +25,7 @@ import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { runAgyReviewJuror, scrubPaths } from '../lib/agy-review-juror.mjs';
 import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../lib/review-seat-caps.mjs';
-import { reserveShadowSession } from '../lib/review-shadow-budget.mjs';
+import { releaseShadowSession, reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
 
 /** The closed set of directive modes this runner accepts. */
@@ -48,6 +48,7 @@ export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
 export async function runSeatWithProvider(request, {
   claudeJudge, unwrap, wrap, cwd, agyJuror = runAgyReviewJuror, appendRow = appendShadowRow, now = () => Date.now(),
   log = (m) => console.error(m), reserveSession = reserveShadowSession,
+  releaseSession = releaseShadowSession,
 }) {
   const { seatProvider: directive, ...plain } = request;
   if (!directive || !SEAT_RUN_MODES.includes(directive.mode)) {
@@ -84,14 +85,25 @@ export async function runSeatWithProvider(request, {
     // directive cap falls back to the settings default (100/day), never to unlimited.
     const shadowCap = carbonShadow && !(Number.isSafeInteger(directive.dailyCap) && directive.dailyCap >= 0)
       ? CARBON_SHADOW_DEFAULT_DAILY_CAP : directive.dailyCap;
+    let admission = null;
     if (directive.mode === 'shadow' && shadowCap !== undefined) {
-      const admission = reserveSession({ dailyCap: shadowCap, now: now() });
+      admission = reserveSession({ dailyCap: shadowCap, now: now() });
       if (!admission.allowed) {
         logReviewSeat(log, `review-seat: agy shadow skipped: ${admission.reason}`);
         return { status: 'skipped', reasons: [admission.reason] };
       }
     }
-    try { return await agyJuror({ request: plain, laneCwd: cwd, model: runModel }); } catch (e) {
+    try {
+      const ran = await agyJuror({ request: plain, laneCwd: cwd, model: runModel });
+      // A read_file void is a known-bad outcome that ran no model time: give its slot back. Never alters the result.
+      // Carbon shadows only, and only when that is the SOLE void reason (any write/checkout reason keeps its slot).
+      if (admission && carbonShadow && releaseSession && ran?.status === 'voided'
+        && ran.reasons?.length === 1
+        && /^(completed state-changing tool call\(s\): )?read_file \(missing or invalid in-lane path\)( \[[^\]]*\])?$/.test(String(ran.reasons[0]))) {
+        try { releaseSession({ ...admission, now: now() }); } catch { /* best effort */ }
+      }
+      return ran;
+    } catch (e) {
       // A thrown error's text reaches the run record and a skipped advisory seat's PR summary: no local paths there.
       return { status: 'failed', telemetry: e?.telemetry, reasons: [scrubPaths(e?.message ?? e, [cwd])] };
     }

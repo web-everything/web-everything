@@ -6155,7 +6155,8 @@ ledger's home) and builds on [delivery-decider-under-fixed-settings](#delivery-d
 
 **The rule:**
 1. **F1: what the ledger holds.** Every judgment-bearing event: `verdict`, `referral`, `ruling`, `review-run`,
-   `hold` / `release`, `approval`, `send-back`, `author` and `label-input`. A v1 row reads as `type: verdict`.
+   `hold` / `release`, `approval`, `send-back`, `author`, `label-input` and `merge-intent` (D3: the drain's
+   per-PR promise to merge one head, written only through `appendIf`). A v1 row reads as `type: verdict`.
    Lifecycle transitions are **not** stored one by one. They are a pure function of the events plus facts, so a
    git push means "something was decided", never "a tick happened". Identity is repo + PR + append order; the
    content witnesses (`headSha`, `reviewedDiff`, `reviewedContribution`) stay attributes, never keys.
@@ -6212,9 +6213,62 @@ order) are built in; a product store (Plateau) registers under its own name and 
   invalid. On an I/O failure `appended` is the count really written.
 - `read({repo, from?})` returns `{status: 'ok', rows}` or `{status: 'unreadable', reason, error}` and never
   throws. A failed read is `unreadable`, never an empty `ok`; every gate treats `unreadable` as a hold.
+- `appendIf(rows, {repo, pr, expectPrSeq})`, required when `ordering` is `total` and absent otherwise. `prSeq` is
+  the number of rows the store holds for that repo and PR. First validate the whole non-empty batch as in
+  `append`, including each row's own `repo`; every row must also carry the option's `pr`. An invalid row
+  (even one with an already-stored event id) refuses the whole call with `{ok: false, appended: 0, error}`
+  and writes nothing; rows are never repaired. Then identify duplicates by event id, both already stored
+  and repeated within the batch, before comparing `prSeq` with `expectPrSeq`. If every row is already stored,
+  return `{ok: true, appended: 0, duplicates: rows.length, prSeq}` without comparing the expectation: a retry
+  after a lost answer succeeds even though the first write advanced `prSeq`. For a partly duplicate batch,
+  compare the current `prSeq` with the original `expectPrSeq` and append only the distinct new rows, in batch
+  order, if equal. Deduplication, comparison and write are one atomic step across all writers, re-evaluated
+  against fresh state after a lost push race. On a mismatch it writes nothing and returns
+  `{ok: false, appended: 0, conflict: true, prSeq}`. A successful append returns
+  `{ok: true, appended, duplicates, prSeq}`, with the resulting per-PR count; `duplicates` counts input rows
+  not appended because their event id was already stored or appeared earlier in the batch. Rows of other
+  PRs or repos never cause a conflict. It never throws or rejects; an I/O failure or an unknown outcome is
+  `{ok: false, error}`, never a success, and the caller treats it as no intent. An unreadable ledger cannot
+  supply `prSeq: 0`. A caller that needs `appendIf` refuses to run on a store without it.
 
 Every adapter must pass the conformance suite (`we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs`).
-The event schema and the fold stay the standard; the contract does not change either.
+The event schema and the fold stay the standard. The contract changes only by statute PR; its first change is
+`appendIf` (D3, 2026-11-21).
+
+**D3 implementation dependency (PR 2 of 2, card #8629).** This statute amendment supplies no implementation
+or behavioral proof. PR 2 is a hard prerequisite for enabling any production `appendIf` / `merge-intent`
+caller; it must implement the adapter and validator together and pass the cases below. All cases are
+**planned**, not implemented by this amendment. `check:statute` checks document integrity only. PR 2 adds no
+production caller; caller-boundary cases use an injected consumer fixture until F3 permits production wiring.
+The later wiring must exercise the same assertions against the real caller.
+
+Each row names a repository-qualified file, a case and its observable assertion. PR 2's preparation check
+must reject an unmapped clause; its implementation check must verify that every named case exists and passes
+before marking it implemented. The inventory case below makes this a deterministic coverage obligation.
+
+| Planned file | Named case | Observable assertion |
+| --- | --- | --- |
+| `we:scripts/lib/__tests__/verdict-ledger-store.test.mjs` | `appendIf_contract_case_inventory` | Every D3 contract clause maps to a named case, observable assertion and planned/implemented status; missing mappings or claimed implemented cases that do not exist fail the check. |
+| `we:scripts/lib/__tests__/verdict-ledger-store.test.mjs` | `appendIf_required_for_total_ordering` | `validateLedgerStore` rejects a total-order store with missing or non-function `appendIf`; registration refuses it. |
+| `we:scripts/lib/__tests__/verdict-ledger-store.test.mjs` | `appendIf_absent_for_other_orderings` | Stores with `none` or `append` ordering expose no `appendIf`; the validator rejects either descriptor with the method present. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_counts_repo_and_pr` | Only persisted rows matching both repo and PR count; success reports the resulting count and distinct appended rows. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_other_pr_or_repo_never_conflicts` | Appending another PR's row in the same repo, or the same PR number in another repo, leaves the target expectation valid. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_invalid_batch_writes_nothing` | Empty batches, invalid events and missing, malformed or mismatched row repo/PR refuse the whole call with `ok:false`, `appended:0` and an error, in either batch position; persisted rows stay unchanged and no row is repaired. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_validates_before_deduplication` | An invalid row bearing a stored id still refuses the whole batch, including with a stale expectation. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_duplicate_before_conflict` | Retry an already committed batch with its original expectation; get `{ok:true, appended:0, duplicates:rows.length, prSeq}` with the current count and no conflict or extra rows. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_mixed_duplicates_compare_original_expectation` | Mixed stored/new ids append distinct new rows only when the original expectation matches; stale expectation returns conflict and writes no new rows. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_deduplicates_within_batch` | Repeated new and stored ids count as duplicates; each new id persists once, in input order, and result counts agree with readback. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_conflict_writes_nothing` | Mismatched expectation returns exactly `{ok:false, appended:0, conflict:true, prSeq}` with the current count; complete ledger readback is unchanged. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_two_writers_one_wins` | Two distinct intents race through independent writers with the same expectation; exactly one succeeds and only its rows persist. Removing the sequence comparison makes this case fail. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_failures_resolve_without_throwing` | Broken read/write media and injected synchronous throws or rejected I/O promises resolve to `{ok:false, error}`, never throw or reject. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_unreadable_is_not_zero` | An unreadable ledger refuses the call even with expectation zero; no write is attempted. |
+| `we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs` | `appendIf_unknown_outcome_is_failure` | Lose the acknowledgement after a possible durable write; return `ok:false` with an error, never success; a subsequent same-id retry deduplicates if committed. |
+| `we:scripts/lib/__tests__/verdict-ledger-io.test.mjs` | `appendIf_lost_push_refetches_and_rechecks` | A rejected push forces refetch and a fresh dedupe/count comparison; same-PR competing rows cause conflict, other-PR rows permit retry, and a committed same-id row returns duplicate. |
+| `we:scripts/lib/__tests__/verdict-ledger-io.test.mjs` | `appendIf_crash_before_push_leaves_no_intent` | Terminate a writer after local commit but before push; a separate reader of the shared ledger sees no intent. |
+| `we:scripts/__tests__/merge-ai-prs-drain-verdict-ledger.test.mjs` | `merge_intent_refuses_store_without_appendIf` | The consumer fixture refuses an unsupported store before any append or merge side effect. |
+| `we:scripts/__tests__/merge-ai-prs-drain-verdict-ledger.test.mjs` | `merge_intent_failure_is_no_intent` | `ok:false`, including an unknown outcome, never authorizes merge; the fixture holds until intent is established through a safe retry. |
+| `we:scripts/__tests__/merge-ai-prs-drain-verdict-ledger.test.mjs` | `merge_intent_uses_only_appendIf` | The fixture writes `merge-intent` exclusively through `appendIf`; ordinary `append` is never invoked for that event. |
+| `we:scripts/__tests__/merge-ai-prs-drain-verdict-ledger.test.mjs` | `D3_PR2_has_no_production_caller` | Production entry-point call graphs contain no `appendIf` call or `merge-intent` writer; only adapter definitions and test fixtures exercise the new method until F3. |
 
 **What this ruling does not do.** It builds nothing and adds no code. The build slices (event types v2, git
 io-shell, dual write, `derivePrState`, mirror, ledger gate) are filed separately. The write-miss posture is
@@ -6222,6 +6276,7 @@ documented at the append site and tested by the build that moves the ledger onto
 
 **Lineage:** ratified via the #3007 plan (2026-10-05); F4 resolves #3216. Unifies #3007, #5052, #5053, #5054
 and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-posture-before-the-authority-m/).
+`appendIf` and the `merge-intent` event added 2026-11-21 by statute PR (ratified D3, `standards.D3`, card #8629).
 
 ---
 

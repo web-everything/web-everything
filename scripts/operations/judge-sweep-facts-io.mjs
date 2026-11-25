@@ -229,7 +229,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
     };
     const argv = listArgv({ repo });
     // Assignees supply ownership; detail selection uses rounds and exit-ruling presence below.
-    argv[argv.length - 1] += ',assignees,isDraft';
+    argv[argv.length - 1] += ',assignees,isDraft,mergeable';
     const listing = JSON.parse(boundedGh(argv));
     if (!Array.isArray(listing) || listing.length >= LIST_LIMIT) throw failure('open PR listing incomplete (limit 200); use an exhaustive operator listing');
     let ledger = [], fixRows = [], jobs = [];
@@ -265,6 +265,10 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
       const evidenceErrors = [...errors];
+      // GitHub may still be computing mergeability; only malformed states are evidence errors.
+      if (p.mergeable != null && !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable)) {
+        evidenceErrors.push('merge state unavailable; inspect PR mergeability');
+      }
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
       const round = errors.includes('verdict ledger unreadable') ? null
@@ -283,6 +287,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const result = { number: p.number, title: p.title, labels, headSha, round, cap: baseCap,
         infraFailStreak: errors.includes('fix-loop ledger unreadable') ? null : infraFailStreak,
         isDraft: typeof p.isDraft === 'boolean' ? p.isDraft : null,
+        mergeable: ['MERGEABLE', 'CONFLICTING'].includes(p.mergeable) ? p.mergeable : null,
         minutesSinceHeadChange: null,
         minutesSinceFixDispatch: minutesSince(lastDispatch?.at),
         redTeam: { state: 'unknown', latestResultId: null, latestOutcome: null }, latestVerdict: null,

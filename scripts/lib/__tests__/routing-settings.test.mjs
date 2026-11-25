@@ -36,8 +36,16 @@ it.each([
   expect(chain.value).toEqual(expected);
   expect(pickChainRung({ chain: chain.value, launcherAvailable: () => true }).executor).toBe('codex');
   if (provider === 'claude') {
-    expect(pickChainRung({ chain: chain.value, codexUnproductive: 3, launcherAvailable: () => true }).executor).toBeNull();
-    expect(pickChainRung({ chain: chain.value, critical: true, trigger: 'takeover', launcherAvailable: () => true }).executor).toBeNull();
+    for (const critical of [false, true]) {
+      for (const trigger of ['stronger-model', 'takeover', 'ruling-not-addressed']) {
+        const next = pickChainRung({ chain: chain.value, critical, trigger, launcherAvailable: () => true });
+        expect(next).toMatchObject({ executor: 'codex', rung: 'codex-alt' });
+        expect(next.requiresReview === true).toBe(critical);
+        expect(pickChainRung({ chain: chain.value, critical, trigger, codexUnproductive: 3,
+          launcherAvailable: () => true })).toMatchObject({ executor: null, source: 'capacity',
+          reason: expect.stringMatching(/escalation requires Claude.*filtered out/) });
+      }
+    }
   }
 });
 

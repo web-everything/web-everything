@@ -13,6 +13,8 @@
  * of this family is most of scripts/, so a module two imports away is protected only if it is named here.
  */
 export const REVIEW_AUTH_FLOOR = Object.freeze([
+  // AUTH-BOUND-APPROVAL: the pinned approval trust root (App id, operator allowlist) and its writer.
+  'scripts/lib/approval-record.mjs', 'scripts/operations/approve-head.mjs',
   'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
   'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
   'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
@@ -103,6 +105,8 @@ const REVIEW_AUTH_IMPORTS = Object.freeze([
  * form (`'settings/x.json'`, `join(dir, 'settings', 'x.json')`, a file next to the module), onto the floor.
  */
 const FLOOR_SETTINGS = Object.freeze([
+  // The invariant enforcer catalogue is also named by the protected POC registry module.
+  'scripts/lib/invariant-catalogue.json',
   'scripts/settings/build-priority-scope.json',
   'scripts/settings/daemon-tasks.json',
   'scripts/settings/card-ledger-legacy-identities.json', 'scripts/settings/card-ledger-trust.json', 'scripts/settings/card-numbering.json',
@@ -130,6 +134,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/test-timeout-policy.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
+  // The policy watcher uses these expectations while holding its state lock.
+  'scripts/settings/actions-policy-watch.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
   'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json',
   // Read by card-number-ledger.mjs (landed on main since).
@@ -159,8 +165,14 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The policy watcher serializes dedupe state updates with an exclusive lock directory.
+  'scripts/conveyor/actions-policy-watch.mjs',
+  // The record-only file-class writer reserves its evaluation output with an exclusive `wx` create.
+  'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
+  // Red-team reprobe requests dedupe across gate sources and restarts with an exclusive `wx` create.
+  'scripts/lib/red-team-queue-state.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
@@ -244,6 +256,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // Remote discovery imports the remote-exec lock holder for its execution adapter.
+  'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
   'scripts/lib/mq-failure-ledger.mjs', 'scripts/lib/operator-override-store.mjs', 'scripts/lib/review-run-index.mjs',
   // Callers of a `with…Lock` helper (withAddGuardLock, withDaemonCloneLock, …) and of a lock user's lock API through a
@@ -327,6 +341,9 @@ export const LOCK_USERS = Object.freeze([
 // blocks more, and the audit-verdict test lists that over-capture.
 // A Set: the lock users repeat a few modules other entries already name.
 export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*', 'scripts/*file-locks*', 'scripts/**/*lease*', 'scripts/*lease*',
+  'scripts/lib/poc-branches.mjs', 'scripts/lib/prototype-tracker-data.mjs',
+  'scripts/lib/local-date.mjs', 'scripts/lib/constellation-repos.mjs',
+  'scripts/lib/authorized-push.mjs', 'scripts/lib/review-hold-model.mjs', 'scripts/lib/strict-utc-timestamp.mjs',
   'scripts/lib/lane-lease.mjs', 'scripts/readiness/scope-lease*',
   'scripts/**/*slot*', 'scripts/*slot*', 'scripts/**/*lock-reaper*', 'scripts/*lock-reaper*', 'scripts/**/*lane-pool*', 'scripts/*lane-pool*',
   'scripts/**/*merge*', 'scripts/*merge*', 'scripts/**/*drain*', 'scripts/*drain*', 'scripts/**/*mq*', 'scripts/*mq*',

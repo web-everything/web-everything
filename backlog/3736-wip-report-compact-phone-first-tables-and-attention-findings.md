@@ -19,3 +19,5 @@ Operator (2026-09-20): /wip is read on a phone most of the time and the Attentio
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Superseded by plan step DZ-SHELL (PL-WIP-CLEANUP, 2026-11-22). Unfinished acceptance carried to DZ-SHELL and the FUI-10 data table: compact phone-first tables. The "Attention findings become queued items" half has no named owner in the plan; it should be carried by the Delivery plan step that lists attention findings.

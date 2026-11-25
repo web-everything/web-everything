@@ -5,7 +5,8 @@ size: 8
 parent: "2804"
 status: parked
 parkedReason: maturityGated
-maturityTrigger: "adoptionSignal: DZ P3 planned in the Plateau UI pipeline"
+maturityTrigger: "adoptionSignal: plan step PD-BOARD mounts the board in the new shell (final route and tokens exist)."
+dateParked: "2026-11-22"
 blockedBy: []
 scope:
   - "plateau-app:src/backlog-view/lane-board.ts"
@@ -55,3 +56,5 @@ board is actually fixed. WE validates; plateau-app renders (MEMORY #6 preserved)
   (`plateau-app:tests/visual/real-route-fidelity.spec.ts`) goes GREEN.
 - Full plateau-app `npm test` stays green; `we:` `check:standards` passes.
 - Delivered via a plateau-app PR left OPEN for the orchestrator's independent review of the red→green proof.
+
+Ruled PARK in the master plan (2026-11-22), kept parked (operator ruling). No blockedBy on #2811: #2811's red-to-green proof depends on this remediation, so that edge would be circular. Unpark when: plan step PD-BOARD mounts the board in the new shell (final route and tokens exist). #2811's failing oracle is written first and is not deferred.

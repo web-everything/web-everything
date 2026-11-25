@@ -16,8 +16,8 @@
  *   NEVER WEAKER THAN THE DRAIN: the operator relief valve (`--no-review-escalation`) is never applied; every
  *   unreadable input is a fail-closed, never a pass; the ledger mode is the drain's own default.
  *
- *   MODE (`mergeGate.mode`, shadow | enforce — bottom of this file): shadow reports every verdict exactly as
- *   enforce but exits 0 on a HOLD. `mergeGate.carryApproval` (on | off, default on) uses the same cascade:
+ *   MODE (`mergeGate.mode`, shadow | enforce — bottom of this file): shadow is a log label only; the exit
+ *   code is the strict verdict in every mode (PRT-SHADOW-HOLD v2).`mergeGate.carryApproval` (on | off, default on) uses the same cascade:
  *   standard → platform → declared repo settings → MERGE_GATE_CARRY_APPROVAL. Invalid/unreadable → off.
  *   In addition to setting loaders and the --run-gate CLI, evaluatePrGates may read git through the shared
  *   drain carry proof when no carry fact is supplied. Inject carrySetting, proveCarry and write for pure tests.
@@ -384,14 +384,12 @@ export function groupMembership({ headRef = '', headSha = '', entries = [], comm
 }
 
 // ── mergeGate.mode: shadow | enforce ───────────────────────────────────────────────────────────────────────────
-// Operator-approved 2026-10-10: the check runs in SHADOW until a shared red-main freeze source exists (#4715,
-// card 5805). Shadow evaluates every rule exactly as enforce and reports the same table; it changes ONLY the exit
-// code of a HOLD verdict (0 instead of 1). It never changes a rule's verdict, and it never masks a run that
-// produced no verdict (a crash, a usage error, unparsable output). The ruleset step (making `merge-gate`
-// required) needs enforce.
+// Shadow is an observation label only (PRT-SHADOW-HOLD v2): the exit code is ALWAYS the strict verdict, in every
+// mode. The old mask (exit 0 on a HOLD) existed until a shared red-main freeze source landed (#4715, card 5805);
+// that has landed, so nothing is masked any more. `shadow` only changes the log line.
 //
 // Resolved through the policy cascade, each layer overriding the one below (agent-memory 151):
-//   1. standard default            STANDARD_MERGE_GATE_MODE ('shadow' for now)
+//   1. standard default            STANDARD_MERGE_GATE_MODE ('enforce')
 //   2. platform preference         we:scripts/lib/delivery-platform-preferences.json  `mergeGate.mode`
 //   3. repo setting                declared settings (we:scripts/settings/*.json)    `mergeGate.mode`
 //   4. env                         MERGE_GATE_MODE (the workflow passes the `MERGE_GATE_MODE` repository variable)
@@ -399,7 +397,7 @@ export function groupMembership({ headRef = '', headSha = '', entries = [], comm
 // typo'd layer could be the one that said enforce, so it must never fall through to shadow.
 
 export const MERGE_GATE_MODES = Object.freeze(['shadow', 'enforce']);
-export const STANDARD_MERGE_GATE_MODE = 'shadow';
+export const STANDARD_MERGE_GATE_MODE = 'enforce';
 export const MERGE_GATE_MODE_ENV = 'MERGE_GATE_MODE';
 
 /**
@@ -485,10 +483,11 @@ export function applyGateMode({ mode, source, childStatus, report }) {
   }
   const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
   const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
-  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
-  const exitCode = report.ok || shadowLine ? 0 : 1;
+  // PRT-SHADOW-HOLD v2: the exit code is the strict verdict in every mode; `mode` only picks the log label.
+  const exitCode = report.ok ? 0 : 1;
+  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW (log only): HOLD on ${holds.length ? holds.join(', ') : report.reason} — exit 1, same as enforce` : null;
   const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
-  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
+  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}**\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
   return { exitCode, holds, text, summary };
 }
 

@@ -1,13 +1,14 @@
 /**
  * @file breaks/codex-unproductive-jumps-to-claude.mjs — live break 2026-10-14: 22 repairs jumped from
  * two unproductive Codex runs straight to Claude (including PRs #5294, #5281, #5237), as did five
- * stronger-model fixes. The fallback chain must try codex-alt first. R99 (2026-10-25) extends this to
- * critical work below criticalClaudeFromRung (default index 2); takeover and ruling-not-addressed force Claude.
+ * stronger-model fixes. The fallback chain must try codex-alt first. The direct-executor policy
+ * (2026-11-23) applies the same ladder to critical work, with requiresReview instead of forced Claude.
  *
  * SCENARIO: route an ordinary fix with two unproductive Codex runs on its head, a round-3 ordinary fix
  * with none, and a round-3 fix with two, for ordinary and critical work. All must try codex-alt first.
- * Critical work must reach Claude at index 2 (three unproductive runs), at index 1 with the legacy threshold,
- * and on takeover or ruling-not-addressed even with a threshold beyond the chain.
+ * Persisted legacy thresholds must not force Claude or skip codex-alt on takeover or send-back.
+ * Without an admitted Gemini path, three unproductive runs record its skip before Claude;
+ * four unproductive runs exhaust the default ladder. Every critical dispatch requires review.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -46,6 +47,8 @@ const out = {
   criticalCombined: routeFixExecutor({ ...planned, round: 3 }, criticalOptions),
   criticalThreshold: routeFixExecutor(planned, { ...criticalOptions,
     readRouted: () => ({ 'we#5294': [...table['we#5294'], { head, outcome: 'failed' }] }) }),
+  criticalExhausted: routeFixExecutor(planned, { ...criticalOptions,
+    readRouted: () => ({ 'we#5294': [...table['we#5294'], { head, outcome: 'failed' }, { head, outcome: 'failed' }] }) }),
   criticalLegacyThreshold: routeFixExecutor(planned, { ...criticalOptions,
     chain: { ...chain, criticalClaudeFromRung: 1 } }),
   criticalTakeover: routeFixExecutor({ ...planned, takeover: true }, highThresholdOptions),
@@ -83,6 +86,9 @@ export default {
         ['critical', 'critical-tries-codex-alt', 'critical work with two unproductive Codex runs'],
         ['criticalStrongerModel', 'critical-stronger-model-tries-codex-alt', 'round-3 critical fix with no unproductive runs'],
         ['criticalCombined', 'critical-combined-triggers-try-codex-alt', 'round-3 critical fix with two unproductive runs'],
+        ['criticalLegacyThreshold', 'critical-legacy-threshold-ignored', 'critical work with two unproductive runs and retired criticalClaudeFromRung=1'],
+        ['criticalTakeover', 'critical-takeover-tries-codex-alt', 'critical takeover with retired criticalClaudeFromRung=99'],
+        ['criticalRuling', 'critical-ruling-tries-codex-alt', 'critical ruling-not-addressed with retired criticalClaudeFromRung=99'],
       ]) {
         const decision = out[key];
         if (decision.executor !== 'codex' || decision.rung !== 'codex-alt') {
@@ -90,14 +96,23 @@ export default {
         }
       }
       for (const [key, invariant, detail] of [
-        ['criticalThreshold', 'critical-reaches-claude', 'critical work with three unproductive runs at the default threshold'],
-        ['criticalLegacyThreshold', 'critical-legacy-threshold', 'critical work with two unproductive runs and criticalClaudeFromRung=1'],
-        ['criticalTakeover', 'critical-takeover-forces-claude', 'critical takeover with criticalClaudeFromRung=99'],
-        ['criticalRuling', 'critical-ruling-forces-claude', 'critical ruling-not-addressed with criticalClaudeFromRung=99'],
+        ['criticalThreshold', 'critical-skips-unadmitted-gemini', 'critical work with three unproductive runs and no admitted Gemini path'],
+        ['criticalExhausted', 'critical-exhausts-ladder', 'critical work with four unproductive runs'],
       ]) {
         const decision = out[key];
         if (decision.executor !== 'claude' || decision.rung !== 'claude') {
           violations.push({ invariant, detail: `${detail} must pick Claude; got ${JSON.stringify(decision)}` });
+        }
+      }
+      if (!out.criticalThreshold.reason.includes('gemini skipped: no admitted fix path')) {
+        violations.push({ invariant: 'gemini-skip-recorded', detail: 'Claude fallback must record why Gemini was skipped' });
+      }
+      for (const [key, decision] of Object.entries(out)) {
+        if (decision.mode !== 'direct') {
+          violations.push({ invariant: 'direct-execution', detail: `${key} must execute directly; got ${JSON.stringify(decision)}` });
+        }
+        if (key.startsWith('critical') && decision.requiresReview !== true) {
+          violations.push({ invariant: 'critical-requires-review', detail: `${key} must require review; got ${JSON.stringify(decision)}` });
         }
       }
       return { violations };

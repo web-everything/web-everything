@@ -67,3 +67,5 @@ Excluded: live interest/watch transport, token/tool timelines, remote transcript
 ## Done when
 
 The scoped Plateau tests and repo gate pass; a real card displays its review job and fixer separately with all required fields and verified transcript access/path fallback; healthy-empty, unknown and stale evidence remain distinguishable; publisher/relay compatibility and keyboard/phone use are observed. This preparation changes only the card and does not implement or claim that proof.
+
+Merged into plan step PD-LIVE (PL-WIP-CLEANUP, 2026-11-22): the per-card activity panel (sessions and jobs) is built once in the Delivery detail sheet, not on /wip.

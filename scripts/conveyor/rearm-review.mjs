@@ -201,14 +201,23 @@ function normaliseComment(c) {
  * posted AFTER a fix-begin claim (null when none, or after a rearm-review answer already cleared it). Both the guard
  * (`decideEmptyFixRound`) and the answer CLI (`stand-down-answer.mjs`) read it, so the CLI refuses exactly what the
  * guard refuses. `claims` is null when a claim is unparseable (the guard then fails open).
+ * `wouldHonour(answer)` checks window eligibility for an answer from a trusted operator/relay; the reader
+ * separately authenticates the posted comment. The CLI uses it for fresh answers and superseding retries.
  */
 const REARM_WAIVER_CAP = 2;
+const NO_CODE_OWED_CAP = 1;
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
   let standDownIds = [];
   let rearmed = false;
+  let capBlockedId = null;
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
+  let overrides = 0;
+  const overrideAvailable = () => overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
+  const wouldHonour = answer => answer?.disposition === 'rearm-review'
+    && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
+    && (!rearmed || (answer.noCodeOwed === true && overrideAvailable()));
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -217,12 +226,16 @@ export function rearmWindow(comments) {
     // The documented ceremony relays explicit operator instructions under automation credentials. Trust the actual
     // allowlisted poster, as parseOperatorAnswer does; --actor and viewerDidAuthor alone never authorize a waiver.
     const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
-    if (!rearmed && answer?.disposition === 'rearm-review' && answer.standDownId === standDownIds.at(-1) && operatorPoster) {
+    const capOverride = answer?.noCodeOwed === true && overrideAvailable();
+    if (wouldHonour(answer) && operatorPoster) {
       claims = [];
       reviewedHead = null;
       standDownIds = [];
       rearmed = true;
-      waivers += 1;
+      capBlockedId = null;
+      // An explicit no-code ruling closes the round without spending a bounded waiver.
+      if (answer.noCodeOwed !== true) waivers += 1;
+      if (capOverride) overrides += 1;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
@@ -234,9 +247,11 @@ export function rearmWindow(comments) {
       standDownIds = [];
       rearmed = false;
       waivers = 0;
+      overrides = 0;
+      capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
       const sha = claimStartSha(body);
-      if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false };
+      if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false, capBlocked: false, wouldHonour: () => false };
       claims.push(sha);
     } else if (claims.length && standDownComments([c]).length
       // Reopening permits another waiver: require the actual trusted poster, never viewerDidAuthor alone.
@@ -245,10 +260,12 @@ export function rearmWindow(comments) {
         standDownIds.push(String(c.id));
         // A fresh stop after a later claim needs its own answer; the cleared old id stays unanswerable.
         if (waivers < REARM_WAIVER_CAP) rearmed = false;
+        else if (rearmed) capBlockedId = String(c.id);
       }
     }
   }
-  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed };
+  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed, wouldHonour,
+    capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
 export function decideEmptyFixRound({ comments, liveHead } = {}) {

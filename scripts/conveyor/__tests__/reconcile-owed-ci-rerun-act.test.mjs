@@ -6,6 +6,8 @@ import { enrichPrsWithMainRedFacts, resolveOwedCiRerunSettings, defaultReadJobAt
 const repo = 'web-everything/web-everything';
 const head = 'ab9985630d90019a07b94e946bc75f8de7a6161f';
 const at = '2026-10-14T06:06:58Z';
+const now = Date.parse('2026-10-14T08:00:00Z');
+const pendingSince = new Date(now - 60_000).toISOString();
 const green = { red: false, sha: '123456789abcdef', at: '2026-10-14T07:00:00Z' };
 const windows = [{ start: '2026-10-14T06:00:00Z', end: green.at }];
 const check = (name = 'test', run = 123, job = 456) => ({ name, status: 'COMPLETED', conclusion: 'FAILURE',
@@ -17,7 +19,7 @@ const fixture = (over = {}) => ({ number: 5195, state: 'OPEN', headRefName: 'lan
   requiredCheckCompletedAt: at, requiredCheckName: 'test', aheadByOnMain: 33,
   mainGreenNow: green, owedCiRerunRetry: evidence, timeoutRetryBudget: { confirmed: 0, rejected: 0 }, ...over });
 const plan = (over = {}, setting = { rerun: 'on', maxRerunsPerHead: 1 }) => planReconcile({
-  prs: [fixture(over)], agents: [], requiredChecks: ['test'], now: Date.parse('2026-10-14T08:00:00Z'),
+  prs: [fixture(over)], agents: [], requiredChecks: ['test'], now,
   mainRedWindows: windows, owedCiRerun: setting });
 
 describe('owed CI rerun action', () => {
@@ -28,9 +30,18 @@ describe('owed CI rerun action', () => {
     expect(out.refusals.some(r => r.kind === 'owed-ci-rerun')).toBe(false);
   });
   it('holds a pending request', () => {
-    const out = plan({ timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true } });
+    const out = plan({ timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true, pendingSince } });
     expect(out.dispatch).toEqual([]);
     expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight' }));
+  });
+  it.each([false, true])('escalates an unstamped pending request (review pending=%s)', reviewPending => {
+    const out = plan({ labels: reviewPending ? [{ name: 'review:pending' }] : [],
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending: true } });
+    expect(out.dispatch).toEqual([]);
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated',
+      why: expect.stringContaining('without a usable timestamp') }));
+    expect(out.refusals.some(r => r.kind === 'ci-timeout-rerun-in-flight')).toBe(false);
+    expect(out.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
   it.each([{ confirmed: 1, rejected: 0 }, { confirmed: 0, rejected: 1 }])('heals after the budget is spent: %j', budget => {
     const out = plan({ timeoutRetryBudget: budget });
@@ -45,8 +56,10 @@ describe('owed CI rerun action', () => {
     expect(out.dispatch[0].timeoutRetry.cap).toBe(4);
   });
   it.each([false, true])('folds the review prerequisite into the rerun decision (pending=%s)', pending => {
-    const out = plan({ labels: [{ name: 'review:pending' }], timeoutRetryBudget: { confirmed: 0, rejected: 0, pending } });
+    const out = plan({ labels: [{ name: 'review:pending' }],
+      timeoutRetryBudget: { confirmed: 0, rejected: 0, pending, ...(pending ? { pendingSince } : {}) } });
     const row = pending ? out.refusals[0] : out.dispatch.find(r => r.kind === 'ci-timeout-rerun');
+    expect(row.kind).toBe(pending ? 'ci-timeout-rerun-in-flight' : 'ci-timeout-rerun');
     expect(row.reviewRefusal).toBeDefined();
     expect(out.refusals.filter(r => r.kind === 'owed-ci-rerun')).toEqual([]);
     expect(out.dispatch.filter(r => r.kind === 'review')).toEqual([]);

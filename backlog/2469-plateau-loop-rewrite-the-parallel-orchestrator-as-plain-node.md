@@ -5,7 +5,7 @@ size: 5
 parent: "2445"
 status: open
 priority: low
-blockedBy: ["2446"]
+blockedBy: ["5488"]
 dateOpened: "2026-07-12"
 tags: []
 ---

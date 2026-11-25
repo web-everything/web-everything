@@ -3,12 +3,13 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import ts from 'typescript';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   extractPassTimings, parseMarkCause, isEligibleCause, parseMarkKey, notePending, duePending,
   CATCH_UP_QUERY, ENQUEUE_ON_EVENT_DEFAULTS, readPendingChangePaths, readCatchUpCandidates, readyAtQuery, planCatchUp,
@@ -439,7 +440,7 @@ describe('createEnqueueOnEvent', () => {
     [1, { considered: 1, toMerge: [], failed: [], skipReasons: [] }],
     [0, { considered: 1, toMerge: [], failed: [], skipReasons: [] }],
   ])('publishes only allowlisted diagnostics for exit %s with JSON %j', async (code, json) => {
-    const stderr = 'opaque diagnostic text';
+    const stderr = 'opaque diagnostic text\nsecond line must stay hidden';
     const { handle, children, lines, advance } = setup({ manualFinish: true });
     handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
     const tick = handle.tick();
@@ -448,9 +449,118 @@ describe('createEnqueueOnEvent', () => {
     children[0].stderr.emit('data', stderr);
     children[0].emit('close', code);
     const [result] = await tick;
+    // Deliberate change: only the sanitised first line may appear; the rest of stderr stays private.
     expect(JSON.stringify({ result, lines })).not.toContain(stderr);
+    expect(JSON.stringify({ result, lines })).not.toContain('second line must stay hidden');
+    const drainLine = lines.find(line => line.includes('fast drain exit'));
+    if (code !== 0) expect(drainLine).toContain('first error: opaque diagnostic text');
+    else expect(drainLine).not.toContain('opaque diagnostic text'); // exit 0 never publishes stderr text
     expect(lines.find(line => line.includes('fast drain exit'))).toContain('exit ' + code + ', ' + stderr.length + 'B stderr, class=unknown');
     expect(result.outcome).toBe(code !== 0 ? 'error' : 'other');
+  });
+
+  it('a failed fast drain logs the first stderr error line', async () => {
+    const { handle, children, lines, advance } = setup({ manualFinish: true });
+    handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
+    const tick = handle.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    children[0].stderr.emit('data', '\n\u001b[31mfatal: merge queue refused\u001b[0m\nmore detail\n');
+    children[0].emit('close', 1);
+    await tick;
+    const line = lines.find(l => l.includes('fast drain exit'));
+    expect(line).toContain('first error: [31mfatal: merge queue refused');
+    expect(line).not.toContain('more detail');
+    expect(line).not.toContain('\u001b');
+  });
+
+  it('firstStderrErrorLine surfaces the script failure line behind policy preamble (DRAIN-FASTDRAIN-CRASH)', () => {
+    const preamble = '(node:1) DeprecationWarning: x\ngithub-app-auth-env: WARNING — personal login\npolicy · drain.x=on (source: default)\n';
+    const tail = 'merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass\n    at readFastDrainContext (x.mjs:1:1)\n';
+    expect(enqueueModule.firstStderrErrorLine(preamble + tail)).toBe('merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'.replace(/[^\x20-\x7e]/g, ' '));
+    expect(enqueueModule.firstStderrErrorLine(preamble + 'opaque')).toBe('[unclassified stderr; see local log]');
+    // an arbitrary prefixed tail never publishes, and an earlier real error is not hidden by a later one
+    expect(enqueueModule.firstStderrErrorLine(preamble + 'response ✗ Error: opaque-private-value-123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('TypeError: primary failure\n' + tail)).toBe('TypeError: primary failure');
+  });
+
+  it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {
+    const noise = '(node:1) DeprecationWarning: The `punycode` module is deprecated.\n(Use `node --trace-deprecation ...` to show where)\n(node:1) ExperimentalWarning: x\n';
+    expect(enqueueModule.firstStderrErrorLine(`${noise}TypeError: x`)).toBe('TypeError: x');
+    expect(enqueueModule.firstStderrErrorLine(`${noise}opaque-value-123`)).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: secret follows\nopaque-value-123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('plain first line')).toBe('plain first line');
+    expect(enqueueModule.firstStderrErrorLine(noise)).toBe('');
+    expect(enqueueModule.firstStderrErrorLine('Error: DeprecationWarning is fatal')).toBe('Error: DeprecationWarning is fatal');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nSESSION=opaque123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('(node:1) ExperimentalWarning: x\nError: SESSION=opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('SESSION: opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJhbGciOi.eyJzdWIiOi.sig123')).toBe('[redacted]');
+  });
+
+  it.each(['DeprecationWarning', 'ExperimentalWarning'])('firstStderrErrorLine skips real Node %s output and trace hints', type => {
+    const child = spawnSync(process.execPath, ['--eval', `
+      process.emitWarning('fixture warning', { type: ${JSON.stringify(type)}, ${type === 'DeprecationWarning' ? "code: 'DEP0040'" : ''} });
+      process.nextTick(() => process.stderr.write('TypeError: x\\n'));
+    `], { encoding: 'utf8', timeout: 5000, maxBuffer: 64 * 1024,
+      env: { ...process.env, NODE_OPTIONS: '', NODE_NO_WARNINGS: '', NODE_REDIRECT_WARNINGS: '' } });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stderr).toContain(`${type}: fixture warning`);
+    expect(child.stderr).toContain(type === 'DeprecationWarning' ? '[DEP0040]' : '--trace-warnings');
+    expect(enqueueModule.firstStderrErrorLine(child.stderr)).toBe('TypeError: x');
+    expect(enqueueModule.firstStderrErrorLine(child.stderr.replace('TypeError: x\n', ''))).toBe('');
+  });
+
+  it('firstStderrErrorLine scans long assignment and JWT near-misses without blocking', () => {
+    // The browser test environment exposes an HTTP import.meta.url; the Node child needs a file URL.
+    const moduleUrl = pathToFileURL(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs')).href;
+    const script = `import { firstStderrErrorLine } from ${JSON.stringify(moduleUrl)};
+      const assignment = 'session'.repeat(100000);
+      const jwt = 'eyJabcde-'.repeat(100000);
+      if (firstStderrErrorLine(assignment) !== assignment.slice(0, 200) + '...') throw new Error('assignment changed');
+      if (firstStderrErrorLine(jwt) !== jwt.slice(0, 200) + '...') throw new Error('JWT changed');`;
+    expect(() => execFileSync(process.execPath, ['--input-type=module', '--eval', script],
+      { timeout: 5000, maxBuffer: 64 * 1024, stdio: 'pipe' })).not.toThrow();
+  });
+
+  it('firstStderrErrorLine preserves assignment and JWT redaction boundaries', () => {
+    for (const line of ['pass: 2', 'drain-prs: pass: 2 failed', 'Error: monkey: banana', 'error: bypass=1 not allowed']) {
+      expect(enqueueModule.firstStderrErrorLine(line)).toBe(line);
+    }
+    for (const key of ['SESSION', 'MY_SESSION', 'session.id', 'service-key', 'AUTH', 'PASS', 'DB_PASS']) {
+      expect(enqueueModule.firstStderrErrorLine(`${key}=opaque123`)).toBe('[redacted]');
+    }
+    expect(enqueueModule.firstStderrErrorLine('PASS=2')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('PASS: opaque123')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('DB_PASS: 2')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('MY_SESSION.id-1 : value')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('session =   ')).toBe('session =');
+    expect(enqueueModule.firstStderrErrorLine('session! = value')).toBe('session! = value');
+    expect(enqueueModule.firstStderrErrorLine('jwt prefix-eyJabcde.abcde.')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('jwt xeyJabcde.abcde.')).toBe('jwt xeyJabcde.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcd.abcde.')).toBe('jwt eyJabcd.abcde.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcd.')).toBe('jwt eyJabcde.abcd.');
+    expect(enqueueModule.firstStderrErrorLine('jwt eyJabcde.abcde')).toBe('jwt eyJabcde.abcde');
+  });
+
+  it('firstStderrErrorLine caps length and redacts credential-looking lines', () => {
+    expect(enqueueModule.firstStderrErrorLine('x'.repeat(500)).length).toBeLessThanOrEqual(203);
+    expect(enqueueModule.firstStderrErrorLine('Authorization: Bearer abc')).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('')).toBe('');
+    const forged = enqueueModule.firstStderrErrorLine('real error' + String.fromCharCode(0x2028) + '[fake] merged 99' + String.fromCharCode(0x200b));
+    expect(forged).toBe('real error [fake] merged 99');
+    expect(enqueueModule.firstStderrErrorLine('a' + String.fromCharCode(0x2066, 0x2067, 0x2068, 0x2069) + 'b')).toBe('a    b');
+    // Allowlist: any non-printable-ASCII code point (e.g. U+061C, U+00E9, U+1F600) is replaced, never passed through.
+    expect(enqueueModule.firstStderrErrorLine('a' + String.fromCharCode(0x61c, 0xe9, 0xd83d, 0xde00) + 'b')).toBe('a    b');
+    expect(enqueueModule.firstStderrErrorLine('fetch https://alice:hunter2@example.test failed')).toBe('[redacted]');
+    // Env-value redaction only (none of these match the pattern blacklist), including short, opaque, multiline and tab values.
+    expect(enqueueModule.firstStderrErrorLine('opaque123', { MY_SESSION: 'opaque123' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom abc12', { SERVICE_TOKEN: 'abc12' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom zq81xk', { DATABASE_URL: 'zq81xk' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom line-one-xyz\nline-two-xyz', { DB_CONN: 'line-one-xyz\nline-two-xyz' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom a\tb-cred', { DB_CONN: 'a\tb-cred' })).toBe('[redacted]');
+    expect(enqueueModule.firstStderrErrorLine('boom ok', { DB_CONN: 'other-value' })).toBe('boom ok');
   });
 
   it('does not trust an enqueue-success JSON result from a nonzero-exit child', async () => {
@@ -2192,13 +2302,13 @@ describe('child pass timings', () => {
     'configured-env-secret',
   ])('publishes no stderr text (%#)', async secret => {
     const source = readFileSync(join(process.cwd(), 'scripts/lib/enqueue-on-event.mjs'), 'utf8');
-    const runChild = new Function('classifyChildFailure', 'extractPassTimings',
-      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(enqueueModule.classifyChildFailure, extractPassTimings);
+    const runChild = new Function('classifyChildFailure', 'extractPassTimings', 'firstStderrErrorLine',
+      source.slice(source.indexOf('function runChild('), source.indexOf('\nconst lastJsonLine')) + '; return runChild;')(enqueueModule.classifyChildFailure, extractPassTimings, enqueueModule.firstStderrErrorLine);
     const child = new EventEmitter(); child.stderr = new EventEmitter();
     const pending = runChild({ env: { SERVICE_SECRET: secret }, args: [], timeoutMs: 1000, spawnImpl: () => child });
     child.stderr.emit('data', secret); child.emit('close', 1);
     const result = await pending;
-    expect(result).toEqual({ code: 1, stdout: '', stderrBytes: secret.length, errorClass: 'unknown', passTimings: null, timedOut: false });
+    expect(result).toEqual({ code: 1, stdout: '', stderrBytes: secret.length, stderrFirstLine: '[redacted]', errorClass: 'unknown', passTimings: null, timedOut: false });
     const { handle, lines, advance } = setup({ env: { SERVICE_SECRET: secret }, drainStderr: secret });
     handle.notePoll({ ok: true, marked: [mark()] }); advance(15_000);
     const ran = await handle.tick();
