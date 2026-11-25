@@ -11,8 +11,13 @@ export function createSiblingHistoryReader(readGit) {
   };
 }
 
-/** Read-only ancestry/patch evidence. Returns sibling counts, or an unreadable refusal. */
+/**
+ * Refuse incorporated open sibling tips with shared unlanded commits. Divergent
+ * overlap (including a sibling advanced after the cut) cannot prove ownership.
+ * Returns sibling counts, or an unreadable refusal; never prescribes a rebase.
+ */
 export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = '', openPrs }) {
+  let readingPr = '';
   try {
     const read = createSiblingHistoryReader(git);
     const oid = value => {
@@ -51,6 +56,12 @@ export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = ''
     read(['check-ref-format', `refs/remotes/origin/${base}`]);
     const head = pin(sha), main = pin('refs/remotes/origin/main');
     const baseOid = pin(`refs/remotes/origin/${base}`);
+    // Traverse the complete proposed ancestry before considering PR tips. In a
+    // non-shallow graph a tip absent from this set cannot be incorporated, whether
+    // it is locally available, unfetched, or from a fork. Do not resolve unrelated
+    // objects or fetch them. A missing ancestor or a bounded-read failure refuses.
+    const ancestors = new Set(lines(read(['rev-list', head, '--'])).map(oid));
+    if (!ancestors.has(head)) throw new Error('incomplete proposed ancestry');
     // Exclude exact main ancestry first; cherry excludes patch-equivalent squash landings.
     // Merge commits have no cherry row and remain conservatively unlanded.
     const commits = lines(read(['rev-list', `${baseOid}..${head}`, `^${main}`, '--'])).map(oid);
@@ -62,6 +73,8 @@ export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = ''
     const unlanded = commits.filter(commit => !landed.has(commit));
     const siblings = [];
     for (const pr of openPrs) {
+      if (!ancestors.has(pr.headRefOid)) continue;
+      readingPr = ` for PR #${pr.number} (${pr.headRefOid})`;
       const sibling = pin(pr.headRefOid);
       if (base !== 'main' && base === pr.headRefName && pr.isCrossRepository === false) continue;
       // A child's shared commits came from this branch, including before a parent review fix.
@@ -70,16 +83,10 @@ export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = ''
       const reachable = new Set(lines(read(['rev-list', sibling, `^${main}`, '--'])).map(oid));
       const count = unlanded.filter(commit => reachable.has(commit)).length;
       if (!count) continue;
-      // Shared ancestors alone cannot establish dependency direction: this may be an
-      // undeclared child, including one cut before this branch's latest review fix.
-      // Only an incorporated sibling tip supplies directional ancestry evidence.
-      // Divergent overlap is intentionally inconclusive; do not infer commit ownership.
-      const outside = lines(read(['rev-list', '--max-count=1', sibling, `^${head}`, '--'])).map(oid);
-      if (outside.length) continue;
       siblings.push({ number: pr.number, headRefName: pr.headRefName, count });
     }
     return siblings;
   } catch {
-    return { reason: 'sibling-base-unreadable', detail: 'Sibling ancestry or open PR evidence is unreadable or incomplete; restore complete non-shallow history, local origin/main, base and sibling commit objects and retry --check. If the read exceeds its time/output limit, ask a human to inspect the branch history.' };
+    return { reason: 'sibling-base-unreadable', detail: `Sibling ancestry or open PR evidence is unreadable or incomplete${readingPr}; restore complete non-shallow history, local origin/main, base and incorporated sibling commit objects and retry --check. If the read exceeds its time/output limit, ask a human to inspect the branch history.` };
   }
 }

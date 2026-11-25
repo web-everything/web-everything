@@ -6,23 +6,36 @@ import { checkSiblingBase } from '../../lib/sibling-base-check.mjs';
 import { createGitReader } from '../../lib/pr-size-admission.mjs';
 import { createPrLandRunner, readSiblingBase } from '../open-pr-io.mjs';
 import { ghRepoSlug } from '../../lib/constellation-repos.mjs';
+import { runGhSync } from '../../lib/gh-throttle.mjs';
+
+// Keep the runner's default-spawn identity check intact while making the process
+// boundary hermetic. Tests below omit both spawn and siblingBase to exercise wiring.
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal();
+  const spawnSync = vi.fn(() => ({ status: 0, stdout: '{"reason":"check-ok"}' }));
+  return { ...actual, spawnSync, default: { ...actual.default, spawnSync } };
+});
+vi.mock('../../lib/gh-throttle.mjs', async importOriginal => ({
+  ...await importOriginal(), runGhSync: vi.fn(),
+}));
 
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
-function fixture() {
+function fixture(source) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'sibling-base-'));
   dirs.push(dir);
   const git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-  git('init', '-b', 'main');
+  if (source) git('clone', source, '.');
+  else git('init', '-b', 'main');
   git('config', 'user.email', 'fixture@example.test');
   git('config', 'user.name', 'Fixture');
-  git('remote', 'add', 'origin', `https://github.com/${ghRepoSlug('we')}.git`);
+  git('remote', source ? 'set-url' : 'add', 'origin', `https://github.com/${ghRepoSlug('we')}.git`);
   const commit = name => {
     writeFileSync(join(dir, name), name + '\n');
     git('add', name); git('commit', '-m', name);
     return git('rev-parse', 'HEAD');
   };
-  commit('root');
+  if (!source) commit('root');
   git('update-ref', 'refs/remotes/origin/main', 'HEAD');
   const openPrs = [];
   const sibling = number => {
@@ -39,6 +52,21 @@ function fixture() {
 }
 
 describe('sibling base admission', () => {
+  it('the production default runner invokes sibling admission', () => {
+    const f = fixture(), pr = f.sibling(236);
+    f.git('checkout', '-b', 'lane/child'); f.commit('child');
+    runGhSync.mockReset();
+    runGhSync.mockReturnValue(JSON.stringify([pr]));
+    const run = createPrLandRunner({ cwd: f.dir, env: {},
+      prepGate: () => ({ ok: true }), prePrReview: () => ({ action: 'pass' }),
+      canonicalAudit: () => ({ ok: true }), dupBornAs: () => [],
+    });
+    const result = run({ argv: ['--ref=lane/child', '--check'] });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('#236');
+    expect(runGhSync).toHaveBeenCalledOnce();
+  });
+
   it('refuses a branch whose history holds commits that belong to another open lane', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/child'); f.commit('child');
@@ -94,6 +122,32 @@ describe('sibling base admission', () => {
     const f = fixture(), pr = f.sibling(236);
     f.git('checkout', '-b', 'lane/237'); f.commit('child');
     expect(f.check({ base: pr.headRefName })).toEqual([]);
+  });
+
+  it('forwards the declared stack base through runner --check', () => {
+    const f = fixture(), pr = f.sibling(236);
+    f.git('checkout', '-b', 'lane/237'); f.commit('child');
+    expect(runner(f)({ argv: ['--ref=lane/237', `--base=${pr.headRefName}`, '--check'] }))
+      .toMatchObject({ outcome: 'checked', reason: 'check-ok' });
+  });
+
+  it.each([false, true])('admits a clean checkout after an unrelated remote PR advances (fork: %s)', isCrossRepository => {
+    const seed = fixture();
+    // Two clones share a local origin; only the peer sees the new branch commit.
+    const origin = mkdtempSync(join(process.env.TMPDIR, 'sibling-origin-'));
+    dirs.push(origin);
+    execFileSync('git', ['clone', '--bare', seed.dir, origin], { stdio: 'pipe' });
+    const f = fixture(origin), peer = fixture(origin);
+    peer.git('checkout', '-b', 'lane/unfetched');
+    const headRefOid = peer.commit('unrelated');
+    peer.git('push', origin, 'HEAD:refs/heads/lane/unfetched');
+    f.git('checkout', '-b', 'lane/clean'); f.commit('clean');
+    expect(() => f.git('cat-file', '-e', headRefOid)).toThrow();
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, () => JSON.stringify([
+      { number: 999, headRefName: 'lane/unfetched', headRefOid, baseRefName: 'main', isCrossRepository },
+    ]));
+    expect(runner(f, { siblingBase })({ argv: ['--ref=lane/clean', '--check'] }))
+      .toMatchObject({ outcome: 'checked', reason: 'check-ok' });
   });
 
   it.each([true, undefined])('does not exempt a declared-base name collision without same-repository proof (%s)', isCrossRepository => {
@@ -165,17 +219,40 @@ describe('sibling base admission', () => {
     expect(JSON.stringify(result)).not.toContain('git rebase --onto');
   });
 
-  it.each(['error', 'malformed'])('fails closed on unreadable directional ancestry (%s)', failure => {
+  it.each(['error', 'malformed', 'empty'])('fails closed on unreadable directional ancestry (%s)', failure => {
     const f = fixture(); f.sibling(236); f.commit('child');
     const real = createGitReader(f.dir);
     const git = (args, opts) => {
-      if (args.includes('--max-count=1')) {
+      if (args[0] === 'rev-list' && args.length === 3) {
         if (failure === 'error') throw new Error('ancestry read unavailable');
+        if (failure === 'empty') return '';
         return 'invalid-commit-identity\n';
       }
       return real(args, opts);
     };
     expect(f.check({ git })).toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it('names the PR and oid when incorporated sibling evidence cannot be read', () => {
+    const f = fixture(), pr = f.sibling(236); f.commit('child');
+    const real = createGitReader(f.dir);
+    const git = (args, opts) => {
+      if (args[0] === 'rev-list' && args[1] === pr.headRefOid) throw new Error('unreadable object');
+      return real(args, opts);
+    };
+    const result = f.check({ git });
+    expect(result).toMatchObject({ reason: 'sibling-base-unreadable' });
+    expect(result.detail).toContain(`#${pr.number}`);
+    expect(result.detail).toContain(pr.headRefOid);
+  });
+
+  it('admits an advanced sibling after cut because shared ownership is inconclusive', () => {
+    const f = fixture(), pr = f.sibling(236);
+    f.git('checkout', '-b', 'lane/child'); f.commit('child');
+    expect(f.check()).toHaveLength(1);
+    f.git('checkout', pr.headRefName);
+    pr.headRefOid = f.commit('sibling-review-fix');
+    expect(f.check({ sha: 'lane/child' })).toEqual([]);
   });
 
   it.each([true, undefined])('does not exempt a child without same-repository proof (%s)', isCrossRepository => {
@@ -222,12 +299,12 @@ describe('sibling base admission', () => {
       .toMatchObject({ reason: 'sibling-base-unreadable' });
   });
 
-  it('requires readable child commit objects before exempting a declared descendant', () => {
+  it('allows an unfetched declared descendant outside the complete proposed history', () => {
     const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
     f.git('checkout', parent.headRefName);
     expect(f.check({ branch: parent.headRefName,
       openPrs: [{ ...child, baseRefName: parent.headRefName, headRefOid: 'f'.repeat(40) }] }))
-      .toMatchObject({ reason: 'sibling-base-unreadable' });
+      .toEqual([]);
   });
 
   it('fails closed when git state is unreadable', () => {
@@ -236,6 +313,13 @@ describe('sibling base admission', () => {
     expect(f.check()).toMatchObject({ reason: 'sibling-base-unreadable' });
     expect(f.check({ git: () => { throw new Error('unreadable'); } })).toMatchObject({ reason: 'sibling-base-unreadable' });
     expect(f.check({ openPrs: null })).toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
+  it('refuses a missing commit inside proposed ancestry even when every listed tip is unrelated', () => {
+    const f = fixture(), pr = f.sibling(236); f.commit('child');
+    rmSync(join(f.dir, '.git', 'objects', pr.headRefOid.slice(0, 2), pr.headRefOid.slice(2)));
+    expect(f.check({ openPrs: [{ ...pr, headRefOid: 'f'.repeat(40) }] }))
+      .toMatchObject({ reason: 'sibling-base-unreadable' });
   });
 
   it('surfaces the sibling blocker in runner --check output and retains other gates', () => {
@@ -350,9 +434,19 @@ describe('sibling base admission', () => {
     expect(spawn.mock.calls[0][1]).toContain(`--sha=${audited}`);
   });
 
-  it('refuses an oversized or malformed open PR listing with an operator fallback', () => {
+  it('refuses 1000 otherwise-valid PR records with the cap-specific operator fallback', () => {
+    const f = fixture(), pr = f.sibling(236);
+    const prs = Array.from({ length: 1000 }, (_, i) => ({ ...pr, number: i + 1, headRefName: `lane/pr-${i}` }));
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, () => JSON.stringify(prs));
+    const result = runner(f, { siblingBase })({ argv: ['--ref=lane/child', '--check'] });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unreadable' });
+    expect(result.detail).toContain('1000 PR limit');
+    expect(result.detail).toContain('ask a human');
+  });
+
+  it('refuses a malformed open PR listing with an operator fallback', () => {
     const f = fixture();
-    for (const evidence of [Array(1000).fill({}), null, '{bad-json']) {
+    for (const evidence of [[{}], null, '{bad-json']) {
       const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir },
         () => typeof evidence === 'string' ? evidence : JSON.stringify(evidence));
       const result = runner(f, { siblingBase })({ argv: ['--ref=lane/child', '--check'] });
@@ -372,12 +466,14 @@ describe('sibling base admission', () => {
     }
   });
 
-  it('fails closed on missing sibling objects and bounds each Git read', () => {
+  it('ignores absent sibling tips but still detects incorporated siblings and bounds each Git read', () => {
     const f = fixture(); f.sibling(236); f.commit('child');
-    expect(f.check({ openPrs: [{ ...f.openPrs[0], headRefOid: 'f'.repeat(40) }] }))
-      .toMatchObject({ reason: 'sibling-base-unreadable' });
+    const missing = { ...f.openPrs[0], number: 999, headRefName: 'lane/unfetched', headRefOid: 'f'.repeat(40) };
+    expect(f.check({ openPrs: [missing] })).toEqual([]);
     const real = createGitReader(f.dir), git = vi.fn((...args) => real(...args));
-    expect(f.check({ git })).toHaveLength(1);
+    expect(f.check({ git, openPrs: [missing, ...f.openPrs] })).toEqual([
+      { number: 236, headRefName: f.openPrs[0].headRefName, count: 1 },
+    ]);
     for (const [, opts] of git.mock.calls) {
       expect(opts).toMatchObject({ timeout: 5000, maxBuffer: 8 * 1024 * 1024,
         env: { GIT_NO_LAZY_FETCH: '1', GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null' } });
