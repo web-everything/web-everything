@@ -107,7 +107,7 @@ export function startLaneLeaseHeartbeat({ cwds, everyMs = DEFAULT_LEASE_HEARTBEA
   });
   if (!targets.length) return () => {};
   // The interval never exceeds a third of the shortest lease ttl, so a short lease cannot lapse between beats.
-  const period = Math.max(1000, Math.min(everyMs, ...targets.map((t) => t.ttlMs / 3)));
+  const period = Math.min(everyMs, ...targets.map((t) => t.ttlMs / 3));
   const tick = () => {
     for (const t of targets) {
       if (renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, caller, now, leaseDirFn, fs })) { t.lost = false; continue; }

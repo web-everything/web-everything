@@ -142,6 +142,42 @@ describe('lease mutation coordination', () => {
 
 describe('startLaneLeaseHeartbeat', () => {
   it.each([
+    { ttlMinutes: 0.01, everyMs: undefined, expectedPeriod: 200 },
+    { ttlMinutes: 0.025, everyMs: undefined, expectedPeriod: 500 },
+    { ttlMinutes: 0.05, everyMs: undefined, expectedPeriod: 1000 },
+    { ttlMinutes: 0.01, everyMs: 100, expectedPeriod: 100 },
+  ])('keeps short leases live across their original expiry: %j', ({ ttlMinutes, everyMs, expectedPeriod }) => {
+    const short = gitDir(), long = gitDir();
+    put(short, { ...lease, ttlMinutes });
+    put(long, lease);
+    let current = Date.parse(lease.acquiredAt), tick, period;
+    const warn = vi.fn(), clearIntervalFn = vi.fn(), timer = {};
+    const stop = startLaneLeaseHeartbeat({
+      cwds: ['long', 'short'], callerSession: 'a', everyMs,
+      leaseDirFn: cwd => cwd === 'short' ? short : long,
+      now: () => new Date(current), warn,
+      setIntervalFn: (fn, ms) => { tick = fn; period = ms; return timer; }, clearIntervalFn,
+    });
+    try {
+      expect(read(short).renewedAt).toBe(new Date(current).toISOString());
+      Array.from({ length: 8 }).forEach(() => {
+        current += period;
+        tick();
+        expect(read(short).renewedAt).toBe(new Date(current).toISOString());
+        expect(read(long).renewedAt).toBe(new Date(current).toISOString());
+      });
+      expect(current - Date.parse(lease.acquiredAt)).toBeGreaterThan(ttlMinutes * 60_000);
+      expect(period).toBe(expectedPeriod);
+      expect(period).toBeLessThanOrEqual(ttlMinutes * 60_000 / 3);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      stop();
+      rmSync(short, { recursive: true, force: true });
+      rmSync(long, { recursive: true, force: true });
+    }
+    expect(clearIntervalFn).toHaveBeenCalledWith(timer);
+  });
+  it.each([
     { ownerSession: 'me' }, { workerSession: 'me', ownerSession: 'dispatcher' },
     { session: 'me' }, { holder: 'my-holder', ownerSession: 'dispatcher' },
   ])('renews a caller identity proven by %j', (identity) => {
