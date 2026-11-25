@@ -51,7 +51,7 @@ function probe(root = ROOT) {
         labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }], files: [{ path: 'README.md', changeType: 'MODIFIED' }],
         commits: [{ oid: sha, messageHeadline: 'Update readme', authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
         statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha }],
-        comments: [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${scenario.carry ? 'c'.repeat(40) : sha} -->`
+        comments: [{ id: 'IC_clearance', author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${scenario.carry ? 'c'.repeat(40) : sha} -->`
           + (scenario.cleared || scenario.carry ? '\n<!-- cleared-human: chalbert -->' : '')
           + (scenario.carry ? `\n<!-- reviewed-diff: ${normalizeDiffFingerprint(carryDiff)} -->` : ''), createdAt: new Date().toISOString() }], reviews: [],
         ...(scenario.carry ? { gitDiffText: carryDiff } : {}), compare: scenario.compare }));

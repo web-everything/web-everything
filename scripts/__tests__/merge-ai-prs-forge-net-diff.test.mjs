@@ -60,6 +60,8 @@ it.each([true, false])('an older non-local clearance carries an identical diff o
   ready(pr);
   pr.compare = compare({ files: [file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })] });
   pr.gitDiffText = synthesizeUnifiedDiff(pr.compare.files);
+  // A durable carry must cite the original human comment, as a real forge comment does.
+  pr.comments[0].id = 'IC_clearance';
   pr.comments[0].body = `<!-- reviewed-sha: ${'c'.repeat(40)} -->\n<!-- cleared-human: chalbert -->\n<!-- reviewed-diff: ${normalizeDiffFingerprint(pr.gitDiffText)} -->`;
   const r = await run(false, { ...options, env: { WE_ACCEPT_CARRY_FORWARD: 'on' } });
   const delivered = r.calls.some(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge'));
@@ -67,6 +69,11 @@ it.each([true, false])('an older non-local clearance carries an identical diff o
   if (sibling) {
     expect(r.report.parked, r.stderr).toEqual([]);
     expect(r.calls.some(a => a[0] === 'git' && a.includes('diff') && a.includes(pr.headRefOid))).toBe(true);
+    const carryRecord = r.calls.findIndex(a => a[0] === 'pr' && a[1] === 'comment'
+      && a.some(x => x?.includes('<!-- cleared-from: IC_clearance -->')));
+    expect(carryRecord).toBeGreaterThanOrEqual(0);
+    expect(r.calls[carryRecord].join('\n')).toContain(`<!-- reviewed-sha: ${pr.headRefOid} -->`);
+    expect(carryRecord).toBeLessThan(r.calls.findIndex(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge')));
   } else {
     expect(r.calls.some(a => a.includes('--add-label') && a.some(x => x?.includes('review:held-mechanical')))).toBe(true);
   }
