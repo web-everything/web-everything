@@ -5,7 +5,12 @@ import { CONSTELLATION_REPOS, DEFAULT_REPO_KEY } from '../lib/constellation-repo
 
 export const UPDATE_BRANCH_OP = 'update-branch';
 
-function validate({ pr, reason }) {
+const EXPECTED_HEAD = /^[0-9a-f]{40}$/;
+const expectedOf = input => input['expected-head'] ?? input.expectedHead;
+
+function validate({ pr, reason, ...rest }) {
+  const expected = expectedOf(rest);
+  if (expected !== undefined && !(typeof expected === 'string' && EXPECTED_HEAD.test(expected))) throw new TypeError('update-branch: --expected-head must be a 40-hex sha');
   if (!Number.isSafeInteger(pr) || pr < 1) throw new TypeError('update-branch: --pr must be a positive integer');
   if (typeof reason !== 'string' || !reason.trim()) throw new TypeError('update-branch: --reason is required and must be non-empty');
 }
@@ -33,6 +38,14 @@ export async function runUpdateBranch(input, io) {
       Object.assign(result, { refused: true, status: 'not-open' });
     } else {
       if (!result.beforeHead || !pull?.base?.ref) throw new Error('missing PR head/base; inspect the PR manually');
+      const expected = expectedOf(input);
+      if (expected !== undefined && expected !== result.beforeHead) {
+        Object.assign(result, { refused: true, status: 'head-moved', expectedHead: expected,
+          detail: 'The PR head is not the expected head; nothing was written. Re-read the PR before retrying.' });
+        const loggedMoved = await io.append({ kind: UPDATE_BRANCH_OP, repo, pr, detail: result });
+        if (!loggedMoved) result.logWarning = 'Event log unavailable; preserve this result for the operator.';
+        return result;
+      }
       result.behindBefore = behind(await io.compare(repo, pull.base.ref, result.beforeHead));
       result.behindAfter = result.behindBefore;
       if (result.behindBefore === 0) Object.assign(result, { ok: true, status: 'already-up-to-date' });
@@ -77,9 +90,10 @@ export async function runUpdateBranch(input, io) {
 export function updateBranchOperation() {
   return op(UPDATE_BRANCH_OP, {
     input: { pr: { type: 'number', required: true }, reason: { type: 'string', required: true },
-      repo: { type: 'string', required: false, default: CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug } },
+      repo: { type: 'string', required: false, default: CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug },
+      'expected-head': { type: 'string', required: false } },
     verdictFrom: 'assess',
-    act: effect({ reads: ['input.pr', 'input.reason', 'input.repo'], effects: ({ input }) => {
+    act: effect({ reads: ['input.pr', 'input.reason', 'input.repo', 'input.expected-head'], effects: ({ input }) => {
       validate(input);
       return [{ type: UPDATE_BRANCH_OP, payload: input, idempotent: false }];
     } }),

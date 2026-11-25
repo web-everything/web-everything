@@ -131,6 +131,38 @@ describe('update-branch', () => {
     expect(f.sleep).not.toHaveBeenCalled();
   });
 
+  it('refuses head-moved with no PUT when the head differs', async () => {
+    const f = fixture([pull]);
+    const result = await f.run({ ...input, 'expected-head': 'd'.repeat(40) });
+    expect(result).toMatchObject({ ok: false, refused: true, status: 'head-moved', beforeHead: head, afterHead: head });
+    expect(writes(f)).toHaveLength(0);
+    expect(f.gh).toHaveBeenCalledTimes(1);
+    expect(f.append).toHaveBeenCalledTimes(1);
+  });
+
+  it('PUT carries expected_head_sha equal to the given head', async () => {
+    const f = fixture([pull, { behind_by: 2 }, accepted, next, { behind_by: 0 }]);
+    expect(await f.run({ ...input, 'expected-head': head })).toMatchObject({ ok: true, status: 'updated' });
+    expect(writes(f)[0][0]).toContain(`expected_head_sha=${head}`);
+  });
+
+  it('omitted flag keeps today\'s behaviour', async () => {
+    const f = fixture([pull, { behind_by: 2 }, accepted, next, { behind_by: 0 }]);
+    expect(await f.run()).toMatchObject({ ok: true, status: 'updated' });
+    expect(writes(f)[0][0]).toContain(`expected_head_sha=${head}`);
+  });
+
+  it.each(['abc', 'A'.repeat(40), 42])('rejects a malformed expected head before any IO (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it('declares --expected-head in the CLI usage', async () => {
+    const { declaration } = resolveOperation(UPDATE_BRANCH_OP);
+    expect(parseOperationArgv(declaration, ['--pr=42', '--reason=x', `--expected-head=${head}`]).ok).toBe(true);
+  });
+
   it.each([undefined, '', '   '])('refuses a missing/empty reason before any IO (%j)', async reason => {
     const f = fixture([]);
     await expect(f.run({ pr: 42, reason })).rejects.toThrow(/reason/);
