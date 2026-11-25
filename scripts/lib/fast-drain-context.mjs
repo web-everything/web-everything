@@ -188,10 +188,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     validateLeanOpenPrs(inventory, OPEN_PR_LIST_LIMIT, repo);
     return [repo, inventory];
   }));
-  const revalidateAfterMembership = async (writtenAt, { refresh = false } = {}) => {
-    // Building a new round: concurrent mutations dirty the source within seconds, so the source is re-read through the
-    // refresh path FIRST; the main-head and TTL checks below then run after the last (possibly slow) source read.
-    const sources = refresh ? readSources({ refresh }) : null;
+  const revalidateAfterMembership = async (writtenAt, { held = null } = {}) => {
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
@@ -199,7 +196,10 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
     // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    return sources ?? readSources();
+    // `held`: rows refreshed within this very build. Mutations dirty the source within seconds, so re-reading cache-only
+    // would always fail; the rows stay bound by the writtenAt TTL and main-head checks above, and every changed row is
+    // live-hydrated by the lean membership comparison.
+    return held ?? readSources();
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -218,11 +218,11 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     // Include main-read/lock wait time in the freshness bound. A cold source refresh can itself outlast the TTL and
     // observes nothing the round publishes, so when one ran the bound starts after it, with main re-read after it.
     let refreshed = false;
-    readSources({ refresh: true, onRefresh: () => { refreshed = true; } });
+    const sources = readSources({ refresh: true, onRefresh: () => { refreshed = true; } });
     if (refreshed) heads = await readHeads();
     const writtenAt = refreshed ? now() : observedAt;
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt, { refresh: true });
+    const snapshots = await revalidateAfterMembership(writtenAt, { held: refreshed ? sources : null });
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });

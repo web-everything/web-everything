@@ -670,10 +670,10 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     try {
       const first = await readFastDrainPassInventory(options);
       expect(first.snapshots.get(repo)).toEqual(rows);
-      expect(refreshes).toBe(2); // the source read and the post-membership re-read, both while building the round
+      expect(refreshes).toBe(1);
       // A later child with a stale source must NOT refresh while reusing the published round.
       await expect(readFastDrainPassInventory({ ...options, refreshSnapshot: () => { refreshes++; return rows; } })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
-      expect(refreshes).toBe(2);
+      expect(refreshes).toBe(1);
     } finally { f.close(); }
   });
 
@@ -691,13 +691,13 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     } finally { f.close(); }
   });
 
-  it('a main move or an expiry during the final source refresh is rejected, not published', async () => {
+  it('a main move or an expiry while reading membership after a refresh is rejected, not published', async () => {
     for (const mode of ['main-moved', 'expired']) {
       const f = pass();
-      let t = 1000, calls = 0;
-      const options = { ...f.options, now: () => t, readSnapshot: () => null,
-        refreshSnapshot: () => { calls++; if (calls === 2) { if (mode === 'expired') t += 90_000; } return rows; },
-        readMain: async () => (mode === 'main-moved' && calls >= 2 ? { ...head, sha: 'c'.repeat(40) } : head) };
+      let t = 1000, moved = false;
+      const options = { ...f.options, now: () => t, readSnapshot: () => null, refreshSnapshot: () => rows,
+        listLean: async () => { if (mode === 'expired') t += 90_000; else moved = true; return inventory(rows); },
+        readMain: async () => (moved ? { ...head, sha: 'c'.repeat(40) } : head) };
       try {
         await expect(readFastDrainPassInventory(options)).rejects.toThrow(mode === 'expired' ? 'expired while reading' : 'main changed');
         expect(existsSync(f.options.path)).toBe(false);
