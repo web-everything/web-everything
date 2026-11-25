@@ -75,6 +75,47 @@ const { createDefaultJudge, resolveJudgeProvider, JUDGE_PROVIDER_NAMES, unwrapJu
 const { judgeSpawn } = await import('../../lib/judge-spawn.mjs');
 const { buildReviewJudgeRequest, buildReviewAdvisoryJudgeRequest, DEFAULT_LENS } = await import('../review-pr.mjs');
 
+describe('round 3 findings 2 and 3: replacement model reaches the spawn unchanged', () => {
+  it('Claude replacement cannot inherit the factory Haiku override instead of the selected Opus route', async () => {
+    claudeJudgeSpawnCalls.length = 0;
+    const selected = { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' };
+    const judge = createDefaultJudge({ model: 'haiku',
+      jurorTimeoutExclusions: [{ lens: 'security', provider: 'agy-claude' }],
+      timeoutRoutes: () => [selected], checkProviderHold: async () => null });
+    await judge({ lens: 'security', mandate: 'Judge', input: 'diff', shape: { type: 'object' },
+      model: 'sonnet', allowedTools: ['Read'], budget: null, forbiddenVendor: 'OpenAI' });
+    expect(claudeJudgeSpawnCalls).toHaveLength(1);
+    expect(claudeJudgeSpawnCalls[0].model).toBe(selected.model);
+  });
+
+  it('Codex replacement cannot strip the selected model and silently spawn the provider default', async () => {
+    codexJudgeSpawnCalls.length = 0;
+    const selected = { provider: 'codex', model: 'gpt-6.1-sol', effort: 'high' };
+    const judge = createDefaultJudge({ model: 'haiku', cwd: 'review-lane',
+      jurorTimeoutExclusions: [{ lens: 'quality', provider: 'agy-claude' }],
+      timeoutRoutes: () => [selected], checkProviderHold: async () => null });
+    await judge({ lens: 'quality', mandate: 'Judge', input: 'diff', shape: { type: 'object' },
+      model: 'sonnet', budget: null, forbiddenVendor: 'Anthropic' });
+    expect(codexJudgeSpawnCalls).toHaveLength(1);
+    expect(codexJudgeSpawnCalls[0].model).toBe(selected.model);
+    expect(codexJudgeSpawnCalls[0]).not.toHaveProperty('cwd');
+  });
+
+  it.each(['claude', 'codex'])('%s replacement refuses a flag-shaped selected model before spawning', async provider => {
+    claudeJudgeSpawnCalls.length = 0;
+    codexJudgeSpawnCalls.length = 0;
+    const lens = provider === 'claude' ? 'security' : 'quality';
+    const judge = createDefaultJudge({ model: 'haiku',
+      jurorTimeoutExclusions: [{ lens, provider: 'agy-claude' }],
+      timeoutRoutes: () => [{ provider, model: '--unsafe', effort: 'high' }],
+      checkProviderHold: async () => null });
+    await expect(judge({ lens, mandate: 'Judge', input: 'diff', shape: { type: 'object' },
+      budget: null, forbiddenVendor: 'Google' })).rejects.toThrow(/refusing.*model/);
+    expect(claudeJudgeSpawnCalls).toHaveLength(0);
+    expect(codexJudgeSpawnCalls).toHaveLength(0);
+  });
+});
+
 describe('JUDGE_PROVIDER_NAMES', () => {
   it('is exactly claude, codex, antigravity — additive, claude first/default', () => {
     expect(JUDGE_PROVIDER_NAMES).toEqual(['claude', 'codex', 'antigravity']);

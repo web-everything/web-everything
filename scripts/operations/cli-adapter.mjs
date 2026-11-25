@@ -812,7 +812,7 @@ export function createDefaultJudge({
   const providerName = factoryProviderName ?? 'claude';
   // `opts.cwd` — a seat given a lane of its OWN by a concurrent batch (`./parallel-judges.mjs`) runs there instead of
   // in the factory's lane. Absent, the factory's `cwd` applies exactly as before.
-  const judge = async (request, opts = null) => {
+  const judge = async (request, opts = null, replacement = false) => {
     const cwd = opts?.cwd !== undefined ? opts.cwd : factoryCwd;
     // #xqa9ttq — A REQUEST MAY PIN ITS OWN PROVIDER (`request.providerName`), overriding this factory's. This
     // is what lets ONE run seat a tool-free Codex juror (`review-pr`'s opt-in `judgeAdvisory` seat) while its
@@ -839,7 +839,8 @@ export function createDefaultJudge({
     // `assertNoCodexToolAllowlist` documents as tool-free. `assertSafeJudgeRequest` is shared with claude and
     // rejects [], so the empty array is dropped for an effectively-codex request ONLY, before the guard runs;
     // claude keeps refusing it.
-    const declared = effectiveProviderName === 'codex' ? stripForCodex(request) : request;
+    // Only the validated timeout route can pin a replacement model; ordinary Codex requests still strip it.
+    const declared = !replacement && effectiveProviderName === 'codex' ? stripForCodex(request) : request;
     // THE OVERRIDE IS MERGED BEFORE THE GUARD RUNS, NEVER AFTER (#3151). `assertSafeJudgeRequest` is what stops
     // a flag-shaped `model` reaching argv, so asserting the declaration's request and then substituting the
     // operator's value would check one string and spawn another — the guard would be decorative. The CLI
@@ -851,7 +852,7 @@ export function createDefaultJudge({
     // the seat(s) they are steering with `--model`); a request whose effective provider is tool-free (via
     // `request.providerName` or this factory's own) would otherwise carry that Claude model name onto the
     // other CLI's own model flag verbatim.
-    const effective = configured ? { ...declared, providerName: configured.provider, model: configured.model, effort: configured.effort } : (model && !TOOL_FREE_JUDGE_PROVIDER_NAMES.includes(effectiveProviderName)) ? { ...declared, model } : declared;
+    const effective = replacement ? declared : configured ? { ...declared, providerName: configured.provider, model: configured.model, effort: configured.effort } : (model && !TOOL_FREE_JUDGE_PROVIDER_NAMES.includes(effectiveProviderName)) ? { ...declared, model } : declared;
     assertSafeJudgeRequest(effective);
     // #xqa9ttq/#3383 — TOOL-FREE ONLY, ENFORCED HERE TOO, not only inside each provider's own spawn module. A
     // caller that injects its own `provider` function bypasses `resolveProvider` entirely, so this check is the
@@ -1004,6 +1005,8 @@ export function createDefaultJudge({
       if (hold) {
         throw new Error(`juror-timeout: replacement ${route.provider} held: ${hold}; orchestrator must restore an available provider`);
       }
+      // Preserve the selected route's model through the same guards and spawn builder.
+      if (request.seatProvider == null) return judge(request, opts, true);
     }
     if (request?.seatProvider == null) return judge(request, opts);
     const laneCwd = opts?.cwd !== undefined ? opts.cwd : factoryCwd;

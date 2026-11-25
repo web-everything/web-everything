@@ -217,3 +217,28 @@ describe('round 1 finding 7: validated effort and spending constraints', () => {
     expect(f.checkProviderHold).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('round 3 finding 1: shadow fallback provenance', () => {
+  it('holds after Claude times out when every remaining provider belongs to the validated shadow chain', async () => {
+    const f = liveReader();
+    const policy = structuredClone(DEFAULT_ROUTING_POLICY);
+    policy.operations['review-seat:mandatory:security'] = {
+      provider: 'agy-gemini', model: 'gemini-3.8-flash', mode: 'shadow',
+      fallback: [{ provider: 'claude', model: 'sonnet' }, { provider: 'agy-claude', model: 'sonnet' }],
+    };
+    f.write(policy);
+    expect(f.reader({ strict: true }).operations['review-seat:mandatory:security'].mode).toBe('shadow');
+    const recovered = recovery({ timeoutRoutes: null });
+    await expect(recovered.judge(request)).rejects.toMatchObject({
+      reason: 'juror-timeout-no-alternative',
+      message: expect.stringMatching(/no alternative.*orchestrator must restore an allowed provider/),
+    });
+    expect(recovered.seatRunner).not.toHaveBeenCalled();
+    expect(recovered.provider).not.toHaveBeenCalled();
+    const routes = jurorTimeoutRoutes('security');
+    expect(routes.find(r => r.provider === 'agy-claude')).toMatchObject({ mode: 'shadow' });
+    // Shadow provenance must still permit the chain's counting Claude fallback.
+    expect(selectJurorTimeoutRoute({ lens: 'security', routes, forbiddenVendor: 'OpenAI',
+      exclusions: [{ lens: 'security', provider: 'agy-gemini' }] }).provider).toBe('claude');
+  });
+});

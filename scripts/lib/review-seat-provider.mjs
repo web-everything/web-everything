@@ -232,7 +232,9 @@ export function jurorTimeoutRoutes(lens) {
   const route = resolveOperationRoute({ operation: REVIEW_SEAT_OPERATION, taskType: task, available, policy,
     aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator, operatorKeys: readRoutingPolicy.operatorKeys() });
   // Inheritance grants no new fallback. The caller must hold rather than invent providers.
-  return route ? [route, ...(route.fallback ?? [])] : [];
+  // A shadow chain's non-Claude fallbacks remain advisory too; only Claude counts.
+  return route ? [route, ...(route.fallback ?? []).map(fallback =>
+    route.mode === 'shadow' && fallback.provider !== 'claude' ? { ...fallback, mode: 'shadow' } : fallback)] : [];
 }
 
 export function jurorTimeoutRouteAvailable({ exclusions, forbiddenVendor }) {
