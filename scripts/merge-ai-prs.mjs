@@ -8106,7 +8106,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
   let localSynced = false;
-  const landedLocalAny = !DRY_RUN && !localWriteRefusal && merged.some((m) => isLocalRepo(m.repo));
+  const landedLocalAny = !enqueueOnly && !DRY_RUN && !localWriteRefusal && merged.some((m) => isLocalRepo(m.repo));
   const landedLocal = landedLocalAny && !followup.handedOff;
   // The pass's OWN checkout is refreshed inline even when the job takes the rest (cheap, and the duplicate-id
   // tripwire below reads this tree): the job only syncs a separate `primary`, so skipping this left a
@@ -8175,7 +8175,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
   if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
   const queuedHashOnMain = !!numbered.files?.length;
-  if (!localWriteRefusal && queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = repairHashOnMain({ cwd: process.cwd() });
+  if (!localWriteRefusal && queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = writeBoundary.fullPassDuty(() => repairHashOnMain({ cwd: process.cwd() }), numbered);
   if (landedLocal && !DRY_RUN) {
     if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
@@ -8369,8 +8369,10 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   });
   const result = { alerts, ok: duplicateIdsOnMain?.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain?.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
-  if (writeBoundary.violations.length) result.enqueueOutcomes = [{ num: Number(onlyPr), repo: onlyRepo || localSlug,
-    outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(writeBoundary.violations[0]) }];
+  if (writeBoundary.violations.length && !enqueueOutcomes.some(o => o.outcome === 'enqueued'
+    && Number(o.num) === Number(onlyPr) && (o.repo || localSlug) === (onlyRepo || localSlug)))
+    result.enqueueOutcomes = [...enqueueOutcomes, { num: Number(onlyPr), repo: onlyRepo || localSlug,
+      outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(writeBoundary.violations[0]) }];
   if (localWriteRefusal) result.localWriteRefusal = localWriteRefusal;
   if (duplicateIdsOnMain === null) {
     result.duplicateIdCheck = { status: 'unknown', reason: 'checkout-sync-refused', fallback: 'Operator must sync main and rerun the drain.' };

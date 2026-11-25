@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import * as scope from '../../lib/fast-drain-scope.mjs';
 import { buildEnqueueArgs } from '../merge-queue-enqueue.mjs';
 import { strategyFixture, HEAD, REPO } from './fixtures/fast-drain-strategy.mjs';
@@ -182,4 +183,63 @@ test('child killed before confirmation leaves no stamp', () => {
   assert.throws(() => h.strategy.enqueue({ num: 7 }, HEAD));
   assert.deepEqual(h.writes, ['enqueue']);
   assert.ok(!h.state()?.pending?.some(p => p.clearanceHead));
+});
+
+// Execute the production call sites with recording ports: these helpers own executors
+// outside the boundary, so checking the boundary helper alone misses the bypasses.
+const drainSource = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+function drainSection(start, end) {
+  const from = drainSource.indexOf(start);
+  const to = drainSource.indexOf(end, from);
+  assert.ok(from >= 0 && to > from, `missing drain section: ${start}`);
+  return drainSource.slice(from, to);
+}
+
+test('enqueue-only skips hash repair on main even when the queue probe finds hash cards', () => {
+  const source = drainSection('  let numbered = { assigned: [], committed: false };', '  if (landedLocal && !DRY_RUN) {');
+  for (const writeScope of ['enqueue-only', 'full']) {
+    const calls = [];
+    const ports = { writeBoundary: scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 }),
+      mergeStrategy: { enqueues: () => true }, DRY_RUN: false, localWriteRefusal: null, landedLocal: false,
+      process: { cwd: () => 'fixture' }, probeQueuedLand: () => ({ assigned: [], files: ['backlog/xhash.md'] }),
+      repairHashOnMain: () => { calls.push('repair'); return { assigned: [], committed: true }; } };
+    Function(...Object.keys(ports), source)(...Object.values(ports));
+    assert.deepEqual(calls, writeScope === 'full' ? ['repair'] : []);
+  }
+});
+
+test('enqueue-only skipped detached follow-up cannot enable inline work for an already merged target', async () => {
+  const source = drainSection('  const followup = await writeBoundary.fullPassDuty(', "  // The pass's OWN checkout");
+  for (const writeScope of ['enqueue-only', 'full']) {
+    const calls = [];
+    const ports = { writeBoundary: scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 }),
+      enqueueOnly: writeScope === 'enqueue-only', DRY_RUN: false, localWriteRefusal: null,
+      merged: [{ num: 7, repo: REPO }], isLocalRepo: repo => repo === REPO,
+      __t: { mark: () => 0 }, process: { stderr: { write() {} } },
+      handOffDrainFollowup: () => { calls.push('handoff'); return { handedOff: false }; } };
+    const state = await Function(...Object.keys(ports), `return (async () => {${source}
+      return { landedLocal, landedLocalAny }; })();`)(...Object.values(ports));
+    assert.equal(state.landedLocal, writeScope === 'full');
+    assert.equal(state.landedLocalAny, writeScope === 'full');
+    assert.deepEqual(calls, writeScope === 'full' ? ['handoff'] : []);
+  }
+});
+
+test('a later boundary refusal preserves confirmed enqueues and defers only an unconfirmed target', () => {
+  const source = drainSection('  if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;', '  if (localWriteRefusal) result.localWriteRefusal');
+  const admitted = { num: 7, repo: REPO, outcome: 'enqueued', already: false };
+  const peer = { num: 7, repo: 'fixture/peer', outcome: 'enqueued' };
+  const violation = { num: 7, repo: REPO, outcome: 'not-enqueued', enqueued: false, deferred: true,
+    kind: 'defer-to-pass:write-boundary:refresh' };
+  for (const [outcomes, expected] of [
+    [[admitted], [admitted]],
+    [[admitted, peer], [admitted, peer]],
+    [[peer], [peer, violation]],
+    [[], [violation]],
+  ]) {
+    const ports = { result: {}, enqueueOutcomes: [...outcomes], onlyPr: 7, onlyRepo: REPO, localSlug: REPO,
+      writeBoundary: { violations: [violation.kind] }, requireFastDrainDeferKind: scope.requireFastDrainDeferKind };
+    Function(...Object.keys(ports), source)(...Object.values(ports));
+    assert.deepEqual(ports.result.enqueueOutcomes, expected);
+  }
 });
