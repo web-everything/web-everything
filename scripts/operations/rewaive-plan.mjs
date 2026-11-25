@@ -17,31 +17,38 @@ import { wellFormedAudit } from './canonical-audit-gate.mjs';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
+import { QUESTION_HASH } from './codex-audit.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
 const MAX_WALK = 8; // a constant, not a setting
+const RULING = /^R\d+[A-Za-z]?$/;
 const refuse = (reason, extra = {}) => ({ state: 'refuse', reason, ...extra });
 const sameFindings = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length > 0
   && a.length === b.length && a.every((x, i) => typeof x === 'string' && x === b[i]);
 const isFull = r => !Object.hasOwn(r, 'basis');
 
 /** Pure planner. Every doubt is a refuse; no timestamp is compared; the git chain decides order. */
-export function planRewaive({ ref, tip, chain, merges, records, waivers, revoked = () => false, wellFormed = wellFormedAudit }) {
+export function planRewaive({ ref, tip, chain, merges, records, waivers, revoked = () => false, wellFormed = wellFormedAudit,
+  baseOk = () => false }) {
   if (!SHA.test(String(tip)) || !Array.isArray(chain) || chain[0] !== tip || !chain.every(s => SHA.test(s))) return refuse('bad-chain');
   if (!Array.isArray(records) || !records.every(wellFormed)) return refuse('malformed-records');
   const recordsFor = sha => records.filter(r => String(r.head).toLowerCase() === sha);
+  // Every record for B and H must be a current-question FULL audit under ONE base that main covers (and is not the head itself).
+  const evidenceOk = (sha, recs) => recs.every(r => r.questionHash === QUESTION_HASH && isFull(r)
+    && String(r.base).toLowerCase() === String(recs[0].base).toLowerCase()) && String(recs[0].base).toLowerCase() !== sha
+    && baseOk(String(recs[0].base).toLowerCase());
   const baseSha = chain.slice(1).find(sha => recordsFor(sha).length > 0);
   if (!baseSha) return refuse('no-waived-ancestor');
   if (!Array.isArray(merges) || merges.length) return refuse('merge-in-delta');
   const baseRecords = recordsFor(baseSha), last = baseRecords[baseRecords.length - 1];
-  if (!isFull(last) || last.verdict !== 'WEAKENED' || !last.findings.length) return refuse('basis-not-full-weakened', { basis: baseSha });
+  if (!evidenceOk(baseSha, baseRecords) || last.verdict !== 'WEAKENED' || !last.findings.length) return refuse('basis-not-full-weakened', { basis: baseSha });
   const waiver = (waivers || []).find(w => w && w.ref === ref && String(w.sha).toLowerCase() === baseSha
-    && !revoked(w) && sameFindings(w.findings, last.findings));
+    && typeof w.ruling === 'string' && RULING.test(w.ruling) && !revoked(w) && sameFindings(w.findings, last.findings));
   if (!waiver) return refuse('basis-not-waived', { basis: baseSha });
   const own = recordsFor(tip), head = own[own.length - 1];
   if (!head) return { state: 'audit-needed', basis: baseSha,
     command: `node scripts/operations/run.mjs codex-audit --base=origin/main --head=${tip}` };
-  if (!isFull(head)) return refuse('head-record-is-delta', { basis: baseSha });
+  if (!evidenceOk(tip, own)) return refuse('head-evidence-unusable', { basis: baseSha });
   if (head.verdict === 'NOT WEAKENED') return { state: 'not-needed', basis: baseSha };
   if (head.verdict !== 'WEAKENED' || !head.findings.length) return refuse('head-record-unusable', { basis: baseSha });
   return { state: 'request', basis: baseSha, request: { ref, sha: tip, ruling: waiver.ruling, findings: [...head.findings],
@@ -65,16 +72,20 @@ function defaultLoaders({ env, repo }) {
   const loadRecords = () => String(readFileSync(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8'))
     .split(/\r?\n/).filter(l => l.trim()).map(l => JSON.parse(l));
   const loadWaivers = () => {
-    const platform = readPlatformPreferences({ env: full, readFile: readFileSync, warn: () => {} });
+    // Any warning (damaged revocation log, unreadable store) means uncertain evidence: refuse, never authorize.
+    const warnings = [], warn = m => warnings.push(String(m));
+    const platform = readPlatformPreferences({ env: full, readFile: readFileSync, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
-    return loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
-      fs: { readFileSync }, env: full, warn: () => {} });
+    const list = loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
+      fs: { readFileSync }, env: full, warn });
+    if (warnings.length) throw new Error(`waiver evidence warnings: ${warnings[0].slice(0, 100)}`);
+    return list;
   };
   return { loadRecords, loadWaivers };
 }
 
 /** IO wrapper: pinned git env, read-only git, then the pure planner. Any throw is a refuse. */
-export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSync, loadRecords, loadWaivers, revoked, maxWalk = MAX_WALK }) {
+export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSync, loadRecords, loadWaivers, revoked, baseOk: baseOkIn, maxWalk = MAX_WALK }) {
   try {
     if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(String(ref)) || String(ref).includes('..')) return refuse('bad-ref');
     const loaders = loadRecords && loadWaivers ? { loadRecords, loadWaivers } : defaultLoaders({ env, repo });
@@ -92,10 +103,12 @@ export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSyn
     const chain = query('rev-list', '--first-parent', `--max-count=${maxWalk + 1}`, tip).split('\n').filter(Boolean);
     const records = loaders.loadRecords(), waivers = loaders.loadWaivers();
     // The merges check needs B, which is only known after the walk: ask the pure planner first with none, then verify.
-    const first = planRewaive({ ref, tip, chain, merges: [], records, waivers, revoked });
+    try { query('fetch', '--quiet', 'origin', 'main'); } catch { /* an unrefreshed main only makes baseOk stricter */ }
+    const baseOk = baseOkIn || (b => { try { query('merge-base', '--is-ancestor', b, 'origin/main'); return true; } catch { return false; } });
+    const first = planRewaive({ ref, tip, chain, merges: [], records, waivers, revoked, baseOk });
     if (!first.basis) return first;
     const merges = query('rev-list', '--merges', `${first.basis}..${tip}`).split('\n').filter(Boolean);
-    const out = planRewaive({ ref, tip, chain, merges, records, waivers, revoked });
+    const out = planRewaive({ ref, tip, chain, merges, records, waivers, revoked, baseOk });
     if (out.state === 'request') {
       const names = (...a) => query('diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', ...a, `${out.basis}..${tip}`)
         .split('\n').filter(Boolean);
@@ -109,11 +122,11 @@ export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSyn
   }
 }
 
-export function runCli({ argv, repo = process.cwd(), env = process.env, loadRecords, loadWaivers, stdout = s => process.stdout.write(s),
+export function runCli({ argv, repo = process.cwd(), env = process.env, loadRecords, loadWaivers, baseOk, stdout = s => process.stdout.write(s),
   spawn = spawnSync } = {}) {
   const flag = n => argv.find(a => a === `--${n}` || a.startsWith(`--${n}=`));
   const ref = flag('ref')?.split('=').slice(1).join('=');
-  const out = runPlan({ repo, ref, env, loadRecords, loadWaivers });
+  const out = runPlan({ repo, ref, env, loadRecords, loadWaivers, baseOk });
   const text = argv.includes('--json') ? JSON.stringify(out) : [`state: ${out.state}${out.reason ? ` (${out.reason})` : ''}`,
     ...(out.command ? [out.command] : []), ...(out.table || []).map(t => `${t.class}\t${t.file ?? '-'}\tsameTextAsWaived=${t.sameTextAsWaived}`)].join('\n');
   stdout(`${text}\n`);

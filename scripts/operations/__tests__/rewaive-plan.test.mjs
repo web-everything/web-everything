@@ -40,7 +40,7 @@ const rec = (head, over = {}) => ({ head, base: 'b'.repeat(40), questionHash: QU
   verdict: 'WEAKENED', findings: ['a.mjs:10 weak'], ...over });
 const waiver = (sha, over = {}) => ({ ref: REF, sha, ruling: 'R1085', findings: ['a.mjs:10 weak'], ...over });
 const plan = (r, { records, waivers, ...rest } = {}) => runPlan({ repo: r.work, ref: REF, env: { PATH: process.env.PATH, HOME: r.root },
-  loadRecords: () => records, loadWaivers: () => waivers ?? [], ...rest });
+  loadRecords: () => records, loadWaivers: () => waivers ?? [], baseOk: () => true, ...rest });
 
 describe('rewaive-plan: negative cases', () => {
   it('the nearest audited ancestor with an unparseable at refuses; the older waived sha is never used', () => {
@@ -86,6 +86,23 @@ describe('rewaive-plan: negative cases', () => {
     expect(plan(r, { records: [rec(r.shas[1], { verdict: 'NOT WEAKENED', findings: [] })], waivers: [waiver(r.shas[1])] }).state).toBe('refuse');
     expect(plan(r, { records: [rec(r.shas[1], { basis: r.shas[0] })], waivers: [waiver(r.shas[1])] }).state).toBe('refuse');
   });
+  it('foreign-question, self-base, mixed-base, and uncovered-base evidence refuses', () => {
+    const r = mkRepo();
+    const [, B, , H] = r.shas;
+    const w = [waiver(B)];
+    expect(plan(r, { records: [rec(B), rec(H, { verdict: 'NOT WEAKENED', findings: [], questionHash: 'f'.repeat(64) })], waivers: w }).state).toBe('refuse');
+    expect(plan(r, { records: [rec(B), rec(H, { base: H })], waivers: w }).state).toBe('refuse');
+    expect(plan(r, { records: [rec(B), rec(H), rec(H, { base: 'd'.repeat(40), verdict: 'NOT WEAKENED', findings: [] })], waivers: w }).state).toBe('refuse');
+    expect(plan(r, { records: [rec(B), rec(H)], waivers: w, baseOk: () => false }).state).toBe('refuse');
+  });
+  it('a waiver with a non-ruling string (WITHDRAWN) or an unreadable waiver source refuses', () => {
+    const r = mkRepo();
+    const [, B, , H] = r.shas;
+    expect(plan(r, { records: [rec(B), rec(H)], waivers: [waiver(B, { ruling: 'WITHDRAWN' })] }).state).toBe('refuse');
+    const out = runPlan({ repo: r.work, ref: REF, env: { PATH: process.env.PATH, HOME: r.root }, baseOk: () => true,
+      loadRecords: () => [rec(B), rec(H)], loadWaivers: () => { throw new Error('damaged revocation log'); } });
+    expect(out.state).toBe('refuse');
+  });
   it('no audited ancestor within maxWalk refuses with no-waived-ancestor', () => {
     const r = mkRepo(4);
     const out = plan(r, { records: [rec(r.shas[0])], waivers: [waiver(r.shas[0])], maxWalk: 2 });
@@ -101,7 +118,7 @@ describe('rewaive-plan: negative cases', () => {
     sh(r.work, 'replace', r.shas[2], r.shas[0]);
     const other = mkRepo(2);
     const env = { PATH: process.env.PATH, HOME: r.root, GIT_DIR: join(other.work, '.git'), GIT_WORK_TREE: other.work };
-    const out = runPlan({ repo: r.work, ref: REF, env, loadRecords: () => [rec(r.shas[1])], loadWaivers: () => [waiver(r.shas[1])] });
+    const out = runPlan({ repo: r.work, ref: REF, env, baseOk: () => true, loadRecords: () => [rec(r.shas[1])], loadWaivers: () => [waiver(r.shas[1])] });
     expect(base).toMatchObject({ state: 'audit-needed', basis: r.shas[1] });
     expect(out).toMatchObject({ state: 'audit-needed', basis: r.shas[1] });
   });
@@ -158,7 +175,7 @@ describe('rewaive-plan: --file-request', () => {
     const r = mkRepo();
     const [, B, , H] = r.shas;
     const out = runCli({ argv: [`--ref=${REF}`, '--file-request'], repo: r.work, env: { PATH: process.env.PATH, HOME: r.root },
-      loadRecords: () => [rec(B), rec(H)], loadWaivers: () => [waiver(B)], stdout: () => {} });
+      loadRecords: () => [rec(B), rec(H)], loadWaivers: () => [waiver(B)], baseOk: () => true, stdout: () => {} });
     expect(out.code).toBe(3);
     expect(existsSync(join(r.root, 'workspace/.operations/handoff/waiver-requests.jsonl'))).toBe(false);
   });
@@ -172,10 +189,10 @@ describe('rewaive-plan: --file-request', () => {
     writeFileSync(join(dir, 'waive-request.mjs'),
       `import { appendFileSync, readFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(file)}, JSON.stringify(JSON.parse(readFileSync(0, 'utf8'))) + '\\n');\n`);
     const env = { PATH: process.env.PATH, HOME: r.root };
-    const noop = runCli({ argv: [`--ref=${REF}`, '--file-request'], repo: r.work, env, loadRecords: () => [rec(B)], loadWaivers: () => [waiver(B)], stdout: () => {} });
+    const noop = runCli({ argv: [`--ref=${REF}`, '--file-request'], repo: r.work, env, loadRecords: () => [rec(B)], loadWaivers: () => [waiver(B)], baseOk: () => true, stdout: () => {} });
     expect(noop.code).toBe(1);
     expect(existsSync(file)).toBe(false);
-    const ok = runCli({ argv: [`--ref=${REF}`, '--file-request'], repo: r.work, env, loadRecords: () => [rec(B), rec(H)], loadWaivers: () => [waiver(B)], stdout: () => {} });
+    const ok = runCli({ argv: [`--ref=${REF}`, '--file-request'], repo: r.work, env, loadRecords: () => [rec(B), rec(H)], loadWaivers: () => [waiver(B)], baseOk: () => true, stdout: () => {} });
     expect(ok.code).toBe(0);
     const lines = readFileSync(file, 'utf8').trim().split('\n');
     expect(lines).toHaveLength(1);
