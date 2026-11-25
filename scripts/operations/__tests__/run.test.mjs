@@ -7,7 +7,7 @@
  * child process against a real stale checkout (real git, real origin), so that wiring is pinned.
  */
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync,readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -20,6 +20,19 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 // (via `completion-store.mjs`), so the fixture clone needs it beside `scripts/`.
 const TOP_FILES = ['package.json', 'schemas/worker-result.v1.json'];
 const TREES = ['scripts', 'skills-src'];
+
+/**
+ * The fixture's own `node_modules`: one link per real dependency, never the caches. Linking the whole
+ * directory let a sibling vitest run's `.vite/vitest/results.json` show up inside the fixture mid-test.
+ */
+function linkDependencies(clone) {
+  const modules = join(clone, 'node_modules');
+  mkdirSync(modules);
+  for (const name of readdirSync(join(REPO, 'node_modules'))) {
+    if (name === '.vite' || name === '.cache') continue;
+    symlinkSync(join(REPO, 'node_modules', name), join(modules, name));
+  }
+}
 
 /** Copy the parts of this repo the CLI imports into the fixture clone, commit on main and push. */
 function seedCheckout(ctx) {
@@ -36,7 +49,7 @@ function seedCheckout(ctx) {
   }
   for (const f of TOP_FILES) if (existsSync(join(REPO, f))) cpSync(join(REPO, f), join(ctx.clone, f));
   writeFileSync(join(ctx.clone, '.gitignore'), 'node_modules\n');
-  symlinkSync(join(REPO, 'node_modules'), join(ctx.clone, 'node_modules'));
+  linkDependencies(ctx.clone);
   ctx.git(['add', '-A']);
   ctx.git(['commit', '--quiet', '-m', 'fixture: repo tree']);
   ctx.git(['push', '--quiet', 'origin', 'main']);
@@ -169,33 +182,21 @@ describe('runner freshness CLI', () => {
 
 import { FRESHNESS_CACHE, FRESHNESS_TTL } from '../runner-freshness.mjs';
 
-// The fixture symlinks the REAL node_modules, and CI's recursive walk follows it. Any vitest run in this
-// checkout (a sibling in the same shard) writes this one file when it finishes, so it is not evidence about
-// the command under test. Exactly this file: anything else new must still fail the snapshot.
-const VITEST_RESULTS = join('clone', 'node_modules', '.vite', 'vitest', 'results.json');
-
 function treeFiles(root) {
   return readdirSync(root, { recursive: true, withFileTypes: true })
-    .filter(e => e.isFile()).map(e => join(e.parentPath ?? e.path, e.name))
-    .filter(path => path !== join(root, VITEST_RESULTS)).sort();
+    .filter(e => e.isFile()).map(e => join(e.parentPath ?? e.path, e.name)).sort();
 }
 
 describe('runner freshness real repository witnesses', () => {
-  // Exercises the snapshot filter on plain directories, so it never writes into the shared node_modules.
-  it('the new-files snapshot ignores only vitest\'s results file behind node_modules', async () => {
+  // A sibling vitest run writes `node_modules/.vite/` whenever it finishes. If the fixture shares that
+  // directory, the zero-new-files snapshot below sees a write the command under test never made.
+  it('the fixture clone does not share the real checkout\'s mutable dependency caches', async () => {
     await withBareOrigin(async ctx => {
-      const before = treeFiles(ctx.tmp);
-      const put = rel => {
-        const path = join(ctx.clone, rel);
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, '{}');
-        return path;
-      };
-      // A concurrent vitest run finishing writes this into the shared node_modules.
-      put('node_modules/.vite/vitest/results.json');
-      expect(treeFiles(ctx.tmp)).toEqual(before);
-      const added = [put('node_modules/.cache/new.json'), put('node_modules/.vite/vitest/other.json'), put('.vite/new.json')];
-      expect(treeFiles(ctx.tmp)).toEqual([...before, ...added].sort());
+      seedCheckout(ctx);
+      const modules = join(ctx.clone, 'node_modules');
+      expect(lstatSync(modules).isSymbolicLink()).toBe(false);
+      for (const cache of ['.vite', '.cache']) expect(existsSync(join(modules, cache))).toBe(false);
+      expect(existsSync(join(modules, 'vitest/package.json'))).toBe(true);
     });
   }, 120_000);
 
