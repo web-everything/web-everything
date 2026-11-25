@@ -78,7 +78,13 @@ import {
  * (corrupt store, fetch/merge-tree error) refuses: fail closed, as add does.
  * @returns {Promise<{registered:true, check:object}|{registered:false, reason:string, check?:object}>}
  */
-export async function guardedRegister({ root, ref, pr, env, gate, register }) {
+export async function guardedRegister({ root, ref, pr, env, gate, register, admitHotpatch = null }) {
+  // RS-HP-3: a hotpatch/* ref registers only after the hotpatch admission (receipt + own-sha audit) passes. Fail closed.
+  if (typeof ref === 'string' && ref.startsWith('hotpatch/')) {
+    let passed = false;
+    try { passed = typeof admitHotpatch === 'function' && (await admitHotpatch({ root, ref, pr, env }))?.outcome === 'pass'; } catch { passed = false; }
+    if (!passed) return { registered: false, reason: 'hotpatch-not-admitted' };
+  }
   // Lazy: daemon-overlay.mjs imports this module (overlaySafetySettings), so a static import would be a cycle.
   const { stackAwareOverlayCheck, withAddGuardLock } = await import('../daemon-overlay.mjs');
   return withAddGuardLock(root, env, async () => {
