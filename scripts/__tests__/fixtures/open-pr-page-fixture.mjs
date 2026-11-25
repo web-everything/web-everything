@@ -7,10 +7,10 @@ export function openPrPageFixture(prs, query) {
   const nodes = prs.slice(start, end).map(p => ({
     number: p.number, title: p.title, url: p.url || '', isDraft: p.isDraft || false,
     createdAt: p.createdAt || '2026-10-09T00:00:00Z', updatedAt: p.updatedAt || '2026-10-09T00:00:00Z',
-    headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName,
+    headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName, baseRefOid: p.baseRefOid,
     isCrossRepository: p.isCrossRepository || false, mergeable: p.mergeable,
     mergeStateStatus: p.mergeStateStatus, reviewDecision: p.reviewDecision || '',
-    labels: { nodes: p.labels || [] },
+    labels: { totalCount: (p.labels || []).length, nodes: p.labels || [] },
     commits: { nodes: [{ commit: { oid: p.headRefOid, statusCheckRollup: { contexts: {
       totalCount: (p.statusCheckRollup || []).length, pageInfo: { hasNextPage: false, endCursor: null }, nodes:
       (p.statusCheckRollup || []).map(c => c.context

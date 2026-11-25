@@ -80,6 +80,7 @@ function runCli({ env: extraEnv = {} } = {}) {
     for (const [name, code] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([3001].map((number) => ({
+      baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],

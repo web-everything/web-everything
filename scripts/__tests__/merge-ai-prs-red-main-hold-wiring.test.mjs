@@ -117,7 +117,8 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const fixture = join(dir, 'prs.json');
     writeFileSync(fixture, JSON.stringify([FIX, OTHER].map((number) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
-      baseRefName: 'main', headRefOid: number.toString(16).padStart(40, '0'), mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
+      baseRefName: 'main', baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
+      headRefOid: number.toString(16).padStart(40, '0'), mergeable: number === FIX ? fixMergeable : 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
       commits: [{ oid: number.toString(16).padStart(40, '0'), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],

@@ -124,6 +124,7 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     }
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
+      baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: head(number), mergeable: 'MERGEABLE', mergeStateStatus,
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' },
@@ -384,6 +385,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, e
       comments: [{ body: `Reviewed.\n<!-- reviewed-sha: ${sha(number)} -->`, viewerDidAuthor: true, author: { login: 'web-everything' }, createdAt: iso(60) }] });
     const pr = (number, headRefName, ages, extra = {}) => ({
       number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
+      baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
       mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
       commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],

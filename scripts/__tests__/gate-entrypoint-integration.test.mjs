@@ -95,7 +95,8 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 // The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
 // tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
 const listedRows = () => fx.prs.map((pr) => {
-  const row = { ...pr, headRefName: pr.headRefName || 'lane/fixture-' + pr.number };
+  const row = { baseRefOid: 'b'.repeat(40), updatedAt: '2026-10-09T00:00:00Z',
+    ...pr, headRefName: pr.headRefName || 'lane/fixture-' + pr.number };
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
   // These unrelated gate scenarios use known modifications; unknown/rename metadata
   // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
@@ -124,6 +125,13 @@ if (a[0] === 'pr' && a[1] === 'view') {
   // requested field in one reply, so the shim now ACCUMULATES matching fields into one response object instead
   // of returning the first match alone, matching real gh for any field combination a caller asks for.
   const resp = {};
+  // Heavy hydration pins the page identity; preserve the listed head here so
+  // _headRefOid still models a later push at the existing merge revalidation read.
+  if (fieldList.includes('baseRefOid')) {
+    const listed = listedRows().find(p => p.number === pr.number);
+    for (const key of fieldList) if (Object.hasOwn(listed, key)) resp[key] = listed[key];
+    out(resp);
+  }
   if (fields.includes('commits')) resp.commits = pr._commits || [];
   if (fields.includes('files')) resp.files = (pr.files || pr._files || []).map(f => ({ changeType: 'MODIFIED', ...f }));
   if (fields.includes('body')) resp.body = pr.body || '';
