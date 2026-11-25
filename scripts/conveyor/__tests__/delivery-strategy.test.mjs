@@ -414,8 +414,12 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
     const record = { ...decision(), ...got, inputs: recorded, table: { uri: changed.id, version: changed.version, digest: digestOf(changed) } };
     expect(decisionFindings({ record, table: changed, settings, strategies })).toEqual([]);
     const points = [{ at, candidates: [{ id: '#example', planOrder: 1, inputs: recorded }], expected: { order: ['#example'], outputs: { '#example': got } } }];
-    expect(replayFindings({ table: changed, settings, points, strategies })).toEqual([]);
-    expect(decisionFindings({ record, table: changed, settings }).some((f) => f.includes('SHIP-WM-161'))).toBe(true);
+    expect(replayFindings({ table: changed, settings, points, records: [record], strategies })).toEqual([]);
+    // Without the custom contract, load validation refuses before comparing outputs.
+    const missingContract = [`table ${changed.name}@${changed.version}: strategy x-custom has no contract: refused (SHIP-WM-154)`];
+    expect(tableFindings({ table: changed })).toEqual(missingContract);
+    expect(decisionFindings({ record, table: changed, settings })).toEqual(missingContract);
+    expect(replayFindings({ table: changed, settings, points: [], records: [record] })).toEqual(missingContract);
     expect(replayFindings({ table: changed, settings, points }).length).toBeGreaterThan(0);
   });
   it.each(DECISION_FIELDS)('SHIP-WM-162: decision missing %s is refused', (field) => {
