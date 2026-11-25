@@ -1037,6 +1037,57 @@ retryable `infra-transient` block (`verify-wait`), so nothing reads an unverifie
 The await-verify pass treats a session missing from an incomplete listing (either population failed to
 list, or a wrapped record was unreadable) as unknown, not gone: cover it with a listing that throws.
 
+## GitHub points admission
+
+Each GitHub attempt costs one point by default; `throttle.points` may supply an integer
+from 1 to 60. Invalid or oversized costs refuse execution; split larger work into bounded
+attempts. The host bucket refills at `pointsBudgetPerMin / 60` points per second (300/minute
+by default), holds at most 60 points, and shares the existing `points-budget` mutex.
+Priority (writes, critical callers, reserved reads) retains a floor of 0; standard retains
+10; batch retains 30, reduced to 10 after a ticket at 20 seconds. Batch classification uses
+the first matching normalized caller pattern, default `^rebuild-smoke`. Malformed patterns
+are skipped. Batch spends at most 60 points in any rolling 60 seconds; entries expire at
+exactly 60 seconds. Only the oldest live ticket may admit batch work while tickets exist;
+standard preserves an additional oldest-ticket cost. Dead and expired tickets are removed.
+Batch is best effort: sustained priority load can delay or starve it. Batch fails closed at
+60 seconds, reserved reads at their `reservedCapMs`; retry on the next tick. Neither may
+execute through setup errors, gate exceptions, held locks, or the slot `ungated` override.
+
+Other calls may run after 120 seconds, proceeding through slot admission. A timeout charges
+the full cost as debt down to -60 and logs `points_bypass`. When the full cost would cross
+-60, the call runs uncharged, retains its tokens, and logs `points_bypass_overflow`. A lock
+timeout or gate exception logs `points_bypass_uncharged`. Only charged points satisfy the
+bound `120 + refillRate * intervalSeconds`; uncharged calls are outside it. Missing, corrupt,
+or unreadable bucket state recovers to -60 tokens and a full batch cap for one 60-second
+window, never fresh capacity. Clock rollback neither refills nor expires future entries.
+State writes use a same-directory temporary file and rename. A pending legacy charge is
+persisted before writing that ledger and repaired under the mutex after interruption;
+recovery may overcharge but cannot grant a second spend from that interrupted write.
+Recovery logs `points_state_reset`. With no algorithm switch, charged points over any
+interval of T seconds are at most `120 + (pointsBudgetPerMin / 60) * T`. Uncharged
+overflow, exception and held-lock bypasses are outside that bound and are logged as
+`points_bypass_overflow` or `points_bypass_uncharged`. More than 1% uncharged bypasses
+in an hour calls for operator rollback to `window`.
+
+New code starts in compat mode: it both requires and charges the legacy fixed window.
+Bucket mode requires configured `ghThrottle.pointsBucketAdoption` evidence: `requiredHead`
+is the full commit containing this feature, and `daemons` is the complete operator-supplied
+list of daemon clone roots. Every daemon-self-sync `adopted.head` must descend from it.
+Missing, unreadable, incomplete, or failed ancestry evidence keeps compat. There is no
+clean-window auto-switch. Bucket mode still charges the legacy ledger; old spend or corrupt
+legacy state immediately restores compat. Old processes' uncharged timeout executions remain
+invisible to both ledgers; no total-execution bound is claimed during mixed-version operation.
+
+`ghThrottle.pointsAlgorithm` defaults to `bucket`; `window` restores the legacy path.
+It and `pointsClasses.batch` resolve standard → platform → tool (`scripts/settings/gh-throttle.json`)
+→ environment (`WE_GH_THROTTLE_POINTS_ALGORITHM`, `WE_GH_THROTTLE_POINTS_BATCH`, JSON array).
+Invalid values retain the lower layer; provenance is logged in `points-admission-settings.jsonl`. Settings are
+read on every admission decision, so running waiters observe rollback. Algorithm switches
+retain each ledger; the charged bound applies only within intervals without a switch.
+Test with injected clocks, sleep and jitter, temporary roots, seeded property arrivals, and
+real child processes sharing the mutex, including an old-code ledger simulator. Run only
+scoped throttle suites through the host heavy queue; never use live GitHub quota for scarcity.
+
 ## GitHub priority admission
 
 The throttle returns a JSON `deferred-low-budget` result without invoking GitHub when a fresh,

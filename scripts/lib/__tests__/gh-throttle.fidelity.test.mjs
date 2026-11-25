@@ -27,7 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { runGhSync, runGhCliPassthrough, stripGhDebug, rateLimitRecords, ghThrottleLogPath } from '../gh-throttle.mjs';
+import { runGhSync, runGhCliPassthrough, stripGhDebug, rateLimitRecords, ghThrottleLogPath } from './gh-throttle.window-fixture.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WRAPPER = join(HERE, '..', 'gh-throttle.mjs');
