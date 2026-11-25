@@ -2878,22 +2878,6 @@ export function planReconcile({
       continue;
     }
 
-    const noCode = isNoCodeRearmAnswer(operatorAnswer)
-      ? noCodeRearmPlan({ comments: pr.comments, headRefOid: pr.headRefOid,
-        labels: Array.isArray(pr.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : pr.labels })
-      : { state: 'none' };
-    if (noCode.state === 'ready') {
-      dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: noCode.answerId, why: noCode.why });
-      continue;
-    }
-    if (noCode.state === 'held' || noCode.state === 'spent') {
-      const kind = noCode.state === 'held' ? 'no-code-rearm-held' : 'no-code-rearm-spent';
-      refuse(kind, { why: noCode.why, answerId: noCode.answerId });
-      notes.push({ kind, prNumber, answerId: noCode.answerId,
-        text: `PR #${prNumber}: ${noCode.why} (answer ${noCode.answerId ?? 'unknown'}); a fresh answer is needed` });
-      continue;
-    }
-
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
       // The planner accepts strings and GraphQL label objects; the board classifier
@@ -2987,6 +2971,22 @@ export function planReconcile({
           ...(attempts >= effectiveRoundCap ? sendBackRoundFields : {}),
           why: attempts >= effectiveRoundCap ? sendBackRoundWhy : 'operator send-back not yet addressed after a fixer had its chance' });
       }
+      continue;
+    }
+
+    const noCode = isNoCodeRearmAnswer(operatorAnswer)
+      ? noCodeRearmPlan({ comments: pr.comments, headRefOid: pr.headRefOid,
+        labels: Array.isArray(pr.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : pr.labels })
+      : { state: 'none' };
+    if (noCode.state === 'ready') {
+      dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: noCode.answerId, why: noCode.why });
+      continue;
+    }
+    if (noCode.state === 'held' || noCode.state === 'spent') {
+      const kind = noCode.state === 'held' ? 'no-code-rearm-held' : 'no-code-rearm-spent';
+      refuse(kind, { why: noCode.why, answerId: noCode.answerId });
+      notes.push({ kind, prNumber, answerId: noCode.answerId,
+        text: `PR #${prNumber}: ${noCode.why} (answer ${noCode.answerId ?? 'unknown'}); a fresh answer is needed` });
       continue;
     }
 

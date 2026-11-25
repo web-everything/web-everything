@@ -86,6 +86,23 @@ describe('no-code rearm planning', () => {
     expect(result.dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
     expect(result.dispatch[0]).toMatchObject({ answerId: 'answer', expectHead: HEAD });
   });
+  it('already-landed content refuses a ready no-code answer without rearm-no-code', () => {
+    expect(predicate()).toMatchObject({ state: 'ready', answerId: 'answer' });
+    const result = plan(comments, { alreadyLandedInMain: { carrierPr: 43 } });
+    expect(result.dispatch.filter(d => d.kind === 'rearm-no-code')).toEqual([]);
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'already-landed', carrierPr: 43 }));
+  });
+  it('unresolved operator send-back wins over a ready no-code answer without rearm-no-code', () => {
+    const sendBack = c('send-back', `🔁 review — changes requested\n\nRecorded by chalbert via chat.\n\nFix the outstanding defect at head \`${'b'.repeat(40)}\`.`, 'chalbert');
+    const thread = [sendBack, ...comments];
+    expect(predicate({ comments: thread })).toMatchObject({ state: 'ready', answerId: 'answer' });
+    const result = plan(thread);
+    expect(result.dispatch.filter(d => d.kind === 'rearm-no-code')).toEqual([]);
+    expect(result.dispatch).toHaveLength(1);
+    expect(result.dispatch[0]).toMatchObject({ kind: 'fix', mode: 'ruling-not-addressed',
+      rulingNotAddressed: { items: [expect.objectContaining({ id: 'send-back' })] } });
+  });
   it('fix-begin after answer holds with zero fix rows', () => {
     const result = plan([...comments, begin]);
     expect(result.dispatch).toEqual([]);
