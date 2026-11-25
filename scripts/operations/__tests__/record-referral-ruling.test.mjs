@@ -275,6 +275,19 @@ describe('#4979 acceptance and wake-up read the operator ruling', () => {
     expect(() => assertMandatoryReferralsCleared({ ...state, comments: [...state.comments, gh(state.comments[1].body, 'mallory')] }, opts)).toThrow(/malformed-operator-ruling/);
   });
 
+  it('OFF: a legacy-format hold record is kept exactly as on main (persistRetries read as before)', () => {
+    const rec = referral({ summaries: ['broken case'] });
+    const r = newRunRecord({ id: 'review-pr-legacy', op: 'review-pr', input: { repo, pr: 7 } });
+    const at = Date.parse('2026-10-04T08:00:00Z');
+    r.findings = { read: { repo, pr: 7, netBasis: { rev: head } },
+      mandatoryReferrals: { effects: [{ type: 'review.mandatory-referrals', result: { records: [rec] } }] },
+      referralVerdict: { verdict: 'needs-human', pendingReferrals: [rec.referrals[0].key], referrals: rec.referrals } };
+    r.stepTimings = [{ step: 'read', startedAt: new Date(at - 60_000).toISOString() }, { step: 'advise', finishedAt: new Date(at).toISOString() }];
+    r.resumeOf = { persistRetries: '2' };
+    expect(reviewRunEvidence(r, { retryEnabled: () => false })).toMatchObject({ persistRetries: 2 });
+    expect(reviewRunEvidence({ ...r, resumeOf: { persistRetries: -1 } }, { retryEnabled: () => false })).toMatchObject({ persistRetries: 0 });
+  });
+
   it('an operator ruling on the parked head wakes the paused review; one on another head does not', () => {
     const rec = referral({ summaries: ['broken case'] });
     const r = newRunRecord({ id: 'review-pr-parked', op: 'review-pr', input: { repo, pr: 7 } });

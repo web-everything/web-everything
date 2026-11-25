@@ -165,7 +165,9 @@ export function reviewRunEvidence(run, { requireVerdict = false, retryEnabled = 
     rulings: records.flatMap(r => r?.rulings ?? []).map(r => JSON.stringify(r)),
     // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
     // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
-    persistRetries: run.resumeOf?.persistRetries === undefined ? 0
+    // OFF: exactly as on main. Strict counter validation only when the juror-timeout retry is enabled.
+    persistRetries: retryEnabled() !== true || run.resumeOf?.persistRetries === undefined
+      ? Math.max(0, Number(run.resumeOf?.persistRetries) || 0)
       : retryCounterValid(run.resumeOf.persistRetries) ? run.resumeOf.persistRetries : REFERRAL_RETRY_MS.length,
   };
 }

@@ -461,12 +461,9 @@ export function withStepFinish(run, { stepIndex, at } = {}) {
 export function validateRunRecord(record) {
   const errors = [];
   if (!isPlainObject(record)) return { ok: false, errors: ['run record must be an object'] };
-  for (const [key, value] of Object.entries({ jurorResumeAttempts: record.jurorResumeAttempts,
-    recordEffectResumeAttempts: record.recordEffectResumeAttempts, referralEffectResumeAttempts: record.referralEffectResumeAttempts,
-    'resumeOf.attempts': record.resumeOf?.attempts, 'resumeOf.adviseAttempts': record.resumeOf?.adviseAttempts,
-    'resumeOf.persistRetries': record.resumeOf?.persistRetries })) {
-    if (value !== undefined && !retryCounterValid(value, key === 'jurorResumeAttempts' ? 3 : Number.MAX_SAFE_INTEGER)) errors.push(`invalid retry counter ${key}`);
-  }
+  // Only the juror-retry counter (new, absent on every pre-existing record) is validated here: legacy counters stay
+  // exactly as on main, so a legacy-format record is never refused and dropped (that would be a fail-open).
+  if (record.jurorResumeAttempts !== undefined && !retryCounterValid(record.jurorResumeAttempts, 3)) errors.push('invalid retry counter jurorResumeAttempts');
   if (record.v !== RUN_RECORD_VERSION) {
     errors.push(`unsupported run record version ${JSON.stringify(record.v)} (this build reads v${RUN_RECORD_VERSION})`);
   }

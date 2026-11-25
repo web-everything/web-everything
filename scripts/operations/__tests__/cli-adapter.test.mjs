@@ -262,11 +262,12 @@ it('redacts, strips injected lines and bounds every public timeout hold field', 
   expect(hold.why.length).toBeLessThan(1000);
 });
 
-it.each(['recordEffectResumeAttempts', 'referralEffectResumeAttempts'])('validates persisted %s counters', key => {
-  for (const value of [-1, 1.5, NaN, Infinity, null, '0', Number.MAX_SAFE_INTEGER + 1]) {
-    expect(validateRunRecord({ ...fixture().run, [key]: value }).errors).toContain(`invalid retry counter ${key}`);
+it.each(['recordEffectResumeAttempts', 'referralEffectResumeAttempts'])('OFF: a legacy-format hold record is kept exactly as on main (%s)', key => {
+  // Legacy counters are never refused by the validator: dropping such a record would remove a hold (fail-open).
+  for (const value of [-1, 1.5, '2', null, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(validateRunRecord({ ...fixture().run, [key]: value }).errors).not.toContain(`invalid retry counter ${key}`);
   }
-  expect(validateRunRecord({ ...fixture().run, [key]: 0 }).ok).toBe(true);
+  expect(validateRunRecord({ ...fixture().run, resumeOf: { persistRetries: '2', attempts: -1 } }).errors.join(' ')).not.toContain('invalid retry counter');
 });
 
 it('still strips a foreign model before the Codex provider seam', async () => {
