@@ -691,6 +691,20 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     } finally { f.close(); }
   });
 
+  it('a main move or an expiry during the final source refresh is rejected, not published', async () => {
+    for (const mode of ['main-moved', 'expired']) {
+      const f = pass();
+      let t = 1000, calls = 0;
+      const options = { ...f.options, now: () => t, readSnapshot: () => null,
+        refreshSnapshot: () => { calls++; if (calls === 2) { if (mode === 'expired') t += 90_000; } return rows; },
+        readMain: async () => (mode === 'main-moved' && calls >= 2 ? { ...head, sha: 'c'.repeat(40) } : head) };
+      try {
+        await expect(readFastDrainPassInventory(options)).rejects.toThrow(mode === 'expired' ? 'expired while reading' : 'main changed');
+        expect(existsSync(f.options.path)).toBe(false);
+      } finally { f.close(); }
+    }
+  });
+
   for (const bad of ['null', 'throws', 'not-array']) {
     it(`stays fail-closed and publishes no round when the refresh is ${bad}`, async () => {
       const f = pass();

@@ -5945,7 +5945,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
         repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
         // A stale cache-only source would otherwise fail every catch-up child until the next full pass.
-        refreshSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs' }),
+        // Strict TTL/dirty only: the stale-ok allowance must never serve a source that catch-up already rejected.
+        refreshSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
+          env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_PR_SNAPSHOT_STALE_OK_MS')) }),
         log: line => process.stderr.write(`${line}\n`),
         concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
         readMain: async repo => {

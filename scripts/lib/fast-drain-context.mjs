@@ -189,6 +189,9 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return [repo, inventory];
   }));
   const revalidateAfterMembership = async (writtenAt, { refresh = false } = {}) => {
+    // Building a new round: concurrent mutations dirty the source within seconds, so the source is re-read through the
+    // refresh path FIRST; the main-head and TTL checks below then run after the last (possibly slow) source read.
+    const sources = refresh ? readSources({ refresh }) : null;
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
@@ -196,8 +199,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
     // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    // Building a new round: concurrent mutations dirty the source within seconds, so re-read through the same refresh path.
-    return readSources({ refresh });
+    return sources ?? readSources();
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -213,10 +215,11 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    // Include main-read/lock wait time in the freshness bound. A cold source refresh can itself outlast the TTL, so the
-    // bound then starts when it ends (heads were read just before it and are re-checked after membership).
+    // Include main-read/lock wait time in the freshness bound. A cold source refresh can itself outlast the TTL and
+    // observes nothing the round publishes, so when one ran the bound starts after it, with main re-read after it.
     let refreshed = false;
     readSources({ refresh: true, onRefresh: () => { refreshed = true; } });
+    if (refreshed) heads = await readHeads();
     const writtenAt = refreshed ? now() : observedAt;
     const inventories = Object.fromEntries(await readInventories());
     const snapshots = await revalidateAfterMembership(writtenAt, { refresh: true });
