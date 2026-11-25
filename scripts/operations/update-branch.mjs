@@ -11,8 +11,9 @@ const EXPECTED_HEAD = /^[0-9a-f]{40}$/;
 function expectedOf(input) {
   if (!Object.hasOwn(input, 'expected-head')) return undefined;
   const value = input['expected-head'];
-  if (value === undefined || (Array.isArray(value) && value.length === 0)) return undefined; // the CLI supplies [] when the flag is omitted
-  return Array.isArray(value) && value.length === 1 ? value[0] : (Array.isArray(value) ? value.join(',') : (value ?? null));
+  if (value === undefined) return undefined;
+  // Present but empty ([] or ''), null, repeated, blank or non-string: returned as a non-hex value so validate refuses it.
+  return Array.isArray(value) && value.length === 1 ? value[0] : (Array.isArray(value) ? `[${value.join(',')}]` : (value ?? null));
 }
 
 function validate({ pr, reason, ...rest }) {

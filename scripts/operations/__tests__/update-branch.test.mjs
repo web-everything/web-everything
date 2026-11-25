@@ -158,6 +158,34 @@ describe('update-branch', () => {
     expect(f.gh).not.toHaveBeenCalled();
   });
 
+  it.each(['', '   ', [], [''], ['  ']])('empty --expected-head refuses, no PUT (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+    expect(writes(f)).toHaveLength(0);
+  });
+
+  it('CLI: the head lock reaches the op (head-moved, no PUT), empty and repeated flags refuse, absent keeps behaviour', async () => {
+    const { declaration, registry } = resolveOperation(UPDATE_BRANCH_OP);
+    const cli = async (extra, replies) => {
+      const f = fixture(replies);
+      const outcome = await runOperationCli({ declaration, registry, sinks: f.sinks, argv: ['--pr=42', '--reason=sync', ...extra], store: createMemoryRunStore(), newRunId: () => 'cli-lock' });
+      return { f, finished: finishUpdateBranch(outcome), outcome };
+    };
+    const moved = await cli([`--expected-head=${'d'.repeat(40)}`], [pull]);
+    expect(JSON.parse(moved.finished.lines[0])).toMatchObject({ status: 'head-moved', refused: true });
+    expect(writes(moved.f)).toHaveLength(0);
+    for (const extra of [['--expected-head='], ['--expected-head=   '], [`--expected-head=${head}`, `--expected-head=${head}`]]) {
+      const bad = await cli(extra, [pull]);
+      expect(bad.f.gh).not.toHaveBeenCalled();
+      expect(JSON.stringify(bad.outcome)).toMatch(/expected-head/);
+    }
+    const ok = await cli([], [pull, { behind_by: 0 }]);
+    expect(JSON.parse(ok.finished.lines[0])).toMatchObject({ status: 'already-up-to-date' });
+    const match = await cli([`--expected-head=${head}`], [pull, { behind_by: 0 }]);
+    expect(JSON.parse(match.finished.lines[0])).toMatchObject({ status: 'already-up-to-date' });
+  });
+
   it.each([null, [head, 'd'.repeat(40)], [head, head]])('refuses an explicit null or repeated expected head before any IO (%j)', async value => {
     const f = fixture([]);
     await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
