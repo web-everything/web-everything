@@ -811,7 +811,7 @@ describe('CLI red-team reserve wiring', () => {
   const head = 'a'.repeat(40);
   const entries = (count, blocked) => Array.from({ length: count }, (_, i) => ({
     key: `${repo}#${i + 1}`, repo, pr: i + 1, head, enqueuedAt: 1, attempts: 0,
-    ...(blocked ? { blocked } : {}),
+    ...(blocked ? { blocked, blockedReason: 'fixture evidence' } : {}),
   }));
   const live = ({ pr }) => ({ number: pr, state: 'OPEN', isDraft: false,
     headRefOid: head, labels: ['red-team:pending'], comments: [], reviews: [] });
