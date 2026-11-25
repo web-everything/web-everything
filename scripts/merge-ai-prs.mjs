@@ -261,6 +261,7 @@ import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: t
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { resolveSiblingRepoName, siblingCloneStatus, provisionMissingSiblingClones } from './lib/sibling-clone-provision.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
@@ -4035,9 +4036,7 @@ export function resolveContextRepos(repos, self) {
  * @returns {string|null}
  */
 export function siblingCloneName(repo) {
-  if (!repo || !repo.includes('/')) return null;
-  const name = repo.split('/').pop();
-  return CONSTELLATION_REPO_NAMES.includes(name) ? name : null;
+  return resolveSiblingRepoName(repo);
 }
 
 /**
@@ -4953,6 +4952,7 @@ export function describeGhListError(e) {
 
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+let siblingClonesChecked = false;
 if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
 export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
@@ -4975,6 +4975,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
+  // The daemon's pool may have no PORT_BANDS entry, so lane-pool healing never visits it.
+  // Check once per process, before any sweep; dry runs only report missing-clone status.
+  let siblingProvisionFailures = [];
+  if (!siblingClonesChecked) {
+    siblingClonesChecked = true;
+    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN,
+      log: line => process.stderr.write(`${line}\n`) }).failed;
+  }
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
   // #2290 — `--only=<pr>` (alias `--couple=<pr>`, and the legacy `--pr=<pr>`) scopes the sweep to ONE PR: the
   // single-couple FAST DRAIN that /pr (pr-land) and /finish (lane-resume) shell so they still feel instant
@@ -5139,15 +5147,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
-  // sibling directory is missing (not provisioned) or isn't a git working copy falls back to the prior skip —
-  // nothing here clones on the fly (provisioning is the lane-pool allocator's job — #2303, see
-  // skills-src/drain/SKILL.md's Preconditions).
+  // sibling directory is still missing after the startup repair falls back to the prior skip.
   const siblingCloneDir = (repo) => {
     if (isLocalRepo(repo)) return null;
     const name = siblingCloneName(repo);
     if (!name) return null;
     const dir = resolve(process.cwd(), '..', name);
     try { return existsSync(join(dir, '.git')) ? dir : null; } catch { return null; }
+  };
+  const siblingCloneReason = repo => {
+    const name = siblingCloneName(repo);
+    return siblingProvisionFailures.find(row => row.name === name)?.reason
+      ?? siblingCloneStatus({ cwd: process.cwd() }).find(row => row.name === name)?.reason
+      ?? 'unknown constellation sibling';
   };
 
   // #2313 — post (or skip, if already posted) a drain reason comment on a PR. Best-effort: a `gh` miss never
@@ -6482,7 +6494,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // prior "left for its author" skip (rebasing it needs a clone of that repo).
       const cloneDir = isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo);
       if (!isLocalRepo(v.repo) && !cloneDir) {
-        if (isRebaseDropCandidate(v)) { v.rebaseDrop = 'skipped-remote'; if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} needs rebase in a ${v.repo} clone (no sibling clone provisioned — rebase-drop is local-only); left for its author\n`); }
+        if (isRebaseDropCandidate(v)) { v.rebaseDrop = 'skipped-remote'; if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} needs rebase in a ${v.repo} clone (no sibling clone provisioned: ${siblingCloneReason(v.repo)} — rebase-drop is local-only); left for its author\n`); }
         continue;
       }
       if (DRY_RUN) {
@@ -7504,7 +7516,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
     let out;
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
-    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned: ${siblingCloneReason(cand.repo)}` };
     else out = await refreshApprovedHead(cand, { laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
     // Once per pass on a head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git
     // error, no clone) is retried next pass rather than parking the head as `wait` forever. The record names the pass
