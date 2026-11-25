@@ -2970,7 +2970,10 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
             results.push(result);
           }
         }
-        observation = results.find(r => r.overlap) ?? results[0] ?? { overlap: true, why: 'unknown scope', failedClosed: true };
+        // A confirmed conflict on any shared file takes precedence over binary/directory fallbacks
+        // and ordinary region intersections, so scope order cannot bypass landing-holder protection.
+        observation = results.find(r => r.overlap && r.conflict === true)
+          ?? results.find(r => r.overlap) ?? results[0] ?? { overlap: true, why: 'unknown scope', failedClosed: true };
         if (!observation.overlap) {
           decide(entry, c, 'overlapGranularity', false, observation.why); return false;
         }

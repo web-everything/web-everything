@@ -89,6 +89,71 @@ function landingGate(options = {}, planned = [oldWaiter], claims = []) {
   });
 }
 describe('landing holder aging protection', () => {
+  describe.each(['live claim', 'landing holder'])('mixed-file conflict precedence (%s)', source => {
+    it.each(['intersection', 'disjoint', 'null', 'throw', 'directory'])('a preceding %s observation cannot mask a later confirmed conflict', kind => {
+      const scope = ['we:assets/icon.png', 'we:shared.mjs'];
+      const heldScope = kind === 'directory' ? ['we:assets/', 'we:shared.mjs'] : scope;
+      const regionOverlap = (_entry, _holder, file) => {
+        if (file === 'we:shared.mjs') return { overlap: true, conflict: true, holderHead: 'observed-head' };
+        if (kind === 'throw') throw new Error('unreadable region');
+        if (kind === 'null') return null;
+        return { overlap: kind !== 'disjoint', why: kind };
+      };
+      const out = landingGate({
+        regionOverlap,
+        landingHolders: source === 'landing holder' ? [{ pr: 90, scope: heldScope, headRefOid: 'observed-head' }] : [],
+      }, [{ ...oldWaiter, scope }], source === 'live claim' ? [{ meta: { pr: 90, scope: heldScope } }] : []);
+      expect(out.planned).toEqual([]);
+      expect(out.landingHolds).toHaveLength(1);
+      expect(out.landingEscalations).toEqual([expect.objectContaining({ holder: 90, holderHead: 'observed-head' })]);
+    });
+    it.each([
+      ['binary first', ['we:asset.png', 'we:shared.mjs']],
+      ['text first', ['we:shared.mjs', 'we:asset.png']],
+    ])('%s retains and escalates the confirmed conflict regardless of holder state', (_order, scope) => {
+      for (const state of [{ labels: ['review:accepted'] }, null]) {
+        const regionOverlap = createLiveRegionOverlap({
+          readPrHeads: () => new Map([[90, 'observed-head']]), policy: landingPolicy,
+          regionReader: {
+            hunksFor: () => new Map([['asset.png', null], ['shared.mjs', [[1, 2]]]]),
+            mergeConflicts: () => true,
+          },
+        });
+        const out = landingGate({
+          regionOverlap, holderState: () => state,
+          landingHolders: source === 'landing holder' ? [{ pr: 90, scope, headRefOid: 'observed-head' }] : [],
+        }, [{ ...oldWaiter, scope, headRefOid: 'waiter-head' }],
+        source === 'live claim' ? [{ meta: { pr: 90, scope } }] : []);
+        expect(out.planned).toEqual([]);
+        expect(out.refusals[0]?.kind).toBe('scope-overlap');
+        expect(out.scopeDecisions).toContainEqual(expect.objectContaining({
+          holder: 90, rule: 'waitForLandingHolder', decision: 'blocked',
+          why: expect.stringContaining('escalated, not released'),
+        }));
+        expect(out.landingHolds).toHaveLength(1);
+        expect(out.landingEscalations).toEqual([expect.objectContaining({
+          holder: 90, holderHead: 'observed-head', waiters: [80], failedClosed: state === null,
+        })]);
+      }
+    });
+    it('keeps the ordinary aging behavior when no shared file confirms a conflict', () => {
+      const scope = ['we:asset.png', 'we:shared.mjs'];
+      const regionOverlap = createLiveRegionOverlap({
+        readPrHeads: () => new Map([[90, 'observed-head']]), policy: landingPolicy,
+        regionReader: {
+          hunksFor: () => new Map([['asset.png', null], ['shared.mjs', [[1, 2]]]]),
+          mergeConflicts: () => false,
+        },
+      });
+      const out = landingGate({
+        regionOverlap,
+        landingHolders: source === 'landing holder' ? [{ pr: 90, scope, headRefOid: 'observed-head' }] : [],
+      }, [{ ...oldWaiter, scope, headRefOid: 'waiter-head' }], source === 'live claim' ? [{ meta: { pr: 90, scope } }] : []);
+      expect(out.planned.map(e => e.pr)).toEqual([80]);
+      expect(out.landingHolds).toEqual([]);
+      expect(out.landingEscalations).toEqual([]);
+    });
+  });
   it.each([{ labels: ['review:accepted'] }, { inMergeQueue: true }])('aging never releases a confirmed conflict with a landing holder (%j)', state => {
     const out = landingGate({ holderState: () => state });
     expect(out.planned).toEqual([]);

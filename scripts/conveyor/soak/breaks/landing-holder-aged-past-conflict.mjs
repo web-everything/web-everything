@@ -22,6 +22,27 @@ export default {
     const violations = [];
     if (out.planned.length || out.refusals[0]?.kind !== 'scope-overlap') violations.push('waiter admitted past confirmed landing conflict');
     if (out.landingEscalations?.length !== 1 || out.landingEscalations[0].holder !== 90) violations.push('stuck holder was not escalated');
+    // Live send-back x1b8hlo: a binary observation must not mask a later text conflict.
+    for (const scope of [['we:asset.png', 'we:shared.mjs'], ['we:shared.mjs', 'we:asset.png']]) {
+      const policy = resolveFixScopePolicy({ env: {}, platform: {}, readTool: () => ({ fixScope: { priorityBypass: false } }) });
+      const regionOverlap = createLiveRegionOverlap({
+        readPrHeads: () => new Map([[90, 'observed-head']]), policy,
+        regionReader: {
+          hunksFor: () => new Map([['asset.png', null], ['shared.mjs', [[1, 2]]]]),
+          mergeConflicts: () => true,
+        },
+      });
+      const held = filterFixesByInFlightScope([{ pr: 80, scope, headRefOid: 'waiter-head', waitingSince: since }], [],
+        [{ meta: { pr: 90, scope } }], {
+          now, maxWaitMinutes: 60, rebaseExempt: null, policy, regionOverlap,
+          holderState: () => ({ labels: ['review:accepted'] }),
+          landingBlockedSince: new Map([['80:90', since]]),
+        });
+      if (held.planned.length || held.refusals[0]?.kind !== 'scope-overlap'
+        || held.landingHolds?.length !== 1 || held.landingEscalations?.[0]?.holder !== 90) {
+        violations.push(`mixed-file landing conflict lost behind ${scope[0]}`);
+      }
+    }
     // Live send-back: holder state is unreadable and only a running claim names the holder.
     // Cover both the acquisition head and the final fallback to the current region observation.
     for (const headSha of ['claim-head', null]) {
