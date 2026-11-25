@@ -93,6 +93,16 @@ describe('SHIP-WM-160/161: timestamps denote valid, timezone-independent instant
   it.each(invalid)('SHIP-WM-160: invalid observation time %j fails closed', (observedAt) => {
     outcome(select({ table, settings, inputs: datedInputs(observedAt), at: '2026-11-25T12:00:00Z' }), 'unhandled', 'EVIDENCE_UNKNOWN');
   });
+  it.each([...invalid, undefined, null, '', '1795604400', true, {}, [], NaN, Infinity, -Infinity].map((observedAt) => [observedAt]))('SHIP-WM-162: invalid observation time %j is refused even in an accurate unhandled record', (observedAt) => {
+    const recorded = datedInputs(observedAt);
+    const decisionAt = '2026-11-25T12:00:00Z';
+    const got = select({ table, settings, inputs: recorded, at: decisionAt });
+    outcome(got, 'unhandled', 'EVIDENCE_UNKNOWN');
+    const record = { ...decision(), ...got, inputs: recorded, at: decisionAt };
+    const findings = decisionFindings({ record, table, settings });
+    expect(findings).toHaveLength(table.inputs.length);
+    expect(findings.every((f) => f.includes('observation time') && f.includes('SHIP-WM-162'))).toBe(true);
+  });
   it.each(invalid)('SHIP-WM-160/162: invalid decision time %j fails selection and record validation', (badAt) => {
     outcome(select({ table, settings, inputs: datedInputs('1800-01-01T00:00:00Z'), at: badAt }), 'unhandled', 'EVIDENCE_UNKNOWN');
     expect(decisionFindings({ record: { ...decision(), at: badAt }, table, settings })).toContain('decision decision-fixture: decision time is invalid: refused (SHIP-WM-162)');
@@ -104,9 +114,16 @@ describe('SHIP-WM-160/161: timestamps denote valid, timezone-independent instant
     ['2026-11-25T11:00:00.123Z', '2026-11-25T11:00:00.124Z'],
     ['2024-02-29T11:00:00Z', '2024-02-29T12:00:00Z'],
     ['2000-02-29T11:00:00Z', '2000-02-29T12:00:00Z'],
-    [0, 1], [1795604400, 1795608000],
+    [0, 1], [-1, 0], [1795604400.123, 1795604400.124],
+    [1795604400, 1795608000],
+    [1795604400, '2026-11-25T12:00:00Z'],
+    ['2026-11-25T11:00:00Z', 1795608000],
   ])('SHIP-WM-161: valid instants %j / %j retain prototype selection', (observedAt, decisionAt) => {
-    expect(select({ table, settings, inputs: datedInputs(observedAt), at: decisionAt })).toMatchObject({ rule: 'R3', strategy: 'prototype-first', build: true });
+    const recorded = datedInputs(observedAt);
+    const got = select({ table, settings, inputs: recorded, at: decisionAt });
+    expect(got).toMatchObject({ rule: 'R3', strategy: 'prototype-first', build: true });
+    const record = { ...decision(), ...got, inputs: recorded, at: decisionAt };
+    expect(decisionFindings({ record, table, settings })).toEqual([]);
   });
   it('SHIP-WM-160: explicit offsets still reject future observations', () => {
     outcome(select({ table, settings, inputs: datedInputs('2026-11-25T08:00:00-05:00'), at: '2026-11-25T12:00:00Z' }), 'unhandled', 'EVIDENCE_UNKNOWN');

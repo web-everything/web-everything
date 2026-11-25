@@ -218,7 +218,7 @@ export function decisionFindings({ record: d, table, settings, strategies = STRA
     const x = d?.inputs?.[i.name];
     if (!x) { add(`input ${i.name} is not recorded: refused`, 162); continue; }
     if (x.value === undefined) add(`input ${i.name} carries no value (unknown is written as unknown): refused`, 162);
-    if (!nonEmpty(x.observedAt)) add(`input ${i.name} carries no observation time: refused`, 162);
+    if (!Number.isFinite(secs(x.observedAt))) add(`input ${i.name} carries no valid observation time: refused`, 162);
     if (!nonEmpty(x.source?.uri) || !x.source?.digest) add(`input ${i.name} carries no source with a digest: refused`, 162);
     if (typeof x.fresh !== 'boolean') add(`input ${i.name} carries no freshness: refused`, 162);
   }
