@@ -40,7 +40,7 @@ export function planRewaive({ ref, tip, chain, merges, records, waivers, revoked
   if (!waiver) return refuse('basis-not-waived', { basis: baseSha });
   const own = recordsFor(tip), head = own[own.length - 1];
   if (!head) return { state: 'audit-needed', basis: baseSha,
-    command: `node scripts/operations/run.mjs codex-audit --base=origin/main --head=${tip} --branch=${ref}` };
+    command: `node scripts/operations/run.mjs codex-audit --base=origin/main --head=${tip}` };
   if (!isFull(head)) return refuse('head-record-is-delta', { basis: baseSha });
   if (head.verdict === 'NOT WEAKENED') return { state: 'not-needed', basis: baseSha };
   if (head.verdict !== 'WEAKENED' || !head.findings.length) return refuse('head-record-unusable', { basis: baseSha });

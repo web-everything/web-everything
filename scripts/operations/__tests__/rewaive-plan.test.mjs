@@ -120,7 +120,7 @@ describe('rewaive-plan: positive flow and request shape', () => {
     const [, B, , H] = r.shas;
     const first = plan(r, { records: [rec(B)], waivers: [waiver(B)] });
     expect(first).toMatchObject({ state: 'audit-needed', basis: B });
-    expect(first.command).toBe(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${H} --branch=${REF}`);
+    expect(first.command).toBe(`node scripts/operations/run.mjs codex-audit --base=origin/main --head=${H}`);
     const second = plan(r, { records: [rec(B), rec(H, { findings: ['f3.txt:1 new'] })], waivers: [waiver(B)] });
     expect(second.state).toBe('request');
     expect(second.request).toEqual({ ref: REF, sha: H, ruling: 'R1085', findings: ['f3.txt:1 new'], reason: `ci-heal re-waiver; supersedes ${B}` });
