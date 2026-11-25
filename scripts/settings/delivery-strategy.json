@@ -1,9 +1,18 @@
 {
-  "_doc": "Thresholds for scripts/conveyor/delivery-strategy.mjs selectStrategy. No defaults live in code: a missing key yields hold/settings-missing.",
-  "staleMin": 60,
-  "daemonKinds": ["daemon-tooling", "daemon-fix", "gate-fix"],
-  "prototypeLoadWithinMin": 15,
-  "designPassAfterRounds": 3,
-  "buildAheadMax": 2,
-  "unblockerCap": 4
+ "note": "OURS: proposal, not ratified; placeholder numbers",
+ "revision": "ours-settings-draft-1",
+ "values": {
+  "overlay-cap": 3,
+  "design-pass-after-rounds": 3,
+  "stack-max-depth": 3,
+  "land-by-budget": 14400,
+  "prototype-load-window": 900,
+  "override-window": 604800,
+  "override-threshold": 3
+ },
+ "units": {
+  "land-by-budget": "seconds",
+  "prototype-load-window": "seconds (the 15 min window: load within it after the first audited-green revision)",
+  "override-window": "seconds"
+ }
 }
