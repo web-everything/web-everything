@@ -2091,7 +2091,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     // return null so the caller's existing retry loop (`excluded.add(pick)` then pick the next candidate) moves
     // on, instead of an uncaught throw crashing the whole acquire. Live-caught: wev-review-daemon session
     // review-2549 crashed here writing into a lane `trim` had just removed.
-    if (e.code === 'ENOENT') return null;
+    if (e.code === 'ENOENT' || e.code === 'ELEASEBUSY') return null;
     if (e.code !== 'EEXIST') throw e;
   }
   const existing = readLease(dir);
@@ -2110,7 +2110,10 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing)));
+    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing))); } catch (e) {
+      if (e.code === 'ELEASEBUSY') return null;
+      throw e;
+    }
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
@@ -3880,8 +3883,10 @@ async function cmdReleaseAllPools(repo) {
       const refusedReset = resetPinnedLaneForRelease(salvageRepo, dir, lease);
       if (refusedReset) { kept.push({ pool: name, lane: n, ...refusedReset }); process.exitCode = 1; continue; }
       // owner-operation: explicit release, including the holder's own renewals.
-      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
-        log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
+      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n, { onBusy: () => {
+        kept.push({ pool: name, lane: n, reason: 'lease mutation busy' }); process.exitCode = 1;
+      } })) {
+        log(`  ${name}/lane-${n}: lease unavailable during salvage (changed or mutation busy); kept`);
         continue;
       }
       journalLaneEvent(dir, {
@@ -4100,8 +4105,10 @@ async function cmdRelease(repo) {
     const refusedReset = resetPinnedLaneForRelease(repo, dir, lease);
     if (refusedReset) { kept.push({ lane: n, ...refusedReset }); process.exitCode = 1; continue; }
     // owner-operation: explicit release, including the holder's own renewals.
-    if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
-      log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
+    if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n, { onBusy: () => {
+      kept.push({ lane: n, reason: 'lease mutation busy' }); process.exitCode = 1;
+    } })) {
+      log(`  lane-${n}: lease unavailable (changed or mutation busy) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
     }
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
@@ -5157,8 +5164,13 @@ const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluate
 /** Move lane `dir`'s lease marker aside atomically (only one renamer wins) and keep it gone ONLY if `isMine`
  *  accepts what was moved; otherwise put it back without clobbering a marker written meanwhile (`link` fails if
  *  the name exists). Returns true iff the marker was taken. */
-function takeMarkerIf(dir, isMine, n) {
-  return withLaneLeaseMutation(LEASE_MARKER(dir), () => takeMarkerIfUnlocked(dir, isMine, n));
+function takeMarkerIf(dir, isMine, n, { onBusy = () => {} } = {}) {
+  try { return withLaneLeaseMutation(LEASE_MARKER(dir), () => takeMarkerIfUnlocked(dir, isMine, n)); } catch (error) {
+    if (error.code !== 'ELEASEBUSY') throw error;
+    log(`  lane-${n}: ${error.message} — kept`);
+    onBusy();
+    return false;
+  }
 }
 
 function takeMarkerIfUnlocked(dir, isMine, n) {
@@ -5839,10 +5851,16 @@ function cmdAdopt(repo) {
   const me = process.env.CLAUDE_CODE_SESSION_ID || null;
   if (!me) fail('adopt needs a durable session id (CLAUDE_CODE_SESSION_ID) to stamp — without one there is nothing to declare, and the Edit/Write guard stays fail-open for this lane');
   const dir = laneDir(repo, n);
-  return withLaneLeaseMutation(LEASE_MARKER(dir), () => adoptLaneLease(repo, n, dir, me));
+  let adopted;
+  try { adopted = withLaneLeaseMutation(LEASE_MARKER(dir), () => adoptLaneLease(n, dir, me)); } catch (error) {
+    fail(error.message);
+  }
+  // History and git snapshots need no mutation lock; a slow observer must not
+  // exclude heartbeat, release or acquire after the hand-off has been published.
+  recordLaneAdoption(repo, n, dir, me, adopted);
 }
 
-function adoptLaneLease(repo, n, dir, me) {
+function adoptLaneLease(n, dir, me) {
   const lease = readLease(dir);
   // Throw inside the transaction so the mutex is released before CLI exit.
   if (!lease) throw new Error(`lane-${n} holds no lease to adopt — acquire it first (\`acquire --lane=${n} --purpose=<why> --adopt\`)`);
@@ -5857,6 +5875,10 @@ function adoptLaneLease(repo, n, dir, me) {
     );
   }
   writeLeaseAtomicUnlocked(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
+  return { lease, current };
+}
+
+function recordLaneAdoption(repo, n, dir, me, { lease, current }) {
   // #3383 — record the occupancy hand-off in the lane-history ledger (best-effort).
   appendLaneHistory(dir, laneHistoryEntry({ event: 'adopt', ownerSession: me, workerSession: me, session: lease.session }));
   journalLaneEvent(dir, {
@@ -6090,4 +6112,9 @@ if (flags.lane !== undefined && (
   fail('--lane requires a lane number');
 }
 
-await COMMANDS[cmd](resolveRepo());
+try { await COMMANDS[cmd](resolveRepo()); } catch (error) {
+  // Batch release and auto-pick handle busy lanes locally so they can continue.
+  // Other mutation callers still owe a clean refusal when a writer wins the lock.
+  if (error.code === 'ELEASEBUSY') fail(error.message);
+  throw error;
+}
