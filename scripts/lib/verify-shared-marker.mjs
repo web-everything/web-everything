@@ -31,7 +31,7 @@ function validRecord(rec, { repo, sha, policyKey }, nowMs) {
     && rec.v === 1 && rec.writer === 'verify-lane' && rec.repo === repo && rec.sha === sha && rec.policyKey === policyKey
     && rec.status === 'green' && rec.exitCode === 0
     && typeof rec.executedGate === 'string' && rec.executedGate.trim().length > 0
-    && ['pr', 'full', 'since-last-green'].includes(rec.selectionMode)
+    && ['full', 'pr', 'since-last-green'].includes(rec.selectionMode)
     && (rec.selectionMode === 'since-last-green' ? typeof rec.deltaBase === 'string' && SHA.test(rec.deltaBase) : rec.deltaBase === null)
     && typeof rec.finishedAt === 'string' && Number.isFinite(Date.parse(rec.finishedAt)) && Date.parse(rec.finishedAt) <= nowMs + 5 * 60_000
     && typeof rec.lane === 'string' && rec.lane.trim().length > 0;
