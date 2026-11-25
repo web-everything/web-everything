@@ -76,9 +76,13 @@ export function parseFeed(xml) {
 }
 
 export async function fetchFeedText(url, fetchImpl = fetch) {
-  const res = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
-  return parseFeed(await res.text());
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 15_000);
+  try {
+    const res = await fetchImpl(url, { signal: ctl.signal });
+    if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+    return parseFeed(await res.text());
+  } finally { clearTimeout(timer); }
 }
 
 /** The only gh invocation: a plain GET (no method, field or input flags). */
