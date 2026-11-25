@@ -11,6 +11,7 @@ const capacityLeaf = (validate, direction, failClosedFallback) => Object.freeze(
 // These are operator limits, not defaults or fail-closed fallbacks, and grant no guard-leaf authority.
 export const OPERATOR_CAPACITY_MAX = Object.freeze({ fix: 24, review: 16, redTeam: 24, ciHealReserve: 12, lanes: 24 });
 export const CAPACITY_LEAVES = Object.freeze({
+  'gh.throttle.pointsBudgetPerMin': capacityLeaf(integer(1, 600), 'cap', 300),
   'ciHeal.reserve': capacityLeaf(integer(0, 12), 'cap', 2),
   'lanes.maxConcurrent': capacityLeaf(integer(1, 24), 'cap', 8),
   // Floor/reserves protect capacity: an unreadable override must retain the larger bound.
