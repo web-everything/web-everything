@@ -1,7 +1,7 @@
 /**
  * Pure S1 selector ported from ship/working-model v0.1.9 tools/strategy.mjs.
  * Rules and numeric policy values belong to the caller's table and settings.
- * `at` is the recorded decision instant (ISO or epoch seconds), never a clock read.
+ * `at` is the recorded decision instant (zoned ISO date-time or epoch seconds), never a clock read.
  * Each observation must attest `fresh: true` and be dated at or before `at`.
  * Freshness windows are evaluated by the evidence producer; S1 refuses stale evidence.
  * S2 contract/dispatch and S3 audit/load lifecycle validation are outside this module.
@@ -35,7 +35,21 @@ export const INPUTS = {
   'free-slots': { type: 'count' }, 'review-rounds': { type: 'count' }, 'non-convergence-evidence': { type: 'boolean' } };
 const X = /^x-[a-z][a-z0-9-]*$/, SETTING = /^[a-z][a-z0-9-]*$/, CODE = /^[A-Z][A-Z0-9_]*$/;
 const nonEmpty = (s) => typeof s === 'string' && s.trim().length > 0;
-const secs = (t) => (typeof t === 'number' ? t : typeof t === 'string' && t.trim() ? Date.parse(t) / 1000 : NaN);
+const secs = (t) => {
+  if (typeof t === 'number') return t;
+  if (typeof t !== 'string') return NaN;
+  // Require an explicit zone and check the written calendar before Date.parse:
+  // it otherwise reads local time and silently rolls impossible days forward.
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(t);
+  if (!m || m[0] !== t) return NaN;
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1]
+    || hour > 23 || minute > 59 || second > 59
+    || Number(m[7] ?? 0) > 23 || Number(m[8] ?? 0) > 59) return NaN;
+  return Date.parse(t) / 1000;
+};
 const U = Symbol('unknown');
 const numbersIn = (x, path = '', skip = []) => (typeof x === 'number' ? [path || '/'] : Array.isArray(x) ? x.flatMap((v, i) => numbersIn(v, `${path}/${i}`, skip)) : x && typeof x === 'object' ? Object.entries(x).flatMap(([k, v]) => (skip.includes(k) ? [] : numbersIn(v, `${path}/${k}`, skip))) : []);
 const isStrategyName = (n) => REFERENCE.includes(n) || X.test(n ?? '');
