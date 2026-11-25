@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { createUpdateBranchSinks } from '../update-branch-io.mjs';
 import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
@@ -30,6 +30,12 @@ function fixture(replies, options = {}) {
 function writes(f) { return f.gh.mock.calls.filter(([args]) => args.includes('PUT')); }
 
 describe('update-branch', () => {
+  let resolveOperation;
+  // Load the CLI registry in bounded setup, preserving each test's five-second deadline.
+  beforeAll(async () => {
+    ({ resolveOperation } = await import('../run.mjs'));
+  }, 60_000);
+
   it('refuses a closed PR without comparing or writing and logs the refusal', async () => {
     const f = fixture([{ ...pull, state: 'closed' }]);
     const result = await f.run();
@@ -160,7 +166,6 @@ describe('update-branch', () => {
   });
 
   it('declares required CLI inputs and prints exactly one JSON line through the engine', async () => {
-    const { resolveOperation } = await import('../run.mjs');
     const { declaration, registry, finish, sinks } = resolveOperation(UPDATE_BRANCH_OP);
     expect(declaration.name).toBe(updateBranchOperation().name);
     expect(typeof sinks[UPDATE_BRANCH_OP]).toBe('function');

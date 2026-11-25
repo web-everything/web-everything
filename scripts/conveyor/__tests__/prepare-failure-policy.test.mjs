@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -589,8 +589,13 @@ describe('prepare publication failures', () => {
 });
 
 describe('cliPrepareFailureEvidence for a pid: handle', () => {
-  it('reads the last JSON line of the dispatch log into evidence.error, not the bare label', async () => {
-    const { cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs');
+  let cliPrepareFailureEvidence;
+  // Cold daemon-graph transforms must not consume the assertions' five-second deadline.
+  beforeAll(async () => {
+    ({ cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs'));
+  }, 60_000);
+
+  it('reads the last JSON line of the dispatch log into evidence.error, not the bare label', () => {
     const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-'));
     try {
       const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
@@ -601,11 +606,7 @@ describe('cliPrepareFailureEvidence for a pid: handle', () => {
       expect(cliPrepareFailureEvidence({ handle: 'pid:1', payload: { num: '9999' } }, { logRoot }).error).toBeNull();
     } finally { rmSync(logRoot, { recursive: true, force: true }); }
   });
-});
-
-describe('cliPrepareFailureEvidence dispatch-log guards', () => {
-  it('ignores a stale log from before the attempt and JSON that is not the terminal shape', async () => {
-    const { cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs');
+  it('ignores a stale log from before the attempt and JSON that is not the terminal shape', () => {
     const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-guard-'));
     try {
       const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
