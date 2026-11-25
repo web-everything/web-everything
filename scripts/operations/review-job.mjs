@@ -85,6 +85,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { writeEndedJobDiagnosis } from './review-job-end-diagnosis.mjs';
 import { heapCapArgs } from '../lib/node-heap-cap.mjs';
 import { execRead, READ_MAX_BUFFER } from '../lib/proc-read.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -204,6 +205,10 @@ export function classifyReviewLoopOutcome(parsed) {
   const verdict = typeof parsed?.verdict?.verdict === 'string' ? parsed.verdict.verdict : null;
   const loopOutcome = typeof parsed?.verdict?.loop?.outcome === 'string' ? parsed.verdict.loop.outcome : null;
   const base = { verdict, loopOutcome, runId };
+  if (parsed?.stopped === 'juror-timeout') {
+    const { lens, provider, model, head, timeoutMs, wallMs } = parsed;
+    return { outcome: BLOCKED_ON_INFRA, ...base, reason: 'juror-timeout', lens, provider, model, head, timeoutMs, wallMs };
+  }
   if (parsed?.queued === 'accept-needs-human') return { outcome: 'parked', ...base };
   if (Array.isArray(parsed?.preventionFiled)) return { outcome: 'auto-cleared', ...base };
   const stopped = typeof parsed?.stopped === 'string' ? parsed.stopped : null;
@@ -618,6 +623,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return verdict;
     },
     updateRecord: (record) => writeJobRecord(record, dir),
+    writeEnded: (job, diagnosis) => writeEndedJobDiagnosis({ ...job, dir }, diagnosis),
     unclaim: (slug, pid) => removeJobRecord(slug, pid, dir),
     acquireLane: ({ laneRepo, slug, actorId, waitMs, lane }) => {
       const r = node([
@@ -1592,6 +1598,10 @@ function runReviewArc({
     return result({ ...classified, lanePath });
   } finally {
     const done = classified ?? { outcome: BLOCKED_ON_INFRA, label: 'review-job exited without an outcome' };
+    if (done.reason === 'juror-timeout') {
+      try { io.writeEnded({ slug, pid }, done); }
+      catch (e) { io.log(`review-job ${slug}: FAILED to write timeout ended record — ${tail(e?.message ?? e, 200)}`); }
+    }
     try {
       if (!redTeamOnly) io.report({
         session: slug, pr: String(planned.pr), repo: planned.repo, status: 'done', outcome: done.outcome,
