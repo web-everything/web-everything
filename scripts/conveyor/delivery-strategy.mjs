@@ -35,6 +35,9 @@ export const INPUTS = {
   'free-slots': { type: 'count' }, 'review-rounds': { type: 'count' }, 'non-convergence-evidence': { type: 'boolean' } };
 const X = /^x-[a-z][a-z0-9-]*$/, SETTING = /^[a-z][a-z0-9-]*$/, CODE = /^[A-Z][A-Z0-9_]*$/;
 const nonEmpty = (s) => typeof s === 'string' && s.trim().length > 0;
+// Diagnostics must not coerce malformed JSON objects (including nested arrays).
+const diagnostic = (v) => v !== null && typeof v === 'object'
+  ? (Array.isArray(v) ? '[array]' : '[object]') : String(v);
 const secs = (t) => {
   if (typeof t === 'number') return t;
   if (typeof t !== 'string') return NaN;
@@ -107,27 +110,30 @@ const requires = (r, n, k, v) => { const c = r.when?.[n]; return !!c && (k === '
 
 // ---- SHIP-WM-157..160, 164..166, 168, 170, 178: the table at load (S1)
 export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
-  const out = [], add = (m, r) => out.push(`table ${t?.name ?? '?'}@${t?.version ?? '?'}: ${m} (SHIP-WM-${r})`);
+  const out = [], add = (m, r) => out.push(`table ${diagnostic(t?.name ?? '?')}@${diagnostic(t?.version ?? '?')}: ${m} (SHIP-WM-${r})`);
   const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   if (!object(t) || !['inputs', 'settings', 'reasonCodes', 'overrideReasons', 'prototypeStepKinds', 'rules'].every((k) => Array.isArray(t[k]))
-    || !object(t.strategies) || !Array.isArray(t.strategies.names)
-    || !t.inputs.every((i) => object(i) && nonEmpty(i.name)
+    || !object(t.strategies) || !Array.isArray(t.strategies.names) || !t.strategies.names.every((n) => typeof n === 'string')
+    || !Array.isArray(strategies) || !strategies.every((c) => object(c) && nonEmpty(c.name))
+    || !t.prototypeStepKinds.every((k) => typeof k === 'string')
+    || !t.inputs.every((i) => object(i) && nonEmpty(i.name) && typeof i.type === 'string'
       && (i.values === undefined || Array.isArray(i.values))
       && (i.type !== 'enum' || Array.isArray(i.values)))
-    || !t.reasonCodes.every(object)
+    || !t.reasonCodes.every((c) => object(c) && typeof c.code === 'string' && typeof c.class === 'string')
     || !t.rules.every((r) => object(r) && nonEmpty(r.id) && object(r.when) && object(r.output)
+      && typeof r.output.strategy === 'string' && typeof r.output.reason === 'string'
       && Object.values(r.when).every(object))) {
     add('incomplete or malformed table shape: refused at load', 158);
     return out;
   }
-  if (t?.hitPolicy !== 'first') add(`hit policy ${t?.hitPolicy} is not first: refused at load`, 158);
+  if (t?.hitPolicy !== 'first') add(`hit policy ${diagnostic(t?.hitPolicy)} is not first: refused at load`, 158);
   if (!nonEmpty(t?.version)) add('the table declares no version: refused at load', 158);
   const decl = Object.create(null); for (const i of t?.inputs ?? []) { if (decl[i.name]) add(`input ${i.name} declared twice: refused`, 159); decl[i.name] = i; if (!INPUT_TYPES.includes(i.type)) add(`input ${i.name} has type ${i.type}: refused`, 159); if (i.type === 'enum' && !(i.values ?? []).length) add(`enum input ${i.name} declares no values: refused`, 159); if (typeof i.required !== 'boolean') add(`input ${i.name} does not say whether it is required: refused`, 159); }
   for (const [n, d] of Object.entries(INPUTS)) { if (!decl[n]) add(`the input ${n} is not declared: refused at load`, 158); else { if (decl[n].type !== d.type) add(`input ${n} has type ${decl[n].type}, not ${d.type}: refused`, 158); for (const x of d.values ?? []) if (!decl[n].values?.includes(x)) add(`input ${n} lacks the value ${x}: refused`, 158); } }
-  const settings = new Set(t?.settings ?? []); for (const s of t?.settings ?? []) if (typeof s !== 'string' || !SETTING.test(s)) add(`setting ${s} is not a setting name: refused`, 178);
+  const settings = new Set(t?.settings ?? []); for (const s of t?.settings ?? []) if (typeof s !== 'string' || !SETTING.test(s)) add(`setting ${diagnostic(s)} is not a setting name: refused`, 178);
   const codes = Object.create(null); for (const c of t?.reasonCodes ?? []) { if (codes[c.code]) add(`reason code ${c.code} declared twice: refused`, 159); codes[c.code] = c.class; if (!REASON_CLASSES.includes(c.class)) add(`reason code ${c.code} has class ${c.class}: refused`, 159); if (!CODE.test(c.code ?? '')) add(`reason code ${c.code} is not a code: refused`, 159); }
   if (!(t?.overrideReasons ?? []).length) add('no override reason is declared: refused', 171);
-  for (const k of ['onUnknown', 'onNoMatch']) if (!t?.[k] || codes[t[k].reason] !== 'unhandled' || !nonEmpty(t[k].rule)) add(`${k} does not give unhandled with a declared unhandled reason: refused`, 160);
+  for (const k of ['onUnknown', 'onNoMatch']) if (!t?.[k] || typeof t[k].reason !== 'string' || codes[t[k].reason] !== 'unhandled' || !nonEmpty(t[k].rule)) add(`${k} does not give unhandled with a declared unhandled reason: refused`, 160);
   const set = t?.strategies ?? {}, names = set.names ?? [], byName = Object.fromEntries(strategies.map((c) => [c.name, c]));
   if (typeof set.closed !== 'boolean') add('the strategy set does not say whether it is closed: refused', 155);
   for (const n of names) { if (!isStrategyName(n)) add(`strategy ${n} is neither a reference nor an x- strategy: refused`, 155); const c = byName[n]; if (!c) add(`strategy ${n} has no contract: refused`, 154); else if (typeof c.feedsGates !== 'boolean') add(`strategy ${n} declares no gate effect: refused`, 158); }
@@ -143,10 +149,10 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
       if (ks.length !== 1 || !CONDS.includes(ks[0])) { add(`rule ${r.id}: condition on ${n} is not one of ${CONDS.join(', ')}: refused`, 159); continue; }
       const [k, a] = [ks[0], c[ks[0]]];
       for (const p of numbersIn(c)) add(`rule ${r.id}: a literal number in the condition on ${n} (${p}): every number is a setting, refused`, 178);
-      if (['atLeastSetting', 'belowSetting', 'atMostSetting'].includes(k)) { if (d.type !== 'count') add(`rule ${r.id}: ${k} on the non-count input ${n}: refused`, 159); if (typeof a !== 'string' || !settings.has(a)) add(`rule ${r.id}: setting ${a} is not declared: refused`, 159); }
+      if (['atLeastSetting', 'belowSetting', 'atMostSetting'].includes(k)) { if (d.type !== 'count') add(`rule ${r.id}: ${k} on the non-count input ${n}: refused`, 159); if (typeof a !== 'string' || !settings.has(a)) add(`rule ${r.id}: setting ${diagnostic(a)} is not declared: refused`, 159); }
       if (k === 'positive' && (d.type !== 'count' || typeof a !== 'boolean')) add(`rule ${r.id}: positive on ${n} needs a count and a flag: refused`, 159);
-      if (k === 'eq' && d.type === 'boolean' && typeof a !== 'boolean') add(`rule ${r.id}: ${n} eq ${a} is not a flag: refused`, 159);
-      if (k === 'eq' && d.type === 'enum' && !(d.values ?? []).includes(a)) add(`rule ${r.id}: ${n} eq ${a} is outside its declared values: refused`, 159);
+      if (k === 'eq' && d.type === 'boolean' && typeof a !== 'boolean') add(`rule ${r.id}: ${n} eq ${diagnostic(a)} is not a flag: refused`, 159);
+      if (k === 'eq' && d.type === 'enum' && !(d.values ?? []).includes(a)) add(`rule ${r.id}: ${n} eq ${diagnostic(a)} is outside its declared values: refused`, 159);
       if (k === 'eq' && d.type === 'count' && typeof a !== 'number') add(`rule ${r.id}: eq on the count ${n}: refused`, 159);
       if (k === 'in' && (d.type !== 'enum' || !Array.isArray(a) || !a.length || a.some((x) => !(d.values ?? []).includes(x)))) add(`rule ${r.id}: ${n} in a list outside its declared values: refused`, 159);
     }
@@ -155,6 +161,8 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
     const cls = codes[o.reason], want = NOT_STRATEGY.includes(o.strategy) ? (o.strategy === 'hold' ? ['hold'] : ['unhandled', 'floor']) : ['strategy'];
     if (!cls) add(`rule ${r.id}: reason ${o.reason} is not declared: refused`, 159); else if (!want.includes(cls)) add(`rule ${r.id}: reason ${o.reason} of class ${cls} does not fit ${o.strategy}: refused`, 159);
   }
+  // Do not sort malformed ranks or inspect contracts until row validation passes.
+  if (out.length) return out;
   const sorted = byRank(t ?? {}), rankOf = (r) => r.rank, stratRows = sorted.filter((r) => names.includes(r.output?.strategy));
   const contract = (r) => byName[r.output?.strategy];
   // 157: the security row
@@ -202,7 +210,9 @@ export function orderFindings({ candidates, order }) {
 // ---- SHIP-WM-161, 162, 173: the decision record and its replay (S1)
 export const DECISION_FIELDS = ['decisionId', 'at', 'candidate', 'position', 'positionReason', 'inputs', 'table', 'settings', 'evaluated', 'rule', 'strategy', 'build', 'reason', 'unknown', 'actions'];
 export function decisionFindings({ record: d, table, settings, strategies = STRATEGY_EFFECTS }) {
-  const out = [], add = (m, r) => out.push(`decision ${d?.decisionId ?? '?'}: ${m} (SHIP-WM-${r})`);
+  const invalidTable = tableFindings({ table, strategies });
+  if (invalidTable.length) return invalidTable;
+  const out = [], add = (m, r) => out.push(`decision ${diagnostic(d?.decisionId ?? '?')}: ${m} (SHIP-WM-${r})`);
   for (const f of DECISION_FIELDS) if (d?.[f] === undefined || d[f] === null) add(`field ${f} is absent: refused`, 162);
   for (const i of table.inputs ?? []) {
     const x = d?.inputs?.[i.name];
@@ -212,7 +222,7 @@ export function decisionFindings({ record: d, table, settings, strategies = STRA
     if (!nonEmpty(x.source?.uri) || !x.source?.digest) add(`input ${i.name} carries no source with a digest: refused`, 162);
     if (typeof x.fresh !== 'boolean') add(`input ${i.name} carries no freshness: refused`, 162);
   }
-  if (d?.table && (d.table.uri !== table.id || d.table.version !== table.version || canon(d.table.digest) !== canon(digestOf(table)))) add(`pins table ${d.table.version} at a digest that is not the table supplied: replay against the pinned version only, refused`, 173);
+  if (d?.table && (d.table.uri !== table.id || d.table.version !== table.version || canon(d.table.digest) !== canon(digestOf(table)))) add(`pins table ${diagnostic(d.table.version)} at a digest that is not the table supplied: replay against the pinned version only, refused`, 173);
   if (d?.settings && (d.settings.revision !== settings.revision || canon(d.settings.digest) !== canon(digestOf(settings.values)))) add('pins a settings revision or digest that is not the one supplied: refused', 162);
   if (!Number.isFinite(secs(d?.at))) add('decision time is invalid: refused', 162);
   if (d?.inputs) {
@@ -224,7 +234,7 @@ export function decisionFindings({ record: d, table, settings, strategies = STRA
 
 // ---- SHIP-WM-173: a table change is a new declared version (S1)
 export function tableChangeFindings({ from, to }) {
-  const out = [], add = (m) => out.push(`table change ${from?.version} -> ${to?.version}: ${m} (SHIP-WM-173)`);
+  const out = [], add = (m) => out.push(`table change ${diagnostic(from?.version)} -> ${diagnostic(to?.version)}: ${m} (SHIP-WM-173)`);
   if (canon(digestOf(from)) === canon(digestOf(to))) return out;
   if (!nonEmpty(to?.version) || from.version === to.version) { add('the content changed under the same version: a silent edit, refused'); return out; }
   if (!to.supersedes || to.supersedes.version !== from.version || canon(to.supersedes.digest) !== canon(digestOf(from))) add('the new version does not name the version and digest it supersedes: refused');
@@ -236,10 +246,10 @@ export function replayFindings({ table, settings, points, strategies = STRATEGY_
   const out = [];
   for (const p of points) {
     const order = candidateOrder(p.candidates);
-    if (canon(order) !== canon(p.expected.order)) out.push(`${p.at}: order ${canon(order)}, expected ${canon(p.expected.order)} (SHIP-WM-163)`);
+    if (canon(order) !== canon(p.expected.order)) out.push(`${diagnostic(p.at)}: order ${canon(order)}, expected ${canon(p.expected.order)} (SHIP-WM-163)`);
     for (const c of p.candidates) {
-      const got = select({ table, settings, strategies, inputs: c.inputs, at: p.at }), want = p.expected.outputs[c.id];
-      for (const k of ['strategy', 'reason', 'rule']) if (got[k] !== want?.[k]) out.push(`${p.at} ${c.id}: ${k} ${got[k]}, expected ${want?.[k]} (SHIP-WM-160)`);
+      const got = select({ table, settings, strategies, inputs: c.inputs, at: p.at }), want = c.id !== null && typeof c.id === 'object' ? undefined : p.expected.outputs[c.id];
+      for (const k of ['strategy', 'reason', 'rule']) if (got[k] !== want?.[k]) out.push(`${diagnostic(p.at)} ${diagnostic(c.id)}: ${k} ${diagnostic(got[k])}, expected ${diagnostic(want?.[k])} (SHIP-WM-160)`);
     }
   }
   return out;

@@ -220,8 +220,71 @@ describe('SHIP-WM-160/178: configured settings', () => {
 });
 
 describe('SHIP-WM-157/158/159: table load checks', () => {
+  it.each([
+    ['shadowed toString', { toString: null }],
+    ['nested shadowed toString', [{ toString: null }]],
+    ['object', {}], ['array', []], ['null', null], ['number', 42], ['boolean', true],
+  ])('SHIP-WM-178: malformed JSON setting declaration (%s) fails closed', (_, value) => {
+    const changed = JSON.parse(JSON.stringify(table));
+    changed.settings.push(JSON.parse(JSON.stringify(value)));
+    expect(tableFindings({ table: changed }).length).toBeGreaterThan(0);
+    expect(run({}, { table: changed })).toMatchObject({
+      rule: 'unconfigured', strategy: 'unhandled', reason: 'EVIDENCE_UNKNOWN', build: false,
+    });
+  });
   it('SHIP-WM-158: the copied versioned First table loads', () => {
     expect(tableFindings({ table })).toEqual([]);
+  });
+  it.each([
+    ['table name in a refusal', (t, v) => { t.name = v; t.settings.push(null); }],
+    ['table version', (t, v) => { t.version = v; }],
+    ['hit policy', (t, v) => { t.hitPolicy = v; }],
+    ['input name', (t, v) => { t.inputs[0].name = v; }],
+    ['input type', (t, v) => { t.inputs[0].type = v; }],
+    ['reason code', (t, v) => { t.reasonCodes[0].code = v; }],
+    ['reason class', (t, v) => { t.reasonCodes[0].class = v; }],
+    ['unknown reason', (t, v) => { t.onUnknown.reason = v; }],
+    ['no-match reason', (t, v) => { t.onNoMatch.reason = v; }],
+    ['strategy name', (t, v) => { t.strategies.names.push(v); }],
+    ['prototype kind', (t, v) => { t.prototypeStepKinds.push(v); }],
+    ['rule id', (t, v) => { t.rules[0].id = v; }],
+    ['rule rank', (t, v) => { t.rules[0].rank = v; }],
+    ['output strategy', (t, v) => { t.rules[0].output.strategy = v; }],
+    ['output reason', (t, v) => { t.rules[0].output.reason = v; }],
+    ['boolean condition', (t, v) => { t.rules[0].when['security-open'].eq = v; }],
+    ['enum condition', (t, v) => { row(t, 'R2').when.blocker.eq = v; }],
+    ...['belowSetting', 'atLeastSetting', 'atMostSetting'].map((k) => [
+      k, (t, v) => { row(t, 'R3').when['live-overlays'] = { [k]: v }; },
+    ]),
+  ])('SHIP-WM-158/160: malformed JSON at %s is refused through validation and selection', (_, mutate) => {
+    for (const value of [{ toString: null }, [{ toString: null }]]) {
+      const changed = clone(table);
+      mutate(changed, value);
+      const jsonTable = JSON.parse(JSON.stringify(changed));
+      expect(tableFindings({ table: jsonTable }).length).toBeGreaterThan(0);
+      expect(run({}, { table: jsonTable })).toMatchObject({
+        rule: 'unconfigured', strategy: 'unhandled', reason: 'EVIDENCE_UNKNOWN', build: false,
+      });
+      expect(decisionFindings({ record: decision(), table: jsonTable, settings }).length).toBeGreaterThan(0);
+      expect(replayFindings({ table: jsonTable, settings, points: replay.points }).length).toBeGreaterThan(0);
+    }
+  });
+  it('SHIP-WM-158: malformed contract names fail closed before property-key coercion', () => {
+    const strategies = [{ name: { toString: null }, feedsGates: true }];
+    expect(tableFindings({ table, strategies }).length).toBeGreaterThan(0);
+    expect(run({}, { strategies })).toMatchObject({ rule: 'unconfigured', strategy: 'unhandled', build: false });
+  });
+  it('SHIP-WM-161/173: sibling diagnostics do not coerce malformed JSON metadata', () => {
+    const bad = JSON.parse('{"toString":null}');
+    const record = decision();
+    record.decisionId = bad;
+    record.table.version = bad;
+    expect(decisionFindings({ record, table, settings }).length).toBeGreaterThan(0);
+    expect(tableChangeFindings({ from: table, to: { ...table, version: bad } }).length).toBeGreaterThan(0);
+    const point = clone(replay.points[0]);
+    point.at = bad;
+    point.candidates[0].id = bad;
+    expect(replayFindings({ table, settings, points: [point] }).length).toBeGreaterThan(0);
   });
   it('SHIP-WM-159: tied rank is refused', () => refused(159, (t) => { row(t, 'R2').rank = row(t, 'R1').rank; }));
   it('SHIP-WM-159: undeclared input is refused', () => refused(159, (t) => { row(t, 'R3').when.secret = { eq: true }; }));
