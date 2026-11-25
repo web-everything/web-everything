@@ -2340,3 +2340,14 @@ it('default review-loop minting keys the persisted run by its parsed PR', async 
   expect(out.code).toBe(0);
   expect(out.run.id.match(NAME_RE)?.[1]).toBe(String(out.run.input.pr));
 });
+
+it('prints a named juror-timeout with seat identity and the reviewed head', async () => {
+  const { declaration, registry } = registryFor({ rev: HEAD_A });
+  const out = await runReviewLoopOnce({ declaration, registry, argv: [...BASE_ARGV, '--json'],
+    store: createMemoryRunStore(), sinks: recordingSinks([]),
+    makeJudge: () => async () => { throw Object.assign(Error('juror timed out'), { timedOut: true, timeoutMs: 5, wallMs: 6 }); } });
+  expect(out.code).toBe(1);
+  expect(out.stopped).toBe('juror-timeout');
+  expect(JSON.parse(out.lines.join('\n'))).toMatchObject({ stopped: 'juror-timeout', runId: out.run.id,
+    lens: 'correctness', provider: 'claude', model: expect.any(String), head: HEAD_A, timeoutMs: 5, wallMs: 6 });
+});
