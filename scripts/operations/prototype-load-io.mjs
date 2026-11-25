@@ -223,8 +223,8 @@ export function defaultDeps() {
     retirePlanner: defaultRetirePlanner };
 }
 /** Preserve tool/platform precedence and matching; ops contributes only validated entries. */
-export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn, scopeRef, warnOther }) {
-  const isRevoked = withdrawnRevocations({ fs, env, warn, scopeRef, ...(warnOther ? { warnOther } : {}) });
+export function loadRuledWeakened({ platform, tool, fs, env, warn = console.warn, scopeRef, warnOther, relaxUnattributed }) {
+  const isRevoked = withdrawnRevocations({ fs, env, warn, scopeRef, ...(warnOther ? { warnOther } : {}), relaxUnattributed });
   const merged = mergeRuledWeakened(platform, tool, warn).filter(e => !isRevoked(e));
   const store = readStore({ path: storePath(env), fs, warn });
   if (store.error) warn(`WARNING: ruled-weakened store unreadable: ${store.error}; no ops waivers loaded. Restore store readability and retry.`);

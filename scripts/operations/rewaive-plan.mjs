@@ -77,7 +77,7 @@ function defaultLoaders({ env, repo, ref, malformed }) {
     const platform = readPlatformPreferences({ env: full, readFile: readFileSync, warn });
     if (platform.errors.length) throw new Error('platform preferences unreadable');
     const list = loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened, tool: tool.ruledWeakened,
-      fs: { readFileSync }, env: full, warn, scopeRef: ref,
+      fs: { readFileSync }, env: full, warn, scopeRef: ref, relaxUnattributed: true,
       // An unrelated damaged line is reported (line number) and never grants a carry; it does not refuse this ref.
       warnOther: m => { const n = /line(?:s)? (\d+)/.exec(String(m)); malformed.push(n ? Number(n[1]) : String(m).slice(0, 80)); } });
     if (warnings.length) throw new Error(`waiver evidence warnings: ${warnings[0].slice(0, 100)}`);

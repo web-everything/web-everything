@@ -102,11 +102,9 @@ describe('ops ruled-weakened evidence', () => {
         expect(warnOther).not.toHaveBeenCalled();
       });
       it('an unattributable line blocks', () => {
-        // Unattributable text blocks only when it names the scoped ref or could be a revocation; plain junk is reported.
-        requests('{"ref": truncated lane/fix', '{"findings":"no ref revoked","sha":1}', '{"junk": truncated');
-        const { warn, warnOther } = scoped('lane/fix');
+        requests('{"ref": truncated', '{"findings":"no ref","sha":1}');
+        const { warn } = scoped('lane/fix');
         expect(warn).toHaveBeenCalledTimes(2);
-        expect(warnOther).toHaveBeenCalledTimes(1);
       });
       it('without a scope every damaged line blocks', () => {
         requests(damagedFor('lane/other'));
@@ -134,7 +132,7 @@ describe('ops ruled-weakened evidence', () => {
         expect(withdrawnRevocations({ fs, env, warn: () => {} })(entry())).toBe(false);
       });
       it('a split record whose join does not parse stays unattributable and blocks', () => {
-        requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed lane/fix');
+        requests('{"ref":"lane/other","sha":"' + SHA + '","findings":"a', 'b', 'c', 'd', 'e', 'never closed');
         const { warn } = scoped('lane/fix');
         expect(warn).toHaveBeenCalled();
       });

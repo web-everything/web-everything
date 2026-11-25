@@ -55,6 +55,9 @@ describe('rewaive-plan: a malformed waiver-log line', () => {
     expect(run(mk([valid, '{"ruling":"WITH']))).toMatchObject({ state: 'refuse' });
     expect(run(mk([valid, '{"ref":"lane\\/x","ruling":"WITHDRAWN","sha":']))).toMatchObject({ state: 'refuse' });
   });
+  it('a unicode-escaped malformed withdrawal refuses', () => {
+    expect(run(mk([valid, '{"ref":"lane\\u002fx","ruling":"\\u0057ITHDRAWN","sha":'])).state).toBe('refuse');
+  });
   it('a malformed line naming the planned ref refuses', () => {
     const r = mk([valid, `{"ref":"${REF}","sha":`]);
     expect(run(r).state).toBe('refuse');

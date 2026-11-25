@@ -32,7 +32,7 @@ const isoTime = at => typeof at === 'string'
   && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at) ? Date.parse(at) : NaN;
 
 /** Admission-time revocations for every waiver layer. Unreadable evidence revokes all waivers. */
-export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn, scopeRef, warnOther = console.warn } = {}) {
+export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = console.warn, scopeRef, warnOther = console.warn, relaxUnattributed = false } = {}) {
   // Use the same HOME validation as the store; never fall back to an ambient home.
   storePath(env);
   const path = join(env.HOME, 'workspace/.operations/handoff/waiver-requests.jsonl');
@@ -52,8 +52,10 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
     let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
     // Unparseable text: it may only block when it could be a revocation or names the scoped ref (fail closed); else it is unrelated.
-    if (scopeRef !== undefined && !named) {
-      const raw = lines.slice(i, i + count).join('\n').toLowerCase().replaceAll('\\', '');
+    // Opt-in only (rewaive-plan, a read-only planner): every other caller keeps the fail-closed default.
+    if (relaxUnattributed && scopeRef !== undefined && !named) {
+      const raw = lines.slice(i, i + count).join('\n').toLowerCase()
+        .replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase().replaceAll('\\', '');
       // Could be a revocation: names revok/withdrawn, or is cut off inside "withdrawn" (e.g. a truncated "WITH").
       const hint = /revok|withdraw/.test(raw) || /(?:^|[^a-z])w(?:i(?:t(?:h(?:d(?:r(?:a(?:w(?:n)?)?)?)?)?)?)?)?["'\s]*$/.test(raw);
       other = !hint && !raw.includes(String(scopeRef).toLowerCase());
