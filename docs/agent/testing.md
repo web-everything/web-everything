@@ -6457,3 +6457,7 @@ Before changing an admission gate, compare each PREP acceptance line with the ne
 behavior change. Every new refusal path needs explicit authorization in the card;
 keep a deterministic test for admission without timing metadata so a separate
 measurement policy cannot silently reintroduce per-PR timing work.
+
+## Juror timeout resume regressions
+
+Exercise retry routing through `createDefaultJudge` and its injected provider, not only a mocked judge: the provider must receive the selected model and extended timeout. Invalid persisted counters spend the retry budget; inject historical corrupt records at the reader boundary because new run-store writes reject them. Timeout evidence changes must invalidate the review evidence cache. Exhausted same-head holds survive resume failures and release only through the operator wake rule or a moved head.

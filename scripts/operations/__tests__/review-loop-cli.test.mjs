@@ -210,7 +210,7 @@ const cannedJudge = (answer) => () => async () => judgeOutcome(answer, {});
 
 const BASE_ARGV = ['--pr=1234', '--repo=web-everything/web-everything'];
 
-it.each(['same', 'moved', 'roster', 'budget'])('juror timeout resume guard: %s head/roster', async scenario => {
+it.each(['same', 'moved', 'moved-spent', 'roster', 'roster-spent', 'budget', 'invalid', 'malformed', 'head-error', 'head-missing', 'capacity', 'capacity-error'])('juror timeout resume guard: %s head/roster', async scenario => {
   const head = 'a'.repeat(40), store = createMemoryRunStore();
   const first = registryFor({ rev: head });
   const timedOut = Object.assign(new Error('timeout'), { timedOut: true, timeoutMs: 1200000, wallMs: 1200001 });
@@ -219,24 +219,35 @@ it.each(['same', 'moved', 'roster', 'budget'])('juror timeout resume guard: %s h
   expect(parked.stopped).toBe('juror-timeout');
   const saved = JSON.parse(JSON.stringify(parked.run));
   saved.pending.request.seatProvider = { fallbackModel: 'claude-opus-5-5-high' };
-  if (scenario === 'roster') saved.findings.read.securitySeat = false;
-  if (scenario === 'budget') saved.jurorResumeAttempts = RESUME_MAX_ATTEMPTS;
-  store.write(saved);
-  const liveHead = scenario === 'moved' ? 'b'.repeat(40) : head;
+  if (scenario.startsWith('roster')) saved.findings.read.securitySeat = false;
+  if (['budget', 'moved-spent', 'roster-spent'].includes(scenario)) saved.jurorResumeAttempts = RESUME_MAX_ATTEMPTS;
+  if (scenario === 'invalid') saved.jurorResumeAttempts = -1;
+  const liveHead = scenario.startsWith('moved') ? 'b'.repeat(40) : head;
   expect(defaultFindResumableRun({ repo: saved.input.repo, pr: saved.input.pr }, {
     readPr: () => ({ headRefOid: liveHead }), readRuns: () => [reviewRunEvidence(saved)],
-  })).toBe(['moved', 'budget'].includes(scenario) ? null : saved.id);
+  })).toBe(scenario.startsWith('moved') ? null : saved.id);
   const current = registryFor({ rev: liveHead });
   const judge = vi.fn(async () => CLEAN_ANSWER);
-  const resumed = await runReviewLoopOnce({ ...current, argv: ['--resume=timeout-run'], store,
-    sinks: recordingSinks([]), makeJudge: () => judge, readResumePr: () => ({ headRefOid: liveHead }), mintRunId: () => 'fresh-run' });
+  if (scenario === 'malformed') saved.seatTimeouts = [null];
+  const resumed = await runReviewLoopOnce({ ...current, argv: ['--resume=timeout-run'], store: { ...store, read: () => saved },
+    providerCapacity: () => { if (scenario === 'capacity-error') throw Error('unreadable capacity'); return scenario === 'capacity' ? 'provider quota held' : null; },
+    sinks: recordingSinks([]), makeJudge: () => judge, readResumePr: () => { if (scenario === 'head-error') throw Error('head read failed'); return scenario === 'head-missing' ? {} : { headRefOid: liveHead }; }, mintRunId: () => 'fresh-run' });
+  if (!['same', 'moved', 'moved-spent', 'roster'].includes(scenario)) {
+    expect(resumed.stopped).toBe('refused');
+    expect(resumed.run.id).toBe(saved.id);
+    expect(judge).not.toHaveBeenCalled();
+    return;
+  }
   expect(resumed.run?.id, resumed.lines.join('\n')).toBe(scenario === 'same' ? 'timeout-run' : 'fresh-run');
   if (scenario === 'same') {
-    const { model, timeoutMs, ...rest } = judge.mock.calls[0][0];
-    const { model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
+    const { providerName, model, timeoutMs, ...rest } = judge.mock.calls[0][0];
+    const { providerName: oldProvider, model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
     expect(JSON.stringify(rest)).toBe(JSON.stringify(oldRest));
-    expect({ model, timeoutMs }).toEqual({ model: 'claude-opus-5-5-high', timeoutMs: 1800000 });
-  } else expect(resumed.run.seatTimeouts).toBeUndefined();
+    expect({ providerName, model, timeoutMs }).toEqual({ providerName: 'claude', model: 'claude-opus-5-5-high', timeoutMs: 1800000 });
+  } else {
+    expect(resumed.run.seatTimeouts).toBeUndefined();
+    expect(resumed.run.jurorResumeAttempts).toBeUndefined();
+  }
 });
 
 describe('runReviewLoopOnce — the loop field (converged/in-progress/exhausted/escalated) survives --json on EVERY stop', () => {
@@ -2146,7 +2157,8 @@ describe('CI-held record driver resume', () => {
       else raw[field] = value;
       // Run-store JSON turns NaN into null; exercise the actual saved representation.
       const saved = JSON.parse(JSON.stringify(raw));
-      f.store.write(saved);
+      // Historical corrupt records must enter through the reader: new writes reject them.
+      vi.spyOn(f.store, 'read').mockReturnValue(saved);
       expect(f.find(saved.input)).toBeNull();
       const judges = f.judge.mock.calls.length, checks = f.publishGate.mock.calls.length;
       const out = await runReviewLoopOnce({ ...f.args,
@@ -2379,4 +2391,23 @@ it('prints a named juror-timeout with seat identity and the reviewed head', asyn
   expect(out.stopped).toBe('juror-timeout');
   expect(JSON.parse(out.lines.join('\n'))).toMatchObject({ stopped: 'juror-timeout', runId: out.run.id,
     lens: 'correctness', provider: 'claude', model: expect.any(String), head: HEAD_A, timeoutMs: 5, wallMs: 6 });
+});
+
+it.each(['missing', 'failed'])('automatic timeout lookup preserves the hold on a %s live-head read', failure => {
+  const saved = { id: 'timeout-lookup', repo: 'web-everything/web-everything', pr: 1234, head: HEAD_A,
+    incomplete: true, startedAt: 1, jurorTimeout: { attempts: 3 }, rulings: [] };
+  expect(defaultFindResumableRun({ repo: saved.repo, pr: saved.pr }, {
+    readRuns: () => [saved], readPr: () => { if (failure === 'failed') throw Error('head unreadable'); return {}; },
+  })).toBe(saved.id);
+});
+
+it('refuses automatic resume when saved evidence lookup fails, without starting a panel', async () => {
+  const judge = vi.fn(), mintRunId = vi.fn();
+  const out = await runReviewLoopOnce({ ...registryFor({ rev: HEAD_A }), argv: BASE_ARGV, store: createMemoryRunStore(),
+    sinks: recordingSinks([]), makeJudge: () => judge, mintRunId,
+    findResumableRun: () => { throw Error('saved timeout evidence unreadable'); } });
+  expect(out.stopped).toBe('refused');
+  expect(out.lines.join(' ')).toContain('inspect the saved hold');
+  expect(judge).not.toHaveBeenCalled();
+  expect(mintRunId).not.toHaveBeenCalled();
 });

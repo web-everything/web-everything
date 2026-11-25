@@ -32,6 +32,10 @@ import { JOB_OP_PREFIX, newJobBlock, validateJobBlock } from './job-record.mjs';
 /** Schema version stamped on every record. A reader refuses a version it does not know. */
 export const RUN_RECORD_VERSION = 1;
 
+/** Persisted retry counters cannot grant budget through coercion or invalid numbers. */
+export const retryCounterValid = (value, max = Number.MAX_SAFE_INTEGER) =>
+  Number.isSafeInteger(value) && value >= 0 && value <= max;
+
 /**
  * The lifecycle of one declared effect inside a run record. See {@link ./effect-executor.mjs}.
  *
@@ -457,6 +461,12 @@ export function withStepFinish(run, { stepIndex, at } = {}) {
 export function validateRunRecord(record) {
   const errors = [];
   if (!isPlainObject(record)) return { ok: false, errors: ['run record must be an object'] };
+  for (const [key, value] of Object.entries({ jurorResumeAttempts: record.jurorResumeAttempts,
+    recordEffectResumeAttempts: record.recordEffectResumeAttempts, referralEffectResumeAttempts: record.referralEffectResumeAttempts,
+    'resumeOf.attempts': record.resumeOf?.attempts, 'resumeOf.adviseAttempts': record.resumeOf?.adviseAttempts,
+    'resumeOf.persistRetries': record.resumeOf?.persistRetries })) {
+    if (value !== undefined && !retryCounterValid(value, key === 'jurorResumeAttempts' ? 3 : Number.MAX_SAFE_INTEGER)) errors.push(`invalid retry counter ${key}`);
+  }
   if (record.v !== RUN_RECORD_VERSION) {
     errors.push(`unsupported run record version ${JSON.stringify(record.v)} (this build reads v${RUN_RECORD_VERSION})`);
   }

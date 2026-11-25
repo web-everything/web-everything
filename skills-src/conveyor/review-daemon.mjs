@@ -85,7 +85,7 @@ import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } from '../../scripts/conveyor/reconcile-pass.mjs';
 import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
-import { notifyReferralHold, readReviewRunEvidence } from '../../scripts/conveyor/review-referral-hold.mjs';
+import { notifyReferralHold, readReviewRunEvidence, jurorTimeoutWoken } from '../../scripts/conveyor/review-referral-hold.mjs';
 import { jurorTimeoutHold } from '../../scripts/operations/juror-timeout-route.mjs';
 import { createRedTeamIo } from '../../scripts/operations/review-extra-seats.mjs';
 import { providerQuotaHold } from '../../scripts/lib/provider-quota-hold.mjs';
@@ -752,7 +752,17 @@ export function runReviewTick({
   let occupiedLanes = 0;
   const dispatched = [];
   const failed = [];
-  for (const row of plan.refusals ?? []) {
+  const timeoutHolds = new Map();
+  for (const d of reviews) {
+    const subject = (rawPrs ?? []).find(p => Number(p.number) === Number(d.prNumber));
+    const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
+    const last = readRuns().filter(r => r.repo === repo && r.pr === Number(d.prNumber))
+      .sort((a, b) => b.startedAt - a.startedAt)[0];
+    if (last?.head !== head || !last?.jurorTimeout || jurorTimeoutWoken(subject ?? {}, last)) continue;
+    const hold = jurorTimeoutHold(last, providerCapacity);
+    if (hold) timeoutHolds.set(d.prNumber, hold);
+  }
+  for (const row of [...(plan.refusals ?? []), ...[...timeoutHolds].map(([prNumber, referralHold]) => ({ prNumber, referralHold }))]) {
     const hold = row.referralHold ?? row.reviewRefusal?.referralHold;
     if (!hold) continue;
     try {
@@ -854,12 +864,9 @@ export function runReviewTick({
       }
       // The head this review was planned against: the job refuses (no verdict) unless live head still matches it.
       const plannedHead = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
-      const last = readRuns().filter(r => r.repo === repo && r.pr === Number(d.prNumber))
-        .sort((a, b) => b.startedAt - a.startedAt)[0];
-      const timeoutHold = last?.head === plannedHead && jurorTimeoutHold(last, providerCapacity);
+      const timeoutHold = timeoutHolds.get(d.prNumber);
       if (timeoutHold) {
         if (reserved) liveReviewBudget.left++;
-        notifyReferral({ repo, prNumber: d.prNumber, hold: timeoutHold, comments: subject?.comments ?? [] });
         notStarted.push({ prNumber: d.prNumber, reason: timeoutHold.why });
         continue;
       }

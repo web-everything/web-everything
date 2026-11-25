@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runReviewTick } from '../review-daemon.mjs';
 import { diagnoseEndedJob, writeEndedJobDiagnosis } from '../../../scripts/operations/review-job-end-diagnosis.mjs';
-import { reviewRunEvidence, notifyReferralHold } from '../../../scripts/conveyor/review-referral-hold.mjs';
+import { reviewRunEvidence, notifyReferralHold, findResumableParkedRun } from '../../../scripts/conveyor/review-referral-hold.mjs';
 
 it('holds a second timeout over three ticks including restart; a moved head starts fresh', () => {
   const dir = mkdtempSync(join(tmpdir(), 'timeout-hold-'));
@@ -16,11 +16,11 @@ it('holds a second timeout over three ticks including restart; a moved head star
     seatTimeouts: ['sonnet', 'claude-opus-5-5-high'].map((model, i) => ({ step: 'judge', lens: 'correctness', head, provider: 'claude', model, timeoutMs: i ? 1800000 : 1200000 })) };
   const dispatch = vi.fn(() => ({})), post = vi.fn();
   const notifyReferral = vi.fn(args => notifyReferralHold({ ...args, dir, post, log() {} }));
-  const tick = (liveHead = head, providerCapacity = () => null) => runReviewTick({ repo, now: () => 1000,
+  const tick = (liveHead = head, providerCapacity = () => null, comments = []) => runReviewTick({ repo, now: () => 1000,
     dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
     readRuns: () => [reviewRunEvidence(JSON.parse(JSON.stringify(run)))], providerCapacity,
     holdReconcile: () => [], reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 10, headRefOid: liveHead }], refusals: [] }),
-    readPrs: () => [{ number: 10, headRefOid: liveHead, labels: ['review:pending'] }], readAgents: () => [],
+    readPrs: () => [{ number: 10, headRefOid: liveHead, labels: ['review:pending'], comments }], readAgents: () => [],
     dispatch, notifyReferral, tagRound() {}, tagStatus() {}, statusCandidates: () => [], log() {} });
   tick(); tick(); tick();
   expect(dispatch).not.toHaveBeenCalled();
@@ -33,9 +33,11 @@ it('holds a second timeout over three ticks including restart; a moved head star
   tick(head, () => 'provider capacity held');
   expect(dispatch).toHaveBeenCalledTimes(1);
   expect(notifyReferral.mock.calls.at(-1)[0].hold.why).toContain('provider capacity held');
+  tick(head, () => null, [{ author: { login: 'chalbert' }, body: 'run a fresh review', createdAt: '2026-11-25T01:00:00Z' }]);
+  expect(dispatch).toHaveBeenCalledTimes(2);
   delete run.pending.request.seatProvider;
   tick();
-  expect(dispatch).toHaveBeenCalledTimes(1);
+  expect(dispatch).toHaveBeenCalledTimes(2);
   expect(notifyReferral.mock.calls.at(-1)[0].hold.why).toContain('no allowed route remains');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -73,4 +75,12 @@ it('logs a persisted juror-timeout without no-verdict wording and keeps retry pr
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(diagnoseEndedJob({ ...job, pid: 999 }).reason).toBeUndefined();
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+it.each(['run a fresh review', '🔁 review — changes requested'])('timeout resume honors operator fresh request: %s', body => {
+  const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
+  const run = { id: 'parked', repo, pr: 10, head, incomplete: true, startedAt: Date.parse('2026-11-25T00:00:00Z'), rulings: [], jurorTimeout: { attempts: 0 } };
+  const pr = { number: 10, headRefOid: head, comments: [{ author: { login: 'chalbert' }, body, createdAt: '2026-11-25T01:00:00Z' }] };
+  expect(findResumableParkedRun(pr, [run], { repo })).toBeNull();
+  expect(findResumableParkedRun({ ...pr, comments: [] }, [run], { repo })).toEqual({ id: run.id, head });
 });
