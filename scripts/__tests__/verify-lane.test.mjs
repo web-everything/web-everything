@@ -2305,7 +2305,7 @@ describe('verify phase telemetry (#5141)', () => {
     if (previousPoolRoot === undefined) delete process.env.LANE_POOL_ROOT;
     else process.env.LANE_POOL_ROOT = previousPoolRoot;
   });
-  const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
+  const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number), executedTests: null,
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
     importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null,
     outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };
