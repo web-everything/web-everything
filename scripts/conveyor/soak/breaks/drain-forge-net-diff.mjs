@@ -1,6 +1,6 @@
 /** Non-local net-diff admission must use fresh forge evidence in the real drain CLI. */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,13 +15,14 @@ import { normalizeDiffFingerprint } from '../../../lib/review-escalation.mjs';
 const SIBLING = ['frontier-ui', 'frontierui'].join('/');
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 function probe(root = ROOT) {
-  const dir = mkdtempSync(join(tmpdir(), 'soak-forge-net-diff-'));
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), 'soak-forge-net-diff-')));
   const violations = [];
   try {
     const bin = join(dir, 'bin'); mkdirSync(bin); mkdirSync(join(dir, 'backlog'));
     const cwd = join(dir, 'local'); mkdirSync(cwd);
     const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json');
-    const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: SIBLING, PRESTAGE_LOCAL_REPO: ['web-everything', 'web-everything'].join('/') };
+    const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: SIBLING, PRESTAGE_LOCAL_REPO: ['web-everything', 'web-everything'].join('/'),
+      PRESTAGE_SIBLING_DIR: join(dir, 'frontierui'), PRESTAGE_SIBLING_REPO: SIBLING };
     for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), withFixtureEnv(body, routing), { mode: 0o755 });
     writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
     const appEnv = daemonAppEnv(dir);
@@ -45,7 +46,7 @@ function probe(root = ROOT) {
       { name: 'carry-no-clone', compare: tamper, carry: true },
       { name: 'carry-sibling', compare: tamper, carry: true, sibling: true },
     ]) {
-      if (scenario.sibling) symlinkSync(root, join(dir, 'frontierui'), 'dir');
+      if (scenario.sibling) mkdirSync(join(dir, 'frontierui', '.git'), { recursive: true });
       writeFileSync(log, '');
       rmSync(fixture + '.queued', { force: true });
       writeFileSync(fixture, JSON.stringify({ number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,

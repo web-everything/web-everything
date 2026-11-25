@@ -1,8 +1,7 @@
 // @vitest-environment node
 import { it, expect, vi, afterEach } from 'vitest';
 import { mkdirSync, readdirSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
 import { synthesizeUnifiedDiff } from '../lib/drain-api-reads.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
@@ -65,8 +64,9 @@ it('a non-local test-tampering PR stays cleared at the current head and attempts
 it.each([
   { name: 'complete comments', sibling: true },
   { name: 'missing clone', sibling: false },
+  { name: 'mismatched sibling origin', sibling: true, siblingOrigin: setup.localSlug },
   { name: 'mismatched comment count', sibling: true, commentsTotalCount: 2 },
-])('an older non-local clearance needs a sibling clone and complete comments: $name', ({ sibling, commentsTotalCount }) => world(async ({ pr, run }) => {
+])('an older non-local clearance needs a sibling clone and complete comments: $name', ({ sibling, siblingOrigin, commentsTotalCount }) => world(async ({ pr, run }) => {
   ready(pr);
   pr.compare = compare({ files: [file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })] });
   pr.gitDiffText = synthesizeUnifiedDiff(pr.compare.files);
@@ -76,8 +76,9 @@ it.each([
   pr.commentsTotalCount = commentsTotalCount;
   const r = await run(false, { ...options, env: { WE_ACCEPT_CARRY_FORWARD: 'on' } });
   const delivered = r.calls.some(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge'));
-  expect(delivered, r.stderr).toBe(sibling && commentsTotalCount === undefined);
-  if (sibling && commentsTotalCount === undefined) {
+  const usableClone = sibling && siblingOrigin === undefined;
+  expect(delivered, r.stderr).toBe(usableClone && commentsTotalCount === undefined);
+  if (usableClone && commentsTotalCount === undefined) {
     expect(r.report.parked, r.stderr).toEqual([]);
     expect(r.calls.some(a => a[0] === 'git' && a.includes('diff') && a.includes(pr.headRefOid))).toBe(true);
     const carryRecord = r.calls.findIndex(a => a[0] === 'pr' && a[1] === 'comment'
@@ -103,7 +104,7 @@ it.each([
       expect(r.calls.some(a => a.includes('--add-label') && a.some(x => x?.includes('review:held-mechanical')))).toBe(true);
     }
   }
-}, { ...setup, ...(sibling ? { siblingCloneSource: resolve(dirname(fileURLToPath(import.meta.url)), '../..') } : {}) }), 120_000);
+}, { ...setup, siblingClone: sibling, siblingOrigin }), 120_000);
 it('the CLI passes a non-main base through to the forge guard before any compare read', () => world(async ({ pr, run }) => {
   ready(pr); pr.baseRefName = 'release';
   // Match the repo default so classification reaches scoring; the forge reader only supports main.

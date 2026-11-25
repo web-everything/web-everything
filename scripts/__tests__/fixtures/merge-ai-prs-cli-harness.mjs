@@ -33,7 +33,7 @@ function dispatch(file, args = [], options = {}) {
     active.unexpected.push(error);
     throw error;
   }
-  return port(args, options.env ?? process.env);
+  return port(args, options.env ?? process.env, options);
 }
 function spawnSync(file, args, options = {}) {
   const result = dispatch(file, args, options);

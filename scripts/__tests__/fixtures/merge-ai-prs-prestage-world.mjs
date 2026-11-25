@@ -1,6 +1,6 @@
 import { daemonAppEnv } from './daemon-app-env.mjs';
 import { expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const sha = 'a'.repeat(40);
@@ -8,24 +8,25 @@ import { fakeGh, fakeGit } from './merge-ai-prs-fake-ports.mjs';
 import { withFixtureEnv } from './with-fixture-env.mjs';
 
 export function createPrestageWorld(runCommand) {
-  return async function world(fn, { slug = 'fixture/prestage', localSlug = slug, siblingCloneSource = null } = {}) {
-    const root = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+  return async function world(fn, { slug = 'fixture/prestage', localSlug = slug, siblingClone = false, siblingOrigin = slug } = {}) {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'prestage-cli-')));
     const dir = join(root, 'local');
     const cwd = dir;
     try {
       mkdirSync(dir);
-      // Only explicit sibling tests use a clone. Non-repository placeholders keep
-      // startup fail-closed without cloning or probing a shared temp parent.
+      // Only explicit sibling tests have fixture Git metadata. No host clone is
+      // needed: the Git port supplies the origin and object reads for this directory.
       for (const name of ['frontierui', 'plateau-app']) {
-        if (siblingCloneSource && name === slug.split('/').at(-1)) symlinkSync(siblingCloneSource, join(root, name), 'dir');
-        else mkdirSync(join(root, name));
+        mkdirSync(join(root, name));
+        if (siblingClone && name === slug.split('/').at(-1)) mkdirSync(join(root, name, '.git'));
       }
       const bin = join(dir, 'bin'); mkdirSync(bin);
       mkdirSync(join(dir, 'backlog'));
       const fixture = join(dir, 'pr.json'), log = join(dir, 'calls.jsonl'), settings = join(dir, 'settings.json'), coord = join(dir, 'coord'), ledger = join(dir, 'ledger');
       writeFileSync(settings, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
       // Embed fixture routing in executable shims: safety reads intentionally scrub PRESTAGE_* from their child env.
-      const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: slug, PRESTAGE_LOCAL_REPO: localSlug };
+      const routing = { PRESTAGE_PR: fixture, PRESTAGE_LOG: log, PRESTAGE_REPO: slug, PRESTAGE_LOCAL_REPO: localSlug,
+        PRESTAGE_SIBLING_DIR: join(root, slug.split('/').at(-1)), PRESTAGE_SIBLING_REPO: siblingOrigin };
       for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), withFixtureEnv(body, routing), { mode: 0o755 });
       const pr = { number: 42, id: 'PR_NODE', title: 'Update readme', body: 'Update the readme.', state: 'OPEN', isDraft: false,
         headRefOid: sha, headRefName: 'lane/readme', baseRefName: 'main', mergeable: 'MERGEABLE', mergeStateStatus: 'BLOCKED',
@@ -38,7 +39,7 @@ export function createPrestageWorld(runCommand) {
         const r = await runCommand([ ...(thisRepo ? ['--this-repo'] : []),'--label=ready-to-merge','--only=42', '--json', ...args,
           '--no-drain-lease','--no-red-main-freeze',...(!rebaseDrop ? ['--no-rebase-drop'] : []),'--no-heal-collision','--no-overlap-yield',
           ...(green ? ['--from-green-event'] : [])], { cwd,encoding:'utf8',timeout:120_000, // a loaded host can push one real drain run past 30s
-          env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, PRESTAGE_PR:fixture,PRESTAGE_LOG:log, PRESTAGE_REPO:slug, PRESTAGE_LOCAL_REPO:localSlug,
+          env: { ...process.env, ...daemonAppEnv(dir), PATH:bin+':'+process.env.PATH, ...routing,
             PRESTAGE_DEFAULT_BRANCH:defaultBranch, PRESTAGE_FAIL_BRANCH:failDefaultBranch ? '1' : '0',
             ...(failDefaultBranch ? { WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS:'1' } : {}),
             WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
