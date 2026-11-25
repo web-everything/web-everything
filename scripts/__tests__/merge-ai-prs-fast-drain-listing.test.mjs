@@ -785,6 +785,17 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     } finally { f.close(); }
   });
 
+  it('selfRefresh OFF: a source invalidated during the final main-head read is still caught (main order)', async () => {
+    const f = pass();
+    let mains = 0;
+    try {
+      await expect(readFastDrainPassInventory({ ...f.options,
+        readMain: async () => { mains++; return head; },
+        readSnapshot: () => (mains >= 3 ? null : rows) })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
+      expect(existsSync(f.options.path)).toBe(false);
+    } finally { f.close(); }
+  });
+
   it('classifies the incomplete pass context failure instead of "unknown"', () => {
     expect(classifyChildFailure('merge-ai-prs Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'))
       .toBe('incomplete-context');

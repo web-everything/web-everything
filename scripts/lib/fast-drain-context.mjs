@@ -231,7 +231,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     const writtenAt = observedAt;
     readSources({ refresh: true });
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt, { refresh: true });
+    const snapshots = await revalidateAfterMembership(writtenAt, { refresh: typeof refreshSnapshot === 'function' });
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });
