@@ -174,7 +174,7 @@ describe('update-branch', () => {
     expect(finished.lines).toHaveLength(1);
     expect(JSON.parse(finished.lines[0])).toMatchObject({ pr: 42, reason: 'sync', status: 'already-up-to-date' });
     expect(finishUpdateBranch({ run: { verdict: { ok: false, refused: true } } }).code).toBe(1);
-  });
+  }, 60_000); // the first dynamic import of the whole operations registry can exceed the 5s default on a loaded coverage shard
 
   it('keeps shell-looking reason and filenames inert in the JSON result', async () => {
     const reason = '$(touch never-run)\n\u001b[31m';
