@@ -12,6 +12,7 @@ import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisory
   uncorroboratedRetirements, knownVerificationReasons, foldVerifyReason, activeReferrals } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective, shadowSeatStatus } from '../lib/review-seat-provider.mjs';
+import { correctnessSeatVendor, resolveCorrectnessSeatRouting } from '../lib/review-seat-routing.mjs';
 import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
 /**
  * @file scripts/operations/review-pr.mjs
@@ -2667,10 +2668,16 @@ export function reviewPrOperation({
         // narrower question than the floor above (see `assertSeatSpentOnMandatoryLens`) and does not weaken
         // it: both run, in this order, and #3344's is still the one that can never be satisfied by an input.
         assertSeatSpentOnMandatoryLens({ lens: view.input.lens, careLevel: view.input.careLevel });
+        const rawRead = readPr({ pr: view.input.pr, repo: view.input.repo });
         const finding = shapeReadFinding(
-          readPr({ pr: view.input.pr, repo: view.input.repo }),
+          rawRead,
           { pr: view.input.pr, repo: view.input.repo, careLevel: view.input.careLevel },
         );
+        // review.seatRouting.correctness: recorded ON the read finding so a resume never re-derives it. Only the
+        // correctness seat's vendor moves; an unknown builder stays on claude.
+        finding.correctnessVendor = !cardOnlyLight && view.input.lens === 'correctness'
+          ? correctnessSeatVendor({ mode: resolveCorrectnessSeatRouting().value, body: finding.body, headMessage: rawRead?.headMessage })
+          : 'claude';
         if (cardOnlyLight && (view.input.lens !== 'correctness' || !isCardOnlyDiff([...finding.netChangedFiles, ...finding.netRenameSources]))) {
           throw new Error('card-only light lane contradicted by pinned net diff or lens');
         }
@@ -2692,7 +2699,7 @@ export function reviewPrOperation({
     // `buildReviewJudgeRequest`, shared with the `judgeSecurity` seat below so the two differ in one field.
     judge: judgeStep({
       reads: ['input.lens', 'input.aim', 'findings.read'],
-      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
+      request: (view) => (cardOnlyLight || view.findings.read?.correctnessVendor === 'codex') ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
         read: view.findings.read,
         lens: view.input.lens,
         // #3094 — the caller's aim rides in the MANDATE, beside the goal. `input.aim` is DECLARED in `reads`
@@ -2892,7 +2899,7 @@ export function reviewPrOperation({
         // act on.
         const seats = [
           // `tools: true` (#4815) — the panel jurors are tool-bearing (`allowedTools: REVIEW_JUROR_TOOLS`), so they bypass the confirmation turn.
-          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight ? { provider: 'codex' } : {}) },
+          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight || read.correctnessVendor === 'codex' ? { provider: 'codex' } : {}) },
           ...(securitySeat !== false ? [{ step: SECURITY_SEAT_STEP, lens: SECURITY_LENS, answer: view.findings.judgeSecurity, tools: true }] : []),
           // #xqa9ttq — THE THIRD SEAT, ONLY WHEN SEATED. `ADVISORY_JUDGE_LENS` is a LITERAL here, exactly
           // like `SECURITY_LENS` above, for the same reason: it is not caller-negotiable. `provider: 'codex'`

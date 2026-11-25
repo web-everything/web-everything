@@ -470,6 +470,8 @@ export function readPr({
     // the io shell fetches, the declaration decides, which is what keeps the refusal testable with no `gh`.
     state: typeof view.state === 'string' ? view.state : '',
     body: typeof view.body === 'string' ? view.body : '',
+    // review.seatRouting.correctness: the head commit message names the builder (Co-Authored-By). Unreadable = ''.
+    headMessage: (() => { try { return revSha ? String(gitExec('git', ['log', '-1', '--format=%B', revSha], { encoding: 'utf8' }) ?? '') : ''; } catch { return ''; } })(),
     // #xwk0tzu (#3322) — THE TWO HALVES OF THE INDEPENDENCE COMPARISON, carried up for the SAME reason
     // `state` is: read here, judged in the PURE `shapeReadFinding`. The author half is already in `body`
     // above (the `authored-by-actor` stamp `we:scripts/pr-land.mjs` writes at open), so only these two are
