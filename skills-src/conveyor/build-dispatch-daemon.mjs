@@ -133,7 +133,9 @@ export const PREPARE_REFUSAL_HOLD_MS = 30 * 60_000;
 export const INFRA_RETRY_TIMEOUT_MS = 60_000;
 export const KILL_SWITCH_ENV = 'WE_BUILD_DAEMON_KILL';
 export const KILL_SWITCH_FILENAME = 'build-dispatch-daemon.kill';
-export const PAUSED_PREP_ENV = 'WE_BUILD_DAEMON_PAUSED_PREP';
+export const EXTERNAL_ZERO_SKIP_REASON = 'external concurrency 0';
+let lastExternalZeroLogAt = 0;
+export const PAUSED_PREP_ENV ='WE_BUILD_DAEMON_PAUSED_PREP';
 export const PAUSED_SYNC_MS_ENV = 'WE_BUILD_DAEMON_PAUSED_SYNC_MS';
 export const DEFAULT_PAUSED_SYNC_MS = 30 * 60 * 1000;
 
@@ -1477,7 +1479,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepareGroupPlan = planPrepareGroups();
   }
   prepare.groups = prepareGroupPlan.groups;
-  if (prepareEnabled && !prepare.freezeHeld) {
+  // An external cap of 0 means builds are paused, never "unlimited": the batch coordinator refuses every prepare
+  // launch at start ("prepare batch requires positive external concurrency"), so launching only burns a lane.
+  const externalCapZero = policy.maxConcurrentExternalBuilds === 0;
+  if (prepareEnabled && !prepare.freezeHeld && externalCapZero && prepareSpawns.length) {
+    prepare.skippedExternalZero = { reason: EXTERNAL_ZERO_SKIP_REASON, count: prepareSpawns.length };
+    const nowMs = effects.now?.() ?? Date.now();
+    if (nowMs - lastExternalZeroLogAt >= 3_600_000) {
+      lastExternalZeroLogAt = nowMs;
+      console.error(`build-dispatch-daemon: prepare launches skipped (${prepareSpawns.length} candidate(s)): ${EXTERNAL_ZERO_SKIP_REASON}`);
+    }
+  }
+  if (prepareEnabled && !prepare.freezeHeld && !externalCapZero) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
       // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
@@ -1905,10 +1918,30 @@ export function clearPrepareEvidenceCache() { evidenceTranscripts.clear(); evide
 export function prepareEvidenceCacheSizes() { return { transcripts: evidenceTranscripts.size, misses: evidenceMisses.size }; }
 
 /** Read terminal observations only. Prompts are instructions, not evidence that a failure occurred. */
-export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.claude', 'projects') } = {}) {
+// A `pid:` worker has no transcript; its only output is the dispatch log, whose last JSON line carries the real
+// reason of an early exit (e.g. a refusal at start). Read it so the failure never shows as a bare label.
+function readDispatchLogReason(entry, logRoot) {
+  const num = entry.payload?.num ?? entry.num ?? entry.result?.num;
+  if (!num) return null;
+  try {
+    const path = join(logRoot, '.operations', 'delivery-dispatch-logs', `prepare-item-${normNum(num)}.log`);
+    if (!existsSync(path)) return null;
+    for (const line of readFileSync(path, 'utf8').split('\n').reverse()) {
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (!row || typeof row !== 'object') continue;
+      const reason = row.detail ?? row.error ?? row.reason ?? row.outcome ?? null;
+      return reason ? String(reason) : null;
+    }
+  } catch { /* an unreadable log leaves the evidence as it was */ }
+  return null;
+}
+
+export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.claude', 'projects'), logRoot = REPO_ROOT } = {}) {
   if (entry.result?.evidence) return entry.result.evidence;
   const evidence = { error: entry.result?.detail ?? entry.error ?? null };
   const handle = entry.handle;
+  if (handle?.startsWith('pid:') && !evidence.error) evidence.error = readDispatchLogReason(entry, logRoot);
   // A short handle would prefix-match another session's transcript and misattribute its evidence.
   if (!handle || handle.startsWith('pid:') || handle.length < 6) return evidence;
   const finish = (file, terminal) => {

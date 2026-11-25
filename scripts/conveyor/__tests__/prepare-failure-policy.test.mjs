@@ -587,3 +587,18 @@ describe('prepare publication failures', () => {
     expect(releaseDuePrepareRetries({ path, prLimitClear: () => true })).toEqual([]);
   });
 });
+
+describe('cliPrepareFailureEvidence for a pid: handle', () => {
+  it('reads the last JSON line of the dispatch log into evidence.error, not the bare label', async () => {
+    const { cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs');
+    const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-'));
+    try {
+      const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
+      execFileSync('mkdir', ['-p', logs]);
+      writeFileSync(join(logs, 'prepare-item-5086.log'), 'noise\n{"outcome":"escalated-needs-human","executor":"none","pr":null,"detail":"prepare batch requires positive external concurrency"}\n');
+      const evidence = cliPrepareFailureEvidence({ handle: 'pid:31324', payload: { num: '5086' } }, { logRoot });
+      expect(evidence.error).toBe('prepare batch requires positive external concurrency');
+      expect(cliPrepareFailureEvidence({ handle: 'pid:1', payload: { num: '9999' } }, { logRoot }).error).toBeNull();
+    } finally { rmSync(logRoot, { recursive: true, force: true }); }
+  });
+});
