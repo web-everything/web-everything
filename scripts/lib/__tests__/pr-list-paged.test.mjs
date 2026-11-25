@@ -194,7 +194,7 @@ describe('query and gh row shape', () => {
     const status = { __typename: 'StatusContext', context: 'ci', createdAt: 'today', state: 'PENDING', targetUrl: null };
     const n = node(1, { labels: { nodes: [{ id: 'id', name: 'ready', description: '', color: 'abc123' }] },
       commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: [check, status] } } } }] } });
-    expect(mapGraphqlPr(n)).toEqual({ rowsHead: null, rowsComplete: false, ...node(1), reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
+    expect(mapGraphqlPr(n)).toEqual({ rowsHead: null, rowsComplete: false, ...node(1), baseRefOid: undefined, labelsComplete: false, reviewDecision: '', labels: n.labels.nodes, statusCheckRollup: [
       { __typename: 'CheckRun', completedAt: '0001-01-01T00:00:00Z', conclusion: '', detailsUrl: check.detailsUrl,
         name: 'test', startedAt: '0001-01-01T00:00:00Z', status: 'IN_PROGRESS', workflowName: '', appSlug: '', appId: null },
       { __typename: 'StatusContext', context: 'ci', startedAt: 'today', state: 'PENDING', targetUrl: '' },

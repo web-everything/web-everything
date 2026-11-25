@@ -189,6 +189,7 @@ import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r
 import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
+import { loadHeavyStore, saveHeavyStore } from './lib/heavy-cache.mjs';
 import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
@@ -5575,21 +5576,23 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // constellation-context repos — rare, a no-op on the common full sweep) needs its own live open set.
       if (liveByRepo.has(repo)) return liveByRepo.get(repo);
       // Round rows are candidate evidence only. Re-list pages live, reusing the hydrated
-      // heavy-field cache/shared host seed only after matching the live head and updatedAt.
+      // heavy store only after validating the complete live identity.
       if (readLiveRowsByRepo.has(repo)) return readLiveRowsByRepo.get(repo)();
       // xsbyo56 — `body` added so the #2832 held-reconcile branch (below) can read back the PR's own
       // `## Escalation reason` block (`buildHeldReviewHoldReason`/`parseEscalationReason`) and name the
       // specific file(s) that forced a review:human/pending/changes hold, not just the label.
       // Extra context repos need the same freshness as candidate repos: a snapshot can omit a new blocker.
-      // Reuse its heavy fields only after matching them against the live pages.
+      // Reuse validated heavy entries only after matching them against the live pages.
       const slug = repo || localSlug;
       if (slug) {
-        let seed = [];
-        try { seed = readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs' }) || []; } catch { /* live read below remains authoritative */ }
-        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging: resolvePrListPaging(),
-          heavyFields: ['body', 'files'], cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+        const paging = resolvePrListPaging();
+        const store = heavyStoreFor(slug);
+        const listed = await withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
+          heavyFields: ['body', 'files'], delta: { isCandidate: operatorSelects }, store,
           maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain context page)' } } }), { repo: slug, op: 'drain-context-list', daemon: 'drain' });
-        drainHeavyCacheByRepo.set(repo, listed.cache);
+        saveHeavyStore({ repo: slug, entries: listed.store });
+        drainHeavyStoresByRepo.set(slug, listed.store);
+        logHeavyListing(listed, paging);
         return resolveListedChecks(repo, listed.rows);
       }
       const { stdout } = await execFileP('gh', ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(OPEN_PR_LIST_LIMIT), '--json', CONTEXT_LIST_FIELDS], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -5771,7 +5774,18 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
 
   // ── ONE sweep pass — reconcile labels → list → classify → cascade-merge → sync. Returns the pass result (no
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
-  const drainHeavyCacheByRepo = new Map(); // Reuse heavy fields across --watch passes.
+  const drainHeavyStoresByRepo = new Map(); // Disk is authoritative across processes; retain validated entries for --watch.
+  const heavyStoreFor = (repo) => {
+    if (!drainHeavyStoresByRepo.has(repo)) {
+      const loaded = loadHeavyStore({ repo });
+      drainHeavyStoresByRepo.set(repo, loaded.entries);
+      if (loaded.dropped) process.stderr.write(`heavy-cache ${repo}: dropped=${loaded.dropped}; invalid records will be re-read\n`);
+    }
+    return drainHeavyStoresByRepo.get(repo);
+  };
+  const logHeavyListing = (listed, paging) => {
+    process.stderr.write(`listing.pages.light=${listed.timing.lightMs}ms listing.pages.hydrate=${listed.timing.hydrateMs}ms hydrate=${JSON.stringify(listed.stats)} heavyBackstopSeconds=${paging.heavyBackstopSeconds} (${paging.source?.heavyBackstopSeconds ?? 'absent'}) heavySettleSeconds=${paging.heavySettleSeconds} (${paging.source?.heavySettleSeconds ?? 'absent'})\n`);
+  };
   const sweepOnce = async () => {
   const __t = createStepTimer();
   const __passStart = Date.now();
@@ -6037,40 +6051,15 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       const roundPath = passListingSnapshot && isFastDrainTarget(repo, { number: onlyPr }) ? passListingSnapshot : null;
       const readTarget = () => __t.timeAsync('listing.target', () => readFullListingPr(repo, onlyPr));
       const listLive = async () => {
-        let snapshotSeed;
-        // Snapshot rows seed heavy fields only. The open set must still be listed live:
-        // refreshing only the target can miss a newly opened blockedBy/stack/couple sibling.
-        if (!roundPath && slug && onlyPr != null && fastDrainListing.listing === 'snapshot' && isFastDrainTarget(repo, { number: onlyPr })) {
-          const fields = RECONCILE ? SWEEP_LIST_FIELDS
-            : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '');
-          try {
-            const snap = __t.time('listing.snapshot', () => readSharedOpenPrs({ repo: slug, fields: `${fields},updatedAt`, caller: 'merge-ai-prs.mjs', cacheOnly: true }));
-            if (snap == null) {
-              process.stderr.write('fast-drain: listing fell back to live (snapshot disabled/unavailable)\n');
-            } else {
-              const targetRow = await readTarget();
-              snapshotSeed = mergeLiveTargetIntoRows(snap, targetRow, onlyPr);
-            }
-          } catch {
-            process.stderr.write('fast-drain: listing fell back to live (snapshot or live target read failed)\n');
-          }
-        }
         if (slug) {
           const paging = resolvePrListPaging();
-          const heavyFields = ['body', ...((RECONCILE || workflowEditSetting.value !== 'off') ? ['files'] : [])];
-          // Seed body/files from the host-shared snapshot (its heavy copies persist across drain processes); a seed
-          // row is used only when its updatedAt + head SHA match the LIVE page row, so it never serves stale content.
-          let seed = snapshotSeed || [];
-          if (!snapshotSeed) {
-            // Cache-only within the snapshot's normal TTL and dirty rules (same bounds as before, so heavy-field
-            // staleness is unchanged); a stale or dirty snapshot just gives no seed. The old fresh-or-refresh read ran a second full paged
-            // listing (60-200 s) inside the pass. The seed never decides the open set: the live listing does.
-            try { seed = __t.time('listing.seed', () => readSharedOpenPrs({ repo: slug, fields: 'number,updatedAt,headRefOid,body,files', caller: 'merge-ai-prs.mjs', cacheOnly: true })) || []; } catch { seed = []; }
-          }
+          const store = heavyStoreFor(slug);
           listed = await __t.timeAsync('listing.pages', () => withListRetry(() => listOpenPrsPagedHydrated({ repo: slug, exec: execFileSyncThrottled, execAsync: execFileP, paging,
-            heavyFields, needsHeavy: RECONCILE ? () => true : operatorSelects, cache: drainHeavyCacheByRepo.get(repo) || {}, seed,
+            heavyFields: ['body', 'files'], delta: { isCandidate: operatorSelects }, store,
             maxRows: OPEN_PR_LIST_LIMIT, execOpts: { throttle: { op: 'pr list (drain page)' } } }), { repo: slug, op: 'drain-list', daemon: 'drain' }));
-          drainHeavyCacheByRepo.set(repo, listed.cache);
+          saveHeavyStore({ repo: slug, entries: listed.store });
+          drainHeavyStoresByRepo.set(slug, listed.store);
+          logHeavyListing(listed, paging);
         } else if (!slug) {
           // Cwd repo identity unresolved: retain the legacy gh discovery path only here.
           const sized = candidateListLimit(repo);

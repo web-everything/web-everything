@@ -473,14 +473,30 @@ test('a completely absent target base field fails closed', () => {
   assert.match(v.reason, /PR base branch unreadable/);
 });
 
-test('real fast drain with a null target base defers after both snapshot and live listing paths', () => {
+test('real fast drain with a null target base refuses unreadable delta listing after both snapshot and live paths', () => {
   for (const killSwitch of [false, true]) {
     const run = runFastDrainContextCli({ targetBaseRefName: null, killSwitch });
-    assert.equal(run.status, 0, run.stderr);
+    // Delta cannot manufacture a validated entry for a null base: refuse the entire listing.
+    assert.equal(run.status, 4, run.stderr);
     const result = JSON.parse(run.stdout);
-    assert.deepEqual(result.toMerge, []);
-    assert.deepEqual(result.enqueueOutcomes ?? [], []);
-    assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'gh-error');
+    assert.match(result.detail, /hydrate.*malformed/);
+    assert.deepEqual(run.heavyStores, []);
+    assert.equal(run.calls.some(a => a[0] === 'pr' && a[1] === 'merge'), false);
     if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
   }
+});
+
+
+test('async drain entry executes delta at candidate and extra RECONCILE context call sites with body and files for every row', () => {
+  const result = runFastDrainContextCli({killSwitch:true,extraContextRows:true,rowCount:2,
+    livePatches:{8:{labels:[]}}});
+  assert.equal(result.status,0,result.stderr);
+  assert.equal(result.fullListings,3,result.stderr);
+  assert.deepEqual(result.heavyStores.sort(),['frontierui','plateau-app','web-everything']);
+  const pinned = result.prViews.filter(({fields}) => fields.includes('baseRefOid') && fields.includes('body') && fields.includes('files'));
+  assert.equal(pinned.length,6,JSON.stringify(result.prViews));
+  for (const {view} of pinned) { assert.equal(typeof view.body,'string'); assert.ok(view.files.length > 0); }
+  assert.match(result.stderr,/listing.pages.light=.*listing.pages.hydrate=.*hydrate=/);
 });

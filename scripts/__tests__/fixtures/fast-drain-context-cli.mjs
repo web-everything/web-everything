@@ -11,7 +11,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null } = {}) {
+  catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null, extraContextRows = false } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -19,7 +19,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
-        updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', isDraft: false,
+        updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', baseRefOid: 'b'.repeat(40), isDraft: false,
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
         labels: number === 7 && targetLabels ? targetLabels : [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
         body: embedManifestInBody('fixture', buildManifest({ item: number, repos: [{ repo: 'we', ref: `lane/${number}` }] })),
@@ -51,7 +51,7 @@ const a = process.argv.slice(2);
 fs.appendFileSync(process.env.CONTEXT_CALLS, JSON.stringify(a) + '\\n');
 const rows = JSON.parse(fs.readFileSync(process.env.CONTEXT_ROWS, 'utf8'));
 const r = a.includes('--repo') ? a[a.indexOf('--repo') + 1] : process.env.GH_REPO;
-const selected = !r || r === 'fixture/web-everything' ? rows : [];
+const selected = !r || r === 'fixture/web-everything' || process.env.CONTEXT_EXTRA_ROWS === '1' ? rows : [];
 function out(v) { fs.writeSync(1, JSON.stringify(v)); process.exit(0); }
 if (a[0] === 'repo' && a[1] === 'view') {
   if (process.env.CONTEXT_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture default branch failure'); process.exit(1); }
@@ -86,7 +86,7 @@ if (a[0] === 'pr' && a[1] === 'list') {
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const fields = (a[a.indexOf('--json') + 1] || '').split(',');
-  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
+  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
   if (fields.some(f => !realFields.has(f))) process.exit(1);
   const p = selected.find(p => p.number === Number(a[2]));
   const view = p ? Object.fromEntries(fields.map(f => [f, f === 'commits' ? [] : p[f]])) : {};
@@ -95,7 +95,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
 }
 if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN'))) {
   const query = a.find(v => v.includes('pullRequests(states:OPEN'));
-  const pageRows = query.includes('name:"web-everything"') ? rows : [];
+  const pageRows = query.includes('name:"web-everything"') || process.env.CONTEXT_EXTRA_ROWS === '1' ? rows : [];
   if (!query.includes('statusCheckRollup')) {
     if (pageRows.length && process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP) {
       fs.writeFileSync(process.env.CONTEXT_BRANCH_FILE, process.env.CONTEXT_BRANCH_AFTER_MEMBERSHIP);
@@ -112,7 +112,7 @@ if (a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests
   }
   const fullRows = process.env.CONTEXT_FULL_INCOMPLETE === '1' ? pageRows.slice(0, -1) : pageRows;
   out({data:{repository:{pullRequests:{totalCount:pageRows.length, pageInfo:{hasNextPage:false,endCursor:null},
-    nodes:fullRows.map(p => ({...p, labels:{nodes:p.labels}, commits:{nodes:[{commit:{oid:p.headRefOid,
+    nodes:fullRows.map(p => ({...p, labels:{totalCount:p.labels.length,nodes:p.labels}, commits:{nodes:[{commit:{oid:p.headRefOid,
       statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false},totalCount:p.statusCheckRollup.length,nodes:p.statusCheckRollup}}}}]}}))}}}});
 }
 out({});
@@ -132,7 +132,7 @@ out({});
         WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'), WE_GH_THROTTLE_OUTER_INV: '',
         WE_GH_THROTTLE_COST_HEADERS: '0', WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1',
         CONTEXT_LEAN_INCOMPLETE: leanIncomplete ? '1' : '0', CONTEXT_FULL_INCOMPLETE: fullIncomplete ? '1' : '0',
-        CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0',
+        CONTEXT_LEAN_PAGE_ERROR: leanPageError ? '1' : '0', CONTEXT_EXTRA_ROWS: extraContextRows ? '1' : '0',
         CONTEXT_CALLS: join(dir, 'calls.jsonl'), CONTEXT_ROWS: join(dir, 'rows.json') },
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
@@ -141,6 +141,7 @@ out({});
         ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))
         ? readFileSync(join(dir, 'calls.jsonl.views'), 'utf8').trim().split('\n').map(JSON.parse) : [],
+      heavyStores: ['web-everything','frontierui','plateau-app'].filter(name => existsSync(join(snapshots, `heavy-fixture-${name}.json`))),
       passSnapshotPublished: existsSync(roundPath),
       cachedBranch: readDefaultBranchCache('fixture/web-everything', { env: cacheEnv }),
       fullListings: calls.filter(a => a[0] === 'api' && a[1] === 'graphql' && a.some(v => v.includes('pullRequests(states:OPEN') && v.includes('statusCheckRollup'))).length,
