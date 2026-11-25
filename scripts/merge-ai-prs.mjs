@@ -4953,6 +4953,7 @@ export function describeGhListError(e) {
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 let siblingClonesChecked = false;
+let siblingProvisionFailures = [];
 if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
 export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
@@ -4975,14 +4976,6 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   process.stderr.write(`${formatOverlapYieldRequiresLandableSetting(resolveOverlapYieldRequiresLandableSetting({ argv, env }))}\n`);
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
-  // The daemon's pool may have no PORT_BANDS entry, so lane-pool healing never visits it.
-  // Check once per process, before any sweep; dry runs only report missing-clone status.
-  let siblingProvisionFailures = [];
-  if (!siblingClonesChecked) {
-    siblingClonesChecked = true;
-    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN,
-      log: line => process.stderr.write(`${line}\n`) }).failed;
-  }
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
   // #2290 — `--only=<pr>` (alias `--couple=<pr>`, and the legacy `--pr=<pr>`) scopes the sweep to ONE PR: the
   // single-couple FAST DRAIN that /pr (pr-land) and /finish (lane-resume) shell so they still feel instant
@@ -5151,9 +5144,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const siblingCloneDir = (repo) => {
     if (isLocalRepo(repo)) return null;
     const name = siblingCloneName(repo);
-    if (!name) return null;
-    const dir = resolve(process.cwd(), '..', name);
-    try { return existsSync(join(dir, '.git')) ? dir : null; } catch { return null; }
+    if (!name || siblingProvisionFailures.some(row => row.name === name)) return null;
+    const status = siblingCloneStatus({ cwd: process.cwd() }).find(row => row.name === name);
+    return status?.present ? status.dir : null;
   };
   const siblingCloneReason = repo => {
     const name = siblingCloneName(repo);
@@ -8403,6 +8396,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // releaseDrainLease only frees a lease THIS owner still holds, so a reclaimer who seized it is never stomped.
     process.on('exit', () => { releaseDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { repoKey: localSlug }); });
     for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => exit(0)); // → triggers the exit handler → frees the lease
+  }
+
+  // The daemon's pool may have no PORT_BANDS entry, so lane-pool healing never visits it.
+  // Check once per process, before any sweep; dry runs only report missing-clone status.
+  if (!siblingClonesChecked) {
+    siblingClonesChecked = true;
+    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN,
+      log: line => process.stderr.write(`${line}\n`) }).failed;
   }
 
   // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────
