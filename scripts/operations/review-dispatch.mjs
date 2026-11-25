@@ -2,7 +2,9 @@
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
-import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
+import { readReviewCiGate, readReviewHead, formatReviewCiSkip } from '../lib/review-ci-gate-io.mjs';
+import { readGh } from '../lib/proc-read.mjs';
+import { isRealHead } from '../lib/red-team-skip-outcome.mjs';
 /**
  * @file scripts/operations/review-dispatch.mjs
  * @description `#3279` — DISPATCH AN INDEPENDENT REVIEW OF A PR TO A FRESH SESSION.
@@ -122,6 +124,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { claudeLaunchRouteFor } from '../lib/dispatch-routing-policy.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
@@ -176,7 +179,7 @@ import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
-import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
+import { assertWrappedClaudeStarted, launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 // re-exported so nothing that already imports `reviewSessionSlug` from this file has to change (#3437) — the
 // slug itself now lives in `we:scripts/conveyor/review-session-slug.mjs`, a PURE module both this file and
@@ -555,8 +558,23 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
   return { pr: prNum, repo: CONSTELLATION_REPOS[repoKey].slug, repoKey, laneRepo, sessionSlug: reviewSessionSlug(prNum, repoKey) };
 }
 
+/** Shared admission for direct session callers, the mode router and review jobs. */
+export function expectedHeadRefusal(expectedHead, input, io, { required = false } = {}) {
+  if (expectedHead === undefined) {
+    // Unknown reviewed head must never fall back to the checkout head.
+    return required
+      ? { refused: true, outcome: 'refused-no-expected-head', reason: 'no expected head: the reviewed head is unknown; dispatch with the head that was reviewed' }
+      : null;
+  }
+  try {
+    const head = io.liveHead(input);
+    if (isRealHead(expectedHead) && isRealHead(head) && head.toLowerCase() === expectedHead.toLowerCase()) return null;
+  } catch { /* unreadable evidence refuses */ }
+  return { refused: true, outcome: 'refused-head-moved', reason: 'PR head changed or unreadable; operator must inspect before retrying' };
+}
+
 /**
- * DISPATCH ONE INDEPENDENT REVIEW SESSION. The composition: plan → fill the brief → mint a fresh session id →
+ * DISPATCH ONE INDEPENDENT REVIEW SESSION. The composition: plan → admit head → fill the brief → mint a fresh session id →
  * spawn. Mirrors `we:scripts/operations/dispatch-lane-io.mjs#createDispatchSinks`'s own composition closely —
  * same `assertNotALaneCheckout` guard (a dispatcher run FROM a lane clone would hand the dispatched agent a
  * confusing root, and could not itself be released the way a lane can), same "the handle is minted, not
@@ -565,6 +583,7 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
  * @param {object} o
  * @param {number|string} o.pr
  * @param {string} o.repo
+ * @param {string} o.expectedHead - full 40-hex planned review head; missing or unreadable evidence refuses.
  * @param {string} [o.root] - the cwd the dispatched session starts in (never a lane — it acquires its own).
  * @param {(root?: string) => string} [o.readBrief] - injectable brief-template reader.
  * @param {() => string} [o.mintSessionId] - injectable UUID minter.
@@ -588,6 +607,9 @@ export function planReviewDispatch({ pr, repo, checkoutExists = existsSync, home
 export function dispatchReview({
   ciGate = readReviewCiGate, advisoryCiWaiver = null,
   pr, repo, root = REPO_ROOT, env = process.env,
+  expectedHead,
+  io = { liveHead: input => readReviewHead({ ...input, run: args => readGh(args,
+    { cwd: root, env, encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 }) }) },
   readBrief = (r) => readFileSync(reviewBriefPath(r), 'utf8'),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
@@ -616,8 +638,14 @@ export function dispatchReview({
   // `--json-schema`, a v2 completion record) instead of `claude --bg`. `false` keeps the old spawn byte for byte.
   wrapReview = workerWrapperEnabledFor('review'),
   launchWrapped = launchWrappedClaudeWorker,
+  resolveRoute = resolveOperationRoute,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
+  // TEMPORARY (SMOKE-GUARD-RELAND): `required` is off so the OLD installed rebuild-smoke harness (which passes no
+  // expectedHead) still reaches its stub spawner. A PROVIDED expectedHead is still checked. Re-land `required: true`
+  // once every daemon has adopted the harness that passes expectedHead.
+  const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: false });
+  if (refusal) return { pr: planned.pr, repo: planned.repo, ...refusal };
   assertNotALaneCheckout(root);
   // #3439 — refuse (not silently spawn) when this checkout is behind origin/main: see `assertMainNotStale`.
   // `checkStaleness` undefined here falls straight through to that function's own default — no need to
@@ -685,10 +713,15 @@ export function dispatchReview({
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
   if (wrapReview) {
+    // The session is the Claude supervisor; judgeProvider selects a child juror, including Antigravity.
+    const executor = 'claude';
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+      route: claudeLaunchRouteFor({ policyRoute: resolveRoute({ operation: 'review' }), executor,
+        reason: 'review-dispatch: inherited Claude review tier' }),
     });
+    assertWrappedClaudeStarted(launched);
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
       unknownTokens, judgeProvider, wrapped: true,
@@ -749,11 +782,12 @@ if (IS_CLI) {
   // review-job.mjs's static import of it waits for this module to finish evaluating, which waits on the import —
   // a cycle node reports as "unsettled top-level await" (exit 13, nothing dispatched; reproduced live on main
   // 0cb0bf39f and later). `.then` lets this module finish evaluating first.
-  import('./review-job.mjs').then(({ resolveReviewDispatchMode, dispatchReviewJob }) => {
+  import('./review-job.mjs').then(({ resolveReviewDispatchMode, dispatchReviewJob, dispatchReviewByMode }) => {
     const mode = flag('mode') === 'session' || flag('mode') === 'job' ? flag('mode') : resolveReviewDispatchMode();
     if (mode === 'job') {
       try {
-        const r = dispatchReviewJob({ pr: flag('pr'), repo: flag('repo') });
+        const r = dispatchReviewJob({ pr: flag('pr'), repo: flag('repo'), ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }) });
+        if (r.refused) { writeLineSync(2, `dispatch-review: refused (${r.outcome}) — ${r.reason}`); process.exitCode = 75; return; }
         writeAllSync(1, r.skipped
           ? `dispatch-review: ${r.repo}#${r.pr} not started — ${r.skipped}${r.jobPid ? ` (job pid ${r.jobPid})` : ''}\n`
           : `dispatch-review: started review job pid ${r.jobPid} (slug ${r.sessionSlug}) for ${r.repo}#${r.pr} — no Claude wrapper session\n`
@@ -770,9 +804,11 @@ if (IS_CLI) {
       // #xqa9ttq — `--judge-provider` is OPTIONAL; `dispatchReview`'s own `judgeProvider = 'claude'` default
       // applies when the flag is omitted, so `flag('judge-provider')` returning `undefined` here is the ordinary
       // case, not a gap.
-      const result = dispatchReview({
+      const result = dispatchReviewByMode({
+        mode: 'session', expectedHead: flag('expected-head'),
         pr: flag('pr'), repo: flag('repo'), extraArgs: agentArgsFromEnv(), judgeProvider: flag('judge-provider'), careLevel: flag('care-level'),
       });
+      if (result.refused) { writeLineSync(2, `dispatch-review: refused (${result.outcome}) — ${result.reason}`); process.exitCode = 75; return; }
       writeAllSync(1, formatSessionDispatchResult(result));
     } catch (e) {
       writeLineSync(2, `error: ${String(e?.message ?? e)}`);

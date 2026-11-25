@@ -111,7 +111,7 @@ import { assertNotALaneCheckout, REPO_ROOT, resolveGhShimSettingsEnv } from './d
 import {
   decideJobClaim, diagnosticPath, jobLogPath, pidAlive, readJobRecord, removeJobRecord, reviewJobsDir, writeJobRecord,
 } from './review-job-store.mjs';
-import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
+import { assertMainNotStale, dispatchReview, expectedHeadRefusal, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
 import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
 import { reviewSeatLaunchEnv } from '../lib/review-seat-caps.mjs';
@@ -1296,14 +1296,7 @@ function finalHeadSeatsGate(input, io) {
 }
 
 /** An operator-pinned dispatch must refuse unknown or superseded live evidence. */
-function expectedHeadRefusal(expectedHead, input, io) {
-  if (expectedHead === undefined) return null;
-  try {
-    const head = io.liveHead(input);
-    if (isRealHead(expectedHead) && isRealHead(head) && head.toLowerCase() === expectedHead.toLowerCase()) return null;
-  } catch { /* unreadable evidence refuses */ }
-  return { refused: true, outcome: 'refused-head-moved', reason: 'PR head changed or unreadable; operator must inspect before retrying' };
-}
+export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 
 function runReviewArc({
   pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
@@ -1635,7 +1628,7 @@ export function dispatchReviewJob({
   isAlive = pidAlive,
   checkoutExists = existsSync, home = homedir(), expectedHead, io = createReviewJobIo({ root, env }),
 } = {}) {
-  const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io);
+  const refusal = expectedHeadRefusal(expectedHead, { pr, repo }, io, { required: true });
   if (refusal) return { pr, repo, ...refusal };
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
@@ -1702,6 +1695,12 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }, { spawnChild = spaw
  */
 // Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
 export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+  // Refuse before stack effects; dispatchReview also checks admission for its direct callers.
+  if (mode === 'session') {
+    const refusal = expectedHeadRefusal(opts.expectedHead, { pr: opts.pr, repo: opts.repo },
+      opts.io ?? createReviewJobIo({ root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }), { required: true });
+    if (refusal) return { mode, pr: opts.pr, repo: opts.repo, ...refusal };
+  }
   // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
   // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
   let stack = null;
@@ -1838,6 +1837,12 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       // Bare legacy flag selects recovery automatically; explicit modes stay strict.
       const redTeamMode = flag('red-team-only') ?? (rest.includes('--red-team-only') ? 'auto' : 'fresh');
       const redTeamOnly = rest.includes('--red-team-only') || flag('red-team-only') !== undefined;
+      if (flag('expected-head') === undefined) {
+        const noHead = { refused: true, outcome: 'refused-no-expected-head', reason: 'no expected head: the reviewed head is unknown' };
+        writeAllSync(1, `${JSON.stringify(noHead)}\n`);
+        process.exitCode = 75;
+        return;
+      }
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });

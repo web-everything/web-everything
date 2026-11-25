@@ -40,6 +40,7 @@
 import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, renameSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
+import { isStrictUtcTimestamp } from '../lib/strict-utc-timestamp.mjs';
 
 /** Default lease before a held lock is considered stale and reclaimable. Short enough that a crashed
  *  owner frees a path within a working block; long enough to outlast a normal reserve→edit→commit→push
@@ -244,16 +245,34 @@ const heartbeatFileFor = (owner) => `hb.${createHash('sha256').update(String(own
 export function readLockEntry(lockRoot, path) { return readEntryInDir(lockDirFor(lockRoot, path)); }
 
 function readEntryInDir(dir) {
-  const file = join(dir, 'lock.json');
-  if (!existsSync(file)) return null;
-  let entry;
-  try { entry = parseLockEntry(readFileSync(file, 'utf8')); } catch { return null; }
-  if (!entry) return null;
+  try {
+    const { entry, sidecarAt } = readClaimEvidence(dir, { strict: false });
+    const parsed = parseLockEntry(JSON.stringify(entry));
+    return parsed && { ...parsed, ...(sidecarAt ? { sidecarAt } : {}) };
+  } catch { return null; }
+}
+
+/** Draft evidence belongs to one exact claim identity, never to its replacement. */
+export const draftSidecarFor = entry => `draft.${createHash('sha256').update(JSON.stringify([
+  entry.owner, entry.meta?.sessionId, entry.meta?.tokenHash, entry.meta?.claimedAt,
+])).digest('hex')}`;
+
+/** Strict raw evidence for claim scans; fold in the same owner heartbeat as readLockEntry. */
+export function readClaimEvidence(dir, { strict = true } = {}) {
+  const entry = JSON.parse(readFileSync(join(dir, 'lock.json'), 'utf8'));
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('Invalid lock entry');
   try {
     const beat = readFileSync(join(dir, heartbeatFileFor(entry.owner)), 'utf8').trim();
+    if (!isStrictUtcTimestamp(beat)) throw new Error('Invalid heartbeat evidence');
     if (Date.parse(beat) > Date.parse(entry.heartbeatAt)) entry.heartbeatAt = beat;
-  } catch { /* never refreshed through heartbeatOwn */ }
-  return entry;
+  } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
+  let sidecarAt = null;
+  try {
+    const draft = JSON.parse(readFileSync(join(dir, draftSidecarFor(entry)), 'utf8'));
+    if (draft?.preDraft !== false || !isStrictUtcTimestamp(draft.at)) throw new Error('Invalid draft evidence');
+    sidecarAt = draft.at;
+  } catch (error) { if (strict && error.code !== 'ENOENT') throw error; }
+  return { entry, sidecarAt };
 }
 
 /**

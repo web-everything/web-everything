@@ -1020,6 +1020,14 @@ describe('runLiveSmoke — injected runChild', () => {
     return '';
   });
 
+  it('smoke acquire deliberately keeps its ten-minute lease TTL', async () => {
+    const runChild = vi.fn(passingRunChild);
+    await runLiveSmoke({ root: '/x', env: {}, runChild });
+    const acquire = runChild.mock.calls.find(([, args]) => args[0] === 'scripts/lane-pool.mjs' && args[1] === 'acquire');
+    expect(acquire).toBeDefined();
+    expect(acquire[1]).toEqual(expect.arrayContaining(['--ttl-minutes=10', '--exact-ttl']));
+  });
+
   it('the kill switch skips every check and passes unconditionally', async () => {
     const runChild = vi.fn();
     const result = await runLiveSmoke({ root: '/x', env: { [SMOKE_KILL_SWITCH_ENV]: '1' }, runChild });

@@ -17,6 +17,48 @@ let scratch;
 afterEach(() => { if (scratch) rmSync(scratch, { recursive: true, force: true }); scratch = null; });
 
 describe('R1086 measured host saturation', () => {
+  it('marks idle evidence known only with valid idle, threshold and admission evidence', () => {
+    expect(host(15)).toMatchObject({ saturated: false, known: true });
+    expect(host(80)).toMatchObject({ saturated: false, known: true });
+    for (const value of [null, undefined, NaN, -1, 101, '15']) {
+      expect(host(value)).toMatchObject({ saturated: false, known: false });
+      expect(hostSaturation({ collect: () => ({ mac: { idlePct: 80 }, thresholds: { cpuIdleLowPct: value } }),
+        admission: () => ({ admitted: true }) })).toMatchObject({ saturated: false, known: false });
+    }
+    expect(host(80, { admitted: false, reason: 'host load 40.00/8=5.00' }))
+      .toMatchObject({ saturated: true, known: true });
+    for (const admission of [() => undefined, () => { throw Error('denied'); }]) {
+      expect(hostSaturation({ collect: () => reading(80), admission }))
+        .toMatchObject({ saturated: false, known: false });
+    }
+    expect(hostSaturation({ collect: () => { throw Error('denied'); }, admission: () => ({ admitted: true }) }))
+      .toMatchObject({ saturated: false, known: false });
+  });
+
+  it('negative: unknown load and non-load refusals never establish known idle capacity', () => {
+    for (const reason of ['host load unknown: denied', 'host memory headroom 10MB', 'host capacity: unknown mac reading']) {
+      expect(host(80, { admitted: false, reason })).toMatchObject({ saturated: false, known: false });
+    }
+    for (const load of [0, -1, NaN, Infinity, undefined]) {
+      expect(hostSaturation({ collect: () => ({}),
+        admission: () => ({ admitted: true, reason: 'host load ' + load + '/8=0.1' }) }))
+        .toMatchObject({ saturated: false, known: false });
+    }
+    expect(hostSaturation({ collect: () => ({}),
+      admission: () => ({ admitted: true, reason: 'host load 1.00/8=0.13' }) }))
+      .toMatchObject({ saturated: false, known: true });
+  });
+
+  it('keeps ci-only decisions byte-identical regardless of the known field', () => {
+    for (const saturated of [false, true]) {
+      const original = decide({ saturation: () => ({ saturated, reason: 'test host' }) });
+      for (const known of [false, true]) {
+        expect(JSON.stringify(decide({ saturation: () => ({ saturated, known, reason: 'test host' }) })))
+          .toBe(JSON.stringify(original));
+      }
+    }
+  });
+
   it('accepts CPU idle strictly below the shared configured threshold', () => {
     expect(host(14).saturated).toBe(true);
     expect(host(15).saturated).toBe(false);
@@ -37,6 +79,10 @@ describe('R1086 measured host saturation', () => {
   });
   it('refuses an unsaturated host with measured idle and an operator fallback', () => {
     expect(decide({ saturation: () => host(80) })).toMatchObject({ ok: false, reason: 'ci-only-not-saturated', detail: expect.stringMatching(/CPU idle 80%.*retry local verification/) });
+  });
+  it.each(['park', 'label-on-green', 'open-only'])('ordinary %s keeps ci-only-not-saturated when saturated=false', mode => {
+    expect(decide({ mode, saturation: () => ({ saturated: false, reason: 'idle host' }) }))
+      .toMatchObject({ ok: false, reason: 'ci-only-not-saturated' });
   });
   it('refuses land and every bad value before sampling, while omission leaves the guard alone', () => {
     const saturation = vi.fn();

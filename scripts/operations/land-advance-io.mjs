@@ -242,11 +242,13 @@ export function createLandAdvanceApplier(ports = {}) {
         // `sessionSlugFor` → `repoSlugTag`, which (unlike `repoProfile`) accepts only a known internal key, never
         // a gh slug — see `we:scripts/lib/constellation-repos.mjs#repoSlugTag`. This module's own branch snapshot
         // predates that multi-repo tightening, which is why it originally read `row.slug` here.
-        const result = kind === 'review' ? await dispatchReview({ pr: row.pr, repo: row.repo, extraArgs, actions })
+        const result = kind === 'review' ? await dispatchReview({ pr: row.pr, repo: row.repo, expectedHead: row.headRefOid, extraArgs, actions })
           : kind === 'ci-heal' ? await dispatchCiHeal({ ...row.fixPlan, reason: 'red-ci', lane: await pickFixLane() }, { extraArgs, actions, repo: row.repo })
           : await dispatchFix({ ...row.fixPlan, lane: await pickFixLane() }, { extraArgs, actions, repo: row.repo });
         if (result?.held) { deferred.push({ target: row.subject, reason: result.reason === 'unavailable' ? 'coordination-unavailable' : 'held-by-action-record' }); continue; }
         if (result?.ok === false || result?.error) throw new Error(result.error ?? 'dispatch failed');
+        // Head admission refusals never started either: preserve capacity and do not record a launch.
+        if (result?.refused) { deferred.push({ target: row.subject, reason: String(result.outcome) }); continue; }
         // A review refused by the fresh CI gate never started: no ledger entry, no capacity spent.
         if (result?.skipped) { deferred.push({ target: row.subject, reason: String(result.skipped) }); continue; }
         const session = result?.agentId ?? null;

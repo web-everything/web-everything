@@ -66,6 +66,23 @@ function fixture(test) {
 
 const declined = f => f.log.mock.calls.map(([line]) => line).filter(line => /^mq-same-head-retry-declined:/.test(line));
 
+it('mqSameHeadGuard reads ANSI-colored job logs with the escape flag and reaches the quarantine retry decision', () => fixture(f => {
+  const base = f.exec;
+  f.exec = vi.fn((command, args, opts) => {
+    const endpoint = args.find(arg => arg.startsWith(`repos/${repo}/`)) ?? '';
+    if (/\/actions\/jobs\/\d+\/logs$/.test(endpoint) && !args.includes('--allow-escape-sequences'))
+      throw new Error('log contains escape sequences; use --allow-escape-sequences');
+    const result = base(command, args, opts);
+    return /\/actions\/jobs\/\d+\/logs$/.test(endpoint) ? `\x1b[31m${result}\x1b[0m` : result;
+  });
+  expect(f.guard().hold).toBe(false);
+  expect(f.log.mock.calls.some(([line]) => line.startsWith('mq-same-head-retry:'))).toBe(true);
+  expect(declined(f)).toEqual([]);
+  const reads = f.exec.mock.calls.filter(([, args]) => args.some(arg => /\/actions\/jobs\/\d+\/logs$/.test(arg)));
+  expect(reads.length).toBeGreaterThan(0);
+  expect(reads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
+}));
+
 describe('merge-queue same-head retry for unreadable failed-job logs', () => {
   const REMOVED_AT = Date.parse('2026-11-07T22:21:51Z');
   const setup = test => fixture(f => {
@@ -908,12 +925,14 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(result.reason).toMatch(/operator must inspect|enqueue manually/);
   }));
 
-  it.each([false, true])('staged evidence readers issue each rerun request only once (refused=%s)', refused => exactFixture(f => {
+  it.each([false, true])('staged evidence readers reach the ANSI-log rerun decision with the escape flag and issue each request only once (refused=%s)', refused => exactFixture(f => {
     f.mqChecks = [check(31, 'test-shard (1)', 800, 'failure')];
     Object.assign(f.mqChecks[0], { head_sha: mergeCommit, started_at: iso(removedAt - 120_000) });
-    f.logs[31] = shardLog().slice(601); // An ordinary test failure, eligible for a job rerun.
+    f.logs[31] = `\x1b[31m${shardLog().slice(601)}\x1b[0m`; // An ordinary test failure, eligible for a job rerun.
     const underlying = f.exec.getMockImplementation();
     f.exec.mockImplementation((command, args, opts) => {
+      if (args.some(arg => /\/actions\/jobs\/\d+\/logs$/.test(arg)) && !args.includes('--allow-escape-sequences'))
+        throw new Error('log contains escape sequences; use --allow-escape-sequences');
       if (refused && args.includes('POST')) throw new Error('ambiguous rerun response');
       return underlying(command, args, opts);
     });
@@ -923,6 +942,9 @@ describe('merge-queue exact-test extra retry after two failed_checks removals', 
     expect(f.exec.mock.calls.filter(([, args]) => args.some(a => a.includes(`commits/${mergeCommit}/check-runs`)))).toHaveLength(1);
     expect(f.guard().hold).toBe(false);
     expect(f.exec.mock.calls.filter(([, args]) => args.includes('POST') && args.includes(`repos/${repo}/actions/jobs/31/rerun`))).toHaveLength(1);
+    const logReads = f.exec.mock.calls.filter(([, args]) => args.some(arg => /\/actions\/jobs\/\d+\/logs$/.test(arg)));
+    expect(logReads).toHaveLength(2); // One read per guard invocation, shared by the staged readers.
+    expect(logReads.every(([, args]) => args.includes('--allow-escape-sequences'))).toBe(true);
   }));
 
   it.each(['merge-gate freeze', 'runner-loss pattern', 'aggregator log fallback'])('only proven merge-gate freeze permits the two-removal retry: %s', route => exactFixture(f => {

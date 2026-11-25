@@ -31,7 +31,7 @@ import { isTerminalStatus } from './lib/backlog-status.cjs';
  *   node scripts/lane-pool.mjs status  [--lane=N] [--json] [--leased-only] [--max-age-ms=N]     # per-lane: path / head / clean / behind origin/main / deps / lease. --lane=N probes only that provisioned lane (unknown lane: no rows). #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
  *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--lane-clean-reuse-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000); xkv3p37: a cached-mode scan reuses each CLEAN lane's verdict while its cheap stat signals are unchanged, for up to --lane-clean-reuse-ms (env LANE_POOL_LIST_LANE_CLEAN_REUSE_MS, default 300000; 0 disables), and an overrun returns the lanes already proven acquirable (never cached) — it fails only when it proved none
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
- *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--at=<sha> --branch=lane/x] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
+ *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--at=<sha> --branch=lane/x] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--exact-ttl] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure (omitted ⇒ 8000ms, overridden by LANE_POOL_ACQUIRE_DEFAULT_WAIT_MS; invalid env falls back to 8000ms; explicit --wait-ms=0 ⇒ instant-fail); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
  *   node scripts/lane-pool.mjs release (--lane=N | --all | --all-pools (--session=<slug> | --item=<num>)) [--session=<slug>] [--pool=<name>] [--force] [--release-reserved] [--discard]   # #2275 hand a leased lane back to the pool (own lease, or --force); refuses unpushed commits or tracked changes unless --discard explicitly accepts their loss; #2350 --release-reserved is the deliberate un-reserve for a PERMANENT reserved lane (--force alone never drops one); #2667 --all-pools --session sweeps EVERY pool under POOL_ROOT and releases that session's leases (cross-locus couple cleanup in one call), and --pool=<name> selects a pool by dir-name (no checkout path needed); #2748 --all-pools --item=<num> is the by-ITEM sweep the drain's release-on-land uses (matches every lease whose session encodes that item number — needs no exact slug); #2997 a CONTESTED lease (another live lease — in ANY pool under POOL_ROOT, per r2 — shares its ownerSession, i.e. a sibling agent of yours holds a lane) is never released on the ownerSession match alone — pass `--session=<the holder slug acquire printed>` or `--force`. A STALE lease is never contested (r2): a dead holder has nothing to prove, so an expired lease releases without --force exactly as on main.
  *   node scripts/lane-pool.mjs remove  (--lane=N | --all) [--dry-run] # tear down lane(s); #2350 REFUSES a reserved lane (even --all/--force) — deliberate teardown is `remove --lane=N --release-reserved`
@@ -159,7 +159,7 @@ import { appendLaneHistory, laneHistoryEntry, readLaneHistory, lastLaneHistoryEn
 // every reset/clean below appends one line naming its ACTOR, reason, HEAD before→after and the dirty/ahead/
 // unpushed state it found. `check:standards` (`findUnjournaledLaneMutations`) flags a new mutation point here
 // that forgets to call `journalLaneEvent`.
-import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict } from './lib/lane-history.mjs';
+import { journalLaneEvent, laneStateSnapshot, laneHead, destructiveActionVerdict, readLaneJournalTail } from './lib/lane-history.mjs';
 // #3568 — the shared known-safe-scratch-litter allowlist + cleanup core, reused verbatim by the periodic
 // `we:scripts/conveyor/lane-pool-health-watch.mjs` pass so the two never diverge into two separately-maintained
 // lists. Side-effect-free at import (no top-level dispatch), like every other `./lib/*.mjs` import above.
@@ -2119,12 +2119,12 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     // each holds the lane — only one lease file survives, and it may not be the caller that thinks it does.
     // `takeMarkerIf` (already `cmdTrim`'s own fix for the identical TOCTOU) closes it the same way here: the
     // stale marker is moved aside ATOMICALLY (only one renamer can ever win a given inode), and it is kept gone
-    // — this call's reclaim to proceed — ONLY if what got moved is still, by `sameLease`, the exact stale lease
+    // — this call's reclaim to proceed — ONLY if what got moved is still, by identity and renewal version, the exact stale lease
     // just judged; a lease that changed underneath us (a legitimate re-acquire, or another reclaimer that won
     // first) is put back untouched and this call falls through to `null`, exactly like a live lease already does.
     const laneNum = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
     acquireReclaimTestBarrier();
-    if (!takeMarkerIf(dir, (moved) => sameLease(moved, existing), laneNum)) return null;
+    if (!takeMarkerIf(dir, (moved) => sameStaleLease(moved, existing, ttlMs), laneNum)) return null;
     // #4370 — the dead holder's lease EXPIRED and was dropped here; the new lease is journalled by the acquire.
     journalLaneEvent(dir, {
       action: 'lease-expire', reason: `stale lease taken over by acquire (${describeLease(existing)})`,
@@ -2291,7 +2291,7 @@ function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
         }, { discard: false, setExitCode: false })) continue;
         if (resetPinnedLaneForRelease(repo, c.dir, c.lease, { discard: false })) continue;
       }
-      if (!takeMarkerIf(c.dir, (moved) => sameLease(moved, c.lease), c.lane)) continue;
+      if (!takeMarkerIf(c.dir, (moved) => sameStaleLease(moved, c.lease, ttlMs), c.lane)) continue;
       // #3383 — record the reap in the lane-history ledger (best-effort, after the marker is confirmed ours to drop).
       appendLaneHistory(c.dir, laneHistoryEntry({
         event: 'reap', session: c.lease?.session, ownerSession: c.lease?.ownerSession || null,
@@ -2301,6 +2301,7 @@ function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
         action: 'reap', reason: c.reason, before: laneStateSnapshot(c.dir, `origin/${repo.branch}`),
         leaseSession: c.lease?.session, leaseOwnerSession: c.lease?.ownerSession || undefined,
       });
+      journalLaneEvent(c.dir, { action: 'lease-expire', reason: `acquire reap: ${c.reason}`, leaseSession: c.lease?.session });
       unmapLanes(repo, [c.lane]); // a reaped ghost no longer renders its dead item (#2139)
       log(`  reaped lane-${c.lane} before acquire (${c.reason}; was ${describeLease(c.lease)}) — ghost lease reclaimed (#2748)`);
       reaped.push(c.lane);
@@ -2580,6 +2581,16 @@ async function cmdAcquire(repo) {
   // owner) before anything is claimed.
   if (flags.reserve && flags.lane === undefined) {
     fail('--reserve requires an explicit --lane=N (a permanent reserved lane is a specific, known slot — never auto-picked)');
+  }
+  if (flags['exact-ttl']) {
+    const ttlMinutes = Number(flags['ttl-minutes'] ?? DEFAULT_LEASE_TTL_MINUTES);
+    if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) {
+      fail('--exact-ttl requires --ttl-minutes to be a finite number greater than 0');
+    }
+  }
+  if (!flags.reserve && !flags['exact-ttl'] && ttlMinutesFromFlags() < DEFAULT_LEASE_TTL_MINUTES) {
+    log(`  WARNING acquire: --ttl-minutes=${ttlMinutesFromFlags()} raised to ${DEFAULT_LEASE_TTL_MINUTES}; use --exact-ttl for deliberate short leases`);
+    flags['ttl-minutes'] = DEFAULT_LEASE_TTL_MINUTES;
   }
   const session = defaultSession();
   const nowMs = Date.now();
@@ -3125,6 +3136,7 @@ async function cmdAcquire(repo) {
       git(['checkout', '--no-overwrite-ignore', '-B', repo.branch, `origin/${repo.branch}`, '--quiet'], dir);
       journalLaneEvent(dir, { action: 'acquire-rollback', headAfter: laneHead(dir), reason: 'pinned target refused' });
       // Keep the pinned lease if recovery throws: an off-main lane is not free.
+      // owner-operation: roll back only this acquire's own pinned claim.
       if (takeMarkerIf(dir, moved => sameLease(moved, pinnedClaim), chosen)
         && preClaimLease && !isLeaseStale(preClaimLease, Date.now(), ttlMsFromFlags())) {
         try { writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preClaimLease, null, 2) + '\n', { exclusive: true }); } catch { /* replacement holder wins */ }
@@ -3639,6 +3651,7 @@ async function salvageUnpushed(repo, { lanes = existingLanes(repo), dryRun = fal
       process.exitCode = 1;
     } finally {
       if (claim) {
+        // owner-operation: release the temporary salvage hold created by this call.
         if (takeMarkerIf(dir, moved => sameLease(moved, claim), n)) {
           journalLaneEvent(dir, { action: 'salvage-unclaim', reason: 'unpushed-work salvage hold released' });
         }
@@ -3861,6 +3874,7 @@ async function cmdReleaseAllPools(repo) {
       releaseTestBarrier();
       const refusedReset = resetPinnedLaneForRelease(salvageRepo, dir, lease);
       if (refusedReset) { kept.push({ pool: name, lane: n, ...refusedReset }); process.exitCode = 1; continue; }
+      // owner-operation: explicit release, including the holder's own renewals.
       if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
         log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
         continue;
@@ -3916,6 +3930,19 @@ function deliveredLeaseForLane(dir, lease) {
   });
 }
 
+function missingLeaseMessage(dir, n, callerSession) {
+  const events = [...readLaneHistory(dir), ...readLaneJournalTail(dirname(dir)).filter(e => e.lane === Number(n))];
+  const last = events.filter(e => ['lease-expire', 'reap', 'release', 'reclaim-reset', 'salvage-reset'].includes(e.action || e.event)
+    && (e.leaseSession || e.session) === callerSession && Number.isFinite(Date.parse(e.ts)))
+    .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts)).at(-1);
+  const session = last?.leaseSession || last?.session;
+  const expired = last && ['lease-expire', 'reap', 'reclaim-reset', 'salvage-reset'].includes(last.action || last.event)
+    && typeof session === 'string' && Number.isFinite(Date.parse(last.ts));
+  const clean = value => String(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 200);
+  const removal = ['reclaim-reset', 'salvage-reset'].includes(last?.action) ? 'reclaimed' : 'taken over';
+  return `lane-${n}: no lease to release${expired ? ` (lease ${clean(session)} expired and was ${removal} at ${clean(last.ts)})` : ''}`;
+}
+
 async function cmdRelease(repo) {
   assertReleaseReservedScoped();
   if (flags['all-pools']) return cmdReleaseAllPools(repo); // #2667 — cross-pool release-by-session
@@ -3935,7 +3962,7 @@ async function cmdRelease(repo) {
   for (const n of targets) {
     const dir = laneDir(repo, n);
     const lease = readLease(dir);
-    if (!lease) { log(`  lane-${n}: no lease to release`); continue; }
+    if (!lease) { log(`  ${missingLeaseMessage(dir, n, session)}`); continue; }
     // #2350 — a RESERVED (permanent) lane is NEVER handed back by an ordinary `release` (not even `--force`):
     // its whole point is to be a durable, off-limits slot. Only the deliberate `--release-reserved` un-reserve
     // drops it. This keeps a stray `release --all` / `--force` from silently un-reserving the memory-lane.
@@ -4067,6 +4094,7 @@ async function cmdRelease(repo) {
     releaseTestBarrier();
     const refusedReset = resetPinnedLaneForRelease(repo, dir, lease);
     if (refusedReset) { kept.push({ lane: n, ...refusedReset }); process.exitCode = 1; continue; }
+    // owner-operation: explicit release, including the holder's own renewals.
     if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
       log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
@@ -5112,6 +5140,12 @@ function laneRemovalEligibility(repo, n, { remoteShasBox, nowMs, ttlMs, deadReas
 /** Same lease? A re-acquire always rewrites `acquiredAt` (and a reclaim mints a fresh `holder`), so these three
  *  fields tell "the dead lease we judged" apart from "a new hold written since". */
 const sameLease = (a, b) => !!a && !!b && a.acquiredAt === b.acquiredAt && a.session === b.session && a.holder === b.holder;
+// Identity is sufficient for owner operations; stale verdicts must pin the heartbeat too.
+// Compare persisted evidence, including malformed values: unchanged corruption must not strand a stale
+// lease, but corruption introduced after the verdict is still a version change. Preserve null vs absent.
+const renewalVersion = value => JSON.stringify(value);
+const sameLeaseVersion = (a, b) => sameLease(a, b) && renewalVersion(a.renewedAt) === renewalVersion(b.renewedAt);
+const sameStaleLease = (moved, judged, ttlMs) => sameLeaseVersion(moved, judged) && isLeaseStale(moved, Date.now(), ttlMs);
 
 const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluated it — a live hold now owns it, kept' };
 
@@ -5122,6 +5156,7 @@ function takeMarkerIf(dir, isMine, n) {
   const file = LEASE_MARKER(dir);
   const aside = `${file}.trim-${process.pid}`;
   try { renameSync(file, aside); } catch { return false; } // gone or replaced since — don't guess
+  if (process.env.LANE_POOL_MOVED_LEASE_TEST_BARRIER) pauseForTestBarrier(process.env.LANE_POOL_MOVED_LEASE_TEST_BARRIER);
   let moved = null;
   try { moved = JSON.parse(readFileSync(aside, 'utf8')); } catch { /* unreadable ⇒ not provably ours */ }
   if (isMine(moved)) { rmSync(aside, { force: true }); return true; }
@@ -5150,8 +5185,9 @@ function claimLaneForRemoval(repo, n, evaluatedLease, remoteShasBox) {
   const dir = laneDir(repo, n);
   const file = LEASE_MARKER(dir);
   if (evaluatedLease) {
-    if (!sameLease(readLease(dir), evaluatedLease)) return { keep: TRIM_REACQUIRED }; // cheap pre-check
-    if (!takeMarkerIf(dir, (moved) => sameLease(moved, evaluatedLease), n)) return { keep: TRIM_REACQUIRED };
+    if (!sameStaleLease(readLease(dir), evaluatedLease, ttlMsFromFlags())) return { keep: TRIM_REACQUIRED }; // cheap pre-check
+    if (!takeMarkerIf(dir, (moved) => sameStaleLease(moved, evaluatedLease, ttlMsFromFlags()), n)) return { keep: TRIM_REACQUIRED };
+    journalLaneEvent(dir, { action: 'lease-expire', leaseSession: evaluatedLease.session, reason: 'stale lease claimed by trim' });
   }
   const session = `lane-pool-trim-${process.pid}-${randomBytes(4).toString('hex')}`;
   const body = JSON.stringify(leaseBody({
@@ -5170,6 +5206,7 @@ function claimLaneForRemoval(repo, n, evaluatedLease, remoteShasBox) {
   const { dirty, ahead } = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
   if (dirty || ahead > 0) {
     // Hand the lane back as it was — no lease, its new work intact — dropping only a marker that is still ours.
+    // owner-operation: abandon this trim's temporary hold after work appeared.
     takeMarkerIf(dir, (moved) => moved?.session === session, n);
     return { keep: { kind: 'work', reason: 'work appeared after trim evaluated it (uncommitted or unpushed), kept' } };
   }
@@ -5188,6 +5225,7 @@ function moveClaimedLaneToTrash(repo, n, session) {
   try {
     renameSync(dir, trashDir);
   } catch (e) {
+    // owner-operation: abandon this trim's hold after its rename failed.
     takeMarkerIf(dir, (moved) => moved?.session === session, n);
     return { keep: { kind: 'leased', reason: `rename-to-trash failed (${e.message}), kept` } };
   }
@@ -5509,6 +5547,7 @@ function cmdReclaim(repo) {
   // drift apart. Reports + returns `true` on an ineligible gate; a caller does `if (reportKept(...)) return;`.
   const reportKept = (gate, extra, { underHold, ownSession } = {}) => {
     if (gate.eligible) return false;
+    // owner-operation: abandon only this reclaim's temporary hold.
     if (underHold) takeMarkerIf(dir, (moved) => moved?.session === ownSession, n);
     log(`  lane-${n}: KEPT (not reset) — ${gate.reason}${underHold ? ' (re-checked under the hold)' : ''}`);
     if (!dryRun) journalReclaimRefusal(dir, repo, `kept — owner not proven gone: ${gate.reason}`);
@@ -5543,9 +5582,11 @@ function cmdReclaim(repo) {
   // PR #2641 review — a dead session never `release`d, so its TTL-stale marker is usually STILL on disk; the
   // O_EXCL create below would always hit it. Take it aside first exactly as `claimLaneForRemoval` does: only if
   // it is still the SAME stale lease judged above (a fresh acquire since then is put back and wins).
-  if (lease && !takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
+  if (process.env.LANE_POOL_RECLAIM_TEST_BARRIER) pauseForTestBarrier(process.env.LANE_POOL_RECLAIM_TEST_BARRIER);
+  if (lease && !takeMarkerIf(dir, (moved) => sameStaleLease(moved, lease, ttlMs), n)) {
     fail(`lane-${n}: its lease changed between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
+  if (lease) journalLaneEvent(dir, { action: 'lease-expire', leaseSession: lease.session, reason: 'stale lease claimed by reclaim' });
   try {
     writeFileSync(file, body, { flag: 'wx' });
   } catch {
@@ -5557,6 +5598,7 @@ function cmdReclaim(repo) {
   if (automaticRecovery && !proof.preserved && !override) {
     const backup = verifyRecoveryBackup({ laneDir: dir, proof, manifestPath: process.env.WE_LANE_RECOVERY_BACKUP });
     if (!backup.ok) {
+      // owner-operation: abandon this reclaim's hold when its backup proof fails.
       takeMarkerIf(dir, (moved) => moved?.session === session, n);
       log(`  lane-${n}: NOT reclaimed — ${backup.error}`);
       return;
@@ -5577,6 +5619,7 @@ function cmdReclaim(repo) {
   if (!reproof.preserved && !overrideStillCovers) {
     // Hand the lane back with its work intact, dropping only a marker that is still OUR claim (as trim does). A
     // stale lease taken aside above is not restored — it was already dead, exactly like trim's same path.
+    // owner-operation: abandon this reclaim's hold after work appeared.
     takeMarkerIf(dir, (moved) => moved?.session === session, n);
     const why = overriding
       ? `NEW unpreserved content appeared after the initial look — override never covers content nobody reviewed (${reproof.reason})`
@@ -5602,6 +5645,7 @@ function cmdReclaim(repo) {
     unpushed: !reproof.preserved, ownerGone: relive ? relive.eligible : null, override: overriding, ownerReason: relive?.reason,
   });
   if (!verdict.allowed) {
+    // owner-operation: abandon this reclaim's hold when the final destruction gate refuses.
     takeMarkerIf(dir, (moved) => moved?.session === session, n);
     log(`  lane-${n}: NOT reclaimed — ${verdict.reason}`);
     journalReclaimRefusal(dir, repo, `not reclaimed — ${verdict.reason}`, { unpushed: true, before });
@@ -5611,6 +5655,7 @@ function cmdReclaim(repo) {
   if (process.env.WE_LANE_RECOVERY_BACKUP !== undefined) {
     const backup = verifyRecoveryBackup({ laneDir: dir, proof: () => laneReclaimPreservationProof(dir, repo.branch, repo), manifestPath: process.env.WE_LANE_RECOVERY_BACKUP });
     if (!backup.ok) {
+      // owner-operation: abandon this reclaim's hold when final backup verification fails.
       takeMarkerIf(dir, (moved) => moved?.session === session, n);
       log(`  lane-${n}: NOT reclaimed — ${backup.error}`);
       return;
@@ -5622,6 +5667,7 @@ function cmdReclaim(repo) {
   rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
   journalLaneEvent(dir, {
     action: 'reclaim-reset', before, headAfter: laneHead(dir),
+    leaseSession: lease?.session,
     unpushed: !reproof.preserved, preserved: reproof.preserved, override: overriding || undefined,
     reason: `${typeof flags.reason === 'string' ? `${flags.reason}: ` : ''}${reproof.reason}${relive ? `; ${relive.reason}` : ''}`,
     loud: verdict.loud || undefined,
@@ -5663,12 +5709,15 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
     session, purpose: 'lane-pool-salvage', acquiredAt: new Date().toISOString(),
     host: hostname(), pid: process.pid, ownerSession: process.env.CLAUDE_CODE_SESSION_ID || null,
   }), null, 2)}\n`;
-  if (lease && !takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
+  if (process.env.LANE_POOL_RECLAIM_TEST_BARRIER) pauseForTestBarrier(process.env.LANE_POOL_RECLAIM_TEST_BARRIER);
+  if (lease && !takeMarkerIf(dir, (moved) => sameStaleLease(moved, lease, ttlMsFromFlags()), n)) {
     fail(`lane-${n}: its lease changed between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
+  if (lease) journalLaneEvent(dir, { action: 'lease-expire', leaseSession: lease.session, reason: 'stale lease claimed by salvage' });
   try { writeFileSync(file, body, { flag: 'wx' }); } catch {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
+  // owner-operation: release only this salvage's temporary hold on any later refusal.
   const giveBack = () => takeMarkerIf(dir, (moved) => moved?.session === session, n);
   const g2 = gate(session);
   if (!g2.eligible) {
@@ -5716,6 +5765,7 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   // #4370 — unpushed content here was SAVED first (a verified bundle), and the owner was proven gone (g2).
   journalLaneEvent(dir, {
     action: 'salvage-reset', before, headAfter: laneHead(dir),
+    leaseSession: lease?.session,
     unpushed: !proof.preserved, salvagedTo: salvage.bundle || salvage.outDir || undefined,
     reason: `${typeof flags.reason === 'string' ? `${flags.reason}: ` : ''}${proof.reason}; ${g2.reason}`,
     removedWorktrees: removedWorktrees.length ? removedWorktrees : undefined,
@@ -5851,7 +5901,7 @@ function cmdUnmap(repo) {
 const KNOWN_FLAGS = new Set([
   'acquirable', 'adopt', 'all', 'all-pools', 'at', 'base', 'branch', 'count', 'discard', 'force', 'item', 'json', 'lane',
   'name', 'no-install', 'no-reap', 'no-reset', 'origin', 'pool', 'purpose', 'reference', 'release-reserved',
-  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'wait-ms',
+  'repo', 'reserve', 'scope', 'session', 'expect-holder', 'ttl-minutes', 'exact-ttl', 'wait-ms',
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms', 'list-contention-grace-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
@@ -5966,7 +6016,7 @@ if (!cmd || cmd === 'help' || cmd === '--help' || !COMMANDS[cmd]) {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.stderr.write(`unknown command: ${cmd}\n`);
   process.stderr.write(
     'usage: lane-pool.mjs <gc|heal-siblings|salvage-unpushed|provision|refresh|status|list|path|acquire|adopt|release|remove|trim|reclaim|keep|map|unmap> [--count=N] [--lane=N] [--all] [--all-pools] [--acquirable] [--max-new=N] ' +
-      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
+      '[--item=NNN[,NNN…]] [--purpose=<slug>] [--session=<slug>] [--expect-holder=<slug>] [--adopt] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--release-reserved] [--ttl-minutes=N] [--exact-ttl] [--no-reset] [--no-reap] [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--list-contention-grace-ms=N] [--repo=<path>] [--pool=<name>] [--origin=<url>] ' +
       '[--reference=<path>] [--name=<slug>] [--branch=<ref>] [--no-install] [--force] [--json] [--max=N] [--dry-run] [--override] [--reason=<text>] ' +
       '[--no-free-list] [--free-list-max-age-ms=N] [--leased-only]  # trim: shrink a pool to --max lanes (default per-repo cap; env LANE_POOL_TRIM_MAX)\n' +
       '  # gc [--watch]: serialized maintenance; --watch repeats at lanes.gc.schedule (default 24h), host load may defer a pass\n' +

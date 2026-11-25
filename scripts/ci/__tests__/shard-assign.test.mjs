@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync,
 import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
+import { assignByTime, balanceRatio, predictedBalance, staleRatio, median, ambiguousFilters, timingsFromReports, parseShardArg, listUnitTestFiles, listTestFiles, loadTimings, assertTimingKeys, formatUpdatedTimings, REPO_ROOT } from '../shard-assign.mjs';
 
 beforeEach(() => {
   vi.stubEnv('GITHUB_ACTIONS', 'true');
@@ -89,10 +89,37 @@ describe('shard-assign — timings from vitest json reports', () => {
 
 
 describe('shard-assign — persisted unit timing freshness', () => {
-  it('committed unit timing keys match discovered test filenames', async () => {
-    const files = new Set(await listUnitTestFiles());
+  it('committed unit timing keys match tests discovered in a blocking suite', async () => {
+    // A test may move to integration before the bot refresh drops its old unit timing.
+    // Require actual suite discovery: deleted files and files excluded from both still fail.
+    const files = new Set([
+      ...await listUnitTestFiles(),
+      ...await listTestFiles(REPO_ROOT, 'vitest.integration.config.ts'),
+    ]);
     const unit = loadTimings().unit;
     expect(Object.keys(unit).filter(file => !files.has(file))).toEqual([]);
+  }, 30_000);
+
+  it('discovers migrated integration tests but rejects deleted or unassigned timing keys', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'shard-migration-'));
+    try {
+      mkdirSync(join(root, 'tests'));
+      symlinkSync(join(REPO_ROOT, 'node_modules'), join(root, 'node_modules'), 'dir');
+      for (const file of ['unit', 'moved', 'unassigned']) {
+        writeFileSync(join(root, 'tests', `${file}.test.mjs`), 'throw new Error("discovery must not execute tests");\n');
+      }
+      writeFileSync(join(root, 'vitest.config.ts'), 'export default { test: { include: ["tests/*.test.mjs"], exclude: ["tests/moved.test.mjs", "tests/unassigned.test.mjs"] } };\n');
+      writeFileSync(join(root, 'vitest.integration.config.ts'), 'export default { test: { include: ["tests/*.test.mjs"], exclude: ["tests/unit.test.mjs", "tests/unassigned.test.mjs"] } };\n');
+      const unit = await listUnitTestFiles(root);
+      const integration = await listTestFiles(root, 'vitest.integration.config.ts');
+      expect(unit).toEqual(['tests/unit.test.mjs']);
+      expect(integration).toEqual(['tests/moved.test.mjs']);
+      const files = new Set([...unit, ...integration]);
+      const timings = { 'tests/unit.test.mjs': 1, 'tests/moved.test.mjs': 2, 'tests/deleted.test.mjs': 3, 'tests/unassigned.test.mjs': 4 };
+      expect(Object.keys(timings).filter(file => !files.has(file))).toEqual(['tests/deleted.test.mjs', 'tests/unassigned.test.mjs']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }, 30_000);
 
   it('discovery preserves include/exclude rules without executing tests, setupFiles or globalSetup', async () => {

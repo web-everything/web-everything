@@ -10,6 +10,7 @@ const valid = {
   dataDirs: arrayOf(v => !!v && !/[\\/\x00-\x1f]/.test(v) && v !== '.' && v !== '..'),
   dataPaths: arrayOf(v => !!v && !v.startsWith('/') && !/[\\\x00-\x1f]/.test(v)
     && v.split('/').every(segment => segment && segment !== '.' && segment !== '..')
+    && !v.split('/')[0].includes('*') // a glob must start with a literal directory, never `**/*.json`
     && BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.some(extension => v.endsWith(extension))),
 };
 

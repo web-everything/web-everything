@@ -81,7 +81,7 @@ import {
 } from '../readiness/file-locks.mjs';
 import {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchResource, readFixDispatchClaim,
-  fixDispatchSessionName, listFixDispatchClaims,
+  fixDispatchSessionName, listFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
 } from './fix-claim-store.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
@@ -157,7 +157,7 @@ export function recordIdleRelease(event, recordEvent = appendDaemonEvent) {
 // every existing importer of this module is unchanged.
 export {
   DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES, fixDispatchClaimRoot, fixDispatchResource, readFixDispatchClaim,
-  fixDispatchSessionName, listFixDispatchClaims,
+  fixDispatchSessionName, listFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
 };
 
 /** This PROCESS's own claim identity — `hostname:pid`, mirroring `file-locks.mjs`'s own documented convention
@@ -316,7 +316,7 @@ export function isClaimSessionLive({ repo, pr, kind = 'fix', agentsAll, name: na
  *  original acquire (`meta.claimedAt`). A backstop for a session that reads live forever while not actually
  *  progressing and that no hung detector caught: past this, the refresh stops and the plain TTL reclaims it.
  *  Well above any real fix/ci-heal run, and above `hung-session.mjs`'s own 30-min hung threshold. */
-export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
+// MAX_FIX_DISPATCH_CLAIM_REFRESH_MS is shared with the strict store reader.
 
 /** Missing owners can be released only after this spawn/listing-lag grace and a readable listing.
  * Unknown evidence retains the claim for the existing TTL/operator inspection path. */

@@ -56,6 +56,7 @@ const ranges = [
   ['redTeamQueue.maxProbesPerTick', 0, 50],
   ['redTeam.queue.reservedSlots', 0, 8],
   ['deliveryCapacity.pinUnits', 1, 200],
+  ['gh.throttle.pointsBudgetPerMin', 1, 600],
   ['resourcePool.builderFloor', 0, 64],
   ['resourcePool.class.1.reserve', 0, 64],
   ['resourcePool.class.1.max', 0, 64],

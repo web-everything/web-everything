@@ -34,6 +34,13 @@ import { isSmokeSentinelPr, resolveSmokeRealWorker } from '../lib/smoke-real-wor
 import { COMPLETION_RECORD_V2, listCompletionSessions, resolveCompletionsDir, tryReadCompletion } from './completion-store.mjs';
 import { STRUCTURED_OUTPUT_SUFFIX, WORKER_WRAPPER_ENV, launchDetached, withStructuredOutput, resumeRequestPath } from './worker-wrapper.mjs';
 import { isValidSessionSlug } from './completion-record.mjs';
+import { checkClaudeLaunchRoute } from '../lib/dispatch-routing-policy.mjs';
+import { notApplied } from './effect-executor.mjs';
+
+/** Convert a returned pre-launch refusal into the shared, retryable no-start error at each dispatch site. */
+export function assertWrappedClaudeStarted(launched) {
+  if (launched.refused) throw notApplied(launched.refused, { code: 'WORKER_LAUNCH_REFUSED' });
+}
 
 /** The roles whose launch is wrapped when the knob is unset (D7 FINAL, operator 2026-10-08). */
 export const WRAPPED_ROLES_DEFAULT_ON = Object.freeze(['fix', 'ci-heal', 'review']);
@@ -124,10 +131,11 @@ export function requestWrappedResume({ session, prompt, specDir = defaultWorkerS
  * @param {string[]} o.bgArgv the argv `buildAgentArgv` built for the old launch
  * @param {string} o.cwd
  * @param {object} o.env      the env the old spawn would have used (already sanitized and worker-marked)
+ * @param {object|null} o.route actual process route, including a reason for any selected Claude fallback
  * @returns {{handle: string, wrapperPid: number|null, sessionId: string, argv: string[]}}
  */
 export function launchWrappedClaudeWorker({
-  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null,
+  role, session, bgArgv, cwd, env = process.env, pr = null, item = null, model = null, route = null,
   sessionId = randomUUID(), specDir = defaultWorkerSpecDir(), launch = launchDetached,
   allowRealSentinel = resolveSmokeRealWorker({ env }).allowSentinel,
 } = {}) {
@@ -141,11 +149,18 @@ export function launchWrappedClaudeWorker({
     console.error(refused);
     return { handle: `refused:smoke-sentinel-${sentinelPr}`, wrapperPid: null, sessionId, argv: [], refused };
   }
+  const routeCheck = checkClaudeLaunchRoute(route);
+  if (!routeCheck.ok) {
+    // DIRECT-EXEC-GUARD: a Claude launch whose resolved route is codex/agy (or absent) starts nothing.
+    const refused = `operations: refusing to launch a claude worker for ${session}: ${routeCheck.reason}`;
+    console.error(refused);
+    return { handle: 'refused:route-mismatch', wrapperPid: null, sessionId, argv: [], refused };
+  }
   const argv = wrappedArgvFromBg(bgArgv, { sessionId });
   const { wrapperPid } = launch({
     role, launcher: 'claude-p', session, command: 'claude', argv, cwd, env, timeoutMs: wrappedTimeoutMs(role, env),
     model, pr: pr == null ? null : String(pr), item: item == null || item === '' ? null : String(item), sessionId,
-    legacyFromCompletion: true, preserveLegacyWords: true,
+    legacyFromCompletion: true, preserveLegacyWords: true, route: { provider: route.provider, fallbackProvider: route.fallbackProvider ?? null, reason: route.reason ?? null },
   }, { specDir });
   return { handle: Number.isInteger(wrapperPid) ? `pid:${wrapperPid}` : null, wrapperPid: Number.isInteger(wrapperPid) ? wrapperPid : null, sessionId, argv };
 }

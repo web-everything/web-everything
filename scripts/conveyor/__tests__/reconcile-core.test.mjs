@@ -3769,6 +3769,19 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it.each([
+    { pending: true },
+    { pending: true, reason: 'timeout-state-unreadable:corrupt' },
+    { pending: true, retired: true, reason: 'timeout-state-retired:pr-closed' },
+  ])('pending retry state preserves review ownership of annotated held gates: %j', timeoutRetryBudget => {
+    expect(plan({ isDraft: false, timeoutRetryBudget })).toEqual(plan({ isDraft: false }));
+    // An additional real CI failure still needs a decision before a rerun or heal.
+    const realRed = plan({ isDraft: false, timeoutRetryBudget,
+      statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
+    expect(realRed.dispatch).toEqual([]);
+    expect(realRed.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
+  });
+
+  it.each([
     ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
@@ -4004,13 +4017,100 @@ describe('xng7q1p mechanical timeout precedence', () => {
     expect(result.refusals[0].kind).toBe('ci-timeout-rerun-in-flight');
     expect(result.notes.some((n) => n.kind === 'timeout-retry-needs-human')).toBe(false);
   });
-  it('a re-run unresolved past the window still escalates; unreadable state escalates at once', () => {
+  // RERUN-PENDING-EXPIRY (live we#7431): a lost re-run marker held the PR forever. In flight = younger than the window AND
+  // (once it had time to start) a live run on the head; otherwise it is lost and the PR re-plans (never a human first).
+  it('a pending re-run older than the window is lost: it re-plans a mechanical re-run, never holds or escalates', () => {
     const old = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
-    const stale = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true, pendingSince: old } })], now: NOW });
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, pendingSince: old } })], now: NOW });
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+    expect(r.refusals.map((x) => x.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.notes.some((n) => n.kind === 'timeout-retry-needs-human')).toBe(false);
+  });
+  it('a lost marker with the re-run cap spent falls to ci-heal', () => {
+    const old = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 2, pending: true, pendingSince: old } })], now: NOW });
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
+  });
+  it('a retired pending marker escalates directly in the planner before dispatch', () => {
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, retired: true,
+      pendingSince: new Date(NOW - 2 * 3_600_000).toISOString(), reason: 'timeout-state-retired:pr-closed' } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated',
+      why: expect.stringContaining('timeout-state-retired:pr-closed') }));
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human',
+      text: expect.stringContaining('timeout-state-retired:pr-closed') }));
+  });
+  it.each([
+    { pending: true },
+    { pending: true, pendingSince: new Date(NOW - 2 * 3_600_000).toISOString(), retired: true, reason: 'timeout-state-retired:pr-closed' },
+    { pending: true, reason: 'timeout-state-unreadable:corrupt' },
+  ])('green checks retain review and queued handling despite pending marker %j', budget => {
+    for (const labels of [[{ name: 'review:pending' }], [{ name: 'review:accepted' }]]) {
+      const row = pr({ labels, statusCheckRollup: greenRollup, timeoutRetryBudget: budget });
+      const expected = planReconcile({ prs: [{ ...row, timeoutRetryBudget: { pending: false, confirmed: 0 } }], now: NOW });
+      expect(planReconcile({ prs: [row], now: NOW })).toEqual(expected);
+    }
+  });
+  it('a young pending re-run with no live run on the head, past the start grace, is lost', () => {
+    const since = new Date(NOW - 8 * 60 * 1000).toISOString();
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, pendingSince: since } })], now: NOW });
+    expect(r.refusals.map((x) => x.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-timeout-rerun']);
+  });
+  it('rerunInFlight: young + live run holds; young + no live run past grace, and old, are lost; unreadable holds', () => {
+    const since = (ms) => new Date(NOW - ms).toISOString();
+    const live = pr({ statusCheckRollup: [{ name: 'gate', status: 'IN_PROGRESS' }] });
+    const dead = pr();
+    const b = (ms, extra = {}) => ({ confirmed: 0, pending: true, pendingSince: since(ms), ...extra });
+    const o = { requiredChecks: ['gate'], now: NOW };
+    expect(rerunInFlight(live, { ...o, budget: b(8 * 60_000) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: b(60_000) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000) })).toBe(false);
+    expect(rerunInFlight(dead, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    // The quiet hold has an upper bound even when the rollup never settles.
+    expect(rerunInFlight(live, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    expect(rerunInFlight({ ...dead, rollupIncomplete: true }, { ...o, budget: b(2 * 3_600_000) })).toBe(false);
+    expect(rerunInFlight(dead, { ...o, budget: b(8 * 60_000, { reason: 'timeout-state-unreadable:x' }) })).toBe(true);
+    expect(rerunInFlight(dead, { ...o, budget: { confirmed: 0, pending: false } })).toBe(false);
+  });
+  it.each([
+    ['live', { statusCheckRollup: [...redRollup, { name: 'stuck', status: 'IN_PROGRESS' }] }],
+    ['queued', { statusCheckRollup: [...redRollup, { name: 'stuck', status: 'QUEUED' }] }],
+    ['commit status', { statusCheckRollup: [...redRollup, { context: 'stuck', state: 'PENDING' }] }],
+    ['incomplete', { rollupIncomplete: true }],
+  ])('old pending planner invariant: %s evidence escalates instead of holding silently', (_name, extra) => {
+    const r = planReconcile({ prs: [pr({ ...extra, timeoutRetryBudget: {
+      confirmed: 0, pending: true, pendingSince: new Date(NOW - 7 * 24 * 3_600_000).toISOString(),
+    } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.refusals.map(row => row.kind)).not.toContain('ci-timeout-rerun-in-flight');
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
+  });
+  it('mediation: no refusal site reads budget.pending directly; all go through rerunInFlight()', () => {
+    const src = readFileSync(join(process.cwd(), 'scripts/conveyor/reconcile-core.mjs'), 'utf8');
+    const direct = src.split('\n').filter((l) => /[bB]udget\??\.pending\b/.test(l) && !/^\s*\/\//.test(l));
+    // Bare pending reads authorize escalations only; every in-flight refusal uses the predicate.
+    expect(direct.filter((l) => !l.includes('rerunInFlight')).map((l) => l.trim())).toEqual([
+      'if (!budget?.pending) return false;',
+      'if (timeoutRepairOwed && pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)',
+    ]);
+    expect(src.match(/rerunInFlight\(/g).length).toBeGreaterThanOrEqual(6);
+  });
+  it('a re-run unresolved without a timestamp escalates; unreadable state escalates at once', () => {
+    const stale = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 1, pending: true } })], now: NOW });
     expect(stale.refusals[0].kind).toBe('ci-heal-escalated');
     const fresh = new Date(NOW - 1000).toISOString();
     const unreadable = planReconcile({ prs: [pr({ timeoutRetryBudget: { pending: true, pendingSince: fresh, reason: 'timeout-state-unreadable:x' } })], now: NOW });
     expect(unreadable.refusals[0].kind).toBe('ci-heal-escalated');
+    expect(unreadable.notes).toContainEqual(expect.objectContaining({
+      kind: 'timeout-retry-needs-human', text: expect.stringContaining('timeout-state-unreadable:x'),
+    }));
+  });
+  it('a future pending timestamp is unusable and escalates instead of creating an unbounded grace period', () => {
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true,
+      pendingSince: new Date(NOW + 24 * 3_600_000).toISOString() } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
   it('keeps live fix ownership ahead of retries', () => {
     const result = planReconcile({ prs: [pr({ fixClaim: { who: 'fixer' } })], now: NOW });
@@ -4246,7 +4346,7 @@ describe('restore-review-label - orphaned review-status:fixing tag (R502 item 4)
 import { loadFlakeLegacyBody } from './load-flake-fixture.mjs';
 import { REVIEW_PR_FOOTER } from '../mechanical-round-cap.mjs';
 import { REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
-import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+import { countUnresolvedStandDowns, rerunInFlight } from '../reconcile-core.mjs';
 it('legacy #3881 waits on host load, not a human', () => {
   const comment = { body: loadFlakeLegacyBody, createdAt: '2026-10-04T18:51:50Z', author: AUTOMATION };
   expect(countUnresolvedStandDowns([comment])).toBe(0);
@@ -4403,6 +4503,7 @@ describe('xu1nixv — the red-main fix PR is first, never a waiting draft, never
 
 
 describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
+  const now = Date.parse('2026-10-09T19:20:00Z');
   const head = 'c'.repeat(40);
   const repo = 'o/r';
   const url = (run, job) => `https://github.com/${repo}/actions/runs/${run}/job/${job}`;
@@ -4417,7 +4518,7 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
     ],
     timeoutRetry: retry, timeoutRetryBudget: { confirmed: 0, pending: false }, ...extra });
   const plan = (extra = {}) => planReconcile({ prs: [pr(extra)], agents: [], durableCounts: {},
-    now: Date.parse('2026-10-09T19:20:00Z'), requiredChecks: ['test', 'soak-replay-gate'] });
+    now, requiredChecks: ['test', 'soak-replay-gate'] });
 
   it('dispatches one mechanical blocked-cancelled rerun capped at two per head', () => {
     const result = plan();
@@ -4436,9 +4537,18 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
   });
 
   it('refuses another rerun while one is in flight', () => {
-    const result = plan({ timeoutRetryBudget: { pending: true } });
+    const result = plan({ timeoutRetryBudget: { pending: true, pendingSince: new Date(now - 60_000).toISOString() } });
     expect(result.dispatch).toEqual([]);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight', prNumber: 4651 }));
+  });
+
+  it('escalates an unstamped pending request instead of holding it in flight', () => {
+    const result = plan({ timeoutRetryBudget: { pending: true } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated', prNumber: 4651,
+      why: expect.stringContaining('without a usable timestamp') }));
+    expect(result.refusals.some(r => r.kind === 'ci-timeout-rerun-in-flight')).toBe(false);
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
   });
 
   it('owes nothing when the same green-by-completedAt PR is CLEAN', () => {

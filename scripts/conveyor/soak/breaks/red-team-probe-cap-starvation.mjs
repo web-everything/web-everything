@@ -27,7 +27,7 @@ export default {
     const repo = 'example/project', head = 'a'.repeat(40), file = 'queue.json';
     const files = new Map([[file, JSON.stringify(Array.from({ length: 10 }, (_, i) => ({
       key: `${repo}#${i + 1}`, repo, pr: i + 1, head, enqueuedAt: 1, attempts: 0,
-      blocked: i % 2 ? 'planner-skip' : 'review-unfinished',
+      blocked: i % 2 ? 'planner-skip' : 'review-unfinished', blockedReason: 'soak fixture evidence',
     })))]]);
     try {
       const { createRedTeamDispatchQueue, runWithRedTeamQueue } = await import(pathToFileURL(join(sourceRoot, PATH)).href);
