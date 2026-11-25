@@ -293,3 +293,17 @@ describe('DRAIN-LIST-DELTA round 4: direct hydrator callers', () => {
     expect(out.stats.byReason.new).toBe(1);
   });
 });
+
+describe('DRAIN-LIST-DELTA round 5', () => {
+  it('delta.maxAgeMs only tightens the caller maxAgeMs, never widens it', async () => {
+    const { hydrateHeavyFields } = await import('../pr-list-paged.mjs');
+    const row1 = { number: 1, updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' };
+    const cache = { 1: { body: 'old', files: [], stamps: {
+      body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
+      files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } } } };
+    const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [] }),
+      fields: ['body', 'files'], nowMs: 1000 + 700_000, maxAgeMs: 600_000, cache,
+      delta: { isCandidate: () => false, backstopMs: 3_600_000, maxAgeMs: 900_000 } });
+    expect(out.rows[0].body).toBe('fresh');
+  });
+});
