@@ -92,8 +92,7 @@ export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
-import { resolveBuilder } from './review-builder.mjs';
-export { resolveBuilder } from './review-builder.mjs';
+import { resolveBuilder as resolveBuilderShared } from '../lib/review-seat-routing.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
@@ -1389,6 +1388,7 @@ function missRowRecorded(records, row) {
  * provider/model/taskType), else the `Co-Authored-By: Claude …` trailer of the reviewed head commit, else unknown. PURE.
  * @returns {{provider:string, model:string, taskType:(string|null), delegated:boolean, source:string}}
  */
+export const resolveBuilder = resolveBuilderShared;
 
 /**
  * The red team's brief. PURE. Same two shapes as {@link buildSeatTask}: `inline` for a tool-free seat (Gemini),

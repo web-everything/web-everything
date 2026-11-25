@@ -3,6 +3,8 @@ import { createUpdateBranchSinks } from '../update-branch-io.mjs';
 import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
+// Collect the operation registry before the per-test deadline, like the other CLI wiring suites.
+import { resolveOperation } from '../run.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';

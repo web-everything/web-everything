@@ -16,6 +16,9 @@ import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
+import { decideSnapshotMemoryFloor } from './memory-warn-corroboration.mjs';
+import { readSnapshot } from './resource-admission.mjs';
+import { loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
 
 // GC has no reason to reclaim even a stale lease. Unknown markers/IO refuse work too.
 function gcLeaseProtected(lane) {
@@ -126,7 +129,7 @@ export function readHostMemoryHeadroomMb(options = {}) {
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
   capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
-  interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
+  interactive = !!process.stdin.isTTY, env = process.env, log, readSnap = () => readSnapshot(), now = () => Date.now() } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
   try {
@@ -150,6 +153,25 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
     const min = policy.settings.host.minMemoryHeadroomMb ?? DEFAULT_MIN_MEMORY_HEADROOM_MB;
     if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
     const { mb, source, level } = memoryReading({ env });
+    if (source === 'memory-pressure' && level === 'critical') {
+      return { admitted: false, reason: 'host memory pressure critical (level 4); source=memory-pressure' };
+    }
+    if (source === 'memory-pressure' && level === 'warn') {
+      // Level 2 is not measured: hold unless the fixer gate's own snapshot rule corroborates nothing is scarce.
+      let snap = null;
+      try { snap = readSnap(); } catch { snap = null; }
+      if (!Number.isFinite(snap?.memory?.swapGrowthMb)) {
+        return { admitted: false, reason: 'host memory pressure warn: warn corroboration unavailable; source=memory-pressure' };
+      }
+      const cap = policy.settings.host.capacity ?? {};
+      const d = decideSnapshotMemoryFloor({ snap, nowMs: now(), pressureLevel: 2, ...loadMemoryPressureSettings({ env }),
+        floor: { floorMb: Math.max(cap.memAvailableFloorMb, min), metric: cap.memoryMetric,
+          snapshotMaxFreshMs: cap.snapshotMaxFreshMs, snapshotClockSkewMs: cap.snapshotClockSkewMs } });
+      const m = snap.memory;
+      return d.admit
+        ? { admitted: true, reason: `${loadVerdict.reason}; host memory pressure warn uncorroborated (free ${m.freePct}%, swap +${m.swapGrowthMb}MB); ${d.reason}; source=memory-pressure` }
+        : { admitted: false, reason: `host memory pressure warn: ${d.reason}; source=memory-pressure` };
+    }
     if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
     const description = source === 'memory-pressure'
       ? `host memory pressure ${level}; reclaimable headroom ${Math.round(mb)}MB`

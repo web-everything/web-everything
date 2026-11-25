@@ -43,13 +43,17 @@ describe.each([
   ['mode router', dispatchReviewByMode], ['direct dispatcher', dispatchReview],
 ])('%s', (_entry, dispatch) => {
 describe.each([false, true])('session review head admission (wrapped=%s)', wrapReview => {
-  // SMOKE-GUARD-RELAND: the direct dispatcher temporarily admits a MISSING expectedHead so the installed rebuild-smoke
-  // harness still works; the mode router (review-job.mjs) keeps refusing it.
   if (dispatch === dispatchReview) {
-    it.todo('direct dispatcher: missing expected head is refused for any PR number, 9xxxxx included (re-land with SMOKE-GUARD-RELAND)');
-    it('direct dispatcher: the OLD harness call shape (no expectedHead, 9xxxxx PR) reaches the injected spawner', () => {
+    it('direct dispatcher: missing expected head is refused for a 9xxxxx smoke PR', () => {
       const { options } = sessionFixture(wrapReview);
       const result = dispatch({ ...options, pr: 900001, expectedHead: undefined });
+      expect(result).toMatchObject({ refused: true, outcome: 'refused-no-expected-head' });
+      expect(options.spawnAgent).not.toHaveBeenCalled();
+      expect(options.launchWrapped).not.toHaveBeenCalled();
+    });
+    it('direct dispatcher: the updated harness call shape (expectedHead, 9xxxxx PR) reaches the injected spawner', () => {
+      const { options } = sessionFixture(wrapReview);
+      const result = dispatch({ ...options, pr: 900001, expectedHead: head });
       expect(result.refused).toBeUndefined();
       expect(options.spawnAgent.mock.calls.length + options.launchWrapped.mock.calls.length).toBe(1);
     });
@@ -58,10 +62,11 @@ describe.each([false, true])('session review head admission (wrapped=%s)', wrapR
       io.liveHead.mockImplementation(() => 'b'.repeat(40));
       expect(dispatch({ ...options, expectedHead: head })).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
       expect(options.spawnAgent).not.toHaveBeenCalled();
+      expect(options.launchWrapped).not.toHaveBeenCalled();
     });
   }
   it.each([
-    ...(dispatch === dispatchReview ? [] : [['missing expected head', undefined, head, 'refused-no-expected-head']]),
+    ['missing expected head', undefined, head, 'refused-no-expected-head'],
     ['null expected head', null, head, 'refused-head-moved'],
     ['malformed expected head', 'bad', head, 'refused-head-moved'],
     ['oversized expected head', 'a'.repeat(41), head, 'refused-head-moved'],
@@ -124,8 +129,7 @@ it('session admission rechecks the head after stack inspection', () => {
   expect(options.ciGate).not.toHaveBeenCalled();
   expect(options.spawnAgent).not.toHaveBeenCalled();
 });
-// SMOKE-GUARD-RELAND: skipped while the direct dispatcher admits a missing expectedHead; un-skip on re-land.
-it.skip('land-advance default dispatcher refuses without head evidence', async () => {
+it('land-advance default dispatcher refuses without head evidence', async () => {
   const writeLedger = vi.fn();
   const apply = createLandAdvanceApplier({ writeLedger,
     readCapacity: () => ({ sessions: [], freeLanes: 1, load: 0 }) });
@@ -136,7 +140,7 @@ it.skip('land-advance default dispatcher refuses without head evidence', async (
     deferred: [{ target: 'pr:10', reason: 'refused-no-expected-head' }] });
   expect(writeLedger).not.toHaveBeenCalled();
 });
-it.skip('land-advance defers an unpinned review without a launch ledger entry or spending capacity', async () => {
+it('land-advance defers an unpinned review without a launch ledger entry or spending capacity', async () => {
   const { options } = sessionFixture(false);
   const writeLedger = vi.fn();
   const dispatchFix = vi.fn(() => ({ agentId: 'fix-session' }));

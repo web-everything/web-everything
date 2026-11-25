@@ -1,4 +1,4 @@
-import { decideMemoryFloor } from './memory-warn-corroboration.mjs';
+import { decideMemoryFloor, decideSnapshotMemoryFloor } from './memory-warn-corroboration.mjs';
 import { loadHostOverloadSettings, DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
 import { resolveHandoffSettings } from './handoff-settings.mjs';
 /**
@@ -338,20 +338,10 @@ export function createResourceFixThrottle({
     try { snap = readSnap(); } catch { snap = null; }
     try { floor = resolveFloor(); } catch { floor = { floorMb: null, source: 'unreadable policy' }; }
     lastSnap = snap; lastFloor = floor;
-    const m = snap?.memory ?? {};
-    const sampledAt = Date.parse(snap?.sampledAt);
-    const freshUntil = Date.parse(snap?.freshUntil);
-    const maxFreshMs = floor.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS;
-    const skewMs = floor.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS;
-    const fresh = !!snap && Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
-      && freshUntil - sampledAt <= maxFreshMs && sampledAt <= nowMs() + skewMs && nowMs() <= freshUntil;
-    // R559: the reading must have been taken under the SAME metric this process's policy names; a missing or different
-    // stamp is a mismatch and refuses (a stricter "free" dispatcher never trusts a larger "available" reading).
-    const metricOk = typeof floor.metric === 'string' && m.metric === floor.metric;
-    const d = !metricOk && fresh && floor.floorMb != null
-      ? { admit: false, reason: `memory metric mismatch (snapshot ${m.metric ?? 'unstamped'}, policy ${floor.metric ?? 'unknown'})` }
-      : decideMemoryFloor({ availableMb: m.availableMb, floorMb: floor.floorMb, pressureLevel: m.pressureLevel, snapshotFresh: fresh,
-        freePct: m.freePct, swapGrowthMb: m.swapGrowthMb, ...loadMemoryPressureSettings({ env }) });
+    // R559: freshness, the same-metric rule and the floor verdict live in decideSnapshotMemoryFloor (shared with host-load).
+    const d = decideSnapshotMemoryFloor({ snap, nowMs: nowMs(), ...loadMemoryPressureSettings({ env }),
+      floor: { ...floor, snapshotMaxFreshMs: floor.snapshotMaxFreshMs ?? DEFAULT_SNAPSHOT_MAX_FRESH_MS,
+        snapshotClockSkewMs: floor.snapshotClockSkewMs ?? DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } });
     if (d.admit) return { admit: true };
     return { admit: false, refusal: { admit: false, kind: 'host-load', signal: 'mem-floor', why: `memory floor: ${d.reason} (floor ${floor.floorMb ?? '?'} MB from ${floor.source}); ${kind} deferred, no claim taken` } };
   };
