@@ -2929,7 +2929,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         }
         if (c.landing && observation.conflict !== true) return false;
         if (observation.conflict && wait?.enabled) {
-          const d = landingHolderDecision({ state: holderState ? holderState(c.pr) : null, setting: wait, waitingSince: entry.waitingSince, now });
+          const d = landingHolderDecision({ state: holderState ? holderState(c.pr) : null, setting: wait, waitingSince: entry.waitingSince, now: acceptedIds.has(c.id) ? undefined : now });
           if (!d.hold) {
             decide(entry, c, 'waitForLandingHolder', false, d.why); return false;
           }

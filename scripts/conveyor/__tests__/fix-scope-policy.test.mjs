@@ -331,6 +331,11 @@ describe('wait only for a landing holder', () => {
     const early = gate([entry(2, { waitingSince: minutesAgo(59) })], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
     expect(early.planned).toEqual([]);
   });
+  it('never lets the timeout admit past a fix accepted earlier in the same pass', () => {
+    const old = minutesAgo(120);
+    const out = gate([entry(1, { waitingSince: old }), entry(2, { waitingSince: old })], [], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
+    expect(out.planned.length).toBeLessThan(2);
+  });
   it('keeps the hold when waitingSince is unparseable (fail closed)', () => {
     const bad = gate([entry(2, { waitingSince: 'not-a-date' })], [claim(1)], { overlapGranularity: 'region' }, { regionOverlap: conflict, holderState: () => ({ labels: ['review:accepted'] }) });
     expect(bad.planned).toEqual([]);
