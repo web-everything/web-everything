@@ -16,6 +16,11 @@ import { fileURLToPath } from 'node:url';
 import { types } from 'node:util';
 import { resolveOrgAwareShimDir, shimGhPath } from './gh-app-shim.mjs';
 import { GITHUB_APP_ROLES } from './github-app-identity.mjs';
+import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../operations/session-role.mjs';
+
+/** Launcher-owned env keys that the agent's own shells must also receive (codex policy.set, claude --settings env). */
+export const LAUNCHER_POLICY_KEYS = Object.freeze(['PATH', 'HOME', 'SHELL', 'TMPDIR', 'WE_GH_DAEMON_CALLER',
+  'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_GITHUB_APP_ROLE', WORKER_MARKER_ENV]);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXED_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/opt/homebrew/bin'];
@@ -288,14 +293,17 @@ export function buildAgentInvocation(descriptor, io = {}) {
     PATH: path, HOME: home, USER: user.username, LOGNAME: user.username, SHELL: accountShell(user, io),
     TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
     WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: d.githubRole,
+    [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE,
   };
+  // One list: the same launcher-owned keys are pinned for the agent's own shells (codex policy, claude --settings).
+  const pinned = Object.fromEntries(LAUNCHER_POLICY_KEYS.map(key => [key, env[key]]));
   let launcher;
   if (d.agent === 'codex') {
     env.CODEX_HOME = join(home, '.codex');
-    launcher = { 'shell_environment_policy.set.PATH': path, 'shell_environment_policy.set.WE_GITHUB_APP_ROLE': d.githubRole };
-    if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) launcher[`shell_environment_policy.set.${key}`] = tempRoot;
+    launcher = Object.fromEntries(Object.entries(pinned).map(([key, value]) => [`shell_environment_policy.set.${key}`, value]));
+    if (d.tempRoot !== undefined) for (const key of ['TMP', 'TEMP']) launcher[`shell_environment_policy.set.${key}`] = tempRoot;
   } else {
-    launcher = JSON.stringify({ env: { PATH: path, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: d.githubRole } });
+    launcher = JSON.stringify({ env: pinned });
   }
   const args = argsFrom(d, launcher);
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }

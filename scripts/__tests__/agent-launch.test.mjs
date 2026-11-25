@@ -138,7 +138,9 @@ describe('7 codex argv carries the launcher PATH', () => {
     const t = join(root, 't');
     const a = buildAgentInvocation(codex({ tempRoot: t }), seam()).args.join('\n');
     for (const k of ['TMPDIR', 'TMP', 'TEMP']) expect(a).toContain(`shell_environment_policy.set.${k}=${JSON.stringify(t)}`);
-    expect(buildAgentInvocation(codex(), seam()).args.join('\n')).not.toContain('set.TMP');
+    const plain = buildAgentInvocation(codex(), seam()).args.join('\n');
+    expect(plain).not.toContain('set.TMP=');
+    expect(plain).not.toContain('set.TEMP=');
   });
   it('pins literal edit argv', () => {
     const spec = buildAgentInvocation(codex({ ephemeral: true, config: { model_reasoning_effort: 'high' } }), seam());
@@ -151,7 +153,9 @@ describe('8 claude argv carries the launcher --settings', () => {
   it('emits one settings JSON with the same PATH, before the prompt delimiter', () => {
     const spec = buildAgentInvocation(claude(), seam());
     const i = spec.args.indexOf('--settings');
-    expect(JSON.parse(spec.args[i + 1])).toEqual({ env: { PATH: spec.options.env.PATH, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: 'worker' } });
+    const e = spec.options.env;
+    expect(JSON.parse(spec.args[i + 1])).toEqual({ env: { PATH: e.PATH, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse',
+      WE_GITHUB_APP_ROLE: 'worker', WE_CONVEYOR_WORKER: '1', SHELL: e.SHELL, HOME: e.HOME, TMPDIR: e.TMPDIR } });
     expect(spec.args.slice(-2)).toEqual(['--', 'hello']);
     expect(spec.args.indexOf('--settings')).toBe(spec.args.lastIndexOf('--settings'));
     expect(spec.guards.map(g => g.name)).toEqual(['gh']);
@@ -209,6 +213,35 @@ describe('11 githubRole (finding 14)', () => {
     const l = buildAgentInvocation(claude({ githubRole: 'reviewer', env: { PATH: binDir, WE_GITHUB_APP_ROLE: 'merger' } }), seam());
     expect(l.options.env.WE_GITHUB_APP_ROLE).toBe('reviewer');
     expect(JSON.parse(l.args[l.args.indexOf('--settings') + 1]).env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+  });
+});
+
+describe('14 worker marker and one launcher-owned key list (round 3)', () => {
+  const { LAUNCHER_POLICY_KEYS } = mod;
+  const codexPins = args => args.filter(a => a.startsWith('shell_environment_policy.set.')).map(a => a.slice('shell_environment_policy.set.'.length).split('=')[0]);
+  it('always sets the worker marker, and classifySession says worker for the child env', async () => {
+    const { classifySession } = await import('../operations/session-role.mjs');
+    for (const env of [{ PATH: binDir }, { PATH: binDir, WE_CONVEYOR_WORKER: '0' }, { PATH: binDir, WE_CONVEYOR_WORKER: '' }]) {
+      for (const make of [codex, claude]) {
+        const spec = buildAgentInvocation(make({ env }), seam());
+        expect(spec.options.env.WE_CONVEYOR_WORKER).toBe('1');
+        expect(classifySession(spec.options.env).role).toBe('worker');
+      }
+    }
+  });
+  it('codex policy and claude settings pin exactly the launcher-owned key list', () => {
+    const c = buildAgentInvocation(codex(), seam());
+    expect(codexPins(c.args).sort()).toEqual([...LAUNCHER_POLICY_KEYS].sort());
+    const l = buildAgentInvocation(claude(), seam());
+    expect(Object.keys(JSON.parse(l.args[l.args.indexOf('--settings') + 1]).env).sort()).toEqual([...LAUNCHER_POLICY_KEYS].sort());
+    for (const key of LAUNCHER_POLICY_KEYS) {
+      expect(c.options.env[key], key).toBeDefined();
+      expect(c.args).toContain(`shell_environment_policy.set.${key}=${JSON.stringify(c.options.env[key])}`);
+      expect(JSON.parse(l.args[l.args.indexOf('--settings') + 1]).env[key]).toBe(l.options.env[key]);
+    }
+    for (const key of ['PATH', 'WE_GITHUB_APP_ROLE', 'WE_GH_DAEMON_CALLER', 'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_CONVEYOR_WORKER', 'SHELL', 'HOME', 'TMPDIR']) {
+      expect(LAUNCHER_POLICY_KEYS).toContain(key);
+    }
   });
 });
 
