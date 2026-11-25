@@ -710,7 +710,10 @@ export function dispatchReview({
     // `reconcile-fix-dispatch.mjs`'s own call exactly. Written into `<sessionCwd>/.claude/settings.local.json`
     // — the cwd this dispatched review session ACTUALLY starts in, never `root`'s any more.
     settingsEnv: { ...resolveSettingsEnv(sessionCwd),
-      WE_REVIEW_SESSION_PIN: JSON.stringify({ pr: planned.pr, repo: planned.repo, head: expectedHead }) },
+      // No pin without a head to pin (the temporary missing-expectedHead admission): a headless pin would make
+      // the worker refuse every review.
+      ...(expectedHead === undefined ? {} : {
+        WE_REVIEW_SESSION_PIN: JSON.stringify({ pr: planned.pr, repo: planned.repo, head: expectedHead }) }) },
     worktreeSettings: isolateSession(sessionCwd).worktreeSettings,
   });
   // #3331 — THE HANDLE COMES BACK OFF STDOUT, it is not the uuid minted above. `claude --bg` DISCARDS
@@ -722,7 +725,7 @@ export function dispatchReview({
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
   const spawnRefusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo },
-    { liveHead: readExpectedHead }, { required: true });
+    { liveHead: readExpectedHead }, { required: false }); // TEMPORARY (SMOKE-GUARD-RELAND): mirrors the admission call above
   if (spawnRefusal) return { pr: planned.pr, repo: planned.repo, ...spawnRefusal };
   if (leaseHeld() !== true) throw Error('dispatch lease lost');
   if (wrapReview) {
