@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
+
 dateOpened: "2026-10-04"
 tags: []
 ---
@@ -23,3 +23,12 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-25)
+
+The build-dispatch daemon held #5050 with:
+
+> worker-declined: Not prepared: #5050 — could-not-prepare. The unresolved choice is whether existing test coverage may satisfy a behaviour claim, or every claim must map to a test file changed in that PR. Current review rules require named defending tests ('we:scripts/lib/review-core.mjs:225'), but do not require those files to change. A mandatory changed-test gate would therefore introduce a stricter policy, beyond extending the existing review lens. No files changed or stamped. No tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
