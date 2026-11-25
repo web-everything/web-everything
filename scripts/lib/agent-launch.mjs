@@ -164,7 +164,9 @@ export function findAgentBinary(agent, dirs) {
       if (!isAbsolute(file) || !statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;
-    } catch { /* Try the next fixed installation directory. */ }
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code)) fail(`${agent} binary unreadable; restore installation access and retry`);
+    }
   }
   fail(`${agent} binary not found; install it in a well-known installation directory`);
 }
@@ -172,12 +174,12 @@ export function findAgentBinary(agent, dirs) {
 /** Pure argv projection, retained for direct-task's existing argv consumers. */
 export function buildAgentArgs(descriptor) { return argsFrom(snapshot(descriptor)); }
 
-// Node would search these directories in order. Relative/empty entries before the
-// first match cannot establish an installation identity, so refuse instead of guessing.
+// Validate the entire child search path before identifying the first executable.
 function firstCodex(path) {
   if (path === undefined) fail('codex not found on child PATH; set an absolute installation PATH and retry');
-  for (const dir of path.split(':')) {
-    if (!isAbsolute(dir)) fail('relative child PATH entry before codex; use absolute directories and retry');
+  const dirs = path.split(':');
+  for (const dir of dirs) if (!isAbsolute(dir)) fail('relative child PATH entry; use absolute directories and retry');
+  for (const dir of dirs) {
     try {
       // Preserve the OS lookup: normalization can erase missing/non-directory components
       // or change the meaning of '..' after a symlink.
@@ -185,7 +187,9 @@ function firstCodex(path) {
       if (!statSync(file).isFile()) continue;
       accessSync(file, constants.X_OK);
       return file;
-    } catch { /* Try the next absolute directory. */ }
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error.code)) fail('child PATH binary unreadable; restore access and retry');
+    }
   }
   fail('codex not found on child PATH; set an absolute installation PATH and retry');
 }
@@ -196,7 +200,7 @@ export function buildAgentInvocation(descriptor, io) {
   const args = argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   const env = envRecord(d.env ?? {});
   if (d.pathPrefix !== undefined) {
-    const rest = String(env.PATH ?? '').split(':').filter(dir => dir && dir !== d.pathPrefix);
+    const rest = env.PATH === undefined ? [] : env.PATH.split(':').filter(dir => dir !== d.pathPrefix);
     rest.forEach(dir => absolute(dir, 'PATH'));
     env.PATH = [d.pathPrefix, ...rest].join(':');
   }
@@ -216,14 +220,14 @@ export function buildAgentInvocation(descriptor, io) {
 
 // Admission hook point (SEC1 S3/S4 moves runtime admission here, #7090). It sees a frozen
 // copy of the final spec and can only refuse (return false or throw); it cannot rewrite it.
-const allowAll = () => true;
 const frozen = value => Object.freeze(Array.isArray(value) ? value.map(frozen)
   : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, frozen(v)])) : value);
 
 export function launchAgent(descriptor, io) {
   const { file, args, options } = buildAgentInvocation(descriptor, io);
   let admitted;
-  try { admitted = (io?.admit ?? allowAll)(frozen({ file, args, options })); }
+  if (typeof io?.admit !== 'function') fail('launch not admitted');
+  try { admitted = io.admit(frozen({ file, args, options })); }
   catch (e) { fail(`launch not admitted: ${e?.message ?? e}`); }
   if (admitted !== true) fail('launch not admitted');
   return (io?.spawn ?? spawn)(file, args, options);

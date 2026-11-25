@@ -5,14 +5,27 @@ import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync, readFileSync, symlinkSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary } from '../lib/agent-launch.mjs';
-import { buildCodexDirectTaskDescriptor, CODEX_SHIM_DIR } from '../codex-direct-task.mjs';
+const CODEX_SHIM_DIR = new NodeURL('../codex-shims', import.meta.url).pathname;
+
+// Test data only: this slice does not depend on the direct-task adapter.
+function codexDescriptor({ cwd, env, review = false, tempRoot, model, effort, ephemeral, writableRoots, outputLastMessageFile }) {
+  const config = {};
+  if (effort !== undefined) config.model_reasoning_effort = effort;
+  if (writableRoots !== undefined) config['sandbox_workspace_write.writable_roots'] = writableRoots;
+  if (!review && tempRoot !== undefined) {
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) config[`shell_environment_policy.set.${key}`] = tempRoot;
+  }
+  return { agent: 'codex', cwd, env, sandbox: review ? 'read-only' : 'workspace-write',
+    processGroup: true, model, ephemeral, outputLastMessageFile, config,
+    ...(review ? {} : { pathPrefix: CODEX_SHIM_DIR, tempRoot }) };
+}
 
 const SID = '12345678-1234-4234-8234-123456789abc';
 const cwd = process.cwd();
 let root, bin, binary;
 const base = () => ({ agent: 'codex', cwd, model: 'gpt-5.6-sol', sandbox: 'workspace-write', env: { PATH: bin } });
 const claude = () => ({ agent: 'claude', cwd, print: true, sessionId: SID, prompt: 'hello', env: { PATH: bin } });
-const seam = () => ({ spawn: vi.fn(() => 'child'), resolveBinary: vi.fn(() => binary) });
+const seam = () => ({ admit: vi.fn(() => true), spawn: vi.fn(() => 'child'), resolveBinary: vi.fn(() => binary) });
 function refused(descriptor, reason) {
   const io = seam();
   expect(() => launchAgent(descriptor, io)).toThrow(reason);
@@ -27,8 +40,8 @@ beforeEach(() => {
 });
 afterEach(() => { vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 
-// Independent oracle copied from origin/main c18c5279b4's codexShimPath.
-function mainCodexShimPath(env) {
+// Expected prefix projection for local descriptor fixtures.
+function prefixedPath(env) {
   const rest = String(env.PATH ?? '').split(':').filter((d) => d && d !== CODEX_SHIM_DIR);
   return [CODEX_SHIM_DIR, ...rest].join(':');
 }
@@ -72,8 +85,8 @@ const matrix = [
   ['undefined and arbitrary', { OMIT: undefined, UNKNOWN: 'verbatim', EMPTY: '' }],
 ];
 const envLaunchPaths = [
-  ['codex edit', env => buildCodexDirectTaskDescriptor({ cwd, env, review: false })],
-  ['codex review', env => buildCodexDirectTaskDescriptor({ cwd, env, review: true })],
+  ['codex edit', env => codexDescriptor({ cwd, env, review: false })],
+  ['codex review', env => codexDescriptor({ cwd, env, review: true })],
   // Claude has no separate review/edit grammar; both roles use this same branch.
   ['claude', env => ({ ...claude(), env })],
 ];
@@ -85,7 +98,7 @@ const invalidEnvKeys = [
   ['BAD\0KEY', 'value'],
   ['', 'value'],
 ];
-describe('B1/B2 caller environment follows main verbatim, without any ambient merge', () => {
+describe('B1/B2 caller environment without any ambient merge', () => {
   for (const [path, descriptor] of envLaunchPaths) {
     it.each(invalidEnvKeys.flatMap(([key, value]) => [[key, value], [key, undefined]]))(
       `refuses malformed env key %j with value %j before spawn (${path})`, (key, value) => {
@@ -128,16 +141,16 @@ describe('B1/B2 caller environment follows main verbatim, without any ambient me
   it('has no ambient process environment access in the launcher source', () => {
     expect(readFileSync(new NodeURL('../lib/agent-launch.mjs', import.meta.url), 'utf8')).not.toContain('process.env');
   });
-  for (const review of [false, true]) it.each(matrix)(`differential review=${review}: %s`, (_name, extra) => {
+  for (const review of [false, true]) it.each(matrix)(`environment projection review=${review}: %s`, (_name, extra) => {
     vi.stubEnv('HOME', '/ambient-home'); vi.stubEnv('SEC1_AMBIENT_ONLY', 'excluded');
-    const env = { PATH: `${bin}:${CODEX_SHIM_DIR}:${bin}::`, TMP: '/caller/tmp', ...extra };
+    const env = { PATH: `${bin}:${CODEX_SHIM_DIR}:${bin}`, TMP: '/caller/tmp', ...extra };
     const tempRoot = '/task-temp';
-    const descriptor = buildCodexDirectTaskDescriptor({ cwd, env, review, tempRoot });
+    const descriptor = codexDescriptor({ cwd, env, review, tempRoot });
     expect(descriptor.env).toBe(env);
     const io = seam(); launchAgent(descriptor, io);
     const defined = withoutLoaders(Object.fromEntries(Object.entries(env).filter(([, value]) => value !== undefined)));
     expect(io.spawn.mock.calls[0][2].env).toEqual(review ? defined : {
-      ...defined, PATH: mainCodexShimPath(env), TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
+      ...defined, PATH: prefixedPath(env), TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
     });
   });
   it.each([null, [], 'X=1', { X: 1 }, { X: 'nul\0value' }])('refuses invalid env %j before spawn', env => refused({ ...base(), env }, /env/));
@@ -159,6 +172,7 @@ describe('B1/B2 caller environment follows main verbatim, without any ambient me
     mkdirSync(dispatchBin);
     symlinkSync(dispatcher, join(dispatchBin, 'codex'));
     const child = launchAgent({ ...base(), env: { PATH: dispatchBin } }, {
+      admit: () => true,
       resolveBinary: agent => findAgentBinary(agent, [dispatchBin]),
       spawn: (file, args, options) => spawnSync(file, args, { ...options, encoding: 'utf8', timeout: 5000, maxBuffer: 8192 }),
     });
@@ -181,6 +195,36 @@ describe('B1/B2 caller environment follows main verbatim, without any ambient me
   });
 });
 
+describe('snapshot PATH isolation', () => {
+  it.each(['getter', 'Proxy'])('never rereads a caller PATH replaced by a hostile %s after snapshot', kind => {
+    const env = { PATH: bin }; const descriptor = { ...base(), env }; const io = seam();
+    const trap = vi.fn(() => { throw Error('caller PATH read after snapshot'); });
+    io.resolveBinary.mockImplementation(() => {
+      if (kind === 'getter') Object.defineProperty(env, 'PATH', { get: trap });
+      else descriptor.env = new Proxy(env, { get: trap, ownKeys: trap });
+      return binary;
+    });
+    launchAgent(descriptor, io);
+    expect(trap).not.toHaveBeenCalled();
+    expect(io.admit.mock.calls[0][0].options.env).toEqual({ PATH: bin });
+    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: bin });
+  });
+  it('refuses a hostile snapshotted PATH even if the caller replaces it with a trusted PATH', () => {
+    const wrapper = join(root, 'snapshot-wrapper'); mkdirSync(wrapper);
+    writeFileSync(join(wrapper, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const env = { PATH: `${wrapper}:${bin}` }; const io = seam();
+    io.resolveBinary.mockImplementation(() => { env.PATH = bin; return binary; });
+    expect(() => launchAgent({ ...base(), env }, io)).toThrow(/identity/);
+    expect(io.admit).not.toHaveBeenCalled(); expect(io.spawn).not.toHaveBeenCalled();
+  });
+  it.each(['getter', 'Proxy'])('refuses unreadable caller PATH via %s before IO', kind => {
+    const trap = vi.fn(() => { throw Error('unreadable'); });
+    const env = kind === 'getter' ? Object.defineProperty({}, 'PATH', { get: trap }) : new Proxy({}, { get: trap });
+    refused({ ...base(), env }, /accessor|Proxy/);
+    expect(trap).not.toHaveBeenCalled();
+  });
+});
+
 describe('B3/B4 exact PATH and TMP projection', () => {
   it('retains the first caller gh guard before the real gh and appends no directories', () => {
     const guard = join(root, 'guard'), real = join(root, 'real');
@@ -191,20 +235,20 @@ describe('B3/B4 exact PATH and TMP projection', () => {
     expect(findAgentBinary('gh', io.spawn.mock.calls[0][2].env.PATH.split(':'))).toBe(join(guard, 'gh'));
   });
   it('projects /usr/bin to exactly shim:/usr/bin, with no fixed, node or agent dirs', () => {
-    const d = buildCodexDirectTaskDescriptor({ cwd, env: { PATH: '/usr/bin' } });
-    expect(d.config['shell_environment_policy.set.PATH']).toBe(`${CODEX_SHIM_DIR}:/usr/bin`);
+    const d = codexDescriptor({ cwd, env: { PATH: '/usr/bin' } });
+    expect(d.pathPrefix).toBe(CODEX_SHIM_DIR);
     // Claude has no Codex identity check; exercise the child projection independently of installed codex.
     const io = seam(); launchAgent({ ...claude(), env: { PATH: '/usr/bin' }, pathPrefix: CODEX_SHIM_DIR }, io);
     expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${CODEX_SHIM_DIR}:/usr/bin`);
   });
   it('review keeps PATH exactly, TMP unchanged, and an absent PATH stays absent', () => {
-    const env = { PATH: `${bin}::.:${bin}`, TMPDIR: '/caller/tmp' };
-    const io = seam(); launchAgent(buildCodexDirectTaskDescriptor({ cwd, env, review: true, tempRoot: '/ignored' }), io);
+    const env = { PATH: `${bin}:${bin}`, TMPDIR: '/caller/tmp' };
+    const io = seam(); launchAgent(codexDescriptor({ cwd, env, review: true, tempRoot: '/ignored' }), io);
     expect(io.spawn.mock.calls[0][2].env).toEqual(env);
     expect(buildAgentInvocation({ ...claude(), env: { TMP: '/caller/tmp' } }, seam()).options.env).toEqual({ TMP: '/caller/tmp' });
   });
   it('review without PATH refuses Codex without adding a PATH key', () => {
-    const descriptor = buildCodexDirectTaskDescriptor({ cwd, env: { TMP: '/caller/tmp' }, review: true });
+    const descriptor = codexDescriptor({ cwd, env: { TMP: '/caller/tmp' }, review: true });
     expect(descriptor.env).not.toHaveProperty('PATH');
     const io = seam();
     expect(() => launchAgent(descriptor, io)).toThrow(/codex.*PATH/);
@@ -213,7 +257,7 @@ describe('B3/B4 exact PATH and TMP projection', () => {
   });
   it('refuses a relative non-review PATH entry before spawn', () => {
     const io = seam();
-    expect(() => launchAgent(buildCodexDirectTaskDescriptor({ cwd, env: { PATH: `.:${bin}` } }), io)).toThrow(/PATH/);
+    expect(() => launchAgent(codexDescriptor({ cwd, env: { PATH: `.:${bin}` } }), io)).toThrow(/PATH/);
     expect(io.spawn).not.toHaveBeenCalled(); expect(io.resolveBinary).not.toHaveBeenCalled();
   });
   it('keeps config PATH tokens rather than rewriting them to the child PATH', () => {
@@ -235,10 +279,9 @@ describe('B5 same executable as main or refuse', () => {
   it('launches the fixed lookup path when it is the first executable codex', () => {
     const io = seam(); launchAgent(base(), io); expect(io.spawn.mock.calls[0][0]).toBe(binary);
   });
-  it('refuses a relative entry before codex, but accepts one after the match in review mode', () => {
-    noSpawn({ PATH: `.:${bin}` }, /relative|absolute/);
-    const io = seam(); launchAgent(buildCodexDirectTaskDescriptor({ cwd, env: { PATH: `${bin}:.` }, review: true }), io);
-    expect(io.spawn.mock.calls[0][2].env.PATH).toBe(`${bin}:.`);
+  it.each(['.', 'relative', ''])('refuses a %j PATH entry before or after codex', entry => {
+    noSpawn({ PATH: `${entry}:${bin}` }, /relative|absolute/);
+    noSpawn({ PATH: `${bin}:${entry}` }, /relative|absolute/);
   });
   it('refuses no codex, missing PATH and an empty entry before codex', () => {
     noSpawn({ PATH: root }, /codex.*PATH/); noSpawn({}, /codex.*PATH/); noSpawn({ PATH: `:${bin}` }, /relative|absolute/);
@@ -284,12 +327,32 @@ describe('B5 same executable as main or refuse', () => {
     const wrapper = join(root, 'review-wrapper'); mkdirSync(wrapper);
     writeFileSync(join(wrapper, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
     const io = seam();
-    expect(() => launchAgent(buildCodexDirectTaskDescriptor({ cwd, env: { PATH: `${wrapper}:${bin}` }, review: true }), io)).toThrow(/binary.*differ|identity/);
+    expect(() => launchAgent(codexDescriptor({ cwd, env: { PATH: `${wrapper}:${bin}` }, review: true }), io)).toThrow(/binary.*differ|identity/);
+    expect(io.spawn).not.toHaveBeenCalled();
+  });
+
+  it.each(['permission denied', 'symlink loop'])('refuses unreadable PATH evidence (%s) instead of falling through to a trusted binary', kind => {
+    const unreadable = join(root, 'unreadable');
+    if (kind === 'permission denied') { mkdirSync(unreadable); chmodSync(unreadable, 0o000); }
+    else symlinkSync(unreadable, unreadable);
+    try { noSpawn({ PATH: `${unreadable}:${bin}` }, /unreadable.*restore access/); }
+    finally { if (kind === 'permission denied') chmodSync(unreadable, 0o700); }
+  });
+  it('refuses a non-executable PATH candidate instead of falling through', () => {
+    const blocked = join(root, 'blocked'); mkdirSync(blocked);
+    writeFileSync(join(blocked, 'codex'), 'blocked', { mode: 0o600 });
+    noSpawn({ PATH: `${blocked}:${bin}` }, /unreadable/);
+  });
+  it('refuses unreadable fixed binary lookup instead of using a later installation', () => {
+    writeFileSync(join(root, 'codex'), 'blocked', { mode: 0o600 });
+    expect(() => findAgentBinary('codex', [root, bin])).toThrow(/binary unreadable/);
+    const io = seam(); io.resolveBinary.mockImplementation(() => findAgentBinary('codex', [root, bin]));
+    expect(() => launchAgent(base(), io)).toThrow(/binary unreadable/);
     expect(io.spawn).not.toHaveBeenCalled();
   });
   it('fixed lookup refuses missing and non-executable installations', () => {
     writeFileSync(join(root, 'codex'), 'not executable', { mode: 0o644 });
-    expect(() => findAgentBinary('codex', [root])).toThrow(/binary not found/);
+    expect(() => findAgentBinary('codex', [root])).toThrow(/binary unreadable/);
     chmodSync(join(root, 'codex'), 0o755);
     expect(findAgentBinary('codex', [join(root, 'missing'), root])).toBe(join(root, 'codex'));
     expect(() => findAgentBinary('claude', [root])).toThrow(/binary not found/);
@@ -446,15 +509,15 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
 
 describe('built invocation positive controls', () => {
   it('preserves direct spawn options and token order', () => {
-    const d = buildCodexDirectTaskDescriptor({ cwd, env: { PATH: bin }, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high' });
+    const d = codexDescriptor({ cwd, env: { PATH: bin }, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high' });
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
     expect(io.spawn).toHaveBeenCalledWith(binary, buildAgentArgs(d), {
-      shell: false, cwd, env: { PATH: mainCodexShimPath(d.env) }, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
+      shell: false, cwd, env: { PATH: prefixedPath(d.env) }, stdio: ['pipe', 'pipe', 'pipe'], detached: true,
     });
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
-    const d = buildCodexDirectTaskDescriptor({ cwd, env: { PATH: bin }, model: 'gpt-5.6-sol', effort: 'high', ephemeral: true, writableRoots: [tempRoot], tempRoot });
+    const d = codexDescriptor({ cwd, env: { PATH: bin }, model: 'gpt-5.6-sol', effort: 'high', ephemeral: true, writableRoots: [tempRoot], tempRoot });
     const args = buildAgentArgs(d);
     expect(args).toContain('--ephemeral');
     expect(args).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([tempRoot])}`);
@@ -476,14 +539,16 @@ describe('built invocation positive controls', () => {
 });
 
 describe('admission hook point (#7090 moves runtime admission here)', () => {
-  it('defaults to allow and passes the exact final spec, frozen', () => {
+  it('requires explicit admission and passes the exact final spec, frozen', () => {
     const io = seam(); io.admit = vi.fn(() => true);
     expect(launchAgent(base(), io)).toBe('child');
     const [spec] = io.admit.mock.calls[0];
     const [file, args, options] = io.spawn.mock.calls[0];
     expect(spec).toEqual({ file, args, options });
     expect(Object.isFrozen(spec.args) && Object.isFrozen(spec.options.env)).toBe(true);
-    const plain = seam(); expect(launchAgent(base(), plain)).toBe('child');
+    const plain = seam(); delete plain.admit;
+    expect(() => launchAgent(base(), plain)).toThrow('launch not admitted');
+    expect(plain.spawn).not.toHaveBeenCalled();
   });
   it('refuses when admit returns anything but true or throws, and never spawns', () => {
     for (const admit of [() => false, () => undefined, () => 'yes', () => Promise.resolve(true), () => { throw Error('busy'); }]) {

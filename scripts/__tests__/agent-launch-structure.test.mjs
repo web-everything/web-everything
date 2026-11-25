@@ -22,7 +22,7 @@ function literalLaunches(source) {
   visit(ts.createSourceFile('source.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS));
   return found;
 }
-function offenders() {
+function offenders(dirs = ['scripts', '.claude/skills']) {
   const found = {};
   function walk(path, ancestors = new Set()) {
     const real = realpathSync(path);
@@ -37,7 +37,7 @@ function offenders() {
       if (count) found[relative(root, path)] = count;
     }
   }
-  for (const dir of ['scripts', '.claude/skills']) walk(join(root, dir));
+  for (const dir of dirs) walk(join(root, dir));
   return found;
 }
 function overPin(counts, pins) {
@@ -66,6 +66,9 @@ describe('literal agent process call tripwire', () => {
     expect(overPin(scan(`${existing}\nexecFile('codex', []);`), pins)).toEqual([['approved.mjs', 2]]);
     expect(overPin({ 'new.mjs': 1 }, pins)).toEqual([['new.mjs', 1]]);
     expect(overPin({ 'approved.mjs': 0 }, pins)).toEqual([]);
+  });
+  it('refuses an unreadable source scope instead of reporting no launches', () => {
+    expect(() => offenders(['scripts/__missing_agent_launch_scope__'])).toThrow(/ENOENT/);
   });
   it('fails closed on a malformed pin rather than exempting its file', () => {
     for (const pin of [null, '1', -1, 1.5]) expect(() => overPin({ 'old.mjs': 1 }, { 'old.mjs': pin })).toThrow(/invalid launch pin/);
