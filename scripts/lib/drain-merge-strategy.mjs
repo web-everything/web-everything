@@ -34,6 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   (non-dry-run) pass ignores the variable and says so.
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
+import { createFastDrainWriteBoundary } from './fast-drain-scope.mjs';
 import { guardEnqueue } from './drain-poison-guard.mjs';
 import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
@@ -245,13 +246,19 @@ export function createDrainMergeStrategy({
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
   redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
   publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
+  writeScope = 'full', targetPr = null, writeBoundary,
 } = {}) {
   const { policy, note } = resolved;
+  const boundary = writeBoundary ?? createFastDrainWriteBoundary({ writeScope, repo: localSlug, num: targetPr,
+    log: line => log.write(`${line}\n`) });
+  exec = boundary.exec(exec);
+  postConflictFinding = boundary.helper('post-conflict-finding', postConflictFinding);
+  if (requestRedTeamOpt) requestRedTeamOpt = boundary.helper('red-team-request', requestRedTeamOpt);
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.
   const grantScopeFor = (c, headSha, comments) => {
     try { return readGrantScope({ repo: slugOf(c.repo), pr: { number: c.num, headRefOid: headSha, comments } }) ?? null; } catch { return null; }
   };
-  const statusProvider = labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) });
+  const statusProvider = boundary.labelProvider(labelProvider ?? createGhProvider({ exec: (args, opts) => exec('gh', args, opts) }));
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
   /**
    * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
@@ -330,7 +337,7 @@ export function createDrainMergeStrategy({
   // Default wiring: a planner-skipped queue entry is re-requested (re-probed) once per head; the caller's once-per-head
   // spend is written before this runs. A dry run never writes the queue file.
   const requestRedTeam = requestRedTeamOpt !== undefined ? requestRedTeamOpt
-    : dryRun ? null : input => requestRedTeamReprobe({ repo: input.repo, pr: input.pr, head: input.head, env });
+    : dryRun ? null : boundary.helper('red-team-request', input => requestRedTeamReprobe({ repo: input.repo, pr: input.pr, head: input.head, env }));
   const safety = queueSafety ?? readDrainQueueSafety({ env, log: line => log.write(`  ${line}\n`) });
   const deadline = redTeamDeadline ?? readRedTeamDeadlineAction({ env, log: line => log.write(`  ${line}\n`) });
   const deadlineAction = deadline.value?.deadlineAction ?? 'requeue-then-hold';
@@ -371,7 +378,10 @@ export function createDrainMergeStrategy({
   const removeSentBack = (repo, num, labels) => {
     if (dryRun || !safety.value.dequeueOnSendBack || !Array.isArray(labels)) return;
     const reason = sendBackReason(labels);
-    if (reason) dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
+    if (reason) {
+      if (boundary.limited) boundary.refuse('dequeue');
+      dequeueSentBack({ repo: slugOf(repo), pr: num, reason, exec, log: say });
+    }
   };
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const adaptiveBatching = () => batching ??= createAdaptiveBatching({ repo: localSlug, exec, dryRun, log: say });
@@ -387,6 +397,7 @@ export function createDrainMergeStrategy({
 
     /** Live open rows are unfiltered by ready-to-merge; also covers entries not in our follow-up file. */
     dequeueSendBacks(rows = [], repo = null) {
+      if (boundary.limited) return;
       if (dryRun || !enqueueMode || !safety.value.dequeueOnSendBack || !isLocalRepo(repo)) return;
       const candidates = rows.filter(row => Array.isArray(row.labels) && sendBackReason(row.labels));
       // Discover membership once, before any per-PR read. An incomplete discovery retries next pass;
@@ -447,6 +458,9 @@ export function createDrainMergeStrategy({
       } catch { return { allowed: false, reason: 'red-team evidence unreadable' }; }
     },
     enqueue(c, headSha, { comments = null, prepared = null, sameHeadAdmission } = {}) {
+      boundary.target(slugOf(c.repo), c.num);
+      if (boundary.limited && deadlineAction === RED_TEAM_DEADLINE_OVERRIDE)
+        return { enqueued: false, deferred: true, kind: 'defer-to-pass:red-team-override' };
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
@@ -465,8 +479,9 @@ export function createDrainMergeStrategy({
       const live = readLive(c.repo, c.num);
       if (live.headRefOid !== headSha || !Array.isArray(live.labels)) return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'live head or labels do not match the judged state' };
       if (preparedAdmission && prepared.labels !== labelSignature(live.labels)) return { fallback: true };
-      const held = sendBackReason(live.labels);
+      const held = queueLabels(live.labels).includes('review:hold') ? 'state is review:hold' : sendBackReason(live.labels);
       if (held) {
+        if (boundary.limited) return { enqueued: false, deferred: true, kind: 'defer-to-pass:write-boundary:dequeue', reason: held };
         removeSentBack(c.repo, c.num, live.labels);
         return { enqueued: false, deferred: true, kind: 'sent-back', reason: held };
       }
@@ -526,6 +541,7 @@ export function createDrainMergeStrategy({
           }
         }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
+        if (boundary.violations.length) return { enqueued: false, deferred: true, kind: boundary.violations.at(-1) };
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
@@ -636,11 +652,12 @@ export function createDrainMergeStrategy({
       if (fresh?.headRefOid !== headSha || !Array.isArray(fresh?.labels)) {
         return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'final live head or labels do not match the judged state' };
       }
-      const freshHeld = sendBackReason(fresh.labels);
+      const freshHeld = queueLabels(fresh.labels).includes('review:hold') ? 'state is review:hold' : sendBackReason(fresh.labels);
       const freshLabels = queueLabels(fresh.labels);
       const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
         ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
       if (freshHeld) {
+        if (boundary.limited) return { enqueued: false, deferred: true, kind: 'defer-to-pass:write-boundary:dequeue', reason: freshHeld };
         removeSentBack(c.repo, c.num, fresh.labels);
         // Blocked labels still get send-back cleanup, with the admission hold's pending outcome.
         if (freshHeld !== freshLabelHold) return { enqueued: false, deferred: true, kind: 'sent-back', reason: freshHeld };
@@ -717,6 +734,7 @@ export function createDrainMergeStrategy({
         try { writeState(statePath, state); }
         catch (e) { log.write(`  enqueue failure state write failed ${key}: ${firstLine(e)}\n`); }
         if (healthSmell && !quiet) log.write(`  health smell: ${key} enqueue failed ${count} times (enqueueFailureSmellAfter=${policy.enqueueFailureSmellAfter}, ${policy.sources?.enqueueFailureSmellAfter || 'standard'})\n`);
+        if (conflict && boundary.limited) return { enqueued: false, deferred: true, kind: 'defer-to-pass:write-boundary:post-conflict-finding', reason: r.error };
         if (conflict && !failure.conflictRouted) {
           try {
             postConflictFinding({ pr: { number: c.num, headRefName: c.headRef }, enqueueRefusal: r.error, repo: slugOf(c.repo), exec });
@@ -731,6 +749,7 @@ export function createDrainMergeStrategy({
         if (r.reason === REQUIRED_WORKFLOWS_UNSATISFIED) { err.code = REQUIRED_WORKFLOWS_UNSATISFIED; err.headSha = headSha; }
         throw err;
       }
+      boundary.confirm();
       try { adaptiveBatching().confirm?.(c.num, batchingGroupId, { already: !!r.already }); } catch { /* batching bookkeeping never blocks an enqueue */ }
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
@@ -777,6 +796,7 @@ export function createDrainMergeStrategy({
      * @returns {Array} the pending entries whose follow-up this pass must confirm
      */
     collectQueueMerged({ merged, landedThisPass, landedIdsFor = () => [] }) {
+      if (boundary.limited) return [];
       if (enqueueMode) {
         try { cancelObsoleteRuns({ repo: localSlug, exec, dryRun, log }); }
         catch (e) { say(`  ⚠ merge-queue: obsolete run cancellation failed (${firstLine(e)}) — continuing drain pass`); }

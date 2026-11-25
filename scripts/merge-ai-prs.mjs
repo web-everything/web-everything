@@ -133,8 +133,8 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
-import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches } from './lib/fast-drain-context.mjs';
+import { createFastDrainWriteBoundary, isFastDrainDeferKind, shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, resolveFastDrainIndexSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches, validateFastDrainQueuePrecondition } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
@@ -149,20 +149,21 @@ import { describeBlockedChecks, sendBackBlockedGates } from './lib/drain-blocked
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync as rawExecFileSync, spawnSync as rawSpawnSync } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { cascadePolicy } from './lib/policy-cascade.mjs';
-import { readGit, readGh } from './lib/proc-read.mjs';
+import { readGit as rawReadGit, readGh as rawReadGh } from './lib/proc-read.mjs';
 import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync, mkdirSync, renameSync, unlinkSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, join, dirname, isAbsolute } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { createLabelEnsurer, isLabelNotFoundError } from './lib/label-memo.mjs';
-import { rebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
+import { rebaseDropManifest as rawRebaseDropManifest, gitRunner } from './lib/rebase-drop-manifest.mjs';
 // fix-couple-split — a couple lands WHOLE in one pass or not at all (hold + contiguous order + carrier pre-flight).
 import { planCoupleCascadeStep, carrierPreflight, openSiblingRefSet, candKey, isImplHalf, isCoupleCarrier } from './lib/couple-cascade.mjs';
-import { rebaseDropContent } from './lib/rebase-drop-content.mjs';
-import { healNnnCollision } from './lib/nnn-collision-heal.mjs';
+import { rebaseDropContent as rawRebaseDropContent } from './lib/rebase-drop-content.mjs';
+import { healNnnCollision as rawHealNnnCollision } from './lib/nnn-collision-heal.mjs';
 // Rebase resolution (2026-08-08): the UNION of four independent concerns on one import line — #2979's accept
 // fingerprint reader (`parseReviewedDiff`), #2832/#984's hold-invariant helpers (`READY_TO_MERGE_LABEL`,
 // `isReviewHoldLabel`, `decideParkReadyStrip`), #2890's null-contract diff mapper (`diffHunksFrom`), and
@@ -178,7 +179,7 @@ import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewG
   normalizeDiffFingerprint, // card xu7kxtt — strict net-diff identity for carrying a clearance
 } from './lib/review-escalation.mjs';
 import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBaseline, recordBaseline, diffBaseline } from './lib/review-baseline-state.mjs';
-import { mergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
+import { mergePr as rawMergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs as rawRetargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
 import { DERIVED_REGEN, DERIVED_OUTPUT_PATHS, numberPendingHashes, isPostLandTreeDirty, landedNumberFor, resolveLandedItem } from './lane-drain.mjs'; // #2899 A5 — `resolveLandedItem` shares lane-drain's ONE resolve-on-land home, exactly as `numberPendingHashes` shares its numbering (never a fork)
 import { isHash } from './backlog/id.mjs'; // #2393 — a stackParent hash's bornAs-on-main lookup is hash-only
 import { withNumberingLock, withLandWriteLock, acquireDrainLease, heartbeatDrainLease, releaseDrainLease, drainLeaseStatus, drainOwner, DRAIN_LOCK_ROOT, localRepoSlug } from './readiness/drain-lock.mjs'; // #2391 — numbering-critical-section mutex + (#2683) the merge-write mutex (withLandWriteLock, same lock key) + (#2395) whole-process drain lease a `--watch` monitor holds for its lifetime + (#3440) localRepoSlug keys that lease per-repo
@@ -191,8 +192,7 @@ import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
-import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-const FAST_DRAIN_SOURCE_MAX_AGE_MS = 10 * 60_000;
+import { markPrSnapshotDirty, readSnapshotFile, snapshotPath, prSnapshotDir, prSnapshotEnabled } from './lib/pr-snapshot-store.mjs';
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
 export function backfillDrainReviewRuns(context, {
@@ -216,7 +216,7 @@ export function backfillDrainReviewRuns(context, {
 }
 import { resolveRunsDir } from './operations/run-store.mjs';
 import { resolveCardNumbering } from './lib/policy-cascade.mjs';
-import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue as rawPrepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, repairHashOnMain, fallbackMinNext, sweepQueuedHashCards, hashBacklogFiles } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -229,7 +229,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
-import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature, enqueuePrestage } from './lib/drain-prestage.mjs';
+import { createPrestageCache, resolvePrestageSettings, prestageCi, prestageRequiredChecks, labelSignature } from './lib/drain-prestage.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { resolveRequiredChecks } from './lib/check-state-predicate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
@@ -2755,9 +2755,10 @@ const overlapNetDiffCache = new Map();
 /**
  * Overlap-yield compares NET diffs (merge-base...head), not GitHub's file list: after a refresh merge that list
  * still shows main's content and fakes an overlap. Only rows that overlap in the listing are re-read (one pinned
- * read per head+base, cached); an unreadable or oversized read keeps the listing (no new yield, no lost one).
+ * read per head+base, cached on full passes). Fast drains use a fresh map for every refinement;
+ * an unreadable or oversized read keeps the listing (no new yield, no lost one).
  */
-export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, cache = overlapNetDiffCache } = {}) {
+export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = [], localSlug = null, readFiles, fastDrain = false, cache = fastDrain ? new Map() : overlapNetDiffCache } = {}) {
   const paths = (r) => new Set((r.files || []).map((f) => f?.path ?? f));
   const net = (r) => {
     if ((r.repo || null) !== (localSlug || null) || typeof readFiles !== 'function') return r; // other repos keep their listing
@@ -2783,6 +2784,7 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
     return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
   });
   // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
+  if (unreadable && fastDrain) throw new Error('defer-to-pass:incomplete-context');
   return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
 }
 const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
@@ -4748,7 +4750,26 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, Math.trunc(ms)));
 }
 
-const execFileP = execDrainAsync;
+const drainWriteContext = new AsyncLocalStorage();
+const guardedExec = run => (...args) => {
+  const boundary = drainWriteContext.getStore()?.boundary;
+  return boundary ? boundary.exec(run)(...args) : run(...args);
+};
+const execFileSync = guardedExec(rawExecFileSync);
+const spawnSync = guardedExec(rawSpawnSync);
+const execFileP = guardedExec(execDrainAsync);
+const readGit = (args, options) => guardedExec((_file, a, o) => rawReadGit(a, o))('git', args, options);
+const readGh = (args, options) => guardedExec((_file, a, o) => rawReadGh(a, o))('gh', args, options);
+const guardedHelper = (kind, run) => (...args) => {
+  const boundary = drainWriteContext.getStore()?.boundary;
+  return boundary ? boundary.helper(kind, run)(...args) : run(...args);
+};
+const mergePr = guardedHelper('merge', rawMergePr);
+const retargetStackedPrs = options => rawRetargetStackedPrs({ ...options, exec: execFileSync });
+const rebaseDropManifest = guardedHelper('refresh', rawRebaseDropManifest);
+const rebaseDropContent = guardedHelper('refresh', rawRebaseDropContent);
+const healNnnCollision = guardedHelper('numbering-push', rawHealNnnCollision);
+const prepareBranchBeforeEnqueue = guardedHelper('numbering-push', rawPrepareBranchBeforeEnqueue);
 
 // The ordered pool lives in drain-concurrency.mjs; the public export above remains compatible.
 
@@ -4956,7 +4977,23 @@ export function describeGhListError(e) {
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
-export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
+export async function main(argv, options = {}) {
+  return drainWriteContext.run({ boundary: null }, async () => {
+    try { return await runMain(argv, options); }
+    catch (error) {
+      const boundary = drainWriteContext.getStore()?.boundary;
+      const thrownKind = error?.kind || error?.message;
+      if (!boundary?.limited || !isFastDrainDeferKind(thrownKind)) throw error;
+      const kind = boundary.violations[0] || thrownKind;
+      const outcome = { num: boundary.num, repo: boundary.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind };
+      const result = { ok: true, considered: 0, toMerge: [], merged: [], failed: [], skipped: [outcome], enqueueOutcomes: [outcome] };
+      process.stderr.write(`fast-drain: ${kind}\n`);
+      if (parseArgvFlags(argv).json) (options.stdout ?? process.stdout).write(JSON.stringify(result) + '\n');
+      return result;
+    }
+  });
+}
+async function runMain(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
   const flags = parseArgvFlags(argv);
   // Keep the real CLI's synchronous flush before exit; fixtures supply a memory sink.
   const writeStdout = text => stdout === process.stdout ? writeAllSync(1, text) : stdout.write(text);
@@ -5075,6 +5112,23 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // resolve the repo set: `--repos=a,b` (explicit) / `--this-repo` (scoped single-repo) / neither → the
   // constellation (the #2287 default; `--all-repos` is accepted as a harmless no-op alias of the default).
   const localSlug = localRepoSlug(); // #3440 — also THIS run's whole-process drain-lease repoKey (below)
+  const enqueueOnly = onlyPr != null && !!(flags['from-green-event'] || flags['from-catch-up']);
+  const writeBoundary = createFastDrainWriteBoundary({ writeScope: enqueueOnly ? 'enqueue-only' : 'full',
+    repo: onlyRepo || localSlug, num: Number(onlyPr), log: line => process.stderr.write(`${line}\n`) });
+  drainWriteContext.getStore().boundary = writeBoundary;
+  if (onlyPr != null && (flags['from-green-event'] || flags['from-catch-up'])) {
+    let defaultBranch;
+    try { defaultBranch = execFileSync('gh', ['repo', 'view', onlyRepo || localSlug, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
+      { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 }).trim(); } catch { /* missing is a refusal */ }
+    const precondition = validateFastDrainQueuePrecondition({ repo: onlyRepo || localSlug, defaultBranch, exec: execFileSync });
+    if (!precondition.ok) {
+      const outcome = { num: Number(onlyPr), repo: onlyRepo || localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: precondition.kind };
+      process.stderr.write(`fast-drain: ${precondition.kind}\n`);
+      const result = { ok: true, considered: 0, toMerge: [], merged: [], failed: [], skipped: [outcome], enqueueOutcomes: [outcome] };
+      if (AS_JSON) writeStdout(JSON.stringify(result) + '\n');
+      return result;
+    }
+  }
   const REPOS = resolveRepos({ repos: typeof flags.repos === 'string' ? flags.repos : null, singleRepo: !!flags['this-repo'], self: localSlug });
   // #xc7p3q9 (Fix 1 / B8) — the CONTEXT repo set for `collectOpenPrContext` is the FULL constellation, UNION'd
   // with REPOS, regardless of `--only`/`--repos`/`--this-repo` narrowing. The couple gate reads carrier HEALTH
@@ -5215,14 +5269,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
+    writeScope: enqueueOnly ? 'enqueue-only' : 'full', targetPr: Number(onlyPr), writeBoundary,
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
+    // Best-effort full-pass helpers can swallow a boundary refusal. Preserve
+    // its named defer before queue admission, rather than recording a failed mutation.
+    if (enqueueOnly && writeBoundary.violations.length) return { enqueued: false, deferred: true,
+      kind: writeBoundary.violations[0], reason: writeBoundary.violations[0] };
     // Admission must precede same-head recovery, which can update the branch.
     const refusal = assertCapability(c.repo ?? localSlug, 'review');
     if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
     // Live manual retries pass the guard and retain the strategy's already-queued bookkeeping.
-    const refresh = DRY_RUN ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
+    const refresh = DRY_RUN || enqueueOnly ? undefined : createMqSameHeadRefreshOptions({ store: mqSameHeadRefreshStore,
       approvedHeadHold, repo: c.repo ?? localSlug, pr: c.num, head: sha,
       // Refresh mutates the branch before enqueue runs. Reuse its authorization gates here,
       // with fresh evidence at H, before the refresh's label read or once-per-head claim.
@@ -5826,64 +5885,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     }
   };
   const prestageSetting = __t.time('setup.policy', () => resolvePrestageSettings({ log: line => process.stderr.write(`${line}\n`) }));
-  // Prepared admission is still a candidate selection: honor the same resolved repo set and
-  // operator label/base filters as listOne before consuming (or invalidating) a cached preparation.
-  // The entry stores labels as their sorted-name signature; a missing entry falls through to the miss path.
-  const prepared = !DRY_RUN && flags['from-green-event'] && onlyPr != null ? prestageCache.get(localSlug, Number(onlyPr), prestageSetting.value.prestageTtlMin) : null;
-  const preparedLabels = (() => { try { return JSON.parse(prepared?.labels ?? 'null'); } catch { return null; } })();
-  // `--only` matches the listing's string comparison (`matchesOnlyTarget`): `--only=042` selects no PR there.
-  if (!DRY_RUN && flags['from-green-event'] && onlyPr != null && String(Number(onlyPr)) === String(onlyPr) && !onlyRepo && REPOS.some(isLocalRepo) && mergeStrategy.enqueues(null)
-      && (!prepared || operatorSelects({ ...prepared, labels: preparedLabels }))) {
-    // The global stop-the-line signal can change independently of any PR head/label.
-    const freeze = redMainBypass ? null : await __t.timeAsync('setup.opsFetch', readDrainFreezePass);
-    const hold = redMainBypass ? null : __t.time('setup.opsFetch', () => drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn: __t.time('setup.policy', () => resolveRedMainHoldSetting()).value === 'on' }));
-    const blocked = hold?.red && decideRedMainHold({ num: onlyPr, isLocal: true, signal: hold, setting: 'on' }).hold;
-    passMainFix = mainFixFrom(hold);
-    let prestageShadowCandidate;
-    const fast = blocked ? { fallback: true } : await enqueuePrestage({ cache: prestageCache, repo: localSlug, num: Number(onlyPr), settings: prestageSetting,
-      readPr: async () => {
-        const { stdout } = await execFileP('gh', ['pr', 'view', String(onlyPr), ...repoFlag(null), '--json',
-          'number,headRefOid,labels,statusCheckRollup,state,isDraft,body,baseRefName,reviewDecision,mergeable,mergeStateStatus'], { encoding: 'utf8' });
-        const pr = JSON.parse(stdout);
-        // The cache is re-read inside enqueuePrestage, so a concurrently written entry may be unchecked here. Out of
-        // scope is not stale: throwing falls back without dropping it (a null read would invalidate it).
-        if (!operatorSelects(pr)) throw new Error('PR outside this run\'s --label/--base selection');
-        // The same full `--check` read the listing and the pre-merge re-read use: gh caps the rollup at 100 contexts.
-        const resolved = await resolveChecks(null, pr);
-        const checks = readReviewChecks({ repo: localSlug, headSha: pr.headRefOid });
-        return attachLiveFixClaim({ ...resolved, statusCheckRollup: checks,
-          rowsComplete: checks.rowsComplete, rowsHead: checks.rowsHead },
-        { claimKey: repoKeyForSlug(localSlug), readClaim: readLiveFixClaim });
-      },
-      withLock: fn => withLandWriteLock(fn, { runUnlockedOnContention: false }),
-      fixClaimHeld: () => prestageFixClaimHeld(onlyPr, { claimKey: repoKeyForSlug(localSlug) }),
-      // Preparation's branch is only a hint; this process must verify before any enqueue authorization.
-      beforeEnqueue: async (c, sha, entry) => {
-        const liveBranch = await __t.timeAsync('gate.defaultBranch', () => verifyDefaultBranch(c.repo || localSlug));
-        const hold = defaultBranchHold(entry.baseRefName, liveBranch);
-        if (hold) throw new Error(hold);
-        prestageShadowCandidate = { repo: c.repo || localSlug, num: c.num, headSha: sha };
-        // Eligibility was just checked live. No label reads are added for telemetry.
-        try {
-          asyncShadow?.observePass({ candidates: [prestageShadowCandidate], observedPrs: [prestageShadowCandidate] });
-          shadowObserved = true;
-        } catch { /* Timing only. */ }
-        return announceAndRetargetBeforeLand(c, { preread: fetchPrComments(c.repo, c.num), defaultBranch: liveBranch });
-      },
-      enqueue: (c, sha, entry) => enqueueWithSameHeadGuard(c, sha, { prepared: entry.queueAdmission, comments: entry.queueAdmission.comments }, approvedHeadHold, asyncShadow),
-      recordLanded: recordLandedLedgerFacts,
-      requiredCheck: REQUIRED,
-    });
-    if (!fast.fallback) {
-      const result = { ok: true, prestaged: true, considered: 1, merged: [], failed: [], pendingRebased: [], deferred: [],
-        enqueueOutcomes: [] };
-      recordEnqueue(result.enqueueOutcomes, localSlug,
-        { num: Number(onlyPr), repo: localSlug, outcome: fast.enqueued ? 'enqueued' : 'not-enqueued', kind: fast.kind || 'prestage', ...fast });
-      summarizeAsyncShadow(result.enqueueOutcomes, prestageShadowCandidate ? [prestageShadowCandidate] : []);
-      return { result, merged: [], failedMerges: [], pendingRebased: [], deferred: [], duplicateIdsOnMain: [] };
-    }
-    process.stderr.write('drain-prestage: cache miss/stale — full fast drain\n');
-  }
+  // Fast drains fall through to live context and every gate. A prepared entry cannot
+  // bypass the queue precondition, F10–F13, or the enqueue-only write boundary.
+  if (enqueueOnly) process.stderr.write('drain-prestage: full fast drain — live context and enqueue-only validators required\n');
   // xym8nt4 — the repair PRs as of pass start, BEFORE the heal/rebase steps consult card-group membership (the
   // red-main hold below refreshes it with the freeze applied). Records only: a manual freeze is re-read there.
   passMainFix = !redMainBypass && __t.time('setup.policy', () => resolveRedMainHoldSetting()).value === 'on'
@@ -5935,10 +5939,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // inventory and re-read when it differs, and the target plus its related set are read live. A mutation-dirtied
     // source therefore stays usable, bounded by an age cap that covers a full pass (a refresh itself takes ~80s,
     // longer than the 75s snapshot TTL, so a TTL-only source could never be served).
-    // mergeQueue.fastDrain.selfRefresh (standard OFF): while off, every read below is exactly what main does.
-    const selfRefresh = fastDrainListing.selfRefresh === true;
-    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
-      cacheOnly: true, ...(selfRefresh ? { ignoreDirty: true, ttlMs: FAST_DRAIN_SOURCE_MAX_AGE_MS } : {}) });
+    const indexSetting = resolveFastDrainIndexSetting({ env });
+    process.stderr.write(`${indexSetting.line}\n`);
+    // Consume the store as a bounded identity index. TTL, dirty markers and main's moving
+    // SHA confer no authority; complete live membership and per-row provenance do.
+    const readSnapshot = repo => prSnapshotEnabled(env) ? readSnapshotFile(snapshotPath(prSnapshotDir(env), repo)) : null;
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
@@ -5946,30 +5951,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // Full-scope lifecycle reconciliation also needs live CI/mergeability for every PR it can mutate:
     // check reruns need not change the PR's head or updatedAt. Commits follow the same scope policy.
     // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
-    const passBranches = new Map();
-    let passBranchChanged = false;
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
-      concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
-      ...(selfRefresh ? { targetMaxAgeMs: 60_000 } : {}),
-      readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
-        repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
-        // A stale cache-only source would otherwise fail every catch-up child until the next full pass.
-        // Strict TTL/dirty only: the stale-ok allowance must never serve a source that catch-up already rejected.
-        refreshSnapshot: selfRefresh ? repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
-          env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_PR_SNAPSHOT_STALE_OK_MS')) }) : null,
-        log: line => process.stderr.write(`${line}\n`),
-        concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
-        readMain: async repo => {
-          // Each before/after membership probe needs its own live read, not a memoized gate result.
-          const defaultBranch = await newDefaultBranchReader()(repo);
-          if (!defaultBranch) throw new Error('default branch unresolved live');
-          if (passBranches.has(repo) && passBranches.get(repo) !== defaultBranch) passBranchChanged = true;
-          passBranches.set(repo, defaultBranch);
-          const { stdout } = await execFileP('gh', ['api', `repos/${repo}/git/ref/heads/${defaultBranch}`, '--jq', '.object.sha'],
-            { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 });
-          return { sha: stdout.trim(), defaultBranch };
-        },
-      }) : undefined,
+      concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!(flags['from-catch-up'] || flags['from-green-event']),
+      indexSetting,
       readSnapshot,
       listLean,
       readFull: (repo, num) => readFullListingPr(repo, num, true),
@@ -5988,12 +5972,18 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       readGroups: () => { const path = resolveCardGroupStatePath(); return path ? readGroupState(path) : { groups: [] }; },
       time: (phase, fn) => __t.timeAsync(phase, fn), log: line => process.stderr.write(`${line}\n`),
     })).catch(error => {
-      if (!passBranchChanged || !error.cause?.message?.startsWith('pass main changed while reading')) throw error;
-      // The parent round's branch evidence is no longer usable by the slow listing path either.
-      passListingSnapshot = null;
-      process.stderr.write('fast-drain: default branch changed during membership — discarded pass snapshot; falling back to live listing\n');
-      return null;
+      if (flags['from-catch-up'] || flags['from-green-event']) {
+        const kind = writeBoundary.violations[0] || (/^defer-to-pass:[a-z-]+(?::[a-z-]+)?/.exec(error.message)?.[0]) || 'defer-to-pass:incomplete-context';
+        process.stderr.write(`fast-drain: ${kind}\n`);
+        return { deferredKind: kind };
+      }
+      throw error;
     });
+    if (rows?.deferredKind) {
+      const outcome = { num: Number(onlyPr), repo: localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: rows.deferredKind };
+      const result = { ok: true, considered: 0, toMerge: [], merged: [], failed: [], skipped: [outcome], enqueueOutcomes: [outcome] };
+      return { result, merged: [], failedMerges: [], duplicateIdsOnMain: [] };
+    }
     // Fast rows replace the whole repo listing: an incomplete PR must send its repo through
     // the existing slow path, rather than disappear from labels, rebase or classification.
     if (rows) fastContextRows = new Map([...new Set([...CONTEXT_REPOS, ...REPOS])]
@@ -6226,7 +6216,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const repo = REPOS.find(isLocalRepo);
     const refusal = assertCapability(localSlug, 'review');
     if (refusal) log.write(`renamed-pr-refresh: ${refusal.why}\n`);
-    if (!refusal && REPOS.some(isLocalRepo)) await runRenamedPrRefresh({ prs: fastDrainPrs(repo, openPrContext.prsByRepo.get(repo) || []), slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log });
+    if (!refusal && REPOS.some(isLocalRepo)) await writeBoundary.fullPassDuty(() => runRenamedPrRefresh({ prs: fastDrainPrs(repo, openPrContext.prsByRepo.get(repo) || []), slug: localSlug, root: process.cwd(), settings, dryRun: DRY_RUN, log }));
   } catch (e) { if (!AS_JSON) process.stderr.write(`renamed-pr-refresh: ${e.message}\n`); }
 
   // #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach→couple-join sequence is now `prepareDrainVerdicts`, the
@@ -6398,6 +6388,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     }, opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
   });
   const refreshApprovedHead = (v, options) => {
+    if (enqueueOnly) writeBoundary.refuse('refresh');
     // Shared by freshness prechecks, required-workflow recovery and stale-merge recovery.
     const refusal = assertCapability(v.repo ?? localSlug, 'review');
     if (refusal) return { ok: false, action: refusal.kind, error: refusal.why };
@@ -7350,7 +7341,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     process.stderr.write(`${lines.join('\n')}\n`);
   };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
-  const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff });
+  const overlapNet0 = refineOverlapRowsToNetDiff({ ...overlapRows0, localSlug, readFiles: readOverlapNetDiff, fastDrain: !!(flags['from-catch-up'] || flags['from-green-event']) });
   const overlapCtx0 = computeOverlapContext({ candidateRows: overlapNet0.candidateRows, openPrRows: overlapNet0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
   const preparedPass = planDrainPass({
@@ -7382,7 +7373,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // the same staleness #3004 documents elsewhere in this cascade).
     const mergedPrKeys = new Set(merged.map((m) => overlapRowKey({ repo: m.repo || localSlug, number: m.num })));
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
-    const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff });
+    const netRows = refineOverlapRowsToNetDiff({ ...rows, localSlug, readFiles: readOverlapNetDiff, fastDrain: !!(flags['from-catch-up'] || flags['from-green-event']) });
     const octx = computeOverlapContext({ candidateRows: netRows.candidateRows, openPrRows: netRows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
     const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, ...contextProofFields(openPrContext), strictAbsentHashDependencies: onlyPr != null, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
@@ -7540,13 +7531,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   const numberCardsBeforeEnqueue = logQueueNumbering();
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
   if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
-  if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num),
+  if (numberingOnBranch && !DRY_RUN) writeBoundary.fullPassDuty(() => sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num),
     // Dequeue is cancellation; only the subsequent branch rewrite requires admission.
     prepare: options => {
       const refusal = assertCapability(localSlug, 'review');
       if (refusal) return { action: 'skip', reason: refusal.why };
       return prepareBranchBeforeEnqueue(options);
-    } });
+    } }));
   const branchPreparationRequired = createBranchPreparationRequired({ enabled: numberingOnBranch,
     serial: resolvedMergePolicy.policy.concurrency.enqueue === 1,
     // -z: line output C-quotes non-ASCII names, which would hide a pending hash card.
@@ -7682,6 +7673,9 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         }),
         onError: (c, e) => {
           const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+          const deferKind = /^defer-to-pass:[a-z-]+(?::[a-z-]+)?/.exec(String(e?.message ?? ''))?.[0];
+          // A write-boundary refusal is a named defer to the full pass, not a failed merge.
+          if (deferKind && (flags['from-catch-up'] || flags['from-green-event'])) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: deferKind }); return; }
           failedMerges.push({ num: c.num, repo: c.repo, detail: ghListErrText(e), headSha: c.headSha ?? null });
         },
         run: async (candidate) => {
@@ -8019,7 +8013,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
           // #2198 — a PR we JUST rebuilt (rebase-drop) has a new head, so CI (`test`) is re-running; an immediate
           // merge is EXPECTED to bounce on pending checks. That is not a hard failure — the watch re-sweeps and
           // lands it the next pass once green. Only a merge failure on a PR we did NOT just touch is a real fault.
-          if (c.rebaseDrop === 'rebased') {
+          const boundaryDefer = (flags['from-catch-up'] || flags['from-green-event']) ? /^defer-to-pass:write-boundary:[a-z-]+/.exec(String(detail))?.[0] : null;
+          if (boundaryDefer) { // a write-boundary refusal is a named defer to the full pass, not a failed merge
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: boundaryDefer });
+          } else if (c.rebaseDrop === 'rebased') {
             pendingRebased.push(c.num);
             if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(c.repo)}${c.num} rebuilt onto main — awaiting re-run of checks; will land on a later pass\n`);
           } else {
@@ -8094,10 +8091,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
   const localWriteRefusal = assertCapability(localSlug, 'review');
   if (localWriteRefusal && !AS_JSON) process.stderr.write(`  ${localWriteRefusal.why}; local land follow-up writes held for operator\n`);
-  const followup = await handOffDrainFollowup({
+  const followup = await writeBoundary.fullPassDuty(() => handOffDrainFollowup({
     landed: !DRY_RUN && !localWriteRefusal && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN || !!localWriteRefusal, log: (m) => process.stderr.write(`  ${m}\n`),
     buildInput: () => buildFollowupInput({ numberingOnBranch, landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof env.WE_PRIMARY === 'string' && env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
-  });
+  }), { handedOff: false });
   if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
   let localSynced = false;
@@ -8364,6 +8361,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   });
   const result = { alerts, ok: duplicateIdsOnMain?.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain?.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
+  if (writeBoundary.violations.length) result.enqueueOutcomes = [{ num: Number(onlyPr), repo: onlyRepo || localSlug,
+    outcome: 'not-enqueued', enqueued: false, deferred: true, kind: writeBoundary.violations[0] }];
   if (localWriteRefusal) result.localWriteRefusal = localWriteRefusal;
   if (duplicateIdsOnMain === null) {
     result.duplicateIdCheck = { status: 'unknown', reason: 'checkout-sync-refused', fallback: 'Operator must sync main and rerun the drain.' };
@@ -8470,7 +8469,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // #2230 — the label index lags the producer's label write, so a one-shot fired right after labelling can see
     // the just-labelled PR as absent. Re-poll ONCE after a short delay before concluding the queue is empty.
     // Fail-soft: a still-empty re-poll is a legitimate empty queue, not an error.
-    if (shouldRepollForLabelLag({ label, found: result.considered, expect: EXPECT, retried: false })) {
+    if (!result.enqueueOutcomes?.some(row => row.kind?.startsWith('defer-to-pass:'))
+      && shouldRepollForLabelLag({ label, found: result.considered, expect: EXPECT, retried: false })) {
       if (!AS_JSON) process.stderr.write(`  · ${result.considered} labelled candidate(s)${EXPECT ? ` (< expected ${EXPECT})` : ''} — re-polling once in ${REPOLL_SEC}s (label index may lag the producer's label write)…\n`);
       sleepSync(REPOLL_SEC * 1000);
       ({ result, failedMerges, duplicateIdsOnMain } = await sweepOnce());

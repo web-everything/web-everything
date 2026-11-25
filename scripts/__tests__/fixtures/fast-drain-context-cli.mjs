@@ -30,7 +30,8 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     for (const repo of ['fixture/web-everything', 'fixture/frontierui', 'fixture/plateau-app']) {
       writeFileSync(join(snapshots, `${repo.replace('/', '__')}.json`), JSON.stringify({ v: PR_SNAPSHOT_VERSION,
         repo, fetchedAtMs: Date.now(), fields: SNAPSHOT_FIELDS, count: repo === 'fixture/web-everything' ? rows.length : 0,
-        prs: repo === 'fixture/web-everything' ? rows : [] }));
+        prs: repo === 'fixture/web-everything' ? rows : [],
+        heavyMeta: Object.fromEntries(rows.map(p => [p.number, { fetchedAtMs: Date.now() }])) }));
     }
     const cacheEnv = { ...process.env, WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branch-cache') };
     if (cachedBranch) writeDefaultBranchCache('fixture/web-everything', cachedBranch, { env: cacheEnv });
@@ -53,6 +54,12 @@ const rows = JSON.parse(fs.readFileSync(process.env.CONTEXT_ROWS, 'utf8'));
 const r = a.includes('--repo') ? a[a.indexOf('--repo') + 1] : process.env.GH_REPO;
 const selected = !r || r === 'fixture/web-everything' ? rows : [];
 function out(v) { fs.writeSync(1, JSON.stringify(v)); process.exit(0); }
+if (a[0] === 'api' && a.some(v => v.includes('/rules/branches/'))) out([[
+  {type:'merge_queue'},
+  {type:'required_status_checks',parameters:{required_status_checks:['test','smoke','daemon-soak','soak-replay-gate','merge-gate'].map(context=>({context,integration_id:15368}))}},
+  {type:'workflows',parameters:{workflows:['ci.yml','soak-replay-gate.yml','merge-gate.yml'].map(name=>({path:'.github/workflows/'+name,ref:'refs/heads/main',repository_id:1142650361}))}}
+]]);
+if (a[0] === 'api' && a[1] === 'repos/fixture/web-everything') out({id:1142650361});
 if (a[0] === 'repo' && a[1] === 'view') {
   if (process.env.CONTEXT_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture default branch failure'); process.exit(1); }
   fs.writeSync(1, fs.readFileSync(process.env.CONTEXT_BRANCH_FILE, 'utf8')); process.exit(0);
@@ -121,7 +128,7 @@ out({});
       : [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7', '--from-green-event', '--label=ready-to-merge',
         ...(outputAsJson ? ['--json'] : []), ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])];
     const result = spawnSync(process.execPath, [...args, '--dry-run', '--no-drain-lease',
-      '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
+      '--no-red-main-freeze', '--no-review-escalation', '--no-heal-collision', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, WE_UNDER_TEST: '1',
         ...(workflowEditSetting ? { WE_DRAIN_WORKFLOW_EDIT_HUMAN: workflowEditSetting } : {}),

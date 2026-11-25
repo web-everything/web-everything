@@ -5,13 +5,75 @@ import { hostname } from 'node:os';
 import { readFileSync, statSync } from 'node:fs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
-import { cascadePolicy } from './policy-cascade.mjs';
+import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { validDefaultBranch } from './default-branch-cache.mjs';
+import { isPinnedQueueEntryCommand } from './merge-queue-enqueue.mjs';
+
+export const FAST_DRAIN_DEFER_KINDS = Object.freeze(new Set([
+  'ordered', 'couple', 'card-group', 'manifest-unreadable', 'red-team-override',
+  'couple-unknown', 'sibling-unreadable', 'hydration-race', 'budget', 'index-age',
+  'index-setting', 'queue-precondition', 'incomplete-context',
+].map(kind => `defer-to-pass:${kind}`)));
+export const FAST_DRAIN_WRITE_KINDS = Object.freeze(new Set([
+  'merge', 'refresh', 'numbering-push', 'retarget', 'dequeue', 'label-removal', 'other-pr',
+  'post-conflict-finding', 'workflow-run', 'labels', 'pr-edit', 'comment', 'pr', 'graphql', 'api', 'gh', 'git', 'exec', 'prior-refusal', 'ledger',
+]));
+export function isFastDrainDeferKind(kind) {
+  return typeof kind === 'string' && (FAST_DRAIN_DEFER_KINDS.has(kind)
+    || kind.startsWith('defer-to-pass:write-boundary:') && FAST_DRAIN_WRITE_KINDS.has(kind.slice('defer-to-pass:write-boundary:'.length)));
+}
 
 /** The cwd-repo sentinel must share the full pass's persistent cache namespace. */
 export function shaCacheRepo(repo, localSlug) {
   return repo || localSlug;
+}
+
+/** Safety bounds: an invalid layer refuses rather than silently falling through to a lower value. */
+export function resolveFastDrainIndexSetting({ env = process.env, tool, platform, readSettings = readDeclaredSettings,
+  readPlatform = readPlatformPreferences } = {}) {
+  const closed = () => ({ ok: false, kind: 'defer-to-pass:index-setting', line: 'fast-drain: defer-to-pass:index-setting' });
+  try {
+    if (tool === undefined) {
+      const settings = readSettings();
+      if (settings.errors?.length || settings.duplicates?.some(d => d.path.startsWith('mergeQueue.fastDrain.index'))) return closed();
+      tool = settings.settings?.mergeQueue?.fastDrain;
+    }
+    if (platform === undefined) {
+      const p = readPlatform({ env });
+      if (p.errors?.length) return closed();
+      platform = p.prefs?.['mergeQueue.fastDrain.index'] !== undefined
+        ? { index: p.prefs['mergeQueue.fastDrain.index'] } : p.prefs?.['mergeQueue.fastDrain'];
+    }
+    const validAge = v => Number.isInteger(v) && v >= 1 && v <= 120;
+    const validBudget = v => Number.isInteger(v) && v >= 0 && v <= 50;
+    for (const block of [tool, platform]) {
+      if (block !== undefined && (block === null || typeof block !== 'object' || Array.isArray(block))) return closed();
+      if (block && Object.hasOwn(block, 'index') && (!block.index || typeof block.index !== 'object' || Array.isArray(block.index))) return closed();
+    }
+    const parseEnv = key => env[key] === undefined ? undefined : /^\d+$/.test(env[key]) ? Number(env[key]) : null;
+    const c = cascadePolicy('mergeQueue.fastDrain.index', tool?.index, { env, platform: platform?.index,
+      standard: { maxAgeMinutes: 40, hydrateBudget: 10 },
+      envValues: { maxAgeMinutes: parseEnv('WE_FAST_DRAIN_INDEX_MAX_AGE_MINUTES'), hydrateBudget: parseEnv('WE_FAST_DRAIN_INDEX_HYDRATE_BUDGET') },
+      valid: { maxAgeMinutes: validAge, hydrateBudget: validBudget }, log: () => {} });
+    if (c.invalid.length) return closed();
+    const { maxAgeMinutes, hydrateBudget } = c.value;
+    if (!validAge(maxAgeMinutes) || !validBudget(hydrateBudget)) return closed();
+    const line = `fast-drain: mergeQueue.fastDrain.index.maxAgeMinutes=${maxAgeMinutes} (${c.sources.maxAgeMinutes}), hydrateBudget=${hydrateBudget} (${c.sources.hydrateBudget})`;
+    return { ok: true, maxAgeMinutes, hydrateBudget, sources: c.sources, line };
+  } catch { return closed(); }
+}
+
+export function assertFastDrainIndexAge(index, { now = Date.now(), maxAgeMinutes = 40 } = {}) {
+  const stamp = index?.fetchedAtMs;
+  if (!Number.isFinite(stamp) || stamp > now || now - stamp >= maxAgeMinutes * 60_000) throw new Error('defer-to-pass:index-age');
+}
+
+export function createFastDrainHydrationBudget(limit) {
+  let used = 0;
+  return { take({ target = false } = {}) {
+    if (!target && ++used > limit) throw new Error('defer-to-pass:budget');
+  }, get used() { return used; } };
 }
 
 /** Resolve standard → platform → tool → env; injected layers keep unit probes deterministic. */
@@ -40,19 +102,101 @@ export function resolveFastDrainListingSetting({ env = process.env, tool, platfo
   const raw = String(env?.WE_FAST_DRAIN_LISTING ?? '').trim().toLowerCase();
   const contextRaw = String(env?.WE_FAST_DRAIN_CONTEXT ?? '').trim().toLowerCase();
   const c = cascadePolicy('mergeQueue.fastDrain', block, {
-    env, standard: { listing: 'snapshot', context: 'snapshot', selfRefresh: 'off' },
-    // selfRefresh deliberately has NO env override: only the settings key (via a settings PR) can enable it.
+    env, standard: { listing: 'snapshot', context: 'snapshot' },
     envValues: { listing: raw || undefined, context: contextRaw || undefined },
-    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live', selfRefresh: (v) => v === 'on' || v === 'off' },
+    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live' },
     ...(platform !== undefined ? { platform } : {}), log: () => {},
   });
   const listing = c.value.listing, source = c.sources.listing;
   const context = c.value.context, contextSource = c.sources.context;
   const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source}), context=${context} (${contextSource})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
-  // mergeQueue.fastDrain.selfRefresh (on|off, standard off, settings only, no env override): catch-up children may refresh a
-  // stale base snapshot themselves. Off, the fast drain refuses on a stale source exactly as before.
-  const selfRefresh = c.value.selfRefresh === 'on';
-  return { listing, source, context, contextSource, selfRefresh, line };
+  return { listing, source, context, contextSource, line };
+}
+
+/** One boundary for injected writers and their subprocesses. Unknown mutations refuse. */
+export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, log = () => {} } = {}) {
+  const limited = writeScope === 'enqueue-only';
+  let confirmed = false;
+  const violations = [];
+  const refuse = kind => {
+    const reason = `defer-to-pass:write-boundary:${kind}`;
+    violations.push(reason);
+    throw Object.assign(new Error(reason), { kind: reason });
+  };
+  const target = (r, n) => { if (limited && (r !== repo || Number(n) !== Number(num))) refuse('other-pr'); };
+  const allow = kind => { if (limited) log(`fast-drain write: ${repo}#${num} ${kind}`); };
+  const labels = (r, n, plan) => {
+    if (!limited) return;
+    target(r, n);
+    if (!Array.isArray(plan?.remove ?? [])) refuse('label-removal');
+    const remove = plan.remove ?? [];
+    if (remove.length && !(plan.add === 'red-team:clear' && remove.every(l => l === 'red-team:pending'))) refuse('label-removal');
+    if (plan.add && !['review:changes', 'red-team:pending', 'red-team:blocked', 'red-team:clear'].includes(plan.add)) refuse('labels');
+  };
+  return {
+    limited, violations, refuse, target, repo, num,
+    fullPassDuty: (fn, fallback) => limited ? fallback : fn(),
+    confirm: () => { confirmed = true; },
+    helper: (kind, fn) => (...args) => {
+      if (limited && !['hold-comment', 'red-team-request', 'local-state', 'operator-feed', 'enqueue'].includes(kind)
+        && !(confirmed && ['clearance-stamp', 'ledger'].includes(kind))) refuse(kind);
+      allow(kind); return fn(...args);
+    },
+    labelProvider: provider => !limited ? provider : { ...provider,
+      // The full pass provisions repository labels; a child only edits target membership.
+      ensureLabel: () => {},
+      setLabels: (r, n, plan) => { labels(r, n, plan); allow('labels'); return provider.setLabels(r, n, plan); },
+    },
+    exec: run => (file, args, options) => {
+      if (!limited) return run(file, args, options);
+      const value = flag => args[args.indexOf(flag) + 1];
+      if (file === 'git') {
+        // Net-diff readers pin these inert settings before the verb. Unknown
+        // configuration stays closed: stripping arbitrary -c options can run aliases.
+        const safeConfig = new Set(['core.quotepath=false', 'color.ui=never', 'diff.noprefix=false',
+          'diff.external=', 'diff.srcPrefix=a/', 'diff.dstPrefix=b/', 'diff.mnemonicPrefix=false',
+          'core.attributesFile=/dev/null']);
+        let verbArgs = args;
+        while (verbArgs[0] === '-c') {
+          if (!safeConfig.has(verbArgs[1])) refuse('git');
+          verbArgs = verbArgs.slice(2);
+        }
+        if (verbArgs[0] === 'push') refuse('numbering-push');
+        if (!(verbArgs[0] === 'commit-graph' && verbArgs[1] === 'verify') && !['diff', 'show', 'ls-tree', 'rev-parse', 'ls-remote', 'fetch', 'cat-file', 'grep', 'remote', 'status', 'log', 'config', 'merge-base'].includes(verbArgs[0])) refuse('git');
+      } else if (file === 'gh') {
+        if (args[0] === 'pr' && !['view', 'list', 'diff', 'checks'].includes(args[1])) {
+          target(args.includes('--repo') ? value('--repo') : repo, args[2]);
+          if (args[1] === 'merge') refuse('merge');
+          if (args[1] === 'update-branch') refuse('refresh');
+          if (args[1] === 'edit') {
+            if (args.includes('--base')) refuse('retarget');
+            const add = args.flatMap((a, i) => a === '--add-label' ? args[i + 1].split(',') : []);
+            const remove = args.flatMap((a, i) => a === '--remove-label' ? args[i + 1].split(',') : []);
+            labels(repo, num, { add: add.length === 1 ? add[0] : add.length ? 'unknown' : null, remove });
+            if (args.some(a => a.startsWith('--') && !['--repo', '--add-label', '--remove-label'].includes(a))) refuse('pr-edit');
+            allow('labels');
+          } else if (args[1] === 'comment') {
+            const body = value('--body');
+            if (!(typeof body === 'string' && (/^<!-- we-drain-poison head=[a-f0-9]{40} kind=bornas-collision /.test(body)
+              || confirmed && body.startsWith('<!-- we-drain-enqueue-clearance head=')))) refuse('comment');
+            allow(confirmed ? 'clearance-stamp' : 'hold-comment');
+          } else refuse('pr');
+        } else if (args[0] === 'api') {
+          const query = args.find(a => typeof a === 'string' && a.startsWith('query='));
+          if (query && /\bmutation\b/.test(query)) {
+            if (query.includes('dequeuePullRequest')) refuse('dequeue');
+            if (!isPinnedQueueEntryCommand(args)) refuse('graphql');
+            if (violations.length) refuse('prior-refusal');
+            allow('enqueue');
+          } else if (args.includes('--method') && value('--method') !== 'GET' || args.includes('-X') && value('-X') !== 'GET'
+            || !query && args.some(a => ['-f', '-F', '--field', '--raw-field', '--input'].includes(a))) refuse('api');
+        } else if (args[0] === 'run') {
+          if (!['view', 'list'].includes(args[1])) refuse('workflow-run');
+        } else if (!(args[0] === 'repo' && args[1] === 'view') && !['pr', 'search'].includes(args[0])) refuse('gh');
+      } else refuse('exec');
+      return run(file, args, options);
+    },
+  };
 }
 
 /** Replace the live target while preserving snapshot context without mutating either input. */

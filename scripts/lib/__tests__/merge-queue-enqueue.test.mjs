@@ -9,6 +9,40 @@ import { classifyStartupFailureGate, handleStaleMergeGate, staleMergeGateRefresh
 import { refreshStalePr as refreshRealStalePr } from '../merge-queue-hook.mjs';
 import { execFileSyncThrottled } from '../gh-throttle.mjs';
 import { reserve, releaseLockDirIf, readLockEntry } from '../../readiness/file-locks.mjs';
+import { strategyFixture, HEAD as FAST_HEAD } from './fixtures/fast-drain-strategy.mjs';
+
+describe('fast-drain final head and label validators', () => {
+  it('late review:hold before the fresh read refuses', () => {
+    const h = strategyFixture({ onLive: n => ({ headRefOid: FAST_HEAD, labels: ['ready-to-merge', ...(n === 2 ? ['review:hold'] : [])] }) });
+    expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ enqueued: false });
+    expect(h.writes).toEqual([]);
+  });
+  it('head moved before the judged read: live-state-unreadable', () => {
+    const h = strategyFixture({ onLive: () => ({ headRefOid: 'b'.repeat(40), labels: ['ready-to-merge'] }) });
+    expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ kind: 'live-state-unreadable' });
+    expect(h.writes).toEqual([]);
+  });
+  it('moved before the mutation: refused via expectedHeadOid, failure recorded', () => {
+    const h = strategyFixture({ mutation: () => JSON.stringify({ errors: [{ message: 'expectedHeadOid does not match' }] }) });
+    expect(() => h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toThrow('expectedHeadOid');
+    expect(h.calls.find(c => c.some(a => a.includes('enqueuePullRequest')))).toEqual(expect.arrayContaining([`sha=${FAST_HEAD}`, expect.stringContaining('expectedHeadOid')]));
+    expect(h.state().enqueueFailures['cwd#7']).toMatchObject({ headSha: FAST_HEAD, kind: 'enqueue-error', count: 1 });
+    expect(h.writes).toEqual(['enqueue']);
+  });
+  it('GraphQL error is not confirmed', () => {
+    const h = strategyFixture({ mutation: () => JSON.stringify({ errors: [{ message: 'permission refused' }] }) });
+    expect(() => h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toThrow('permission refused');
+    expect(h.writes).toEqual(['enqueue']);
+  });
+  it.each([false, 'different-head'])('isInMergeQueue false or head mismatch: unconfirmed (%s)', result => {
+    const h = strategyFixture({ membership: mutated => JSON.stringify({ data: { repository: { pullRequest: {
+      isInMergeQueue: mutated && result !== false, headRefOid: mutated && result === 'different-head' ? 'b'.repeat(40) : FAST_HEAD,
+    } } } }) });
+    expect(() => h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toThrow('unconfirmed');
+    expect(h.state().enqueueFailures['cwd#7'].kind).toBe('unconfirmed');
+    expect(h.writes).toEqual(['enqueue']);
+  });
+});
 
 vi.mock('../gh-throttle.mjs', async importOriginal => ({
   ...await importOriginal(), execFileSyncThrottled: vi.fn(() => { throw new Error('unexpected GitHub IO'); }),

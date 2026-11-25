@@ -19,6 +19,9 @@ const RED_TEAM_PUBLICATION_CONTEXT = redTeamPublicationContext(7);
 import { recordRedTeamStatus } from '../drain-red-team-evidence.mjs';
 
 const HEAD = 'a'.repeat(40);
+it('shadow exits on the strict verdict', () => {
+  expect(applyGateMode({ mode: 'shadow', childStatus: 0, report: { ok: false, prs: [] } }).exitCode).toBe(1);
+});
 const base = () => ({
   repo: 'o/r', num: 7, defaultBranch: 'main',
   pr: { number: 7, title: 't', body: 'A real body', baseRefName: 'main', headRefName: 'lane/x', headRefOid: HEAD, isCrossRepository: false,

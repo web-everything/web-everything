@@ -57,11 +57,9 @@
 # FAILS CLOSED: an input that is unreadable, or that has no shared source CI can reach yet, holds the PR.
 #
 # MODE (`mergeGate.mode`, shadow | enforce; scripts/lib/merge-gate-ci.mjs `loadMergeGateMode`): resolved standard
-# default (shadow) -> platform preference -> repo setting -> env (the MERGE_GATE_MODE repository variable), and the
-# winning source is logged. SHADOW evaluates and prints every rule exactly as enforce, adds "SHADOW: would HOLD on
-# <rules>" to the step summary, and exits 0; it changes only the exit code, never a verdict, and never masks a run
-# with no verdict. Shadow until the shared red-main freeze source lands (#4715 flips the repo setting to enforce).
-# The ruleset step (making `merge-gate` required) needs enforce.
+# default (enforce) -> platform preference -> repo setting -> env (the MERGE_GATE_MODE repository variable).
+# The winning source is logged. Shadow is an observation label: every mode exits on the strict verdict;
+# a HOLD or missing verdict exits 1. The child-start queue precondition relies on that invariant.
 # TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge, gate:refresh — a neutral label the drain toggles after an acceptance restamp so the gate re-reads the thread,
 # review:*). Any other label event is skipped under a DIFFERENT job name (a skipped job counts as passing for a
 # required check, so it must never post as `merge-gate`) and in its own concurrency group (it never cancels a real

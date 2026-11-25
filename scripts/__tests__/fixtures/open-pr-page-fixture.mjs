@@ -5,7 +5,7 @@ export function openPrPageFixture(prs, query) {
   const start = cursor ? Number(JSON.parse(cursor[1])) : 0;
   const end = Math.min(start + size, prs.length);
   const nodes = prs.slice(start, end).map(p => ({
-    number: p.number, title: p.title, url: p.url || '', isDraft: p.isDraft || false,
+    number: p.number, state: p.state || 'OPEN', title: p.title, url: p.url || '', isDraft: p.isDraft || false,
     createdAt: p.createdAt || '2026-10-09T00:00:00Z', updatedAt: p.updatedAt || '2026-10-09T00:00:00Z',
     headRefName: p.headRefName, headRefOid: p.headRefOid, baseRefName: p.baseRefName,
     isCrossRepository: p.isCrossRepository || false, mergeable: p.mergeable,

@@ -12,6 +12,13 @@ import recorded from './fixtures/fast-drain-18-prs.recorded.json';
 import { it, expect, describe } from 'vitest';
 import { classifyChildFailure } from '../lib/child-failure-class.mjs';
 import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
+import { resolveFastDrainListingSetting } from '../lib/fast-drain-scope.mjs';
+
+it('no selfRefresh key; existing cases green', () => {
+  for (const tool of [{}, { selfRefresh: 'on' }]) {
+    expect(resolveFastDrainListingSetting({ env: {}, tool, platform: {} })).not.toHaveProperty('selfRefresh');
+  }
+});
 
 it('negative first: catch-up retains a review:changes block under narrowed reads', () => {
   const result = runFastDrainContextCli({ catchUp: true, rowCount: 18,
@@ -105,14 +112,12 @@ it('catch-up discovers failing CodeQL omitted from a capped PR view even when th
   expect(decision.skipped.some(p => p.num === 7 && /CodeQL/.test(p.reason)), result.stdout).toBe(true);
 });
 
-it('a live default-branch change during membership is read afresh, refuses publication and falls back to slow classification', () => {
+it('a live default-branch change during membership is read afresh without invalidating the identity index', () => {
   const result = runFastDrainContextCli({ catchUp: true, rowCount: 18, branchAfterMembership: 'develop' });
   expect(result.status, result.stderr).toBe(0);
   expect(result.passSnapshotPublished).toBe(false);
-  expect(result.fullListings + result.heavyListings).toBeGreaterThan(0);
-  expect(result.stderr).toContain('default branch changed during membership — discarded pass snapshot; falling back to live listing');
+  expect(result.fullListings + result.heavyListings).toBe(0);
   expect(result.cachedBranch).toBe('develop');
-  expect(result.calls.some(a => a[0] === 'api' && a[1]?.endsWith('/git/ref/heads/develop'))).toBe(true);
   const decision = JSON.parse(result.stdout);
   expect(decision.toMerge).toEqual([]);
   expect(decision.skipped.some(p => p.num === 7 && /base is not develop \(main\)/.test(p.reason))).toBe(true);
@@ -282,38 +287,53 @@ for (const [name, recording] of [['frozen', fixture], ['recorded', recorded]]) {
       listLean: async () => { listings++; return inventory(live); } });
     try {
       const before = [], after = [];
+      let earlyDefers = 0;
       for (const p of live) {
-        const context = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
-          readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
+        // Preserve the full-pass planning parity independently of the new fast refusal.
+        const legacy = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
+          readInventory: () => readFastDrainPassInventory(f.options),
           readFull: async (_repo, n) => live.find(p => p.number === n),
           readManifest: async (_repo, p) => p.manifest ?? p.recordedManifest });
         const fresh = c => live.find(p => p.number === c.num);
         before.push(await productionDecision(new Map([[targetRepo, live]]), targetRepo, p.number, fresh));
-        after.push(await productionDecision(context, targetRepo, p.number, fresh));
+        after.push(await productionDecision(legacy, targetRepo, p.number, fresh));
+        let context;
+        try { context = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
+          readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
+          readFull: async (_repo, n) => live.find(p => p.number === n),
+          readManifest: async (_repo, p) => p.manifest ?? p.recordedManifest }); }
+        catch (error) {
+          // Ordered, coupled and manifest-less targets now leave the full pass to plan them.
+          expect(error.message).toMatch(/^defer-to-pass:(ordered|couple|couple-unknown)$/);
+          earlyDefers++;
+          continue;
+        }
+        expect(await productionDecision(context, targetRepo, p.number, fresh)).toEqual(before.at(-1));
       }
       expect(after).toEqual(before);
+      expect(earlyDefers).toBeGreaterThan(0);
       expect(before.some(p => p.enqueue.length)).toBe(true);
       expect(before.some(p => p.skipped.length || p.deferred.length)).toBe(true);
-      expect(listings).toBe(18);
+      expect(before.length).toBe(18);
+      expect(listings).toBeGreaterThanOrEqual(before.length);
     } finally { f.close(); }
   });
 }
 
-it('listing context reads overlap within the configured bound and preserve the blocked target', async () => {
+it('an ordered target defers before the manifest fan-out', async () => {
   let active = 0, peak = 0;
-  const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7,
+  await expect(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7,
     readSnapshot: () => rows, listLean: async () => inventory(rows), concurrency: 2, failClosed: true,
     readFull: async (_repo, n) => rows.find(p => p.number === n),
-    readManifest: async (_repo, p) => { active++; peak = Math.max(peak, active); await setImmediate(); active--; return p.manifest; } });
-  expect(peak).toBe(2);
-  expect(context.get(repo).find(p => p.number === 8).labels).toContainEqual({ name: 'review:changes' });
+    readManifest: async (_repo, p) => { active++; peak = Math.max(peak, active); await setImmediate(); active--; return p.manifest; } })).rejects.toThrow('defer-to-pass:ordered');
+  expect(peak).toBe(1);
 });
 
 it('catch-up holds on incomplete context without falling back to full pagination', () => {
   const r = runFastDrainContextCli({ catchUp: true, leanIncomplete: true, rowCount: 18 });
-  expect(r.status).not.toBe(0);
+  expect(r.status, r.stderr).toBe(0);
   expect(r.fullListings + r.heavyListings).toBe(0);
-  expect(r.stderr).toContain('retry next pass');
+  expect(JSON.parse(r.stdout).enqueueOutcomes[0].kind).toBe('defer-to-pass:couple-unknown');
 });
 
 for (const invalid of ['TTL expired', 'dirty', 'disabled']) {
@@ -423,7 +443,7 @@ it('main-SHA and minimal inventory reads fan out within gateReads across context
   } finally { f.close(); }
 });
 
-it('a newly opened blocker prevents enqueue during valid pass reuse with unchanged main and TTL', async () => {
+it('a target with its own ordering defers even when its blocker is absent from the index', async () => {
   const target = rows[0], blocker = rows[1];
   let live = [target], snapshotReads = 0, membershipReads = 0;
   const fullReads = [];
@@ -434,15 +454,13 @@ it('a newly opened blocker prevents enqueue during valid pass reuse with unchang
     readFull: async (_repo, number) => { fullReads.push(number); return live.find(p => p.number === number); },
     readManifest: async (_repo, p) => p.manifest });
   try {
-    expect((await productionDecision(await context(), repo, target.number, () => target)).enqueue).toEqual([7]);
+    await expect(context()).rejects.toThrow('defer-to-pass:ordered');
     // The same main SHA and clock keep the pass valid; opening this PR does not move main.
     live = [target, blocker];
-    const decision = await productionDecision(await context(), repo, target.number, () => target);
-    expect(decision.enqueue).toEqual([]);
-    expect(decision.deferred.map(([num, waitOn]) => [num, waitOn])).toEqual([[7, [108]]]);
-    expect(membershipReads).toBe(2);
-    expect(snapshotReads).toBe(3);
-    expect(fullReads).toEqual([7, 7, 8]);
+    await expect(context()).rejects.toThrow('defer-to-pass:ordered');
+    expect(membershipReads).toBe(0);
+    expect(snapshotReads).toBe(0);
+    expect(fullReads).toEqual([7, 7]);
   } finally { f.close(); }
 });
 
@@ -456,7 +474,7 @@ it('valid pass reuse fails closed when live membership revalidation is unreadabl
     ]) {
       await expect(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7,
         readInventory: () => readFastDrainPassInventory({ ...f.options, listLean }), failClosed: true,
-        readFull: async (_repo, number) => rows.find(p => p.number === number), readManifest: async (_repo, p) => p.manifest,
+        readFull: async (_repo, number) => rows.find(p => p.number === number), readManifest: async (_repo, p) => ({ ...p.manifest, blockedBy: [], stackParents: [], repos: [] }),
       })).rejects.toThrow(/incomplete pass context.*retry next pass/);
     }
   } finally { f.close(); }
@@ -472,7 +490,8 @@ for (const conclusion of ['FAILURE', 'SUCCESS']) {
     expect(result.fullListings + result.heavyListings).toBe(0);
     expect(result.calls.some(a => a[0] === 'pr' && a[1] === 'view' && a[2] === '8'
       && a[a.indexOf('--json') + 1].includes('statusCheckRollup'))).toBe(true);
-    expect(JSON.parse(result.stdout).reconciledLabels).toContain(8);
+    expect(JSON.parse(result.stdout).enqueueOutcomes[0].kind).toBe('defer-to-pass:budget');
+    expect(result.calls.filter(a => a[0] === 'pr' && a[1] === 'edit')).toEqual([]);
   });
 }
 
@@ -483,16 +502,14 @@ it('production couple health holds an impl when its same-head carrier gained a l
     repos: [{ repo: 'we', ref: rows[15].headRefName }, { repo: 'fui', ref: impl.headRefName }] } };
   const liveCarrier = { ...carrier, labels: [{ name: 'review:changes' }] };
   const byRepo = new Map([[repo, [liveCarrier]], [implRepo, [impl]]]);
-  const context = await readFastDrainContext({ repos: [...byRepo.keys()], targetRepo: implRepo, onlyPr: impl.number,
+  await expect(readFastDrainContext({ repos: [...byRepo.keys()], targetRepo: implRepo, onlyPr: impl.number,
     readSnapshot: r => r === repo ? [carrier] : [impl], listLean: async r => inventory(byRepo.get(r)), failClosed: true,
-    readFull: async (r, n) => byRepo.get(r).find(p => p.number === n), readManifest: async (_r, p) => p.manifest });
+    readFull: async (r, n) => byRepo.get(r).find(p => p.number === n), readManifest: async (_r, p) => p.manifest })).rejects.toThrow('defer-to-pass:couple-unknown');
   const fresh = () => impl;
   const before = await productionDecision(byRepo, implRepo, impl.number, fresh);
-  const after = await productionDecision(context, implRepo, impl.number, fresh);
-  expect(after).toEqual(before);
-  expect(after.health[0][1].held).toBe(true);
-  expect(after.deferred).toHaveLength(1);
-  expect(after.enqueue).toEqual([]);
+  expect(before.health[0][1].held).toBe(true);
+  expect(before.deferred).toHaveLength(1);
+  expect(before.enqueue).toEqual([]);
   // A positive control makes the live carrier refresh load-bearing.
   const stale = await productionDecision(new Map([[repo, [carrier]], [implRepo, [impl]]]), implRepo, impl.number, fresh);
   expect(stale.enqueue).toEqual([impl.number]);
@@ -653,11 +670,8 @@ for (const number of [7, 8]) {
     expect(result.calls.some(a => a[0] === 'api' && a[1]?.includes(`${sha}/check-runs?`)
       && a.includes('--paginate') && a.includes('--slurp'))).toBe(true);
     const decision = JSON.parse(result.stdout);
-    expect(decision.reconciledLabels).toContain(number);
-    if (number === 7) {
-      expect(decision.toMerge).toEqual([]);
-      expect(decision.skipped.some(p => p.num === 7 && /required check/.test(p.reason))).toBe(true);
-    }
+    expect(decision.enqueueOutcomes[0].kind).toBe('defer-to-pass:budget');
+    expect(decision.toMerge).toEqual([]);
   });
 }
 
@@ -731,10 +745,15 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t, targetMaxAgeMs: 60_000,
       readInventory: async () => { await setImmediate(); t += 90_000; return { snapshots: new Map([[repo, rows]]) }; },
       readSnapshot: () => rows, listLean: async () => inventory(rows),
-      readFull: async (_repo, n) => { if (n === 7) targetReads++; return rows.find(p => p.number === n); },
-      readManifest: async (_repo, p) => p.manifest });
+      readFull: async (_repo, n) => {
+        const row = rows.find(p => p.number === n);
+        if (n === 7 && ++targetReads === 2) return { ...row, labels: [{ name: 'review:hold' }] };
+        return row;
+      },
+      readManifest: async (_repo, p) => ({ ...p.manifest, blockedBy: [], stackParents: [], repos: [] }) });
     expect(context.get(repo)).toBeTruthy();
     expect(targetReads).toBe(2);
+    expect(context.get(repo).find(p => p.number === 7).labels).toEqual([{ name: 'review:hold' }]);
   });
 
   it('a main move or an expiry while reading membership after a refresh is rejected, not published', async () => {
@@ -772,7 +791,7 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
       await expect(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true,
         readInventory: () => readFastDrainPassInventory({ ...f.options, readSnapshot: () => null }),
         readSnapshot: () => null, listLean: async () => inventory(rows), readFull: async (_r, n) => { refreshCalls++; return rows.find(p => p.number === n); },
-        readManifest: async (_r, p) => p.manifest })).rejects.toThrow(/incomplete pass context \(snapshot unavailable\/disabled\/stale\/dirty/);
+        readManifest: async (_r, p) => ({ ...p.manifest, blockedBy: [], stackParents: [], repos: [] }) })).rejects.toThrow(/incomplete pass context \(snapshot unavailable\/disabled\/stale\/dirty/);
       expect(classifyChildFailure('merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty — retry next pass) — retry next pass'))
         .toBe('incomplete-context');
       // A slow target read is not re-read while OFF (default bound is unlimited), as on main.
@@ -780,7 +799,7 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
       await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t,
         readInventory: async () => { await setImmediate(); t += 90_000; return { snapshots: new Map([[repo, rows]]) }; },
         readSnapshot: () => rows, listLean: async () => inventory(rows),
-        readFull: async (_r, n) => { if (n === 7) reads++; return rows.find(p => p.number === n); }, readManifest: async (_r, p) => p.manifest });
+        readFull: async (_r, n) => { if (n === 7) reads++; return rows.find(p => p.number === n); }, readManifest: async (_r, p) => ({ ...p.manifest, blockedBy: [], stackParents: [], repos: [] }) });
       expect(reads).toBe(1);
     } finally { f.close(); }
   });

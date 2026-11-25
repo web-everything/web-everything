@@ -188,6 +188,13 @@ export function buildEnqueueArgs({ nodeId, headSha }) {
   return ['api', 'graphql', '-f', `query=${ENQUEUE_MUTATION}`, '-f', `id=${nodeId}`, '-f', `sha=${headSha}`];
 }
 
+/** The enqueue-only executor accepts only this module's complete, head-pinned command. */
+export function isPinnedQueueEntryCommand(args) {
+  return Array.isArray(args) && args.length === 8 && args[0] === 'api' && args[1] === 'graphql'
+    && args[2] === '-f' && args[3] === `query=${ENQUEUE_MUTATION}` && args[4] === '-f'
+    && /^id=\S+$/.test(args[5]) && args[6] === '-f' && /^sha=[a-f0-9]{40}$/.test(args[7]);
+}
+
 /**
  * Transport for the explicitly instructed operator operation. Keep mutation dispatch in this module;
  * the caller owns its operator gates, credential environment, response handling and queue verification.

@@ -11,7 +11,49 @@ import { fetchPrReadsCached, prReadCacheIdentity, reduceOpenPrContext, planDrain
 import {
   shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, mergeLiveTargetIntoRows, shouldReadContextCommits,
   filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt,
+  resolveFastDrainIndexSetting, assertFastDrainIndexAge, createFastDrainHydrationBudget,
 } from '../fast-drain-scope.mjs';
+
+describe('fast-drain identity index bounds', () => {
+  it('ships fastDrain.index settings with bounded defaults', () => {
+    const settings = JSON.parse(readFileSync(resolve('scripts/settings/merge-queue.json'), 'utf8'));
+    expect(settings.mergeQueue.fastDrain.index).toEqual({ maxAgeMinutes: 40, hydrateBudget: 10 });
+  });
+  const setting = options => resolveFastDrainIndexSetting({ env: {}, tool: {}, platform: {}, ...options });
+  it('age at cap −1 ms accepted, at cap deferred', () => {
+    expect(() => assertFastDrainIndexAge({ fetchedAtMs: 1 }, { now: 2_400_000, maxAgeMinutes: 40 })).not.toThrow();
+    expect(() => assertFastDrainIndexAge({ fetchedAtMs: 0 }, { now: 2_400_000, maxAgeMinutes: 40 })).toThrow('defer-to-pass:index-age');
+  });
+  it.each([undefined, NaN, Infinity, 101])('future, missing or NaN fetchedAtMs: index-age: %s', fetchedAtMs => {
+    expect(() => assertFastDrainIndexAge({ fetchedAtMs }, { now: 100, maxAgeMinutes: 40 })).toThrow('defer-to-pass:index-age');
+  });
+  it('budget 0 with one re-read defers', () => expect(() => createFastDrainHydrationBudget(0).take()).toThrow('defer-to-pass:budget'));
+  it('budget N ok, N+1 defers', () => {
+    const budget = createFastDrainHydrationBudget(2); budget.take(); budget.take();
+    expect(() => budget.take()).toThrow('defer-to-pass:budget');
+  });
+  it('related and race reads count, target re-read does not', () => {
+    const budget = createFastDrainHydrationBudget(2);
+    budget.take({ target: true }); budget.take({ target: true });
+    budget.take({ reason: 'related' }); budget.take({ reason: 'race' });
+    expect(() => budget.take()).toThrow('defer-to-pass:budget');
+  });
+  it.each([0, 121, 1.5, null, 'x'])("maxAgeMinutes 0, 121, 1.5, null or 'x', and unreadable settings: index-setting: %s", value => {
+    for (const layer of ['tool', 'platform']) expect(setting({ [layer]: { index: { maxAgeMinutes: value } } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
+  });
+  it.each([-1, 0.5, null, 51, 'x'])('hydrateBudget invalid layers: %s', value => {
+    for (const layer of ['tool', 'platform']) expect(setting({ [layer]: { index: { hydrateBudget: value } } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
+  });
+  it('unreadable settings: index-setting', () => {
+    expect(setting({ tool: undefined, readSettings: () => { throw new Error('EACCES'); } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
+    expect(setting({ tool: undefined, readSettings: () => ({ errors: [{ error: 'bad JSON' }], settings: {} }) })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
+  });
+  it('index settings resolve independently and log provenance', () => {
+    const s = setting({ platform: { index: { hydrateBudget: 4 } }, tool: { index: { maxAgeMinutes: 20 } } });
+    expect(s).toMatchObject({ ok: true, maxAgeMinutes: 20, hydrateBudget: 4 });
+    expect(s.line).toMatch(/maxAgeMinutes=20 \(tool\).*hydrateBudget=4 \(platform\)/);
+  });
+});
 
 describe('fast drain scope', () => {
   it('normalizes the local cache repo without changing an explicit repo', () => {
@@ -189,16 +231,16 @@ describe('legacy manifest revision identity', () => {
 describe('fast drain listing', () => {
   const resolve = (options = {}) => resolveFastDrainListingSetting({ env: {}, tool: {}, platform: {}, ...options });
   it('defaults to snapshot from the standard', () => {
-    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', context: 'snapshot', contextSource: 'standard', selfRefresh: false, line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard), context=snapshot (standard)' });
+    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', context: 'snapshot', contextSource: 'standard', line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard), context=snapshot (standard)' });
   });
-  it('selfRefresh is OFF by default, on only for tool/env "on", and ignores invalid values', () => {
-    expect(resolve().selfRefresh).toBe(false);
-    expect(resolve({ tool: { selfRefresh: 'on' } }).selfRefresh).toBe(true);
+  it('removed selfRefresh settings cannot enable a child refresh', () => {
+    expect(resolve()).not.toHaveProperty('selfRefresh');
+    expect(resolve({ tool: { selfRefresh: 'on' } })).not.toHaveProperty('selfRefresh');
     for (const v of ['1', 'on', 'true']) {
-      expect(resolve({ env: { WE_FAST_DRAIN_SELF_REFRESH: v } }).selfRefresh, `env WE_FAST_DRAIN_SELF_REFRESH=${v} has no effect; behaviour stays OFF`).toBe(false);
+      expect(resolve({ env: { WE_FAST_DRAIN_SELF_REFRESH: v } })).not.toHaveProperty('selfRefresh');
     }
-    expect(resolve({ tool: { selfRefresh: 'yes' } }).selfRefresh).toBe(false);
-    expect(resolve({ tool: { selfRefresh: true } }).selfRefresh).toBe(false);
+    expect(resolve({ tool: { selfRefresh: 'yes' } })).not.toHaveProperty('selfRefresh');
+    expect(resolve({ tool: { selfRefresh: true } })).not.toHaveProperty('selfRefresh');
   });
   it('resolves platform, tool and env in cascade order', () => {
     expect(resolve({ platform: { listing: 'live' } })).toMatchObject({ listing: 'live', source: 'platform' });

@@ -14,7 +14,7 @@ import { OPEN_PR_LIST_LIMIT } from '../lib/no-search-backed-pr-list.mjs';
 import { runFastDrainContextCli } from './fixtures/fast-drain-context-cli.mjs';
 
 process.env.WE_UNDER_TEST = '1';
-const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass } = await import('../merge-ai-prs.mjs');
+const { planLabelDrain, revalidateForMerge, classifyPr, buildDrainVerdicts, prepareDrainVerdicts, planDrainPass, buildOverlapRows, refineOverlapRowsToNetDiff } = await import('../merge-ai-prs.mjs');
 const repo = 'fixture/repo', other = 'fixture/frontierui';
 const manifest = (item, blockedBy = [], stackParents = []) => ({ item, blockedBy, stackParents, repos: [] });
 const pr = (number, extra = {}) => ({
@@ -27,6 +27,170 @@ const pr = (number, extra = {}) => ({
 });
 const inventory = (rows, extra = {}) => ({ rows, totalCount: rows.length, hasNextPage: false, truncated: false, ...extra });
 const lean = p => Object.fromEntries(LEAN_OPEN_PR_FIELDS.split(',').map(f => [f, p[f]]));
+
+test('main moved between two reads: the second net-diff read is fresh, not cached by headSha@baseRefName', () => {
+  const x = { repo, number: 7, headSha: 'f13-target', baseRefName: 'main', files: [{ path: 'shared' }] };
+  const y = { ...x, number: 8, headSha: 'f13-partner' };
+  let moved = false;
+  const reads = [];
+  const readFiles = ({ headSha }) => { reads.push(headSha); return { files: moved ? ['after-main-moved'] : ['shared'] }; };
+  const options = { candidateRows: [x], openPrRows: [x, y], localSlug: repo, readFiles, fastDrain: true };
+  refineOverlapRowsToNetDiff(options);
+  moved = true;
+  const second = refineOverlapRowsToNetDiff(options);
+  assert.deepEqual(reads, ['f13-target', 'f13-partner', 'f13-target', 'f13-partner']);
+  assert.deepEqual(second.openPrRows[1].files.map(f => f.path), ['after-main-moved']);
+});
+
+test('an unreadable partner net diff defers fast drain and retains the full-pass listed hold', () => {
+  const x = { repo, number: 7, headSha: 'c'.repeat(40), baseRefName: 'main', files: [{ path: 'shared' }] };
+  const y = { ...x, number: 8, headSha: 'd'.repeat(40) };
+  const options = { candidateRows: [x], openPrRows: [x, y], localSlug: repo,
+    readFiles: ({ headSha }) => headSha === y.headSha ? { error: 'unreadable net diff' } : { files: [] } };
+  assert.throws(() => refineOverlapRowsToNetDiff({ ...options, fastDrain: true }), /defer-to-pass:incomplete-context/);
+  assert.deepEqual(refineOverlapRowsToNetDiff({ ...options, cache: new Map() }), { candidateRows: [x], openPrRows: [x, y] });
+});
+
+function hardenedContext({ target = pr(7, { manifest: manifest(107) }), siblings = [pr(8, { manifest: manifest(108) })],
+  targetManifest = p => p.manifest, siblingRead, groups = { groups: [] }, fullRead } = {}) {
+  const calls = [], logs = [];
+  const rows = new Map([[repo, [target]], [other, siblings]]);
+  const promise = readFastDrainContext({ repos: [repo, other], targetRepo: repo, onlyPr: 7, failClosed: true,
+    readSnapshot: r => rows.get(r),
+    listLean: r => { if (r === other && siblingRead) return siblingRead(); return inventory(rows.get(r).map(lean)); },
+    readFull: (r, n) => { calls.push(`${r}#${n}`); return fullRead ? fullRead(r, n) : rows.get(r).find(p => p.number === n); },
+    readManifest: (_r, p) => targetManifest(p), readGroups: () => groups, log: line => logs.push(line),
+  });
+  return { promise, calls, logs };
+}
+test('own blockedBy defers before related reads', async () => {
+  const h = hardenedContext({ target: pr(7, { manifest: manifest(107, [108]) }) });
+  await assert.rejects(h.promise, /defer-to-pass:ordered/);
+  assert.deepEqual(h.calls, [`${repo}#7`]);
+});
+test('legacy tree manifest with blockedBy defers', async () => {
+  const h = hardenedContext({ target: pr(7), targetManifest: () => manifest(107, [108]) });
+  await assert.rejects(h.promise, /defer-to-pass:ordered/);
+});
+test('tree read 500 defers manifest-unreadable', async () => {
+  const h = hardenedContext({ targetManifest: () => { throw new Error('HTTP 500'); } });
+  await assert.rejects(h.promise, /defer-to-pass:manifest-unreadable/);
+});
+test('manifest-less impl referenced from the frontierui carrier defers couple', async () => {
+  const h = hardenedContext({ target: pr(7), siblings: [pr(8, { manifest: { ...manifest(108), repos: [{ ref: 'lane/7' }] } })] });
+  await assert.rejects(h.promise, /defer-to-pass:couple-unknown/);
+});
+test('transitive A→B→target via deps defers couple', async () => {
+  const h = hardenedContext({ siblings: [pr(8, { manifest: manifest(108, [107]) }), pr(9, { manifest: manifest(109, [108]) })] });
+  await assert.rejects(h.promise, /defer-to-pass:couple/);
+  assert.ok(h.logs.some(line => line.includes(`${other}#8`) && line.includes(`${other}#9`)));
+});
+test('overlap-only partner does not defer and is read live', async () => {
+  const target = pr(7, { manifest: manifest(107) }), partner = pr(8, { files: target.files, manifest: manifest(108) });
+  const calls = [];
+  const rows = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true,
+    readSnapshot: () => [target, partner], listLean: () => inventory([target, partner].map(lean)),
+    readFull: (_r, n) => { calls.push(n); return n === 7 ? target : partner; }, readManifest: (_r, p) => p.manifest });
+  assert.deepEqual(calls, [7, 8]); assert.equal(rows.get(repo).length, 2);
+});
+test('card-group co-member defers', async () => {
+  const h = hardenedContext({ groups: { groups: [{ repo, pr: 7, sources: [{ num: 8 }] }] } });
+  await assert.rejects(h.promise, /defer-to-pass:card-group/);
+});
+test('sibling inventory throws: sibling-unreadable', async () => {
+  // The final orchestrator ruling replaces sibling-unreadable with couple-unknown.
+  const h = hardenedContext({ siblingRead: () => { throw new Error('HTTP 500'); } });
+  await assert.rejects(h.promise, /defer-to-pass:couple-unknown/);
+});
+test('manifest-less target with incomplete sibling read defers', async () => {
+  const h = hardenedContext({ target: pr(7), siblingRead: () => inventory([], { totalCount: 1 }) });
+  await assert.rejects(h.promise, /defer-to-pass:couple-unknown/);
+});
+test('same number in two repos never cross-matches', async () => {
+  const h = hardenedContext({ siblings: [pr(7, { manifest: manifest(207), headRefName: 'lane/other' })] });
+  const rows = await h.promise;
+  assert.equal(rows.get(other)[0].manifest.item, 207);
+});
+
+function identityContext({ observed = 3000, heavy = observed, snapshotPatch = {}, livePatch = {}, fullPatch = {},
+  budget = 10, now = 600_000, includePartner = false, readFull } = {}) {
+  const epoch = Date.parse('2026-11-18T12:00:00Z');
+  const target = pr(7, { manifest: manifest(107) });
+  const partner = pr(8, { manifest: manifest(108), ...(includePartner ? { files: target.files } : {}) });
+  const cached = { ...partner, ...snapshotPatch }, live = { ...partner, ...livePatch };
+  const calls = [];
+  const promise = readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true,
+    indexSetting: { ok: true, maxAgeMinutes: 40, hydrateBudget: budget }, now: () => epoch + now,
+    readSnapshot: () => ({ repo, fetchedAtMs: epoch + observed, prs: [target, cached], heavyMeta: heavy === null ? {} : { 8: { fetchedAtMs: epoch + heavy } } }),
+    listLean: () => inventory([target, live].map(lean)),
+    readFull: (r, n) => { calls.push(n); return readFull ? readFull(r, n, calls) : n === 7 ? target : { ...live, ...fullPatch }; },
+    readManifest: (_r, p) => p.manifest,
+  });
+  return { promise, calls };
+}
+test('delayed consumption: row obs S+0.4 s with updatedAt S is re-read 10 min later', async () => {
+  const h = identityContext({ observed: 400 }); await h.promise; assert.deepEqual(h.calls, [7, 8]);
+});
+test('obs at S+3 s is trusted', async () => {
+  const h = identityContext(); await h.promise; assert.deepEqual(h.calls, [7]);
+});
+test('missing heavyMeta is re-read', async () => {
+  const h = identityContext({ heavy: null }); await h.promise; assert.deepEqual(h.calls, [7, 8]);
+});
+test('provenance boundary cases', async () => {
+  for (const heavy of [2999, NaN, Infinity, -1, 700_000]) {
+    const h = identityContext({ heavy }); await h.promise; assert.deepEqual(h.calls, [7, 8]);
+  }
+});
+test('updatedAt or head change is re-read', async () => {
+  for (const livePatch of [{ updatedAt: '2026-11-18T12:00:01Z' }, { headRefOid: 'b'.repeat(40) }]) {
+    const h = identityContext({ livePatch }); await h.promise; assert.deepEqual(h.calls, [7, 8]);
+  }
+});
+test('race twice: hydration-race', async () => {
+  const h = identityContext({ observed: 400, fullPatch: { updatedAt: '2026-11-18T12:00:02Z' } });
+  await assert.rejects(h.promise, /defer-to-pass:hydration-race/);
+  assert.deepEqual(h.calls, [7, 8, 8]);
+});
+test('stale-green overlap row: yield kept from the live read', async () => {
+  const h = identityContext({ includePartner: true, fullPatch: { labels: [{ name: 'review:changes' }], mergeStateStatus: 'BLOCKED' } });
+  const rows = await h.promise;
+  assert.equal(rows.get(repo)[1].mergeStateStatus, 'BLOCKED'); assert.deepEqual(h.calls, [7, 8]);
+});
+test('partner red in a stale index but green live is kept and net-diffed', async () => {
+  const h = identityContext({ includePartner: true,
+    snapshotPatch: { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } });
+  const context = await h.promise;
+  const verdicts = [{ repo, num: 7, decision: 'merge' }];
+  const rows = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext: { prsByRepo: context }, localSlug: repo });
+  const reads = [];
+  const refined = refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, fastDrain: true,
+    readFiles: ({ headSha }) => { reads.push(headSha); return { files: ['src/7.mjs'] }; } });
+  assert.deepEqual(h.calls, [7, 8]);
+  assert.deepEqual(refined.openPrRows.map(p => p.number), [7, 8]);
+  assert.deepEqual(reads, [pr(7).headRefOid, pr(8).headRefOid]);
+});
+test('partner red live is dropped', async () => {
+  const h = identityContext({ includePartner: true,
+    fullPatch: { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' }] } });
+  const context = await h.promise;
+  const verdicts = [{ repo, num: 7, decision: 'merge' }];
+  const rows = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext: { prsByRepo: context }, localSlug: repo });
+  const reads = [];
+  refineOverlapRowsToNetDiff({ ...rows, localSlug: repo, fastDrain: true,
+    readFiles: ({ headSha }) => { reads.push(headSha); return { files: ['src/7.mjs'] }; } });
+  assert.deepEqual(h.calls, [7, 8]);
+  assert.deepEqual(rows.openPrRows.map(p => p.number), [7]);
+  assert.deepEqual(reads, []);
+});
+test('missing files cannot remove an overlap hold', async () => {
+  const h = identityContext({ snapshotPatch: { files: undefined }, fullPatch: { files: undefined } });
+  await assert.rejects(h.promise); assert.ok(h.calls.includes(8));
+});
+test('closed or absent row is dropped', async () => {
+  const h = identityContext({ snapshotPatch: { number: 9, state: 'CLOSED' } });
+  const rows = await h.promise; assert.deepEqual(rows.get(repo).map(p => p.number), [7, 8]);
+});
 
 async function run({ snapshot = [pr(7), pr(8)], live = snapshot, full = live, leanRead, snapshotRead,
   readFull, groups, setting = {}, enabled = true, repos = [repo], manifests = new Map() } = {}) {
@@ -250,9 +414,8 @@ test('failed live default-branch resolution fails closed even with a cached hint
     assert.equal(live.status, 0, live.stderr);
     const result = JSON.parse(live.stdout);
     assert.deepEqual(result.toMerge, []);
-    assert.deepEqual(result.enqueueOutcomes ?? [], []);
-    assert.ok(result.skipped.some(v => /default branch unresolved live/.test(v.reason)), live.stdout);
-    assert.match(live.stderr, /default branch unresolved live .* — deferring merge\/enqueue/);
+    assert.equal(result.enqueueOutcomes[0].kind, 'defer-to-pass:queue-precondition');
+    assert.match(live.stderr, /defer-to-pass:queue-precondition/);
   }
 });
 
@@ -279,8 +442,8 @@ test('cached main and parent round main cannot authorize a PR when live default 
     assert.ok(result.skipped.some(v => v.num === 7 && v.reason === 'base is not develop (main)'), live.stdout);
     assert.equal(live.cachedBranch, 'develop');
     const branchCalls = live.calls.filter(a => a[0] === 'repo' && a[1] === 'view');
-    assert.equal(branchCalls.length, 1);
-    const branchIndex = live.calls.indexOf(branchCalls[0]);
+    assert.equal(branchCalls.length, 2); // child-start precondition, then gate-time authorization
+    const branchIndex = live.calls.indexOf(branchCalls[1]);
     assert.ok(live.calls.every((a, i) => !(a[0] === 'pr' && a[1] === 'list'
       || a[0] === 'api' && a.some(v => v.includes('pullRequests(states:OPEN'))) || i < branchIndex));
     if (!killSwitch) assert.equal(live.fullListings, 0);
@@ -379,12 +542,12 @@ test('uncertified flattened lean rows cannot bypass the shared inventory guard',
   assert.equal(calls.fullPages, 1);
 });
 
-test('real CLI falls back to full listing when lean GraphQL silently omits rows', () => {
+test('real CLI defers couple-unknown when lean GraphQL silently omits rows', () => {
   const live = runFastDrainContextCli({ leanIncomplete: true });
   assert.equal(live.status, 0, live.stderr);
   assert.ok(live.leanListings > 0);
-  assert.ok(live.fullListings > 0);
-  assert.match(live.stderr, /fast-drain: context fell back to full listing.*1 unique of 48/);
+  assert.equal(live.fullListings, 0);
+  assert.equal(JSON.parse(live.stdout).enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
 });
 
 test('real CLI accepts a complete two-page lean inventory without heavy listing', () => {
@@ -395,27 +558,25 @@ test('real CLI accepts a complete two-page lean inventory without heavy listing'
   assert.equal(live.heavyListings, 0);
 });
 
-test('real fast drain does not enqueue when incomplete lean inventory falls back to a full listing short by one row', () => {
+test('real fast drain does not enqueue when incomplete lean and full inventories omit a row', () => {
   const live = runFastDrainContextCli({ rowCount: 2, leanIncomplete: true, fullIncomplete: true });
-  assert.equal(live.status, 4, live.stderr);
+  assert.equal(live.status, 0, live.stderr);
   assert.equal(live.leanListings, 1);
-  assert.equal(live.fullListings, 1);
-  assert.match(live.stderr, /fast-drain: context fell back to full listing.*1 unique of 2 open PRs/);
+  assert.equal(live.fullListings, 0);
   const result = JSON.parse(live.stdout);
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, 'gh-error');
-  assert.match(result.detail, /failed \[unreadable\].*1 unique of 2 open PRs/);
-  assert.equal(Object.hasOwn(result, 'toMerge'), false);
+  assert.equal(result.ok, true);
+  assert.equal(result.enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
+  assert.deepEqual(result.toMerge, []);
   assert.equal(live.calls.some(a => a[0] === 'pr' && a[1] === 'merge'
     || a.some(v => v.includes('enqueuePullRequest'))), false);
 });
 
-test('real CLI falls back when the second lean GraphQL page fails', () => {
+test('real CLI defers couple-unknown when the second lean GraphQL page fails', () => {
   const live = runFastDrainContextCli({ rowCount: 101, leanPageError: true });
   assert.equal(live.status, 0, live.stderr);
   assert.equal(live.leanListings, 2);
-  assert.ok(live.fullListings > 0);
-  assert.match(live.stderr, /fast-drain: context fell back to full listing.*fixture lean page error/);
+  assert.equal(live.fullListings, 0);
+  assert.equal(JSON.parse(live.stdout).enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
 });
 
 test('revalidateForMerge refuses a green develop PR when default-branch evidence is omitted', () => {
@@ -479,8 +640,11 @@ test('real fast drain with a null target base defers after both snapshot and liv
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout);
     assert.deepEqual(result.toMerge, []);
-    assert.deepEqual(result.enqueueOutcomes ?? [], []);
-    assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
-    if (!killSwitch) assert.match(run.stderr, /fast-drain: context fell back to full listing.*base branch unreadable/);
+    if (!killSwitch) {
+      assert.equal(result.enqueueOutcomes[0].kind, 'defer-to-pass:incomplete-context');
+    } else {
+      assert.deepEqual(result.enqueueOutcomes ?? [], []);
+      assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
+    }
   }
 });

@@ -4,21 +4,36 @@ import { drainScoredGit } from './drain-scored-git.mjs';
 import { openPrPageFixture } from './open-pr-page-fixture.mjs';
 
 function prestageGh(process, fs, page) {
-const a = process.argv.slice(2), pr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const a = process.argv.slice(2), rootPr = JSON.parse(fs.readFileSync(process.env.PRESTAGE_PR, 'utf8'));
+const commit = a.find(x => /\/commits\/([a-f0-9]{40})\//.test(x))?.match(/\/commits\/([a-f0-9]{40})\//)?.[1];
+const pr = (rootPr.contextPartners ?? []).find(p => a[0] === 'pr' && a[1] === 'view' && p.number === Number(a[2]) || commit && p.headRefOid === commit) ?? rootPr;
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(a) + '\n');
 // Synchronous writes: an async pipe write past 8KB would be cut off by the exit.
 const out = x => { if (a.includes('-i')) fs.writeSync(1, 'HTTP/2 200 OK\n\n'); fs.writeSync(1, typeof x === 'string' ? x : JSON.stringify(x)); process.exit(0); };
 if (a[0] === 'repo') {
+  if (a.includes('url')) out('https://github.com/' + process.env.PRESTAGE_REPO);
   if (process.env.PRESTAGE_FAIL_BRANCH === '1') { fs.writeSync(2, 'fixture live default branch unreadable'); process.exit(1); }
   out(process.env.PRESTAGE_DEFAULT_BRANCH ?? 'main');
 }
 if (a[0] === 'pr' && ['list', 'view'].includes(a[1]) && a.includes('--repo') && a[a.indexOf('--repo') + 1] !== process.env.PRESTAGE_REPO) out([]);
 if (a[0] === 'pr' && a[1] === 'list' && a.includes('--base')) out(pr.stacked || []);
 if (a[0] === 'pr' && a[1] === 'list') out([pr]);
-if (a[0] === 'pr' && a[1] === 'view') out(pr);
+if (a[0] === 'pr' && a[1] === 'view') {
+  if (pr.fullReadFails) { fs.writeSync(2, 'fixture partner full read failed'); process.exit(1); }
+  out(pr);
+}
 if (a[0] === 'api') {
   if (a[1] === 'user') out('chalbert');
   const path = a.find(x => x.startsWith('repos/')) || '';
+  if (path.includes('/rules/branches/') && path.includes('per_page=100')) {
+    const rules = pr.queuePrecondition === false ? [] : [
+    {type:'merge_queue'},
+    {type:'required_status_checks',parameters:{required_status_checks:['test','smoke','daemon-soak','soak-replay-gate','merge-gate'].map(context=>({context,integration_id:15368}))}},
+    {type:'workflows',parameters:{workflows:['ci.yml','soak-replay-gate.yml','merge-gate.yml'].map(name=>({path:'.github/workflows/'+name,ref:'refs/heads/main',repository_id:1142650361}))}}
+    ];
+    out(a.includes('--slurp') ? [rules] : rules);
+  }
+  if (path === 'repos/'+process.env.PRESTAGE_REPO) out({id:1142650361});
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
   if (path.includes('/comments')) out([pr.comments]);
@@ -43,7 +58,7 @@ if (a[0] === 'api') {
     if (q.includes('mergeQueue(')) out({ data: { repository: { mergeQueue: { entries: { nodes:[],pageInfo:{hasNextPage:false} } } } } });
     const [owner, name] = process.env.PRESTAGE_REPO.split('/');
     if (q.includes('pullRequests(') && !q.includes('repository(owner:"'+owner+'",name:"'+name+'")')) out(page([], q));
-    out(page([pr], q));
+    out(page([pr, ...(pr.contextPartners ?? [])], q));
   }
 }
 out([]);
@@ -54,10 +69,12 @@ let a = process.argv.slice(2);
 while (a[0] === '-c') a = a.slice(2);
 fs.appendFileSync(process.env.PRESTAGE_LOG, JSON.stringify(['git', ...a]) + '\n');
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:' + process.env.PRESTAGE_REPO + '.git\n');
+else if (a[0] === 'cat-file' && a[1] === '-e') process.exit(/^[a-f0-9]{40}\^\{commit\}$/i.test(a.at(-1)) ? 0 : 1);
 else if (['rev-parse', 'cat-file', 'merge-base', 'diff'].includes(a[0])) {
   const result = scoredGit(a, { gitDir: process.env.PRESTAGE_PR.replace(/pr\.json$/, '.git'), files: [{ path: 'README.md' }] });
   if (result) { process.stdout.write(result.stdout); process.exit(result.status); }
-} else if (a[0] === 'ls-tree' && a.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')) process.stdout.write('backlog/xabc123-card.md\n');
+} else if (a[0] === 'ls-tree' && a.at(-1) === '.lane-manifest.json') process.stdout.write('');
+else if (a[0] === 'ls-tree' && a.includes('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')) process.stdout.write('backlog/xabc123-card.md\n');
 else if (a[0] === 'show') {
   if (a[1] === 'origin/main:scripts/lib/queue-branch-numbering.mjs') process.stdout.write('drain-branch-numbering-ci-v1');
   else process.exit(1);

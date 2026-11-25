@@ -15,12 +15,37 @@ import { readLiveFixClaim } from '../conveyor/fix-procedure.mjs';
 import { createPrestageCache, resolvePrestageSettings, enqueuePrestage } from '../lib/drain-prestage.mjs';
 import { buildLedgerEvent, EVENT_TYPES } from '../lib/verdict-ledger.mjs';
 import { createAsyncShadow } from '../lib/drain-async-shadow.mjs';
+import { buildManifest, embedManifestInBody } from '../readiness/lane-manifest.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
 const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
 const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
 
+it.each(['precondition', 'F10', 'F10-F12', 'F12', 'F13', 'writeScope'])('REFINE 4: prestage hit cannot bypass %s', gate => world(async ({ pr, run, coord, slug }) => {
+  await run();
+  pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: sha };
+  if (gate === 'precondition') pr.queuePrecondition = false;
+  if (gate === 'F10') pr.cardGroups = [{ repo: slug, pr: 43, sources: [{ num: 42 }] }];
+  if (gate === 'F10-F12') pr.body += '\n<!-- lane-manifest:begin -->\n```json\n' + JSON.stringify({ item: 'xabc123', repos: [{ repo: 'we', ref: pr.headRefName }], blockedBy: [99], stackParents: [] }) + '\n```\n<!-- lane-manifest:end -->';
+  if (gate === 'F12' || gate === 'F13') pr.contextPartners = [{ ...pr, number: 43, headRefOid: 'b'.repeat(40), headRefName: 'lane/partner', contextPartners: undefined,
+    rowsComplete: true, rowsHead: 'b'.repeat(40), fullReadFails: gate === 'F13',
+    body: embedManifestInBody('partner', buildManifest({ item: gate === 'F12' ? 'xabc123' : 'xdef456', repos: [{ repo: 'we', ref: 'lane/partner' }] })) }];
+  // Persisted preparation is a hint, including entries written by the earlier shortcut.
+  const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
+  const entry = cache.get(slug, 42, 30);
+  cache.put(slug, 42, { ...entry, body: pr.body, eligible: true });
+  const next = await run(true);
+  expect(next.report.prestaged).not.toBe(true);
+  expect(next.report.enqueueOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
+    kind: gate === 'precondition' ? 'defer-to-pass:queue-precondition' : gate === 'F10' ? 'defer-to-pass:card-group'
+      : gate === 'F10-F12' ? 'defer-to-pass:ordered' : gate === 'F12' ? 'defer-to-pass:couple'
+      : gate === 'F13' ? 'defer-to-pass:incomplete-context' : 'defer-to-pass:write-boundary:comment',
+  })]));
+  expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
+}, { recordedLand: gate !== 'writeScope' }));
+
+// Preparation remains a full-pass hint. Green events exercise the full gated fast path.
 describe('real drain pre-stage path', () => {
   it.each(['check-runs', 'status'])('fresh cascade revalidation refuses unreadable %s evidence', endpoint => world(async ({pr,run}) => {
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
@@ -65,7 +90,7 @@ describe('real drain pre-stage path', () => {
           }
         } else {
           expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'enqueued'}]);
-          if (path === 'prestage') expect(next.report.prestaged).toBe(true);
+          if (path === 'prestage') expect(next.report.prestaged).not.toBe(true);
         }
         // Fixture roots differ; preserve every gh argument and its ordering.
         traces.push(calls.filter(a => a[0] !== 'git').map(a => a.map(x => x.replaceAll(dir, '<fixture>'))));
@@ -104,7 +129,7 @@ describe('real drain pre-stage path', () => {
     expect((await run(false, { shadowMode:'shadow' })).stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = (await run(true, { shadowMode:'shadow' }));
-    expect(next.report).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.report).toMatchObject({enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const rows = readFileSync(join(coord, 'drain-async-shadow', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows).toEqual([expect.objectContaining({num:42,headSha:sha,actualEnqueueAt:expect.any(Number)})]);
     expect(rows[0].actualEnqueueAt).toBeGreaterThanOrEqual(rows[0].wouldEnqueueAt);
@@ -125,8 +150,8 @@ describe('real drain pre-stage path', () => {
     // The local helper is not exported; pin its wiring here and exercise each caller below.
     const source = readFileSync(script, 'utf8');
     expect(source).toMatch(/import\s*\{[^}]*\bmqSameHeadGuard\b[^}]*\}\s*from\s*['"]\.\/lib\/drain-queue-safety\.mjs['"]/);
-    const hook = source.match(/enqueue:\s*\(c,\s*sha,\s*entry\)\s*=>\s*(\w+)\(c,\s*sha,/);
-    expect(hook, 'prestage enqueue hook must call a shared local helper').not.toBeNull();
+    const hook = source.match(/return\s+(\w+)\(c,\s*traceHeadSha,/);
+    expect(hook, 'cascade enqueue must call the guarded local helper').not.toBeNull();
     const helperName = hook[1];
     expect(source).toMatch(new RegExp(`return\\s+${helperName}\\(c,\\s*traceHeadSha,`));
     // Accept a function declaration or a local arrow function, without fixing its name.
@@ -250,8 +275,8 @@ describe('real drain pre-stage path', () => {
     expect((await run()).stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = (await run(true, opts));
-    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
-    expect(next.calls.some(a => a.some(x => x.includes('pullRequests(')))).toBe(false);
+    expect(next.report, next.stderr).toMatchObject({enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.calls.some(a => a.some(x => x.includes('pullRequests(')))).toBe(true);
   }, {slug:'web-everything/web-everything'}));
   it('a fix claim acquired after preparation prevents cached enqueue', () => world(async ({pr,run,coord}) => {
     expect((await run()).stderr).toContain('eligible=true');
@@ -291,7 +316,7 @@ describe('real drain pre-stage path', () => {
       source: 'merge-ai-prs', declaredActor: 'drain', reasonCode: 'ci-red', holdSource: 'drain' })) + '\n');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = (await run(true));
-    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.report, next.stderr).toMatchObject({enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
     const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows.filter(r => r.type === EVENT_TYPES.RELEASE)).toEqual([expect.objectContaining({ pr: 42, reasonCode: 'ci-red', holdSource: 'drain' })]);
   }));
@@ -306,8 +331,10 @@ describe('real drain pre-stage path', () => {
     pr.statusCheckRollup = [{name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha},
       {name:'smoke',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha}];
     const next = (await run(true, { args:['--check=smoke'] }));
-    expect(next.report.prestaged, next.stderr).toBe(true);
-    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,outcome:'not-enqueued',reason:'required checks red'}]);
+    expect(next.report.prestaged, next.stderr).not.toBe(true);
+    expect(next.report.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({num:42,reason:'required check "smoke" is not green'}),
+    ]));
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
   }));
   it('a green event reads the selected --check past the 100-context rollup cap, as the full drain does', () => world(async ({pr,run}) => {
@@ -418,39 +445,44 @@ describe('real drain pre-stage path', () => {
     const branchAt = next.calls.findIndex(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef'));
     const listingAt = next.calls.findIndex(a => a.some(x => x.includes('pullRequests(')));
     expect(branchAt).toBeGreaterThan(-1);
-    expect(listingAt).toBeGreaterThan(branchAt);
-    expect(next.calls.slice(0, listingAt).filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
+    // Child-start queue precondition now refuses before listing on unknown branch evidence.
+    expect(listingAt).toBe(-1);
+    expect(next.calls.filter(a => a[0] === 'repo' && a[1] === 'view' && a.includes('defaultBranchRef')), JSON.stringify(next.calls)).toHaveLength(1);
     expect(next.report.prestaged).not.toBe(true);
-    expect(next.stderr).toContain('default branch unresolved live');
-    expect(next.report.skipped).toEqual(expect.arrayContaining([expect.objectContaining({num:42,reason:expect.stringContaining('deferring merge/enqueue')})]));
+    expect(next.stderr).toContain('defer-to-pass:queue-precondition');
+    expect(next.report.enqueueOutcomes).toMatchObject([{num:42,enqueued:false,kind:'defer-to-pass:queue-precondition'}]);
     expect(next.calls.filter(a => a.some(x => x.includes('enqueuePullRequest')))).toHaveLength(0);
   }));
-  it('prepares while pending, then a green event enqueues without listing or gate reads', () => world(async ({pr,run,coord}) => {
+  it('prepares while pending, then a green event enqueues after live listing and gate reads', () => world(async ({pr,run,coord}) => {
     const first = (await run());
     expect(first.stderr).toContain('prepared while CI pending (eligible=true)');
     expect(first.report.enqueueOutcomes ?? []).toHaveLength(0);
     expect(readdirSync(join(coord,'drain-prestage'))).toHaveLength(1);
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = (await run(true));
-    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
-    // The only list is the stacked-set read scoped to this head (`--base lane/readme`), never an open-PR listing.
-    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' && !a.includes('--base') || a.some(x => x.includes('pullRequests(')))).toBe(false);
+    expect(next.report, next.stderr).toMatchObject({enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    // Persisted preparation cannot replace the live open-PR inventory.
+    expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' && !a.includes('--base') || a.some(x => x.includes('pullRequests(')))).toBe(true);
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(true);
   }));
-  it.each(['off', 'shadow'])('a green-event enqueue runs the cascade pre-landing steps: stacked retarget and review-coverage notice (async drain: %s)', shadowMode => world(async ({pr,run}) => {
+  it.each(['off', 'shadow'])('a green-event enqueue refuses forbidden pre-landing comments and stacked retargets (async drain: %s)', shadowMode => world(async ({pr,run}) => {
     expect((await run(false, { shadowMode })).stderr).toContain('eligible=true');
     // The pre-landing read is fresh: the reviewed-sha record is gone by green time, so coverage is announced.
     pr.comments = [];
     pr.stacked = [{ number: 43, baseRefName: pr.headRefName }];
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
     const next = (await run(true, { shadowMode }));
-    expect(next.report, next.stderr).toMatchObject({prestaged:true,enqueueOutcomes:[{num:42,outcome:'enqueued'}]});
+    expect(next.report, next.stderr).toMatchObject({enqueueOutcomes:[{num:42,outcome:'not-enqueued',kind:'defer-to-pass:write-boundary:label-removal'}]});
     const at = pred => next.calls.findIndex(pred);
     const enqueued = at(a => a.some(x => x.includes('enqueuePullRequest')));
     const listed = at(a => a[0] === 'pr' && a[1] === 'list' && a.includes('--base') && a.includes(pr.headRefName));
     const retargeted = at(a => a[0] === 'pr' && a[1] === 'edit' && a[2] === '43' && a.includes('--base') && a.includes('main'));
     const announced = at(a => a[0] === 'pr' && a[1] === 'comment' && a[2] === '42' && a.some(x => x.includes('Incomplete review')));
-    expect([listed, retargeted, announced].every(i => i >= 0 && i < enqueued), JSON.stringify(next.calls)).toBe(true);
+    expect(next.report.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({num:42,reason:expect.stringContaining('no recorded reviewed SHA')}),
+    ]));
+    expect(listed).toBe(-1);
+    expect([enqueued, retargeted, announced], JSON.stringify(next.calls)).toEqual([-1, -1, -1]);
   }));
   it('a moved head falls back to a full listing', () => world(async ({pr,run}) => {
     expect((await run()).stderr).toContain('eligible=true');

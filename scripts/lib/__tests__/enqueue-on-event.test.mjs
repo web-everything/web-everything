@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { execFileSync, spawnSync } from 'node:child_process';
 import ts from 'typescript';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -17,6 +17,7 @@ import {
 } from '../enqueue-on-event.mjs';
 import { readFastDrainRoundSnapshot, readFastDrainRoundListing, readFastDrainRoundDefaultBranch } from '../fast-drain-scope.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
+import { isFastDrainDeferKind } from '../fast-drain-scope.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -649,6 +650,72 @@ const catchUpSetup = (extra = {}) => setup({
   readCapacity: () => ({ capacity: 3, source: 'mergeQueue.enqueueOnEvent.catchUp.maxQueued (tool)' }),
   readPriorities: () => ({}),
   ...extra,
+});
+
+describe('O1-O10 table', () => {
+  const cases = [
+    ['O1 verified', { enqueued: true }, 'yes', false, false],
+    ['O2 unreadable membership', { enqueued: true }, 'unknown', false, true],
+    ['O3 false membership', { enqueued: true }, 'no', true, true],
+    ['O4 hold', { kind: 'red-team-pending' }, null, true, false],
+    ['O5 same-head failure', { kind: 'mq-same-head-failed', reason: 'same-head failed_checks' }, null, true, false],
+    ['O6 retry', { kind: 'enqueue-backoff' }, null, true, true],
+    ...['ordered', 'couple', 'card-group', 'manifest-unreadable', 'red-team-override'].map(kind =>
+      [`O7 ${kind}`, { kind: `defer-to-pass:${kind}` }, null, true, false]),
+    ...['sibling-unreadable', 'hydration-race', 'budget', 'index-age', 'index-setting', 'queue-precondition', 'write-boundary:refresh', 'incomplete-context', 'couple-unknown'].map(kind =>
+      [`O8 ${kind}`, { kind: `defer-to-pass:${kind}` }, null, true, true]),
+    ['O9 timeout', { timeout: true }, null, false, false],
+    ['O10 error', { error: true }, null, false, true],
+    ['REFINE BLOCKED skip', { skip: 'merge state BLOCKED' }, null, false, true],
+    ['REFINE merge-gate skip', { skip: 'merge-gate hold' }, null, false, true],
+    ['REFINE ordinary classifier skip', { skip: 'required check pending' }, null, false, true],
+    ['REFINE absent target', { absent: true }, null, false, true],
+    ['REFINE untyped refusal', { refused: true }, null, false, true],
+  ];
+  it.each(cases)('%s writes memory after the outcome, returns only definite unused room, and controls next catch-up', async (_name, result, membership, missed, eligible) => {
+    vi.useFakeTimers();
+    const row = { ...READY_PR, headRefOid: 'table-head', checksDigest: 'table-checks', lastCheckCompletedAt: 1, lastLabelChangedAt: 1,
+      labelsDigest: createHash('sha256').update(JSON.stringify(['ready-to-merge'])).digest('hex') };
+    const json = result.skip ? { considered: 1, skipped: [{ num: 42, reason: result.skip }], skipReasons: [{ num: 42, reason: result.skip }] }
+      : result.absent ? { considered: 0 } : result.refused ? { ok: false, reason: 'unavailable' }
+        : { considered: 1, enqueueOutcomes: [{ num: 42, outcome: result.enqueued ? 'enqueued' : 'not-enqueued', ...result }] };
+    const f = catchUpSetup({ manualFinish: true, timeoutMs: 1000,
+      readCodeVersion: () => 'c'.repeat(40),
+      readPr: async () => row, readCandidates: async () => ({ ok: true, queued: 0, mainCiRunId: 1, prs: [candidate(42, 0, row)] }),
+      readMembership: async () => membership === 'unknown' ? { ok: false } : { ok: true, inQueue: membership === 'yes' },
+      resolveSetting: () => ({ ...CATCH_UP_SETTING, catchUp: { ...CATCH_UP_SETTING.catchUp, blockedBackoffRounds: 2, timeoutBackoffRounds: 2 } }) });
+    const finish = async run => {
+      await vi.advanceTimersByTimeAsync(0);
+      const child = f.children.at(-1);
+      if (result.timeout) { child.kill = () => child.emit('close', null); await vi.advanceTimersByTimeAsync(1000); }
+      else if (result.error) child.emit('error', new Error('spawn failure'));
+      else { child.stdout.emit('data', JSON.stringify(json)); child.emit('close', 0); }
+      return run;
+    };
+    try {
+      const run = f.handle.catchUp();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.handle.misses().size).toBe(0);
+      expect(f.handle.blocked().size).toBe(0);
+      expect(f.handle.missBackoff().size).toBe(0);
+      await finish(run);
+      expect(f.handle.misses().has(42)).toBe(missed);
+      if (result.enqueued && membership === 'yes') row.inQueue = true;
+      f.advance(600_000);
+      const second = f.handle.catchUp();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.calls.length).toBe(eligible ? 2 : 1);
+      if (eligible) await finish(second); else await second;
+    } finally { f.handle.kill(); vi.useRealTimers(); }
+  });
+  it('O8 transient defer returns room to the next candidate in the same round', async () => {
+    const f = catchUpSetup({ readPr: async () => ({ ...READY_PR, headRefOid: 'room-head' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 1)] }),
+      readCapacity: () => ({ capacity: 1 }),
+      drainResult: num => ({ enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind: 'defer-to-pass:index-age' }] }) });
+    try { await f.handle.catchUp(); expect(f.calls.map(c => c.args[1])).toEqual(['--only=42', '--only=43']); }
+    finally { f.handle.kill(); }
+  });
 });
 
 describe('catch-up setting', () => {
@@ -1882,27 +1949,27 @@ describe('BLOCKED catch-up back-off', () => {
     } });
   });
 
-  it('continues and refills every round, skips the next N listings, then retries and re-arms', async () => {
+  it('ordinary BLOCKED skips refill room and retry every round without suppression', async () => {
     const { handle, calls, lines, advance } = blockedSetup();
     await handle.catchUp();
     expect(nums(calls)).toEqual([5193, 42, 43, 44]);
-    expect(handle.blocked().has(5193)).toBe(true);
+    expect(handle.blocked().has(5193)).toBe(false);
     handle.blocked().clear();
-    expect(handle.blocked().has(5193)).toBe(true);
+    expect(handle.blocked().has(5193)).toBe(false);
     for (let i = 0; i < 2; i++) {
       advance(600_000);
       const ran = await handle.catchUp();
-      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: expect.stringMatching(/^backed off:/) });
-      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: 'skipped: merge state BLOCKED' });
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(i + 2);
       expect(nums(calls).slice(-3)).toEqual([42, 43, 44]);
-      expect(lines).toContain(`enqueue-on-event: catch-up #5193 — backed off: BLOCKED at head abcdef123 (${2 - i} of 2 catch-up(s) left; retried sooner if its head or checks change)`);
+      expect(lines.some(line => line.includes('backed off: BLOCKED'))).toBe(false);
       await handle.tick(); // another tick is not another listing
-      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(i + 2);
     }
     advance(600_000);
     await handle.catchUp();
-    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
-    expect(handle.blocked().has(5193)).toBe(true);
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(4);
+    expect(handle.blocked().has(5193)).toBe(false);
   });
 
   it.each(['head', 'checks', 'unreadable'])('retries when the %s changes', async (change) => {
@@ -1929,17 +1996,17 @@ describe('BLOCKED catch-up back-off', () => {
     handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
     await handle.tick();
     expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
-    expect(handle.blocked().has(5193)).toBe(true);
+    expect(handle.blocked().has(5193)).toBe(false);
     blocked = false;
     handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
     await handle.tick();
     expect(handle.blocked().has(5193)).toBe(false);
   });
 
-  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('only backs off the targeted gate skips (%s)', async (skip) => {
+  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('untyped classifier skips do not suppress catch-up (%s)', async (skip) => {
     const { handle, calls, advance } = blockedSetup({ drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
     await handle.catchUp(); advance(600_000); await handle.catchUp();
-    expect(nums(calls).filter(n => n === 5193)).toHaveLength(skip.startsWith('merge-gate hold') ? 1 : 2);
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
   });
 
   it('bypasses back-off for an event folded into retained catch-up work', async () => {
@@ -2667,7 +2734,8 @@ describe('catch-up miss backoff', () => {
   // Every recordEnqueue not-enqueued kind, including its delegated producers.
   // Timers, queue/base state and unreadable evidence can recover without a head/label change.
   const holdEligibility = [
-    ['batching-deferred', false], ['merge-lock-held', false], ['prestage', false],
+    ['defer-to-pass', false],
+    ['batching-deferred', false], ['merge-lock-held', false],
     ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
     ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],
     ['mq-same-head-failed', false],
@@ -2690,7 +2758,11 @@ describe('catch-up miss backoff', () => {
   it('lints recordEnqueue kinds and delegated producers against the classification table', () => {
     const kinds = new Set();
     const literals = node => {
-      if (ts.isStringLiteral(node)) kinds.add(node.text);
+      if (ts.isStringLiteral(node)) {
+        if (node.text.startsWith('defer-to-pass:')) { expect(isFastDrainDeferKind(node.text), node.text).toBe(true); kinds.add('defer-to-pass'); }
+        else kinds.add(node.text);
+      }
+      else if (['precondition.kind', 'rows.deferredKind', 'writeBoundary.violations[0]', 'boundary.violations.at(-1)'].includes(node.getText())) kinds.add('defer-to-pass');
       else if (ts.isConditionalExpression(node)) { literals(node.whenTrue); literals(node.whenFalse); }
       else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken) literals(node.right);
       else throw new Error(`Unclassified dynamic enqueue kind: ${node.getText()}`);
@@ -2718,7 +2790,7 @@ describe('catch-up miss backoff', () => {
     expect(Object.keys(enqueueModule.MISS_BACKOFF_HOLD_ELIGIBILITY).sort()).toEqual([...kinds].sort());
   });
 
-  it.each([undefined, 'new-unknown-kind', 'toString', '__proto__'])('never holds an unclassified kind: %s', async kind => {
+  it.each([undefined, 'prestage', 'new-unknown-kind', 'toString', '__proto__'])('never holds an unclassified or historical kind: %s', async kind => {
     const f = fixture({ drainResult: num => ({ enqueueOutcomes: [{ num, outcome: 'not-enqueued', kind,
       reason: 'red-team-pending: misleading text' }] }) });
     await f.handle.catchUp(); f.advance(600_000); await f.handle.catchUp();
@@ -2919,7 +2991,7 @@ describe('catch-up miss backoff', () => {
       expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome: outcome === 'exit-error' ? 'error' : outcome }]);
       expect(attempts(f)).toHaveLength(3);
       expect(f.handle.missBackoff().size).toBe(0);
-      if (outcome === 'skipped' || outcome === 'timeout') {
+      if (outcome === 'timeout') {
         expect(f.handle.blocked().get(42)).toMatchObject({ rounds: 1,
           reason: outcome === 'timeout' ? 'timeout' : 'blocked' });
         f.advance(600_000);

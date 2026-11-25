@@ -75,7 +75,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
-import { writeFastDrainRoundDefaultBranch } from './fast-drain-scope.mjs';
+import { writeFastDrainRoundDefaultBranch, isFastDrainDeferKind } from './fast-drain-scope.mjs';
 import { classifyChildFailure } from './child-failure-class.mjs';
 import { PASS_STEP_ORDER } from './pass-timings.mjs';
 export { classifyChildFailure } from './child-failure-class.mjs';
@@ -111,7 +111,8 @@ export const CATCH_UP_DECLINE_TTL_MS = 60 * 60_000;
 // Declines safe to dedupe: bound to a head/labels/checks snapshot. Everything else retries every catch-up.
 // Only red-team-pending survives main CI churn; mq-same-head-failed recovery is main-dependent,
 // so it, sent-back and bornas-collision require the same mainCiRunId.
-export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision']));
+export const CATCH_UP_DECLINE_DEDUPE_KINDS = Object.freeze(new Set(['mq-same-head-failed', 'red-team-pending', 'sent-back', 'bornas-collision',
+  'defer-to-pass:ordered', 'defer-to-pass:couple', 'defer-to-pass:card-group', 'defer-to-pass:manifest-unreadable', 'defer-to-pass:red-team-override']));
 const READY_LABEL = 'ready-to-merge';
 const ELIGIBLE_LABELS = Object.freeze(['review:accepted', READY_LABEL]);
 
@@ -329,9 +330,9 @@ export function fastDrainArgs({ scriptRoot, num, listingSnapshot }) {
  * Infrastructure, queue/base state and existing retry timers must not acquire a second, longer hold.
  */
 export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
+  'defer-to-pass': false,
   'batching-deferred': false,
   'merge-lock-held': false,
-  prestage: false,
   'branch-preparation': false,
   'card-group-hold': false,
   'card-grouped': false,
@@ -364,7 +365,7 @@ export function summarizeFastDrain(json, num) {
   const failed = hit(json.failed);
   if (failed) return 'failed: unknown';
   const outcome = hit(json.enqueueOutcomes);
-  if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${Object.hasOwn(MISS_BACKOFF_HOLD_ELIGIBILITY, outcome.kind) ? outcome.kind : 'unknown'}:`;
+  if (outcome?.outcome === 'not-enqueued') return `not enqueued: ${Object.hasOwn(MISS_BACKOFF_HOLD_ELIGIBILITY, outcome.kind) || isFastDrainDeferKind(outcome.kind) ? outcome.kind : 'unknown'}:`;
   if (outcome?.outcome === 'enqueued') return `passed every drain gate — enqueued${outcome.already ? ' (already queued)' : ''}`;
   const deferred = hit(json.deferred);
   if (deferred && !hit(json.merged)) {
@@ -409,6 +410,8 @@ function fastDrainUsedNoRoom(json, num) {
   if (!isObj(json) || json.ok === false) return false;
   const hit = (list) => Array.isArray(list) && list.some((p) => Number(p?.num) === Number(num));
   if (hit(json.merged) || hit(json.failed)) return false;
+  const outcome = json.enqueueOutcomes?.find?.(p => Number(p?.num) === Number(num));
+  if (outcome?.outcome === 'not-enqueued' && typeof outcome.kind === 'string' && outcome.kind.startsWith('defer-to-pass:')) return true;
   if ([json.revalidationAborted, json.deferred, json.coupleHeld, json.parked].some(hit)) return true;
   // toMerge is the planned set, so explicit non-enqueue outcomes above take precedence.
   // toMerge also appears in skipReasons after a successful enqueue (ready-not-reached).
@@ -1298,10 +1301,7 @@ export function createEnqueueOnEvent({
           backoff.set(p.num, { signature, labelsDigest: digest, at: now(), rounds: blockedRounds,
             untilRound: catchUpRound + blockedRounds, reason: 'same-head-failed' });
         }
-        if (p.catchUp && !spawnFailed && blockedRounds > 0 && signature && summary.startsWith('skipped:') && /merge state BLOCKED|merge-gate hold/.test(summary)) {
-          // A listing consumes a round even if capacity/window holds this PR until a later tick.
-          backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
-        }
+        // Ordinary classifier skips carry no head-bound decline evidence and remain eligible.
         if (p.catchUp && r.timedOut && timeoutRounds > 0 && signature) {
           backoff.set(p.num, { signature, rounds: timeoutRounds, untilRound: catchUpRound + timeoutRounds, reason: 'timeout' });
         }
