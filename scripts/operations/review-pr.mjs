@@ -1622,6 +1622,17 @@ export function buildCardOnlyJudgeRequest(read, aim = '') {
 }
 
 /**
+ * review.seatRouting.correctness=B — the MANDATORY correctness seat on Codex. Same recipe and the SAME
+ * `allowedTools` as the Claude seat (`buildReviewJudgeRequest`); only the vendor (`providerName`) and the
+ * sandbox correction differ. It is a mandatory seat, never an advisory one: it does not count toward
+ * `minNonClaudeSeats`.
+ */
+export function buildCodexCorrectnessJudgeRequest(read, aim = '') {
+  const { model, seatProvider, ...request } = buildReviewJudgeRequest({ read, lens: 'correctness', aim });
+  return { ...request, providerName: 'codex', mandate: request.mandate + '\n\n' + CODEX_ADVISORY_SANDBOX_CORRECTION };
+}
+
+/**
  * #xqa9ttq — CORRECTS `buildMandate`'s "if you have no tools at all, you cannot run or clone anything" branch
  * (`we:scripts/lib/review-core.mjs`) FOR THIS SEAT SPECIFICALLY. That branch is accurate for a genuinely
  * zero-tool Claude juror (`--tools ''`), but this seat runs on Codex, which ALWAYS gets `-s read-only` —
@@ -2675,8 +2686,10 @@ export function reviewPrOperation({
         );
         // review.seatRouting.correctness: recorded ON the read finding so a resume never re-derives it. Only the
         // correctness seat's vendor moves; an unknown builder stays on claude.
+        const routing = resolveCorrectnessSeatRouting();
+        finding.correctnessRouting = routing;
         finding.correctnessVendor = !cardOnlyLight && view.input.lens === 'correctness'
-          ? correctnessSeatVendor({ mode: resolveCorrectnessSeatRouting().value, body: finding.body, headMessage: rawRead?.headMessage })
+          ? correctnessSeatVendor({ mode: routing.value, commitMessages: rawRead?.commitMessages })
           : 'claude';
         if (cardOnlyLight && (view.input.lens !== 'correctness' || !isCardOnlyDiff([...finding.netChangedFiles, ...finding.netRenameSources]))) {
           throw new Error('card-only light lane contradicted by pinned net diff or lens');
@@ -2699,7 +2712,8 @@ export function reviewPrOperation({
     // `buildReviewJudgeRequest`, shared with the `judgeSecurity` seat below so the two differ in one field.
     judge: judgeStep({
       reads: ['input.lens', 'input.aim', 'findings.read'],
-      request: (view) => (cardOnlyLight || view.findings.read?.correctnessVendor === 'codex') ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
+      request: (view) => cardOnlyLight ? buildCardOnlyJudgeRequest(view.findings.read, view.input.aim)
+        : view.findings.read?.correctnessVendor === 'codex' ? buildCodexCorrectnessJudgeRequest(view.findings.read, view.input.aim) : buildReviewJudgeRequest({
         read: view.findings.read,
         lens: view.input.lens,
         // #3094 — the caller's aim rides in the MANDATE, beside the goal. `input.aim` is DECLARED in `reads`
@@ -2899,7 +2913,7 @@ export function reviewPrOperation({
         // act on.
         const seats = [
           // `tools: true` (#4815) — the panel jurors are tool-bearing (`allowedTools: REVIEW_JUROR_TOOLS`), so they bypass the confirmation turn.
-          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight || read.correctnessVendor === 'codex' ? { provider: 'codex' } : {}) },
+          { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge, tools: true, ...(cardOnlyLight ? { provider: 'codex' } : read.correctnessVendor === 'codex' ? { provider: 'codex', routedMandatory: true } : {}) },
           ...(securitySeat !== false ? [{ step: SECURITY_SEAT_STEP, lens: SECURITY_LENS, answer: view.findings.judgeSecurity, tools: true }] : []),
           // #xqa9ttq — THE THIRD SEAT, ONLY WHEN SEATED. `ADVISORY_JUDGE_LENS` is a LITERAL here, exactly
           // like `SECURITY_LENS` above, for the same reason: it is not caller-negotiable. `provider: 'codex'`
@@ -3080,7 +3094,7 @@ export function reviewPrOperation({
         // #xqa9ttq — WHICH LENS RAN ON A NON-CLAUDE PROVIDER, keyed the same way as `lensVerdicts` so the
         // renderer can zip the two together. Built straight off `seats` (never re-derived from the lens name),
         // so a future non-codex provider seat carries its own label for free.
-        const nonClaudeSeats = seats.filter((s) => s.provider?.startsWith('codex') && s.answer
+        const nonClaudeSeats = seats.filter((s) => s.provider?.startsWith('codex') && !s.routedMandatory && s.answer
           && !s.answer.skipped && typeof s.answer.summary === 'string' && s.answer.summary.trim()
           && Array.isArray(s.answer.findings)).length;
         const nonClaudeSeatShortfall = nonClaudeSeats < minNonClaudeSeats

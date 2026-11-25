@@ -49,7 +49,14 @@ export function resolveBuilder({ body = '', headMessage = '' } = {}) {
  * Which vendor judges the correctness seat. `'codex'` only in mode B for a Claude-built PR; `'claude'` otherwise
  * (a Codex-built PR, an unknown builder, or mode A), which is today's route and never weaker. PURE.
  */
-export function correctnessSeatVendor({ mode = 'A', body = '', headMessage = '' } = {}) {
+export function correctnessSeatVendor({ mode = 'A', commitMessages = '' } = {}) {
   if (normMode(mode) !== 'B') return 'claude';
-  return resolveBuilder({ body, headMessage }).provider === 'claude' ? 'codex' : 'claude';
+  // COMMIT-LEVEL EVIDENCE ONLY: a PR-body delegation marker is author-controlled text, so it never routes a seat.
+  return claudeTrailerIn(commitMessages) ? 'codex' : 'claude';
+}
+
+/** Does any commit message (a string or an array of them) carry a `Co-Authored-By: Claude ...` trailer? PURE. */
+export function claudeTrailerIn(commitMessages) {
+  const text = Array.isArray(commitMessages) ? commitMessages.join('\n\n') : String(commitMessages ?? '');
+  return /^Co-Authored-By:\s*Claude\s+[^<\n]+?\s*</im.test(text);
 }
