@@ -44,7 +44,7 @@ import { CODEX_MODEL } from '../codex-model-routing.mjs';
 import { routeDispatch, decideDispatchRoute } from '../dispatch-contracts.mjs';
 import { readAgyAuthState, runProbe } from '../../operations/agy-auth-probe.mjs';
 
-describe('production dispatch consumes the persisted agy auth record', () => {
+describe('dispatch consumes explicitly supplied persisted agy auth snapshots', () => {
   let home, statePath;
   const now = 3000000;
   const profile = { taskType: 'doc-fix', filesTouched: ['README.md'], estimatedLoc: 30,
@@ -54,6 +54,9 @@ describe('production dispatch consumes the persisted agy auth record', () => {
   const policy = { ...DEFAULT_ROUTING_POLICY, taskTypes: {}, operations: { ...DEFAULT_ROUTING_POLICY.operations,
     'build:doc-fix': agyRoute } };
   const save = record => writeFile(statePath, typeof record === 'string' ? record : JSON.stringify(record));
+  // Scheduling and job-session coordination must ship before callers enable this IO.
+  const routeWithAuth = (profile, options) => routeDispatch(profile, { agyAuth: readAgyAuthState(), ...options });
+  const decideWithAuth = (dispatch, options) => decideDispatchRoute(dispatch, { agyAuth: readAgyAuthState(), ...options });
   beforeEach(async () => {
     home = await mkdtemp(join(tmpdir(), 'agy-routing-'));
     // The hermetic harness makes native homedir() follow HOME for every consumer.
@@ -62,6 +65,13 @@ describe('production dispatch consumes the persisted agy auth record', () => {
     statePath = join(home, '.plateau', 'agy-auth-state.json');
   });
   afterEach(async () => { await rm(home, { recursive: true, force: true }); });
+
+  it.each([undefined, 'not json', { state: 'off' }, { state: 'on', lastProbeAt: 1 }])(
+    'keeps default routing independent of unscheduled host auth: %j', async record => {
+      if (record !== undefined) await save(record);
+      expect(routeDispatch(profile, { stage: 'task', now }).alternateBackend).not.toBeNull();
+      expect(decideDispatchRoute(dispatch, { routingPolicy: policy, now }).policyRoute.provider).toBe('antigravity');
+    });
 
   it('honors explicit off even when the persisted record is on', async () => {
     await save({ state: 'on', lastProbeAt: now });
@@ -73,50 +83,50 @@ describe('production dispatch consumes the persisted agy auth record', () => {
     { state: 'on', lastProbeAt: now + 1 }, ' '.repeat(65537)]
     .map(record => [typeof record === 'string' && record.length > 64 ? 'oversized' : JSON.stringify(record), record]))('fails closed for unavailable persisted auth: %s', async (_label, record) => {
     if (record !== undefined) await save(record);
-    const route = routeDispatch(profile, { stage: 'task', now });
+    const route = routeWithAuth(profile, { stage: 'task', now });
     expect(route.alternateBackend).toBeNull();
-    const policyRoute = decideDispatchRoute(dispatch, { routingPolicy: policy, now });
+    const policyRoute = decideWithAuth(dispatch, { routingPolicy: policy, now });
     expect(policyRoute.policyRoute).toMatchObject({ provider: 'claude', fallback: [] });
     expect(policyRoute.probationWorker).toBeNull();
   });
   it('fails closed when the state path is not a regular file', async () => {
     await mkdir(statePath);
-    expect(routeDispatch(profile, { stage: 'task', now }).alternateBackend).toBeNull();
+    expect(routeWithAuth(profile, { stage: 'task', now }).alternateBackend).toBeNull();
   });
   it('filters agy from policy fallback chains, and retains healthy policy routes', async () => {
     await save({ state: 'on', lastProbeAt: now });
     expect(readAgyAuthState()).toEqual({ state: 'on', lastProbeAt: now });
-    expect(decideDispatchRoute(dispatch, { routingPolicy: policy, now }).policyRoute.provider).toBe('antigravity');
+    expect(decideWithAuth(dispatch, { routingPolicy: policy, now }).policyRoute.provider).toBe('antigravity');
     await save({ state: 'off' });
     const fallbackPolicy = { ...policy, operations: { ...policy.operations,
       'build:doc-fix': { provider: 'codex', model: 'default', fallback: [{ provider: 'antigravity', model: 'sonnet' }, { provider: 'claude', model: 'sonnet' }] } } };
-    const routed = decideDispatchRoute(dispatch, { routingPolicy: fallbackPolicy, now });
+    const routed = decideWithAuth(dispatch, { routingPolicy: fallbackPolicy, now });
     expect(routed.policyRoute.provider).toBe('codex');
     expect(routed.policyRoute.fallback.map(route => route.provider)).toEqual(['claude']);
   });
   it('holds prepare, ci-heal re-selection, and supervisor agy candidates', async () => {
     await save({ state: 'off' });
     const inherited = { ...policy, taskTypes: {}, operations: { '*': { inherit: true } } };
-    const prepare = decideDispatchRoute({ kind: 'prepare-item', cardPath: 'backlog/123-card.md', simple: true },
+    const prepare = decideWithAuth({ kind: 'prepare-item', cardPath: 'backlog/123-card.md', simple: true },
       { routingPolicy: inherited, now, scorecards: [{ provider: 'codex', model: CODEX_MODEL, taskType: 'prepare', outcome: 'reworked' }] });
     expect(prepare.probationWorker).toBeNull();
-    const heal = decideDispatchRoute({ kind: 'ci-heal', scopePaths: ['scripts/example.mjs'], size: 1, reason: 'behind' },
+    const heal = decideWithAuth({ kind: 'ci-heal', scopePaths: ['scripts/example.mjs'], size: 1, reason: 'behind' },
       { routingPolicy: inherited, now, ciHealAvailability: { codex: 'held' }, ciHealNativeFallback: true });
     expect(heal.outcome).not.toBe('refused');
     expect(heal.probationWorker).toBeNull();
-    const story = routeDispatch(profile, { stage: 'story', kind: 'build', now });
+    const story = routeWithAuth(profile, { stage: 'story', kind: 'build', now });
     expect(story.backend).not.toBe('agy');
     expect(story.shadow?.backend).not.toBe('agy');
   });
   it('uses the supplied freshness period and does not replace explicit null with disk state', async () => {
     await save({ state: 'on', lastProbeAt: now });
-    expect(routeDispatch(profile, { stage: 'task', now }).alternateBackend).not.toBeNull();
-    expect(routeDispatch(profile, { stage: 'task', agyAuth: null, now }).alternateBackend).toBeNull();
-    expect(routeDispatch(profile, { stage: 'task', now: now + 201, agyAuthPeriodMs: 100 }).alternateBackend).toBeNull();
+    expect(routeWithAuth(profile, { stage: 'task', now }).alternateBackend).not.toBeNull();
+    expect(routeWithAuth(profile, { stage: 'task', agyAuth: null, now }).alternateBackend).toBeNull();
+    expect(routeWithAuth(profile, { stage: 'task', now: now + 201, agyAuthPeriodMs: 100 }).alternateBackend).toBeNull();
   });
   it('observes a signed-out probe and two-probe recovery without restarting the router', async () => {
     await save({ state: 'on', goodStreak: 2, lastProbeAt: now });
-    const route = () => routeDispatch(profile, { stage: 'task', now });
+    const route = () => routeWithAuth(profile, { stage: 'task', now });
     expect(route().alternateBackend).not.toBeNull();
     let reply = 'Authentication required';
     const spawn = () => {

@@ -7,7 +7,7 @@ tags: []
 
 # agy signed out: sign in to agy on the Studio
 
-agy is unavailable (outage 1795538211758). Sign in to agy on the Studio; two successful probes restore the auth record. Production routing does not yet consume this record automatically. This card also tracks the remaining integration and prevention requirements from PR #7440.
+agy is unavailable (outage 1795538211758). Sign in to agy on the Studio; two successful probes restore the auth record. Production routing does not yet consume this record automatically. Dispatch wrappers enforce caller-supplied `agyAuth` snapshots, including null/unreadable snapshots as unavailable. Default enforcement must wait for the scheduled producer and shared job-session lock in A2–A3. This card also tracks the remaining integration and prevention requirements from PR #7440.
 
 ## Acceptance
 

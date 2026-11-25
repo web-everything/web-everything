@@ -16,7 +16,7 @@
  *     or in-memory fixtures) and backdown thresholds.
  *   • Fully deterministic: identical arguments produce byte-identical return objects every time.
  *   • Auth freshness uses the clock unless context.now is supplied; other routing remains pure.
- *     readDispatchAuth is the production IO boundary used by the dispatch wrappers.
+ *     readDispatchAuth normalizes the caller-supplied snapshot for dispatch wrappers.
  *     Timestamps in scorecards are treated as
  *     deterministic ISO-8601 strings.
  *
@@ -68,7 +68,7 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
-import { agyAuthOff, readAgyAuthState } from '../operations/agy-auth-probe.mjs';
+import { agyAuthOff } from '../operations/agy-auth-probe.mjs';
 import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
@@ -80,13 +80,15 @@ import { isUsableForExploration } from './model-capability-ratings.mjs';
 import { isTestPath } from './dispatch-task-type.mjs';
 import { CODEX_MODEL } from './codex-model-routing.mjs';
 
-/** Production IO boundary; selectors below remain pure when passed this snapshot. */
+/** Auth is opt-in until a scheduled producer and shared job-session lock ship.
+ * Callers can pass readAgyAuthState() as agyAuth; null/unreadable snapshots fail closed.
+ */
 export function readDispatchAuth(options = {}) {
-  const agyAuth = options.agyAuth === undefined ? readAgyAuthState() : options.agyAuth;
+  const agyAuth = options.agyAuth;
   const now = options.now === undefined ? Date.now() : options.now;
   const agyAuthPeriodMs = options.agyAuthPeriodMs;
   const availability = { ...options.availability };
-  if (agyAuthOff(agyAuth, now, agyAuthPeriodMs)) {
+  if (agyAuth !== undefined && agyAuthOff(agyAuth, now, agyAuthPeriodMs)) {
     availability.antigravity = 'auth-off';
     availability.gemini = 'auth-off';
   }

@@ -35,10 +35,13 @@ export default {
       const routingPolicy = JSON.parse(readFileSync(join(sourceRoot, 'scripts/lib/dispatch-routing-policy.json'), 'utf8'));
       const task = { kind: 'build', size: 3, scopePaths: ['we:scripts/example.mjs'] };
       const trial = { subjectClass: 'work-agent', provider: 'codex', model: PROBATION_WORKERS.codex.model, taskType: 'build-new-feature' };
+      // Replay backend/checker holds against healthy auth at the same historical clock.
+      const now = Date.parse('2026-10-15T12:00:00Z');
+      const agyAuth = { state: 'on', lastProbeAt: now };
       for (const held of [null, 'antigravity', 'codex']) {
         const scorecards = [trial, ...(held ? [{ provider: held, status: 'quota-exhausted',
           scoredAt: '2026-10-15T10:00:00Z', quotaResetsAt: '2099-01-01T00:00:00Z' }] : [])];
-        const route = resolveDispatchRoute(task, { routingPolicy, scorecards, now: Date.parse('2026-10-15T12:00:00Z') });
+        const route = resolveDispatchRoute(task, { routingPolicy, scorecards, now, agyAuth });
         if (held) {
           check(route.probationWorker?.id !== 'antigravity-argon', `${held} hold still yielded Argon`);
           if (held === 'codex') check(!route.probationWorker, 'held Codex still yielded a worker/checker');

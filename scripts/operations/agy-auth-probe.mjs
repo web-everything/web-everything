@@ -51,7 +51,7 @@ export function fileCard({ title, outageId }, exec = execFileSync) {
   try { exec(process.execPath, ['scripts/operations/run.mjs', 'file-item', `--title=${title}`,
     '--kind=task', '--workItem=task', '--queue=false',
     `--notDuplicateReason=New authentication outage ${outageId}; a previous sign-in action does not resolve this outage.`,
-    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore the auth record. Production dispatch reads this record and excludes unavailable agy routes.`],
+    `--digest=agy is unavailable (outage ${outageId}). Sign in to agy on the Studio; two successful probes restore the auth record. Dispatch enforces explicitly supplied auth snapshots; automatic consumption awaits probe scheduling and shared job-session locking.`],
   { cwd: resolve(dirname(fileURLToPath(import.meta.url)), '../..'), stdio: 'ignore', timeout: 45000, maxBuffer: 65536 });
   } catch (error) {
     // Only a failure to START the child proves no card was created. Nonzero exit/timeout

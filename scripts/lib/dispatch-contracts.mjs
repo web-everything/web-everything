@@ -4,8 +4,8 @@
  * Callers supply cards, plans, provenance, scorecards and timestamps. This module owns
  * validation and composition; provider fitness and supervision remain router policy.
  * Invalid boundary inputs fail closed, including malformed or cyclic objects.
- * Production routing reads probe auth through readDispatchAuth unless a snapshot
- * is supplied explicitly; validators and selector policy remain input-driven.
+ * Auth enforcement requires an explicit agyAuth snapshot; dispatch does not read
+ * the unscheduled host record by default. Null/unreadable snapshots fail closed.
  */
 import { DEFAULT_ROUTING_POLICY, resolveOperationRoute, PROBATION_ROSTER,
   PROVEN_TASK_ENVELOPES, isStatuteTierPath, isHighStakesTask, isWithinProvenEnvelope,
