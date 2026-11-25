@@ -11,9 +11,10 @@ const EXPECTED_HEAD = /^[0-9a-f]{40}$/;
 function expectedOf(input) {
   if (!Object.hasOwn(input, 'expected-head')) return undefined;
   const value = input['expected-head'];
-  if (value === undefined) return undefined;
-  // Present but empty ([] or ''), null, repeated, blank or non-string: returned as a non-hex value so validate refuses it.
-  return Array.isArray(value) && value.length === 1 ? value[0] : (Array.isArray(value) ? `[${value.join(',')}]` : (value ?? null));
+  // Only an absent KEY means no guard. Any present value (undefined, null, '', [], [undefined], sparse or repeated
+  // arrays, non-strings) must be exactly one 40-hex string, else validate refuses it.
+  if (Array.isArray(value)) return value.length === 1 && typeof value[0] === 'string' ? value[0] : null;
+  return typeof value === 'string' ? value : null;
 }
 
 function validate({ pr, reason, ...rest }) {
@@ -103,8 +104,12 @@ export function updateBranchOperation() {
       'expected-head': { type: 'array', repeatable: true, required: false } },
     verdictFrom: 'assess',
     act: effect({ reads: ['input.pr', 'input.reason', 'input.repo', 'input.expected-head'], effects: ({ input }) => {
-      validate(input);
-      return [{ type: UPDATE_BRANCH_OP, payload: input, idempotent: false }];
+      // The CLI adapter fills an omitted optional flag with an explicit undefined; that (and only that) means "no
+      // guard" and is dropped here so the runner sees an absent key. Every other present value is validated strictly.
+      const { 'expected-head': guard, ...rest } = input;
+      const payload = guard === undefined ? rest : input;
+      validate(payload);
+      return [{ type: UPDATE_BRANCH_OP, payload, idempotent: false }];
     } }),
     assess: compute({ reads: ['findings.act'], fn: ({ findings }) => {
       const entry = findings.act?.effects?.[0];

@@ -158,7 +158,7 @@ describe('update-branch', () => {
     expect(f.gh).not.toHaveBeenCalled();
   });
 
-  it.each(['', '   ', [], [''], ['  ']])('empty --expected-head refuses, no PUT (%j)', async value => {
+  it.each(['', '   ', [], [''], ['  '], undefined, [undefined], [, ], new Array(1)])('empty --expected-head refuses, no PUT (%j)', async value => {
     const f = fixture([]);
     await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
     expect(f.gh).not.toHaveBeenCalled();
