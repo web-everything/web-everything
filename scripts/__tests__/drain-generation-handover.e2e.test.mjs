@@ -30,7 +30,7 @@ const decide = (groupDeath) => decidePromotion({ exitCode: 77, groupDeath, recor
 /** Green acts only after `go`, which exists only if the barrier said so. `awaitDeath` is injectable for the mutation proof. */
 async function runHandover(sink, awaitDeath) {
   const pgid = await startBlue(sink);
-  const groupDeath = await awaitDeath({ pgid, identity: 'spawn-nonce', killGroup: (p, s) => process.kill(-p, s), sleep, probeMs: 20, timeoutMs: 15000 });
+  const groupDeath = await awaitDeath({ pgid, identity: 'spawn-nonce', probeIdentity: () => null, killGroup: (p, s) => process.kill(-p, s), sleep, probeMs: 20, timeoutMs: 15000 });
   const verdict = decide(groupDeath);
   if (verdict.promote) appendFileSync(sink, 'green-merge\n');
   return { groupDeath, verdict, lines: readFileSync(sink, 'utf8').trim().split('\n') };
@@ -41,7 +41,8 @@ async function runHandover(sink, awaitDeath) {
 const canReap = await (async () => {
   const l = spawn(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},50)'],{stdio:'ignore'});process.exit(0)"], { detached: true, stdio: 'ignore' });
   await new Promise((r) => l.on('exit', r));
-  return (await awaitGroupDeath({ pgid: l.pid, identity: 'probe', killGroup: (p, s) => process.kill(-p, s), sleep, probeMs: 20, timeoutMs: 2000 })) === 'dead';
+  for (let i = 0; i < 100; i++) { try { process.kill(-l.pid, 0); } catch (e) { return e.code === 'ESRCH'; } await sleep(20); }
+  return false; // measured with raw kill(-pgid, 0), never with the barrier under test
 })();
 
 describe('generation handover (ordered exit)', () => {

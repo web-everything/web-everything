@@ -18,8 +18,18 @@ export const HANDOVER_EXIT_CODE = 77;
 /** Default settle bound after an unclean blue: at least blue's `gh` request timeout (S1.4 passes the real one). */
 export const DEFAULT_GH_REQUEST_TIMEOUT_MS = 120_000;
 
-/** The only spawns allowed to start a new session/process group; neither can merge. */
-export const MERGE_CAPABLE_SPAWN_ALLOWLIST = Object.freeze(['osascript', 'deps-job']);
+/**
+ * The only spawns allowed to start a new session/process group. An entry names the file it may appear in and the
+ * exact code line, so a comment or another command nearby cannot exempt a different spawn.
+ * `osascript` (a notification) and `deps-job` (npm ci) cannot merge. `drain-followup-job` is the post-merge
+ * follow-up job (x4y74wj): it survives its leader on purpose, is serialized by its own job store and resumed by
+ * the next generation's reattach tick. KNOWN GAP against invariant I, carded in the PR; it is listed, not hidden.
+ */
+export const MERGE_CAPABLE_SPAWN_ALLOWLIST = Object.freeze([
+  { name: 'osascript', file: null, line: /osascript/ },
+  { name: 'deps-job', file: null, line: /deps-job/ },
+  { name: 'drain-followup-job', file: 'daemon-jobs-runtime.mjs', line: /spawn\(process\.execPath,\s*\[entryPath\]/ },
+]);
 
 /**
  * Wait for the whole group to be gone. `'dead'` only on ESRCH AND a matching spawn identity; anything else that
@@ -28,8 +38,10 @@ export const MERGE_CAPABLE_SPAWN_ALLOWLIST = Object.freeze(['osascript', 'deps-j
  * on that pgid's leader pid, or null when it is gone. A different identity means the pgid was reused: unknown.
  * @returns {Promise<'dead'|'alive'|'unknown'>}
  */
-export async function awaitGroupDeath({ pgid, identity = null, probeIdentity = () => null, killGroup, sleep, probeMs = GROUP_PROBE_MS, timeoutMs = GROUP_DEATH_TIMEOUT_MS } = {}) {
+export async function awaitGroupDeath({ pgid, identity = null, probeIdentity = null, killGroup, sleep, probeMs = GROUP_PROBE_MS, timeoutMs = GROUP_DEATH_TIMEOUT_MS } = {}) {
   if (!Number.isInteger(pgid) || pgid <= 1 || typeof killGroup !== 'function' || typeof sleep !== 'function') return 'unknown';
+  if (typeof probeIdentity !== 'function') return 'unknown'; // the identity check is mandatory, never defaulted away
+  if (!(probeMs > 0) || !(timeoutMs >= 0)) return 'unknown';
   if (identity == null || identity === '') return 'unknown'; // no recorded start identity: the proof cannot be tied to our spawn
   for (let waited = 0; ; waited += probeMs) {
     let now;
@@ -51,7 +63,8 @@ export async function awaitGroupDeath({ pgid, identity = null, probeIdentity = (
 export function settleDecision({ exitCode, inFlight, lastSendAt = null, nowMs, ghRequestTimeoutMs = DEFAULT_GH_REQUEST_TIMEOUT_MS, settleMs = 0 } = {}) {
   const clean = exitCode === HANDOVER_EXIT_CODE && inFlight === 0;
   if (clean) return { waitMs: 0, reconcileFirst: false, clean: true };
-  const bound = Math.max(Number.isFinite(settleMs) ? settleMs : 0, Number.isFinite(ghRequestTimeoutMs) ? ghRequestTimeoutMs : DEFAULT_GH_REQUEST_TIMEOUT_MS);
+  // A zero, negative or non-finite timeout is never trusted: it falls back to the default bound.
+  const bound = Math.max(Number.isFinite(settleMs) && settleMs > 0 ? settleMs : 0, Number.isFinite(ghRequestTimeoutMs) && ghRequestTimeoutMs > 0 ? ghRequestTimeoutMs : DEFAULT_GH_REQUEST_TIMEOUT_MS);
   const anchor = Number.isFinite(lastSendAt) && Number.isFinite(nowMs) ? lastSendAt : nowMs;
   const waitMs = Number.isFinite(anchor) && Number.isFinite(nowMs) ? Math.max(0, anchor + bound - nowMs) : bound;
   return { waitMs, reconcileFirst: true, clean: false };
@@ -64,11 +77,11 @@ export function settleDecision({ exitCode, inFlight, lastSendAt = null, nowMs, g
 export function decidePromotion({ exitCode, groupDeath, recordWritten, candidate, expectedDigest, inFlight, lastSendAt = null, nowMs, ghRequestTimeoutMs, settleMs } = {}) {
   if (groupDeath !== 'dead') return { promote: false, reason: groupDeath === 'alive' ? 'group-alive' : 'group-death-unknown' };
   if (recordWritten !== true) return { promote: false, reason: 'record-not-written' };
-  if (!candidate || !Number.isInteger(candidate.pid) || candidate.alive !== true) return { promote: false, reason: 'candidate-dead' };
+  if (!candidate || !Number.isInteger(candidate.pid) || candidate.pid <= 1 || candidate.alive !== true) return { promote: false, reason: 'candidate-dead' };
   if (candidate.ready !== true) return { promote: false, reason: 'candidate-not-ready' };
   if (!expectedDigest || candidate.codeDigest !== expectedDigest) return { promote: false, reason: 'digest-mismatch' };
   if (!Number.isInteger(inFlight) || inFlight < 0) return { promote: false, reason: 'in-flight-unknown' };
-  if (exitCode == null) return { promote: false, reason: 'exit-code-unknown' };
+  if (!Number.isInteger(exitCode)) return { promote: false, reason: 'exit-code-unknown' };
   const settle = settleDecision({ exitCode, inFlight, lastSendAt, nowMs, ghRequestTimeoutMs, settleMs });
   if (settle.clean) return { promote: true, to: candidate, waitMs: 0, reconcileFirst: false };
   // Not a clean handover (killed, crashed, not 77, or work in flight): the group is dead, but green settles first.
@@ -78,27 +91,37 @@ export function decidePromotion({ exitCode, groupDeath, recordWritten, candidate
 /** Blue's pass-boundary check (S1.4 calls it). A refusal means blue keeps passing. */
 export function mayHandOver({ holdingLease, paused, currentChild, eoeIdle, sourcesStopped } = {}) {
   if (holdingLease !== true) return { ok: false, reason: 'lease-not-held' };
-  if (paused === true) return { ok: false, reason: 'paused' };
-  if (currentChild != null) return { ok: false, reason: 'child-running' };
+  if (paused !== false) return { ok: false, reason: 'paused' }; // absent state is not "not paused"
+  if (currentChild !== null) return { ok: false, reason: 'child-running' };
   if (eoeIdle !== true) return { ok: false, reason: 'eoe-busy' };
   if (sourcesStopped !== true) return { ok: false, reason: 'sources-live' };
   return { ok: true };
 }
 
-const NEW_SESSION_RE = /detached\s*:\s*(?:true|!0)|\bsetsid\b|start_new_session|new[-_ ]session|setpgid|\bsetsid\(/g;
+// `detached` as an object key (`detached: x`, `'detached': x`, `["detached"]: x`) or shorthand (`{ detached }`,
+// `{ a, detached }`), plus the other ways to leave the group. Prose such as 'detached HEAD' does not match.
+const NEW_SESSION_RE = /\bdetached\s*:|['"`]detached['"`]\s*\]?\s*:|[{,]\s*detached\s*[,}]|\bsetsid\b|start_new_session|new[-_ ]session|\bsetpgid\b|\bsetpgrp\b/g;
+
+/** Remove // and block comments (keeping newlines so line numbers hold) so a comment can never exempt a spawn. */
+function stripComments(src) {
+  return src.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' ')).replace(/(^|[^:'"`\\])\/\/[^\n]*/g, '$1');
+}
 
 /**
- * Scan source text for spawns that leave the gate's process group (detached, setsid, new session). Each hit
- * must sit within its allowlisted context (the 300 chars around it name an allowlisted command).
+ * Scan source text for spawns that leave the gate's process group (detached, setsid, new session). A hit is
+ * exempt only when an allowlist entry for this `file` matches the hit's own line or the two code lines before
+ * it (comments are stripped first, so a nearby comment never exempts anything).
  * @returns {{line:number, text:string}[]} violations
  */
-export function scanNewSessionSpawns(source, allowlist = MERGE_CAPABLE_SPAWN_ALLOWLIST) {
+export function scanNewSessionSpawns(source, { file = null, allowlist = MERGE_CAPABLE_SPAWN_ALLOWLIST } = {}) {
   const out = [];
-  const text = String(source ?? '');
+  const text = stripComments(String(source ?? ''));
+  const lines = text.split('\n');
   for (const m of text.matchAll(NEW_SESSION_RE)) {
-    const around = text.slice(Math.max(0, m.index - 300), m.index + 300);
-    if (allowlist.some((name) => around.includes(name))) continue;
-    out.push({ line: text.slice(0, m.index).split('\n').length, text: m[0] });
+    const n = text.slice(0, m.index).split('\n').length;
+    const window = lines.slice(Math.max(0, n - 3), n).join('\n');
+    const exempt = allowlist.some((e) => (e.file == null || e.file === file) && e.line.test(window));
+    if (!exempt) out.push({ line: n, text: m[0] });
   }
   return out;
 }

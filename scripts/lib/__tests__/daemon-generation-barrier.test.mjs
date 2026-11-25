@@ -12,28 +12,36 @@ const root = join(here, '..', '..'); // scripts/
 const realSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errCode = (code) => Object.assign(new Error(code), { code });
 
+// Host capability, measured with raw kill(-pgid, 0) and NOT with the code under test: a container whose pid 1 never
+// reaps leaves an exited orphan as a zombie, so a real group never reads ESRCH there (the Forge exec container).
+const canReap = await (async () => {
+  const l = spawn(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},50)'],{stdio:'ignore'});process.exit(0)"], { detached: true, stdio: 'ignore' });
+  await new Promise((r) => l.on('exit', r));
+  for (let i = 0; i < 100; i++) { try { process.kill(-l.pid, 0); } catch (e) { return e.code === 'ESRCH'; } await realSleep(20); }
+  return false;
+})();
+
 describe('awaitGroupDeath', () => {
-  it('is dead after a straggler grandchild of a real group exits', async () => {
+  it.skipIf(!canReap)('is dead after a straggler grandchild of a real group exits', async () => {
     const leader = spawn(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},400)'],{stdio:'ignore'});setTimeout(()=>process.exit(0),50)"], { detached: true, stdio: 'ignore' });
     const pgid = leader.pid;
     await new Promise((r) => leader.on('exit', r));
     expect(() => process.kill(-pgid, 0)).not.toThrow(); // grandchild still alive
-    const res = await awaitGroupDeath({ pgid, identity: 'n1', killGroup: (p, s) => process.kill(-p, s), sleep: realSleep, probeMs: 20, timeoutMs: 3000 });
-    // A container whose pid 1 never reaps leaves the exited straggler as a zombie that keeps the group probe
-    // alive for ever: that is 'alive' (fail closed), never a false 'dead'.
-    expect(['dead', 'alive']).toContain(res);
+    const res = await awaitGroupDeath({ pgid, identity: 'n1', probeIdentity: () => null, killGroup: (p, s) => process.kill(-p, s), sleep: realSleep, probeMs: 20, timeoutMs: 3000 });
+    expect(res).toBe('dead');
   }, 10_000);
   it('is alive at the timeout', async () => {
-    const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', killGroup: () => {}, sleep: async () => {}, probeMs: 10, timeoutMs: 30 });
+    const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null, killGroup: () => {}, sleep: async () => {}, probeMs: 10, timeoutMs: 30 });
     expect(res).toBe('alive');
   });
   it('is unknown on a non-ESRCH probe error (EPERM)', async () => {
-    const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', killGroup: () => { throw errCode('EPERM'); }, sleep: async () => {}, timeoutMs: 30 });
+    const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null, killGroup: () => { throw errCode('EPERM'); }, sleep: async () => {}, timeoutMs: 30 });
     expect(res).toBe('unknown');
   });
   it('is unknown without a recorded start identity, or when the pgid was reused', async () => {
     const dead = () => { throw errCode('ESRCH'); };
-    expect(await awaitGroupDeath({ pgid: 4242, killGroup: dead, sleep: async () => {} })).toBe('unknown');
+    expect(await awaitGroupDeath({ pgid: 4242, probeIdentity: () => null, killGroup: dead, sleep: async () => {} })).toBe('unknown');
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'a', killGroup: dead, sleep: async () => {} })).toBe('unknown'); // no identity probe
     expect(await awaitGroupDeath({ pgid: 4242, identity: 'a', probeIdentity: () => 'b', killGroup: dead, sleep: async () => {} })).toBe('unknown');
     expect(await awaitGroupDeath({ pgid: 4242, identity: 'a', probeIdentity: () => { throw new Error('x'); }, killGroup: dead, sleep: async () => {} })).toBe('unknown');
     expect(await awaitGroupDeath({ pgid: 4242, identity: 'a', probeIdentity: () => null, killGroup: dead, sleep: async () => {} })).toBe('dead');
@@ -58,6 +66,9 @@ describe('decidePromotion', () => {
     ['expected digest missing', { expectedDigest: undefined }],
     ['in-flight unknown', { inFlight: undefined }],
     ['exit code unknown', { exitCode: undefined }],
+    ['exit code NaN', { exitCode: NaN }],
+    ['candidate pid 0', { candidate: { ...good.candidate, pid: 0 } }],
+    ['candidate pid negative', { candidate: { ...good.candidate, pid: -5 } }],
   ])('refuses on %s', (_n, patch) => {
     expect(decidePromotion({ ...good, ...patch })).toMatchObject({ promote: false });
   });
@@ -80,6 +91,9 @@ describe('settleDecision', () => {
     expect(settleDecision({ exitCode: 1, inFlight: 0, lastSendAt: 0, nowMs: 3000, ghRequestTimeoutMs: 5000, settleMs: 9000 }).waitMs).toBe(6000);
     expect(settleDecision({ exitCode: 1, inFlight: 0, lastSendAt: 0, nowMs: 99999, ghRequestTimeoutMs: 5000 }).waitMs).toBe(0);
   });
+  it('a zero, negative or NaN gh timeout falls back to the default bound', () => {
+    for (const t of [0, -1, NaN, null]) expect(settleDecision({ exitCode: 1, inFlight: 0, lastSendAt: 0, nowMs: 0, ghRequestTimeoutMs: t }).waitMs).toBe(120000);
+  });
   it('an unknown last-send time waits the full bound from now, and reconciles first', () => {
     expect(settleDecision({ exitCode: null, inFlight: 1, nowMs: 3000, ghRequestTimeoutMs: 5000 })).toEqual({ waitMs: 5000, reconcileFirst: true, clean: false });
   });
@@ -95,24 +109,38 @@ describe('mayHandOver', () => {
     ['paused', { paused: true }],
     ['lease not held', { holdingLease: false }],
     ['absent state', { holdingLease: undefined }],
+    ['paused field missing', { paused: undefined }],
+    ['currentChild field missing', { currentChild: undefined }],
   ])('refuses with %s', (_n, patch) => expect(mayHandOver({ ...ok, ...patch }).ok).toBe(false));
 });
 
 describe('new-session spawn allowlist', () => {
-  it('declares exactly the two non-merging spawns', () => {
-    expect([...MERGE_CAPABLE_SPAWN_ALLOWLIST]).toEqual(['osascript', 'deps-job']);
+  it('declares exactly the three known non-merging-or-disclosed spawns', () => {
+    expect(MERGE_CAPABLE_SPAWN_ALLOWLIST.map((e) => e.name)).toEqual(['osascript', 'deps-job', 'drain-followup-job']);
   });
-  it('flags detached, setsid and new-session spawns outside the allowlist', () => {
-    expect(scanNewSessionSpawns("spawn('gh', a, { detached: true })")).toHaveLength(1);
-    expect(scanNewSessionSpawns("spawn('setsid', ['gh'])")).toHaveLength(1);
-    expect(scanNewSessionSpawns("subprocess.Popen(x, start_new_session=True)")).toHaveLength(1);
+  it.each([
+    ["spawn('gh', a, { detached: true })"],
+    ["spawn('gh', a, { detached })"],
+    ["spawn('gh', a, { stdio, detached })"],
+    ["spawn('gh', a, { ['detached']: true })"],
+    ["spawn('gh', a, { 'detached' : opts.d })"],
+    ["spawn('setsid', ['gh'])"],
+    ["subprocess.Popen(x, start_new_session=True)"],
+    ["// osascript\nspawn('gh', a, { detached: true })"],
+    ["spawn('gh', a, { detached: true }) // osascript"],
+    ["/* deps-job */ spawn('gh', a, { detached: true })"],
+  ])('flags %s', (src) => expect(scanNewSessionSpawns(src)).toHaveLength(1));
+  it('exempts only an allowlisted spawn on its own code line, and prose is not a spawn', () => {
     expect(scanNewSessionSpawns("spawn('osascript', a, { detached: true })")).toHaveLength(0);
+    expect(scanNewSessionSpawns("branch || 'detached HEAD'; const detached = x == null;")).toHaveLength(0);
+    // the follow-up allowlist entry applies to its own file only
+    const src = 'spawn(process.execPath, [entryPath], { cwd, env, detached: true })';
+    expect(scanNewSessionSpawns(src, { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(0);
+    expect(scanNewSessionSpawns(src, { file: 'other.mjs' })).toHaveLength(1);
   });
   it('no merge-capable spawn outside the allowlist is detached or in a new session', () => {
-    const files = [
-      join(root, 'merge-ai-prs.mjs'),
-      join(root, 'lib', 'enqueue-on-event.mjs'),
-    ]; // the sibling repo's daemon.mjs is out of reach for a hermetic test: its scan is the live PGID probe (acceptance 6)
-    for (const f of files) expect(scanNewSessionSpawns(readFileSync(f, 'utf8')), f).toEqual([]);
+    const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
+    // the sibling repo's daemon.mjs is out of reach for a hermetic test: its scan is the live PGID probe (acceptance 6)
+    for (const f of files) expect(scanNewSessionSpawns(readFileSync(join(root, f), 'utf8'), { file: f.split('/').pop() }), f).toEqual([]);
   });
 });
