@@ -162,10 +162,11 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     for (const rows of sources.values()) {
       if (!Object.hasOwn(rows, 'fetchedAtMs')) { unstamped = true; continue; }
       // Future-dated or non-finite source time is stale: never clamp it to the observation time.
-      if (!Number.isFinite(rows.fetchedAtMs) || rows.fetchedAtMs > now()) return NaN;
+      if (typeof rows.fetchedAtMs !== 'number' || !Number.isFinite(rows.fetchedAtMs) || rows.fetchedAtMs > now()) return NaN;
       oldest = Math.min(oldest, rows.fetchedAtMs);
     }
-    return unstamped || oldest === Infinity ? Math.min(oldest, floor) : oldest;
+    // The pass-time floor applies to every source: the freshness limit bounds elapsed pass time too.
+    return Math.min(oldest, floor);
   };
   const readSources = () => new Map(repos.map(repo => {
     const rows = readSnapshot(repo);

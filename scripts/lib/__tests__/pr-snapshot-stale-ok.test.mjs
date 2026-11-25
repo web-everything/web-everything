@@ -18,7 +18,7 @@ const prs = [
   { number: 4, createdAt: '2026-10-01T00:00:00Z' },
   { number: 2, createdAt: '2026-10-01T00:00:00Z' },
   { number: 1, createdAt: '2026-10-02T00:00:00Z' },
-];
+].map(pr => ({ ...pr, headRefOid: pr.number.toString(16).padStart(40, '0') }));
 let dir;
 let repo;
 let sequence = 0;
@@ -220,7 +220,7 @@ process.stdout.write(JSON.stringify({ data: { repository: { pullRequests: {
     const exec = vi.fn((_cmd, args) => args[0] === 'api'
       ? JSON.stringify({ data: { repository: { pullRequests: { nodes: prs.map(pr => ({ ...pr, labels: { nodes: [] } })),
         totalCount: prs.length, pageInfo: { hasNextPage: false, endCursor: null } } } } })
-      : JSON.stringify({ comments: [], body: '', files: [] }));
+      : JSON.stringify({ comments: [], body: '', files: [], headRefOid: prs.find(p => p.number === Number(args[2])).headRefOid }));
     expect(readSharedOpenPrs(options({ exec, env: { WE_PR_SNAPSHOT_SAMPLE: '3' } })))
       .toEqual([{ number: 2 }, { number: 4 }, { number: 1 }]);
     expect(JSON.parse(readFileSync(snapshotPath(dir, repo), 'utf8')).prs.map(pr => pr.number)).toEqual([9, 4, 2, 1]);

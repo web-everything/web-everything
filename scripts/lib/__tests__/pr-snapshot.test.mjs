@@ -23,7 +23,7 @@ import { prSnapshotEnabled, markPrSnapshotDirty, latestDirtyMs, repoFromGhArgs, 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
   rowsHead: null, rowsComplete: false, number: 100 + i, title: `t${i}`, body: `b${i}`, url: `u${i}`, isDraft: false, createdAt: 'c', updatedAt: 'u',
-  headRefName: `lane/x${i}`, headRefOid: `abc${i}`, baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
+  headRefName: `lane/x${i}`, headRefOid: (i + 1).toString(16).padStart(40, '0'), baseRefName: 'main', isCrossRepository: false, reviewDecision: 'APPROVED', mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
   labels: [{ name: 'ready-to-merge' }], files: [{ path: 'a.mjs' }], comments: [{ body: 'hi' }], statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED',
     startedAt: 's', completedAt: 'e', detailsUrl: 'url', workflowName: 'build', appSlug: 'github-actions', appId: 15368 }],
 }));
@@ -105,7 +105,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
       import { readSharedOpenPrs } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/lib/pr-snapshot.mjs')).href)};
       const [dir, count] = process.argv.slice(1);
       const ids = Array.from({ length: Number(count) }, (_, i) => 777 + i);
-      const nodes = ids.map((id, i) => ({ number: i + 1, headRefOid: 'head-' + i,
+      const nodes = ids.map((id, i) => ({ number: i + 1, headRefOid: (i + 1).toString(16).padStart(40, '0'),
         updatedAt: 'unchanged', labels: { nodes: [] }, commits: { nodes: [{ commit: {
           statusCheckRollup: { contexts: { nodes: [{ __typename: 'CheckRun', name: 'red-team',
             databaseId: id, status: 'IN_PROGRESS', checkSuite: { app: null, workflowRun: null } }] } }
@@ -115,7 +115,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
         if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: {
           nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null }
         } } } });
-        if (args[0] === 'pr') return JSON.stringify({ comments: [], body: '', files: [], headRefOid: 'head-' + (Number(args[2]) - 1) });
+        if (args[0] === 'pr') return JSON.stringify({ comments: [], body: '', files: [], headRefOid: Number(args[2]).toString(16).padStart(40, '0') });
         lookups++;
         return JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } });
       };

@@ -514,6 +514,16 @@ test('freshness uses the oldest rows.fetchedAtMs, and a too-old final replacemen
     // Future-dated source rows are refused, not clamped to the observation time.
     await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => withAge(200_000), path: join(dir, 'round3.json') }),
       /expired|retry next pass/);
+    // Timestamped sources keep the pass-time floor: a pass that took 70s is refused even if its sources are fresh.
+    let t = 100_000;
+    await assert.rejects(readFastDrainPassInventory({ ...base, path: join(dir, 'round4.json'), now: () => t,
+      listLean: async () => { t = 170_000; return inventory(rows.map(lean)); },
+      readSnapshot: () => withAge(t - 1_000) }), /expired|retry next pass/);
+    // Null and string timestamps are invalid, not coerced to numbers.
+    for (const bad of [null, '99000']) {
+      await assert.rejects(readFastDrainPassInventory({ ...base, path: join(dir, `bad-${String(bad)}.json`), readSnapshot: () => withAge(bad) }),
+        /expired|retry next pass/);
+    }
     // A replacement that is too old is refused even when the cached pass is valid.
     let calls = 0;
     await assert.rejects(readFastDrainPassInventory({ ...base, readSnapshot: () => (calls++ === 0 ? withAge(99_000) : withAge(1_000)),

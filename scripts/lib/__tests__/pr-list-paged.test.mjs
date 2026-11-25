@@ -15,9 +15,10 @@ import {
 import { withListRetryAsync } from '../gh-list-retry.mjs';
 
 const repo = 'owner/name';
+const hex40 = number => Number(number).toString(16).padStart(40, '0');
 const node = (number, extra = {}) => ({ number, title: `PR ${number}`, url: `https://example.com/${number}`,
   isDraft: false, createdAt: '2026-10-12T00:00:00Z', updatedAt: '2026-10-13T00:00:00Z',
-  headRefName: `branch-${number}`, headRefOid: `head-${number}`, baseRefName: 'main',
+  headRefName: `branch-${number}`, headRefOid: hex40(number), baseRefName: 'main',
   isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null, ...extra });
 const page = (nodes, hasNextPage = false, endCursor = null, totalCount = 45) => JSON.stringify({
   data: { repository: { pullRequests: { nodes, pageInfo: { hasNextPage, endCursor }, totalCount } } },
@@ -27,7 +28,7 @@ const timeout = 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)'
 const heavy = { comments: [{ body: 'hello' }], body: 'description', files: [{ path: 'a.js' }] };
 const row = number => mapGraphqlPr(node(number));
 // A well-formed `gh pr view` response names the head it was read at; mocks echo the requested PR's head.
-const hv = (args, extra = {}) => JSON.stringify({ ...heavy, ...extra, headRefOid: `head-${args[2]}` });
+const hv = (args, extra = {}) => JSON.stringify({ ...heavy, ...extra, headRefOid: hex40(args[2]) });
 const cached = (r, extra = {}) => ({ updatedAt: r.updatedAt, headRefOid: r.headRefOid,
   fetchedAtMs: 9500, ...heavy, ...extra });
 const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -601,7 +602,7 @@ describe('paged hydrated listing', () => {
   });
 
   it('a seed is aged by its own fetchedAtMs through the same predicate as the cache, never renewed', () => {
-    for (const fetchedAtMs of [1, 20000, undefined, NaN]) { // old, future, missing, invalid
+    for (const fetchedAtMs of [1, 20000, undefined, NaN, null, '9500']) { // old, future, missing, invalid, null, string
       const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1)).mockReturnValueOnce(JSON.stringify({ ...heavy, headRefOid: row(1).headRefOid }));
       const result = list(exec, { seed: [{ ...row(1), ...heavy, fetchedAtMs }] });
       expect(result, String(fetchedAtMs)).toMatchObject({ hydrated: 1, reused: 0 });
@@ -610,7 +611,7 @@ describe('paged hydrated listing', () => {
 
   it('future-dated or non-finite heavy cache evidence is never fresh', () => {
     const r = row(1);
-    for (const fetchedAtMs of [20000, NaN, undefined, Infinity]) {
+    for (const fetchedAtMs of [20000, NaN, undefined, Infinity, null, '9500', true, [], {}]) {
       expect(heavyIsFresh(cached(r, { fetchedAtMs }), r, { nowMs: 10000, maxAgeMs: 1000 })).toBeFalsy();
       expect(heavyIsFresh(cached(r, { fetchedAtMs }), r, { nowMs: 10000, maxAgeMs: 0 })).toBeFalsy();
     }
@@ -619,6 +620,18 @@ describe('paged hydrated listing', () => {
   it('a hydration response without headRefOid is refused', () => {
     expect(() => hydrateHeavyFields({ repo, rows: [row(1)], exec: () => JSON.stringify(heavy), nowMs: 10000, maxAgeMs: 1000 }))
       .toThrow(PrListUnreadableError);
+  });
+
+  it('head verification needs BOTH sides to be 40-hex and equal; undefined, short or non-hex heads are unknown', () => {
+    const good = 'a'.repeat(40);
+    const attempt = (listingHead, hydratedHead) => () => hydrateHeavyFields({ repo,
+      rows: [{ ...row(1), headRefOid: listingHead }], nowMs: 10000, maxAgeMs: 1000,
+      exec: () => JSON.stringify({ ...heavy, ...(hydratedHead === undefined ? {} : { headRefOid: hydratedHead }) }) });
+    expect(attempt(good, good)).not.toThrow();
+    for (const [l, h] of [[undefined, undefined], [good, undefined], [undefined, good], ['abc', 'abc'], ['head-1', 'head-1'],
+      ['A'.repeat(40), 'A'.repeat(40) + 'x'], [good, 'b'.repeat(40)], [null, null], ['', '']]) {
+      expect(attempt(l, h), `${l} / ${h}`).toThrow(PrListUnreadableError);
+    }
   });
 
   it('reuses matching snapshot seeds without view calls', () => {
@@ -634,7 +647,7 @@ describe('paged hydrated listing', () => {
   it.each([
     { headRefOid: 'old' }, { updatedAt: 'old' }, { files: undefined },
   ])('hydrates a mismatched or incomplete seed (%j)', extra => {
-    const seedRow = { ...row(1), ...heavy, ...extra };
+    const seedRow = { ...row(1), ...heavy, fetchedAtMs: 9500, ...extra }; // valid age: only identity/completeness can reject
     if (extra.files === undefined && Object.hasOwn(extra, 'files')) delete seedRow.files;
     const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1))
       .mockImplementationOnce((_c, args) => hv(args));
@@ -763,12 +776,12 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
     const cache = { 99: cached(row(99)) };
     const seed = [];
     if (mode === 'seed' || mode === 'cache') {
-      seed.push({ ...row(1), ...heavy, body: 'seed' });
+      seed.push({ ...row(1), ...heavy, body: 'seed', fetchedAtMs: 9500 });
       cache[2] = cached(row(2), { body: 'cached' });
     }
     if (mode === 'cache') cache[1] = cached(row(1), { body: 'preferred cache' });
     if (mode === 'stale') {
-      seed.push({ ...row(1), ...heavy, headRefOid: 'old' });
+      seed.push({ ...row(1), ...heavy, headRefOid: 'old', fetchedAtMs: 9500 });
       cache[2] = cached(row(2), { fetchedAtMs: 8000 });
       cache[3] = { ...cached(row(3)), headRefOid: 'old' };
       cache[4] = { ...row(4), body: 'missing files', fetchedAtMs: 9500 };

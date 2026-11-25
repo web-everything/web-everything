@@ -558,7 +558,10 @@ for (const phase of ['cold', 'direct hit', 'locked hit']) {
       try {
         if (phase !== 'cold') await readFastDrainPassInventory(f.options);
         let reads = 0;
-        const result = await readFastDrainPassInventory({ ...f.options,
+        // A cached pass whose own evidence expires during the read is refused: the pass-time floor applies to
+        // every source, so a refreshed replacement cannot rescue an expired pass (only a cold build can).
+        const expectRefusal = invalid === 'expired' && phase !== 'cold';
+        const attempt = readFastDrainPassInventory({ ...f.options,
           read: path => { if (phase === 'locked hit' && ++reads === 1) throw Error('force locked hit'); return JSON.parse(readFileSync(path, 'utf8')); },
           listLean: async () => {
             await setImmediate();
@@ -569,6 +572,8 @@ for (const phase of ['cold', 'direct hit', 'locked hit']) {
             return inventory(rows); // Identical head/updatedAt cannot make the pass's old checks reusable.
           },
         });
+        if (expectRefusal) { await expect(attempt).rejects.toThrow('expired while reading'); return; }
+        const result = await attempt;
         const freshRows = f.options.readSnapshot(repo);
         expect(freshRows).not.toBeNull();
         expect(result.snapshots.get(repo)).toEqual(freshRows);

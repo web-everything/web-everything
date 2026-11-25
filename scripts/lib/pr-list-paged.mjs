@@ -262,10 +262,14 @@ export function isTransientGhFailure(text) {
   return [...GH_TRANSIENT_SERVER_PATTERNS, ...GH_JSON_PARSE_FAILURE_PATTERNS].some(re => re.test(String(text ?? '')));
 }
 
+const isSha = v => typeof v === 'string' && /^[0-9a-f]{40}$/i.test(v);
+
 /** PURE: both PR identity stamps and the heavy-field age must still be fresh. */
 export function heavyIsFresh(cached, row, { nowMs, maxAgeMs }) {
   if (!cached || cached.updatedAt !== row.updatedAt || cached.headRefOid !== row.headRefOid) return false;
-  const age = nowMs - cached.fetchedAtMs; // missing/NaN/future timestamps are never fresh
+  // Only a finite number counts: null/string/boolean/missing would coerce in the subtraction below.
+  if (typeof cached.fetchedAtMs !== 'number' || !Number.isFinite(cached.fetchedAtMs)) return false;
+  const age = nowMs - cached.fetchedAtMs; // future timestamps (negative age) are never fresh
   return Number.isFinite(age) && age >= 0 && age < maxAgeMs;
 }
 
@@ -314,7 +318,8 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
       throw new Error('missing PR heavy-field data');
     }
     // Hydrated data must be for the listing head; a differing head is a mid-flight push, refuse not stamp.
-    if (data.headRefOid !== row.headRefOid) {
+    // Both sides must be a full 40-hex SHA and equal; an absent or malformed head is unknown, never a match.
+    if (!isSha(data.headRefOid) || !isSha(row.headRefOid) || data.headRefOid !== row.headRefOid) {
       throw new Error('hydrated PR head differs from listing head');
     }
     return data;
