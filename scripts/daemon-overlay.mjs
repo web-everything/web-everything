@@ -1018,7 +1018,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       }
       // RS-HP-3: the same hotpatch door as guardedRegister: admitted sha == candidate sha, or no registration.
       if (!flags.check) {
-        const hp = await admitHotpatchRef({ root, ref: flags.ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch });
+        const hp = await admitHotpatchRef({ root, ref: flags.ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: deps.tip ?? ((r) => remoteTip({ root, ref: r, env })) });
         if (!hp.ok) {
           process.stderr.write(`daemon-overlay: REFUSED — ${flags.ref} is a hotpatch ref and ${hp.reason} (needs a bound green CI receipt and an own-sha audit)\n`);
           process.exitCode = 3;
