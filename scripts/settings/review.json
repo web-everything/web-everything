@@ -4,6 +4,7 @@
   "seatDailyCaps": {"codex":600},
   "timing": { "startAfter": "push", "cancelOnCiRed": true, "startEarly": "off" },
   "postAcceptAdvisory": { "mode": "off" },
+  "seatRouting": { "correctness": "B" },
   "parallelSeats": "on",
   "seatsByTouchSet": "on",
   "shadowSeats": {
