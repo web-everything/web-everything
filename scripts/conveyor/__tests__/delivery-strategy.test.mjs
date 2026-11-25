@@ -62,7 +62,7 @@ describe('SHIP-WM-160: replay 11-24..25: each fix gets the winning strategy', ()
   it('SHIP-WM-161/173: golden table and settings digests match the copied fixtures and replay helper', () => {
     expect(digestOf(table)).toEqual(replay.table.digest);
     expect(digestOf(settings.values)).toEqual(replay.settings.digest);
-    expect(replayFindings({ table, settings, points: replay.points })).toEqual([]);
+    expect(replayFindings({ table, settings, points: replay.points, records: replay.records })).toEqual([]);
   });
   it('SHIP-WM-160/163: #7485 is prototype-first and first as hold-causer at its now-green head', () => {
     const point = replay.points.find((p) => p.candidates.some((c) => c.id === '#7485'));
@@ -289,5 +289,85 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
   it('SHIP-WM-161: canonical digest ignores object insertion order', () => {
     expect(canon({ b: 2, a: [true, null] })).toBe(canon({ a: [true, null], b: 2 }));
     expect(digestOf({ b: 2, a: 1 })).toEqual(digestOf({ a: 1, b: 2 }));
+  });
+});
+
+
+describe('S1.1c audit regressions', () => {
+  it('S1.1c finding delivery-strategy.mjs:45 - selection requires source URI and digest', () => {
+    for (const source of [undefined, {}, { uri: 'evidence' }, { digest: digestOf('evidence') }, { uri: ' ', digest: digestOf('evidence') }, { uri: 'evidence', digest: {} }]) {
+      const recorded = inputs({ 'step-kind': 'daemon-fix', blocker: 'stage' });
+      recorded['audit-state'].source = source;
+      outcome(run({}, { inputs: recorded }), 'unhandled', 'EVIDENCE_UNKNOWN');
+    }
+  });
+  it('S1.1c finding delivery-strategy.mjs:110 - core inputs cannot become optional', () => {
+    for (const input of table.inputs.filter((i) => i.required)) refused(158, (t) => { t.inputs.find((i) => i.name === input.name).required = false; });
+  });
+  it('S1.1c finding delivery-strategy.mjs:159 - prototype bound must use overlay-cap', () => {
+    refused(165, (t) => { row(t, 'R3').when['live-overlays'].belowSetting = 'land-by-budget'; });
+  });
+  it('S1.1c finding delivery-strategy.mjs:150 - blocker condition alone never clears a stalled gate', () => {
+    refused(164, (t) => { row(t, 'R10').rank = 0; row(t, 'R10').when.blocker = { in: ['stage', 'hold'] }; });
+  });
+  it('S1.1c finding delivery-strategy.mjs:115 - supplied contracts cannot redefine reference gate effects', () => {
+    const strategies = table.strategies.names.map((name) => ({ name, feedsGates: false }));
+    for (const [id, clause] of [['R6', 164], ['R8', 170]]) {
+      const changed = clone(table);
+      changed.rules = changed.rules.filter((r) => r.id !== id);
+      expect(tableFindings({ table: changed, strategies }).some((f) => f.includes(`SHIP-WM-${clause}`))).toBe(true);
+      outcome(run({}, { table: changed, strategies }), 'unhandled', 'EVIDENCE_UNKNOWN');
+    }
+  });
+  it('S1.1c finding delivery-strategy.mjs:147 - every output ranks after security', () => {
+    refused(157, (t) => { t.rules.push({ id: 'early-hold', rank: 0, when: {}, output: clone(row(t, 'R6').output) }); });
+  });
+  it('S1.1c finding delivery-strategy.mjs:154 - prototype requires passing CI', () => {
+    refused(165, (t) => { delete row(t, 'R3').when['ci-state']; });
+  });
+  it('S1.1c finding delivery-strategy.mjs:162 - hold incident requires audit and CI while red recovery remains valid', () => {
+    for (const key of ['audit-state', 'ci-state']) refused(166, (t) => { delete row(t, 'R2').when[key]; });
+    expect(tableFindings({ table })).toEqual([]);
+    outcome(run({ 'red-interval-open': true, 'red-recovery-candidate': true, 'audit-state': 'fail', 'ci-state': 'fail' }), 'incident', 'RED_MAIN_RECOVERY');
+  });
+  it('S1.1c finding delivery-strategy.mjs:172 - build-ahead requires independent preparation', () => {
+    refused(170, (t) => { delete row(t, 'R7').when['prepped-independent']; });
+    outcome(run({ 'loaded-stage-stress': 'stressed', 'stress-incident': 'fix-landed', 'prepped-independent': false }), 'hold', 'STAGE_STRESSED');
+  });
+  it('S1.1c finding delivery-strategy.mjs:190 - decision metadata has typed non-empty values', () => {
+    for (const [key, value] of [['decisionId', ''], ['decisionId', 1], ['candidate', ' '], ['candidate', {}], ['position', -1], ['position', 0.5], ['position', Infinity], ['positionReason', ''], ['positionReason', true], ['actions', {}]]) {
+      const record = decision();
+      record[key] = value;
+      expect(decisionFindings({ record, table, settings }).some((f) => f.includes('SHIP-WM-162'))).toBe(true);
+    }
+    const record = decision();
+    record.position = 0;
+    expect(decisionFindings({ record, table, settings })).toEqual([]);
+  });
+  it('S1.1c finding delivery-strategy.mjs:196 - source digest is a SHA-256 object', () => {
+    for (const digest of [{}, 'digest', [], { sha256: 'a'.repeat(63) }, { sha256: 'g'.repeat(64) }, { sha256: 'a'.repeat(64) + '\n' }, { sha256: 1 }]) {
+      const record = decision();
+      for (const x of Object.values(record.inputs)) x.source.digest = digest;
+      expect(decisionFindings({ record, table, settings }).some((f) => f.includes('SHIP-WM-162'))).toBe(true);
+    }
+  });
+  it('S1.1c finding delivery-strategy.mjs:180 - order refuses invalid IDs and non-finite plan positions', () => {
+    for (const candidate of [{ planOrder: 1 }, { id: ' ', planOrder: 1 }, { id: 1, planOrder: 1 }, { id: 'a' }, { id: 'a', planOrder: NaN }, { id: 'a', planOrder: Infinity }, { id: 'a', planOrder: '1' }]) {
+      expect(orderFindings({ candidates: [candidate], order: [candidate.id] }).length).toBeGreaterThan(0);
+    }
+    expect(orderFindings({ candidates: [{ id: 'a', planOrder: 1 }, { id: 'a', planOrder: 2 }], order: ['a', 'a'] }).length).toBeGreaterThan(0);
+  });
+  it('S1.1c finding delivery-strategy.mjs:180 - hold flags must agree with recorded hold-causer evidence', () => {
+    for (const [clearsHold, value] of [[true, false], [true, undefined], [false, true], [undefined, true]]) {
+      const candidates = [{ id: 'a', planOrder: 1, clearsHold, inputs: { 'hold-causer': observation(value) } }];
+      expect(orderFindings({ candidates, order: ['a'] }).length).toBeGreaterThan(0);
+    }
+  });
+  it('S1.1c finding delivery-strategy.test.mjs:62 - golden records replay and tampered strategy is detected', () => {
+    expect(replay.records).toHaveLength(8);
+    expect(replayFindings({ table, settings, points: replay.points, records: replay.records })).toEqual([]);
+    const records = clone(replay.records);
+    records[0].strategy = records[0].strategy === 'incident' ? 'normal-pr' : 'incident';
+    expect(replayFindings({ table, settings, points: replay.points, records }).some((f) => f.includes('SHIP-WM-161'))).toBe(true);
   });
 });

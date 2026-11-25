@@ -35,6 +35,8 @@ export const INPUTS = {
   'free-slots': { type: 'count' }, 'review-rounds': { type: 'count' }, 'non-convergence-evidence': { type: 'boolean' } };
 const X = /^x-[a-z][a-z0-9-]*$/, SETTING = /^[a-z][a-z0-9-]*$/, CODE = /^[A-Z][A-Z0-9_]*$/;
 const nonEmpty = (s) => typeof s === 'string' && s.trim().length > 0;
+const isDigest = (d) => d !== null && typeof d === 'object' && !Array.isArray(d) && typeof d.sha256 === 'string' && d.sha256.length === 64 && /^[a-fA-F0-9]+$/.test(d.sha256);
+const hasSource = (x) => nonEmpty(x?.source?.uri) && isDigest(x.source.digest);
 const secs = (t) => (typeof t === 'number' ? t : typeof t === 'string' && t.trim() ? Date.parse(t) / 1000 : NaN);
 const U = Symbol('unknown');
 const numbersIn = (x, path = '', skip = []) => (typeof x === 'number' ? [path || '/'] : Array.isArray(x) ? x.flatMap((v, i) => numbersIn(v, `${path}/${i}`, skip)) : x && typeof x === 'object' ? Object.entries(x).flatMap(([k, v]) => (skip.includes(k) ? [] : numbersIn(v, `${path}/${k}`, skip))) : []);
@@ -42,7 +44,7 @@ const isStrategyName = (n) => REFERENCE.includes(n) || X.test(n ?? '');
 
 // ---- condition evaluation over declared inputs and setting values (S1)
 const valueOf = (decl, x, at) => {
-  if (!x || x.fresh !== true || !Number.isFinite(secs(at)) || !Number.isFinite(secs(x.observedAt)) || secs(x.observedAt) > secs(at) || x.value === undefined || x.value === null || x.value === 'unknown') return U;
+  if (!x || !hasSource(x) || x.fresh !== true || !Number.isFinite(secs(at)) || !Number.isFinite(secs(x.observedAt)) || secs(x.observedAt) > secs(at) || x.value === undefined || x.value === null || x.value === 'unknown') return U;
   const v = x.value;
   if (decl.type === 'boolean') return typeof v === 'boolean' ? v : U;
   if (decl.type === 'count') return Number.isInteger(v) && v >= 0 ? v : U;
@@ -108,11 +110,13 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
   if (!nonEmpty(t?.version)) add('the table declares no version: refused at load', 158);
   const decl = Object.create(null); for (const i of t?.inputs ?? []) { if (decl[i.name]) add(`input ${i.name} declared twice: refused`, 159); decl[i.name] = i; if (!INPUT_TYPES.includes(i.type)) add(`input ${i.name} has type ${i.type}: refused`, 159); if (i.type === 'enum' && !(i.values ?? []).length) add(`enum input ${i.name} declares no values: refused`, 159); if (typeof i.required !== 'boolean') add(`input ${i.name} does not say whether it is required: refused`, 159); }
   for (const [n, d] of Object.entries(INPUTS)) { if (!decl[n]) add(`the input ${n} is not declared: refused at load`, 158); else { if (decl[n].type !== d.type) add(`input ${n} has type ${decl[n].type}, not ${d.type}: refused`, 158); for (const x of d.values ?? []) if (!decl[n].values?.includes(x)) add(`input ${n} lacks the value ${x}: refused`, 158); } }
+  for (const n of [...Object.keys(INPUTS), 'ci-state', 'admission-clear']) if (decl[n] && decl[n].required !== true) add(`core input ${n} must remain required: refused`, 158);
   const settings = new Set(t?.settings ?? []); for (const s of t?.settings ?? []) if (typeof s !== 'string' || !SETTING.test(s)) add(`setting ${s} is not a setting name: refused`, 178);
   const codes = Object.create(null); for (const c of t?.reasonCodes ?? []) { if (codes[c.code]) add(`reason code ${c.code} declared twice: refused`, 159); codes[c.code] = c.class; if (!REASON_CLASSES.includes(c.class)) add(`reason code ${c.code} has class ${c.class}: refused`, 159); if (!CODE.test(c.code ?? '')) add(`reason code ${c.code} is not a code: refused`, 159); }
   if (!(t?.overrideReasons ?? []).length) add('no override reason is declared: refused', 171);
   for (const k of ['onUnknown', 'onNoMatch']) if (!t?.[k] || codes[t[k].reason] !== 'unhandled' || !nonEmpty(t[k].rule)) add(`${k} does not give unhandled with a declared unhandled reason: refused`, 160);
   const set = t?.strategies ?? {}, names = set.names ?? [], byName = Object.fromEntries(strategies.map((c) => [c.name, c]));
+  for (const c of strategies) if (REFERENCE.includes(c.name) && c.feedsGates !== STRATEGY_EFFECTS.find((x) => x.name === c.name).feedsGates) add(`reference strategy ${c.name} cannot redefine its gate effect: refused`, 158);
   if (typeof set.closed !== 'boolean') add('the strategy set does not say whether it is closed: refused', 155);
   for (const n of names) { if (!isStrategyName(n)) add(`strategy ${n} is neither a reference nor an x- strategy: refused`, 155); const c = byName[n]; if (!c) add(`strategy ${n} has no contract: refused`, 154); else if (typeof c.feedsGates !== 'boolean') add(`strategy ${n} declares no gate effect: refused`, 158); }
   for (const k of t?.prototypeStepKinds ?? []) if (!decl['step-kind']?.values?.includes(k)) add(`prototype step kind ${k} is not a declared step kind: refused`, 165);
@@ -140,14 +144,14 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
     if (!cls) add(`rule ${r.id}: reason ${o.reason} is not declared: refused`, 159); else if (!want.includes(cls)) add(`rule ${r.id}: reason ${o.reason} of class ${cls} does not fit ${o.strategy}: refused`, 159);
   }
   const sorted = byRank(t ?? {}), rankOf = (r) => r.rank, stratRows = sorted.filter((r) => names.includes(r.output?.strategy));
-  const contract = (r) => byName[r.output?.strategy];
+  const contract = (r) => STRATEGY_EFFECTS.find((c) => c.name === r.output?.strategy) ?? byName[r.output?.strategy];
   // 157: the security row
   const sec = sorted.find((r) => requires(r, 'security-open', 'eq', true) && r.output?.strategy === 'unhandled' && codes[r.output?.reason] === 'floor' && Object.keys(r.when ?? {}).length === 1);
   if (!sec) add('no row gives unhandled with a floor reason on an open security finding: refused', 157);
-  else for (const r of stratRows) if (rankOf(r) < rankOf(sec)) add(`rule ${r.id} picks a strategy before the security row ${sec.id}: refused`, 157);
+  else for (const r of sorted) if (rankOf(r) < rankOf(sec)) add(`rule ${r.id} gives an output before the security row ${sec.id}: refused`, 157);
   // 164: stop feeding a stalled gate
   const st = sorted.find((r) => requires(r, 'loads-stalled-stage', 'eq', true) && r.output?.strategy === 'hold' && Object.keys(r.when ?? {}).length === 1);
-  const clears = (r) => requires(r, 'blocker', 'in', ['stage', 'hold']);
+  const clears = (r) => requires(r, 'blocker', 'in', ['stage', 'hold']) && requires(r, 'hold-causer', 'eq', true);
   if (!st) add('no row gives hold to a candidate that loads a stalled stage: refused', 164);
   else for (const r of stratRows) if (contract(r)?.feedsGates === true && !clears(r) && rankOf(r) < rankOf(st)) add(`rule ${r.id} feeds the gates before the stalled-gate row ${st.id}: refused`, 164);
   // 165: prototype-first only for declared kinds, adoption, the exact-revision audit, and under the overlay cap
@@ -155,21 +159,23 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
     if (!(t.prototypeStepKinds ?? []).length || !requires(r, 'step-kind', 'in', t.prototypeStepKinds)) add(`rule ${r.id}: prototype-first not limited to the declared prototype step kinds: refused`, 165);
     if (!requires(r, 'targets-can-adopt', 'eq', true)) add(`rule ${r.id}: prototype-first without targets-can-adopt true: refused`, 165);
     if (!requires(r, 'audit-state', 'eq', 'pass')) add(`rule ${r.id}: prototype-first without audit-state pass at the exact revision: refused`, 165);
+    if (!requires(r, 'ci-state', 'eq', 'pass')) add(`rule ${r.id}: prototype-first without ci-state pass: refused`, 165);
     if (!requires(r, 'overlay-loadable', 'eq', true)) add(`rule ${r.id}: prototype-first without overlay-loadable true: refused`, 165);
-    if (!requires(r, 'live-overlays', 'belowSetting')) add(`rule ${r.id}: prototype-first without live-overlays below a cap setting: refused`, 165);
+    if (r.when['live-overlays']?.belowSetting !== 'overlay-cap') add(`rule ${r.id}: prototype-first without live-overlays below overlay-cap: refused`, 165);
   }
   // 166: the incident path, conditioned on adoption (a hold) or on a red interval with its recovery
   for (const r of stratRows.filter((x) => x.output.strategy === 'incident')) {
     const forHold = requires(r, 'blocker', 'eq', 'hold') && requires(r, 'hold-causer', 'eq', true) && requires(r, 'targets-can-adopt', 'eq', false);
     const forRed = decl['red-interval-open'] && decl['red-recovery-candidate'] && requires(r, 'red-interval-open', 'eq', true) && requires(r, 'red-recovery-candidate', 'eq', true);
     if (!forHold && !forRed) add(`rule ${r.id}: incident neither for the hold-causer when the targets cannot adopt nor for a red-interval recovery: refused`, 166);
+    if (!forRed && (!requires(r, 'audit-state', 'eq', 'pass') || !requires(r, 'ci-state', 'eq', 'pass'))) add(`rule ${r.id}: hold incident without passing audit and CI: refused`, 166);
   }
   // 168: the design pass needs the round setting and evidence
   for (const r of stratRows.filter((x) => x.output.strategy === 'design-pass-first')) if (!requires(r, 'review-rounds', 'atLeastSetting') || !requires(r, 'non-convergence-evidence', 'eq', true)) add(`rule ${r.id}: design-pass-first without rounds at or above a setting and non-convergence evidence: refused`, 168);
   // 170: build-ahead only past a known incident whose fix has landed; every other gate-feeding row keeps SHIP-WM-093
   const stressHold = sorted.find((r) => requires(r, 'loaded-stage-stress', 'eq', 'stressed') && r.output?.strategy === 'hold' && Object.keys(r.when ?? {}).length === 1);
   for (const r of stratRows) {
-    if (r.output.strategy === 'build-ahead') { if (!requires(r, 'loaded-stage-stress', 'eq', 'stressed') || !requires(r, 'stress-incident', 'eq', 'fix-landed')) add(`rule ${r.id}: build-ahead without a stressed stage whose incident fix has landed: refused`, 170); continue; }
+    if (r.output.strategy === 'build-ahead') { if (!requires(r, 'loaded-stage-stress', 'eq', 'stressed') || !requires(r, 'stress-incident', 'eq', 'fix-landed') || !requires(r, 'prepped-independent', 'eq', true)) add(`rule ${r.id}: build-ahead without independent preparation and a stressed stage whose incident fix has landed: refused`, 170); continue; }
     if (contract(r)?.feedsGates === true && !requires(r, 'loaded-stage-stress', 'eq', 'clear') && !(stressHold && rankOf(stressHold) < rankOf(r))) add(`rule ${r.id} feeds a stressed stage with no override and no stressed-stage hold before it: refused (SHIP-WM-093 kept)`, 170);
   }
   for (const p of numbersIn(t ?? {}, '', ['rank'])) add(`a literal number at ${p}: every number is a setting, refused`, 178);
@@ -179,6 +185,11 @@ export function tableFindings({ table: t, strategies = STRATEGY_EFFECTS }) {
 // ---- SHIP-WM-163: candidate order, hold-causer first (S1)
 export const candidateOrder = (cands) => [...cands].sort((a, b) => (b.clearsHold === true) - (a.clearsHold === true) || a.planOrder - b.planOrder).map((c) => c.id);
 export function orderFindings({ candidates, order }) {
+  if (!Array.isArray(candidates) || candidates.some((c) => !c || !nonEmpty(c.id) || !Number.isFinite(c.planOrder)) || new Set(candidates.map((c) => c.id)).size !== candidates.length) return ['candidates need unique non-empty identifiers and finite plan positions: refused (SHIP-WM-163)'];
+  for (const c of candidates) if (c.inputs !== undefined) {
+    const x = c.inputs?.['hold-causer'], v = valueOf({ type: 'boolean' }, x, x?.observedAt);
+    if (v === U || typeof c.clearsHold !== 'boolean' || c.clearsHold !== v) return [`candidate ${c.id}: hold priority disagrees with recorded hold-causer evidence: refused (SHIP-WM-163)`];
+  }
   const want = candidateOrder(candidates);
   return canon(want) === canon(order) ? [] : [`candidate order ${canon(order)} is not hold-causers first then plan order, ${canon(want)}: refused (SHIP-WM-163)`];
 }
@@ -188,12 +199,15 @@ export const DECISION_FIELDS = ['decisionId', 'at', 'candidate', 'position', 'po
 export function decisionFindings({ record: d, table, settings }) {
   const out = [], add = (m, r) => out.push(`decision ${d?.decisionId ?? '?'}: ${m} (SHIP-WM-${r})`);
   for (const f of DECISION_FIELDS) if (d?.[f] === undefined || d[f] === null) add(`field ${f} is absent: refused`, 162);
+  for (const f of ['decisionId', 'candidate', 'positionReason']) if (!nonEmpty(d?.[f])) add(`field ${f} must be a non-empty string: refused`, 162);
+  if (!Number.isInteger(d?.position) || d.position < 0) add('position must be a non-negative integer: refused', 162);
+  if (!Array.isArray(d?.actions) || d.actions.some((a) => !nonEmpty(a))) add('actions must be an array of linked action ids: refused', 162);
   for (const i of table.inputs ?? []) {
     const x = d?.inputs?.[i.name];
     if (!x) { add(`input ${i.name} is not recorded: refused`, 162); continue; }
     if (x.value === undefined) add(`input ${i.name} carries no value (unknown is written as unknown): refused`, 162);
     if (!nonEmpty(x.observedAt)) add(`input ${i.name} carries no observation time: refused`, 162);
-    if (!nonEmpty(x.source?.uri) || !x.source?.digest) add(`input ${i.name} carries no source with a digest: refused`, 162);
+    if (!hasSource(x)) add(`input ${i.name} carries no source with a SHA-256 digest: refused`, 162);
     if (typeof x.fresh !== 'boolean') add(`input ${i.name} carries no freshness: refused`, 162);
   }
   if (d?.table && (d.table.uri !== table.id || d.table.version !== table.version || canon(d.table.digest) !== canon(digestOf(table)))) add(`pins table ${d.table.version} at a digest that is not the table supplied: replay against the pinned version only, refused`, 173);
@@ -216,15 +230,15 @@ export function tableChangeFindings({ from, to }) {
 }
 
 // ---- the golden replay: decision points, each with its candidates, order and expected outputs
-export function replayFindings({ table, settings, points }) {
+export function replayFindings({ table, settings, points, records = [] }) {
   const out = [];
   for (const p of points) {
-    const order = candidateOrder(p.candidates);
-    if (canon(order) !== canon(p.expected.order)) out.push(`${p.at}: order ${canon(order)}, expected ${canon(p.expected.order)} (SHIP-WM-163)`);
+    out.push(...orderFindings({ candidates: p.candidates, order: p.expected.order }).map((f) => `${p.at}: ${f}`));
     for (const c of p.candidates) {
       const got = select({ table, settings, inputs: c.inputs, at: p.at }), want = p.expected.outputs[c.id];
       for (const k of ['strategy', 'reason', 'rule']) if (got[k] !== want?.[k]) out.push(`${p.at} ${c.id}: ${k} ${got[k]}, expected ${want?.[k]} (SHIP-WM-160)`);
     }
   }
+  for (const record of records) out.push(...decisionFindings({ record, table, settings }));
   return out;
 }
