@@ -71,7 +71,7 @@ describe('host gate swap', () => {
     h.children[0].emit('exit', 77, null);
     await tick();
     expect(h.children).toHaveLength(2); // no third spawn, gate did not exit
-    expect(h.reads()).toBe(readsBefore + 1);
+    expect(h.reads()).toBe(readsBefore + 2);
     h.children[1].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
@@ -97,7 +97,7 @@ describe('host gate swap', () => {
     h.children[0].emit('exit', 76, null);
     await tick();
     expect(h.children).toHaveLength(2);
-    expect(h.reads()).toBe(readsBefore + 1);
+    expect(h.reads()).toBe(readsBefore + 2);
     h.children[1].emit('exit', 0, null);
     expect(await run).toBe(0);
   });
@@ -435,6 +435,58 @@ describe('closed swap wiring and bounded handover', () => {
 });
 
 describe('handover evidence regressions', () => {
+  it.each([76, 77].flatMap((code) => ['unset', 'missing', 'other', 'unreadable', 'invalid'].map((owner) => ({ code, owner }))))(
+    'exit $code refuses $owner ownership after deferred readiness', async ({ code, owner }) => {
+      const h = setup({ swap: true });
+      autoExit(h);
+      let ready;
+      h.deps.candidateReady = () => new Promise((resolve) => { ready = resolve; });
+      const { run } = await shadow(h);
+      h.children[0].emit('exit', code, null);
+      await tick();
+      expect(ready).toBeTypeOf('function');
+      const readOwner = vi.fn(async () => {
+        if (owner === 'unreadable') throw new Error('ownership unavailable');
+        if (owner === 'other') return { host: '22222222-2222-4222-8222-222222222222', version: 'file' };
+        if (owner === 'invalid') return { host: 'invalid', version: 'file' };
+        if (owner === 'unset') return { host: '', version: 'file' };
+        return null;
+      });
+      h.deps.source.readOwner = readOwner;
+      ready(true);
+      await tick();
+      // Let a wrongly promoted green exit too, keeping a regression from hanging.
+      h.children[1].emit('exit', 0, null);
+      expect(await run).toBe(code);
+      expect(readOwner).toHaveBeenCalledTimes(1);
+      expect(h.children[1].kills).toContain('SIGTERM');
+      expect(h.logs.join(' ')).not.toContain('promoted');
+      expect(h.logs.join(' ')).toContain('after readiness; refusing promotion');
+      expect(h.files.has('state/m.json')).toBe(false);
+      expect(h.files.has('state/m.json.green')).toBe(false);
+    });
+
+  it.each(['exit', 'shutdown'])('does not promote when %s occurs during the post-readiness ownership read', async (event) => {
+    const h = setup({ swap: true });
+    autoExit(h);
+    let owner;
+    h.deps.candidateReady = () => {
+      h.deps.source.readOwner = () => new Promise((resolve) => { owner = resolve; });
+      return true;
+    };
+    const { run } = await shadow(h);
+    h.children[0].emit('exit', 77, null);
+    await tick();
+    expect(owner).toBeTypeOf('function');
+    if (event === 'exit') h.children[1].emit('exit', 0, null);
+    else h.deps.processSignals.emit('SIGTERM');
+    owner({ host: HOST_A, version: 'file' });
+    expect(await run).toBe(77);
+    expect(h.logs.join(' ')).not.toContain('promoted');
+    expect(h.files.has('state/m.json')).toBe(false);
+    expect(h.files.has('state/m.json.green')).toBe(false);
+  });
+
   it.each([76, 77])('exit %i refreshes ownership and refuses an existing candidate after revocation', async (code) => {
     const h = setup({ swap: true });
     autoExit(h);

@@ -409,16 +409,22 @@ async function watchSwap(first, ctx) {
       }
       if ((ev.code === EX_HANDED_OVER || ev.code === EX_RELOAD) && candidate && !candidate.exited
           && await readyBeforeDeadline() && !candidate.exited && !shuttingDown()) {
-        // Write before transferring cleanup ownership; failed promotion must still stop green.
-        marker.track(candidate.pid);
-        greenMarker.clear();
-        candidate.useMarker(marker);
-        active = candidate;
-        candidate = null;
-        gen += 1;
-        drops = 0;
-        log(`host-gate: handover complete; green promoted to active gen=${gen}; no activation signal exists yet, green learns via lease (S1.4)`);
-        continue;
+        // Readiness may have waited while ownership changed. Refresh before transferring markers.
+        const now = await pollRole(thisHost, source);
+        if (!now.active) {
+          log(`host-gate: owner=${now.owner} after readiness; refusing promotion after blue exit ${ev.code}`);
+        } else if (!candidate.exited && !shuttingDown()) {
+          // Write before transferring cleanup ownership; failed promotion must still stop green.
+          marker.track(candidate.pid);
+          greenMarker.clear();
+          candidate.useMarker(marker);
+          active = candidate;
+          candidate = null;
+          gen += 1;
+          drops = 0;
+          log(`host-gate: handover complete; green promoted to active gen=${gen}; no activation signal exists yet, green learns via lease (S1.4)`);
+          continue;
+        }
       }
     } catch (error) {
       log(`host-gate: promotion failed: ${error.message}; exiting 1, operator cleanup required`);
