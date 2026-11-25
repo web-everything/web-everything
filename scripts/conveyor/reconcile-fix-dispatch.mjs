@@ -90,7 +90,25 @@ import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-p
 import { resolvePrWorkUnit, isSafeFallbackScopeEntry } from './pr-work-unit.mjs';
 import { resolveFixScopePolicy, resolveOperatorPriorityPrs, createRegionReader, createLiveRegionOverlap, createHolderStateReader, landingHolderDecision, stripProseScope } from './fix-scope-policy.mjs';
 import { DEFAULT_FIX_DISPATCH_CLAIM_TTL_MINUTES } from './fix-claim-store.mjs';
-import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { execFileSyncThrottled, runGhSync } from '../lib/gh-throttle.mjs';
+import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
+
+/**
+ * PUSH-GATE-S4 — the live hold read at the spawn site. Reads labels and state fresh (no memo), right before a
+ * fixer launches, and returns `null` (clear) or `{code, reason}` (do not spawn). Any throw, bad JSON or missing
+ * field is a refusal, never a spawn. A hold seen here is read-only: it grants nothing, it only stops a launch.
+ * Hermetic under a test runner unless a test injects its own reader.
+ */
+export function readLivePushHold({ repo, pr }) {
+  if (isUnderTestEnv()) return null;
+  const view = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
+    { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
+  if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
+    || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };
+  if (view.state !== 'OPEN') return { code: 'pr-not-open', reason: 'PR is not open' };
+  const label = view.labels.find(l => PUSH_HOLD_LABELS.includes(l.name))?.name;
+  return label ? { code: 'hold-label', reason: label } : null;
+}
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
@@ -1872,6 +1890,8 @@ export function runReconcileFixDispatch({
   mqFailureLedger = null,
   mqFailureIo = null,
   dryRun = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true',
+  // PUSH-GATE-S4 — live hold read right before any launch; injectable so tests read nothing.
+  readPushHold = readLivePushHold,
   root = REPO_ROOT,
   repo = null,
   // This pass targets WE when repo is omitted, including idle restacks. Pin the shared
@@ -2271,6 +2291,13 @@ export function runReconcileFixDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   refusals.push(...mqRefreshRefusals);
   const dispatched = [];
+  // PUSH-GATE-S4 — live hold read; a hold or any unreadable evidence is a refusal, never a launch.
+  const pushHoldRefusal = (entry) => {
+    let hold;
+    try { hold = readPushHold({ repo: repoKey, pr: entry.pr, branch: entry.laneRef ?? entry.headRefName }); }
+    catch { hold = { code: 'unreadable', reason: 'Cannot read push authority; restore evidence before retrying' }; }
+    return hold ? { pr: entry.pr, kind: 'push-hold', why: `PR #${entry.pr} not launched: ${hold.code} (${hold.reason})` } : null;
+  };
   let handled = 0;
   let deferred = [];
   let conflictHandled = 0;
@@ -2299,6 +2326,8 @@ export function runReconcileFixDispatch({
     if (conflict) conflictHandled += 1;
     if (mechanical) conflictExemptHandled += 1;
     handled += 1;
+    // PUSH-GATE-S4 — a dry run launches nothing and never reaches the dispatcher or the hold read.
+    if (dryRun) { refusals.push({ pr: entry.pr, kind: 'dry-run', why: `dry run: no fixer launched for PR #${entry.pr}` }); continue; }
     // fix-cap / host-load — defer BEFORE any claim, resume or lane pop; the PR simply waits for a later pass.
     const t = dispatchThrottle ? dispatchThrottle.tryAdmit('fix', { sendBack: entry.labels?.includes('review:changes') === true }) : { admit: true };
     if (t.admit && t.note) console.error(`reconcile-fix-dispatch: PR #${entry.pr} fix launch admitted: ${t.note}`);
@@ -2364,6 +2393,11 @@ export function runReconcileFixDispatch({
       refusals.push({ pr: entry.pr, kind: 'executor-held', why: executorDecision.reason });
       continue;
     }
+    // PUSH-GATE-S4 — the resume path also launches a fixer, so it reads the live hold first (the fresh path re-reads after its lane pop).
+    if (entry.isConflict) {
+      const resumeHold = pushHoldRefusal(entry);
+      if (resumeHold) { refusals.push(resumeHold); continue; }
+    }
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
     if (entry.isConflict && !borrowed && (!executorDecision || executorDecision.executor === 'claude' || executorDecision.mode === 'wrapped') && !entry.restack) {
@@ -2407,6 +2441,8 @@ export function runReconcileFixDispatch({
       continue;
     }
     const lane = lanes.shift();
+    const holdRefusal = pushHoldRefusal(entry);
+    if (holdRefusal) { lanes.unshift(lane); refusals.push(holdRefusal); continue; }
     try {
       const result = fixStep('dispatch', () => dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) }), entry.pr);
       if (result?.held) {

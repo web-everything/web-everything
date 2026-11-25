@@ -2806,3 +2806,65 @@ describe('bounced no-findings fresh evidence', () => {
     expect(result.reconcileRefusalDetails.some(r => r.kind === 'cap-exhausted')).toBe(true);
   });
 });
+
+describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer spawn', () => {
+  const entry = { kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass', headRefOid: 'a'.repeat(40) };
+  const run = (extra, entries = [entry]) => runReconcileFixDispatch({
+    root: '/repo', reconcile: () => ({ dispatch: entries, refusals: [], notes: [], prs: entries.length, agents: 0 }),
+    findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [4], checkStaleness: FRESH,
+    fetchItemlessDiffPaths: () => [], ...extra,
+  });
+  const ok = (pr) => ({ sessionId: `s-${pr}`, pr });
+
+  it('spawns when the live read shows no hold (happy path)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(() => null);
+    const result = run({ dispatch, readPushHold, dryRun: false });
+    expect(readPushHold).toHaveBeenCalledWith(expect.objectContaining({ pr: 1764 }));
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(result.dispatched).toHaveLength(1);
+  });
+
+  it.each(['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical'])(
+    'a hold (%s) seen at the spawn site is not spawned, even when the plan was made before it', (label) => {
+      const dispatch = vi.fn(p => ok(p.pr));
+      const result = run({ dispatch, readPushHold: () => ({ code: 'hold-label', reason: label }), dryRun: false });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.dispatched).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    });
+
+  it('an unreadable hold read fails closed: nothing is spawned', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const result = run({ dispatch, readPushHold: () => { throw new Error('gh timeout'); }, dryRun: false });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('a misbound mq-failure hint plus a live hold is not spawned (:2099)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const bad = { ...entry, mqFailureRecovery: { repo: 'web-everything/web-everything', pr: 9999, head: 'b'.repeat(40), evidence: { complete: true } } };
+    const result = run({ dispatch, readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }), dryRun: false }, [bad]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('a hold added after lane selection returns the lane and spawns nothing (:2152)', () => {
+    let laneSelected = false;
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(() => (laneSelected ? { code: 'hold-label', reason: 'review:human' } : null));
+    const pickFreeLanes = () => { laneSelected = true; return [4]; };
+    const result = run({ dispatch, readPushHold, pickFreeLanes, dryRun: false });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+  });
+
+  it('dryRun never calls the dispatcher or the hold gate (:2114)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(() => null);
+    const result = run({ dispatch, readPushHold, dryRun: true });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(readPushHold).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+  });
+});
