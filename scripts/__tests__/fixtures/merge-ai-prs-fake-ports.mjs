@@ -27,8 +27,16 @@ if (a[0] === 'api') {
   }
   if (path.includes('/rules/branches/')) out(a.includes('--slurp') ? [[{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]] : [{type:'required_status_checks',parameters:{required_status_checks:[{context:'test'}]}}]);
   if (path.endsWith('/branches/main')) out({ protected:false });
-  if (path.includes('/comments')) out([pr.comments]);
-  if (path.includes('/reviews')) out([[]]);
+  if (path.includes('/comments')) {
+    const jq = a.includes('--jq') ? a[a.indexOf('--jq') + 1] : '';
+    if (jq.includes('@tsv')) {
+      const escape = value => String(value ?? '').replace(/\\/g, '\\\\').replace(/\t/g, '\\t').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
+      out(pr.comments.map(c => [c.body, c.createdAt, c.author?.login, c.id, c.url].map(escape).join('\t')).join('\n'));
+    }
+    if (jq) out(pr.comments.map(c => JSON.stringify(c)).join('\n'));
+    out([pr.comments]);
+  }
+  if (path.includes('/reviews')) out((pr.reviews ?? []).map(r => JSON.stringify(r)).join('\n'));
   if (path.includes('/files')) out([[{filename:'README.md',status:'modified'}]]);
   if (pr.unreadableCheckRows && path.includes('/' + pr.unreadableCheckRows + '?')) out([{}]);
   // Complete pages carry the server's total_count: the strict reader attests rows only when delivered === total.
@@ -38,6 +46,10 @@ if (a[0] === 'api') {
   if (path.includes('/status?')) out([{total_count:statusRows.length,statuses:statusRows}]);
   if (a[1] === 'graphql') {
     const q = a.find(x => x.startsWith('query=')) || '';
+    // The carry's live re-read independently verifies the paginated REST thread.
+    if (q.includes('comments{totalCount}')) out({ data: { repository: { pullRequest: { comments: {
+      totalCount: pr.commentsTotalCount ?? pr.comments.length
+    } } } } });
     if (q.includes('timelineItems(')) out({ data: { repository: { pullRequest: { timelineItems: {
       nodes:pr.mqTimeline || [], pageInfo:{hasPreviousPage:false}
     } } } } });
