@@ -4,7 +4,7 @@ import { resolveCascade } from './policy-cascade.mjs';
 import { findAudit, QUESTION_HASH } from '../operations/codex-audit.mjs';
 const defaults = Object.freeze({ liveWhen: 'after-receipt-and-audit', auditBar: 'no-pr-introduced-security', receiptSource: 'ci-full-suite', parallel: true });
 const result = (outcome, detail) => ({ outcome, detail, ...(outcome === 'pass' ? {} : {
-  fallback: 'Wait for complete CI and an own-sha audit; repair or archive evidence exceeding 100 API rows/calls or 2 MiB, or use the normal merge path.',
+  fallback: 'Wait for complete push, merge_group or workflow_dispatch CI and an own-sha audit; repair or archive evidence exceeding 100 API rows/calls, 2 MiB per API response or 16 MiB per audit ledger, or use the normal merge path.',
 }) });
 const unknown = () => result('unknown', 'hotpatch-evidence-unreadable');
 const complete = (data, key) => Number.isInteger(data?.total_count) && data.total_count >= 0
@@ -26,27 +26,39 @@ export async function receiptGuard(sha, readers) {
         || (r.status === 'completed' ? typeof r.conclusion !== 'string' : r.conclusion !== null))) return unknown();
     if (workflows.workflow_runs.some(r => !Number.isSafeInteger(r?.check_suite_id) || !/^[a-f0-9]{40}$/.test(r?.head_sha) || typeof r?.path !== 'string')
       || new Set(data.check_runs.map(r => r.id)).size !== data.check_runs.length) return unknown();
-    const runs = data.check_runs.filter(r => r.head_sha === sha && r.app.id === TEST_CHECK_APP_ID);
-    if (runs.some(r => r.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion)))
-      return result('fail', 'hotpatch-ci-failed');
+    if (data.check_runs.some(r => r.head_sha !== sha)) return unknown();
     const tests = data.check_runs.filter(r => r.head_sha === sha && r.name === 'test');
     if (!tests.length) return result('wait', 'hotpatch-needs-ci-receipt');
     for (const test of tests) {
       if (test.app.id !== TEST_CHECK_APP_ID || !testWorkflowBound({ suiteIds: [test.check_suite.id] }, workflows, sha)) return result('unknown', 'hotpatch-workflow-unbound');
+    }
+    // PR CI intentionally omits soak execution. Only these full-suite events can supply a receipt.
+    // Keep all attempts within those workflows: a failed or pending rerun cannot hide behind an older green.
+    const ci = workflows.workflow_runs.filter(r => r.head_sha === sha && r.path === '.github/workflows/ci.yml'
+      && ['push', 'merge_group', 'workflow_dispatch'].includes(r.event));
+    const suiteIds = new Set(ci.map(r => r.check_suite_id));
+    const runs = data.check_runs.filter(r => r.app.id === TEST_CHECK_APP_ID && suiteIds.has(r.check_suite.id));
+    // An Actions check with no workflow binding is unknown, rather than silently treated as unrelated.
+    if (data.check_runs.some(r => r.app.id === TEST_CHECK_APP_ID
+      && !workflows.workflow_runs.some(w => w.check_suite_id === r.check_suite.id && w.head_sha === sha))) return unknown();
+    if (runs.some(r => r.status === 'completed' && ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].includes(r.conclusion)))
+      return result('fail', 'hotpatch-ci-failed');
+    const eligibleTests = tests.filter(r => suiteIds.has(r.check_suite.id));
+    if (!eligibleTests.length || ci.some(w => !eligibleTests.some(t => t.check_suite.id === w.check_suite_id))) return result('wait', 'hotpatch-needs-ci-receipt');
+    for (const test of eligibleTests) {
       for (const name of ['test', 'smoke', 'daemon-soak', ...plan.map((_, i) => `test-shard (${i + 1})`)]) {
         if (!runs.some(r => r.name === name && r.check_suite.id === test.check_suite.id)) return result('wait', 'hotpatch-needs-ci-receipt');
       }
     }
-    // Inspect every attempt and producer, not just the latest successful required job.
-    for (const check of data.check_runs) {
-      if (check.head_sha !== sha) return unknown();
+    // Checks from review/publish workflows and other apps do not attest to test execution.
+    for (const check of runs) {
       if (check.status !== 'completed') return result('wait', 'hotpatch-needs-ci-receipt');
       // ci.yml intentionally disables the optional visual job (#2232); required suites still execute below.
       if (check.name === 'visual' && check.conclusion === 'skipped' && check.app.id === TEST_CHECK_APP_ID
         && testWorkflowBound({ suiteIds: [check.check_suite.id] }, workflows, sha)) continue;
       if (check.conclusion !== 'success') return result('fail', 'hotpatch-incomplete-ci-receipt');
     }
-    if (await readers.fullSuite(sha, workflows) !== true) return result('unknown', 'hotpatch-full-suite-unproven');
+    if (await readers.fullSuite(sha, { total_count: ci.length, workflow_runs: ci }) !== true) return result('unknown', 'hotpatch-full-suite-unproven');
     return result('pass', 'hotpatch-ci-receipt');
   } catch { return unknown(); }
 }
@@ -78,7 +90,7 @@ export async function ciDefinitionGuard(sha, readers) {
   try {
     const paths = await readers.paths(sha);
     if (!Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !p)) return unknown();
-    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|hermetic-tests[^/]*$|readiness\/heavy-admission[^/]*$|conveyor\/soak\/(?:run-shard|shard-files)[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|vitest[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
+    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|(?:check-standards|merge-coverage|lint-host-paths)\.mjs$|hermetic-tests[^/]*$|readiness\/heavy-admission[^/]*$|conveyor\/soak\/(?:run-shard|shard-files|soak-scope)[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|(?:vitest|playwright)[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
       ? result('fail', 'hotpatch-ci-definition-change') : result('pass', 'hotpatch-ci-definition-unchanged');
   } catch { return unknown(); }
 }
