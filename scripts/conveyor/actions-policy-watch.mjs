@@ -37,10 +37,18 @@ export function evaluatePolicy(policy, cfg) {
     return { status: 'unknown', reason: 'unexpected policy response shape' };
   }
   if (policy.id !== cfg.policyId) return { status: 'unknown', reason: `policy id ${policy.id} is not ${cfg.policyId}` };
+  // Provisional response contract: confirm against a real admin:org fixture before relying on it.
+  if (policy.enforcement === 'disabled' || policy.enforcement === 'evaluate') {
+    return { status: 'drift', reason: `policy enforcement is ${policy.enforcement}` };
+  }
+  if (policy.enforcement !== 'active') return { status: 'unknown', reason: 'policy enforcement is not confirmed active' };
   const allowed = [];
   for (const rule of policy.rules) {
+    if (!rule || typeof rule.event !== 'string' || !rule.event.trim()
+      || !Array.isArray(rule.workflows) || !rule.workflows.every((w) => typeof w === 'string' && w.trim())) {
+      return { status: 'unknown', reason: 'malformed policy rule or workflows list' };
+    }
     if (rule?.event !== cfg.event) continue;
-    if (!Array.isArray(rule.workflows)) return { status: 'unknown', reason: 'malformed workflows list' };
     allowed.push(...rule.workflows);
   }
   if (allowed.length === 0) return { status: 'missing', reason: `policy ${cfg.policyId} allows no ${cfg.event} workflow` };
@@ -62,7 +70,7 @@ export function evaluateChangelog(items, cfg, seen) {
   });
 }
 
-export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set(), onAlert = () => {} }) {
+export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set(), onAlert = () => {}, beforeFeed = () => {} }) {
   let policy;
   try {
     const endpoint = cfg.policyEndpoint ? cfg.policyEndpoint.replace('{org}', org).replace('{policyId}', cfg.policyId)
@@ -80,6 +88,8 @@ export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set(), o
     await onAlert(safe);
   };
   if (policy.status !== 'ok') await emit(`needs-you: actions policy ${cfg.policyId} ${policy.status}: ${policy.reason}`);
+  // Dedupe storage is optional to the primary policy check, but mandatory before scanning the feed.
+  await beforeFeed();
   let changelog = [];
   let feed = { status: 'ok' };
   try { changelog = evaluateChangelog(await fetchFeed(cfg.changelogFeed), cfg, seen); } catch (e) {
@@ -90,11 +100,70 @@ export async function runWatch({ cfg, org, ghApi, fetchFeed, seen = new Set(), o
   return { policy, feed, changelog, alerts };
 }
 
-/** Pure: RSS or Atom text -> items. Throws when the text is not a feed. */
+/** Pure: parse a complete RSS/Atom document. Unsupported XML (including DTDs) fails closed. */
 export function parseFeed(xml) {
-  if (typeof xml !== 'string' || !/<(?:rss|feed)\b/.test(xml)) throw new Error('response is not an RSS/Atom feed');
-  return [...xml.matchAll(/<(item|entry)\b[^>]*>([\s\S]*?)<\/\1>/g)].map((m) => {
-    const tag = (n) => (m[2].match(new RegExp(`<${n}(?:\\s[^>]*)?>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${n}>`)) ?? [])[1] ?? '';
+  if (typeof xml !== 'string') throw new Error('response is not an RSS/Atom feed');
+  if (xml.length > 4 * 1024 * 1024) throw new Error('feed exceeds the 4 MiB text limit');
+  const invalid = () => { throw new Error('malformed or incomplete RSS/Atom document'); };
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ud800-\udfff\ufffe\uffff]/u.test(xml)) invalid();
+  const decode = (text) => text.replace(/&(?:#x([\da-fA-F]+)|#(\d+)|(amp|lt|gt|quot|apos));|&/g, (entity, hex, decimal, named) => {
+    if (entity === '&') return invalid();
+    if (named) return ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" })[named] ?? invalid();
+    const code = parseInt(hex ?? decimal, hex ? 16 : 10);
+    if (!(code === 9 || code === 10 || code === 13 || code >= 32 && code <= 0x10ffff)
+      || code >= 0xd800 && code <= 0xdfff || code === 0xfffe || code === 0xffff) return invalid();
+    return String.fromCodePoint(code);
+  });
+  // Sticky tokens cannot skip an unterminated tag, comment or CDATA section.
+  const tokens = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<\/[A-Za-z_][\w.:-]*[\t\r\n ]*>|<[A-Za-z_][\w.:-]*(?:[\t\r\n ]+[A-Za-z_][\w.:-]*[\t\r\n ]*=[\t\r\n ]*(?:"[^"<]*"|'[^'<]*'))*[\t\r\n ]*\/?>|[^<]+/gy;
+  const stack = [];
+  let root;
+  let offset = 0;
+  while (offset < xml.length) {
+    tokens.lastIndex = offset;
+    const match = tokens.exec(xml);
+    if (!match) invalid();
+    const token = match[0];
+    offset = tokens.lastIndex;
+    if (token.startsWith('<!--')) {
+      if (token.slice(4, -3).includes('--') || token.endsWith('--->')) invalid();
+      continue;
+    }
+    if (token.startsWith('<?')) {
+      // Only a leading XML declaration is supported; other processing instructions are unknown.
+      if (match.index !== 0 || !/^<\?xml[\t\r\n ]+version=(?:"1\.0"|'1\.0')(?:[\t\r\n ]+encoding=(?:"[Uu][Tt][Ff]-8"|'[Uu][Tt][Ff]-8'))?(?:[\t\r\n ]+standalone=(?:"(?:yes|no)"|'(?:yes|no)'))?[\t\r\n ]*\?>$/.test(token)) invalid();
+      continue;
+    }
+    if (token.startsWith('</')) {
+      if (stack.pop()?.name !== token.slice(2, -1).trim()) invalid();
+    } else if (token.startsWith('<![CDATA[')) {
+      if (!stack.length) invalid();
+      stack.at(-1).parts.push(token.slice(9, -3));
+    } else if (token.startsWith('<')) {
+      const name = token.match(/^<([A-Za-z_][\w.:-]*)/)[1];
+      const attributes = [...token.matchAll(/[\t\r\n ]+([\w.:-]+)[\t\r\n ]*=[\t\r\n ]*(?:"([^"]*)"|'([^']*)')/g)];
+      if (new Set(attributes.map((a) => a[1])).size !== attributes.length) invalid();
+      attributes.forEach((a) => decode(a[2] ?? a[3]));
+      const node = { name, parts: [] };
+      if (stack.length) stack.at(-1).parts.push(node);
+      else if (root) invalid();
+      else root = node;
+      if (!token.endsWith('/>')) stack.push(node);
+      if (stack.length > 128) throw new Error('feed exceeds the 128 element nesting limit');
+    } else {
+      if (token.includes(']]>')) invalid();
+      if (stack.length) stack.at(-1).parts.push(decode(token));
+      else if (/[^\t\r\n ]/.test(token)) invalid();
+    }
+  }
+  if (stack.length || !root || !['rss', 'feed'].includes(root.name)) invalid();
+  const children = (node, name) => node.parts.filter((part) => typeof part === 'object' && part.name === name);
+  const text = (node) => node.parts.map((part) => typeof part === 'string' ? part : text(part)).join('');
+  const items = root.name === 'rss'
+    ? children(root, 'channel').flatMap((channel) => children(channel, 'item')) : children(root, 'entry');
+  if (!items.length) throw new Error('changelog feed contains no items');
+  return items.map((item) => {
+    const tag = (name) => children(item, name).map(text).join(' ');
     const content = [tag('content:encoded'), tag('content')].filter(Boolean).join(' ');
     return { id: tag('guid') || tag('id') || tag('link'), title: tag('title'),
       summary: tag('description') || tag('summary'), ...(content ? { content } : {}) };
@@ -150,7 +219,7 @@ function writeOutput(stream, text) {
 
 /** Production wiring, injectable without replacing the state-handling path. Returns the CLI exit code. */
 export async function main({ argv = process.argv.slice(2), exec = execFileSync, fetchImpl = fetch,
-  env = process.env, stdout = process.stdout, stderr = process.stderr } = {}) {
+  env = process.env, stdout = process.stdout, stderr = process.stderr, writeState = writeJsonAtomic } = {}) {
   let lock;
   try {
     const cfg = loadConfig();
@@ -161,28 +230,31 @@ export async function main({ argv = process.argv.slice(2), exec = execFileSync, 
     const stateArg = argv.find((a) => a.startsWith('--state='));
     const state = stateArg ? resolve(stateArg.slice(8))
       : resolve(here, '../../.conveyor', `actions-policy-watch-${org.toLowerCase()}-${cfg.policyId}.json`);
-    mkdirSync(dirname(state), { recursive: true });
-    try { mkdirSync(`${state}.lock`); } catch { throw new Error('state is locked or unwritable; check the watcher and recover its lock only after it stops'); }
-    lock = `${state}.lock`;
     const scope = `${org.toLowerCase()}/${cfg.policyId}/${cfg.changelogFeed}`;
-    let saved = { scope, seen: [] };
-    try { saved = JSON.parse(readFileSync(state, 'utf8')); } catch (e) {
-      if (e.code !== 'ENOENT') throw new Error('state unreadable; restore the saved IDs before retrying');
-    }
-    if (saved?.scope !== scope || !Array.isArray(saved.seen)
-      || !saved.seen.every((id) => typeof id === 'string' && id.trim())) throw new Error('state has an invalid scope or seen IDs');
-    const seen = new Set(saved.seen);
+    const seen = new Set();
     const json = argv.includes('--json');
     const result = await runWatch({
       cfg, org, seen, fetchFeed: (url) => fetchFeedText(url, fetchImpl),
       ghApi: async (endpoint) => exec('gh', ghReadArgs(endpoint), { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024 }),
       onAlert: (alert) => writeOutput(json ? stderr : stdout, `${alert}\n`),
+      beforeFeed: () => {
+        mkdirSync(dirname(state), { recursive: true });
+        try { mkdirSync(`${state}.lock`); } catch { throw new Error('state is locked or unwritable; check the watcher and recover its lock only after it stops'); }
+        lock = `${state}.lock`;
+        let saved = { scope, seen: [] };
+        try { saved = JSON.parse(readFileSync(state, 'utf8')); } catch (e) {
+          if (e.code !== 'ENOENT') throw new Error('state unreadable; restore the saved IDs before retrying');
+        }
+        if (saved?.scope !== scope || !Array.isArray(saved.seen)
+          || !saved.seen.every((id) => typeof id === 'string' && id.trim())) throw new Error('state has an invalid scope or seen IDs');
+        saved.seen.forEach((id) => seen.add(id));
+      },
     });
     if (json) await writeOutput(stdout, `${JSON.stringify(result)}\n`);
     else if (!result.alerts.length) await writeOutput(stdout, 'ok\n');
     // IDs are acknowledged only after alert delivery succeeds. Atomic replacement preserves prior state on failure.
     result.changelog.forEach((item) => seen.add(item.id));
-    try { writeJsonAtomic(state, { scope, seen: [...seen] }); } catch { throw new Error('state could not be saved; changelog alerts may repeat until storage is repaired'); }
+    try { writeState(state, { scope, seen: [...seen] }); } catch { throw new Error('state could not be saved; changelog alerts may repeat until storage is repaired'); }
     return result.alerts.length ? 1 : 0;
   } catch (e) {
     try {

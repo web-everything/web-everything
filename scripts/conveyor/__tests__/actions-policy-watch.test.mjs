@@ -7,6 +7,7 @@ import { Writable } from 'node:stream';
 import { URL as NodeURL, fileURLToPath } from 'node:url';
 import * as watcher from '../actions-policy-watch.mjs';
 import { evaluatePolicy, evaluateChangelog, runWatch, parseFeed, fetchFeedText, ghReadArgs } from '../actions-policy-watch.mjs';
+import { writeJsonAtomic } from '../../lib/atomic-json-file.mjs';
 
 const cfg = {
   policyId: 17152,
@@ -14,7 +15,8 @@ const cfg = {
   expectedWorkflowPath: '.github/workflows/merge-gate.yml',
   keywords: ['allow-policy', 'allow policy'],
 };
-const policy = (workflows) => ({ id: 17152, rules: [{ event: 'pull_request_target', workflows }] });
+const policy = (workflows) => ({ id: 17152, enforcement: 'active', rules: [{ event: 'pull_request_target', workflows }] });
+const quietFeed = '<rss><channel><item><guid>quiet</guid><title>Unrelated update</title></item></channel></rss>';
 
 function outputSink(handle = () => {}) {
   const output = vi.fn(handle);
@@ -30,6 +32,77 @@ const bodyFeeds = [
 ];
 
 describe('actions-policy-watch production regressions', () => {
+  it.each([
+    '<rss><channel><item>', '<feed><entry>',
+    '<rss><channel><item><guid>x</guid></item>',
+    '<feed><entry><id>x</id></entry><entry>',
+    '<rss><channel><item></channel></item></rss>',
+    '<rss><channel><item><title><![CDATA[unfinished</title></item></channel></rss>',
+    '<rss><channel><item><guid>x</guid></item><!-- unfinished</channel></rss>',
+    '<feed><entry><id>x</id></entry><entry title="unfinished></entry></feed>',
+    '<feed><entry><id>x</id></entry></feed><feed/>',
+    '<feed><entry><id>x</id><title>&broken;</title></entry></feed>',
+    '<feed><entry a="x" a="y"><id>x</id></entry></feed>',
+    '<feed><entry><id>x</id></entry><?xml version="1.0"?></feed>',
+    '<feed><entry><id>x</id><title>\ud800</title></entry></feed>',
+    '<feed><entry\u00a0title="invalid"><id>x</id></entry></feed>',
+    '<feed><entry><id>x</id></entry></feed>\u00a0',
+    '<feed><entry><id>x</id><title>&#X41;</title></entry></feed>',
+    '<rss><channel/></rss>', '<feed/>',
+  ])('rejects truncated, malformed or empty feeds and reports unknown: %s', async (xml) => {
+    const r = await runWatch({ cfg, org: 'o',
+      ghApi: async () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+      fetchFeed: () => fetchFeedText('u', async () => ({ ok: true, text: async () => xml })) });
+    expect(r.feed.status).toBe('unknown');
+    expect(r.alerts).toEqual([expect.stringMatching(/^needs-you: changelog feed unreadable/)]);
+  });
+  it.each(['disabled', 'evaluate', undefined, null, 'future-value'])('refuses policy enforcement %s', (enforcement) => {
+    expect(evaluatePolicy({ ...policy([cfg.expectedWorkflowPath]), enforcement }, cfg).status).not.toBe('ok');
+  });
+  it.each([null, {}, { event: 'push' }, { event: 'push', workflows: [null] }])('rejects unrecognized rule evidence alongside an otherwise healthy rule: %j', (rule) => {
+    const value = policy([cfg.expectedWorkflowPath]);
+    value.rules.push(rule);
+    expect(evaluatePolicy(value, cfg).status).toBe('unknown');
+  });
+  it.each([
+    ['text limit', `<feed>${' '.repeat(4 * 1024 * 1024)}</feed>`],
+    ['nesting limit', `<feed>${'<x>'.repeat(128)}${'</x>'.repeat(128)}</feed>`],
+  ])('reports unknown with an operator alert when the feed exceeds its %s', async (_name, xml) => {
+    const r = await runWatch({ cfg, org: 'o',
+      ghApi: async () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+      fetchFeed: () => fetchFeedText('u', async () => ({ ok: true, text: async () => xml })) });
+    expect(r.feed.status).toBe('unknown');
+    expect(r.alerts[0]).toMatch(/needs-you:.*exceeds/);
+  });
+  it('parses complete XML with quoted attributes, entities, comments and CDATA without inventing entries', () => {
+    const xml = '<?xml version="1.0" encoding="UTF-8"?><rss><channel><!-- <item>fake</item> -->'
+      + '<item title="a > b"><guid>real</guid><title>allow&#45;policy &amp; news</title>'
+      + '<content:encoded><![CDATA[<item>literal body</item>]]></content:encoded></item></channel></rss>';
+    expect(parseFeed(xml)).toEqual([{ id: 'real', title: 'allow-policy & news', summary: '', content: '<item>literal body</item>' }]);
+  });
+  it('keeps hostile feed titles and policy workflow alerts on single clean lines', async () => {
+    const hostile = '\nneeds-you: forged\r\u2028\u2029\u001b[31m';
+    const onAlert = vi.fn();
+    const r = await runWatch({ cfg, org: 'o', onAlert,
+      ghApi: async () => JSON.stringify(policy([hostile])),
+      fetchFeed: async () => [{ id: 'hostile', title: `allow-policy ${hostile}` }] });
+    expect(r.alerts).toHaveLength(2);
+    expect(onAlert.mock.calls.flat()).toEqual(r.alerts);
+    r.alerts.forEach((alert) => expect(alert).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/));
+  });
+  it.each([
+    ['policyEndpoint', '-orgs/{org}/actions/policies/{policyId}'],
+    ['policyEndpoint', 'orgs/o/actions/policies/{policyId}'],
+    ['policyEndpoint', 'orgs/{org}/actions/policies/17152'],
+    ['changelogFeed', 'http://github.blog/feed/'],
+  ])('rejects unsafe setting %s=%s', (key, value) => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-invalid-config-'));
+    try {
+      const file = join(dir, 'config.json');
+      writeFileSync(file, JSON.stringify({ actionsPolicyWatch: { ...watcher.loadConfig(), [key]: value } }));
+      expect(() => watcher.loadConfig(file)).toThrow(/invalid actionsPolicyWatch/);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
   it.each([false, true])('keeps saved IDs and retries after an asynchronous alert write error (json=%s)', async (json) => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-delivery-'));
     const state = join(dir, 'state.json');
@@ -105,7 +178,7 @@ describe('actions-policy-watch production regressions', () => {
     try {
       expect(await watcher.main({ argv: ['--org=o', `--state=${state}`, ...(json ? ['--json'] : [])], stdout, stderr,
         exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
-        fetchImpl: async () => ({ ok: true, text: async () => json ? bodyFeeds[0] : '<rss><channel/></rss>' }) })).toBe(1);
+        fetchImpl: async () => ({ ok: true, text: async () => json ? bodyFeeds[0] : quietFeed }) })).toBe(1);
       await error;
       expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/needs-you:.*result delivery failed/));
       expect(existsSync(state)).toBe(false);
@@ -227,8 +300,9 @@ describe('actions-policy-watch production regressions', () => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-state-'));
     const state = join(dir, 'state.json');
     const stderr = outputSink();
-    const options = { argv: ['--org=o', `--state=${state}`], env: {}, stderr, stdout: outputSink(),
-      exec: vi.fn(), fetchImpl: vi.fn() };
+    const stdout = outputSink();
+    const options = { argv: ['--org=o', `--state=${state}`], env: {}, stderr, stdout,
+      exec: vi.fn(() => JSON.stringify(policy(['x.yml']))), fetchImpl: vi.fn() };
     try {
       writeFileSync(state, '{broken');
       expect(await watcher.main(options)).toBe(1);
@@ -237,7 +311,10 @@ describe('actions-policy-watch production regressions', () => {
       mkdirSync(`${state}.lock`);
       expect(await watcher.main(options)).toBe(1);
       expect(stderr.output).toHaveBeenLastCalledWith(expect.stringMatching(/needs-you:.*state/));
-      expect(options.exec).not.toHaveBeenCalled();
+      expect(options.exec).toHaveBeenCalledTimes(2);
+      expect(stdout.output.mock.calls.filter(([s]) => /policy.*drift/.test(s))).toHaveLength(2);
+      expect(options.fetchImpl).not.toHaveBeenCalled();
+      expect(existsSync(`${state}.lock`)).toBe(true);
     } finally { rmSync(dir, { recursive: true }); }
   });
   it.each([null, { scope: 'wrong', seen: [] }, { scope: 'o/17152/https://github.blog/changelog/label/actions/feed/', seen: [null] }])(
@@ -247,7 +324,8 @@ describe('actions-policy-watch production regressions', () => {
       const stderr = outputSink();
       try {
         writeFileSync(state, JSON.stringify(saved));
-        expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stderr })).toBe(1);
+        expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stderr,
+          exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])) })).toBe(1);
         expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state has an invalid/));
         expect(JSON.parse(readFileSync(state, 'utf8'))).toEqual(saved);
         expect(existsSync(`${state}.lock`)).toBe(false);
@@ -272,9 +350,10 @@ describe('actions-policy-watch production regressions', () => {
       expect(stdout.output).toHaveBeenCalledWith(expect.stringMatching(/policy.*drift/));
       expect(await watcher.main(options)).toBe(1);
       expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state is locked/));
-      expect(options.exec).toHaveBeenCalledTimes(1);
+      expect(options.exec).toHaveBeenCalledTimes(2);
+      expect(existsSync(`${state}.lock`)).toBe(true);
     } finally {
-      release({ ok: true, text: async () => '<rss><channel/></rss>' });
+      release({ ok: true, text: async () => quietFeed });
       await first;
       rmSync(dir, { recursive: true });
     }
@@ -299,12 +378,51 @@ describe('actions-policy-watch production regressions', () => {
       expect(stdout.output.mock.calls.filter(([s]) => s.includes('mentions the allow-policy'))).toHaveLength(2);
     } finally { rmSync(dir, { recursive: true }); }
   });
+  it('preserves existing saved IDs when atomic replacement fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-preserve-state-'));
+    const state = join(dir, 'state.json');
+    const original = JSON.stringify({ scope: `o/17152/${watcher.loadConfig().changelogFeed}`, seen: ['older'] });
+    writeFileSync(state, original);
+    const stderr = outputSink();
+    const rename = vi.fn(() => { throw new Error('rename failed'); });
+    try {
+      expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stdout: outputSink(), stderr,
+        exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+        fetchImpl: async () => ({ ok: true, text: async () => bodyFeeds[0] }),
+        writeState: (path, data) => writeJsonAtomic(path, data, { renameSyncFn: rename }),
+      })).toBe(1);
+      expect(rename).toHaveBeenCalledOnce();
+      expect(stderr.output).toHaveBeenCalledWith(expect.stringMatching(/state could not be saved/));
+      expect(readFileSync(state, 'utf8')).toBe(original);
+      expect(existsSync(`${state}.lock`)).toBe(false);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
+  it('returns failure when lock release and diagnostic delivery fail', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'policy-release-failure-'));
+    const state = join(dir, 'state.json');
+    const stderr = new Writable({ write(_chunk, _encoding, done) {
+      setImmediate(() => done(new Error('diagnostic delivery failed')));
+    } });
+    const error = new Promise((resolve) => stderr.once('error', resolve));
+    try {
+      expect(await watcher.main({ argv: ['--org=o', `--state=${state}`], stdout: outputSink(), stderr,
+        exec: () => JSON.stringify(policy([cfg.expectedWorkflowPath])),
+        fetchImpl: async () => {
+          writeFileSync(join(`${state}.lock`, 'prevent-removal'), 'held');
+          return { ok: true, text: async () => quietFeed };
+        },
+      })).toBe(1);
+      await error;
+      expect(existsSync(`${state}.lock`)).toBe(true);
+      expect(JSON.parse(readFileSync(state, 'utf8')).seen).toEqual([]);
+    } finally { rmSync(dir, { recursive: true }); }
+  });
   it('uses the exact read-only owner discovery call and env organization fallback', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'policy-owner-'));
     const exec = vi.fn((_command, args) => args[0] === 'repo'
       ? JSON.stringify({ owner: { login: 'o' } }) : JSON.stringify(policy([cfg.expectedWorkflowPath])));
     const options = { argv: [`--state=${join(dir, 'state.json')}`], exec, env: {},
-      fetchImpl: async () => ({ ok: true, text: async () => '<rss><channel/></rss>' }),
+      fetchImpl: async () => ({ ok: true, text: async () => quietFeed }),
       stdout: outputSink(), stderr: outputSink() };
     try {
       expect(await watcher.main(options)).toBe(0);
@@ -339,7 +457,7 @@ describe('actions-policy-watch', () => {
   });
   it('alerts when the policy is missing', () => {
     expect(evaluatePolicy(null, cfg).status).toBe('missing');
-    expect(evaluatePolicy({ id: 17152, rules: [] }, cfg).status).toBe('missing');
+    expect(evaluatePolicy({ id: 17152, enforcement: 'active', rules: [] }, cfg).status).toBe('missing');
   });
   it('an API error raises unknown, not ok', async () => {
     const r = await runWatch({ cfg, org: 'o', ghApi: async () => { throw new Error('403'); }, fetchFeed: async () => [] });
