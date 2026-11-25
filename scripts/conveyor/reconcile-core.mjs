@@ -3174,12 +3174,20 @@ export function planReconcile({
     // the re-run. A queued PR GitHub holds BLOCKED whose only red is an infra-cancelled newest-suite run (the evidence
     // reader judges `authoritativeCheckRuns` and refuses while any run is still in flight) gets a mechanical re-run,
     // bounded to {@link BLOCKED_CANCELLED_RERUN_CAP} per head; past the cap it is a surfaced note, never a silent skip.
+    const blockedCancelledRepairOwed = !ciRepairOwed && phase === 'queued' && String(pr?.mergeStateStatus ?? '').toUpperCase() === 'BLOCKED'
+      && pr?.timeoutRetry?.eligible && pr.timeoutRetry.infraCancelled
+      && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber;
+    const reviewHoldRed = ciRepairOwed
+      && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
+      && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
+    const timeoutRepairOwed = (ciRepairOwed && !reviewHoldRed) || blockedCancelledRepairOwed || (phase === 'queued' && pr?.codeqlFailure);
     // An old live/unknown run cannot be expired safely. Bound the quiet hold across every retry branch;
     // a completed lost request still re-plans below so the dispatcher can expire it before escalating.
+    // Pending state only gates CI repair: green checks must retain their review and queued handling.
     const pendingBudget = pr.timeoutRetryBudget;
     const pendingAge = now - Date.parse(pendingBudget?.pendingSince);
     const pendingWindow = Number(process.env.WE_TIMEOUT_RETRY_PENDING_ESCALATE_MS) || TIMEOUT_RETRY_PENDING_ESCALATE_MS;
-    if (pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)
+    if (timeoutRepairOwed && pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)
         || (pendingAge >= pendingWindow && hasLiveCheck(pr, { requiredChecks, now })))) {
       const why = `PR #${prNumber}: timeout retry needs your decision — ${pendingBudget.reason ?? (!Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)
         ? 'request outcome remains unresolved without a usable timestamp'
@@ -3188,9 +3196,7 @@ export function planReconcile({
       notes.push({ kind: 'timeout-retry-needs-human', prNumber, text: why });
       continue;
     }
-    if (!ciRepairOwed && phase === 'queued' && String(pr?.mergeStateStatus ?? '').toUpperCase() === 'BLOCKED'
-        && pr?.timeoutRetry?.eligible && pr.timeoutRetry.infraCancelled
-        && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
+    if (blockedCancelledRepairOwed) {
       const budget = pr.timeoutRetryBudget;
       if (rerunInFlight(pr, { budget, requiredChecks, now })) {
         refuse('ci-timeout-rerun-in-flight', { ...withPhase,
@@ -3247,9 +3253,6 @@ export function planReconcile({
     }
 
     const heldGates = ciRepairOwed ? splitFailingChecks(pr?.statusCheckRollup, requiredChecks).required : [];
-    const reviewHoldRed = ciRepairOwed
-      && withPhase.labels.some(l => ['review:human', 'review:pending', 'review:changes', 'review:held-mechanical'].includes(l))
-      && reviewHoldGatesOnlyRed(pr?.statusCheckRollup, requiredChecks);
     if (reviewHoldRed) {
       refuse('review-hold-red', { ...withPhase, why: `review daemon owns held gates: ${heldGates.join(', ')}` });
       // An admitted advisory owns a repair next. Keep the existing finding/cap/ruling

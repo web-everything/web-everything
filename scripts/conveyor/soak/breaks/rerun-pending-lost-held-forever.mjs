@@ -47,6 +47,28 @@ export async function scenario(sourceRoot) {
   const violations = [];
   if (heldForever) violations.push('lost pending marker holds the PR as ci-timeout-rerun-in-flight forever');
   if (!replans) violations.push('a lost pending marker produced no re-run or ci-heal dispatch');
+  const green = { ...pr, labels: [{ name: 'review:accepted' }], mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ ...failed, conclusion: 'SUCCESS' }] };
+  for (const budget of [
+    { pending: true },
+    { pending: true, reason: 'timeout-state-unreadable:corrupt' },
+    { pending: true, retired: true, reason: 'timeout-state-retired:pr-closed' },
+  ]) {
+    const queued = planReconcile({ prs: [{ ...green, timeoutRetryBudget: budget }], now, requiredChecks: ['test'] });
+    if (queued.notes.some(n => n.kind === 'timeout-retry-needs-human')
+        || queued.refusals.some(r => r.kind === 'ci-heal-escalated')) {
+      violations.push('a pending marker diverts green required checks from queued handling');
+    }
+    const reviewHeld = planReconcile({ prs: [{ ...green, labels: [{ name: 'review:pending' }],
+      timeoutRetryBudget: budget, statusCheckRollup: [...green.statusCheckRollup,
+        { ...failed, name: 'merge-gate', mergeGateReviewHold: { holds: ['review-gate'], jobId: 456 } },
+        { ...failed, name: 'review-gate' }],
+    }], now, requiredChecks: ['test', 'merge-gate', 'review-gate'] });
+    if (!reviewHeld.refusals.some(r => r.kind === 'review-hold-red')
+        || reviewHeld.notes.some(n => n.kind === 'timeout-retry-needs-human')) {
+      violations.push('a pending marker diverts review-owned gates from the review daemon');
+    }
+  }
   for (const extra of [
     { statusCheckRollup: [failed, { context: 'stuck', state: 'PENDING' }] },
     { rollupIncomplete: true },
@@ -61,7 +83,7 @@ export async function scenario(sourceRoot) {
     const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const disp = await import(pathToFileURL(join(root, 'scripts/operations/ci-heal-pr-dispatch.mjs')).href);
-    const { timeoutKey } = await import(pathToFileURL(join(root, 'scripts/conveyor/timeout-retry-state.mjs')).href);
+    const { timeoutKey, readTimeoutBudget } = await import(pathToFileURL(join(root, 'scripts/conveyor/timeout-retry-state.mjs')).href);
     const dir = mkdtempSync(join(tmpdir(), 'rerun-lost-'));
     mkdirSync(dir, { recursive: true });
     const target = { run: 123, job: 456, attempt: 1 };
@@ -72,6 +94,14 @@ export async function scenario(sourceRoot) {
       for (const reason of [null, 'aged-out', 'pr-closed']) {
         writeFileSync(path, JSON.stringify({ version: 1, evidence, ...(reason ? { retired: { reason } } : {}),
           requests: [{ id: 0, target, status: 'pending', reservedAt: '2026-11-24T17:56:00Z' }] }));
+        if (reason) {
+          const retired = planReconcile({ prs: [{ ...pr, timeoutRetryBudget: readTimeoutBudget({ ...evidence, dir }) }],
+            now, requiredChecks: ['test'] });
+          if (retired.dispatch.length || !retired.notes.some(n => n.kind === 'timeout-retry-needs-human'
+              && n.text.includes(`timeout-state-retired:${reason}`))) {
+            violations.push(`retired ${reason} marker has no diagnostic planner escalation`);
+          }
+        }
         const result = await disp.runReconcileCiHealDispatch({ root: dir, repo: 'we', now: () => now,
           checkStaleness: () => ({ fresh: true, behind: 0 }),
           reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7431, headRefOid: head }], refusals: [] }),

@@ -38,7 +38,11 @@ export function readTimeoutStates(evidence, dir = timeoutStateDir()) {
 export function readTimeoutBudget({ dir, ...evidence }) {
   try {
     dir ??= timeoutStateDir(); // resolved inside the guard: an unreadable lock root is "unreadable state", never a throw
-    const requests = readTimeoutStates(evidence, dir).flatMap((state) => state.requests);
+    const states = readTimeoutStates(evidence, dir);
+    const requests = states.flatMap((state) => state.requests);
+    // Recovery cannot expire a retired marker. Keep its pending hold and expose why it needs a decision
+    // to the planner, including on repositories where no ci-heal dispatcher is available.
+    const retiredPending = states.find((state) => state.retired && state.requests.some((r) => r.status === 'pending'));
     // `rejected` = requests GitHub refused (4xx) or whose job was no longer failed at the evidenced attempt. They spend
     // no confirmed budget, but the planner counts them against the infra re-run cap so a persistently rejected re-run
     // reaches ci-heal instead of being re-planned forever. An early `released` reservation (a failed observation or a
@@ -48,6 +52,7 @@ export function readTimeoutBudget({ dir, ...evidence }) {
     const expired = requests.filter((r) => r.status === 'expired').length;
     return { confirmed: requests.filter((r) => r.status === 'confirmed').length + expired,
       ...(expired ? { expired } : {}),
+      ...(retiredPending ? { retired: true, reason: `timeout-state-retired:${retiredPending.retired.reason ?? 'unknown'}` } : {}),
       rejected: requests.filter((r) => r.status === 'rejected' && !r.released).length,
       pending: requests.some((r) => r.status === 'pending'),
       // When the oldest still-pending request was reserved: lets the planner tell a rerun that is simply in

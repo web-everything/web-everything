@@ -3769,6 +3769,19 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
   });
 
   it.each([
+    { pending: true },
+    { pending: true, reason: 'timeout-state-unreadable:corrupt' },
+    { pending: true, retired: true, reason: 'timeout-state-retired:pr-closed' },
+  ])('pending retry state preserves review ownership of annotated held gates: %j', timeoutRetryBudget => {
+    expect(plan({ isDraft: false, timeoutRetryBudget })).toEqual(plan({ isDraft: false }));
+    // An additional real CI failure still needs a decision before a rerun or heal.
+    const realRed = plan({ isDraft: false, timeoutRetryBudget,
+      statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
+    expect(realRed.dispatch).toEqual([]);
+    expect(realRed.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human' }));
+  });
+
+  it.each([
     ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
     ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
   ])('reviewChecksAllow still refuses a non-draft with %s even after not-a-ci-break escalation', (_, rollup) => {
@@ -4018,6 +4031,26 @@ describe('xng7q1p mechanical timeout precedence', () => {
     const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 2, pending: true, pendingSince: old } })], now: NOW });
     expect(r.dispatch.map((row) => row.kind)).toEqual(['ci-heal']);
   });
+  it('a retired pending marker escalates directly in the planner before dispatch', () => {
+    const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, retired: true,
+      pendingSince: new Date(NOW - 2 * 3_600_000).toISOString(), reason: 'timeout-state-retired:pr-closed' } })], now: NOW });
+    expect(r.dispatch).toEqual([]);
+    expect(r.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated',
+      why: expect.stringContaining('timeout-state-retired:pr-closed') }));
+    expect(r.notes).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-needs-human',
+      text: expect.stringContaining('timeout-state-retired:pr-closed') }));
+  });
+  it.each([
+    { pending: true },
+    { pending: true, pendingSince: new Date(NOW - 2 * 3_600_000).toISOString(), retired: true, reason: 'timeout-state-retired:pr-closed' },
+    { pending: true, reason: 'timeout-state-unreadable:corrupt' },
+  ])('green checks retain review and queued handling despite pending marker %j', budget => {
+    for (const labels of [[{ name: 'review:pending' }], [{ name: 'review:accepted' }]]) {
+      const row = pr({ labels, statusCheckRollup: greenRollup, timeoutRetryBudget: budget });
+      const expected = planReconcile({ prs: [{ ...row, timeoutRetryBudget: { pending: false, confirmed: 0 } }], now: NOW });
+      expect(planReconcile({ prs: [row], now: NOW })).toEqual(expected);
+    }
+  });
   it('a young pending re-run with no live run on the head, past the start grace, is lost', () => {
     const since = new Date(NOW - 8 * 60 * 1000).toISOString();
     const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true, pendingSince: since } })], now: NOW });
@@ -4059,7 +4092,7 @@ describe('xng7q1p mechanical timeout precedence', () => {
     // Bare pending reads authorize escalations only; every in-flight refusal uses the predicate.
     expect(direct.filter((l) => !l.includes('rerunInFlight')).map((l) => l.trim())).toEqual([
       'if (!budget?.pending) return false;',
-      'if (pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)',
+      'if (timeoutRepairOwed && pendingBudget?.pending && (pendingBudget.reason || !Number.isFinite(pendingAge) || pendingAge < 0 || !(now > 0)',
     ]);
     expect(src.match(/rerunInFlight\(/g).length).toBeGreaterThanOrEqual(6);
   });
@@ -4069,6 +4102,9 @@ describe('xng7q1p mechanical timeout precedence', () => {
     const fresh = new Date(NOW - 1000).toISOString();
     const unreadable = planReconcile({ prs: [pr({ timeoutRetryBudget: { pending: true, pendingSince: fresh, reason: 'timeout-state-unreadable:x' } })], now: NOW });
     expect(unreadable.refusals[0].kind).toBe('ci-heal-escalated');
+    expect(unreadable.notes).toContainEqual(expect.objectContaining({
+      kind: 'timeout-retry-needs-human', text: expect.stringContaining('timeout-state-unreadable:x'),
+    }));
   });
   it('a future pending timestamp is unusable and escalates instead of creating an unbounded grace period', () => {
     const r = planReconcile({ prs: [pr({ timeoutRetryBudget: { confirmed: 0, pending: true,

@@ -763,6 +763,45 @@ describe('xng7q1p retry reservation and restart soak', () => {
     timeoutHold: args => readTimeoutHold({ ...args, dir }),
     ...options,
   });
+  it.each([
+    ['malformed JSON', '{'],
+    ['invalid state structure', JSON.stringify({ version: 1, evidence: {}, requests: {} })],
+  ])('ordinary budget reads fail closed on corrupt timeout state: %s', async (_name, bytes) => harness(async dir => {
+    const e = evidence();
+    writeFileSync(join(dir, `${timeoutKey(e)}.json`), bytes);
+    expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ pending: true,
+      reason: expect.stringContaining('timeout-state-unreadable:') });
+    expect(readTimeoutHold({ ...e, dir })).toMatchObject({ status: 'refused',
+      reason: 'timeout-retry-needs-human', why: expect.stringContaining('timeout-state-unreadable:') });
+    const dispatch = vi.fn(); const expireLost = vi.fn();
+    const out = await healPass(dir, e, { dispatch, expireLost });
+    expect(out.refusals).toContainEqual(expect.objectContaining({ pr: e.pr,
+      kind: 'timeout-retry-needs-human', why: expect.stringContaining('timeout-state-unreadable:') }));
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(expireLost).not.toHaveBeenCalled();
+  }));
+  it('the mechanical pass preserves the human refusal kind and diagnostic reason', async () => harness(async dir => {
+    const e = evidence(); const why = 'retired pending request needs your decision';
+    const retryTimeout = vi.fn(async () => ({ status: 'refused', reason: 'timeout-retry-needs-human', why }));
+    const out = await healPass(dir, e, { retryTimeout,
+      reconcile: () => ({ dispatch: [{ kind: 'ci-timeout-rerun', prNumber: e.pr, timeoutRetry: e }], refusals: [] }),
+    });
+    expect(retryTimeout).toHaveBeenCalledTimes(1);
+    expect(out.dispatched).toEqual([]);
+    expect(out.refusals).toEqual([{ pr: e.pr, kind: 'timeout-retry-needs-human', status: 'refused',
+      reason: 'timeout-retry-needs-human', why }]);
+  }));
+  it('ordinary budget reads expose retired pending markers without losing their spent budget', async () => harness(async dir => {
+    const e = evidence();
+    writeFileSync(join(dir, `${timeoutKey(e)}.json`), JSON.stringify({ version: 1, evidence: e,
+      retired: { reason: 'pr-closed' }, requests: [
+        { id: 0, status: 'expired' }, { id: 1, status: 'pending', reservedAt: new Date(t0).toISOString() },
+      ] }));
+    expect(readTimeoutBudget({ ...e, dir })).toMatchObject({ pending: true, confirmed: 1,
+      retired: true, reason: expect.stringContaining('timeout-state-retired:pr-closed') });
+    expect(readTimeoutHold({ ...e, dir })).toMatchObject({ reason: 'timeout-retry-needs-human',
+      why: expect.stringContaining('timeout-state-retired:pr-closed') });
+  }));
   it('runReconcileCiHealDispatch expires a lost marker, re-reads the hold and dispatches ci-heal', async () => harness(async dir => {
     const e = evidence(); await reservePending(dir, e);
     const state = readState(dir, e);
