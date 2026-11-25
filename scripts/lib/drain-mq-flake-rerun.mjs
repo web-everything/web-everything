@@ -13,10 +13,43 @@ export function mqActionsJob(check, repo) {
   } catch { return null; }
 }
 
+/**
+ * maxFailures > 1: validate the whole attempt chain (same Actions run, same check name, same commit).
+ * Returns null (unavailable) on any ambiguity, else { failures, state, candidate }.
+ * Order is by Actions job id; timestamps are a strict cross-check, so any disagreement refuses.
+ */
+function mqChain(checks, repo, commit, original, removedAt) {
+  const originalJob = mqActionsJob(original, repo);
+  const members = [];
+  for (const check of checks) {
+    if (check.name !== original.name || check.head_sha !== commit) continue;
+    const job = mqActionsJob(check, repo);
+    if (!job || job.run !== originalJob.run || check.app?.slug !== 'github-actions' || check.app?.id !== 15368
+      || !Number.isFinite(stamp(check.started_at))) return null;
+    members.push({ check, id: job.id });
+  }
+  members.sort((a, b) => a.id - b.id);
+  if (members.some((m, i) => i && m.id === members[i - 1].id) || members[0]?.check !== original) return null;
+  if (stamp(original.completed_at) >= removedAt) return null;
+  for (let i = 0; i < members.length; i++) {
+    const { check } = members[i], last = i === members.length - 1;
+    if (!last && (!completed(check) || check.conclusion !== 'failure')) return null;
+    if (completed(check) && stamp(check.completed_at) < stamp(check.started_at)) return null;
+    if (i && stamp(check.started_at) <= stamp(members[i - 1].check.completed_at)) return null;
+  }
+  const tail = members.at(-1), failures = members.filter(m => m.check.conclusion === 'failure' && completed(m.check)).length;
+  const done = completed(tail.check);
+  const state = done && tail.check.conclusion === 'success' ? 'confirmed'
+    : done && tail.check.conclusion === 'failure' ? 'candidate'
+    : !done && ['queued', 'in_progress'].includes(tail.check.status) ? 'pending' : 'incomplete';
+  return { failures, state, candidate: tail.id };
+}
+
 /** Only complete, commit-bound history can establish a flake or authorize a rerun. */
-export function inspectMqReruns({ checks, repo, commit, removedAt }) {
+export function inspectMqReruns({ checks, repo, commit, removedAt, maxFailures = 1 }) {
   const failed = checks.filter(check => check.conclusion === 'failure');
   const unavailable = { checks, confirmed: false, candidates: [] };
+  if (!Number.isSafeInteger(maxFailures) || maxFailures < 1 || maxFailures > 3) return unavailable;
   if (!failed.length) return unavailable;
   const groups = new Map();
   for (const check of failed) {
@@ -29,12 +62,21 @@ export function inspectMqReruns({ checks, repo, commit, removedAt }) {
     groups.get(key).push(check);
   }
   const originals = [], candidates = [];
-  let confirmed = true, retryFailed = false;
+  let confirmed = true, retryFailed = false, worst = 0;
   for (const failures of groups.values()) {
     failures.sort((a, b) => stamp(a.completed_at) - stamp(b.completed_at));
     const original = failures[0], originalJob = mqActionsJob(original, repo);
     originals.push(original);
     if (stamp(original.completed_at) >= removedAt) return unavailable;
+    if (maxFailures > 1) {
+      const chain = mqChain(checks, repo, commit, original, removedAt);
+      if (!chain) return unavailable;
+      worst = Math.max(worst, chain.failures);
+      if (chain.failures >= maxFailures) retryFailed = true;
+      if (chain.state !== 'confirmed') confirmed = false;
+      if (chain.state === 'candidate') candidates.push(chain.candidate);
+      continue;
+    }
     const attempts = checks.filter(check => check.id !== original.id && check.name === original.name
       && check.head_sha === commit && mqActionsJob(check, repo)?.run === originalJob.run
       && mqActionsJob(check, repo)?.id !== originalJob.id
@@ -53,9 +95,9 @@ export function inspectMqReruns({ checks, repo, commit, removedAt }) {
       && mqActionsJob(check, repo)?.run === mqActionsJob(original, repo).run
       && stamp(check.started_at) > stamp(original.completed_at);
   }));
-  return { checks: selected, confirmed: confirmed && !retryFailed,
+  return { checks: selected, confirmed: confirmed && !retryFailed, failures: worst || undefined,
     candidates: retryFailed ? [] : [...new Set(candidates)],
-    reason: retryFailed ? 'rerun failed; operator must inspect failed jobs and enqueue manually'
+    reason: retryFailed ? `rerun failed${maxFailures > 1 ? ` ${worst}/${maxFailures}` : ''}; operator must inspect failed jobs and enqueue manually`
       : !confirmed && !candidates.length ? 'rerun pending or incomplete; operator must inspect failed jobs before retrying' : null };
 }
 
