@@ -5,12 +5,13 @@
  *   check-classification that decides merge-vs-wait-vs-abort. The live gh/git driver is the I/O boundary.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync } from 'node:fs';
 import { resolve, join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 import { drainScoredGit } from './fixtures/drain-scored-git.mjs';
+import * as prLand from '../pr-land.mjs';
 import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, liveBodyLandGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, isAcceptedAtHead, resolveDraft, isMainFixPr, decideReadyOnOpen, applyLabelWithRetry, unlabelledHandOffLabel, landTimeBodyGate } from '../pr-land.mjs';
 import { HOME_REASONS } from '../operations/pr-land-reasons.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
@@ -18,6 +19,69 @@ import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-indepe
 import { PANEL_LENSES } from '../lib/review-core.mjs';
 
 afterEach(() => vi.unstubAllEnvs());
+
+describe('ready-on-open acquisition', () => {
+  const headSha = 'a'.repeat(40);
+  const guard = 'scripts/settings/pr-land-ready.json';
+  const request = { active: true, repo: 'o/r', headSha, remote: 'origin', base: 'main' };
+  const runGit = vi.fn(args => args[0] === 'show'
+    ? JSON.stringify({ prLandReady: { guardConfigPaths: [guard] } }) : `${guard}\n`);
+  it('passes the pinned head to the reader and refuses when the reader refuses', () => {
+    const reader = vi.fn(() => ({ ok: false, reason: 'missing' }));
+    expect(prLand.classifyReadyOnOpen(request, { runGit, reader }).ready).toBe(false);
+    expect(reader).toHaveBeenCalledTimes(1);
+    expect(reader).toHaveBeenCalledWith({ repo: 'o/r', headSha });
+    reader.mockReturnValue({ ok: true, rulingId: 'R474' });
+    expect(prLand.classifyReadyOnOpen(request, { runGit, reader }).ready).toBe(true);
+    expect(runGit).toHaveBeenCalledWith(['diff', '--name-only', '--no-renames', `origin/main...${headSha}`]);
+  });
+  it('rename into a guard-config path preserves the outside source path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'approval-rename-'));
+    const git = args => String(execFileSync('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null',
+      '-c', 'commit.gpgSign=false', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', ...args],
+    { encoding: 'utf8', timeout: 10_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' } }));
+    try {
+      git(['init']);
+      mkdirSync(join(dir, 'scripts/settings'), { recursive: true });
+      writeFileSync(join(dir, guard), JSON.stringify({ prLandReady: { guardConfigPaths: ['scripts/settings/guard.json'] } }));
+      writeFileSync(join(dir, 'outside.mjs'), 'unchanged content\n');
+      git(['add', '.']); git(['commit', '-m', 'base']);
+      git(['update-ref', 'refs/remotes/origin/main', git(['rev-parse', 'HEAD']).trim()]);
+      renameSync(join(dir, 'outside.mjs'), join(dir, 'scripts/settings/guard.json'));
+      git(['add', '.']); git(['commit', '-m', 'rename']);
+      const pinned = git(['rev-parse', 'HEAD']).trim();
+      const paths = [];
+      const runGit = args => {
+        const result = git(args);
+        if (args[0] === 'diff') paths.push(...result.trim().split('\n'));
+        return result;
+      };
+      const reader = vi.fn(() => ({ ok: true, rulingId: 'R474' }));
+      expect(prLand.classifyReadyOnOpen({ ...request, headSha: pinned }, { runGit, reader }).ready).toBe(false);
+      expect(paths).toEqual(['outside.mjs', 'scripts/settings/guard.json']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('requests rename-safe diff acquisition for the pinned range', () => {
+    const reader = vi.fn(() => ({ ok: true, rulingId: 'R474' }));
+    const renamed = vi.fn(args => args[0] === 'show' ? runGit(args)
+      : args.includes('--no-renames') ? `outside.mjs\n${guard}\n` : `${guard}\n`);
+    expect(prLand.classifyReadyOnOpen(request, { runGit: renamed, reader }).ready).toBe(false);
+    expect(renamed).toHaveBeenCalledWith(['diff', '--name-only', '--no-renames', `origin/main...${headSha}`]);
+  });
+  it('skips approval lookup when readiness cannot affect draft state', () => {
+    const reader = vi.fn(); const git = vi.fn();
+    const { active, ...productionRequest } = request;
+    expect(prLand.classifyReadyOnOpen(productionRequest, { runGit: git, reader }).ready).toBe(false);
+    expect(reader).not.toHaveBeenCalled();
+    expect(git).not.toHaveBeenCalled();
+  });
+  it('refuses unavailable diff evidence and never reads an approval for it', () => {
+    const reader = vi.fn();
+    const git = vi.fn(() => { throw new Error('unavailable'); });
+    expect(prLand.classifyReadyOnOpen(request, { runGit: git, reader }).ready).toBe(false);
+    expect(reader).not.toHaveBeenCalled();
+  });
+});
 
 it('open-only runCli labels a failed net-diff read review:human and emits the review label', () => {
   // A scored leaf control is necessary: omitting netDiffScored also fails closed,
@@ -1145,19 +1209,24 @@ describe('decideReadyOnOpen — only flagged PRs skip the draft step (fail close
   const cfg = { guardConfigPaths: ['scripts/settings/prototype-load.json'] };
   const guard = ['scripts/settings/prototype-load.json'];
   const marker = 'x\nOperator-pre-approved: R474\n';
-  it('marker AND a diff confined to guard-config paths opens ready', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, ...cfg })).toMatchObject({ ready: true, why: 'pre-approved-guard-config' });
+  const approval = { ok: true, rulingId: 'R474' };
+  it('a body line Operator-pre-approved no longer makes a PR ready', () => {
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, approval: { ok: false, reason: 'no record' }, ...cfg }).ready).toBe(false);
   });
-  it('a marker with any other file, or guard-config without a marker, stays a draft', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: [...guard, 'x.mjs'], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: '', changedFiles: guard, ...cfg }).ready).toBe(false);
-    for (const body of ['Operator-pre-approved: yes', 'pre-approved R474', 'Operator-pre-approved: R4x']) expect(decideReadyOnOpen({ body, changedFiles: guard, ...cfg }).ready).toBe(false);
+  it('a head-bound approval record AND a diff confined to guard-config paths opens ready', () => {
+    expect(decideReadyOnOpen({ approval, changedFiles: guard, ...cfg })).toMatchObject({ ready: true, why: 'pre-approved-guard-config' });
+  });
+  it('a record with any other file in the diff, or no record, stays a draft', () => {
+    expect(decideReadyOnOpen({ approval, changedFiles: [...guard, 'x.mjs'], ...cfg })).toMatchObject({ ready: false, why: 'approval-outside-guard-config' });
+    expect(decideReadyOnOpen({ approval, changedFiles: ['a.mjs'], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ changedFiles: guard, ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval: { ok: true }, changedFiles: guard, ...cfg }).ready).toBe(false);
   });
   it('no changed files, unreadable settings or no paths fail closed', () => {
-    expect(decideReadyOnOpen({ body: marker, changedFiles: [], ...cfg }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard }).ready).toBe(false);
-    expect(decideReadyOnOpen({ body: marker, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: [], ...cfg }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: guard }).ready).toBe(false);
+    expect(decideReadyOnOpen({ approval, changedFiles: guard, guardConfigPaths: 'nope' }).ready).toBe(false);
   });
   it('resolveDraft opens ready regardless of readyOnOpen', () => {
     expect(resolveDraft({ mode: 'park', optOut: false, readyOnOpen: true })).toBe(false);
@@ -1177,7 +1246,8 @@ describe('applyLabelWithRetry — a park label is retried before it is reported 
 describe('R502 ready-on-open allowlist wiring', () => {
   it('reads the guard-config allowlist from the base branch, never the PR checkout', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
-    expect(src).toMatch(/gitC\(\['show', `\$\{REMOTE\}\/\$\{BASE\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
+    expect(src).toMatch(/runGit\(\['show', `\$\{remote\}\/\$\{base\}:scripts\/settings\/pr-land-ready\.json`\]\)/);
+    expect(src).toContain('classifyReadyOnOpen({ repo: slug, headSha: refSha, remote: REMOTE, base: BASE }, { runGit: gitC })');
     expect(src).not.toMatch(/readSettings\(\)\.prLandReady/);
   });
 });

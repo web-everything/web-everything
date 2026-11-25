@@ -501,11 +501,15 @@ describe('ci.yml daemon-soak scope step wiring', () => {
   const scopeStep = yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope'].steps
     .find((step) => step.id === 'scope');
 
-  function runStep({ files, node = '' }) {
+  let lastShards = '';
+  // Returns the `run=` line; the `shards=` line lands in lastShards.
+  function runStep({ files, node = '', event = 'pull_request', git = null }) {
     const dir = fixtureRoot();
     const output = join(dir, 'output');
     const values = {
-      'github.event_name': 'pull_request',
+      'github.event_name': event,
+      'github.event.merge_group.base_sha': 'c'.repeat(40),
+      'github.event.merge_group.head_sha': 'd'.repeat(40),
       'github.event.pull_request.base.sha': 'a'.repeat(40),
       'github.event.pull_request.head.sha': 'b'.repeat(40),
     };
@@ -513,7 +517,7 @@ describe('ci.yml daemon-soak scope step wiring', () => {
       if (!(key in values)) throw new Error(`unmodelled workflow expression: ${key}`);
       return values[key];
     });
-    const script = `git() { printf '%s\\n' "$SCOPE_FILES"; }\n${node}\n${substitute(scopeStep.run)}`;
+    const script = `${git ?? `git() { printf '%s\\n' "$SCOPE_FILES"; }`}\n${node}\n${substitute(scopeStep.run)}`;
     // GitHub runs `run:` steps as `bash --noprofile --norc -eo pipefail {0}`.
     const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
       cwd: ROOT,
@@ -528,8 +532,35 @@ describe('ci.yml daemon-soak scope step wiring', () => {
     });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(0);
-    return readFileSync(output, 'utf8').trim();
+    const lines = readFileSync(output, 'utf8').trim().split('\n');
+    // Exactly one assignment of each: GitHub consumes the last one, so duplicates are a failure.
+    expect(lines.filter((l) => l.startsWith('run=')).length).toBe(1);
+    expect(lines.filter((l) => l.startsWith('shards=')).length).toBe(1);
+    lastShards = lines.find((l) => l.startsWith('shards='));
+    return lines.find((l) => l.startsWith('run='));
   }
+
+  // CI-SOAK-SCOPE-MQ: merge-queue runs use the same scope decision but always keep shard 1.
+  const ALL = 'shards=[1,2,3,4,5,6,7,8]';
+  it('merge_group: a docs-only change runs shard 1 only', () => {
+    expect(runStep({ event: 'merge_group', files: 'backlog/1-x.md' })).toBe('run=false');
+    expect(lastShards).toBe('shards=[1]');
+  }, 30_000);
+
+  it('merge_group: a daemon-code change runs all 8 shards', () => {
+    expect(runStep({ event: 'merge_group', files: 'scripts/conveyor/x.mjs' })).toBe('run=true');
+    expect(lastShards).toBe(ALL);
+  }, 30_000);
+
+  it('merge_group: a failing diff (unknown scope) runs all 8 shards', () => {
+    expect(runStep({ event: 'merge_group', files: '', git: 'git() { return 128; }' })).toBe('run=true');
+    expect(lastShards).toBe(ALL);
+  }, 30_000);
+
+  it.each(['push', 'workflow_dispatch'])('%s always runs all 8 shards, whatever changed', (event) => {
+    expect(runStep({ event, files: 'backlog/1-x.md' })).toBe('run=true');
+    expect(lastShards).toBe(ALL);
+  }, 30_000);
 
   it('lists changed paths unquoted so non-ASCII names match the scope keys', () => {
     expect(scopeStep.run).toMatch(/git -c core\.quotePath=false diff --name-only/);

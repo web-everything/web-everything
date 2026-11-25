@@ -4,6 +4,7 @@ import { launchWrappedClaudeWorker, WRAPPED_ROLES_DEFAULT_ON } from '../worker-w
 
 const options = (launch, over = {}) => ({
   role: 'fix', session: 'fix-900002', pr: 900002, env: {},
+  route: { provider: 'claude', reason: 'sentinel test: explicit Claude route' },
   bgArgv: ['--bg', '-n', 'fix-900002', 'PROMPT'], specDir: 'unused-specs', launch, ...over,
 });
 const refusal = 'operations: refusing to launch a real claude worker for smoke sentinel PR #900002 (set smokeRealWorker.allowSentinel or WE_SMOKE_ALLOW_REAL_WORKER=1 to allow)';
@@ -25,6 +26,13 @@ describe('wrapped smoke sentinel refusal', () => {
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
     expect(launchWrappedClaudeWorker(options(launch, over)).handle).toBe('pid:4321');
     expect(launch).toHaveBeenCalledTimes(1);
+  });
+  describe.each([{ allowRealSentinel: true }, { env: { WE_SMOKE_ALLOW_REAL_WORKER: '1' } }])('route guard with sentinel opt-in %j', (over) => {
+    it.each([null, { provider: 'codex' }, { provider: 'agy-claude' }])('still refuses route %j before launch', (route) => {
+      const launch = vi.fn(() => ({ wrapperPid: 4321 }));
+      expect(launchWrappedClaudeWorker(options(launch, { ...over, route }))).toMatchObject({ handle: 'refused:route-mismatch', wrapperPid: null, argv: [] });
+      expect(launch).not.toHaveBeenCalled();
+    });
   });
   it('lets an explicit refusal override an allowing env', () => {
     const launch = vi.fn(() => ({ wrapperPid: 4321 }));
