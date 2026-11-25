@@ -74,30 +74,30 @@ function defaultLoaders({ env, repo }) {
 }
 
 /** IO wrapper: pinned git env, read-only git, then the pure planner. Any throw is a refuse. */
-export function runPlan({ repo, ref, env = process.env, exec = execFileSync, loadRecords, loadWaivers, revoked, maxWalk = MAX_WALK }) {
+export function runPlan({ repo, ref, env = process.env, exec: proc = execFileSync, loadRecords, loadWaivers, revoked, maxWalk = MAX_WALK }) {
   try {
     if (!/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/.test(String(ref)) || String(ref).includes('..')) return refuse('bad-ref');
     const loaders = loadRecords && loadWaivers ? { loadRecords, loadWaivers } : defaultLoaders({ env, repo });
     const base = { PATH: env.PATH, HOME: env.HOME, GIT_NO_REPLACE_OBJECTS: '1', GIT_GRAFT_FILE: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
-    const gitDir = String(exec('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { env: base, encoding: 'utf8' })).trim();
+    const gitDir = String(proc('git', ['-C', repo, 'rev-parse', '--absolute-git-dir'], { env: base, encoding: 'utf8' })).trim();
     const genv = { ...base, GIT_DIR: gitDir, GIT_WORK_TREE: repo };
-    const git = (...args) => String(exec('git', args, { cwd: repo, env: genv, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })).trim();
-    const lines = git('ls-remote', 'origin', `refs/heads/${ref}`).split('\n').filter(Boolean);
+    const query = (...args) => String(proc('git', args, { cwd: repo, env: genv, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })).trim();
+    const lines = query('ls-remote', 'origin', `refs/heads/${ref}`).split('\n').filter(Boolean);
     if (lines.length !== 1) return refuse('ls-remote-not-one-line');
     const [remoteSha, remoteName] = lines[0].split('\t');
     if (!SHA.test(remoteSha) || remoteName !== `refs/heads/${ref}`) return refuse('ls-remote-bad-line');
-    try { git('fetch', '--quiet', 'origin', `refs/heads/${ref}`); } catch { /* objects may already be local; verify below */ }
-    const tip = git('rev-parse', '--verify', '--end-of-options', `${remoteSha}^{commit}`).toLowerCase();
+    try { query('fetch', '--quiet', 'origin', `refs/heads/${ref}`); } catch { /* objects may already be local; verify below */ }
+    const tip = query('rev-parse', '--verify', '--end-of-options', `${remoteSha}^{commit}`).toLowerCase();
     if (tip !== remoteSha) return refuse('tip-mismatch');
-    const chain = git('rev-list', '--first-parent', `--max-count=${maxWalk + 1}`, tip).split('\n').filter(Boolean);
+    const chain = query('rev-list', '--first-parent', `--max-count=${maxWalk + 1}`, tip).split('\n').filter(Boolean);
     const records = loaders.loadRecords(), waivers = loaders.loadWaivers();
     // The merges check needs B, which is only known after the walk: ask the pure planner first with none, then verify.
     const first = planRewaive({ ref, tip, chain, merges: [], records, waivers, revoked });
     if (!first.basis) return first;
-    const merges = git('rev-list', '--merges', `${first.basis}..${tip}`).split('\n').filter(Boolean);
+    const merges = query('rev-list', '--merges', `${first.basis}..${tip}`).split('\n').filter(Boolean);
     const out = planRewaive({ ref, tip, chain, merges, records, waivers, revoked });
     if (out.state === 'request') {
-      const names = (...a) => git('diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', ...a, `${out.basis}..${tip}`)
+      const names = (...a) => query('diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', ...a, `${out.basis}..${tip}`)
         .split('\n').filter(Boolean);
       const baseRecs = records.filter(r => String(r.head).toLowerCase() === out.basis);
       out.table = classifyFindings(out.request.findings, { changed: names(), added: names('--diff-filter=A') },
