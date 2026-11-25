@@ -107,7 +107,7 @@ describe('runGhSync — a primary GraphQL exhaustion backs EVERYONE off until th
     let n = 0;
     const exec = vi.fn((args) => {
       if (args[0] === 'api') return JSON.stringify({ data: { rateLimit: { limit: 6100, remaining: 500, resetAt: RESET } } });
-      n += 1; if (n === 1) { const e = new Error('x'); e.stderr = EXHAUSTED; throw e; }
+      n += 1; if (n === 1) { const e = new Error('x'); e.stderr = EXHAUSTED + ' (HTTP 403)'; throw e; }
       return 'ok';
     });
     expect(runGhSync(['pr', 'list'], { env: APP_ENV, throttle: throttleOpts(lockRoot, { exec }) })).toBe('ok');
@@ -118,7 +118,7 @@ describe('runGhSync — a primary GraphQL exhaustion backs EVERYONE off until th
     const lockRoot = tmp();
     let n = 0;
     const exec = vi.fn(() => { n += 1; if (n < 3) { const e = new Error('x'); e.stderr = 'You have exceeded a secondary rate limit.'; throw e; } return 'ok'; });
-    expect(runGhSync(['pr', 'edit', '1'], { env: APP_ENV, throttle: throttleOpts(lockRoot, { exec }) })).toBe('ok');
+    expect(runGhSync(['pr', 'view', '1'], { env: APP_ENV, throttle: throttleOpts(lockRoot, { exec }) })).toBe('ok');
     expect(n).toBe(3);
     expect(readBudgetBlock(lockRoot, 'app', 'graphql', NOW)).toBe(null);
   });

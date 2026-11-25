@@ -177,7 +177,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, accessSync, constants } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, openSync, readSync, closeSync, statSync, lstatSync, accessSync, constants } from 'node:fs';
 import { homedir, constants as osConstants } from 'node:os';
 import { join, resolve, basename, delimiter } from 'node:path';
 import { URL as NodeURL, fileURLToPath, pathToFileURL } from 'node:url';
@@ -196,7 +196,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
-import { readOperatorOverrides } from './operator-override-reader.mjs';
+import { operatorOverridesPath, readOperatorOverrides } from './operator-override-reader.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -270,7 +270,15 @@ export const GH_POINTS_WINDOW_MS = 60_000;
 export const DEFAULT_GH_POINTS_BUDGET_PER_MIN = 300;
 
 let pointsBudgetSourceLogged = false;
-/** Fresh lock-free operator read; explicit invalid env refuses to the safe default, not an override. */
+function validPointsBudget(n) {
+  return Number.isInteger(n) && n >= 1 && n <= 600;
+}
+function explicitPointsBudget(n) {
+  if (validPointsBudget(n)) return n;
+  try { process.stderr.write('gh-throttle: invalid throttle.budgetPerMin; expected an integer 1..600; falling back to 300\n'); } catch { /* diagnostics only */ }
+  return DEFAULT_GH_POINTS_BUDGET_PER_MIN;
+}
+/** Fresh lock-free operator read; invalid env falls through to the operator override. */
 export function resolveGhPointsBudgetPerMinDetailed(env = process.env, { overrideFile } = {}) {
   let result = { budget: DEFAULT_GH_POINTS_BUDGET_PER_MIN, source: 'default' };
   const warn = message => { try { process.stderr.write(`${message}\n`); } catch { /* diagnostics only */ } };
@@ -278,13 +286,23 @@ export function resolveGhPointsBudgetPerMinDetailed(env = process.env, { overrid
     const n = source === 'env' && typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : raw;
     // Leave at least 300 of GitHub's 900 points/minute for callers outside this wrapper
     // until the unmigrated-caller count is 0; do not raise this ceiling before then.
-    if (Number.isInteger(n) && n >= 1 && n <= 600) result = { budget: n, source };
-    else warn(`gh-throttle: invalid ${source} gh.throttle.pointsBudgetPerMin; expected an integer 1..600; falling back to 300`);
+    if (validPointsBudget(n)) result = { budget: n, source };
+    else warn(`gh-throttle: invalid ${source} gh.throttle.pointsBudgetPerMin; expected an integer 1..600; falling back to lower layer or 300`);
   };
   if (env && Object.hasOwn(env, 'WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN')) {
     apply(env.WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN, 'env');
-  } else {
-    const overrides = readOperatorOverrides({ file: overrideFile, log: warn });
+  }
+  if (result.source !== 'env') {
+    let overrides = { readable: false, values: {} };
+    try {
+      const file = overrideFile ?? operatorOverridesPath();
+      const stat = lstatSync(file);
+      if (!stat.isFile() || stat.size > 64 * 1024) {
+        warn('gh-throttle: unsafe or oversized operator override store; using 300');
+      } else overrides = readOperatorOverrides({ file, log: warn });
+    } catch (error) {
+      if (error.code !== 'ENOENT') warn('gh-throttle: unreadable operator override store; using 300');
+    }
     const key = 'gh.throttle.pointsBudgetPerMin';
     if (overrides.readable && Object.hasOwn(overrides.values, key)) apply(overrides.values[key], 'override');
   }
@@ -1232,22 +1250,27 @@ export function parseGraphQLRateLimit(body) {
 /**
  * Classify response headers and optional refusal text (from {@link parseGhDebugResponseHeaders}, or hand-built by a test/caller) into which
  * of the two DISTINCT rate-limit mechanisms it evidences — never both, never conflated (see the module
- * header). `retry-after` is checked FIRST and is UNCONDITIONALLY secondary: GitHub only ever sends that header
- * on the abuse/burst-limit response, never on an ordinary 200 with headroom to spare. Pure.
+ * header). Primary exhaustion takes precedence over Retry-After. Only nonempty numeric
+ * Retry-After values supply a secondary signal. Pure.
  * @param {Record<string,string>} headers
  * @param {string} [refusalText] stripped failure text; never pass debug response bodies
  * @returns {{kind:('secondary'|'primary'|'none'), retryAfterRaw?:string, remaining?:number, resetEpochSec?:number}}
  */
 export function classifyRateLimitSignal(headers, refusalText = '') {
   const h = headers || {};
-  if (h['retry-after'] != null) return { kind: 'secondary', retryAfterRaw: h['retry-after'] };
-  // Reuse the established text classifiers: a 403/429 rate-limit refusal that is not
-  // primary exhaustion is the secondary/abuse signal, even without Retry-After.
-  if (/\b(?:403|429)\b/.test(refusalText) && isRateLimitShaped(refusalText) && !primaryExhaustedResource(refusalText)) return { kind: 'secondary' };
   const remaining = h['x-ratelimit-remaining'] != null ? Number(h['x-ratelimit-remaining']) : null;
   const resetEpochSec = h['x-ratelimit-reset'] != null ? Number(h['x-ratelimit-reset']) : null;
-  if (remaining === 0 && Number.isFinite(resetEpochSec)) return { kind: 'primary', remaining, resetEpochSec };
+  if (remaining === 0 || primaryExhaustedResource(refusalText)) return { kind: 'primary', remaining, resetEpochSec };
+  if (String(h['retry-after'] ?? '').trim() !== '' && Number.isFinite(Number(h['retry-after'])) && Number(h['retry-after']) >= 0) {
+    return { kind: 'secondary', retryAfterRaw: h['retry-after'] };
+  }
+  if (/\b(?:403|429)\b/.test(refusalText) && isRateLimitShaped(refusalText)) return { kind: 'secondary' };
   return { kind: 'none' };
+}
+
+function rateLimitRetryEligible(text, signal) {
+  return /secondary rate limit|abuse detection/i.test(text)
+    || (/\b(?:403|429)\b/.test(text) && (isRateLimitShaped(text) || signal.kind !== 'none'));
 }
 
 /**
@@ -1265,7 +1288,7 @@ export function calibratedBackoffMs({ headers = {}, attempt, tuning = {}, nowMs 
     const ms = retryAfterMs(signal.retryAfterRaw, nowMs); // reused from model-proposer.mjs — not re-derived
     if (ms != null) return { ms: Math.min(ms, headerCapMs), source: 'secondary-retry-after' };
   }
-  if (signal.kind === 'primary') {
+  if (signal.kind === 'primary' && Number.isFinite(signal.resetEpochSec)) {
     const ms = Math.max(0, signal.resetEpochSec * 1000 - nowMs);
     return { ms: Math.min(ms, headerCapMs), source: 'primary-reset' };
   }
@@ -2089,7 +2112,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = Object.hasOwn(throttle, 'budgetPerMin') ? explicitPointsBudget(throttle.budgetPerMin) : resolveGhPointsBudgetPerMin(env);
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   // Header self-calibration is OPT-IN per call (see the module header) — OFF unless a caller explicitly asks,
@@ -2237,12 +2260,12 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // `text` above is the STRIPPED stderr, so a response body mentioning a rate limit never classifies as one.
     const headers = parseGhDebugResponseHeaders(captured ? captured.rawStderrText : failure && failure.stderr);
     const signal = classifyRateLimitSignal(headers, text);
-    if (!isRateLimitShaped(text) && signal.kind !== 'secondary') throw failure;
+    if (isWrite || (!primaryExhaustedResource(text) && !rateLimitRetryEligible(text, signal))) throw failure;
     if (signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
 
     // #gh-graphql-budget — a PRIMARY exhaustion cannot clear before the bucket's reset: record the shared block
     // and give up NOW instead of spending the retry ladder on calls GitHub will refuse.
-    const exhausted = signal.kind === 'secondary' ? null : primaryExhaustedResource(text);
+    const exhausted = primaryExhaustedResource(text) || (signal.kind === 'primary' ? resource : null);
     // Shim-routed: the nested layer already recorded the block under the identity it really spent; retrying here
     // would only re-ask a bucket GitHub (or that block) refuses until its reset.
     if (exhausted && shimRouted) throw failure;
@@ -2262,6 +2285,8 @@ function runGhSyncUnmemoized(args, opts = {}) {
         throw failure;
       }
     }
+
+    if (!rateLimitRetryEligible(text, signal)) throw failure;
 
     // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
     if (attempt >= maxAttempts || reserved) {
@@ -2388,7 +2413,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const pid = throttle.pid || process.pid;
   const owner = throttle.owner || `${pid}:${randomUUID()}`;
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = Object.hasOwn(throttle, 'budgetPerMin') ? explicitPointsBudget(throttle.budgetPerMin) : resolveGhPointsBudgetPerMin(env);
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
@@ -2538,12 +2563,12 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
     }
     const headers = parseGhDebugResponseHeaders(rawStderrText); // LAST response, pre-strip
     const signal = classifyRateLimitSignal(headers, stderrText);
-    if (!failed || (!isRateLimitShaped(stderrText) && signal.kind !== 'secondary')) {
+    if (!failed || isWrite || (!primaryExhaustedResource(stderrText) && !rateLimitRetryEligible(stderrText, signal))) {
       return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
     }
     if (signal.kind === 'secondary') recordGhSecondaryHit({ lockRoot, nowMs: now() });
     // #gh-graphql-budget — PRIMARY exhaustion → record the shared block and return now (see runGhSync).
-    const exhausted = signal.kind === 'secondary' ? null : primaryExhaustedResource(stderrText);
+    const exhausted = primaryExhaustedResource(stderrText) || (signal.kind === 'primary' ? resource : null);
     if (exhausted) {
       const probe = throttle.probeBudget || ((probeArgs) => {
         const probeOpts = callEnv === env
@@ -2577,6 +2602,8 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
         return { status: r.status == null ? 1 : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
       }
     }
+    if (!rateLimitRetryEligible(stderrText, signal)) return { status: r.status ?? 1, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
+
     // A reserved read makes exactly ONE attempt: no retry ladder or backoff can run it past its call bound (the freeze holds; the next tick re-reads). Budget-block recording above still runs.
     if (attempt >= maxAttempts || reserved) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points, outcome: 'retry_exhausted', caller, w: isWrite, id: identity });

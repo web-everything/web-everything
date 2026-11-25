@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as gh from '../gh-throttle.mjs';
@@ -32,9 +33,9 @@ it('env wins over operator override; legacy resolver returns a number', () => {
   save(400);
   expect(resolve()).toEqual({ budget: 400, source: 'override' });
 });
-it.each(['bad', '0', '-1', '1.5', '', 'Infinity', '601'])('invalid env %s refuses to default 300, even with a valid override', value => {
+it.each(['bad', '0', '-1', '1.5', '', 'Infinity', '601'])('invalid env %s falls through to a valid override', value => {
   save(500);
-  expect(resolve({ [ENV]: value })).toEqual({ budget: 300, source: 'default' });
+  expect(resolve({ [ENV]: value })).toEqual({ budget: 500, source: 'override' });
   expect(stderr).toHaveBeenCalledWith(expect.stringContaining('invalid env'));
 });
 it.each(['bad', '500', 0, -1, 1.5, null, true, 601])('invalid override %s falls back to 300 and warns', value => {
@@ -53,6 +54,20 @@ it('absent, malformed and unreadable override stores fall back to 300', () => {
   expect(resolve()).toEqual({ budget: 300, source: 'default' });
   expect(gh.resolveGhPointsBudgetPerMinDetailed({}, { overrideFile: dir })).toEqual({ budget: 300, source: 'default' });
 });
+it.each(['symlink', 'fifo', 'oversized'])('skips a %s override store with a warning', kind => {
+  if (kind === 'symlink') {
+    const target = join(dir, 'target.json');
+    writeFileSync(target, JSON.stringify({ [KEY]: 500 }));
+    symlinkSync(target, file);
+  } else if (kind === 'fifo') execFileSync('mkfifo', [file]);
+  else writeFileSync(file, JSON.stringify({ [KEY]: 500, padding: ' '.repeat(64 * 1024) }));
+  expect(resolve()).toEqual({ budget: 300, source: 'default' });
+  expect(stderr).toHaveBeenCalledWith(expect.stringContaining('using 300'));
+});
+it.each(['bad', '', '601'])('invalid env %s without an override uses 300', value => {
+  expect(resolve({ [ENV]: value })).toEqual({ budget: 300, source: 'default' });
+  expect(stderr).toHaveBeenCalledWith(expect.stringContaining('invalid env'));
+});
 it('registers the bounded capacity leaf and reads it with the builtin-only reader', () => {
   expect(CAPACITY_LEAVES[KEY]).toMatchObject({ direction: 'cap', failClosedFallback: 300 });
   save(600);
@@ -68,29 +83,34 @@ it('keeps the separate write budget unchanged', () => {
 const secondary = 'gh: You have exceeded a secondary rate limit. (HTTP 403)';
 const primary = 'gh: API rate limit exceeded. (HTTP 403)';
 const retryHeader = '< HTTP/2.0 429 Too Many Requests\n< Retry-After: 2\n\ngh: request refused (HTTP 429)';
-function invoke(mode, messages, extra = {}) {
+function invoke(mode, messages, extra = {}, args = ['api', 'user']) {
   const sleep = vi.fn();
   const throttle = { env: { WE_GH_THROTTLE_NO_BUDGET_PROBE: '1' }, lockRoot: dir, cap: 2,
     budgetPerMin: 300, now: () => NOW, maxAttempts: 2, retryBaseMs: 1, sleep, ...extra };
   let calls = 0;
   const next = () => messages[calls++];
+  let status = 0, failure;
   if (mode === 'sync') {
-    gh.runGhSync(['api', 'user'], { throttle: { ...throttle, exec: () => {
+    try { gh.runGhSync(args, { throttle: { ...throttle, exec: () => {
       const text = next();
       if (text) throw Object.assign(new Error(text), { stderr: text, status: 1 });
       return 'ok';
-    } } });
+    } } }); } catch (error) { status = error.status; failure = error; }
   } else {
-    gh.runGhCliPassthrough(['api', 'user'], { throttle, spawn: () => {
+    const result = gh.runGhCliPassthrough(args, { throttle, spawn: () => {
       const text = next();
       return { status: text ? 1 : 0, stdout: Buffer.from('ok'), stderr: Buffer.from(text || '') };
     } });
+    status = result.status;
+    failure = result.stderr.toString();
   }
-  return { sleep, calls };
+  return { sleep, calls, status, failure };
 }
 describe.each(['sync', 'cli'])('%s secondary refusal accounting', mode => {
   it('does not count primary exhaustion', () => {
-    try { invoke(mode, [primary]); } catch (error) { expect(error.stderr).toBe(primary); }
+    const result = invoke(mode, [primary]);
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(1);
     expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW })).toEqual({ currentHour: 0, last60Min: 0 });
   });
   it.each([secondary, 'gh: abuse detection mechanism (HTTP 429)', retryHeader])('counts a secondary refusal and honours Retry-After: %s', message => {
@@ -99,15 +119,51 @@ describe.each(['sync', 'cli'])('%s secondary refusal accounting', mode => {
     expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW })).toEqual({ currentHour: 1, last60Min: 1 });
     if (message === retryHeader) expect(result.sleep).toHaveBeenCalledWith(2000);
   });
-  it('Retry-After takes precedence over primary wording and headers', () => {
-    const text = `< HTTP/2.0 403 Forbidden\n< Retry-After: 2\n< X-Ratelimit-Remaining: 0\n< X-Ratelimit-Reset: ${Math.floor(NOW / 1000) + 3600}\n\n${primary}`;
+  it.each(['text', 'headers', 'both'])('records primary exhaustion despite Retry-After (%s)', evidence => {
+    const text = `< HTTP/2.0 403 Forbidden\n< Retry-After: 2\n${evidence !== 'text' ? `< X-Ratelimit-Remaining: 0\n< X-Ratelimit-Reset: ${Math.floor(NOW / 1000) + 3600}\n` : ''}\n${evidence !== 'headers' ? primary : 'gh: refused (HTTP 403)'}`;
     const result = invoke(mode, [text, null]);
-    expect(result.calls).toBe(2);
-    expect(result.sleep).toHaveBeenCalledWith(2000);
-    expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW })).toEqual({ currentHour: 1, last60Min: 1 });
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(1);
+    expect(result.sleep).not.toHaveBeenCalled();
+    expect(gh.readBudgetBlock(dir, gh.ghAuthIdentity({}), 'core', NOW)).not.toBeNull();
+    expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW }).last60Min).toBe(0);
+  });
+  it.each(['', 'nonsense'])('invalid Retry-After %s does not count as secondary', header => {
+    const result = invoke(mode, [`< HTTP/2.0 403 Forbidden\n< Retry-After: ${header}\n\ngh: refused (HTTP 403)`, null]);
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(1);
+    expect(result.sleep).not.toHaveBeenCalled();
+    expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW }).last60Min).toBe(0);
+  });
+  it.each([
+    [500, ['api', 'user']],
+    [403, ['api', '--method', 'POST', 'user']],
+    [403, ['api', 'graphql', '-f', 'query=mutation { test }']],
+  ])('does not replay HTTP %s for %j with Retry-After', (code, args) => {
+    const result = invoke(mode, [`< HTTP/2.0 ${code} Refused\n< Retry-After: 2\n\ngh: refused (HTTP ${code})`, null], {}, args);
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(1);
+    expect(result.sleep).not.toHaveBeenCalled();
+    expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW }).last60Min).toBe(0);
+  });
+  it.each([601, 0, -1, 1.5, '500', NaN, null])('invalid explicit budget %s uses 300 and warns', budgetPerMin => {
+    const result = invoke(mode, [null], { budgetPerMin, points: 300 });
+    expect(result.status).toBe(0);
+    expect(result.calls).toBe(1);
+    expect(result.sleep).not.toHaveBeenCalled();
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('invalid throttle.budgetPerMin'));
+    let clock = NOW;
+    const sleep = vi.fn(ms => { clock += ms; });
+    const next = invoke(mode, [null], { budgetPerMin, points: 1, now: () => clock, sleep });
+    expect(next.status).toBe(0);
+    expect(next.calls).toBe(1);
+    expect(sleep).toHaveBeenCalled();
   });
   it('counts the final refused attempt too', () => {
-    try { invoke(mode, [secondary, secondary]); } catch (error) { expect(error.stderr).toBe(secondary); }
+    const result = invoke(mode, [secondary, secondary]);
+    expect(result.status).toBe(1);
+    expect(result.calls).toBe(2);
+    expect(mode === 'sync' ? result.failure.stderr : result.failure).toBe(secondary);
     expect(gh.readGhSecondaryHits({ lockRoot: dir, nowMs: NOW })).toEqual({ currentHour: 2, last60Min: 2 });
   });
   it('counter write failure never throws or delays a successful retry', () => {

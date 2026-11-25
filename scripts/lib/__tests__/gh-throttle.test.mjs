@@ -236,7 +236,7 @@ describe('runGhSync — calibrateHeaders opt-in: a real Retry-After beats the gu
     const sleepCalls = [];
     const lockRoot = mkdtempSync(join(tmpdir(), 'gh-t-'));
     try {
-      runGhSync(['pr', 'create'], { throttle: { lockRoot, cap: 2, sleep: (ms) => sleepCalls.push(ms), exec, maxAttempts: 2, retryBaseMs: 100 } });
+      runGhSync(['pr', 'view', '1'], { throttle: { lockRoot, cap: 2, sleep: (ms) => sleepCalls.push(ms), exec, maxAttempts: 2, retryBaseMs: 100 } });
     } catch { /* exhausts after 2 attempts — expected */ }
     expect(sleepCalls).toEqual([100]); // the plain guessed backoff, unaffected by calibration machinery
   });
@@ -250,8 +250,8 @@ describe('runGhSync — calibrateHeaders opt-in: a real Retry-After beats the gu
     });
     const sleepCalls = [];
     const lockRoot = mkdtempSync(join(tmpdir(), 'gh-t-'));
-    const out = runGhSync(['pr', 'create'], {
-      throttle: { lockRoot, cap: 2, sleep: (ms) => sleepCalls.push(ms), exec, maxAttempts: 3, calibrateHeaders: true, op: 'pr-create' },
+    const out = runGhSync(['pr', 'view', '1'], {
+      throttle: { lockRoot, cap: 2, sleep: (ms) => sleepCalls.push(ms), exec, maxAttempts: 3, calibrateHeaders: true, op: 'pr-view' },
     });
     expect(out).toBe('https://github.com/o/n/pull/1');
     expect(sleepCalls).toEqual([42_000]); // Retry-After: 42, taken verbatim — not the guessed 2000ms default
@@ -744,7 +744,7 @@ describe('runGhSync — points budget + sidecar log wiring (#3670)', () => {
     const sleep = vi.fn();
     let caught = null;
     try {
-      runGhSync(['pr', 'create'], { throttle: { lockRoot, cap: 2, sleep, exec, maxAttempts: 2, retryBaseMs: 1, op: 'pr-create' } });
+      runGhSync(['pr', 'view', '1'], { throttle: { lockRoot, cap: 2, sleep, exec, maxAttempts: 2, retryBaseMs: 1, op: 'pr-view' } });
     } catch (e) { caught = e; }
     expect(caught).toBeTruthy();
 
@@ -753,7 +753,7 @@ describe('runGhSync — points budget + sidecar log wiring (#3670)', () => {
     const exhausted = entries.filter((e) => e.outcome === 'retry_exhausted');
     expect(exhausted.length).toBe(1);
     expect(exhausted[0].attempt).toBe(2);
-    expect(exhausted[0].op).toBe('pr-create');
+    expect(exhausted[0].op).toBe('pr-view');
   });
 
   it('a non-rate-limit failure logs one "call" entry and no retry_exhausted entry (never retried)', () => {
