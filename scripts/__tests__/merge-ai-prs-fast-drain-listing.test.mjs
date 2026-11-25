@@ -670,10 +670,11 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
     try {
       const first = await readFastDrainPassInventory(options);
       expect(first.snapshots.get(repo)).toEqual(rows);
-      expect(refreshes).toBe(1);
+      const built = refreshes;
+      expect(built).toBeGreaterThan(0);
       // A later child with a stale source must NOT refresh while reusing the published round.
       await expect(readFastDrainPassInventory({ ...options, refreshSnapshot: () => { refreshes++; return rows; } })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty');
-      expect(refreshes).toBe(1);
+      expect(refreshes).toBe(built);
     } finally { f.close(); }
   });
 
@@ -689,6 +690,51 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
         listLean: async () => { u += 90_000; return inventory(rows); } })).rejects.toThrow('expired while reading');
       late.close();
     } finally { f.close(); }
+  });
+
+  it('finding 1: after a refresh the source of every repo is re-read, so the published rows are the newest, not held ones', async () => {
+    const f = pass();
+    let n = 0;
+    const newest = rows.map(p => ({ ...p, body: 'newest source' }));
+    try {
+      const result = await readFastDrainPassInventory({ ...f.options, readSnapshot: () => null,
+        refreshSnapshot: () => (++n >= 3 ? newest : rows) });
+      expect(result.snapshots.get(repo)).toEqual(newest);
+      expect(JSON.parse(readFileSync(f.options.path, 'utf8')).rows).toEqual(newest);
+    } finally { f.close(); }
+  });
+
+  it('finding 2: writtenAt is the oldest evidence time and a refresh never renews it', async () => {
+    const f = pass();
+    let t = 5000;
+    try {
+      await readFastDrainPassInventory({ ...f.options, now: () => t, readSnapshot: () => null,
+        refreshSnapshot: () => { t += 10_000; return rows; } });
+      // The clock starts once, before main and membership are read; later refreshes advance time but not writtenAt.
+      expect(JSON.parse(readFileSync(f.options.path, 'utf8')).writtenAt).toBe(15_000);
+    } finally { f.close(); }
+  });
+
+  it('finding 4: main moving during a source refresh is rejected as incomplete context, never rebased', async () => {
+    const f = pass();
+    let calls = 0, moved = false;
+    try {
+      await expect(readFastDrainPassInventory({ ...f.options, readSnapshot: () => null,
+        refreshSnapshot: () => { if (++calls >= 3) moved = true; return rows; },
+        readMain: async () => (moved ? { ...head, sha: 'd'.repeat(40) } : head) })).rejects.toThrow('main changed');
+      expect(existsSync(f.options.path)).toBe(false);
+    } finally { f.close(); }
+  });
+
+  it('finding 3: a target read that outlived the bound while the inventory built is read again', async () => {
+    let t = 1000, targetReads = 0;
+    const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t,
+      readInventory: async () => { await setImmediate(); t += 90_000; return { snapshots: new Map([[repo, rows]]) }; },
+      readSnapshot: () => rows, listLean: async () => inventory(rows),
+      readFull: async (_repo, n) => { if (n === 7) targetReads++; return rows.find(p => p.number === n); },
+      readManifest: async (_repo, p) => p.manifest });
+    expect(context.get(repo)).toBeTruthy();
+    expect(targetReads).toBe(2);
   });
 
   it('a main move or an expiry while reading membership after a refresh is rejected, not published', async () => {

@@ -145,7 +145,7 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   read = p => { if (statSync(p).size > 64 * 1024 * 1024) throw new Error('pass snapshot oversized'); return JSON.parse(readFileSync(p, 'utf8')); },
   lock = fn => withFastDrainRoundLock(path, fn),
 }) {
-  const observedAt = now();
+  let observedAt = now();
   const { seconds: ttlSec, source } = roundSnapshotTtl(env);
   log(`fast-drain: pass snapshot TTL=${ttlSec}s, source=${source}`);
   const fresh = writtenAt => {
@@ -154,10 +154,10 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
   // `refresh` is only used while BUILDING a new round (never when reusing a published one): a stale
-  // cache-only source is refreshed once through the shared single-flight reader; any failure stays fail-closed.
-  const readSources = ({ refresh = false, onRefresh = () => {} } = {}) => new Map(repos.map(repo => {
+  // cache-only source is refreshed through the shared single-flight reader; any failure stays fail-closed.
+  const readSources = ({ refresh = false } = {}) => new Map(repos.map(repo => {
     let rows = readSnapshot(repo);
-    if (!Array.isArray(rows) && refresh && typeof refreshSnapshot === 'function') { onRefresh(); rows = refreshSnapshot(repo); }
+    if (!Array.isArray(rows) && refresh && typeof refreshSnapshot === 'function') rows = refreshSnapshot(repo);
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
     return [repo, rows];
   }));
@@ -168,6 +168,19 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     }
     return [repo, head];
   }));
+  // A cold source refresh can outlast the whole TTL. It runs BEFORE the evidence clock starts, and only when no fresh
+  // round is published to reuse; the clock, main baseline and every membership read all begin after it.
+  const roundPublished = () => {
+    try {
+      const s = read(path);
+      return s.v === 1 && s.repo === targetRepo && fresh(s.writtenAt)
+        && Array.isArray(s.repos) && repos.every(r => s.repos.includes(r));
+    } catch { return false; }
+  };
+  if (typeof refreshSnapshot === 'function' && !roundPublished()) {
+    for (const repo of repos) if (!Array.isArray(readSnapshot(repo))) refreshSnapshot(repo);
+  }
+  observedAt = now();
   let heads = await readHeads();
   const cached = () => {
     try {
@@ -188,18 +201,17 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     validateLeanOpenPrs(inventory, OPEN_PR_LIST_LIMIT, repo);
     return [repo, inventory];
   }));
-  const revalidateAfterMembership = async (writtenAt, { held = null } = {}) => {
+  const revalidateAfterMembership = async (writtenAt, { refresh = false } = {}) => {
+    // Building a round: EVERY repo's source is re-read here (refreshing only the ones that went stale or dirty), and the
+    // main-head and TTL checks run after that last, possibly slow, source read.
+    const sources = readSources({ refresh });
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
       throw new Error('pass main changed while reading — use live listing or retry next pass');
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
-    // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    // `held`: rows refreshed within this very build. Mutations dirty the source within seconds, so re-reading cache-only
-    // would always fail; the rows stay bound by the writtenAt TTL and main-head checks above, and every changed row is
-    // live-hydrated by the lean membership comparison.
-    return held ?? readSources();
+    return sources;
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -215,14 +227,11 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    // Include main-read/lock wait time in the freshness bound. A cold source refresh can itself outlast the TTL and
-    // observes nothing the round publishes, so when one ran the bound starts after it, with main re-read after it.
-    let refreshed = false;
-    const sources = readSources({ refresh: true, onRefresh: () => { refreshed = true; } });
-    if (refreshed) heads = await readHeads();
-    const writtenAt = refreshed ? now() : observedAt;
+    // writtenAt is the OLDEST evidence time (main-read/lock wait included) and is never renewed by a refresh.
+    const writtenAt = observedAt;
+    readSources({ refresh: true });
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt, { held: refreshed ? sources : null });
+    const snapshots = await revalidateAfterMembership(writtenAt, { refresh: true });
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });
@@ -286,7 +295,7 @@ async function refreshRelatedContext({ byRepo, readGroups, readManifests, target
 export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnapshot, listLean, readFull,
   readManifest, concurrency = 4, readInventory, failClosed = false, refreshPr = () => false,
   readManifests = entries => readManifestEntries(entries, readManifest, concurrency),
-  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {} }) {
+  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {}, now = Date.now, targetMaxAgeMs = 60_000 }) {
   try {
     const loadInventory = () => {
       if (readInventory) return readInventory();
@@ -299,10 +308,14 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
     };
     // Pass reuse is cache-only and must retain the source snapshot's freshness checks.
     const readTarget = () => time('listing.target', async () => requireFullPr(await readFull(targetRepo, Number(onlyPr)), Number(onlyPr)));
-    let base, target;
+    let base, target, targetReadAt;
+    const readTargetStamped = async () => { const t = await readTarget(); targetReadAt = now(); return t; };
     if (readInventory) [base, target] = await readFastDrainFacts(
-      [() => time('listing.inventory', loadInventory), readTarget], 2, read => read());
-    else { base = loadInventory(); target = await readTarget(); }
+      [() => time('listing.inventory', loadInventory), readTargetStamped], 2, read => read());
+    else { base = loadInventory(); target = await readTargetStamped(); }
+    // The target is read concurrently with a possibly slow inventory build: never gate on facts older than the bound.
+    if (readInventory && !(now() - targetReadAt < targetMaxAgeMs)) target = await readTargetStamped();
+    if (!(now() - targetReadAt < targetMaxAgeMs)) throw new Error('target read older than the pass bound');
     const { snapshots, inventories } = base;
     const liveReads = new Set([fastDrainPrKey(targetRepo, onlyPr)]);
     const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency, refreshPr }));
