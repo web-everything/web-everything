@@ -7,7 +7,7 @@
  *   Setting `drain.reads.source`: "api" (default) | "git" (the old local-git reads). An API failure NEVER falls
  *   back to git: it throws/returns a DrainReadError that is transient (retry next pass) and names its reason.
  */
-import { parseUnifiedDiff } from './pr-merge-gate.mjs';
+import { parseUnifiedDiff, isTestPath } from './pr-merge-gate.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { ghRestGetJson } from './gh-rest-read.mjs';
@@ -309,6 +309,19 @@ export function readAddedFiles(base, headSha, o = {}) {
 }
 
 
+/** A patch the scanner can read: it carries at least one hunk header. Anything else is opaque (binary, mode-only, empty). */
+const hasHunks = (f) => typeof f.patch === 'string' && /^@@ /m.test(f.patch);
+
+/**
+ * A file whose change cannot be reconstructed faithfully (rename/copy/type change, or an opaque patch) must not touch a
+ * test path: the scanner would read a reconstruction, not the real change. Fail closed, on either path.
+ */
+export function unsupportedTestChange(f) {
+  const special = ['renamed', 'copied', 'changed'].includes(f.status) || !hasHunks(f);
+  if (!special) return false;
+  return isTestPath(f.filename) || (typeof f.previous_filename === 'string' && isTestPath(f.previous_filename));
+}
+
 /** Synthesize scanner-readable git headers around complete, validated forge patches. Pure. */
 export function synthesizeUnifiedDiff(files) {
   return files.map((f) => {
@@ -318,10 +331,11 @@ export function synthesizeUnifiedDiff(files) {
     if (f.status === 'added') lines.push('new file mode 100644');
     if (f.status === 'removed') lines.push('deleted file mode 100644');
     if (f.status === 'renamed') lines.push(`rename from ${old}`, `rename to ${next}`);
-    if (f.status === 'renamed' && !f.patch && f.changes === 0) return lines.join('\n') + '\n';
+    if (f.status === 'copied') lines.push(`copy from ${old}`, `copy to ${next}`);
+    if (['renamed', 'copied'].includes(f.status) && !hasHunks(f) && f.changes === 0) return lines.join('\n') + '\n';
     lines.push(`--- ${f.status === 'added' ? '/dev/null' : `a/${old}`}`, `+++ ${f.status === 'removed' ? '/dev/null' : `b/${next}`}`);
-    // Empty/mode-only and binary changes cannot be distinguished by this API. Binary is conservative for tests.
-    lines.push(f.patch || `Binary files a/${old} and b/${next} differ`);
+    // Empty/mode-only/binary/opaque changes cannot be told apart by this API; an opaque patch is never passed through as hunks.
+    lines.push(hasHunks(f) ? f.patch : `Binary files a/${old} and b/${next} differ`);
     return lines.join('\n') + (lines.at(-1).endsWith('\n') ? '' : '\n');
   }).join('');
 }
@@ -350,6 +364,7 @@ export function readCompareNetDiff(repo, headSha, o = {}) {
     if (!path(f?.filename) || ((f.previous_filename !== undefined || ['renamed', 'copied'].includes(f.status)) && !path(f.previous_filename))) return bad(r, 'path-unsupported');
     if (!KNOWN_STATUS.has(f.status) || ![f.additions, f.deletions, f.changes].every(n => Number.isSafeInteger(n) && n >= 0) || f.changes !== f.additions + f.deletions) return bad(r, 'api-malformed', 'file status or counts invalid');
     if (typeof f.patch !== 'string' && f.changes > 0) return bad(r, 'patch-omitted');
+    if (unsupportedTestChange(f)) return bad(r, 'path-unsupported', 'test path with a rename, copy, type change or opaque patch');
     if (f.patch != null && typeof f.patch !== 'string') return bad(r, 'api-malformed', 'patch is not text');
     const lines = (f.patch ?? '').split('\n');
     if (lines.filter(l => l.startsWith('+')).length !== f.additions || lines.filter(l => l.startsWith('-')).length !== f.deletions) return bad(r, 'patch-truncated');

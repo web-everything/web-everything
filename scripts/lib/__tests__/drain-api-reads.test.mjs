@@ -784,10 +784,30 @@ const netFile = (over = {}) => ({ filename: 'blocks/__tests__/x.test.ts', status
 const netDoc = (over = {}) => ({ status: 'ahead', merge_base_commit: { sha: OTHER }, base_commit: { sha: OTHER }, files: [netFile()], ...over });
 const netRead = (doc, o = {}) => drainReads.readCompareNetDiff('o/r', SHA, { allowedRepos: ['o/r'], source: { read: () => ({ ok: true, value: doc, fetchedAt: NOW }) }, ...o });
 describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
+  const T = 'blocks/__tests__/x.test.ts';
+  const bare = { additions: 0, deletions: 0, changes: 0, patch: undefined };
+  it.each([
+    ['binary rename of a test file', netFile({ filename: T, previous_filename: 'old.ts', status: 'renamed', ...bare })],
+    ['binary rename away from a test path', netFile({ filename: 'new.ts', previous_filename: T, status: 'renamed', ...bare })],
+    ['copy of a test file', netFile({ filename: 'copy.ts', previous_filename: T, status: 'copied', ...bare })],
+    ['type change on a test path', netFile({ filename: T, status: 'changed', ...bare })],
+    ['opaque patch on a test path', netFile({ filename: T, status: 'modified', additions: 0, deletions: 0, changes: 0, patch: 'Binary files differ' })],
+  ])('holds %s with forge-path-unsupported', (_n, file) => {
+    expect(netRead(netDoc({ files: [file] }))).toMatchObject({ ok: false, reason: 'path-unsupported' });
+  });
+  it('passes an opaque non-test patch and a non-test copy with correct headers', () => {
+    const files = [netFile({ filename: 'a.png', status: 'modified', additions: 0, deletions: 0, changes: 0, patch: 'GIF89a opaque' }),
+      netFile({ filename: 'c.ts', previous_filename: 'b.ts', status: 'copied', ...bare })];
+    expect(netRead(netDoc({ files })).ok).toBe(true);
+    const text = drainReads.synthesizeUnifiedDiff(files);
+    expect(text).toContain('Binary files a/a.png and b/a.png differ');
+    expect(text).not.toContain('GIF89a');
+    expect(text).toContain('copy from b.ts\ncopy to c.ts');
+  });
   it('round-trips rename, delete, add, binary and pure rename conservatively', () => {
     const files = [netFile(), netFile({ filename: 'gone.ts', status: 'removed', additions: 0, deletions: 1, patch: '@@ -1 +0,0 @@\n-old' }),
       netFile({ filename: 'new.ts', previous_filename: 'old.ts', status: 'renamed' }),
-      netFile({ filename: 'binary.test.ts', changes: 0, additions: 0, patch: undefined }),
+      netFile({ filename: 'binary.ts', changes: 0, additions: 0, patch: undefined }),
       netFile({ filename: 'pure.ts', previous_filename: 'was.ts', status: 'renamed', changes: 0, additions: 0, patch: undefined })];
     const r = netRead(netDoc({ files }));
     expect(r).toMatchObject({ ok: true, value: { headSha: SHA, mergeBase: OTHER, baseTip: OTHER, diffLines: 3 } });
