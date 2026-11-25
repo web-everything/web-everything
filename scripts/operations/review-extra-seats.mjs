@@ -1133,7 +1133,7 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
       const ledgerPath = ledgerPathFor(provider);
       return withLedgerLock(ledgerPath, () => {
         const ledger = existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, 'utf8')) : null;
-        const r = reserveSeatCalls({ ledger, records: readStore(storeIo).records, want, dailyCap, now, newId, provider });
+        const r = reserveSeatCalls({ ledger, records: readStore({ ...storeIo, strict: true }).records, want, dailyCap, now, newId, provider });
         const tmp = `${ledgerPath}.${process.pid}.tmp`;
         writeFileSync(tmp, `${JSON.stringify(r.ledger, null, 2)}\n`);
         renameSync(tmp, ledgerPath);

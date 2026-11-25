@@ -23,7 +23,8 @@ import { buildAntigravityPrompt, ANTIGRAVITY_TOOL_FREE_CORRECTION, antigravityJu
 const FINDING = { summary: 'the guard is inverted so every caller passes', file: 'scripts/x.mjs', line: 10, disposition: 'blocker' };
 const OTHER = { summary: 'a log line leaks the token value', file: 'scripts/y.mjs', line: 3, disposition: 'blocker' };
 const REQUEST = { mandate: 'judge correctness', input: 'the diff', shape: { type: 'object' }, lens: 'correctness', runId: 'run-1', allowedTools: ['Read'] };
-const io = (extra) => ({ unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: '/lanes/review-lane', ...extra });
+const io = (extra) => ({ unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: '/lanes/review-lane',
+  reserveCalls: async () => ({ callIds: ['fixture-call'] }), ...extra });
 const withEntries = (entries) => validateRoutingPolicy({ ...structuredClone(DEFAULT_ROUTING_POLICY), operations: { ...structuredClone(DEFAULT_ROUTING_POLICY.operations), ...entries } });
 
 describe('settings — review.seatProvider.<lens> comes from the routing policy (one source)', () => {
@@ -116,7 +117,7 @@ describe('provider selection — the seat runner', () => {
 
   it('agy: a clean agy answer IS the seat answer and the run record says agy judged', async () => {
     let claudeRan = false;
-    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'm', onEscape: 'claude' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'claude-sonnet-5-5', onEscape: 'claude' } }, io({
       claudeJudge: async () => { claudeRan = true; return judgeOutcome({ summary: 'c', findings: [] }); },
       agyJuror: async () => ({ status: 'ok', sessionId: 'agy-1', wallMs: 5, value: { summary: 'a', findings: [OTHER] } }),
     }));
@@ -130,19 +131,19 @@ describe('provider selection — the seat runner', () => {
 
 describe('void-on-escape — the fallback', () => {
   it('agy seat: a voided agy run falls back to Claude for that seat, and says why', async () => {
-    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'm', onEscape: 'claude' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'claude-sonnet-5-5', onEscape: 'claude' } }, io({
       claudeJudge: async () => judgeOutcome({ summary: 'claude judged', findings: [FINDING] }, { sessionId: 'c' }),
       agyJuror: async () => ({ status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'], value: { summary: 'x', findings: [] } }),
     }));
     const { value } = unwrapJudgeOutcome(out);
     expect(value.summary).toBe('claude judged');
     expect(value.findings).toEqual([FINDING]);
-    expect(value.seatProvider).toEqual({ provider: 'claude', fellBackFrom: { provider: 'agy', model: 'm', status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'] } });
+    expect(value.seatProvider).toEqual({ provider: 'claude', fellBackFrom: { provider: 'agy', model: 'claude-sonnet-5-5', status: 'voided', reasons: ['change outside the juror lane: /lanes/review-lane'] } });
   });
 
   it('advisory agy seat: a voided run is a recorded skip, never a Claude spend', async () => {
     let claudeRan = false;
-    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-sonnet-5-5', onEscape: 'skip' } }, io({
       claudeJudge: async () => { claudeRan = true; return judgeOutcome({ summary: 'c', findings: [] }); },
       agyJuror: async () => ({ status: 'voided', reasons: ['juror lane changed on a read-only seat: ?? pwned.txt'] }),
     }));
@@ -412,11 +413,12 @@ describe('PR #4131 review fixes', () => {
     const agyCalls = [];
     const provider = async (r) => { providerCalls.push(r); return { value: { summary: 'claude', findings: [] }, sessionId: 'claude-s' }; };
     const seatRunner = (request, ioArg) => runSeatWithProvider(request, {
+      reserveCalls: async () => ({ callIds: ['fixture-call'] }),
       ...ioArg, agyJuror: async (o) => { agyCalls.push(o); return { status: 'voided', reasons: ['x'] }; }, appendRow: () => true,
     });
     const judge = createDefaultJudge({ provider, cwd: '/lanes/review-lane', seatRunner });
     // advisory agy seat: voided → skipped; Claude provider never called
-    const skipped = unwrapJudgeOutcome(await judge({ ...REQUEST, allowedTools: undefined, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }));
+    const skipped = unwrapJudgeOutcome(await judge({ ...REQUEST, allowedTools: undefined, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-sonnet-5-5', onEscape: 'skip' } }));
     expect(skipped.value.skipped).toMatchObject({ provider: 'agy' });
     expect(providerCalls).toHaveLength(0);
     expect(agyCalls[0].laneCwd).toBe('/lanes/review-lane');
@@ -599,7 +601,7 @@ describe('PR #4131 review fixes', () => {
   });
 
   it('an agy juror that THROWS never leaks a local path into the published skip summary', async () => {
-    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'm', onEscape: 'skip' } }, io({
+    const out = await runSeatWithProvider({ ...REQUEST, lens: 'agy-correctness', seatProvider: { mode: 'agy', model: 'claude-sonnet-5-5', onEscape: 'skip' } }, io({
       claudeJudge: async () => { throw new Error('advisory seat must not spend Claude'); },
       agyJuror: async () => { throw new Error('spawn failed in /lanes/review-lane/.git: ENOENT'); },
     }));

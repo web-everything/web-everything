@@ -36,7 +36,7 @@ function fixture() {
   const calls = [];
   let mutated = false;
   const run = (act = () => {}, steps = (cwd) => [tool(join(cwd, 'file.txt'))], options = {}) => runAgyReviewJuror({
-    request: { mandate: 'review', input: 'diff', shape: {} }, laneCwd: lane, model: 'test', watch: [extra],
+    request: { mandate: 'review', input: 'diff', shape: {}, ...options.request }, laneCwd: lane, model: 'test', watch: [extra],
     deps: {
       repoRoot: shared, home,
       mkTempDir: () => mkdtempSync(join(root, 'juror-')),
@@ -48,7 +48,9 @@ function fixture() {
         return execFileSync(bin, bin === 'git' ? ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args] : args,
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       },
-      spawnJudge: async ({ cwd }) => {
+      spawnJudge: async (spawnRequest) => {
+        options.onSpawn?.(spawnRequest);
+        const { cwd } = spawnRequest;
         act(cwd);
         mutated = true;
         if (options.timeoutError) throw options.timeoutError;
@@ -64,6 +66,16 @@ function fixture() {
   return { root, lane, shared, extra, home, calls, run };
 }
 const touchedReason = 'change outside the juror lane touched by the juror: this checkout';
+
+it('forwards validated request effort and budget to the agy spawn', async () => {
+  const fx = fixture();
+  let spawned;
+  const out = await fx.run(undefined, undefined, {
+    request: { effort: 'medium', budget: null }, onSpawn: r => { spawned = r; },
+  });
+  expect(out.status).toBe('ok');
+  expect(spawned).toMatchObject({ effort: 'medium', budget: null });
+});
 
 describe('shared checkouts correlate changes with every transcript tool update', () => {
   it.each(['command', 'relative command', 'concatenated command', 'unknown tool', 'unnamed tool', 'malformed JSON', 'scalar JSON', 'deep object', 'deep array', 'NUL', 'symlink dot-dot'])

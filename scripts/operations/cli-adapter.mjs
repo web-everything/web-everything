@@ -693,15 +693,15 @@ export const PROVIDER_QUOTA_FALLBACK = Object.freeze({ codex: 'antigravity' });
  * @param {number} when - epoch ms.
  * @returns {Promise<string|null>} the hold reason, or null when usable.
  */
-export async function defaultProviderQuotaHold(providerName, when) {
+export async function defaultProviderQuotaHold(providerName, when, { strict = false } = {}) {
   try {
     const [{ quotaHold }, { readStore }] = await Promise.all([
       import('./review-extra-seats.mjs'),
       import('../conveyor/run-scorecard-store.mjs'),
     ]);
-    return quotaHold(readStore().records, providerName, when);
+    return quotaHold(readStore({ strict }).records, providerName, when);
   } catch {
-    return null;
+    return strict ? 'provider quota evidence unavailable; orchestrator must restore the scorecard store' : null;
   }
 }
 
@@ -813,7 +813,7 @@ export function createDefaultJudge({
   // `opts.cwd` — a seat given a lane of its OWN by a concurrent batch (`./parallel-judges.mjs`) runs there instead of
   // in the factory's lane. Absent, the factory's `cwd` applies exactly as before.
   const judge = async (request, opts = null) => {
-    const cwd = opts?.cwd || factoryCwd;
+    const cwd = opts?.cwd !== undefined ? opts.cwd : factoryCwd;
     // #xqa9ttq — A REQUEST MAY PIN ITS OWN PROVIDER (`request.providerName`), overriding this factory's. This
     // is what lets ONE run seat a tool-free Codex juror (`review-pr`'s opt-in `judgeAdvisory` seat) while its
     // OTHER judge steps stay on the factory's own provider (`claude` by default, or whatever `--provider`
@@ -970,19 +970,43 @@ export function createDefaultJudge({
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
     if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
     if (jurorTimeoutExclusions.some(row => row.lens === request?.lens)) {
-      const { selectJurorTimeoutRoute, jurorTimeoutRoutes } = await import('../lib/review-seat-provider.mjs');
+      const { selectJurorTimeoutRoute, jurorTimeoutRoutes, assertJurorTimeoutAuthorVendor } = await import('../lib/review-seat-provider.mjs');
+      const originalProvider = request.providerName ?? providerName;
+      const original = originalProvider === 'codex' ? stripForCodex(request) : request;
+      assertSafeJudgeRequest(original);
+      // Production read findings do not currently prove the author's vendor. Old saved requests have no
+      // such evidence either. Hold rather than treating the timed-out provider as the author's identity.
+      assertJurorTimeoutAuthorVendor(request.forbiddenVendor);
       const route = selectJurorTimeoutRoute({ lens: request.lens,
         routes: (timeoutRoutes ?? jurorTimeoutRoutes)(request.lens), exclusions: jurorTimeoutExclusions,
-        forbiddenVendor: request.forbiddenVendor ?? null });
+        forbiddenVendor: request.forbiddenVendor });
       const { seatProvider, providerName: priorProvider, model: priorModel, ...plain } = request;
+      const replacement = { ...plain, model: route.model, effort: route.effort ?? plain.effort };
+      assertSafeJudgeRequest({ ...replacement, providerName: route.provider });
+      const laneCwd = opts?.cwd !== undefined ? opts.cwd : factoryCwd;
+      const source = buildProviderRequest(original, laneCwd, originalProvider);
+      // Reuse the provider request builder's checkout isolation even when the selected provider changes.
+      opts = { ...opts, cwd: source.cwd ?? null };
       if (route.provider.startsWith('agy-')) {
-        request = { ...plain, gracefulOnUnavailable: false, seatProvider: { ...seatProvider, mode: 'agy', model: route.model, onEscape: 'refuse' } };
+        if (!source.cwd || (!original.allowedTools && !seatProvider)) {
+          throw new Error(`juror-timeout: tool-free/checkout-isolated seat ${request.lens} cannot use the agy checkout runner; orchestrator must restore a compatible provider`);
+        }
+        request = { ...replacement, gracefulOnUnavailable: false, seatProvider: { ...seatProvider, mode: 'agy', model: route.model, onEscape: 'refuse' } };
       } else {
-        request = { ...plain, gracefulOnUnavailable: false, providerName: route.provider, model: route.model, effort: route.effort ?? plain.effort };
+        request = { ...replacement, gracefulOnUnavailable: false, providerName: route.provider };
+      }
+      // Both agy and Codex accept budget but cannot enforce a finite ceiling. Recovery must never
+      // silently remove one, including the normal provider's default ceiling when budget is omitted.
+      if (route.provider !== 'claude' && request.budget !== null) {
+        throw new Error(`juror-timeout: ${route.provider} cannot enforce the seat budget/spending ceiling; orchestrator must restore a budget-capable provider`);
+      }
+      const hold = await checkProviderHold(route.provider, now(), { strict: true });
+      if (hold) {
+        throw new Error(`juror-timeout: replacement ${route.provider} held: ${hold}; orchestrator must restore an available provider`);
       }
     }
     if (request?.seatProvider == null) return judge(request, opts);
-    const laneCwd = opts?.cwd || factoryCwd;
+    const laneCwd = opts?.cwd !== undefined ? opts.cwd : factoryCwd;
     return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });
   };
   routedJudge.providerName = providerName;

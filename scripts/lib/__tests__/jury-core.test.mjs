@@ -3274,10 +3274,11 @@ describe('judge honours daemon timeout exclusions', () => {
     const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
     const seatRunner = vi.fn(async request => ({ value: { summary: 'reviewed', findings: [] }, directive: request.seatProvider }));
     const primary = vi.fn();
-    const judge = createDefaultJudge({ provider: primary, providerName: 'claude',
+    const judge = createDefaultJudge({ provider: primary, providerName: 'claude', cwd: 'review-lane', checkProviderHold: async () => null,
       jurorTimeoutExclusions: [{ lens: 'security', provider: 'claude' }],
       timeoutRoutes: () => [{ provider: 'claude', model: 'sonnet' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }], seatRunner });
-    await judge({ lens: 'security', mandate: 'Judge carefully', input: 'diff', shape: { type: 'object' } });
+    await judge({ lens: 'security', mandate: 'Judge carefully', input: 'diff', shape: { type: 'object' },
+      allowedTools: ['Read'], budget: null, forbiddenVendor: 'Anthropic' });
     expect(primary).not.toHaveBeenCalled();
     expect(seatRunner.mock.calls[0][0].seatProvider).toMatchObject({ mode: 'agy', model: 'gemini-3-pro', onEscape: 'refuse' });
   });
@@ -3287,7 +3288,7 @@ describe('judge honours daemon timeout exclusions', () => {
     const judge = createDefaultJudge({ provider: primary, providerName: 'claude', seatRunner,
       jurorTimeoutExclusions: [{ lens: 'security', provider: 'claude' }],
       timeoutRoutes: () => [{ provider: 'claude', model: 'sonnet' }] });
-    await expect(judge({ lens: 'security', mandate: 'Judge', input: 'diff', shape: { type: 'object' } })).rejects.toThrow(/no alternative/);
+    await expect(judge({ lens: 'security', mandate: 'Judge', input: 'diff', shape: { type: 'object' }, forbiddenVendor: 'OpenAI' })).rejects.toThrow(/no alternative/);
     expect(primary).not.toHaveBeenCalled(); expect(seatRunner).not.toHaveBeenCalled();
   });
 });
@@ -3304,13 +3305,15 @@ it('retry exclusions cannot be evaded by a graceful quota fallback or skip', asy
   const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
   const alternate = vi.fn(async () => ({ value: { summary: 'checked', findings: [] } }));
   const checkProviderHold = vi.fn(async () => 'quota held');
-  const judge = createDefaultJudge({ providerName: 'codex',
+  const judge = createDefaultJudge({ providerName: 'claude',
     jurorTimeoutExclusions: [{ lens: 'quality', provider: 'codex' }],
     timeoutRoutes: () => [{ provider: 'codex', model: 'gpt-6.1-sol' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }],
-    seatRunner: async request => { expect(request.gracefulOnUnavailable).toBe(false); return alternate(); }, checkProviderHold });
-  await judge({ lens: 'quality', mandate: 'judge', input: 'diff', shape: {}, gracefulOnUnavailable: true });
-  expect(alternate).toHaveBeenCalledTimes(1);
-  expect(checkProviderHold).not.toHaveBeenCalled();
+    cwd: 'review-lane',
+    seatRunner: alternate, checkProviderHold });
+  await expect(judge({ lens: 'quality', mandate: 'judge', input: 'diff', shape: {}, gracefulOnUnavailable: true,
+    allowedTools: ['Read'], forbiddenVendor: 'Anthropic', budget: null })).rejects.toThrow(/quota held/);
+  expect(alternate).not.toHaveBeenCalled();
+  expect(checkProviderHold).toHaveBeenCalledWith('agy-gemini', expect.any(Number), { strict: true });
 });
 
 

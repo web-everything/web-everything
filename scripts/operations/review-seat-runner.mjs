@@ -27,6 +27,7 @@ import { appendShadowRow, buildShadowRow, compareShadowAnswers, isQuotaHeldShado
 import { CARBON_SHADOW_CAP_ENV, resolveCarbonShadowCap, resolveProviderCap } from '../lib/review-seat-caps.mjs';
 import { releaseShadowSession, reserveShadowSession } from '../lib/review-shadow-budget.mjs';
 import { logReviewSeat } from '../lib/review-seat-provider.mjs';
+import * as extraSeats from './review-extra-seats.mjs';
 
 /** The closed set of directive modes this runner accepts. */
 /** The settings default for a Carbon shadow's daily cap (review-seat-settings standard shadowPolicy.dailyCap). */
@@ -43,12 +44,14 @@ export const SEAT_RUN_MODES =Object.freeze(['agy', 'shadow']);
  * @param {Function} [io.agyJuror] - injectable for tests.
  * @param {Function} [io.appendRow] - injectable for tests.
  * @param {Function} [io.log] - stderr logger, injectable for tests.
+ * @param {Function} [io.reserveCalls] - shared counting-seat reservation, injectable for tests.
  * @param {() => number} [io.now]
  */
 export async function runSeatWithProvider(request, {
   claudeJudge, unwrap, wrap, cwd, agyJuror = runAgyReviewJuror, appendRow = appendShadowRow, now = () => Date.now(),
   log = (m) => console.error(m), reserveSession = reserveShadowSession,
   releaseSession = releaseShadowSession,
+  reserveCalls = async options => extraSeats.createExtraSeatsIo().reserveCalls(options),
 }) {
   const { seatProvider: directive, ...plain } = request;
   if (!directive || !SEAT_RUN_MODES.includes(directive.mode)) {
@@ -71,8 +74,10 @@ export async function runSeatWithProvider(request, {
       }
     }
     // R1062a: Carbon shadow seats sit outside the agy-gemini live cap (their own switch + daily cap apply above/below).
-    if (!carbonShadow && /gemini|carbon/i.test(String(runModel)) && resolveProviderCap('agy-gemini') <= 0) {
-      const reason = 'agy-gemini seat cap 0';
+    const runProvider = /claude/i.test(String(runModel)) ? 'agy-claude' : /gemini|carbon/i.test(String(runModel)) ? 'agy-gemini' : null;
+    const providerCap = runProvider ? resolveProviderCap(runProvider) : null;
+    if (!carbonShadow && providerCap !== null && providerCap <= 0) {
+      const reason = `${runProvider} seat cap 0`;
       logReviewSeat(log, `review-seat: agy ${directive.mode} skipped: ${reason}`);
       return { status: 'skipped', reasons: [reason] };
     }
@@ -91,6 +96,17 @@ export async function runSeatWithProvider(request, {
       if (!admission.allowed) {
         logReviewSeat(log, `review-seat: agy shadow skipped: ${admission.reason}`);
         return { status: 'skipped', reasons: [admission.reason] };
+      }
+    }
+    if (directive.mode === 'agy') {
+      try {
+        if (!runProvider) throw new Error('unknown model provider');
+        const reservation = await reserveCalls({ provider: runProvider, want: 1, dailyCap: providerCap, now: now() });
+        if (reservation?.callIds?.length !== 1) throw new Error(`${runProvider} daily cap reached`);
+      } catch (error) {
+        const reason = `daily seat budget unavailable: ${scrubPaths(error?.message ?? error, [cwd])}`;
+        logReviewSeat(log, `review-seat: agy skipped: ${reason}`);
+        return { status: 'skipped', reasons: [reason] };
       }
     }
     try {

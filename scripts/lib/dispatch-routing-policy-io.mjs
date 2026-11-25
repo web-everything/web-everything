@@ -21,7 +21,7 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
   let operatorKeys = Object.keys(good.operations);
   const signature = value => JSON.stringify(value, (_, v) => v && typeof v === 'object' && !Array.isArray(v)
     ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => a.localeCompare(b))) : v);
-  const reader = () => {
+  const reader = ({ strict = false } = {}) => {
     try {
       const text = read(path, 'utf8');
       const { prefs, errors } = preferences();
@@ -52,6 +52,7 @@ export function createRoutingPolicyReader({ path = ROUTING_POLICY_PATH, read = r
       const errorSignature = `error:${error.message}`;
       if (lastError !== errorSignature) log(`routing-policy-invalid: keeping last good policy: ${error.message}`);
       lastError = errorSignature;
+      if (strict) throw new Error(`routing policy unavailable; orchestrator must repair the live policy: ${error.message}`);
     }
     return good;
   };

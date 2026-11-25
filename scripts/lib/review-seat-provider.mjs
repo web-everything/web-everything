@@ -38,6 +38,14 @@ export const SEAT_PROVIDER_LENSES = Object.freeze(['correctness', 'security']);
 export const REVIEW_SEAT_OPERATION = 'review-seat';
 export const mandatorySeatTask = (lens) => `mandatory:${lens}`;
 export const AGY_ADVISORY_SEAT_TASK = 'advisory:agy-correctness';
+const timeoutSeatTask = lens => SEAT_PROVIDER_LENSES.includes(lens) ? mandatorySeatTask(lens)
+  : lens === 'agy-correctness' ? AGY_ADVISORY_SEAT_TASK : lens;
+
+export function assertJurorTimeoutAuthorVendor(forbiddenVendor) {
+  if (!['Anthropic', 'Google', 'OpenAI'].includes(forbiddenVendor)) {
+    throw new Error('juror-timeout: author vendor unknown; orchestrator must establish author vendor before replacement');
+  }
+}
 
 /** The agy providers the routing policy knows. */
 export const AGY_PROVIDERS = Object.freeze(['agy-claude', 'agy-gemini']);
@@ -201,7 +209,7 @@ export function assertCrossVendorPanel(models, builder) {
 export function selectJurorTimeoutRoute({ lens, routes, exclusions, forbiddenVendor = null }) {
   validateJurorTimeoutExclusions(exclusions);
   const excluded = new Set(exclusions.filter(row => row.lens === lens).map(row => row.provider));
-  const allowed = rosterForKey(`review-seat:${SEAT_PROVIDER_LENSES.includes(lens) ? mandatorySeatTask(lens) : lens}`);
+  const allowed = rosterForKey(`review-seat:${timeoutSeatTask(lens)}`);
   const selected = Array.isArray(routes) && routes.find(route => allowed.includes(route?.provider) && route.mode !== 'shadow'
     && (!route.provider.startsWith('agy-') || carbonNonShadowAllowed(route.model))
     && typeof route.model === 'string' && route.model.length > 0 && !excluded.has(route.provider)
@@ -218,8 +226,8 @@ export function selectJurorTimeoutRoute({ lens, routes, exclusions, forbiddenVen
 
 /** Resolve with the same policy, overlay, disabled-provider and capability filters as normal seats. */
 export function jurorTimeoutRoutes(lens) {
-  const policy = readRoutingPolicy();
-  const task = SEAT_PROVIDER_LENSES.includes(lens) ? mandatorySeatTask(lens) : lens;
+  const policy = readRoutingPolicy({ strict: true });
+  const task = timeoutSeatTask(lens);
   const available = rosterForKey(`review-seat:${task}`);
   const route = resolveOperationRoute({ operation: REVIEW_SEAT_OPERATION, taskType: task, available, policy,
     aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator, operatorKeys: readRoutingPolicy.operatorKeys() });
@@ -227,9 +235,12 @@ export function jurorTimeoutRoutes(lens) {
   return route ? [route, ...(route.fallback ?? [])] : [];
 }
 
-export function jurorTimeoutRouteAvailable({ exclusions }) {
+export function jurorTimeoutRouteAvailable({ exclusions, forbiddenVendor }) {
+  // The daemon has no author-vendor evidence today. Keep the head on its infrastructure hold rather
+  // than launching a retry that the request-level guard must refuse. Old dispatch state holds too.
+  assertJurorTimeoutAuthorVendor(forbiddenVendor);
   for (const lens of new Set(exclusions.map(row => row.lens))) {
-    selectJurorTimeoutRoute({ lens, routes: jurorTimeoutRoutes(lens), exclusions });
+    selectJurorTimeoutRoute({ lens, routes: jurorTimeoutRoutes(lens), exclusions, forbiddenVendor });
   }
   return true;
 }

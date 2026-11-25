@@ -250,6 +250,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // Counting review seats reserve their daily budget through the review-extra-seats lock holder.
+  'scripts/operations/review-seat-runner.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',

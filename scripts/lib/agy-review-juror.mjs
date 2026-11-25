@@ -502,7 +502,8 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
     try {
       outcome = await spawnJudge({
         mandate: request.mandate, input: request.input, shape: request.shape,
-        model, cwd: jurorLane, toolPolicy: 'read-cwd', role: 'review-seat',
+        model, effort: request.effort, budget: request.budget,
+        cwd: jurorLane, toolPolicy: 'read-cwd', role: 'review-seat',
       });
     } catch (e) {
       spawnError = e;
