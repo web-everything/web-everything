@@ -2,7 +2,7 @@ import { createHotpatchReaders, smokeHotpatchReaders } from '../hotpatch-readers
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
 import { receiptGuard, auditGuard, ciDefinitionGuard, resolveHotpatchKnobs, admitHotpatch } from '../hotpatch-guards.mjs';
-import { hotpatchFixture, HP_SHA as SHA } from './fixtures/hotpatch.mjs';
+import { hotpatchFixture, ciControlFiles, HP_SHA as SHA } from './fixtures/hotpatch.mjs';
 import { resolvePriorQuestionHashes } from '../../operations/codex-audit.mjs';
 import { decideCiSkip, addEntries, setFixPrs } from '../red-main-quarantine.mjs';
 import { urgentMarker, urgentSignature, urgentFuiRepo, urgentLedger, urgentKeyPath } from '../../operations/urgent-verify-marker.mjs';
@@ -27,8 +27,28 @@ function signedUrgentEvidence() {
   return { marker, ledger, key };
 }
 describe('hotpatch admission', () => {
+  it('refuses the local import closure of CI commands, npm tests and tool configs (RS-HP-2 wiring condition)', async () => {
+    const controls = ciControlFiles();
+    for (const path of ['scripts/lib/write-all-sync.mjs', 'scripts/lib/test-result-cache.mjs',
+      'scripts/lib/trust-chain-tier.mjs', 'scripts/test-cache/trace-setup.mjs',
+      'scripts/readiness/forge-exec-siblings.mjs', 'eleventy/filters.cjs', '.nvmrc', '.eleventy.js']) {
+      expect(controls.has(path), `CI graph must include ${path}`).toBe(true);
+    }
+    const admitted = [];
+    for (const path of controls) {
+      const { data, readers } = hotpatchFixture(); data.paths = [path];
+      const decision = await ciDefinitionGuard(SHA, readers);
+      if (decision.outcome !== 'fail' || decision.detail !== 'hotpatch-ci-definition-change') admitted.push(path);
+    }
+    expect(admitted).toEqual([]);
+  });
   it('admits complete bound green CI and an own-sha canonical audit', async () => {
     expect(await admitHotpatch(SHA, hotpatchFixture().readers)).toMatchObject({ outcome: 'pass' });
+  });
+  it('keeps application and documentation changes eligible for hotpatch admission', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.paths = ['blocks/example.ts', 'src/css/site.css', 'docs/guide.md'];
+    expect(await admitHotpatch(SHA, readers)).toMatchObject({ outcome: 'pass', detail: 'hotpatch-admitted' });
   });
   it('a success test check from another app or an unbound workflow is not a receipt', async () => {
     for (const mutate of [d => { d.checks.check_runs[0].app.id = 1; }, d => { d.workflows.workflow_runs[0].path = '.github/workflows/other.yml'; }, d => { d.workflows.workflow_runs[0].head_sha = 'b'.repeat(40); }]) {
@@ -103,16 +123,17 @@ describe('hotpatch admission', () => {
       expect((await receiptGuard(SHA, readers)).outcome).not.toBe('pass');
     },
   );
-  it('a shard bound to another workflow cannot fill a missing CI shard', async () => {
-    const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].check_suite = { id: 99 };
-    data.workflows.workflow_runs.push({ check_suite_id: 99, head_sha: SHA, path: '.github/workflows/review.yml', event: 'workflow_dispatch' });
+  it('shards from another complete bound CI suite cannot fill gaps', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.checks.check_runs.push(...data.checks.check_runs.map(check => ({ ...check, id: check.id + 100, check_suite: { id: 99 } })));
+    data.checks.check_runs.splice(1, 1);
+    data.checks.total_count = data.checks.check_runs.length;
+    data.workflows.workflow_runs.push({ ...data.workflows.workflow_runs[0], check_suite_id: 99 });
     data.workflows.total_count++;
     expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait', detail: 'hotpatch-needs-ci-receipt' });
   });
-  it('an unbound Actions shard stays unknown even alongside a complete green receipt', async () => {
-    const { data, readers } = hotpatchFixture();
-    data.checks.check_runs.push({ ...data.checks.check_runs[1], id: 50, check_suite: { id: 99 } });
-    data.checks.total_count++;
+  it('a shard without a workflow binding remains unknown', async () => {
+    const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].check_suite = { id: 99 };
     expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'unknown', detail: 'hotpatch-evidence-unreadable' });
   });
   it('oversized evidence is unknown with an operator fallback', async () => {
@@ -189,6 +210,47 @@ describe('hotpatch production readers', () => {
     const readers = createHotpatchReaders({ cwd: '/repo', env: { HOME: '/home/test', GIT_DIR: '/evil' }, files, exec });
     return { ...fixture, readers, files, exec, calls, jobs, logs, evidence };
   }
+  it('reused readers refresh main before admitting the same sha again', async () => {
+    const f = production(), original = f.exec.getMockImplementation();
+    let remoteDiff = '', fetchedDiff = '';
+    f.exec.mockImplementation((command, args, options) => {
+      if (command === 'git' && args[0] === 'fetch') fetchedDiff = remoteDiff;
+      if (command === 'git' && args[0] === 'diff') return fetchedDiff;
+      return original(command, args, options);
+    });
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
+    remoteDiff = '.github/workflows/ci.yml\0';
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'fail', detail: 'hotpatch-ci-definition-change' });
+  });
+  it('reused readers refuse a failed main refresh and recover only after a successful refresh', async () => {
+    const f = production(), original = f.exec.getMockImplementation();
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
+    f.exec.mockImplementation((command, args, options) => {
+      if (command === 'git' && args[0] === 'fetch') throw new Error('main unavailable');
+      return original(command, args, options);
+    });
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'unknown' });
+    f.exec.mockImplementation(original);
+    expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
+  });
+  it.each(['ciPlan', 'paths', 'fullSuite', 'covers'])('standalone %s refreshes main on every read', name => {
+    const f = production();
+    const args = name === 'fullSuite' ? [SHA, f.data.workflows]
+      : name === 'covers' ? [f.data.audits[0].base, SHA] : [SHA];
+    f.readers[name](...args);
+    f.readers[name](...args);
+    expect(f.calls.filter(c => c.command === 'git' && c.args[0] === 'fetch')).toHaveLength(2);
+  });
+  it.each(['scripts/conveyor/soak/shard-plan.mjs', 'scripts/conveyor/soak/shard-plan.settings.json',
+    'scripts/conveyor/soak/new-selector.mjs', 'scripts/check-standards-rules.mjs',
+    'scripts/check-standards-rules/selection.mjs', '.npmrc', 'tsconfig.json', 'tsconfig.test.json',
+    'scripts/test-cache/trace-setup.mjs', 'scripts/lib/test-result-cache.mjs',
+    'scripts/lib/trust-chain-tier.mjs', 'scripts/lib/write-all-sync.mjs', '.nvmrc', '.eleventy.js'])(
+    'production admission refuses CI execution control %s', async path => {
+      const f = production(); f.evidence.diff = `${path}\0`;
+      expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'fail', detail: 'hotpatch-ci-definition-change' });
+    },
+  );
   it('reads origin/main shard definitions and re-reads API evidence on each admission without loading or rebuilding', async () => {
     const f = production();
     expect(await admitHotpatch(SHA, f.readers)).toMatchObject({ outcome: 'pass' });
@@ -198,7 +260,7 @@ describe('hotpatch production readers', () => {
       ['api', '--allow-escape-sequences', `repos/org/repo/actions/jobs/${id}/logs`, '--hostname', 'github.com']));
     expect(logs.every(c => c.options.timeout === 30000 && c.options.maxBuffer === 2 * 1024 * 1024)).toBe(true);
     expect(f.calls.filter(c => c.command === 'git' && c.args[0] === 'fetch').map(c => c.args))
-      .toEqual([['fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main', SHA]]);
+      .toEqual(Array.from({ length: 4 }, () => ['fetch', '--no-tags', 'origin', '+refs/heads/main:refs/remotes/origin/main', SHA]));
     expect(f.calls.filter(c => c.command === 'git' && c.args[0] === 'show').every(c =>
       JSON.stringify(c.args) === JSON.stringify(['show', 'refs/remotes/origin/main:.github/workflows/ci.yml']))).toBe(true);
     expect(f.calls.findIndex(c => c.args[0] === 'fetch')).toBeLessThan(f.calls.findIndex(c => c.args[0] === 'diff'));
