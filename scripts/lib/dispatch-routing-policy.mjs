@@ -240,7 +240,25 @@ export const DEFAULT_ROUTING_POLICY = validateRoutingPolicy(defaults);
  */
 export function checkClaudeLaunchRoute(route) {
   if (!route || typeof route !== 'object' || typeof route.provider !== 'string' || !route.provider) return { ok: false, reason: 'route-mismatch: no resolved route' };
+  if (!Object.hasOwn(CATALOG, route.provider)) return { ok: false, reason: `route-mismatch: unknown provider ${JSON.stringify(route.provider)}` };
   if (route.provider === 'claude') return { ok: true };
   if (route.fallbackProvider === 'claude' && typeof route.reason === 'string' && route.reason.trim()) return { ok: true };
   return { ok: false, reason: `route-mismatch: resolved route is ${route.provider}, refusing a claude launch` };
+}
+
+/**
+ * PURE — the route a Claude launch is checked against, derived from the dispatcher's own evidence. A policy route
+ * that is not Claude but lists Claude in its fallback chain yields the documented fallback (with a recorded reason);
+ * with no policy route, only an explicit `executor: 'claude'` stands for Claude. Anything else returns a route the
+ * guard refuses (or `null`).
+ */
+export function claudeLaunchRouteFor({ policyRoute = null, executor = null, reason = '' } = {}) {
+  if (policyRoute && typeof policyRoute === 'object') {
+    if (policyRoute.provider === 'claude') return { provider: 'claude', reason: reason || 'policy route claude' };
+    if (Array.isArray(policyRoute.fallback) && policyRoute.fallback.some(r => r?.provider === 'claude')) {
+      return { provider: policyRoute.provider, fallbackProvider: 'claude', reason: `routing-policy fallback to claude from ${policyRoute.provider}` };
+    }
+    return { provider: policyRoute.provider };
+  }
+  return executor === 'claude' ? { provider: 'claude', reason: reason || 'executor claude' } : null;
 }

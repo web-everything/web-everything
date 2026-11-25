@@ -525,3 +525,15 @@ describe('checkClaudeLaunchRoute (DIRECT-EXEC-GUARD)', () => {
     }
   });
 });
+
+describe('claudeLaunchRouteFor + unknown provider (DIRECT-EXEC-GUARD)', () => {
+  it('derives from policy evidence and refuses unknown providers', async () => {
+    const { claudeLaunchRouteFor, checkClaudeLaunchRoute } = await import('../dispatch-routing-policy.mjs');
+    expect(checkClaudeLaunchRoute({ provider: 'bogus', fallbackProvider: 'claude', reason: 'x' }).ok).toBe(false);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallback: [{ provider: 'claude' }] } })).ok).toBe(true);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'codex', fallback: [] } })).ok).toBe(false);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ policyRoute: { provider: 'claude' } })).ok).toBe(true);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({})).ok).toBe(false);
+    expect(checkClaudeLaunchRoute(claudeLaunchRouteFor({ executor: 'claude' })).ok).toBe(true);
+  });
+});

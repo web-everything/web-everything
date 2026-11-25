@@ -124,6 +124,7 @@ import { isRealHead } from '../lib/red-team-skip-outcome.mjs';
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { claudeLaunchRouteFor } from '../lib/dispatch-routing-policy.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
@@ -711,8 +712,9 @@ export function dispatchReview({
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
-      route: { provider: 'claude', reason: 'review-dispatch: claude review launch' },
+      route: claudeLaunchRouteFor({ executor: 'claude', reason: 'review-dispatch: claude review launch' }),
     });
+    if (launched.refused) throw new Error(launched.refused);
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
       unknownTokens, judgeProvider, wrapped: true,

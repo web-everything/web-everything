@@ -8,7 +8,7 @@ import { conflictHelperAllowRules, rearmReviewAllowRules } from '../lib/conflict
 import { composeOperatorTaskBrief, planOperatorPostBuild } from './operator-task-brief.mjs';
 import { observeHealAttempt } from './probation-heal-run.mjs';
 import { dispatchProviderAvailable } from '../lib/dispatch-provider-availability.mjs';
-import { claudeSpawnAlias, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
+import { claudeSpawnAlias, claudeLaunchRouteFor, resolvePolicyEffort } from '../lib/dispatch-routing-policy.mjs';
 import { resolvePolicyModel, resolveOperationEffort, resolveOperationRoute, readRoutingPolicy, resolveDispatchRoute as decideDispatchRoute } from '../lib/dispatch-routing-policy-io.mjs';
 import { meteredAlreadyDone, alreadyDoneRequest } from '../lib/gh-metered-reads.mjs';
 import { readGitAlreadyDone } from '../lib/git-already-done.mjs';
@@ -2021,8 +2021,9 @@ export function defaultClaudeProvider(request, {
     const launched = launchWrapped({
       role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(request.spawnEnv ?? process.env), pr: request.pr ?? null,
       item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
-      route: request.route ?? { provider: 'claude', reason: 'dispatch-lane-io: claude launcher, no resolved route on request' },
+      route: request.route ?? claudeLaunchRouteFor({ policyRoute: request.policyRoute, executor: request.table?.model || request.operatorPostBuild ? 'claude' : null, reason: request.table?.reason }),
     });
+    if (launched.refused) throw new Error(launched.refused);
     request.reportWrapped?.(launched.wrapperPid);
     // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
     return launched.handle || request.sessionId;

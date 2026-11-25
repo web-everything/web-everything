@@ -1,5 +1,5 @@
 /** @file direct-exec-tripwire.test.mjs — every dispatch site passes its resolved route to the wrapped Claude launcher. */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
@@ -27,9 +27,27 @@ describe('direct-exec tripwire', () => {
     it(`${site} passes a route to every launchWrapped call`, () => {
       const bodies = callBodies(readFileSync(join(ROOT, site), 'utf8'));
       expect(bodies.length).toBeGreaterThan(0);
-      for (const body of bodies) expect(body, `${site} launchWrapped call lacks route`).toMatch(/\broute\s*[:,]/);
+      for (const body of bodies) {
+        expect(body, `${site} launchWrapped call lacks a derived route`).toMatch(/\n\s*route:\s*(claudeLaunchRouteFor\(|request\.route \?\? claudeLaunchRouteFor\()/);
+      }
     });
   }
+  it('no other module calls launchWrappedClaudeWorker or defines a launchWrapped call', () => {
+    const scripts = join(ROOT, 'scripts');
+    const found = [];
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.name === 'node_modules' || e.name === '__tests__') continue;
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.mjs$/.test(e.name) && /launchWrapped\(\{|launchWrappedClaudeWorker\(/.test(readFileSync(p, 'utf8'))) found.push(p.slice(ROOT.length + 1));
+      }
+    };
+    walk(scripts);
+    // dispatch-smoke-launch spreads the dispatcher's own request (which carries the derived route) into the launcher.
+    const known = new Set([...SITES, 'scripts/operations/worker-wrapper-launch.mjs', 'scripts/lib/dispatch-smoke-launch.mjs']);
+    expect(found.filter(f => !known.has(f))).toEqual([]);
+  });
   it('the scanner flags a call without a route', () => {
     expect(callBodies('launchWrapped({ role: 1 })')[0]).not.toMatch(/\broute\s*[:,]/);
   });
