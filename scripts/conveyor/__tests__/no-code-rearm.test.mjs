@@ -258,6 +258,62 @@ describe('review recovery regressions', () => {
     expect(output.join('')).toContain(`no-code re-arm refused: ${label} stands`);
     expect(writes).toEqual([]);
   });
+  const writerReplay = ({ flags, labels, readLabels, comments = base }) => {
+    const writes = [];
+    const output = [];
+    const exit = process.exit;
+    let code = null;
+    process.exit = c => { code = c; throw Object.assign(new Error('exit'), { exitCode: c }); };
+    try {
+      runReviewLabelCli({ fixedTo: 'rearm',
+        argv: ['7448', '--repo=o/r', `--expect-head=${HEAD}`, ...flags, '--actor=conveyor'],
+        defaultActor: 'conveyor', usage: 'test', buildComment: () => 'rearm',
+        successResult: o => ({ ok: true, pr: o.pr, labels: o.labels }), refusalResult: ({ decision }) => ({ reason: decision.reason }),
+        emit: line => output.push(line), appendLedgerVerdict: () => ({ ok: true }),
+        provider: {
+          readPostingIdentity: () => ({ login: 'web-everything', type: 'User' }),
+          readPrState: () => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, comments, labels }),
+          readComments: () => comments, readPrReviews: () => [], readLabels,
+          setLabels: () => writes.push('labels'), postComment: () => writes.push('comment'),
+        },
+      });
+    } catch (e) { if (e.message !== 'exit') throw e; } finally { process.exit = exit; }
+    return { writes, out: output.join(''), code };
+  };
+  it.each(['red-team:blocked', 'red-team:pending'])('a plain pinned rearm (no --no-code-rearm) never clears %s under a live no-code ruling', label => {
+    const r = writerReplay({ flags: [], labels: [{ name: 'review:changes' }, { name: label }], readLabels: () => [] });
+    expect(r.writes).toEqual([]);
+    expect(r.out).toContain('refused');
+    expect(r.out).toContain(label);
+  });
+  it('a failed post-write label read reports unobserved labels, never a synthetic success set', () => {
+    const r = writerReplay({ flags: ['--no-code-rearm'], labels: [{ name: 'review:changes' }],
+      readLabels: () => { throw new Error('gh down'); } });
+    const parsed = JSON.parse(r.out.trim().split('\n').pop());
+    expect(parsed.labels).toBeNull();
+    expect(parsed.labelsUnobserved).toBe(true);
+  });
+  it('the no-code executor does not record state=confirm when the writer could not observe the labels', () => {
+    const posted = [];
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200',
+      postComment: ({ comment }) => posted.push(comment),
+      run: () => ({ status: 0, stdout: JSON.stringify({ ok: true, labels: null, labelsUnobserved: true }) }) })).toThrow(/unobserved/i);
+    expect(posted.some(c => c.includes('state=confirm'))).toBe(false);
+    expect(posted.some(c => c.includes('attempt=failed') || c.includes('attempt state=failed') || c.includes('=failed'))).toBe(true);
+  });
+  it('deferred rearms resume from the saved cursor, so an earlier failing PR cannot starve later work', () => {
+    const dispatch = [7448, 7449, 7450].map(prNumber => ({ kind: 'rearm-no-code', prNumber, expectHead: HEAD, answerId: 'IC_200' }));
+    const attempted = [];
+    let cursor;
+    for (let pass = 0; pass < 2; pass++) {
+      let ticks = 0;
+      const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+        reconcile: () => ({ dispatch }), cursor, deadlineAt: 10, now: () => ticks > 0 ? 11 : 0,
+        rearm: ({ prNumber }) => { attempted.push(prNumber); ticks++; throw new Error('still failing'); } });
+      cursor = r.nextCursor;
+    }
+    expect(attempted).toEqual([7448, 7449]);
+  });
   it.each([
     JSON.stringify({ ok: false, reason: 'live head differs from --expect-head' }),
     JSON.stringify({ error: 'live head differs from --expect-head' }),

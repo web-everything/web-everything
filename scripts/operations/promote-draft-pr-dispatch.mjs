@@ -221,6 +221,11 @@ export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, r
       }).find(value => typeof value === 'string' && value.trim());
       throw new Error(String(reason || result?.error?.message || stdout || result?.stderr || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
     }
+    const lastJson = String(result.stdout ?? '').trim().split('\n').reverse().map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).find(value => value && typeof value === 'object');
+    // The writer could not read the labels back: the handoff is unobserved, so it is never recorded as confirmed.
+    if (lastJson?.labelsUnobserved === true) throw new Error('no-code rearm labels unobserved after the write — a person must check labels');
     post('confirm');
     return String(result.stdout ?? '');
   } catch (error) {
@@ -374,6 +379,13 @@ export function runReconcilePromoteDraftDispatch({
     if (start > 0) entries = [...entries.slice(start), ...entries.slice(0, start)];
   }
   let handled = 0;
+  // Every later phase resumes from the saved cursor too, so a recurring failure at the head of a list cannot starve the rest.
+  const resumeFromCursor = rows => {
+    if (deadlineAt == null && cursor == null) return rows;
+    const sorted = [...rows].sort((a, b) => a.prNumber - b.prNumber);
+    const start = sorted.findIndex(row => row.prNumber >= cursor);
+    return start > 0 ? [...sorted.slice(start), ...sorted.slice(0, start)] : sorted;
+  };
   // Each bounded phase makes at least one unit of progress when planning consumed its budget.
   const deadlineReachedAfterProgress = completed => deadlineAt != null && now() > deadlineAt && completed > 0;
   let deferred = [];
@@ -496,7 +508,7 @@ export function runReconcilePromoteDraftDispatch({
     }
   }
   // ── restore-review-label half: green, open, label-less lane PRs get `review:pending` (see reconcile-core).
-  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label')) {
+  for (const entry of resumeFromCursor((reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label'))) {
     if (deadlineReachedAfterProgress(handled)) { deferred.push(entry.prNumber); continue; }
     handled += 1;
     let labels;
@@ -526,7 +538,7 @@ export function runReconcilePromoteDraftDispatch({
     }
   }
   // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.
-  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'close-superseded')) {
+  for (const entry of resumeFromCursor((reconciled.dispatch ?? []).filter((e) => e.kind === 'close-superseded'))) {
     if (deadlineReachedAfterProgress(handled)) { deferred.push(entry.prNumber); continue; }
     handled += 1;
     let onMain;
@@ -547,7 +559,7 @@ export function runReconcilePromoteDraftDispatch({
   }
   // ── rearm-no-code half (STANDDOWN-EMPTY-ROUND D2): the orchestrator's no-code ruling, executed once, never a fixer.
   // ONE attempt per tick, no retry: either rearm-review marker (re-armed, or the empty-round note) spends the ruling.
-  const rearms = (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code');
+  const rearms = resumeFromCursor((reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code'));
   for (const [index, entry] of rearms.entries()) {
     yieldedForAdoption ||= safeAdoptYield(shouldYield);
     if (yieldedForAdoption || deadlineReachedAfterProgress(handled)) {

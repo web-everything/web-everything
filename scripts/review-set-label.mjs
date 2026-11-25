@@ -101,6 +101,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from './lib/marker-authorship.mjs';
+import { isNoCodeRearmAnswer, latestOperatorAnswer, noCodeRearmState } from './conveyor/stand-down-answer-core.mjs';
 import { GATE_OUTCOMES, readRedTeamDisposition } from './lib/red-team-gate.mjs';
 import { REARM_COMMENT_MARKER } from './conveyor/rearm-review.mjs';
 import { sleepSyncMs } from './readiness/drain-lock.mjs';
@@ -2103,6 +2104,16 @@ export function runReviewLabelCli({
     if (noCodeRearm) {
       const security = noCodeRearmSecurityRefusal(fresh.labels);
       if (security) return refuse(security);
+    } else if (Array.isArray(fresh.labels) && Array.isArray(fresh.comments)) {
+      // A live no-code ruling is executed only through the explicit --no-code-rearm opt-in (which keeps red-team
+      // holds). Omitting the flag must never strip a standing red-team label under that ruling.
+      const names = fresh.labels.map(l => typeof l === 'string' ? l : l?.name);
+      const hold = names.find(l => l === 'red-team:blocked' || l === 'red-team:pending');
+      const thread = fresh.comments.map(c => (c && typeof c === 'object'
+        ? { ...c, ...((c.author ?? c.user) ? { author: c.author ?? c.user } : {}), ...((c.node_id ?? c.id) != null ? { id: String(c.node_id ?? c.id) } : {}) } : c));
+      if (hold && isNoCodeRearmAnswer(latestOperatorAnswer(thread)) && noCodeRearmState(thread, fresh.headRefOid).applicable) {
+        return refuse(`re-arm refused: ${hold} stands under a live no-code ruling; only --no-code-rearm may hand it off`);
+      }
     }
     if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuse('head unreadable — cannot prove no human clearance');
@@ -2507,13 +2518,13 @@ export function runReviewLabelCli({
   } else try {
     newLabels = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean);
   } catch {
-    const names = (Array.isArray(currentLabels) ? currentLabels : [])
-      .map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean)
-      .filter((n) => !removals.includes(n));
-    newLabels = [...new Set([...names, decision.addLabel])];
+    // The write happened but its result could not be read back: report the labels as UNKNOWN, never a locally
+    // derived "success" set (a caller must not record an unobserved handoff as confirmed).
+    newLabels = null;
   }
 
   emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision, labels: newLabels }),
+    ...(newLabels === null ? { labels: null, labelsUnobserved: true } : {}),
     ...(gateRefresh ? { gateRefresh } : {}) })}\n`);
   process.exit(0);
 }
