@@ -215,11 +215,11 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     Object.defineProperty(process, 'platform', platformDescriptor);
   });
 
-  function admission({ pressure = '1', env = {}, load = () => [1], readSnap, now, ...probeOptions } = {}) {
+  function admission({ pressure = '1', env = {}, load = () => [1], readSnap, now, readWindow = () => ({ swapGrowthMb: null }), ...probeOptions } = {}) {
     const probe = probes({ pressure, ...probeOptions });
     native.exec.mockImplementation(probe.exec);
     // Deliberately omit memory and memoryReading to exercise the default reader.
-    return hostLoad.hostLoadAdmission({ policy, interactive: false, env, load, cores: () => 8, readSnap, now });
+    return hostLoad.hostLoadAdmission({ policy, interactive: false, env, load, cores: () => 8, readSnap, now, readWindow });
   }
 
   it('normal above floor admits', () => {
@@ -249,7 +249,23 @@ describe('hostLoadAdmission with the default memoryReading', () => {
   });
 
   const T = Date.parse('2026-11-25T12:00:10Z');
-  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z', memory: { metric: 'available', ...memory }, ...over });
+  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z', memory: { metric: 'available', availableMb: 30000, ...memory }, ...over });
+  it('warn holds when snapshot availableMb is below the floor', () => {
+    const r = admission({ pressure: '2', readSnap: () => snap({ freePct: 27, swapGrowthMb: 0, availableMb: 128 }), now: () => T });
+    expect(r.admitted).toBe(false);
+    expect(r.reason).toContain('< floor');
+  });
+  it('warn never counts free swap toward headroom', () => {
+    const swap = 'vm.swapusage: total = 8192.00M  used = 4096.00M  free = 4096.00M';
+    const r = admission({ pressure: '2', vm: lowVmStat, swap, readSnap: () => snap({ freePct: 27, swapGrowthMb: 0 }), now: () => T });
+    expect(r.admitted).toBe(false);
+    expect(r.reason).toContain('headroom 1208MB');
+  });
+  it('warn uses the four-sample window swap growth, not one interval', () => {
+    const r = admission({ pressure: '2', readSnap: () => snap({ freePct: 27, swapGrowthMb: 200 }), readWindow: () => ({ swapGrowthMb: 600 }), now: () => T });
+    expect(r.admitted).toBe(false);
+    expect(r.reason).toContain('corroborated');
+  });
   it.each([
     ['missing swap growth', { freePct: 27 }],
     ['string swap growth', { freePct: 27, swapGrowthMb: '0' }],

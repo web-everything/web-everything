@@ -18,7 +18,7 @@ import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMOR
 import { decideMemoryPressure } from './memory-warn-corroboration.mjs';
 import { readSnapshot } from './resource-admission.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
-import { loadMemoryPressureSettings } from '../readiness/heavy-admission.mjs';
+import { loadMemoryPressureSettings, readLatestLoad } from '../readiness/heavy-admission.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
@@ -120,7 +120,8 @@ function readMemoryReading({ env = process.env, platform = process.platform, exe
       return { mb: pagesMb, source: 'vm_stat' };
     }
     const reclaim = level === 'normal' || level === 'warn';
-    const mb = reclaim ? parseDarwinReclaimableMemoryMb(vm, swap) : parseDarwinMemoryHeadroomMb(vm, swap);
+    // Under warn, free swap never counts toward headroom: swap is exactly what a pressured host is already spending.
+    const mb = reclaim ? parseDarwinReclaimableMemoryMb(vm, level === 'warn' ? 'free = 0M' : swap) : parseDarwinMemoryHeadroomMb(vm, swap);
     if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
     if (reclaim) return { mb, source: 'memory-pressure', level };
     return { mb, source: 'vm_stat+swap' };
@@ -135,6 +136,7 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
   capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
   readSnap = ({ env: e = env } = {}) => { try { return readSnapshot({ root: resolveCoordinationRoot({ env: e }) }); } catch { return null; } }, now = Date.now,
+  readWindow = () => readLatestLoad(),
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
@@ -175,7 +177,15 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
         && m.metric === (cap.memoryMetric ?? 'available')
         && typeof m.freePct === 'number' && typeof m.swapGrowthMb === 'number' && Number.isFinite(m.swapGrowthMb);
       if (!fresh) return { admitted: false, reason: 'host memory pressure warn; resource snapshot stale, unreadable or wrong metric (fail closed); source=memory-pressure' };
-      const d = decideMemoryPressure({ pressureLevel: 2, freePct: m.freePct, swapGrowthMb: m.swapGrowthMb, ...loadMemoryPressureSettings({ env }) });
+      const floorMb = cap.memAvailableFloorMb ?? 2048;
+      if (!(typeof m.availableMb === 'number' && m.availableMb >= floorMb)) {
+        return { admitted: false, reason: `host memory pressure warn; snapshot available ${m.availableMb ?? '?'}MB < floor ${floorMb}MB (swap not counted); source=memory-pressure` };
+      }
+      // Same four-sample window total the shared load-admission gate uses, not one sampler interval.
+      let windowGrowth = null;
+      try { windowGrowth = readWindow({ env })?.swapGrowthMb ?? null; } catch { windowGrowth = null; }
+      const swapGrowthMb = Number.isFinite(windowGrowth) ? Math.max(m.swapGrowthMb, windowGrowth) : m.swapGrowthMb;
+      const d = decideMemoryPressure({ pressureLevel: 2, freePct: m.freePct, swapGrowthMb, ...loadMemoryPressureSettings({ env }) });
       if (d.held) return { admitted: false, reason: `host memory pressure warn corroborated: ${d.reason}; source=memory-pressure` };
       corroboration = `; pressure warn uncorroborated (free ${d.freePct}%, swap growth ${d.swapGrowthMb}MB)`;
     }
