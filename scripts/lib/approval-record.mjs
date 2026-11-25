@@ -9,16 +9,19 @@
  */
 import { runGhSync } from './gh-throttle.mjs';
 import { redTeamWriterEnv, requireRedTeamAppWriter, resolveWeAppId } from './red-team-check-run.mjs';
+import { createHash } from 'node:crypto';
 
 export const APPROVAL_CHECK_NAME = 'operator-approval';
 /** The trust root, pinned in code under a protected path (REVIEW_AUTH_FLOOR): the WE App id that may author an
  *  approval record, and the operator logins that may ask for one. A setting, env or argument can only NARROW these
  *  (a different value refuses); nothing local can widen or replace them. Changing either is a reviewed code change. */
-export const PINNED_APP_ID = '5037855';
+// Pin the identity's digest, keeping the operational account identifier out of public source (R972).
+export const PINNED_APP_ID_SHA256 = 'bfb67e8f75d0a5504561d1414ba3c7838be675e2794ce3f3e4c3403f896f3b62';
 export const OPERATOR_LOGINS = Object.freeze(['chalbert']);
 const ioOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 4 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] };
 const validHead = head => typeof head === 'string' && /^[a-f0-9]{40}$/i.test(head);
 const validApp = id => /^[1-9]\d*$/.test(String(id ?? '')) && Number.isSafeInteger(Number(id));
+const pinnedApp = id => validApp(id) && createHash('sha256').update(String(id)).digest('hex') === PINNED_APP_ID_SHA256;
 export const validRulingId = id => typeof id === 'string' && /^R\d+(?:\+R\d+)*$/.test(id);
 const failure = reason => ({ ok: false, reason });
 const message = error => String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300);
@@ -54,19 +57,22 @@ export function evaluateApprovalRecord({ headSha, checkRuns, appId } = {}) {
 
 /** Read the record for `headSha` live. `recheckHead()` re-reads the current head right after the read; a move refuses. */
 export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env = process.env, recheckHead, resolveApp = resolveWeAppId } = {}) {
-  // The App id is the pinned constant. A caller argument or the local setting may only narrow it: any value that
+  // The App identity is pinned by its digest. A caller argument or the local setting may only narrow it: any value that
   // differs refuses. An unreadable setting leaves the pin in force (it can never disable or widen the trust root).
-  const id = PINNED_APP_ID;
-  if (appId !== undefined && String(appId) !== id) return failure('approval app id differs from the pinned trust root');
+  if (appId !== undefined && !pinnedApp(appId)) return failure('approval app id differs from the pinned trust root');
   let app = { ok: false };
   try { app = resolveApp({ env: { ...env, WE_APP_ID: undefined } }); } catch { /* the pin stands */ }
-  if (app?.ok === true && String(app.appId) !== id) return failure('approval app setting differs from the pinned trust root');
+  if (app?.ok === true && !pinnedApp(app.appId)) return failure('approval app setting differs from the pinned trust root');
   if (!validHead(headSha)) return failure('approval head missing or not a full 40-hex sha');
   let data;
   try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=${APPROVAL_CHECK_NAME}&filter=all&per_page=100`], { ...ioOptions, throttle: { noMemo: true, bin: 'gh' } })); }
   catch (error) { return failure(`approval record unreadable: ${message(error)}`); }
   if (!Array.isArray(data?.check_runs) || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
     return failure('approval record unreadable or incomplete');
+  // Only a GitHub-reported identity matching the code pin can supply the id used by the evaluator.
+  // This preserves the pin when local settings are unreadable, without embedding the account id here.
+  const id = data.check_runs.find(run => pinnedApp(run?.app?.id))?.app?.id;
+  if (id === undefined) return failure('no approval record from the pinned App on head');
   const fact = evaluateApprovalRecord({ headSha, checkRuns: data.check_runs, appId: id });
   if (fact.ok !== true || typeof recheckHead !== 'function') return fact;
   let now;
