@@ -19,7 +19,7 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     const rows = Array.from({ length: rowCount }, (_, i) => {
       const number = i + 7, headRefOid = number.toString(16).padStart(40, '0');
       return { number, headRefOid, headRefName: `lane/${number}`, title: `Fixture ${number}`, state: 'OPEN',
-        updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', isDraft: false,
+        updatedAt: '2026-11-18T00:00:00Z', baseRefName: number === 7 ? targetBaseRefName : 'main', baseRefOid: `base-oid-${number}`, isDraft: false,
         mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: 'APPROVED',
         labels: number === 7 && targetLabels ? targetLabels : [{ name: 'ready-to-merge' }, { name: 'review:accepted' }], files: [{ path: `src/${number}.mjs` }],
         body: embedManifestInBody('fixture', buildManifest({ item: number, repos: [{ repo: 'we', ref: `lane/${number}` }] })),
@@ -86,7 +86,7 @@ if (a[0] === 'pr' && a[1] === 'list') {
 }
 if (a[0] === 'pr' && a[1] === 'view') {
   const fields = (a[a.indexOf('--json') + 1] || '').split(',');
-  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
+  const realFields = new Set('number,headRefOid,headRefName,title,state,updatedAt,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus,reviewDecision,labels,files,body,statusCheckRollup,commits,comments'.split(','));
   if (fields.some(f => !realFields.has(f))) process.exit(1);
   const p = selected.find(p => p.number === Number(a[2]));
   const view = p ? Object.fromEntries(fields.map(f => [f, f === 'commits' ? [] : p[f]])) : {};

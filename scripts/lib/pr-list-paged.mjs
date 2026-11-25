@@ -387,6 +387,19 @@ export function hydrateHeavyFields({ repo, rows, exec, cache = {}, nowMs = Date.
 }
 
 
+/** The identity a delta heavy read is pinned to: the read response must still describe the listed revision. */
+const IDENTITY_FIELDS = Object.freeze(['headRefOid', 'baseRefOid', 'baseRefName', 'updatedAt']);
+const deltaReadFields = fields => [...fields, ...IDENTITY_FIELDS.filter(key => !fields.includes(key))];
+/** A mismatch means the PR moved during hydration: nothing is cached and the listing is unreadable for this pass
+ *  (the next pass re-reads), so another revision's body/files are never stamped with the listed identity. */
+function assertIdentityPinned({ repo, row, data }) {
+  const moved = IDENTITY_FIELDS.filter(key => data[key] !== row[key]);
+  if (moved.length) {
+    throw new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number,
+      cause: new Error(`PR changed during hydration (${moved.join(', ')} differ from the listed row)`) });
+  }
+}
+
 /** SYNC delta hydration: each row re-reads only the fields whose own validator changed (candidates re-read all).
  *  The cache is written only after a successful read; a failed read throws unreadable. Gate fields never enter it. */
 function hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta }) {
@@ -399,7 +412,8 @@ function hydrateDelta({ repo, rows, exec, cache, nowMs, fields, execOpts, delta 
     if (stale.candidate) stats.candidates++;
     let entry = old;
     if (stale.fields.length) {
-      const data = readHeavy({ repo, row, exec, fields: stale.fields, execOpts });
+      const data = readHeavy({ repo, row, exec, fields: deltaReadFields(stale.fields), execOpts });
+      assertIdentityPinned({ repo, row, data });
       entry = { updatedAt: row.updatedAt, headRefOid: row.headRefOid, fetchedAtMs: nowMs, ...old,
         stamps: { ...old?.stamps }, ...Object.fromEntries(stale.fields.map(field => [field, data[field]])) };
       for (const field of stale.fields) {
@@ -423,7 +437,7 @@ export async function hydrateHeavyFieldsAsync({ repo, rows, execAsync, cache = {
   const pending = d ? rows.filter(row => fieldsOf(row).length) : rows.filter(row => !heavyIsFresh(cache[row.number], row, { nowMs, maxAgeMs }));
   const reads = await mapWithConcurrency(pending, 6, async row => {
     try {
-      const { stdout } = await execAsync('gh', heavyArgs(repo, row, fieldsOf(row)), execOptions(execOpts));
+      const { stdout } = await execAsync('gh', heavyArgs(repo, row, d ? deltaReadFields(fieldsOf(row)) : fieldsOf(row)), execOptions(execOpts));
       return { number: row.number, stdout };
     } catch (cause) {
       return { error: new PrListUnreadableError({ repo, stage: 'hydrate', number: row.number, cause }) };

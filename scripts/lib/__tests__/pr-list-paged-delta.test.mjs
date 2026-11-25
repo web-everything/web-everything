@@ -19,9 +19,14 @@ function fakeGh(state) {
         pageInfo: { hasNextPage: false, endCursor: null }, totalCount: state.nodes.length } } } });
     }
     if (state.failView) throw new Error('boom');
-    const fields = args[args.indexOf('--json') + 1].split(',');
+    const all = args[args.indexOf('--json') + 1].split(',');
+    const identity = ['headRefOid', 'baseRefOid', 'baseRefName', 'updatedAt'];
+    const fields = all.filter(f => !identity.includes(f));
     state.views.push({ number: Number(args[2]), fields });
-    return JSON.stringify(Object.fromEntries(fields.map(f => [f, f === 'files' ? [{ path: `f-${state.tag ?? 0}` }] : `${f}-${state.tag ?? 0}`])));
+    // Identity fields describe the PR AS OF THE READ: `state.viewNodes` lets a test move it during hydration.
+    const at = (state.viewNodes ?? state.nodes).find(n => n.number === Number(args[2]));
+    return JSON.stringify(Object.fromEntries(all.map(f => [f, identity.includes(f) ? at?.[f]
+      : f === 'files' ? [{ path: `f-${state.tag ?? 0}` }] : `${f}-${state.tag ?? 0}`])));
   };
 }
 const paging = (extra = {}) => ({ pageSize: 20, pageRetries: 0, heavyMaxAgeSeconds: 600, heavyBackstopSeconds: 3600, ...extra });
@@ -215,10 +220,8 @@ describe('DRAIN-LIST-DELTA audit hardening', () => {
   });
   it('missing validators and future timestamps fail closed', () => {
     const state = { nodes: [baseNode(1, { headRefOid: undefined })], views: [] };
-    const first = run(state);
-    state.views.length = 0;
-    run(state, { cache: first.cache, nowMs: 1_001_000 });
-    expect(state.views.some(v => v.fields.includes('files'))).toBe(true);
+    // A listed row with no head cannot be pinned: the read is unreadable, never cached under a blank identity.
+    expect(() => run(state)).toThrow(PrListUnreadableError);
     const s2 = { nodes: [baseNode(2)], views: [] };
     const f2 = run(s2, { nowMs: 5_000_000 });
     s2.views.length = 0;
@@ -270,7 +273,7 @@ describe('DRAIN-LIST-DELTA round 3', () => {
 
 describe('DRAIN-LIST-DELTA round 4: direct hydrator callers', () => {
   const row1 = { number: 1, updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' };
-  const exec = () => JSON.stringify({ body: 'fresh', files: [] });
+  const exec = () => JSON.stringify({ body: 'fresh', files: [], updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' });
   const entry = (extra = {}) => ({ body: 'old', files: [], stamps: {
     body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
     files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } }, ...extra });
@@ -304,7 +307,7 @@ describe('DRAIN-LIST-DELTA round 5', () => {
     const cache = { 1: { body: 'old', files: [], stamps: {
       body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
       files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } } } };
-    const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [] }),
+    const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [], updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' }),
       fields: ['body', 'files'], nowMs: 1000 + 700_000, maxAgeMs: 600_000, cache,
       delta: { isCandidate: () => false, backstopMs: 3_600_000, maxAgeMs: 900_000 } });
     expect(out.rows[0].body).toBe('fresh');
@@ -319,10 +322,41 @@ describe('DRAIN-LIST-DELTA round 6', () => {
       body: { updatedAt: 'u', headRefOid: 'h', fetchedAtMs: 1000 },
       files: { headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b', fetchedAtMs: 1000 } } } };
     for (const [maxAgeMs, dm] of [[NaN, undefined], [600_000, NaN]]) {
-      const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [] }),
+      const out = hydrateHeavyFields({ repo, rows: [row1], exec: () => JSON.stringify({ body: 'fresh', files: [], updatedAt: 'u', headRefOid: 'h', baseRefName: 'main', baseRefOid: 'b' }),
         fields: ['body', 'files'], nowMs: 2000, maxAgeMs, cache,
         delta: { isCandidate: () => false, backstopMs: 3_600_000, maxAgeMs: dm } });
       expect(out.rows[0].body).toBe('fresh');
     }
+  });
+});
+
+describe('DRAIN-LIST-DELTA round 7: heavy reads are pinned to the listed identity', () => {
+  it('a head that changes during hydration is unreadable and nothing is cached', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    state.viewNodes = [baseNode(1, { headRefOid: 'moved-during-hydration' })];
+    expect(() => run(state)).toThrow(PrListUnreadableError);
+  });
+  it.each([['baseRefOid', 'moved'], ['updatedAt', '2026-10-20T00:00:00Z'], ['baseRefName', 'release']])(
+    'a changed %s during hydration is unreadable', (key, value) => {
+      const state = { nodes: [baseNode(1)], views: [] };
+      state.viewNodes = [baseNode(1, { [key]: value })];
+      expect(() => run(state)).toThrow(PrListUnreadableError);
+    });
+  it('the next pass re-reads, and nothing from the mismatched read was cached', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    state.viewNodes = [baseNode(1, { headRefOid: 'moved' })];
+    const cache = {};
+    expect(() => run(state, { cache })).toThrow(PrListUnreadableError);
+    expect(cache).toEqual({});
+    state.viewNodes = undefined;
+    state.views.length = 0;
+    const out = run(state, { cache });
+    expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
+    expect(out.cache[1].stamps.files.headRefOid).toBe('head-1');
+  });
+  it('a matching identity is cached as before', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    const out = run(state);
+    expect(out.cache[1].stamps.body.updatedAt).toBe('2026-10-13T00:00:00Z');
   });
 });
