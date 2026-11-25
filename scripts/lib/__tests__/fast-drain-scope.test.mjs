@@ -194,7 +194,9 @@ describe('fast drain listing', () => {
   it('selfRefresh is OFF by default, on only for tool/env "on", and ignores invalid values', () => {
     expect(resolve().selfRefresh).toBe(false);
     expect(resolve({ tool: { selfRefresh: 'on' } }).selfRefresh).toBe(true);
-    expect(resolve({ env: { WE_FAST_DRAIN_SELF_REFRESH: 'on' } }).selfRefresh).toBe(true);
+    for (const v of ['1', 'on', 'true']) {
+      expect(resolve({ env: { WE_FAST_DRAIN_SELF_REFRESH: v } }).selfRefresh, `env WE_FAST_DRAIN_SELF_REFRESH=${v} has no effect; behaviour stays OFF`).toBe(false);
+    }
     expect(resolve({ tool: { selfRefresh: 'yes' } }).selfRefresh).toBe(false);
     expect(resolve({ tool: { selfRefresh: true } }).selfRefresh).toBe(false);
   });
