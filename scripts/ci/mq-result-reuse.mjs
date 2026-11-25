@@ -124,7 +124,9 @@ export async function quarantineClear({ readQuarantine, activeEntries, board = p
     // This checkout-only job must not load the quarantine writer's npm dependencies.
     // Reuse the shared transport and schema, within the optional step's one-minute budget.
     const { readFromTransportBranch } = await import('../lib/git-transport-branch.mjs');
-    readQuarantine = ({ board, run = (args, options) => execFileSync('git', args, options) }) => {
+    readQuarantine = ({ board, run = (args, options) => execFileSync('git', args, {
+      ...options, maxBuffer: 16 * 1024 * 1024,
+    }) }) => {
       const deadline = Date.now() + 15_000;
       const boundedRun = (args, options) => {
         const remaining = deadline - Date.now();
