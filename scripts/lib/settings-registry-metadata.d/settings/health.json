@@ -1,0 +1,6 @@
+{
+  "description": "Per-repo health alert thresholds for time since the last merge and the age of the oldest open PR.",
+  "owner": "scripts/settings/repos.json",
+  "changeVia": "pr",
+  "instant": false
+}
