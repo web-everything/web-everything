@@ -57,8 +57,8 @@
  */
 
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
-import { readdirSync, readFileSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readdirSync, readFileSync, existsSync, mkdirSync, appendFileSync, chmodSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -472,7 +472,7 @@ function chooseSecuritySeatResult(argv, { enabled = true, store = null, readChan
   if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
   let files;
   try { files = readChangedFiles({ pr, repo }); } catch (e) {
-    return { securitySeat: true, reason: `touch-set unreadable (${String(e?.message ?? e).slice(0, 200)}) — full roster` };
+    return { securitySeat: true, reason: `touch-set unreadable (${describeErrorClass('touch-set', e)}) — full roster` };
   }
   if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
     return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
@@ -568,11 +568,51 @@ function defaultReadResumePr(input) {
   return createReviewPassPrReader()(input);
 }
 
+/**
+ * REVIEW-CLI-ERROR-CLASS: output never carries a raw error message (a probe leaked a Bearer token that way).
+ * Every catch maps the error to ONE class from this fixed list; anything unmatched is `unknown` (loud, never
+ * allow: callers park / refuse on any class). The full text goes only to a 0600 local debug log.
+ */
+export const ERROR_CLASSES = Object.freeze(['auth', 'network', 'rate-limit', 'not-found', 'parse', 'unknown']);
+const ERROR_CLASS_PATTERNS = [
+  ['rate-limit', /rate.?limit|\b429\b|too many requests/i],
+  ['auth', /\b401\b|\b403\b|unauthori[sz]ed|forbidden|bearer|authorization|credential|bad token/i],
+  ['not-found', /\b404\b|not found|ENOENT/i],
+  ['network', /ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network|timed? ?out|\b50[234]\b/i],
+  ['parse', /JSON|unexpected token|parse error|SyntaxError/i],
+];
+export function classifyErrorClass(error) {
+  let text = '';
+  try { text = typeof error === 'string' ? '' : `${error?.name ?? ''} ${error?.code ?? ''} ${error?.message ?? ''}`; } catch { text = ''; } // error-class-allowed
+  for (const [cls, re] of ERROR_CLASS_PATTERNS) if (re.test(text)) return cls;
+  return 'unknown';
+}
+export function errorDebugLogPath(env = process.env) {
+  return env.REVIEW_LOOP_CLI_DEBUG_LOG || join(env.HOME || '.', '.claude', 'review-loop-cli-debug.log');
+}
+function writeErrorDebugLog(site, error, env = process.env) {
+  try {
+    const path = errorDebugLogPath(env);
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${new Date().toISOString()} ${site} ${String(error?.stack ?? error?.message ?? error)}\n`, { mode: 0o600 }); // error-class-allowed
+    chmodSync(path, 0o600);
+  } catch { /* debug log is best effort */ }
+}
+/** `<site>:<class>` — the only form of an error that may reach output. */
+export function describeErrorClass(site, error, { log = writeErrorDebugLog } = {}) {
+  try { log(site, error); } catch { /* best effort */ }
+  return `${site}:${classifyErrorClass(error)}`;
+}
+/** Class for a non-thrown refusal (file-item exit != 0): its output text is never echoed. */
+function refusalClass(site, lines) {
+  return describeErrorClass(site, new Error((lines ?? []).join(' / ')));
+}
+
 /** Executable boundary: report replay refusals and other thrown errors with a nonzero CLI result. */
 export async function runReviewLoopCliOnce(options) {
   try { return await runReviewLoopOnce(options); }
   catch (error) {
-    return { code: 1, lines: [`error: ${String(error?.message ?? error)}`], run: null, stopped: 'refused' };
+    return { code: 1, lines: [`${describeErrorClass('error', error)}`], run: null, stopped: 'refused' };
   }
 }
 
@@ -637,7 +677,7 @@ export async function runReviewLoopOnce({
       const live = unattendedAcceptableVerdict(run?.verdict, { roundCards }) ? readAcceptancePr(run.input) : {};
       return unattendedAcceptHold({ ...run.input, verdict: run.verdict, ...live, head: live.headRefOid,
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
-    } catch (error) { return `live referrals unavailable: ${error.message}`; }
+    } catch (error) { return `live referrals unavailable: ${describeErrorClass('live-referrals', error)}`; }
   };
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {
@@ -671,7 +711,7 @@ export async function runReviewLoopOnce({
                 decision: postAcceptAdvisoryDecision({ verdict: out.run.verdict, mode: settings.value.mode, invalid: settings.invalid }) });
             }
           } catch (error) {
-            try { advisoryLog(`post-accept-advisory-shadow-miss: ${String(error?.message ?? error).replace(/[\x00-\x1f\x7f]/g, ' ')}; live review unaffected`); } catch { /* telemetry */ }
+            try { advisoryLog(`post-accept-advisory-shadow-miss: ${describeErrorClass('advisory-shadow', error)}; live review unaffected`); } catch { /* telemetry */ }
           }
         }
         return acceptHeld && out?.stopped === 'confirm' ? { ...out, acceptHeld } : out;
@@ -930,9 +970,8 @@ export async function runReviewLoopOnce({
           ? buildPreventionFilingInput({ repo, pr, head, findings: prior.uncovered })
           : filingInput;
         const filed = await fileItem(toFile);
-        const out = (filed?.lines ?? []).join(' / ');
         if (filed?.code !== 0) {
-          filingError = `file-item refused: ${out}`;
+          filingError = refusalClass('filing-refused', filed?.lines);
         } else {
           // The card IS filed (exit 0) — so an unreadable stdout (a Node warning line before the JSON, or no JSON
           // at all) must never crash the loop, and must never re-park either (PR #2767 advisory).
@@ -940,7 +979,7 @@ export async function runReviewLoopOnce({
         }
       }
     } catch (e) {
-      filingError = String(e?.message ?? e);
+      filingError = describeErrorClass('filing-failed', e);
     }
 
     if (filingError) {
@@ -1032,11 +1071,11 @@ export async function runReviewLoopOnce({
           ?? findRetainedRoundCardsReceipt({ store, repo, pr, head, fingerprint, op: declaration.name, nowMs: Date.parse(now()) }));
       if (!alreadyFiled) {
         const filed = await fileItem(filingInput);
-        if (filed?.code !== 0) filingError = `file-item refused: ${(filed?.lines ?? []).join(' / ')}`;
+        if (filed?.code !== 0) filingError = refusalClass('filing-refused', filed?.lines);
         else filedPayload = parseFiledPayload(filed.lines);
       }
     } catch (e) {
-      filingError = String(e?.message ?? e);
+      filingError = describeErrorClass('filing-failed', e);
     }
     if (filingError) {
       const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
@@ -1110,7 +1149,7 @@ export async function runReviewLoopOnce({
       // so the worst this costs is a human finding out later than they might have, never a wrongly-recorded
       // accept. Reported loudly rather than swallowed, because "the notification silently never went out" is
       // exactly the failure mode this branch exists to avoid.
-      filingError = String(e?.message ?? e);
+      filingError = describeErrorClass('filing-failed', e);
     }
 
     if (parsed.control.json) {
@@ -1164,7 +1203,7 @@ export async function runReviewLoopOnce({
         // NEITHER FAILURE UN-DOES THE ACCEPT — it already recorded. The worst this costs is a human finding
         // out about this one unfiled guard later than they might have; reported loudly rather than swallowed,
         // same posture as the queued-accept branch's own filing failure.
-        buildOrFileErrors.push(String(e?.message ?? e));
+        buildOrFileErrors.push(describeErrorClass('filing-failed', e));
       }
     }
     const filingError = buildOrFileErrors.length ? buildOrFileErrors.join('; ') : null;

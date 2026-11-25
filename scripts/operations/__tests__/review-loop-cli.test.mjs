@@ -449,7 +449,7 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.stopped).toBe('confirm');
     expect(out.run.pending.of).toBe('agent');
     expect(seen).toHaveLength(0);
-    expect(out.lines.join('\n')).toMatch(/FAILED to file the owed prevention card mechanically: backlog write failed: disk full/);
+    expect(out.lines.join('\n')).toMatch(/FAILED to file the owed prevention card mechanically: filing-failed:unknown/);
     expect(out.lines.join('\n')).toMatch(/never auto-cleared unfiled/);
   });
 
@@ -464,7 +464,7 @@ describe('runReviewLoopOnce — property 4, MECHANIZED (#2749 fix, 2026-09-26 sc
     expect(out.code).toBe(1);
     expect(out.stopped).toBe('confirm');
     const payload = JSON.parse(out.lines[0]);
-    expect(payload.preventionFilingError).toMatch(/file-item refused: error: invalid --scope/);
+    expect(payload.preventionFilingError).toMatch(/^filing-refused:unknown$/);
   });
 
   it('scopes the filed card to every OUTSTANDING finding\'s file, including one below the prevention impact bar — '
@@ -616,7 +616,7 @@ describe('runReviewLoopOnce — a human `--answer=accept` resume of a parked pre
     expect(out.code).toBe(1);
     expect(out.stopped).toBe('complete');
     expect(out.run.findings.confirm).toBe('accept');
-    expect(out.lines.join('\n')).toMatch(/FAILED to file \(some guard\(s\) may be unfiled\): pool file locked/);
+    expect(out.lines.join('\n')).toMatch(/FAILED to file \(some guard\(s\) may be unfiled\): filing-failed:unknown/);
   });
 
   it('isolates a single oversized guard\'s BUILD failure — the OTHER guard(s) in the same run still file', async () => {
@@ -1286,7 +1286,7 @@ describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files i
     expect(out.code).toBe(1);
     expect(out.stopped).toBe('confirm');
     expect(out.run.findings.confirm).toBeUndefined();
-    expect(out.lines.join('\n')).toMatch(/FAILED to file the round's follow-up card: file-item refused: lane pool exhausted/);
+    expect(out.lines.join('\n')).toMatch(/FAILED to file the round's follow-up card: filing-refused:unknown/);
   });
 });
 
@@ -2184,7 +2184,7 @@ describe('CI-held record driver resume', () => {
     expect(out.code).not.toBe(0);
     expect(out.stopped).toBe('refused');
     expect(out.run).toBeNull();
-    expect(out.lines.join(' ')).toContain('UNKNOWN');
+    expect(out.lines.join(' ')).toContain('error:unknown');
     expect(f.publishGate).toHaveBeenCalledTimes(checks);
     expect(f.runNode).not.toHaveBeenCalled();
   });
@@ -2339,4 +2339,55 @@ it('default review-loop minting keys the persisted run by its parsed PR', async 
   });
   expect(out.code).toBe(0);
   expect(out.run.id.match(NAME_RE)?.[1]).toBe(String(out.run.input.pr));
+});
+
+describe('runReviewLoopOnce — error-class output (REVIEW-CLI-ERROR-CLASS): a thrown error never reaches output raw', () => {
+  const SECRET = 'Authorization: Bearer test-xyz';
+  it('a failed filing prints filing-failed:<class>, leaves the run parked and unaccepted, and leaks no token', async () => {
+    const { declaration, registry } = registryFor({});
+    const store = createMemoryRunStore();
+    const seen = [];
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks(seen),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-errclass-park',
+      fileItem: async () => { throw new Error(`401 ${SECRET}`); },
+    });
+    const text = out.lines.join('\n');
+    expect(out.code).toBe(1);
+    expect(out.stopped).toBe('confirm');
+    expect(seen).toHaveLength(0);
+    expect(text).toMatch(/filing-failed:auth/);
+    expect(text).not.toMatch(/test-xyz/);
+  });
+
+  it('an unknown error maps to class unknown and the run still parks (no accept)', async () => {
+    const { declaration, registry } = registryFor({});
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: [...BASE_ARGV, '--json'], store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-errclass-unknown',
+      fileItem: async () => { throw new Error('weird failure with secret test-xyz'); },
+    });
+    const payload = JSON.parse(out.lines[0]);
+    expect(payload.preventionFilingError).toBe('filing-failed:unknown');
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).toBeUndefined();
+  });
+
+  it('a refused file-item (non-zero exit) prints no raw output text', async () => {
+    const { declaration, registry } = registryFor({});
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store: createMemoryRunStore(), sinks: recordingSinks([]),
+      makeJudge: cannedJudge(PREVENTION_ANSWER), mintRunId: () => 'r-errclass-refused',
+      fileItem: async () => ({ code: 1, lines: [`denied ${SECRET}`] }),
+    });
+    expect(out.lines.join('\n')).not.toMatch(/test-xyz/);
+    expect(out.stopped).toBe('confirm');
+  });
+
+  it('the executable boundary prints error:<class>, not the message', async () => {
+    const out = await runReviewLoopCliOnce({ declaration: null, registry: null, argv: BASE_ARGV, store: { read() { throw new Error(`boom ${SECRET}`); } } });
+    expect(out.code).toBe(1);
+    expect(out.lines.join('\n')).not.toMatch(/test-xyz/);
+    expect(out.lines[0]).toMatch(/^error:[a-z-]+$/);
+  });
 });
