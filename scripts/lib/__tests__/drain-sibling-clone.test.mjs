@@ -24,8 +24,8 @@ const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c',
 /** A real origin repo (main + one PR branch) served over file:// with partial-clone filters allowed. */
 function makeOrigin(prFiles) {
   const root = mkdtempSync(join(tmpdir(), 'sibling-clone-'));
-  const origin = join(root, 'origin');
-  mkdirSync(origin);
+  const origin = join(root, 'owner', 'origin.git'); // the url ensureSiblingClone derives for slug owner/origin
+  mkdirSync(origin, { recursive: true });
   git(origin, 'init', '-q', '-b', 'main');
   git(origin, 'config', 'uploadpack.allowFilter', 'true');
   git(origin, 'config', 'uploadpack.allowAnySHA1InWant', 'true');
@@ -59,7 +59,7 @@ describe('ensureSiblingClone fails closed', () => {
   const base = { slug: 'o/frontierui', name: 'frontierui', parentDir: '/x/pool', localOrigin: 'git@github.com:o/we.git' };
   it('an unreadable remote yields null and is not retried inside the cooldown', () => {
     let calls = 0; let t = 1000;
-    const o = { ...base, exists: poolHas, exec: () => { calls++; throw new Error('auth'); }, now: () => t };
+    const o = { ...base, exists: poolHas, clone: () => { calls++; throw new Error('auth'); }, now: () => t };
     expect(ensureSiblingClone(o)).toBeNull();
     expect(ensureSiblingClone(o)).toBeNull();
     expect(calls).toBe(1);
@@ -69,25 +69,25 @@ describe('ensureSiblingClone fails closed', () => {
   });
   it('no derivable url, or a squatting non-clone directory, never runs git and never clobbers', () => {
     let calls = 0;
-    expect(ensureSiblingClone({ ...base, localOrigin: null, exists: poolHas, exec: () => { calls++; } })).toBeNull();
-    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || p === "/x/pool/frontierui", exec: () => { calls++; } })).toBeNull();
+    expect(ensureSiblingClone({ ...base, localOrigin: null, exists: poolHas, clone: () => { calls++; } })).toBeNull();
+    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || p === "/x/pool/frontierui", clone: () => { calls++; } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('provisioning is off when disabled, and off under a test runner unless explicit', () => {
     let calls = 0;
-    const o = { ...base, exists: poolHas, exec: () => { calls++; } };
+    const o = { ...base, exists: poolHas, clone: () => { calls++; } };
     expect(ensureSiblingClone({ ...o, env: { WE_DRAIN_SIBLING_CLONE: 'off' } })).toBeNull();
     expect(ensureSiblingClone({ ...o, env: { VITEST: 'true' } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('a parent that is not a lane pool (no other sibling clone) never triggers a clone', () => {
     let calls = 0;
-    expect(ensureSiblingClone({ ...base, exists: () => false, exec: () => { calls++; } })).toBeNull();
+    expect(ensureSiblingClone({ ...base, exists: () => false, clone: () => { calls++; } })).toBeNull();
     expect(calls).toBe(0);
   });
   it('an existing clone is used as is', () => {
     let calls = 0;
-    expect(ensureSiblingClone({ ...base, exists: () => true, exec: () => { calls++; } })).toBe('/x/pool/frontierui');
+    expect(ensureSiblingClone({ ...base, exists: () => true, clone: () => { calls++; } })).toBe('/x/pool/frontierui');
     expect(calls).toBe(0);
   });
 });
@@ -98,13 +98,9 @@ describe('the provisioned clone makes the drain read the diff (real git)', () =>
     const { root, origin, head } = makeOrigin(prFiles);
     const pool = join(root, 'pool');
     mkdirSync(join(pool, 'plateau-app', '.git'), { recursive: true }); // a real pool root already holds a sibling
-    // `localOrigin` points the derived url at the on-disk origin: <root>/<x>/<y> → <root>/origin
-    const dir = ensureSiblingClone({ slug: 'owner/origin', name: 'frontierui', parentDir: pool, localOrigin: `file://${root}/owner/we` , exec: (cmd, args, opts) => {
-      const i = args.findIndex((a) => a.startsWith('file://'));
-      const fixed = [...args]; fixed[i] = `file://${origin}`;
-      return execFileSync(cmd, fixed, opts);
-    } });
-    return { dir, head, root };
+    // The REAL default clone: localOrigin's transport + slug owner/origin → file://<root>/owner/origin.git (the origin repo).
+    const dir = ensureSiblingClone({ slug: 'owner/origin', name: 'frontierui', parentDir: pool, localOrigin: `file://${root}/owner/we` });
+    return { dir, head, root, origin };
   }
   const read = (dir, head) => {
     const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: dir, ...opts });
@@ -114,6 +110,8 @@ describe('the provisioned clone makes the drain read the diff (real git)', () =>
   it('a readable, matching diff is scored and clean', () => {
     const { dir, head } = readThroughProvisionedClone({ 'README.md': 'changed\n' });
     expect(dir && existsSync(join(dir, '.git'))).toBeTruthy();
+    expect(git(dir, 'config', 'remote.origin.partialclonefilter')).toBe('blob:none'); // blobless
+    expect(existsSync(join(dir, 'README.md'))).toBe(false); // no checkout
     const sig = read(dir, head);
     expect(sig.netDiffText).toMatchObject({ scored: true, rev: head });
     const scan = scanTestTampering({ netDiffText: sig.netDiffText, pinnedHeadSha: head });

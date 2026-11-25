@@ -16,7 +16,7 @@
  *   {@link describeUnverifiedDiffHold} is the reasoned hold text: the cause and the wake event, never a silent re-park.
  */
 import { existsSync, renameSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execRead } from './proc-read.mjs';
 import { join, resolve } from 'node:path';
 
 /** Do not retry a failed clone for this long (ms). */
@@ -24,6 +24,11 @@ export const CLONE_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 const CLONE_TIMEOUT_MS = 5 * 60 * 1000;
 const POOL_SIBLINGS = ['frontierui', 'plateau-app'];
 const failures = new Map();
+
+/** The one real clone: blobless (blobs are fetched on demand by the diff), no checkout (the drain never reads a worktree). */
+function blobsFreeClone(url, tmp, opts) {
+  return execRead('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', '-c', 'gc.auto=0', url, tmp], opts);
+}
 
 /**
  * The clone URL for `slug` (`owner/name`), taken from the local checkout's own origin so the transport (ssh or
@@ -42,7 +47,7 @@ export function siblingCloneUrl(localOrigin, slug) {
  * @param {{slug:string, name:string, parentDir:string, localOrigin:string|null, exec?:Function, exists?:Function,
  *   rename?:Function, now?:()=>number}} o
  */
-export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = execFileSync, exists = existsSync, rename = renameSync, now = Date.now, env = process.env } = {}) {
+export function ensureSiblingClone({ slug, name, parentDir, localOrigin, clone = blobsFreeClone, exists = existsSync, rename = renameSync, now = Date.now, env = process.env } = {}) {
   const dir = resolve(parentDir, name);
   if (exists(join(dir, '.git'))) return dir;
   // `WE_DRAIN_SIBLING_CLONE=off` disables provisioning; under a test runner it is off unless explicitly `on`
@@ -59,9 +64,8 @@ export function ensureSiblingClone({ slug, name, parentDir, localOrigin, exec = 
   if (!url || exists(dir)) { failures.set(key, now()); return null; } // never clobber a squatting non-clone dir
   const tmp = `${dir}.clone-${process.pid}-${now()}`;
   try {
-    exec('git', ['clone', '--quiet', '--filter=blob:none', '--no-checkout', '-c', 'gc.auto=0', url, tmp],
-      { stdio: ['ignore', 'ignore', 'pipe'], timeout: CLONE_TIMEOUT_MS, killSignal: 'SIGKILL',
-        env: { ...env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' } }); // never block on a prompt
+    clone(url, tmp, { stdio: ['ignore', 'pipe', 'pipe'], timeout: CLONE_TIMEOUT_MS, killSignal: 'SIGKILL',
+      env: { ...env, GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: env.GIT_SSH_COMMAND || 'ssh -o BatchMode=yes' } }); // never block on a prompt
     rename(tmp, dir);
     failures.delete(key);
     return exists(join(dir, '.git')) ? dir : null;

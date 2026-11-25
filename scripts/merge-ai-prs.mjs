@@ -5152,7 +5152,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // CLEAR-HUMAN-NOT-STICKY — the drain daemon's pool had no `frontierui` sibling, so every frontierui PR was
     // "net diff unverified (no-clone)". Provision it (blobless, fail closed) instead of leaving the diff unread.
     let localOrigin = null;
-    try { localOrigin = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* no origin → no clone */ }
+    try { localOrigin = String(readGit(['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); } catch { /* no origin → no clone */ }
     return ensureSiblingClone({ slug: repo, name, parentDir: resolve(process.cwd(), '..'), localOrigin });
   };
 

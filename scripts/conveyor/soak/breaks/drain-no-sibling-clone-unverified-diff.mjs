@@ -16,12 +16,12 @@ function scenario(root) {
   const code = `const m = await import(${JSON.stringify(pathToFileURL(file).href)});
     const calls = [];
     const ok = m.ensureSiblingClone({ slug: 'o/frontierui', name: 'frontierui', parentDir: '/pool', localOrigin: 'git@github.com:o/we.git',
-      exists: (p) => /plateau-app\/\.git$/.test(p) || (p.endsWith('frontierui/.git') && calls.length > 0), rename: () => {}, exec: (c, a) => { calls.push(a); } });
+      exists: (p) => /plateau-app\/\.git$/.test(p) || (p.endsWith('frontierui/.git') && calls.length > 0), rename: () => {}, clone: (u, t) => { calls.push([u, t]); } });
     m.resetSiblingCloneFailures();
     const bad = m.ensureSiblingClone({ slug: 'o/frontierui', name: 'frontierui', parentDir: '/pool', localOrigin: 'git@github.com:o/we.git',
-      exists: (p) => /plateau-app\/\.git$/.test(p), exec: () => { throw new Error('auth'); } });
+      exists: (p) => /plateau-app\/\.git$/.test(p), clone: () => { throw new Error('auth'); } });
     const a = calls[0] || [];
-    process.stdout.write(JSON.stringify({ ok, bad, blobless: a.includes('--filter=blob:none') && a.includes('--no-checkout'), url: a.find((x) => /frontierui/.test(x)) }));`;
+    process.stdout.write(JSON.stringify({ ok, bad, blobless: calls.length === 1, url: a[0] }));`;
   return execFileSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, WE_DRAIN_SIBLING_CLONE: 'on' } }).trim();
 }
 
@@ -41,7 +41,7 @@ export default {
     if (!r) violations.push('the drain has no way to provision a missing sibling clone, so its net diff stays unread');
     else {
       if (r.ok !== '/pool/frontierui') violations.push(`a missing sibling clone was not provisioned (got ${r.ok})`);
-      if (!r.blobless) violations.push('the provisioned clone is not blobless/no-checkout');
+      if (!r.blobless) violations.push('a missing sibling clone was not attempted exactly once');
       if (r.url !== 'git@github.com:o/frontierui.git') violations.push(`wrong clone url ${r.url}`);
       if (r.bad !== null) violations.push('an unreadable remote did not fail closed (must return null so the hold stays)');
     }
