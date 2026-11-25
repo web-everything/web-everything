@@ -86,7 +86,7 @@ import { runReconcilePass, defaultReadPrs, defaultReadAgents, isConflictingPr } 
 import { PrListUnreadableError } from '../../scripts/lib/pr-list-paged.mjs';
 import { promoteDraftsThenReplan, promoteDraftsGuarded, rearmStaleAcceptanceGuarded, rearmStaleAcceptsThenReplan } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold, readReviewRunEvidence, jurorTimeoutWoken } from '../../scripts/conveyor/review-referral-hold.mjs';
-import { jurorTimeoutHold } from '../../scripts/operations/juror-timeout-route.mjs';
+import { jurorTimeoutHold, jurorTimeoutRetryEnabled } from '../../scripts/operations/juror-timeout-route.mjs';
 import { createRedTeamIo } from '../../scripts/operations/review-extra-seats.mjs';
 import { providerQuotaHold } from '../../scripts/lib/provider-quota-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
@@ -404,7 +404,7 @@ export function runReviewTick({
   statusCandidates = selectStatusCandidates,
   holdReconcile = sweepReviewHolds,
   notifyReferral = notifyReferralHold,
-  readRuns = () => [], providerCapacity = () => null,
+  readRuns = () => [], providerCapacity = () => null, retryEnabled = jurorTimeoutRetryEnabled,
   // card x29vm8a - `({repo, prNumber, headRefName, headRefOid, defaultBranch}) => {ok, action, error?}`; `null` (the default) never
   // refreshes, so every existing caller of this function is unchanged. The real daemon passes {@link refreshScopeBloatedPr}.
   refreshScopeBloat = null,
@@ -753,7 +753,7 @@ export function runReviewTick({
   const dispatched = [];
   const failed = [];
   const timeoutHolds = new Map();
-  for (const d of reviews) {
+  for (const d of retryEnabled() === true ? reviews : []) {
     const subject = (rawPrs ?? []).find(p => Number(p.number) === Number(d.prNumber));
     const head = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
     const last = readRuns().filter(r => r.repo === repo && r.pr === Number(d.prNumber))

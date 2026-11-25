@@ -21,7 +21,7 @@ import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
-import { jurorTimeoutEvidence } from '../operations/juror-timeout-route.mjs';
+import { jurorTimeoutEvidence, jurorTimeoutRetryEnabled } from '../operations/juror-timeout-route.mjs';
 import { resolveBuilder } from '../operations/review-builder.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
@@ -57,7 +57,7 @@ const hash = value => createHash('sha256').update(JSON.stringify(value)).digest(
 /** Completed-panel evidence, or an incomplete attempt that can spend a no-verdict retry but prove no verdict.
  * A run suspended at human confirmation has completed its panel, although the operation is pending.
  * Misnamed-record recovery requires a recognized review verdict as well as completion timing. */
-export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
+export function reviewRunEvidence(run, { requireVerdict = false, retryEnabled = jurorTimeoutRetryEnabled } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
@@ -127,7 +127,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
-    const jurorTimeout = jurorTimeoutEvidence(run, resolveBuilder(read));
+    const jurorTimeout = retryEnabled() === true ? jurorTimeoutEvidence(run, resolveBuilder(read)) : null;
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
       ...(jurorTimeout ? { jurorTimeout } : {}),
       ...(requireVerdict ? { misnamed: true } : {}),
@@ -197,7 +197,8 @@ function writeEvidenceDiskCache(file, entries) {
 }
 // Stray records are untrusted. Oversized/unreadable files retain the invalid-entry alert for operator repair.
 export const INVALID_RUN_EVIDENCE_MAX_BYTES = 16 * 1024 * 1024;
-export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
+export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true, retryEnabled = jurorTimeoutRetryEnabled } = {}) {
+  const retryOn = retryEnabled() === true;
   const entries = runFileEntries(dir, { includeInvalid: true, reportInvalid: path => {
     if (!basename(path).startsWith('review-pr-')) reportInvalidRunEntry(path);
   } });
@@ -238,7 +239,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
         if (payload.verdict === VERDICTS.NEEDS_HUMAN && !Array.isArray(payload.pendingReferrals)) throw new Error('needs-human verdict without pendingReferrals');
       }
       // A stray record's timing alone cannot prove a verdict or supersede a persistence-failure hold.
-      const evidence = reviewRunEvidence(run, { requireVerdict: true });
+      const evidence = reviewRunEvidence(run, { requireVerdict: true, retryEnabled });
       reportInvalidRunEntry(path);
       return evidence ? [evidence] : [];
     } catch (error) {
@@ -260,7 +261,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
   const rows = names.filter(n => n.startsWith('review-pr-')).map(name => {
     const path = join(dir, name);
     const stat = statSync(path);
-    return { name, path, key: `${stat.mtimeMs}:${stat.size}` };
+    return { name, path, key: `${stat.mtimeMs}:${stat.size}:${retryOn}` };
   });
   const misses = rows.filter(r => memo.get(r.path)?.key !== r.key).length;
   const useDisk = persist && misses > 0 && (misses === rows.length || misses > EVIDENCE_DISK_MIN_MISSES);
@@ -268,7 +269,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
     // Re-stat right before use (the count above is only a hint), so each record's key is read at the same moment
     // relative to its parse as before this change.
     const stat = statSync(path);
-    const key = `${stat.mtimeMs}:${stat.size}`;
+    const key = `${stat.mtimeMs}:${stat.size}:${retryOn}`;
     let cached = memo.get(path);
     if (cached?.key !== key && useDisk) {
       disk ??= readEvidenceDiskCache(file);
@@ -276,7 +277,7 @@ export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryRea
       if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
     }
     if (cached?.key !== key) {
-      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir)) };
+      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir), { retryEnabled }) };
       dirty = true;
     }
     memo.set(path, cached);
@@ -383,10 +384,10 @@ function latestReviewAttempt(history) {
  * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
+export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0, retryEnabled = jurorTimeoutRetryEnabled } = {}) {
   const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
-  if (last?.jurorTimeout && last.head === pr.headRefOid) {
+  if (retryEnabled() === true && last?.jurorTimeout && last.head === pr.headRefOid) {
     return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
   }
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)

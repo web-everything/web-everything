@@ -1,7 +1,9 @@
+import { jurorTimeoutRetryEnabled } from '../../../scripts/operations/juror-timeout-route.mjs';
+const retryOn = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled: true } });
 import { expect, it, vi } from 'vitest';
 import { REARM_COMMENT_MARKER } from '../../../scripts/conveyor/rearm-review.mjs';
 import { AUTOMATION_LOGINS } from '../../../scripts/lib/marker-authorship.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runReviewTick } from '../review-daemon.mjs';
@@ -18,9 +20,9 @@ it('holds a second timeout over three ticks including restart; a moved head star
     seatTimeouts: ['sonnet', 'claude-opus-5-5-high'].map((model, i) => ({ step: 'judge', lens: 'correctness', head, provider: 'claude', model, timeoutMs: i ? 1800000 : 1200000 })) };
   const dispatch = vi.fn(() => ({})), post = vi.fn();
   const notifyReferral = vi.fn(args => notifyReferralHold({ ...args, dir, post, log() {} }));
-  const tick = (liveHead = head, providerCapacity = () => null, comments = []) => runReviewTick({ repo, now: () => 1000,
+  const tick = (liveHead = head, providerCapacity = () => null, comments = []) => runReviewTick({ repo, retryEnabled: retryOn, now: () => 1000,
     dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() },
-    readRuns: () => [reviewRunEvidence(JSON.parse(JSON.stringify(run)))], providerCapacity,
+    readRuns: () => [reviewRunEvidence(JSON.parse(JSON.stringify(run)), { retryEnabled: retryOn })], providerCapacity,
     holdReconcile: () => [], reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 10, headRefOid: liveHead }], refusals: [] }),
     readPrs: () => [{ number: 10, headRefOid: liveHead, labels: ['review:pending'], comments }], readAgents: () => [],
     dispatch, notifyReferral, tagRound() {}, tagStatus() {}, statusCandidates: () => [], log() {} });
@@ -83,8 +85,8 @@ it.each(['run a fresh review', '🔁 review — changes requested'])('timeout re
   const repo = 'web-everything/web-everything', head = 'a'.repeat(40);
   const run = { id: 'parked', repo, pr: 10, head, incomplete: true, startedAt: Date.parse('2026-11-25T00:00:00Z'), rulings: [], jurorTimeout: { attempts: 0 } };
   const pr = { number: 10, headRefOid: head, comments: [{ author: { login: 'chalbert' }, body, createdAt: '2026-11-25T01:00:00Z' }] };
-  expect(findResumableParkedRun(pr, [run], { repo })).toBeNull();
-  expect(findResumableParkedRun({ ...pr, comments: [] }, [run], { repo })).toEqual({ id: run.id, head });
+  expect(findResumableParkedRun(pr, [run], { repo, retryEnabled: retryOn })).toBeNull();
+  expect(findResumableParkedRun({ ...pr, comments: [] }, [run], { repo, retryEnabled: retryOn })).toEqual({ id: run.id, head });
 });
 
 
@@ -94,5 +96,42 @@ it.each(['🔁 review — changes requested', REARM_COMMENT_MARKER])('automation
     startedAt: Date.parse('2026-11-25T00:00:00Z'), rulings: [], jurorTimeout: { attempts: 3 } };
   const pr = { number: 10, headRefOid: head,
     comments: [{ author: { login: AUTOMATION_LOGINS[0] }, body, createdAt: '2026-11-25T01:00:00Z' }] };
-  expect(findResumableParkedRun(pr, [run], { repo })).toEqual({ id: run.id, head });
+  expect(findResumableParkedRun(pr, [run], { repo, retryEnabled: retryOn })).toEqual({ id: run.id, head });
+});
+
+it('retry OFF: a timed-out seat holds exactly as on main; no retry candidate is chosen', () => {
+  const repo = 'web-everything/web-everything', head = 'b'.repeat(40);
+  const run = { id: 'off-run', op: 'review-pr', input: { pr: 10, repo },
+    findings: { read: { repo, pr: 10, netBasis: { rev: head } } },
+    stepTimings: [{ step: 'read', startedAt: '2026-11-25T00:00:00Z' }],
+    pending: { kind: 'judge', step: 'judge', request: { lens: 'correctness', model: 'sonnet', seatProvider: { fallbackModel: 'claude-opus-5-5-high' } } },
+    seatTimeouts: [{ step: 'judge', lens: 'correctness', head, provider: 'claude', model: 'sonnet', timeoutMs: 1200000 }] };
+  for (const enabled of [undefined, false, true]) {
+    const retryEnabled = () => enabled === true;
+    const evidence = reviewRunEvidence(run, { retryEnabled });
+    const historicalEvidence = reviewRunEvidence(run, { retryEnabled: retryOn });
+    expect(evidence.jurorTimeout ?? null).toEqual(enabled === true ? expect.any(Object) : null);
+    expect(findResumableParkedRun({ number: 10, headRefOid: head, comments: [] }, [historicalEvidence], { repo, retryEnabled }))
+      .toEqual(enabled === true ? { id: run.id, head } : null);
+    const dispatch = vi.fn(() => ({})), notifyReferral = vi.fn(), providerCapacity = vi.fn(() => 'held');
+    runReviewTick({ repo, retryEnabled, readRuns: () => [historicalEvidence], providerCapacity,
+      dispatchState: { firstOwedAt: new Map(), lastDispatched: new Map() }, holdReconcile: () => [],
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 10, headRefOid: head }], refusals: [] }),
+      readPrs: () => [{ number: 10, headRefOid: head, labels: ['review:pending'] }], readAgents: () => [],
+      dispatch, notifyReferral, tagRound() {}, tagStatus() {}, statusCandidates: () => [], log() {} });
+    expect(notifyReferral).toHaveBeenCalledTimes(enabled === true ? 1 : 0);
+    expect(providerCapacity).toHaveBeenCalledTimes(enabled === true ? 1 : 0);
+    expect(dispatch).toHaveBeenCalledTimes(enabled === true ? 0 : 1);
+  }
+});
+
+it('ships juror timeout retries default OFF and enables only literal true', () => {
+  const settings = JSON.parse(readFileSync(join(import.meta.dirname, '../../../scripts/settings/review.json'), 'utf8'));
+  expect(settings.reviewJurorTimeoutRetry.enabled).toBe(false);
+  expect(jurorTimeoutRetryEnabled({ env: {} })).toBe(false);
+  for (const enabled of [undefined, false, 'true', 'false', 1, null, {}]) {
+    expect(jurorTimeoutRetryEnabled({ env: {}, tool: { enabled } })).toBe(false);
+  }
+  expect(retryOn()).toBe(true);
+  expect(jurorTimeoutRetryEnabled({ env: { WE_REVIEW_JUROR_TIMEOUT_RETRY_ENABLED: 'false' }, tool: { enabled: true } })).toBe(false);
 });

@@ -1,3 +1,22 @@
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+
+// Only literal true enables retries; malformed overrides explicitly turn them off.
+export function jurorTimeoutRetryEnabled({ env = process.env, tool } = {}) {
+  try {
+    const block = tool === undefined
+      ? JSON.parse(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../settings/review.json'), 'utf8')).reviewJurorTimeoutRetry : tool;
+    const project = value => value?.enabled === undefined ? {} : { enabled: value.enabled === true };
+    return cascadePolicy('review.reviewJurorTimeoutRetry', project(block), {
+      standard: { enabled: false }, platform: project(platformPreference('review', { env })?.reviewJurorTimeoutRetry),
+      env, valid: { enabled: value => typeof value === 'boolean' },
+      envValues: { enabled: env.WE_REVIEW_JUROR_TIMEOUT_RETRY_ENABLED === undefined ? undefined : env.WE_REVIEW_JUROR_TIMEOUT_RETRY_ENABLED === 'true' },
+    }).value.enabled === true;
+  } catch { return false; }
+}
+
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
 import { retryCounterValid } from './run-record.mjs';
 

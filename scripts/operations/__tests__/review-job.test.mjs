@@ -1,3 +1,5 @@
+import { jurorTimeoutRetryEnabled } from '../juror-timeout-route.mjs';
+const retryOn = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled: true } });
 import * as reviewDispatch from '../review-dispatch.mjs';
 import * as ghShim from '../../lib/gh-app-shim.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
@@ -26,7 +28,7 @@ import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
 
 it('dispatches the same parked run by --resume through the existing loop entry', () => {
   const spawnNode = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }));
-  const io = createReviewJobIo({ spawnNode, findResumableRun: () => 'parked-timeout', log() {} });
+  const io = createReviewJobIo({ spawnNode, retryEnabled: retryOn, findResumableRun: () => 'parked-timeout', log() {} });
   io.runLoop({ pr: 10, repo: 'o/r', lanePath: '/lane', timeoutMs: 2000000 });
   expect(spawnNode.mock.calls[0][1]).toContain('--resume=parked-timeout');
   expect(spawnNode.mock.calls[0][1]).not.toContain('--pr=10');
@@ -776,4 +778,14 @@ it('classifies juror-timeout and writes the named seat to the ended record', () 
   const { io } = fakeIo({ writeEnded, runLoop: () => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }) });
   expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
   expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
+});
+
+it('retry OFF: launcher never looks up a timeout resume', () => {
+  const spawnNode = vi.fn(() => ({ status: 0, stdout: '', stderr: '' }));
+  const findResumableRun = vi.fn(() => 'parked-timeout');
+  const io = createReviewJobIo({ spawnNode, findResumableRun, log() {} });
+  io.runLoop({ pr: 10, repo: 'o/r', lanePath: '/lane', timeoutMs: 2000000 });
+  expect(findResumableRun).not.toHaveBeenCalled();
+  expect(spawnNode.mock.calls[0][1]).toContain('--pr=10');
+  expect(spawnNode.mock.calls[0][1].some(arg => arg.startsWith('--resume='))).toBe(false);
 });

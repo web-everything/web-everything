@@ -1,3 +1,5 @@
+import { jurorTimeoutRetryEnabled } from '../juror-timeout-route.mjs';
+const retryOn = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled: true } });
 import { describe, expect, it, vi } from 'vitest';
 import { createDefaultJudge, driveRun, outcomePayload, renderOutcome } from '../cli-adapter.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
@@ -184,7 +186,7 @@ describe('driveRun permanent guard refusal', () => {
   const saved = store.read(run.id);
   const retried = vi.fn(() => ({ findings: [] }));
   const resumed = await driveRun({ run: saved, registry, store, judge: retried, parallelJudges, log() {},
-    retrySeat: { step: 'judge', provider: 'claude', model: 'claude-opus-5-5-high', timeoutMs: 1800000 } });
+    retryEnabled: retryOn, retrySeat: { step: 'judge', provider: 'claude', model: 'claude-opus-5-5-high', timeoutMs: 1800000 } });
   expect(resumed.run.id).toBe(run.id);
   const { model, timeoutMs, ...rest } = retried.mock.calls[0][0];
   const { model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
@@ -224,9 +226,9 @@ it('resumes on the selected real provider seam with the extended timeout', async
   const parked = await driveRun({ run, registry, store, judge: async () => { throw Object.assign(Error('timeout'), { timedOut: true, timeoutMs: 1200000 }); } });
   const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
   const resolveProvider = vi.fn(() => spawn);
-  const judge = createDefaultJudge({ resolveProvider });
+  const judge = createDefaultJudge({ resolveProvider, retryEnabled: retryOn });
   const out = await driveRun({ run: parked.run, registry, store, judge,
-    retrySeat: { step: 'judge', provider: 'codex', model: 'gpt-6-astra', timeoutMs: 1800000 } });
+    retryEnabled: retryOn, retrySeat: { step: 'judge', provider: 'codex', model: 'gpt-6-astra', timeoutMs: 1800000 } });
   expect(out.stopped).toBe('complete');
   expect(resolveProvider).toHaveBeenCalledWith('codex');
   expect(spawn).toHaveBeenCalledTimes(1);
@@ -278,7 +280,7 @@ it('still strips a foreign model before the Codex provider seam', async () => {
 
 it.each([0, -1, 0.5, NaN, Infinity, null, '1200000', 3600001])('refuses invalid provider timeoutMs %s before spawning', async timeoutMs => {
   const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
-  await expect(createDefaultJudge({ resolveProvider: () => spawn })({
+  await expect(createDefaultJudge({ resolveProvider: () => spawn, retryEnabled: retryOn })({
     providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
   })).rejects.toThrow(/timeoutMs/);
   expect(spawn).not.toHaveBeenCalled();
@@ -286,7 +288,7 @@ it.each([0, -1, 0.5, NaN, Infinity, null, '1200000', 3600001])('refuses invalid 
 
 it.each([1, 3600000])('forwards valid provider timeoutMs %s unchanged', async timeoutMs => {
   const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
-  await createDefaultJudge({ resolveProvider: () => spawn })({
+  await createDefaultJudge({ resolveProvider: () => spawn, retryEnabled: retryOn })({
     providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
   });
   expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs }));
@@ -303,4 +305,33 @@ it.each(['empty', 'head', 'lens', 'step', 'missing', 'malformed'])('keeps exhaus
   const seat = jurorTimeoutEvidence(run);
   expect(seat).toMatchObject({ attempts: 3 });
   expect(jurorTimeoutHold({ id: 'saved', head, jurorTimeout: seat })).toMatchObject({ kind: 'juror-timeout' });
+});
+
+it('retry OFF: ignores the retry-seat override', async () => {
+  const registry = createRegistry();
+  registry.register(op('off-retry', { judge: judgeStep({ request: () => ({ lens: 'correctness', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' } }) }) }));
+  const store = createMemoryRunStore(), run = startRun({ op: 'off-retry', id: 'off-retry', registry });
+  const parked = await driveRun({ run, registry, store, judge: async () => { throw Object.assign(Error('timeout'), { timedOut: true, timeoutMs: 5 }); } });
+  const judge = vi.fn(() => ({}));
+  await driveRun({ run: parked.run, registry, store, judge,
+    retrySeat: { get model() { throw Error('OFF read retry override'); } } });
+  expect(judge.mock.calls[0][0].model).toBe('sonnet');
+  expect(judge.mock.calls[0][0].timeoutMs).toBeUndefined();
+});
+
+it.each([false, true])('Codex model override follows timeout retry setting (enabled=%s)', async enabled => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  const retryEnabled = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled } });
+  await createDefaultJudge({ resolveProvider: () => spawn, retryEnabled })({
+    providerName: 'codex', model: 'gpt-6-astra', mandate: 'check', input: 'diff', shape: { type: 'object' },
+  });
+  expect(spawn.mock.calls[0][0].model).toBe(enabled ? 'gpt-6-astra' : undefined);
+});
+
+it('retry OFF: provider receives no timeout override from saved retry state', async () => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs: 1800000,
+  });
+  expect(spawn.mock.calls[0][0]).not.toHaveProperty('timeoutMs');
 });

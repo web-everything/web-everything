@@ -1,3 +1,5 @@
+import { jurorTimeoutRetryEnabled } from '../juror-timeout-route.mjs';
+const retryOn = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled: true } });
 /**
  * @file review-loop-cli.test.mjs — #3072's remaining slice, exercised end to end with no `gh`, no juror
  * subprocess and no real learnings-pool/backlog file: a stub `readPr`, a canned judge, recording sinks, an
@@ -214,7 +216,7 @@ it.each(['same', 'moved', 'moved-spent', 'roster', 'roster-spent', 'budget', 'in
   const head = 'a'.repeat(40), store = createMemoryRunStore();
   const first = registryFor({ rev: head });
   const timedOut = Object.assign(new Error('timeout'), { timedOut: true, timeoutMs: 1200000, wallMs: 1200001 });
-  const parked = await runReviewLoopOnce({ ...first, argv: BASE_ARGV, store, sinks: recordingSinks([]),
+  const parked = await runReviewLoopOnce({ retryEnabled: retryOn, ...first, argv: BASE_ARGV, store, sinks: recordingSinks([]),
     makeJudge: () => async () => { throw timedOut; }, mintRunId: () => 'timeout-run' });
   expect(parked.stopped).toBe('juror-timeout');
   const saved = JSON.parse(JSON.stringify(parked.run));
@@ -224,12 +226,12 @@ it.each(['same', 'moved', 'moved-spent', 'roster', 'roster-spent', 'budget', 'in
   if (scenario === 'invalid') saved.jurorResumeAttempts = -1;
   const liveHead = scenario.startsWith('moved') ? 'b'.repeat(40) : head;
   expect(defaultFindResumableRun({ repo: saved.input.repo, pr: saved.input.pr }, {
-    readPr: () => ({ headRefOid: liveHead }), readRuns: () => [reviewRunEvidence(saved)],
+    retryEnabled: retryOn, readPr: () => ({ headRefOid: liveHead }), readRuns: () => [reviewRunEvidence(saved, { retryEnabled: retryOn })],
   })).toBe(scenario.startsWith('moved') ? null : saved.id);
   const current = registryFor({ rev: liveHead });
   const judge = vi.fn(async () => CLEAN_ANSWER);
   if (scenario === 'malformed') saved.seatTimeouts = [null];
-  const resumed = await runReviewLoopOnce({ ...current, argv: ['--resume=timeout-run'], store: { ...store, read: () => saved },
+  const resumed = await runReviewLoopOnce({ retryEnabled: retryOn, ...current, argv: ['--resume=timeout-run'], store: { ...store, read: () => saved },
     providerCapacity: () => { if (scenario === 'capacity-error') throw Error('unreadable capacity'); return scenario === 'capacity' ? 'provider quota held' : null; },
     sinks: recordingSinks([]), makeJudge: () => judge, readResumePr: () => { if (scenario === 'head-error') throw Error('head read failed'); return scenario === 'head-missing' ? {} : { headRefOid: liveHead }; }, mintRunId: () => 'fresh-run' });
   if (!['same', 'moved', 'moved-spent'].includes(scenario)) {
@@ -2475,17 +2477,68 @@ it.each(['missing', 'failed'])('automatic timeout lookup preserves the hold on a
   const saved = { id: 'timeout-lookup', repo: 'web-everything/web-everything', pr: 1234, head: HEAD_A,
     incomplete: true, startedAt: 1, jurorTimeout: { attempts: 3 }, rulings: [] };
   expect(defaultFindResumableRun({ repo: saved.repo, pr: saved.pr }, {
-    readRuns: () => [saved], readPr: () => { if (failure === 'failed') throw Error('head unreadable'); return {}; },
+    retryEnabled: retryOn, readRuns: () => [saved], readPr: () => { if (failure === 'failed') throw Error('head unreadable'); return {}; },
   })).toBe(saved.id);
 });
 
 it('refuses automatic resume when saved evidence lookup fails, without starting a panel', async () => {
   const judge = vi.fn(), mintRunId = vi.fn();
-  const out = await runReviewLoopOnce({ ...registryFor({ rev: HEAD_A }), argv: BASE_ARGV, store: createMemoryRunStore(),
+  const out = await runReviewLoopOnce({ ...registryFor({ rev: HEAD_A }), retryEnabled: retryOn, argv: BASE_ARGV, store: createMemoryRunStore(),
     sinks: recordingSinks([]), makeJudge: () => judge, mintRunId,
     findResumableRun: () => { throw Error('saved timeout evidence unreadable'); } });
   expect(out.stopped).toBe('refused');
   expect(out.lines.join(' ')).toContain('inspect the saved hold');
   expect(judge).not.toHaveBeenCalled();
   expect(mintRunId).not.toHaveBeenCalled();
+});
+
+it('retry OFF: a timed-out seat holds exactly as on main; no retry candidate is chosen', async () => {
+  for (const enabled of [undefined, false, true]) {
+    const retryEnabled = () => jurorTimeoutRetryEnabled({ env: {}, tool: { enabled } });
+    const head = 'a'.repeat(40), store = createMemoryRunStore(), first = registryFor({ rev: head });
+    const parked = await runReviewLoopOnce({ ...first, retryEnabled, argv: BASE_ARGV, store, sinks: recordingSinks([]),
+      makeJudge: () => async () => { throw Object.assign(Error('timeout'), { timedOut: true, timeoutMs: 1200000 }); }, mintRunId: () => 'off-timeout' });
+    expect(parked.stopped).toBe('juror-timeout');
+    expect(parked.run.seatTimeouts).toHaveLength(1);
+    const saved = parked.run;
+    saved.pending.request.seatProvider = { get fallbackModel() {
+      if (enabled !== true) throw Error('OFF consulted retry candidate');
+      return 'claude-opus-5-5-high';
+    } };
+    if (enabled === true) store.write(saved);
+    const providerCapacity = vi.fn(() => null), readPr = vi.fn(() => ({ headRefOid: head }));
+    if (enabled !== true) {
+      expect(defaultFindResumableRun({ repo: saved.input.repo, pr: saved.input.pr, jurorOnly: true }, {
+        retryEnabled, readRuns: () => { throw Error('OFF read retry runs'); }, readPr,
+      })).toBeNull();
+      expect(readPr).not.toHaveBeenCalled();
+    }
+    const judge = vi.fn(async () => CLEAN_ANSWER);
+    const out = await runReviewLoopOnce({ ...first, retryEnabled, argv: BASE_ARGV, store, sinks: recordingSinks([]),
+      findResumableRun: args => defaultFindResumableRun(args, { retryEnabled, readPr,
+        readRuns: () => [reviewRunEvidence(saved, { retryEnabled })] }),
+      readResumePr: readPr, providerCapacity, makeJudge: () => judge, mintRunId: () => 'fresh-off' });
+    expect(out.run.id).toBe(enabled === true ? saved.id : 'fresh-off');
+    expect(out.run.jurorResumeAttempts).toBe(enabled === true ? 1 : undefined);
+    expect(providerCapacity).toHaveBeenCalledTimes(enabled === true ? 1 : 0);
+    expect(judge.mock.calls[0][0].model).toBe(enabled === true ? 'claude-opus-5-5-high' : saved.pending.request.model);
+  }
+});
+
+it('retry OFF: unreadable parked lookup keeps main fresh-review fallback', async () => {
+  const out = await runReviewLoopOnce({ ...registryFor({ rev: HEAD_A }), argv: BASE_ARGV, store: createMemoryRunStore(),
+    sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'off-lookup-error',
+    findResumableRun: () => { throw Error('unreadable saved evidence'); } });
+  expect(out.run.id).toBe('off-lookup-error');
+  expect(out.stopped).not.toBe('refused');
+});
+
+it('retry OFF: unreadable auto-resume record keeps main fresh-review fallback', async () => {
+  const store = createMemoryRunStore();
+  const out = await runReviewLoopOnce({ ...registryFor({ rev: HEAD_A }), argv: BASE_ARGV,
+    store: { ...store, read: () => { throw Error('unreadable record'); } },
+    sinks: recordingSinks([]), makeJudge: cannedJudge(CLEAN_ANSWER), mintRunId: () => 'off-record-error',
+    findResumableRun: () => 'old-parked-run' });
+  expect(out.run.id).toBe('off-record-error');
+  expect(out.stopped).not.toBe('refused');
 });

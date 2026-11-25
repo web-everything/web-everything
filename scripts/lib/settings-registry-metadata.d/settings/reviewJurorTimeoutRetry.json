@@ -1,0 +1,6 @@
+{
+  "description": "Default-off saved-seat juror timeout retries; only literal true enables routing and resume.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}

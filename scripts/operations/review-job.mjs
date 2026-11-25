@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { jurorTimeoutRetryEnabled } from './juror-timeout-route.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { settleGhFor, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -420,7 +421,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
   readWitness = key => readRecoveryWitness({ ...key, env, readScorecards: readSeatRecords }), recoveryProbe = defaultRecoveryProbe(),
   queueBaseline = () => resolveLiveQueueBaseline({ checkoutRoot: root, env }),
   seatAvailable = provider => createRedTeamIo({ root, env }).cliAvailable(provider), spawnSpeculative = spawn,
-  findResumableRun = defaultFindResumableRun,
+  findResumableRun = defaultFindResumableRun, retryEnabled = () => jurorTimeoutRetryEnabled({ env }),
   spawnNode = spawnSync,
   log = line => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
 } = {}) {
@@ -638,8 +639,8 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
     runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
-      const resumeId = findResumableRun({ pr, repo, jurorOnly: true }, { env, readPr: () => JSON.parse(exec('gh',
-        ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })) });
+      const resumeId = retryEnabled() === true ? findResumableRun({ pr, repo, jurorOnly: true }, { env, retryEnabled, readPr: () => JSON.parse(exec('gh',
+        ['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid'], { cwd: root, env })) }) : null;
       const r = node([
         'scripts/operations/review-loop-cli.mjs',
         ...(resumeId ? [`--resume=${resumeId}`] : [`--pr=${pr}`, `--repo=${repo}`]), `--cwd=${lanePath}`,

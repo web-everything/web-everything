@@ -82,7 +82,7 @@ import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPoli
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
-import { nextJurorRoute, jurorTimeoutHold } from './juror-timeout-route.mjs';
+import { nextJurorRoute, jurorTimeoutHold, jurorTimeoutRetryEnabled } from './juror-timeout-route.mjs';
 import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
 import { createRedTeamIo } from './review-extra-seats.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
@@ -407,15 +407,24 @@ export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
  * timeout evidence preserves the saved hold; an unreadable store refuses lookup rather than starting a panel.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax, jurorOnly = false }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax, jurorOnly = false }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env, retryEnabled = () => jurorTimeoutRetryEnabled({ env }) } = {}) {
+  if (retryEnabled() !== true) {
+    if (jurorOnly) return null;
+    try {
+      const view = readPr({ repo, pr });
+      if (!view?.headRefOid) return null;
+      return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo, retryEnabled,
+        ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
+    } catch { return null; }
+  }
   const runs = readRuns();
-  const timeoutRun = runs.filter(r => r.repo === repo && r.pr === Number(pr))
-    .sort((a, b) => b.startedAt - a.startedAt)[0];
-  const heldId = timeoutRun?.jurorTimeout ? timeoutRun.id : null;
+  const timeoutRun = retryEnabled() === true ? runs.filter(r => r.repo === repo && r.pr === Number(pr))
+    .sort((a, b) => b.startedAt - a.startedAt)[0] : null;
+  const heldId = retryEnabled() === true && timeoutRun?.jurorTimeout ? timeoutRun.id : null;
   try {
     const view = readPr({ repo, pr });
     if (!view?.headRefOid) return heldId;
-    const id = findResumableParkedRun({ ...view, number: Number(pr) }, runs, { repo,
+    const id = findResumableParkedRun({ ...view, number: Number(pr) }, runs, { repo, retryEnabled,
       ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id;
     return id && (!jurorOnly || runs.find(r => r.id === id)?.jurorTimeout) ? id : null;
   } catch { return heldId; }
@@ -671,7 +680,7 @@ export async function runReviewLoopOnce({
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
-  redTeamOnSkipSettings = resolveReviewRedTeamOnSkip,
+  redTeamOnSkipSettings = resolveReviewRedTeamOnSkip, retryEnabled = jurorTimeoutRetryEnabled,
   // `review.parallelSeats` — start every independent juror seat at once (`./parallel-judges.mjs`); `seatLanes` gives a
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
@@ -787,10 +796,13 @@ export async function runReviewLoopOnce({
 
   let run;
   let retrySeat = null;
-  const pendingTimeout = record => record?.pending?.kind === 'judge' && Object.hasOwn(record, 'seatTimeouts');
+  const pendingTimeout = record => retryEnabled() === true && record?.pending?.kind === 'judge' && Object.hasOwn(record, 'seatTimeouts');
   if (parsed.control.resume) {
     try { run = store.read(parsed.control.resume); }
-    catch { return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved run is unreadable; inspect the saved hold before re-arming.'] }; }
+    catch (error) {
+      if (retryEnabled() !== true) throw error;
+      return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved run is unreadable; inspect the saved hold before re-arming.'] };
+    }
     if (!run) return { code: 2, lines: [`error: no run record for ${JSON.stringify(parsed.control.resume)}`], run: null, stopped: 'refused' };
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
@@ -813,9 +825,12 @@ export async function runReviewLoopOnce({
     let resumedId = parsed.control.resume ?? null;
     if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun === defaultFindResumableRun
-        ? defaultFindResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }, { readPr: readResumePr })
+        ? defaultFindResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }, { readPr: readResumePr, retryEnabled })
         : findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }); }
-      catch { return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved review lookup is unreadable; inspect the saved hold before re-arming.'] }; }
+      catch {
+        if (retryEnabled() === true) return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved review lookup is unreadable; inspect the saved hold before re-arming.'] };
+        resumedId = null;
+      }
     }
     // Timeout evidence must prove a safe retry or a moved head before a saved hold can be left behind.
     let rewound = null;
@@ -824,7 +839,7 @@ export async function runReviewLoopOnce({
     try {
       const parked = resumedId ? store.read(resumedId) : null;
       if (pendingTimeout(parked)) timeoutParked = parked;
-      const timeoutEvidence = reviewRunEvidence(parked);
+      const timeoutEvidence = retryEnabled() === true ? reviewRunEvidence(parked, { retryEnabled }) : null;
       const timeoutSeat = timeoutEvidence?.jurorTimeout;
       const liveTimeoutHead = timeoutParked && readResumePr(parked.input, { refreshHead: true })?.headRefOid;
       if (timeoutParked && (!timeoutSeat || !/^[a-f0-9]{40}$/i.test(liveTimeoutHead ?? ''))) throw new Error('unreadable timeout evidence or live head');
@@ -918,7 +933,7 @@ export async function runReviewLoopOnce({
             ...(persistRetries ? { persistRetries } : {}) } };
       }
     } catch {
-      if (timeoutParked || resumedId) return { code: 2, run: timeoutParked ?? run, stopped: 'refused',
+      if (retryEnabled() === true && (timeoutParked || resumedId)) return { code: 2, run: timeoutParked ?? run, stopped: 'refused',
         lines: ['review-blocked-on-infra: saved review evidence or provider capacity is unreadable; inspect the saved hold before re-arming.'] };
       rewound = null;
     }
@@ -977,7 +992,7 @@ export async function runReviewLoopOnce({
   // reader of the run's own step-timing record can tell this pass apart from a human at a terminal — the same
   // distinction `applyPendingEffects`'s `attemptedBy` already threads for its effect rows.
   const outcome = await drive({
-    run, registry, store, sinks, judge: activeJudge, resume, retrySeat, autoConfirm, attemptedBy: 'agent',
+    run, registry, store, sinks, judge: activeJudge, resume, ...(retrySeat ? { retrySeat } : {}), retryEnabled, autoConfirm, attemptedBy: 'agent',
   });
 
   if (outcome.stopped === 'juror-timeout') {

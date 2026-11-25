@@ -1,3 +1,4 @@
+import { jurorTimeoutRetryEnabled } from './juror-timeout-route.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
@@ -647,11 +648,11 @@ export function resolveJudgeProvider(name) {
  * tool-free signal and is dropped so the shared guard (`assertSafeJudgeRequest`, which rejects `[]` for every
  * provider) does not refuse it. Codex-only: the claude path never calls this. Returns a shallow copy.
  */
-function stripForCodex(request) {
+function stripForCodex(request, retryEnabled) {
   if (!request) return request;
   const { model, allowedTools, ...rest } = request;
   // Keep an explicit Codex model (including a saved retry route); only foreign model names use its default.
-  if (typeof model === 'string' && /^(gpt-|codex)/.test(model)) rest.model = model;
+  if (retryEnabled() === true && typeof model === 'string' && /^(gpt-|codex)/.test(model)) rest.model = model;
   if (Array.isArray(allowedTools) && allowedTools.length === 0) return rest;
   return { ...rest, ...(allowedTools !== undefined ? { allowedTools } : {}) };
 }
@@ -715,8 +716,9 @@ export async function defaultProviderQuotaHold(providerName, when) {
  * @param {string|null} cwd
  * @param {string} effectiveProviderName
  */
-function buildProviderRequest(effective, cwd, effectiveProviderName) {
-  if (effective.timeoutMs !== undefined
+function buildProviderRequest(effective, cwd, effectiveProviderName, retryEnabled) {
+  const timeoutRetry = retryEnabled() === true;
+  if (timeoutRetry && effective.timeoutMs !== undefined
     && (!Number.isInteger(effective.timeoutMs) || effective.timeoutMs <= 0 || effective.timeoutMs > 3600000)) {
     throw new Error('operations: timeoutMs must be a positive integer at most 3600000; correct the saved request before retrying.');
   }
@@ -730,7 +732,7 @@ function buildProviderRequest(effective, cwd, effectiveProviderName) {
     ...(effective.model !== undefined ? { model: effective.model } : {}),
     effort: effective.effort,
     budget: effective.budget,
-    ...(effective.timeoutMs !== undefined ? { timeoutMs: effective.timeoutMs } : {}),
+    ...(timeoutRetry && effective.timeoutMs !== undefined ? { timeoutMs: effective.timeoutMs } : {}),
     runId: effective.runId,
     lens: effective.lens,
     ...(effective.allowedTools ? { allowedTools: effective.allowedTools } : {}),
@@ -806,7 +808,7 @@ function judgeTelemetryFrom(outcome, effective) {
  */
 export function createDefaultJudge({
   provider, providerName: factoryProviderName, cwd: factoryCwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
-  checkProviderHold = defaultProviderQuotaHold,
+  checkProviderHold = defaultProviderQuotaHold, retryEnabled = jurorTimeoutRetryEnabled,
   now = () => Date.now(),
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
   // Card 84 — the seat runner a `seatProvider` request goes to. Injectable so a test drives THIS wrapper (not the
@@ -843,7 +845,7 @@ export function createDefaultJudge({
     // `assertNoCodexToolAllowlist` documents as tool-free. `assertSafeJudgeRequest` is shared with claude and
     // rejects [], so the empty array is dropped for an effectively-codex request ONLY, before the guard runs;
     // claude keeps refusing it.
-    const declared = effectiveProviderName === 'codex' ? stripForCodex(request) : request;
+    const declared = effectiveProviderName === 'codex' ? stripForCodex(request, retryEnabled) : request;
     // THE OVERRIDE IS MERGED BEFORE THE GUARD RUNS, NEVER AFTER (#3151). `assertSafeJudgeRequest` is what stops
     // a flag-shaped `model` reaching argv, so asserting the declaration's request and then substituting the
     // operator's value would check one string and spawn another — the guard would be decorative. The CLI
@@ -922,7 +924,7 @@ export function createDefaultJudge({
         : resolveProvider(spawnProviderName);
       try {
         const actual = configured && spawnProviderName !== effectiveProviderName ? { ...effective, ...configured.fallback.find(route => route.provider === spawnProviderName), providerName: spawnProviderName } : effective;
-        const outcome = await spawnProvider(buildProviderRequest(actual, cwd, spawnProviderName));
+        const outcome = await spawnProvider(buildProviderRequest(actual, cwd, spawnProviderName, retryEnabled));
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
       } catch (e) {
@@ -950,7 +952,7 @@ export function createDefaultJudge({
       : (provider ?? resolveProvider(providerName));
     // #3383 mechanical-dispatcher Gap 2 root cause fix — see `buildProviderRequest`'s own comment for the full
     // account of why `model`/`cwd` are conditionally spread rather than always present.
-    const outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName));
+    const outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName, retryEnabled));
     // NOT a spread of `outcome`: it also carries `argv` (which embeds the whole mandate) and the answer itself.
     // The record keeps the meter, never the material. `normalizeJudgeTelemetry` whitelists again on arrival.
     return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, effective));
@@ -1047,14 +1049,14 @@ function stampFinish(run, stepIndex, clock) {
  *   from `{run, stopped, error, applied}` alone — see the file header and #3063 for why.
  */
 export async function driveRun({
-  run, registry, store, sinks, judge, resume = null, retrySeat = null, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now(),
+  run, registry, store, sinks, judge, resume = null, retrySeat = null, retryEnabled = jurorTimeoutRetryEnabled, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now(),
   // `review.parallelSeats` — see `./parallel-judges.mjs`. OFF by default so every caller that does not ask keeps the
   // sequential drive; the review callers pass the resolved setting. `seatLanes` gives a further tool-bearing seat a
   // lane of its own (absent: it waits for the primary lane). `log` reports seat starts/ends (stderr by default).
   parallelJudges = false, seatLanes = null, log = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
 } = {}) {
   let current = run;
-  if (retrySeat) {
+  if (retryEnabled() === true && retrySeat) {
     const { step, model, provider, timeoutMs } = retrySeat;
     if (run.pending?.kind !== 'judge' || run.pending.step !== step || typeof model !== 'string'
       || !JUDGE_PROVIDER_NAMES.includes(provider)
