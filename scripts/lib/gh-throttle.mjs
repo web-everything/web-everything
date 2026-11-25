@@ -1446,7 +1446,7 @@ export function decideGhBucketSpend({ state, points = 1, pointClass = 'standard'
   s.tickets = s.tickets.filter(t => nowMs - t.since < 60000 && isPidAlive(t.pid)).sort((a, b) => a.since - b.since);
   const batch = pointClass === 'batch', age = Math.max(0, nowMs - startedAt);
   if (batch && age >= 20000 && age < 60000 && !s.tickets.some(t => t.owner === owner))
-    s.tickets.push({ owner, pid, since: startedAt, p: points });
+    s.tickets = [...s.tickets, { owner, pid, since: startedAt, p: points }];
   s.tickets.sort((a, b) => a.since - b.since);
   const oldest = s.tickets[0], ticketed = s.tickets.some(t => t.owner === owner);
   const floor = pointClass === 'priority' ? 0 : batch ? (ticketed ? 10 : 30) : 10 + (oldest?.p ?? 0);
@@ -1457,7 +1457,7 @@ export function decideGhBucketSpend({ state, points = 1, pointClass = 'standard'
   const allowed = normal || forced, charged = normal || (forced && s.tokens - points >= -60);
   if (charged) {
     s.tokens -= points;
-    if (batch) s.batchLog.push({ ms: nowMs, p: points });
+    if (batch) s.batchLog = [...s.batchLog, { ms: nowMs, p: points }];
   }
   if (allowed) s.tickets = s.tickets.filter(t => t.owner !== owner);
   const deficitMs = Math.ceil(Math.max(0, floor + points - s.tokens) * 60000 / budgetPerMin);
