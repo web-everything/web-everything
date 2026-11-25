@@ -237,7 +237,8 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   if (!/^[\w=-]+$/.test(answerId) || /[\r\n]/.test(answerId)) return held('answer id unreadable');
   if (typeof headRefOid !== 'string' || headRefOid.length !== 40 || !/^[a-f0-9]{40}$/i.test(headRefOid)) return held('head unreadable');
   const ruledHead = standDownHead(comments[namedStandDownIndex(comments, answerAt, answer)].body);
-  if (ruledHead && ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return held('stand-down head differs from current head');
+  if (!ruledHead) return held('stand-down has no head; a fresh answer is needed');
+  if (ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return held('stand-down head differs from current head');
   if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
   if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
   if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');

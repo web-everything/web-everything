@@ -697,7 +697,7 @@ describe('operator no-code rearm executor', () => {
   const verdict = c('verdict', `🔁 review — changes requested
 
 Fix defect`);
-  const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }));
+  const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head }));
   const answer = c('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }));
   const thread = () => [verdict, begin, stop, answer];
   const entry = { kind: 'rearm-no-code', prNumber: 42, expectHead: head, answerId: 'answer' };

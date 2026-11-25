@@ -14,7 +14,7 @@ const verdict = c('verdict', `🔁 review — changes requested
 
 Fix the defect
 <!-- reviewed-sha: ${HEAD} -->`);
-const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
+const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head: HEAD }));
 const answer = c('answer', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat', reason: 'No code owed', disposition: 'rearm-review', noCodeOwed: true }), 'chalbert');
 const comments = [verdict, begin, stop, answer];
 const predicate = (over = {}) => core.noCodeRearmPlan({ comments, labels: ['review:changes'], headRefOid: HEAD, ...over });
@@ -43,11 +43,15 @@ describe('no-code rearm predicate', () => {
     const pinned = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head }));
     expect(predicate({ comments: [verdict, begin, pinned, answer] }).state).toBe(state);
   });
-  it('keeps an unheaded stand-down eligible after the head moves', () => {
-    expect(predicate({ headRefOid: 'b'.repeat(40) }).state).toBe('ready');
+  it('holds an unheaded stand-down and requires a fresh answer', () => {
+    const unheaded = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
+    expect(predicate({ comments: [verdict, begin, unheaded, answer] })).toMatchObject({ state: 'held', why: 'stand-down has no head; a fresh answer is needed' });
   });
   it.each([REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER])('legacy marker spends ruling: %s', marker => expect(predicate({ comments: [...comments, c('legacy', marker)] }).state).toBe('spent'));
-  it('trusted receipt spends the answer even if the head moved', () => expect(predicate({ headRefOid: 'b'.repeat(40), comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))] }).state).toBe('spent'));
+  it('trusted receipt spends the answer even if the head moved', () => {
+    const moved = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head: 'b'.repeat(40) }));
+    expect(predicate({ headRefOid: 'b'.repeat(40), comments: [verdict, begin, moved, answer, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))] }).state).toBe('spent');
+  });
   it('untrusted receipt is ignored', () => expect(predicate({ comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD), 'outsider')] }).state).toBe('ready'));
   it('no review:changes resumes ordinary planning', () => expect(predicate({ labels: ['review:pending'] }).state).toBe('none'));
   it('later untrusted ordinary answer cannot override an eligible no-code ruling', () => {
