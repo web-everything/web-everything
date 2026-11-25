@@ -103,9 +103,18 @@ describe('hotpatch admission', () => {
       expect((await receiptGuard(SHA, readers)).outcome).not.toBe('pass');
     },
   );
-  it('missing or queued shards wait and shards from another suite cannot fill gaps', async () => {
+  it('shards from another complete bound CI suite cannot fill gaps', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.checks.check_runs.push(...data.checks.check_runs.map(check => ({ ...check, id: check.id + 100, check_suite: { id: 99 } })));
+    data.checks.check_runs.splice(1, 1);
+    data.checks.total_count = data.checks.check_runs.length;
+    data.workflows.workflow_runs.push({ ...data.workflows.workflow_runs[0], check_suite_id: 99 });
+    data.workflows.total_count++;
+    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait', detail: 'hotpatch-needs-ci-receipt' });
+  });
+  it('a shard without a workflow binding remains unknown', async () => {
     const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].check_suite = { id: 99 };
-    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait' });
+    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'unknown', detail: 'hotpatch-evidence-unreadable' });
   });
   it('oversized evidence is unknown with an operator fallback', async () => {
     const { data, readers } = hotpatchFixture(); data.checks.total_count = 101;
