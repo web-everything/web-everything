@@ -681,16 +681,23 @@ export function runReviewTick({
       // One immediate retry keeps its place; repeated failures yield to waiting peers.
       if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
       let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
+      let timeout = null;
       try {
         const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
         const job = { slug, pid: prior.pid };
         const detail = diagnoseJob(job);
+        if (detail?.reason === 'juror-timeout') timeout = detail;
         diagnosis = summarizeDiagnosis(detail);
         writeJobDiagnosis(job, detail);
       } catch { /* Diagnostics must never interrupt a retry. */ }
-      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
+      endedNoVerdict.push({ prNumber: d.prNumber, reason: timeout ? 'juror-timeout' : 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
       dispatchState.lastDispatched.delete(key);
-      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+      try {
+        const safe = value => String(value ?? '?').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+        log(timeout
+          ? `review-daemon: ${key} review-job-ended juror-timeout (${safe(timeout.lens)} ${safe(timeout.provider)}/${safe(timeout.model)} ${safe(timeout.wallMs)}ms; run ${safe(timeout.runId)}; head ${safe(timeout.head).slice(0, 12)})`
+          : `review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`);
+      } catch {}
     }
     owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
   }

@@ -8,6 +8,14 @@ const UNKNOWN = 'unknown (no exit marker: killed hard or crashed)';
 const MAX_TAIL = 8192;
 
 export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
+  let timeout = {};
+  try {
+    const ended = JSON.parse(readFileSync(diagnosticPath(slug, dir, 'ended'), 'utf8'));
+    if (ended.pid === pid && ended.reason === 'juror-timeout') {
+      const { reason, lens, provider, model, head, runId, timeoutMs, wallMs } = ended;
+      timeout = { reason, lens, provider, model, head, runId, timeoutMs, wallMs };
+    }
+  } catch { /* Missing, stale or unreadable ended evidence cannot identify a timeout. */ }
   let marker;
   try {
     const value = JSON.parse(readFileSync(diagnosticPath(slug, dir, 'exit'), 'utf8'));
@@ -38,7 +46,7 @@ export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   const lastErrorLine = (lines.filter(line => /error|exception|fatal|ETIMEDOUT|ENOENT|killed|timed out/i.test(line)).at(-1)
     ?? lines.at(-1) ?? '').slice(0, 200);
   return { exitCode: marker ? marker.exitCode : UNKNOWN, signal: marker ? marker.signal : UNKNOWN,
-    marker: Boolean(marker), lastErrorLine, tail };
+    marker: Boolean(marker), lastErrorLine, tail, ...timeout };
 }
 
 /** Pure, terminal-safe single-line summary of the collected evidence. */

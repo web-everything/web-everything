@@ -761,3 +761,11 @@ describe('CLI exit evidence', () => {
     expect(() => proc.emit('exit', 1)).not.toThrow();
   });
 });
+
+it('classifies juror-timeout and writes the named seat to the ended record', () => {
+  const payload = { stopped: 'juror-timeout', runId: 'timeout-run', lens: 'correctness', provider: 'claude', model: 'sonnet', head: HEAD, timeoutMs: 5, wallMs: 6 };
+  const writeEnded = vi.fn();
+  const { io } = fakeIo({ writeEnded, runLoop: () => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }) });
+  expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
+  expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
+});
