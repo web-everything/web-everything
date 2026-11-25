@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAccount, accountEnv, loadAccountMap } from '../claude-account.mjs';
+import { markWorkerEnv, WORKER_MARKER_ENV } from '../../operations/session-role.mjs';
 
 const FAKE = 'fake-token-DO-NOT-LEAK-0123456789';
 const MAP = {
@@ -11,6 +13,83 @@ const MAP = {
   '*': 'refuse',
   enforce: false,
 };
+
+describe('markWorkerEnv — unavailable account map fails closed', () => {
+  const cases = [
+    ['missing', null],
+    ['unreadable (directory)', null],
+    ['malformed JSON', '{'],
+    ['empty file', ''],
+    ['empty object', '{}'],
+    ['JSON null', 'null'],
+    ['JSON array', '[]'],
+    ['incomplete map', '{"accounts":{}}'],
+    ['malformed account entry', '{"accounts":{"a":{}},"daemons":{}}'],
+  ];
+  function withMap(kind, contents, run) {
+    const dir = mkdtempSync(join(tmpdir(), 'claude-account-'));
+    try {
+      const path = kind === 'unreadable (directory)' ? dir : join(dir, 'map.json');
+      if (contents !== null) writeFileSync(path, contents);
+      run(loadAccountMap({ path }));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  it('exercises account resolution when TMPDIR is unset', () => {
+    const previous = process.env.TMPDIR;
+    delete process.env.TMPDIR;
+    try {
+      expect(process.env.TMPDIR).toBeUndefined();
+      withMap('empty object', '{}', map => {
+        expect(() => markWorkerEnv({ XPC_SERVICE_NAME: 'com.we.worker' }, { map }))
+          .toThrow('claude account map unavailable; refusing daemon launch');
+        expect(markWorkerEnv({}, { map })).toEqual({ [WORKER_MARKER_ENV]: '1' });
+      });
+    } finally {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+    }
+  });
+  it.each(cases)('refuses daemon launch for a %s map before reading credentials', (kind, contents) => {
+    withMap(kind, contents, map => {
+      const reads = [];
+      for (const label of ['com.we.build-dispatch-daemon', 'com.plateau.worker']) {
+        expect(() => markWorkerEnv({ XPC_SERVICE_NAME: label }, {
+          map, readKeychain: (...args) => { reads.push(args); return FAKE; },
+        })).toThrow('claude account map unavailable; refusing daemon launch');
+      }
+      expect(reads).toEqual([]);
+    });
+  });
+  it.each(cases)('preserves interactive behavior for a %s map', (kind, contents) => {
+    withMap(kind, contents, map => {
+      for (const label of [undefined, '0', 'application.com.microsoft.VSCode.123']) {
+        const env = { XPC_SERVICE_NAME: label, CLAUDE_CODE_OAUTH_TOKEN: 'inherited' };
+        expect(markWorkerEnv(env, { map })).toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+        expect(env).not.toHaveProperty(WORKER_MARKER_ENV);
+      }
+    });
+  });
+  it('preserves valid mapped daemon credentials and scrubbing', () => {
+    const env = { XPC_SERVICE_NAME: 'com.we.build-dispatch-daemon', ANTHROPIC_API_KEY: 'old', ANTHROPIC_AUTH_TOKEN: 'old' };
+    const reads = [];
+    expect(markWorkerEnv(env, { map: MAP, readKeychain: (...args) => { reads.push(args); return FAKE; } }))
+      .toEqual({ XPC_SERVICE_NAME: env.XPC_SERVICE_NAME, [WORKER_MARKER_ENV]: '1',
+        CLAUDE_CODE_OAUTH_TOKEN: FAKE, CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '1' });
+    expect(reads).toEqual([['svc', 'acct-a']]);
+    expect(env.ANTHROPIC_API_KEY).toBe('old');
+  });
+  it('preserves valid maps with no daemon assignments and enforced unmapped refusal', () => {
+    const env = { XPC_SERVICE_NAME: 'com.we.other' };
+    for (const accounts of [MAP.accounts, {}]) {
+      expect(markWorkerEnv(env, { map: { ...MAP, accounts, daemons: {} } }))
+        .toEqual({ ...env, [WORKER_MARKER_ENV]: '1' });
+    }
+    expect(() => markWorkerEnv(env, { map: { ...MAP, enforce: true } }))
+      .toThrow(/no usable Claude account mapping/);
+  });
+});
 
 describe('resolveAccount (pure)', () => {
   it('maps a mapped launchd label to its account', () => {

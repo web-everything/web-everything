@@ -23,7 +23,7 @@ export function expandConfigDir(dir, home) {
 const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 
-/** Strict validation for new consumers; legacy resolution remains unchanged. */
+/** Strict validation of account-map evidence before daemon credential resolution. */
 export function isAccountMap(map) {
   if (!record(map) || !record(map.accounts) || !record(map.daemons)) return false;
   if (map.enforce !== undefined && typeof map.enforce !== 'boolean') return false;
@@ -50,7 +50,7 @@ export function isNotApplied(error) {
   return error instanceof AccountRefusal && error.notApplied === true;
 }
 
-/** The map, or null when unreadable (callers treat null as "nothing mapped"). */
+/** The parsed map, or null when unreadable; daemon resolution refuses unavailable evidence. */
 export function loadAccountMap({ path = MAP_PATH } = {}) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
 }
@@ -59,7 +59,14 @@ export function loadAccountMap({ path = MAP_PATH } = {}) {
 export function resolveAccount(env, map) {
   const label = env && typeof env === 'object' ? env.XPC_SERVICE_NAME : undefined;
   if (typeof label !== 'string' || !DAEMON_LABEL.test(label)) return { kind: 'none' };
-  if (!map || typeof map !== 'object') return { kind: 'none' };
+  // Preserve the existing explicit refusal for a label pointing at an unknown account.
+  if (record(map) && record(map.daemons) && record(map.accounts)
+    && Object.hasOwn(map.daemons, label) && !Object.hasOwn(map.accounts, map.daemons[label])) {
+    return { kind: 'refuse', label };
+  }
+  if (!isAccountMap(map)) {
+    throw new Error('claude account map unavailable; refusing daemon launch; repair scripts/settings/claude-accounts.json and retry');
+  }
   const mapped = map.daemons && Object.hasOwn(map.daemons, label) ? map.daemons[label] : undefined;
   if (mapped !== undefined) {
     return map.accounts && Object.hasOwn(map.accounts, mapped) ? { kind: 'account', account: mapped, label } : { kind: 'refuse', label };
