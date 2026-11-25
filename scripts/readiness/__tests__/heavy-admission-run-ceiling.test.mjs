@@ -66,7 +66,8 @@ describe('runUnderAdmission — run ceiling counted from slot grant', () => {
     for (let i = 0; i < 300 && !(existsSync(pidFile3) && Number(readFileSync(pidFile3, 'utf8').trim()) > 0); i++) await new Promise((res) => setTimeout(res, 100));
     const orphan = Number(readFileSync(pidFile3, 'utf8').trim());
     expect(orphan).toBeGreaterThan(0);
-    wrapper.kill('SIGKILL');
+    expect(isDead(orphan)).toBe(false); // the descendant must be alive now, or "gone" below proves nothing about the watchdog
+    expect(wrapper.kill('SIGKILL')).toBe(true);
     await expectGone(orphan);
   }, 60_000);
   it('no runCeilingMs means no exec timeout; admittedArgv carries the flag only when asked', async () => {
