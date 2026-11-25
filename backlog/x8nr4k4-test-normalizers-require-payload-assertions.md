@@ -19,4 +19,4 @@ The no-code tests compared dispatch rows after stripping `operatorAnswer`, so de
 
 ## Origin
 
-PR #7480 review, 2026-11-25: correctness/coverage finding 1, security/test-coverage finding 1, and simplicity/codex advisory payload suggestions. Immediate assertions are in `scripts/conveyor/__tests__/no-code-rearm.test.mjs` and both no-code soak scenarios.
+PR #7480 review, 2026-11-25: correctness/coverage finding 1, security/test-coverage finding 1, and simplicity/codex advisory payload suggestions. Immediate assertions are in `we:scripts/conveyor/__tests__/no-code-rearm.test.mjs` and both no-code soak scenarios.

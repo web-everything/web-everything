@@ -20,4 +20,4 @@ PR #7480's successful no-code handoff produced a stale note that the publisher t
 
 ## Origin
 
-PR #7480 review, 2026-11-25: correctness/correctness finding 2. Immediate proof: `successful handoff publishes no new decision ask (human=%s)` in `scripts/conveyor/__tests__/no-code-rearm.test.mjs` and the `no-code-rearm-handoff` soak.
+PR #7480 review, 2026-11-25: correctness/correctness finding 2. Immediate proof: `successful handoff publishes no new decision ask (human=%s)` in `we:scripts/conveyor/__tests__/no-code-rearm.test.mjs` and the `no-code-rearm-handoff` soak.

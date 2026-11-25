@@ -19,4 +19,4 @@ PR #7480 claimed a replay against real incident states, while its committed test
 
 ## Origin
 
-PR #7480 review, 2026-11-25: security/test-coverage finding 2 and the simplicity/codex advisory real-state replay suggestions. `scripts/conveyor/stand-down-answer.md` distinguishes reconstructed automated coverage from the unverified manual claim.
+PR #7480 review, 2026-11-25: security/test-coverage finding 2 and the simplicity/codex advisory real-state replay suggestions. `we:scripts/conveyor/stand-down-answer.md` distinguishes reconstructed automated coverage from the unverified manual claim.

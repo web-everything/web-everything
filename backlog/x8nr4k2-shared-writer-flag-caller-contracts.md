@@ -19,4 +19,4 @@ PR #7480 extended head pinning into a red-team refusal and blocked the orphan gu
 
 ## Origin
 
-PR #7480 review, 2026-11-25: correctness/correctness finding 1 and security/delivery-stability finding 1. The immediate regression test lives in `scripts/conveyor/__tests__/no-code-rearm.test.mjs` (`orphan guard argv still rearms a repaired PR carrying %s`).
+PR #7480 review, 2026-11-25: correctness/correctness finding 1 and security/delivery-stability finding 1. The immediate regression test lives in `we:scripts/conveyor/__tests__/no-code-rearm.test.mjs` (`orphan guard argv still rearms a repaired PR carrying %s`).
