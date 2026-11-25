@@ -478,6 +478,9 @@ describe('createEnqueueOnEvent', () => {
     const tail = 'merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass\n    at readFastDrainContext (x.mjs:1:1)\n';
     expect(enqueueModule.firstStderrErrorLine(preamble + tail)).toBe('merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'.replace(/[^\x20-\x7e]/g, ' '));
     expect(enqueueModule.firstStderrErrorLine(preamble + 'opaque')).toBe('[unclassified stderr; see local log]');
+    // an arbitrary prefixed tail never publishes, and an earlier real error is not hidden by a later one
+    expect(enqueueModule.firstStderrErrorLine(preamble + 'response ✗ Error: opaque-private-value-123')).toBe('[unclassified stderr; see local log]');
+    expect(enqueueModule.firstStderrErrorLine('TypeError: primary failure\n' + tail)).toBe('TypeError: primary failure');
   });
 
   it('firstStderrErrorLine skips node deprecation/experimental warning noise but keeps real errors', () => {

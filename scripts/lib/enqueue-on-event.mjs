@@ -761,7 +761,8 @@ const STDERR_LINE_MAX = 200;
 const NODE_WARNING_NOISE = /^(?:\(node:\d+\) (?:\[DEP\d+\] )?(?:Deprecation|Experimental)Warning:|\(Use `node --trace-(?:deprecation|warnings)\b)/;
 const KNOWN_ERROR_SHAPE = /^(?:\w*Error\b|error:|npm ERR!|ERR!|ERR_\w+|FAIL\b|fatal:|✗|×)/i;
 // The ✗ marker is already blanked by the printable-ASCII allowlist when this runs: "merge-ai-prs ✗ Error: x" is "merge-ai-prs   Error: x".
-const SCRIPT_FAILURE_LINE = /^[\w.-]+ {2,}(?:\w*Error\b|error:|fatal:)/i;
+// Only the drain's own top-level handler line (fixed prefix), never an arbitrary "<word>  Error:" line.
+const SCRIPT_FAILURE_LINE = /^merge-ai-prs {2,}Error: fast-drain: [\w :,/()-]{1,160}$/;
 const UNCLASSIFIED_STDERR ='[unclassified stderr; see local log]';
 const SECRET_LINE =/gh[pousr]_|github_pat_|\bsk-|xox[a-z]-|bearer|authorization|passw|secret|token|api[_-]?key|credential|private key/i;
 const SECRET_ENV_KEY = /secret|token|key|passw|auth|cred|url|dsn|database|conn|sign|cert|session/i;
@@ -804,7 +805,9 @@ export function firstStderrErrorLine(stderr, env = {}) {
   const lines = raw.split(/\r?\n/).map(l => l.replace(UNSAFE_LOG_CHARS, ' ').trim()).filter(Boolean);
   // A script's own failure line ("merge-ai-prs ✗ Error: ...") is the real cause: it comes after policy/warning preamble, so prefer it
   // over the first line (DRAIN-FASTDRAIN-CRASH: four fast drains logged "unclassified" while the cause sat in the tail).
-  const failure = lines.find(l => SCRIPT_FAILURE_LINE.test(l));
+  // An earlier genuine error line wins: the tail never hides the original diagnostic.
+  const firstReal = lines.find(l => !NODE_WARNING_NOISE.test(l));
+  const failure = firstReal && KNOWN_ERROR_SHAPE.test(firstReal) ? undefined : lines.find(l => SCRIPT_FAILURE_LINE.test(l));
   const line = failure ?? lines.find(l => !NODE_WARNING_NOISE.test(l));
   if (!line) return '';
   // After skipping warning noise the picked line is not the formerly protected first line: allowlist known error shapes only.
