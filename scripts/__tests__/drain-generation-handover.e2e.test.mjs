@@ -43,7 +43,13 @@ const canReap = await (async () => {
   const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 50);' });
   const l = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});process.exit(0)`], { detached: true, stdio: 'ignore' });
   await new Promise((r) => l.on('exit', r));
-  for (let i = 0; i < 100; i++) { try { process.kill(-l.pid, 0); } catch (e) { return e.code === 'ESRCH'; } await sleep(20); }
+  for (let i = 0; i < 100; i++) {
+    try { process.kill(-l.pid, 0); } catch (e) {
+      if (e.code === 'ESRCH') return true;
+      if (e.code !== 'EPERM') return false;
+    }
+    await sleep(20);
+  }
   return false; // measured with raw kill(-pgid, 0), never with the barrier under test
 })();
 

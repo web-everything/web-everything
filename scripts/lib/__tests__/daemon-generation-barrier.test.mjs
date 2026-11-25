@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   awaitGroupDeath, decidePromotion, mayHandOver, settleDecision, scanNewSessionSpawns, MERGE_CAPABLE_SPAWN_ALLOWLIST,
@@ -19,7 +20,13 @@ const canReap = await (async () => {
   const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 50);' });
   const l = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});process.exit(0)`], { detached: true, stdio: 'ignore' });
   await new Promise((r) => l.on('exit', r));
-  for (let i = 0; i < 100; i++) { try { process.kill(-l.pid, 0); } catch (e) { return e.code === 'ESRCH'; } await realSleep(20); }
+  for (let i = 0; i < 100; i++) {
+    try { process.kill(-l.pid, 0); } catch (e) {
+      if (e.code === 'ESRCH') return true;
+      if (e.code !== 'EPERM') return false;
+    }
+    await realSleep(20);
+  }
   return false;
 })();
 
@@ -41,6 +48,48 @@ describe('awaitGroupDeath', () => {
     const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null, killGroup: () => { throw errCode('EPERM'); }, sleep: async () => {}, timeoutMs: 30 });
     expect(res).toBe('unknown');
   });
+  it('keeps polling through EPERM then confirms ESRCH', async () => {
+    const probes = ['EPERM', 'ESRCH'];
+    let sleeps = 0;
+    const res = await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null,
+      killGroup: () => { throw errCode(probes.shift()); },
+      sleep: async () => { sleeps++; }, probeMs: 10, timeoutMs: 30 });
+    expect(res).toBe('dead');
+    expect(sleeps).toBe(1);
+    expect(probes).toEqual([]);
+  });
+  it('bounds persistent EPERM at the timeout', async () => {
+    const waits = [];
+    let probes = 0;
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null,
+      killGroup: () => { probes++; throw errCode('EPERM'); },
+      sleep: async (ms) => { waits.push(ms); }, probeMs: 10, timeoutMs: 25 })).toBe('unknown');
+    expect(waits).toEqual([10, 10, 5]);
+    expect(probes).toBe(4);
+  });
+  it.each([['reused', 'other'], ['unreadable', undefined]])('refuses %s identity after EPERM', async (_name, observed) => {
+    const identities = [null, observed];
+    let probes = 0;
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => identities.shift(),
+      killGroup: () => { probes++; throw errCode('EPERM'); }, sleep: async () => {},
+      probeMs: 10, timeoutMs: 30 })).toBe('unknown');
+    expect(probes).toBe(1);
+  });
+  it('returns unknown immediately for an unexpected probe error', async () => {
+    let sleeps = 0;
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null,
+      killGroup: () => { throw errCode('EIO'); }, sleep: async () => { sleeps++; } })).toBe('unknown');
+    expect(sleeps).toBe(0);
+  });
+  it.each([{ probeMs: Infinity }, { timeoutMs: Infinity }])('refuses an unbounded retry interval %j', async (patch) => {
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => null,
+      killGroup: () => { throw new Error('must not probe'); }, sleep: async () => {}, ...patch })).toBe('unknown');
+  });
+  it.each([['recorded live leader', 'n'], ['undefined identity evidence', undefined]])(
+    'refuses ESRCH with %s', async (_name, observed) => {
+      expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => observed,
+        killGroup: () => { throw errCode('ESRCH'); }, sleep: async () => {} })).toBe('unknown');
+    });
   it('is unknown without a recorded start identity, or when the pgid was reused', async () => {
     const dead = () => { throw errCode('ESRCH'); };
     expect(await awaitGroupDeath({ pgid: 4242, probeIdentity: () => null, killGroup: dead, sleep: async () => {} })).toBe('unknown');
@@ -132,14 +181,95 @@ describe('new-session spawn allowlist', () => {
     ["// osascript\nspawn('gh', a, { detached: true })"],
     ["spawn('gh', a, { detached: true }) // osascript"],
     ["/* deps-job */ spawn('gh', a, { detached: true })"],
+    ["// lane/* base\nspawn('gh', a, { detached: true });\n/* real comment */"],
+    ["const glob = 'lane/*';\nspawn('gh', a, { detached: true });\n/* real comment */"],
+    ['const glob = `lane/*`;\nspawn("gh", a, { detached: true });\n/* real comment */'],
+    ["opts.detached = true; spawn('gh', a, opts)"],
+    ["opts['detached'] = true; spawn('gh', a, opts)"],
+    ["opts[`detached`] = true; spawn('gh', a, opts)"],
+    ["opts['de' + 'tached'] = true; spawn('gh', a, opts)"],
+    ["opts.detached ||= true; spawn('gh', a, opts)"],
+    ["opts.detached++; spawn('gh', a, opts)"],
+    ["++opts['detached']; spawn('gh', a, opts)"],
+    ["[opts.detached] = [true]; spawn('gh', a, opts)"],
+    ["({ value: opts.detached } = source); spawn('gh', a, opts)"],
+    ["Object.defineProperty(opts, 'detached', { value: true }); spawn('gh', a, opts)"],
+    ["Reflect.set(opts, 'detached', true); spawn('gh', a, opts)"],
+    ["spawn('gh', a, { get detached() { return true; } })"],
+    ["spawn('gh', a, { ['de' + 'tached']: true })"],
+    ["spawn('gh', a, { ['de\\u0074ached']: true })"],
+    ["spawn('launch' + 'ctl', ['submit', '-l', 'job', '--', 'gh'])"],
+    ['spawn(`launch${"ctl"}`, ["submit"])'],
+    ['spawn("sh", ["-c", `launchctl submit -l job -- ${command}`])'],
+    ['spawn("sh", ["-c", `${prefix} launchctl submit -- ${command}`])'],
+    ['spawn("sh", ["-c", `${prefix} launchctl submit -- gh`])'],
+    ["spawn('launchctl', ['submit', '-l', 'job', '--', 'gh', 'pr', 'merge'])"],
+    ["spawn('/bin/sh', ['-c', 'launchctl submit -l job -- gh pr merge'])"],
+    ["setpgid(0, 0)"],
+    ["setpgrp()"],
+    ["// lane/* base\r\nspawn('gh', a, { detached: true });\r\n/* real comment */"],
+    ["// lane/* base\u2028spawn('gh', a, { detached: true });\u2029/* real comment */"],
+    ['const url = "https://example.test/lane/*";\nspawn("gh", a, { detached: true });\n/* real comment */'],
+    ['const glob = /lane\\/\\*/;\nspawn("gh", a, { detached: true });\n/* real comment */'],
+    ['const glob = `lane/* ${spawn("gh", a, { detached: true })}`;\n/* real comment */'],
+    ['spawn(process.execPath, ["-e", "spawn(\'gh\', a, { detached: true })"])'],
+    ['const childSource = "opts[\'detached\'] = true; spawn(\'gh\', a, opts)"'],
   ])('flags %s', (src) => expect(scanNewSessionSpawns(src)).toHaveLength(1));
+  it.each(['osascript', 'deps-job'])('rejects a detached spawn adjacent to %s', (command) => {
+    const file = command === 'osascript' ? 'branch-sync.mjs' : 'deps-job.mjs';
+    const src = `spawn('${command}', a, { detached: true });\nspawn('gh', a, { detached: true });`;
+    expect(scanNewSessionSpawns(src, { file })).toEqual([{ line: 2, text: 'detached: true' }]);
+    expect(scanNewSessionSpawns(`const kind = '${command}';\nlog(kind);\nspawn('gh', a, { detached: true });`, { file })).toHaveLength(1);
+    expect(scanNewSessionSpawns(src.replace('\n', ' '), { file })).toHaveLength(1);
+  });
+  it('never borrows an exemption from another argument or a containing spawn', () => {
+    const file = 'branch-sync.mjs';
+    expect(scanNewSessionSpawns("spawn('gh', ['osascript'], { detached: true })", { file })).toHaveLength(1);
+    expect(scanNewSessionSpawns("spawn('osascript', [spawn('gh', a, { detached: true })], { detached: true })", { file })).toHaveLength(1);
+    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: opts.detached = true })", { file })).toHaveLength(1);
+    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: launchctl() })", { file })).toHaveLength(1);
+  });
+  it('refuses exemptions without the declared file and exact command', () => {
+    const src = "spawn('osascript', a, { detached: true })";
+    expect(scanNewSessionSpawns(src)).toHaveLength(1);
+    expect(scanNewSessionSpawns(src, { file: 'other.mjs' })).toHaveLength(1);
+    expect(scanNewSessionSpawns("spawn('gh', ['deps-job'], { detached: true })", { file: 'deps-job.mjs' })).toHaveLength(1);
+  });
+  it.each([undefined, null, 'spawn("gh", a, { detached: true'])('fails closed on unreadable source %s', (source) => {
+    expect(scanNewSessionSpawns(source)).toHaveLength(1);
+  });
   it('exempts only an allowlisted spawn on its own code line, and prose is not a spawn', () => {
-    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: true })")).toHaveLength(0);
+    expect(scanNewSessionSpawns("spawn('osascript', a, { detached: true })", { file: 'branch-sync.mjs' })).toHaveLength(0);
     expect(scanNewSessionSpawns("branch || 'detached HEAD'; const detached = x == null;")).toHaveLength(0);
     // the follow-up allowlist entry applies to its own file only
     const src = 'spawn(process.execPath, [entryPath], { cwd, env, detached: true })';
     expect(scanNewSessionSpawns(src, { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(0);
     expect(scanNewSessionSpawns(src, { file: 'other.mjs' })).toHaveLength(1);
+    expect(scanNewSessionSpawns(`${src}; spawn('gh', a, { detached: true })`, { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(1);
+    expect(scanNewSessionSpawns("spawn(process.execPath, [entryPath, 'gh'], { detached: true })", { file: 'daemon-jobs-runtime.mjs' })).toHaveLength(1);
+  });
+  it('detects canary detached spawns throughout every real scanned file', () => {
+    const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
+    for (const file of files) {
+      const source = readFileSync(join(root, file), 'utf8');
+      const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      expect(tree.parseDiagnostics, file).toEqual([]);
+      const positions = [];
+      const collect = (node) => {
+        if (ts.isBlock(node) || ts.isSourceFile(node)) positions.push(...node.statements.map((s) => s.getStart(tree)));
+        ts.forEachChild(node, collect);
+      };
+      collect(tree);
+      const sorted = [...new Set(positions)].sort((a, b) => a - b);
+      const stride = Math.max(1, Math.floor(sorted.length / 16));
+      for (const position of sorted.filter((_p, i) => i % stride === 0)) {
+        const canary = "spawn('gh', ['pr', 'merge'], { detached: true });\n";
+        const injected = source.slice(0, position) + canary + source.slice(position);
+        const line = tree.getLineAndCharacterOfPosition(position).line + 1;
+        expect(scanNewSessionSpawns(injected, { file: file.split('/').pop() }), `${file}:${line}`)
+          .toContainEqual({ line, text: 'detached: true' });
+      }
+    }
   });
   it('no merge-capable spawn outside the allowlist is detached or in a new session', () => {
     const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
