@@ -43,6 +43,28 @@ describe.each([
   ['mode router', dispatchReviewByMode], ['direct dispatcher', dispatchReview],
 ])('%s', (_entry, dispatch) => {
 describe.each([false, true])('session review head admission (wrapped=%s)', wrapReview => {
+  if (dispatch === dispatchReview) {
+    it('direct dispatcher: missing expected head is refused for a 9xxxxx smoke PR', () => {
+      const { options } = sessionFixture(wrapReview);
+      const result = dispatch({ ...options, pr: 900001, expectedHead: undefined });
+      expect(result).toMatchObject({ refused: true, outcome: 'refused-no-expected-head' });
+      expect(options.spawnAgent).not.toHaveBeenCalled();
+      expect(options.launchWrapped).not.toHaveBeenCalled();
+    });
+    it('direct dispatcher: the updated harness call shape (expectedHead, 9xxxxx PR) reaches the injected spawner', () => {
+      const { options } = sessionFixture(wrapReview);
+      const result = dispatch({ ...options, pr: 900001, expectedHead: head });
+      expect(result.refused).toBeUndefined();
+      expect(options.spawnAgent.mock.calls.length + options.launchWrapped.mock.calls.length).toBe(1);
+    });
+    it('direct dispatcher: a PROVIDED expected head is still checked', () => {
+      const { io, options } = sessionFixture(wrapReview);
+      io.liveHead.mockImplementation(() => 'b'.repeat(40));
+      expect(dispatch({ ...options, expectedHead: head })).toMatchObject({ refused: true, outcome: 'refused-head-moved' });
+      expect(options.spawnAgent).not.toHaveBeenCalled();
+      expect(options.launchWrapped).not.toHaveBeenCalled();
+    });
+  }
   it.each([
     ['missing expected head', undefined, head, 'refused-no-expected-head'],
     ['null expected head', null, head, 'refused-head-moved'],
