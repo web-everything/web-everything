@@ -73,9 +73,8 @@ describe('ci.yml lightweight required test gate', () => {
 });
 
 describe('ci.yml parallel coverage merge and host-path jobs', () => {
-  it('uses ten unit groups, nine coverage shards, and eight soak shards', () => {
+  it('uses ten unit groups and nine coverage shards', () => {
     expect(jobs['test-shard'].strategy.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
-    expect(jobs['soak-shard'].strategy.matrix.shard).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     const steps = jobs['test-shard'].steps;
     const covered = steps.find((s) => s.name?.startsWith('Unit suite shard'));
     const nocov = steps.find((s) => s.name?.startsWith('Unit suite no-coverage group'));
@@ -91,6 +90,18 @@ describe('ci.yml parallel coverage merge and host-path jobs', () => {
     const command = merge.steps.find((s) => s.run?.includes('coverage:merge')).run;
     expect(command).toContain(`--expect=${count}`);
     expect(command).toContain('coverage-shards --threshold=80');
+  });
+
+  it('uses scope-selected soak shards with a fixed eight-shard total', () => {
+    const soak = jobs['soak-shard'];
+    expect(soak.needs).toBe('daemon-soak-scope');
+    expect(soak.strategy.matrix.shard).toBe('${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}');
+    expect(jobs['daemon-soak-scope'].outputs.shards).toBe('${{ steps.scope.outputs.shards }}');
+    const scope = jobs['daemon-soak-scope'].steps.find(step => step.id === 'scope').run;
+    expect(scope).toContain("echo 'shards=[1,2,3,4,5,6,7,8]' >> \"$GITHUB_OUTPUT\"");
+    expect(scope).toContain("echo 'shards=[1]' >> \"$GITHUB_OUTPUT\"");
+    const command = soak.steps.find(step => step.run?.includes('npm run test:soak:shard')).run;
+    expect(command).toContain('npm run test:soak:shard -- --shard=${{ matrix.shard }}/8');
   });
 
   it('merges only after successful full-run shards, using npm without FUI', () => {

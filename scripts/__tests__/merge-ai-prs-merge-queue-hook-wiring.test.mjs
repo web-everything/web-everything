@@ -6,7 +6,7 @@
 import { daemonAppEnv } from './fixtures/daemon-app-env.mjs';
 import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -119,7 +119,10 @@ while (a[0] === '-c') a = a.slice(2);
 if (a[0] === 'ls-remote') fs.appendFileSync(process.env.MQ_FIXTURE + '.refresh-pins', a.join(' ') + '\\n');
 if (a[0] === 'fetch') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-fetches', a.join(' ') + '\\n');
 if (a[0] === 'merge-tree') fs.appendFileSync(process.env.MQ_FIXTURE + '.rebase-trees', a.join(' ') + '\\n');
-if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-mq.git\\n');
+if (a[0] === 'remote' && a[1] === 'get-url') {
+  const sibling = { frontierui: 'frontier-ui/frontierui', 'plateau-app': 'plateauapp/plateau-app' }[require('node:path').basename(process.cwd())];
+  process.stdout.write(sibling ? 'git@github.com:' + sibling + '.git\\n' : 'git@github.com:fixture/drain-mq.git\\n');
+}
 const db = JSON.parse(fs.readFileSync(process.env.MQ_FIXTURE, 'utf8'));
 const diffPrs = Array.isArray(db) ? db : Object.values(db.repos).flat();
 ${pinnedPrDiffFixture}
@@ -136,12 +139,10 @@ function runCli({ capabilityOff = false, hookOn, seedRefreshed = null, ages = [[
     for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit.replace('fixture/drain-mq.git', capabilityOff ? 'longshoreai/longshore.git' : 'web-everything/web-everything.git')]]) writeFileSync(join(bin, name), withFixtureEnv(code, { MQ_FIXTURE: fixture }), { mode: 0o755 });
     const head = number => approvedHeadPlan ? 'a'.repeat(40) : fixtureOid(`sha-${number}`);
     const comments = approvedHeadPlan ? [{ author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${head()} -->\n<!-- cleared-human: operator -->` }] : [];
-    const cwd = approvedHeadPlan ? join(dir, 'local') : dir;
-    if (approvedHeadPlan) {
-      mkdirSync(cwd);
-      // Provision the sibling read surface without creating or modifying any git metadata.
-      symlinkSync(join(dirname(script), '..'), join(dir, 'frontierui'), 'dir');
-    }
+    const cwd = join(dir, 'local');
+    mkdirSync(cwd);
+    // Every clone read is synthetic and owned by this fixture, including origin validation.
+    for (const name of ['frontierui', 'plateau-app']) mkdirSync(join(dir, name, '.git'), { recursive: true });
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,

@@ -13,6 +13,8 @@
  * of this family is most of scripts/, so a module two imports away is protected only if it is named here.
  */
 export const REVIEW_AUTH_FLOOR = Object.freeze([
+  // AUTH-BOUND-APPROVAL: the pinned approval trust root (App id, operator allowlist) and its writer.
+  'scripts/lib/approval-record.mjs', 'scripts/operations/approve-head.mjs',
   'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
   'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
   'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
@@ -132,6 +134,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/test-timeout-policy.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
+  // The policy watcher uses these expectations while holding its state lock.
+  'scripts/settings/actions-policy-watch.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
   'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json',
   // Read by card-number-ledger.mjs (landed on main since).
@@ -161,6 +165,8 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The policy watcher serializes dedupe state updates with an exclusive lock directory.
+  'scripts/conveyor/actions-policy-watch.mjs',
   // The record-only file-class writer reserves its evaluation output with an exclusive `wx` create.
   'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.

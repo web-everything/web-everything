@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
-import { leaseDisqualifiesAcquire } from '../../../lib/lane-lease.mjs';
+import { DEFAULT_LEASE_TTL_MINUTES, leaseDisqualifiesAcquire } from '../../../lib/lane-lease.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..', '..');
 const MARKER = 'scripts/lane-pool.mjs';
@@ -36,7 +36,10 @@ export async function replayAcquireDeadline({ waitMs = 30, reaperMs = 0, free = 
     flags: { 'no-free-list': true }, repo: { name: 'fixture', poolDir: '/fixture' },
     process: { env: {}, cwd: () => '/caller', stderr: { write() {} } },
     Date, Set, Number, Math, basename: path => path.split('/').pop(), sep: '/',
-    defaultSession: () => 'picker', ttlMsFromFlags: () => 60_000,
+    defaultSession: () => 'picker',
+    DEFAULT_LEASE_TTL_MINUTES,
+    ttlMinutesFromFlags: () => DEFAULT_LEASE_TTL_MINUTES,
+    ttlMsFromFlags: () => DEFAULT_LEASE_TTL_MINUTES * 60_000,
     reapDeadLeasesInPool: () => sleep(reaperMs), parseScopeFlag: () => [],
     existingLanes: () => [1], resolveReal: value => value, ownLaneNumber: () => null,
     acquireDefaultWaitMs: waitMs, acquireDefaultWaitInvalid: false,

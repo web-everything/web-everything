@@ -9,12 +9,16 @@ import { withFixtureEnv } from './with-fixture-env.mjs';
 
 export function createPrestageWorld(runCommand) {
   return async function world(fn, { slug = 'fixture/prestage', localSlug = slug, siblingCloneSource = null } = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+    const root = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+    const dir = join(root, 'local');
+    const cwd = dir;
     try {
-      const cwd = siblingCloneSource ? join(dir, 'local') : dir;
-      if (siblingCloneSource) {
-        mkdirSync(cwd);
-        symlinkSync(siblingCloneSource, join(dir, slug.split('/').at(-1)), 'dir');
+      mkdirSync(dir);
+      // Only explicit sibling tests use a clone. Non-repository placeholders keep
+      // startup fail-closed without cloning or probing a shared temp parent.
+      for (const name of ['frontierui', 'plateau-app']) {
+        if (siblingCloneSource && name === slug.split('/').at(-1)) symlinkSync(siblingCloneSource, join(root, name), 'dir');
+        else mkdirSync(join(root, name));
       }
       const bin = join(dir, 'bin'); mkdirSync(bin);
       mkdirSync(join(dir, 'backlog'));
@@ -45,6 +49,6 @@ export function createPrestageWorld(runCommand) {
         return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
       };
       await fn({pr,run,coord,ledger,slug,dir});
-    } finally { rmSync(dir,{recursive:true,force:true}); }
+    } finally { rmSync(root,{recursive:true,force:true}); }
   };
 }

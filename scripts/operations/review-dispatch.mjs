@@ -124,6 +124,7 @@ import { isRealHead } from '../lib/red-team-skip-outcome.mjs';
  */
 
 import { resolveOperationEffort, resolveOperationRoute, readRoutingPolicy } from '../lib/dispatch-routing-policy-io.mjs';
+import { claudeLaunchRouteFor } from '../lib/dispatch-routing-policy.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
 import { execFileSync } from 'node:child_process';
@@ -178,7 +179,7 @@ import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
-import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
+import { assertWrappedClaudeStarted, launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 // re-exported so nothing that already imports `reviewSessionSlug` from this file has to change (#3437) — the
 // slug itself now lives in `we:scripts/conveyor/review-session-slug.mjs`, a PURE module both this file and
@@ -637,6 +638,7 @@ export function dispatchReview({
   // `--json-schema`, a v2 completion record) instead of `claude --bg`. `false` keeps the old spawn byte for byte.
   wrapReview = workerWrapperEnabledFor('review'),
   launchWrapped = launchWrappedClaudeWorker,
+  resolveRoute = resolveOperationRoute,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: true });
@@ -708,10 +710,15 @@ export function dispatchReview({
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
   if (wrapReview) {
+    // The session is the Claude supervisor; judgeProvider selects a child juror, including Antigravity.
+    const executor = 'claude';
     const launched = launchWrapped({
       role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
       model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+      route: claudeLaunchRouteFor({ policyRoute: resolveRoute({ operation: 'review' }), executor,
+        reason: 'review-dispatch: inherited Claude review tier' }),
     });
+    assertWrappedClaudeStarted(launched);
     return {
       sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
       unknownTokens, judgeProvider, wrapped: true,

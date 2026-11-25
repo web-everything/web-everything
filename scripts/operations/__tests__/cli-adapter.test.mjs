@@ -5,7 +5,9 @@ import { advance, startRun } from '../engine.mjs';
 import { notApplied, retryableWarning } from '../effect-executor.mjs';
 import { createRegistry, op } from '../registry.mjs';
 import { createMemoryRunStore, isRunRecordTerminal } from '../run-store.mjs';
-import { effect } from '../step-kinds.mjs';
+import { EventEmitter } from 'node:events';
+import { judgeSpawn } from '../../lib/judge-spawn.mjs';
+import { judge as judgeStep, effect } from '../step-kinds.mjs';
 
 function fixture(prefix = []) {
   const registry = createRegistry();
@@ -159,3 +161,24 @@ describe('driveRun permanent guard refusal', () => {
     expect(note).not.toHaveBeenCalled();
   });
 });
+
+ it.each([false, true])('names a sleeping juror timeout and retains pending seats (parallel=%s)', async parallelJudges => {
+  const registry = createRegistry();
+  const request = () => ({ lens: 'correctness', providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' } });
+  registry.register(op('timeout-seat', { input: { head: { type: 'string' } }, judge: judgeStep({ request }), other: judgeStep({ request: () => ({ ...request(), lens: 'security' }) }) }));
+  const store = createMemoryRunStore();
+  const run = startRun({ op: 'timeout-seat', id: 'timeout-run', input: { head: 'a'.repeat(40) }, registry });
+  const spawnFn = vi.fn(() => {
+    const child = new EventEmitter();
+    child.stdin = Object.assign(new EventEmitter(), { end() {} });
+    child.kill = () => { queueMicrotask(() => child.emit('close', null, 'SIGKILL')); };
+    return child; // Silent until judge-spawn's real short timer kills it.
+  });
+  const judge = vi.fn(r => r.lens === 'security' ? { findings: [] } : judgeSpawn({ ...r, timeoutMs: 5, spawnFn, retries: 0, log() {} }));
+  const out = await driveRun({ run, registry, store, judge, parallelJudges, log() {} });
+  expect(out.stopped).toBe('juror-timeout');
+  expect(store.read(run.id).seatTimeouts).toEqual([expect.objectContaining({ step: 'judge', lens: 'correctness', provider: 'claude', model: 'sonnet', timeoutMs: 5, wallMs: expect.any(Number), head: run.input.head, at: expect.any(String) })]);
+  expect(store.read(run.id).pending.step).toBe('judge');
+  if (parallelJudges) expect(store.read(run.id).prefilledSeats[0].step).toBe('other');
+  expect(spawnFn).toHaveBeenCalledTimes(1);
+ });

@@ -1,8 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import { createUpdateBranchSinks } from '../update-branch-io.mjs';
 import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
+// Collect the operation registry before the per-test deadline, like the other CLI wiring suites.
+import { resolveOperation } from '../run.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -159,8 +161,13 @@ describe('update-branch', () => {
     });
   });
 
+  // Cold import of run.mjs loads the whole operations registry; keep it out of the test body's 5000 ms budget.
+  let resolveOperation;
+  beforeAll(async () => {
+    ({ resolveOperation } = await import('../run.mjs'));
+  }, 60000);
+
   it('declares required CLI inputs and prints exactly one JSON line through the engine', async () => {
-    const { resolveOperation } = await import('../run.mjs');
     const { declaration, registry, finish, sinks } = resolveOperation(UPDATE_BRANCH_OP);
     expect(declaration.name).toBe(updateBranchOperation().name);
     expect(typeof sinks[UPDATE_BRANCH_OP]).toBe('function');

@@ -19,6 +19,7 @@ import { acquireSmokeSlot, behindMainPriority } from '../daemon-smoke-slots.mjs'
 import { withWriteLock, inspectCloneLock } from '../daemon-clone-lock.mjs';
 import { runForceWatchTick, readForceAdopt, forceBlockedReason } from '../daemon-force-adopt.mjs';
 import { finalizeRebuild } from './adopt.mjs';
+import { makeAuditedTipGate } from './audited-tip.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
   REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
@@ -262,6 +263,7 @@ async function forceWatchAtTick(options, emitEvent, startedAtMs, readers) {
           }
           const done = await finalizeRebuild({
             root, env, log, run, stateOpts, now, prevHead: head, lease: { token: 'force-adopt-rollback' },
+            auditedTip: makeAuditedTipGate(stEnv),
             plan: { ok: true, finalSha: lastGood.head, inputsKey: lastGood.inputsKey, mainSha: lastGood.mainSha, applied: lastGood.applied || [] },
           });
           rolledBack = done?.adopted === true;

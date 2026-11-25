@@ -418,7 +418,7 @@ async function checkLaneAcquireRelease(ctx) {
     // this gate spawns, never just some of them, or an isolated caller's pool override is only PARTLY honored.
     const acquire = () => runChild('node', [
       'scripts/lane-pool.mjs', 'acquire', '--purpose=smoke', `--session=${sessionSlug}`,
-      `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--json',
+      `--wait-ms=${budgets.laneAcquireWaitMs}`, '--ttl-minutes=10', '--exact-ttl', '--json',
     ], {
       cwd: root, timeoutMs: acquireCapMs, env,
     });
@@ -670,7 +670,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "  dispatchFix(",
   "    { itemNum: null, pr: 900002, laneRef: 'lane/900002-smoke-fix', scope: ['we:scripts/lib/daemon-live-smoke.mjs'], lane: 90101, headRefOid: null },",
   "    // recordAdvisor: a dry run is not a real fix run, so it never lands in the advisor trial's per-run ledger (#x331b7u).",
-  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {} },",
+  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {}, readPushHold: () => null },",
   "  );",
   "  checkFilled(captured, 'fix PR #900002', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND.fix);",
   "});",

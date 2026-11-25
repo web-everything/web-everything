@@ -9,7 +9,7 @@ const SOURCE = 'scripts/conveyor/fix-claim-store.mjs';
 export default {
   id: 'push-gate-valid-neighbor',
   title: 'Git-valid live and expired neighboring claims preserve unrelated push authority',
-  card: 'x1b8hlo',
+  card: '5726',
   fixedBy: { sha: 'HEAD', where: 'lane/push-gate-s1', paths: [SOURCE] },
   fixPresent(root) {
     return readFileSync(join(root, SOURCE), 'utf8').includes('function isCanonicalClaimBranch(');

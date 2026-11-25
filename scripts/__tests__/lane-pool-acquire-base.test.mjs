@@ -304,7 +304,7 @@ describe('lane-pool acquire --purpose=workflow-lane marks the lease (#2413)', ()
   it('stamps workflowLane:true and the LANE_SESSION slug into the lease', () => {
     provision(1);
     const r = runPool(
-      ['acquire', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main', '--no-install', '--lane=1', '--purpose=workflow-lane', '--ttl-minutes=90', '--json'],
+      ['acquire', `--origin=${originDir}`, `--reference=${referenceDir}`, '--name=basetest', '--branch=main', '--no-install', '--lane=1', '--purpose=workflow-lane', '--ttl-minutes=90', '--exact-ttl', '--json'],
       { LANE_POOL_ROOT: poolRoot, LANE_SESSION: 'batch-x-2427' },
     );
     expect(r.code).toBe(0);

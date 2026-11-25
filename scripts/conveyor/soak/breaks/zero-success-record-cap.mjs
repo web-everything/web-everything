@@ -9,7 +9,7 @@ const MINUTE = 60_000;
 export default {
   id: 'zero-success-record-cap',
   title: 'busy failing loops retain bounded evidence across the zero-success alarm window',
-  card: 'PR #7417 red-team send-back x1b8hlo item 1',
+  card: 'PR #7417 red-team send-back 5726 item 1',
   fixedBy: { sha: 'HEAD', where: 'zero-success retention', paths: ['scripts/conveyor/health-loop-ticks.mjs'] },
   fixPresent(root) {
     // Behavioral check against the selected tree, independent of source markers and the scenario judge.
