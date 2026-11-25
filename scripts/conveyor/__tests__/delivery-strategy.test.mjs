@@ -415,7 +415,13 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
     expect(decisionFindings({ record, table: changed, settings, strategies })).toEqual([]);
     const points = [{ at, candidates: [{ id: '#example', planOrder: 1, inputs: recorded }], expected: { order: ['#example'], outputs: { '#example': got } } }];
     expect(replayFindings({ table: changed, settings, points, strategies })).toEqual([]);
-    expect(decisionFindings({ record, table: changed, settings }).some((f) => f.includes('SHIP-WM-161'))).toBe(true);
+    // Missing contracts are refused at table load, before decision replay.
+    expect(decisionFindings({ record, table: changed, settings })).toEqual([
+      `table ${changed.name}@${changed.version}: strategy x-custom has no contract: refused (SHIP-WM-154)`,
+    ]);
+    expect(select({ table: changed, settings, inputs: recorded, at })).toMatchObject({
+      rule: 'unconfigured', strategy: 'unhandled', build: false, reason: 'EVIDENCE_UNKNOWN',
+    });
     expect(replayFindings({ table: changed, settings, points }).length).toBeGreaterThan(0);
   });
   it.each(DECISION_FIELDS)('SHIP-WM-162: decision missing %s is refused', (field) => {
