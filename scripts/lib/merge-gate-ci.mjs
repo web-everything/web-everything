@@ -469,6 +469,33 @@ function loadGateSetting(key, envName, { env = process.env, platformPath = PLATF
 }
 
 /**
+ * The CLOSED allow-list of failure kinds shadow mode may turn into exit 0 (PRT-SHADOW-HOLD). Only `red-main-freeze`
+ * (set in evaluatePrGates: no shared freeze source yet / main red), the advisory rule shadow mode exists to observe.
+ * Everything else, an unknown or missing id included, keeps the gate failing.
+ */
+export const SHADOW_ADVISORY_IDS = Object.freeze(['red-main-freeze']);
+
+/**
+ * True only when EVERY reason the report fails is an allow-listed advisory row. Fails closed on an empty or stripped
+ * report, a failed workflow self-check, a group/membership failure (those change `reason` away from the PR-derived
+ * one), a verdict that disagrees with its rows, or any blocking row outside the allow-list. Pure.
+ */
+function shadowMaskable(report) {
+  if (report.workflowCheck?.ok !== true || !report.prs.length) return false;
+  let blockingRows = 0;
+  for (const p of report.prs) {
+    if (typeof p?.ok !== 'boolean' || !Array.isArray(p.results) || !p.results.length) return false;
+    const blocking = p.results.filter((x) => BLOCKING.has(x?.status));
+    if (p.ok !== (blocking.length === 0)) return false;
+    if (blocking.some((x) => !SHADOW_ADVISORY_IDS.includes(x.id))) return false;
+    blockingRows += blocking.length;
+  }
+  if (!blockingRows) return false;
+  const bad = report.prs.filter((p) => !p.ok).map((p) => `#${p.num}`).join(', ');
+  return report.reason === 'held' || report.reason === `held: ${bad}`;
+}
+
+/**
  * Apply the mode to one merge-gate-check.mjs run. `report` is its parsed `--json` output (or null), `childStatus`
  * its exit code. A verdict is trusted only when the report is well-formed AND agrees with the exit code (ok ↔ 0,
  * hold ↔ 1); anything else is "no verdict" and its non-zero exit passes through in both modes. Pure.
@@ -483,10 +510,13 @@ export function applyGateMode({ mode, source, childStatus, report }) {
     const line = `merge-gate: no verdict (exit ${childStatus}, ${wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
     return { exitCode, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
   }
-  const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
-  const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
-  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
-  const exitCode = report.ok || shadowLine ? 0 : 1;
+  const fmt = (p) => { try { return formatPrResult(p); } catch { return `#${p?.num}: unreadable PR result`; } };
+  const rowsOf = (p) => (Array.isArray(p?.results) ? p.results : []);
+  const table = [...report.prs.map(fmt), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
+  const holds = [...new Set(report.prs.flatMap((p) => rowsOf(p).filter((x) => BLOCKING.has(x?.status)).map((x) => x?.id)))];
+  const masked = !report.ok && mode === 'shadow' && shadowMaskable(report);
+  const shadowLine = masked ? `SHADOW: would HOLD on ${holds.join(', ')}` : null;
+  const exitCode = report.ok || masked ? 0 : 1;
   const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
   const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
   return { exitCode, holds, text, summary };

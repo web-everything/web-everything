@@ -1393,7 +1393,7 @@ describe('mergeGate.mode resolves through the policy cascade', () => {
 describe('applyGateMode changes only the exit code', () => {
   const held = evaluatePrGates(facts({ redMain: { source: null } }), {});
   const passing = evaluatePrGates(facts(), {});
-  const report = (prs) => ({ ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs });
+  const report = (prs) => ({ ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', workflowCheck: { ok: true }, prs });
 
   it('shadow: a HOLD verdict exits 0 and names the holding rules', () => {
     expect(held.ok).toBe(false);
@@ -1423,10 +1423,77 @@ describe('applyGateMode changes only the exit code', () => {
     }
   });
 
-  it('a hold that is not one rule (workflow self-check) is still named in shadow', () => {
-    const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: { ok: false, reason: 'workflow self-check failed — fail closed: x', prs: [passing] } });
-    expect(out.exitCode).toBe(0);
-    expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
+  // Shadow masks ONLY the closed allow-list (red-main-freeze, produced at merge-gate-ci.mjs "red-main-freeze").
+  // Every other failure keeps the gate failing (PRT-SHADOW-HOLD, operator ruling 2026-11-24).
+  const shadowExit = (rep) => applyGateMode({ mode: 'shadow', source: 'repo', childStatus: 1, report: rep }).exitCode;
+  const row = (id, status = 'hold') => ({ id, status, reason: 'x' });
+  const pr = (rows, num = 1) => ({ num, ok: !rows.some((x) => ['hold', 'fail-closed'].includes(x.status)), results: rows, blocking: [] });
+  const rep = (prs, extra = {}) => ({ ok: false, reason: 'held', workflowCheck: { ok: true }, prs, ...extra });
+
+  it('shadow still masks the allow-listed advisory failure (red-main-freeze), and only that', () => {
+    expect(shadowExit(rep([pr([row('red-main-freeze', 'fail-closed')])]))).toBe(0);
+    expect(shadowExit(rep([pr([row('red-main-freeze', 'hold')])]))).toBe(0);
+    expect(shadowExit(rep([held]))).toBe(0);
+  });
+
+  it('shadow mode keeps a human-only workflow-edit hold failing (real evaluatePrGates)', () => {
+    const wf = evaluatePrGates(facts({ gatePaths: { files: ['.github/workflows/ci.yml'] }, pinnedHead: { sha: 'a'.repeat(40) } }), {});
+    expect(wf.ok).toBe(false);
+    expect(shadowExit(rep([wf]))).toBe(1);
+    const unreadable = evaluatePrGates(facts({ gatePaths: { error: 'boom' }, pinnedHead: { sha: 'a'.repeat(40) } }), {});
+    expect(shadowExit(rep([unreadable]))).toBe(1);
+  });
+
+  it('shadow fails every non-allow-listed kind: unknown, missing, review-acceptance, test-gaming, ledger', () => {
+    for (const rows of [[row('bogus')], [{ status: 'hold', reason: 'x' }], [row('review-acceptance')], [row('review-acceptance', 'fail-closed')], [row('test-gaming')], [row('ledger', 'fail-closed')], [row('duplicate-id-on-main', 'fail-closed')]]) {
+      expect(shadowExit(rep([pr(rows)])), JSON.stringify(rows)).toBe(1);
+    }
+    expect(shadowExit(rep([pr([row('red-main-freeze'), row('review-acceptance')])]))).toBe(1);
+    expect(shadowExit(rep([pr([row('red-main-freeze')], 1), pr([row('test-gaming')], 2)]))).toBe(1);
+  });
+
+  it('shadow fails a PR-read failure (every gate fail-closed)', () => {
+    const readFail = evaluatePrGates({ prReadError: 'boom' }, {});
+    expect(shadowExit(rep([readFail]))).toBe(1);
+  });
+
+  it('shadow fails a failed workflow self-check, or a missing/false workflowCheck', () => {
+    const base = { reason: 'workflow self-check failed — fail closed: x; held' };
+    expect(shadowExit(rep([held], { ...base, workflowCheck: { ok: false, reason: 'x' } }))).toBe(1);
+    expect(shadowExit(rep([passing], { ...base, workflowCheck: { ok: false, reason: 'x' } }))).toBe(1);
+    expect(shadowExit(rep([held], { workflowCheck: undefined }))).toBe(1);
+    expect(shadowExit(rep([held], { workflowCheck: { ok: false } }))).toBe(1);
+    expect(shadowExit(rep([held], base))).toBe(1);
+  });
+
+  it('shadow fails a group membership failure even when the PRs pass or only red-main holds', () => {
+    for (const prs of [[passing], [held]]) {
+      const g = evaluateGroup(prs, { complete: false, reasons: ['unsure'] });
+      expect(g.ok).toBe(false);
+      expect(shadowExit({ ...g, workflowCheck: { ok: true } })).toBe(1);
+    }
+    expect(shadowExit({ ...evaluateGroup([], { complete: true }), workflowCheck: { ok: true } })).toBe(1);
+  });
+
+  it('shadow fails an empty or stripped report with a failing overall verdict', () => {
+    expect(shadowExit(rep([]))).toBe(1);
+    expect(shadowExit(rep([{ num: 1, ok: false, results: [] }]))).toBe(1);
+    expect(shadowExit(rep([{ num: 1, ok: false }]))).toBe(1);
+    expect(shadowExit(rep([{ num: 1, ok: false, results: [row('red-main-freeze', 'pass')] }]))).toBe(1);
+    expect(shadowExit(rep([{ ...held, results: held.results.filter((x) => x.id !== 'red-main-freeze') }]))).toBe(1);
+    expect(shadowExit(rep([passing]))).toBe(1);
+  });
+
+  it('shadow fails when the report verdict disagrees with its PRs or reason', () => {
+    expect(shadowExit(rep([held], { reason: 'something else' }))).toBe(1);
+    expect(shadowExit(rep([held], { reason: 'held: #999' }))).toBe(1);
+    expect(shadowExit(rep([{ ...held, ok: true }]))).toBe(1);
+  });
+
+  it('an unknown or empty mode is treated as enforce', () => {
+    for (const mode of ['bogus', '', undefined]) {
+      expect(applyGateMode({ mode, source: 'repo', childStatus: 1, report: report([held]) }).exitCode, String(mode)).toBe(1);
+    }
   });
 
   it('no verdict (crash, usage error, unparsable or inconsistent output) is never masked, even in shadow', () => {
@@ -1442,7 +1509,7 @@ describe('runGate (the workflow wrapper around merge-gate-check.mjs)', () => {
   const script = join(new URL('../../', import.meta.url).pathname, 'merge-gate-check.mjs');
   const heldReport = () => {
     const p = evaluatePrGates(facts({ redMain: { source: null } }), {});
-    return JSON.stringify({ ok: false, reason: 'held', prs: [p] });
+    return JSON.stringify({ ok: false, reason: 'held', workflowCheck: { ok: true }, prs: [p] });
   };
   const harness = (stdout, status) => {
     const calls = [];
