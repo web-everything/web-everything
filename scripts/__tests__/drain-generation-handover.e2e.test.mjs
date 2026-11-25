@@ -38,7 +38,7 @@ async function runHandover(sink, awaitDeath) {
 }
 
 // A container whose pid 1 never reaps leaves an exited orphan as a zombie that keeps `kill(-pgid, 0)` alive for
-// ever (fail closed: 'alive'); the ordering test needs a host that reaps (the drain host, CI), so it skips there.
+// ever (fail closed: 'alive'); allow that skip in containers, but require the proof on the Darwin drain host.
 const canReap = await (async () => {
   const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 50);' });
   const l = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});process.exit(0)`], { detached: true, stdio: 'ignore' });
@@ -54,7 +54,11 @@ const canReap = await (async () => {
 })();
 
 describe('generation handover (ordered exit)', () => {
-  it.skipIf(!canReap)('no green effect is recorded before the last blue-group effect', async () => {
+  it.runIf(process.platform === 'darwin')('requires the real ordering proof to run on the Darwin drain host', () => {
+    expect(canReap, 'The drain host must reap orphan groups; an ordering-proof skip is not acceptance evidence').toBe(true);
+  });
+
+  it.skipIf(!canReap).each([1, 2, 3])('no green effect is recorded before the last blue-group effect (repeat %i)', async () => {
     const sink = join(mkdtempSync(join(tmpdir(), 'gen-handover-')), 'sink.log');
     writeFileSync(sink, '');
     const { verdict, lines } = await runHandover(sink, awaitGroupDeath);

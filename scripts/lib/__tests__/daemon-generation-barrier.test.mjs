@@ -31,6 +31,23 @@ const canReap = await (async () => {
 })();
 
 describe('awaitGroupDeath', () => {
+  it.each([undefined, null, -2, 0, 1, 1.5, NaN, Infinity, '4242'])(
+    'refuses unsafe pgid %s before probing', async (pgid) => {
+      let probes = 0;
+      expect(await awaitGroupDeath({ pgid, identity: 'n', probeIdentity: () => { probes++; return null; },
+        killGroup: () => { probes++; throw errCode('ESRCH'); }, sleep: async () => {} })).toBe('unknown');
+      expect(probes).toBe(0);
+    });
+  it.each([
+    { probeMs: 0 }, { probeMs: -1 }, { probeMs: NaN }, { probeMs: '10' },
+    { timeoutMs: -1 }, { timeoutMs: NaN }, { timeoutMs: '10' },
+    { identity: '' },
+  ])('refuses invalid proof inputs %j before probing', async (patch) => {
+    let probes = 0;
+    expect(await awaitGroupDeath({ pgid: 4242, identity: 'n', probeIdentity: () => { probes++; return null; },
+      killGroup: () => { probes++; throw errCode('ESRCH'); }, sleep: async () => {}, ...patch })).toBe('unknown');
+    expect(probes).toBe(0);
+  });
   it.skipIf(!canReap)('is dead after a straggler grandchild of a real group exits', async () => {
     const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 400);' });
     const leader = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});setTimeout(()=>process.exit(0),50)`], { detached: true, stdio: 'ignore' });
@@ -117,6 +134,7 @@ describe('decidePromotion', () => {
     ['digest mismatch', { candidate: { ...good.candidate, codeDigest: 'zz' } }],
     ['expected digest missing', { expectedDigest: undefined }],
     ['in-flight unknown', { inFlight: undefined }],
+    ['in-flight negative', { inFlight: -1 }],
     ['exit code unknown', { exitCode: undefined }],
     ['exit code NaN', { exitCode: NaN }],
     ['candidate pid 0', { candidate: { ...good.candidate, pid: 0 } }],
@@ -129,6 +147,10 @@ describe('decidePromotion', () => {
       const r = decidePromotion({ ...good, ...patch, lastSendAt: 900, ghRequestTimeoutMs: 5000 });
       expect(r).toMatchObject({ promote: true, reconcileFirst: true, waitMs: 4900 });
     }
+  });
+  it('forwards a caller settle wait longer than the gh timeout', () => {
+    expect(decidePromotion({ ...good, exitCode: 1, lastSendAt: 900, ghRequestTimeoutMs: 5000, settleMs: 9000 }))
+      .toMatchObject({ promote: true, reconcileFirst: true, waitMs: 8900 });
   });
 });
 
