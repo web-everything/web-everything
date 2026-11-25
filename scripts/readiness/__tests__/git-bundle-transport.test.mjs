@@ -20,7 +20,7 @@ const git = (cwd, ...args) => {
   return r.stdout.trim();
 };
 const exec = async ({ file, args, cwd, input }) => {
-  const r = spawnSync(file, args, { cwd, input });
+  const r = spawnSync(file, args, { cwd, input, timeout: 30_000, killSignal: 'SIGKILL' });
   return { code: r.status ?? 254, stdout: r.stdout ?? Buffer.alloc(0), stderr: r.stderr ?? Buffer.alloc(0) };
 };
 const hash = (text) => createHash('sha256').update(text).digest('hex');
@@ -622,7 +622,7 @@ describe('R593 empty directory tree entries (R559)', () => {
   const emptyDirCommit = (name, repo = lane, parent = tip) => {
     const base = git(repo, 'rev-parse', `${parent}^{tree}`);
     const entries = git(repo, 'ls-tree', base).split('\n').filter(Boolean);
-    const mk = spawnSync('git', ['mktree'], { cwd: repo, input: `${entries.join('\n')}\n040000 tree ${EMPTY_TREE}\t${name}\n`, encoding: 'utf8' });
+    const mk = spawnSync('git', ['mktree'], { cwd: repo, input: `${entries.join('\n')}\n040000 tree ${EMPTY_TREE}\t${name}\n`, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' });
     if (mk.status !== 0) throw new Error(mk.stderr);
     const out = spawnSync('git', [...ident, 'commit-tree', mk.stdout.trim(), '-p', parent, '-m', 'empty dir'], { cwd: repo, encoding: 'utf8' });
     if (out.status !== 0) throw new Error(out.stderr);
@@ -636,9 +636,9 @@ describe('R593 empty directory tree entries (R559)', () => {
     await fs.mkdir(join(lane, 'pkg'));
     const parentSha = await commit(lane, { 'pkg/a.txt': 'a\n' }, 'pkg');
     const pkgTree = git(lane, 'rev-parse', `${parentSha}:pkg`);
-    const inner = spawnSync('git', ['mktree'], { cwd: lane, input: `100644 blob ${git(lane, 'rev-parse', `${parentSha}:pkg/a.txt`)}\ta.txt\n040000 tree ${EMPTY_TREE}\t${tokenDir}\n`, encoding: 'utf8' }).stdout.trim();
+    const inner = spawnSync('git', ['mktree'], { cwd: lane, input: `100644 blob ${git(lane, 'rev-parse', `${parentSha}:pkg/a.txt`)}\ta.txt\n040000 tree ${EMPTY_TREE}\t${tokenDir}\n`, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' }).stdout.trim();
     expect(inner).not.toBe(pkgTree);
-    const root2 = spawnSync('git', ['mktree'], { cwd: lane, input: `${git(lane, 'ls-tree', `${parentSha}^{tree}`).split('\n').filter(l => !l.endsWith('\tpkg')).join('\n')}\n040000 tree ${inner}\tpkg\n`, encoding: 'utf8' }).stdout.trim();
+    const root2 = spawnSync('git', ['mktree'], { cwd: lane, input: `${git(lane, 'ls-tree', `${parentSha}^{tree}`).split('\n').filter(l => !l.endsWith('\tpkg')).join('\n')}\n040000 tree ${inner}\tpkg\n`, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' }).stdout.trim();
     const head = spawnSync('git', [...ident, 'commit-tree', root2, '-p', parentSha, '-m', 'nested empty dir'], { cwd: lane, encoding: 'utf8' }).stdout.trim();
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ path: 'tree-entry-name', finding: 'github-token' });
   });
@@ -662,7 +662,7 @@ describe('R593 empty directory tree entries (R559)', () => {
   });
   it('still lists a gitlink when diff.ignoreSubmodules=all would hide it', async () => {
     const base = git(lane, 'ls-tree', `${tip}^{tree}`).split('\n').filter(Boolean);
-    const tree = spawnSync('git', ['mktree'], { cwd: lane, input: `${base.join('\n')}\n160000 commit ${tip}\tvendored\n`, encoding: 'utf8' }).stdout.trim();
+    const tree = spawnSync('git', ['mktree'], { cwd: lane, input: `${base.join('\n')}\n160000 commit ${tip}\tvendored\n`, encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' }).stdout.trim();
     const head = spawnSync('git', [...ident, 'commit-tree', tree, '-p', tip, '-m', 'gitlink'], { cwd: lane, encoding: 'utf8' }).stdout.trim();
     git(lane, 'config', 'diff.ignoreSubmodules', 'all');
     expect(await scanBundleRange({ cwd: lane, head, prerequisite: runnerMain, exec })).toMatchObject({ finding: 'gitlink' });

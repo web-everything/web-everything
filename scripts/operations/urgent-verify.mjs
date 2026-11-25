@@ -67,9 +67,11 @@ function supervisedSpawnSync(cmd, args, options) {
 // `decorate(deps, dir)` is a test seam: it may replace step functions of the scoped (worktree) deps.
 // `isolated: true` (the CLI default via urgentVerify) adds `isolate`; scoped deps are created with false so they never nest.
 export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = realFs, spawnSync = supervisedSpawnSync, env = process.env, decorate, isolated = false, stepHome, wrapperRoot, maxMinutes, deadline } = {}) {
-  // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 40).
+  // Wall-clock limit for the whole run (setting urgentVerify.maxMinutes via WE_URGENT_VERIFY_MAX_MINUTES, default 180).
+  // Full 17-step greens: 85.6 min (8e5fde5d1, 2026-11-19), 78.0 min (c673c976e, 2026-11-24).
+  // Keep at least 2x the measured baseline; the wall-clock regression test guards this headroom.
   // Scoped (worktree) deps inherit the parent's deadline so the limit covers the run, not each child.
-  const limitMin = Math.min(240, Math.max(0.01, Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 40));
+  const limitMin = Math.min(240, Math.max(0.01, Number(maxMinutes ?? env.WE_URGENT_VERIFY_MAX_MINUTES) || 180));
   deadline ??= Date.now() + limitMin * 60_000;
   const childEnv = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'TMP', 'TEMP', 'LANG', 'LC_ALL', 'SHELL', 'USER']
     .filter(k => typeof env[k] === 'string' && !env[k].includes(urgentKeyPath(home))).map(k => [k, env[k]]));
@@ -175,7 +177,7 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
       run('git', ['remote', 'add', 'origin', origin], dir);
       fs.writeFileSync(join(dir, '.git/objects/info/alternates'), `${objects}\n`);
       run('git', ['checkout', '-q', '--detach', sha], dir);
-      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd, deadline });
+      const scoped = createUrgentDeps({ cwd: dir, home, fs, spawnSync, env: { ...env, LANE_POOL_ROOT: admissionPool }, isolated: false, stepHome, wrapperRoot: cwd, maxMinutes: limitMin, deadline });
       if (scoped.head() !== sha) throw new Error('isolated checkout not at requested sha');
       return { deps: decorate ? decorate(scoped, dir) : scoped, cleanup };
     } catch (e) { cleanup(); throw e; }
@@ -241,7 +243,13 @@ export function createUrgentDeps({ cwd = process.cwd(), home = homedir(), fs = r
           ...command.slice(2), ...(group ? files : [`--shard=${shard}`])]);
       } catch (e) {
         // Hung-file report: assigned files that never printed a result line before the limit expired.
-        if (e.failure?.timedOut && group) e.failure.hungFiles = files.filter(f => !String(e.stdout ?? '').split(/\r?\n/).some(l => /^\s*[✓✗×❯↓]/.test(l) && l.includes(f))).slice(0, 20);
+        if (e.failure?.timedOut && group) {
+          const lines = String(e.stdout ?? '').split(/\r?\n/);
+          const unfinished = files.filter(f => !lines.some(l => /^\s*[✓✗×❯↓]/.test(l) && l.includes(f)));
+          e.failure.hungFiles = unfinished.slice(0, 20);
+          e.failure.hungFilesTotal = unfinished.length;
+          e.failure.hungFilesTruncated = unfinished.length > e.failure.hungFiles.length;
+        }
         throw e;
       }
       if (group === 'covered') {
