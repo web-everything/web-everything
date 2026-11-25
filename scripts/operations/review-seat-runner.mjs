@@ -96,8 +96,10 @@ export async function runSeatWithProvider(request, {
     try {
       const ran = await agyJuror({ request: plain, laneCwd: cwd, model: runModel });
       // A read_file void is a known-bad outcome that ran no model time: give its slot back. Never alters the result.
-      if (admission && releaseSession && ran?.status === 'voided'
-        && (ran.reasons ?? []).some(r => String(r).includes('read_file (missing or invalid in-lane path)'))) {
+      // Carbon shadows only, and only when that is the SOLE void reason (any write/checkout reason keeps its slot).
+      if (admission && carbonShadow && releaseSession && ran?.status === 'voided'
+        && ran.reasons?.length === 1
+        && /^(completed state-changing tool call\(s\): )?read_file \(missing or invalid in-lane path\)( \[[^\]]*\])?$/.test(String(ran.reasons[0]))) {
         try { releaseSession({ ...admission, now: now() }); } catch { /* best effort */ }
       }
       return ran;

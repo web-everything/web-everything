@@ -314,7 +314,7 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
         for (const path of paths) {
           const real = typeof path === 'string' && path.trim() && cwd && !path.includes('\0') ? canonicalPath(resolve(cwd, path)) : null;
           seenPaths.add(real ?? path);
-          if (typeof path === 'string') shown.add(path.length > 120 ? `${path.slice(0, 120)}...` : path);
+          if (typeof path === 'string') shown.add(path);
         }
         return !cwd || !paths.length || paths.some(p => typeof p !== 'string' || !p.trim()
           || readsOutside(p, laneRoots, cwd))
@@ -322,7 +322,7 @@ export function stateChangingToolCalls(transcriptText, { allowedRoots = [], home
       });
       if (invalid || seenPaths.size !== 1) {
         // Name the offending path(s) so a void can be diagnosed; outside-lane values are not echoed.
-        const named = [...shown].map(p => (cwd && !readsOutside(p, laneRoots, cwd) ? p : '<outside lane>')).slice(0, 4);
+        const named = [...shown].map(p => (cwd && !readsOutside(p, laneRoots, cwd) ? basename(p).slice(0, 80) : '<outside lane>')).slice(0, 4);
         out.push(`read_file (missing or invalid in-lane path)${named.length ? ` [${named.join(', ')}]` : ''}`);
       }
       continue;

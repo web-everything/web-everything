@@ -168,11 +168,24 @@ describe('agy Carbon seat slots (SHADOW-FIX-AGY-CARBON-SEATS)', () => {
       expect(reserveShadowSession({ dailyCap: 1, now: 1000, path }).allowed).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  const run = async (status, reasons, release) => {
-    const outcome = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode: 'shadow', model: 'm', dailyCap: 3 } }, {
+  it('a replayed or stale release cannot free a newer reservation, and refunds are bounded', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'shadow-replay-'));
+    try {
+      const path = join(dir, 'agree');
+      const first = reserveShadowSession({ dailyCap: 1, now: 1000, path });
+      expect(releaseShadowSession({ ...first, now: 1000, path })).toBe(true);
+      const second = reserveShadowSession({ dailyCap: 1, now: 1000, path });
+      expect(releaseShadowSession({ ...first, now: 1000, path })).toBe(false);
+      expect(reserveShadowSession({ dailyCap: 1, now: 1000, path }).allowed).toBe(false);
+      expect(releaseShadowSession({ ...second, now: 1000, path })).toBe(false); // refund budget (dailyCap) spent
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  const run = async (status, reasons, release, model) => {
+    vi.stubEnv('WE_REVIEW_SEAT_CAP_CARBON_SHADOW', '5');
+    const outcome = await runSeatWithProvider({ lens: 'correctness', seatProvider: { mode: 'shadow', model: model ?? 'gemini-4-carbon-high', dailyCap: 3 } }, {
       cwd: '.', unwrap: x => x, wrap: value => value,
       claudeJudge: async () => ({ value: { summary: 'Claude judged', findings: [] } }),
-      reserveSession: () => ({ allowed: true, slot: 0, day: 'd' }), releaseSession: release,
+      reserveSession: () => ({ allowed: true, slot: 0, day: 'd', token: 't', dailyCap: 3 }), releaseSession: release,
       agyJuror: async () => { if (status === 'throw') throw new Error('boom'); return { status, reasons }; },
       appendRow: () => true, log: () => {},
     });
@@ -184,12 +197,14 @@ describe('agy Carbon seat slots (SHADOW-FIX-AGY-CARBON-SEATS)', () => {
     expect(release).toHaveBeenCalledTimes(1);
     await run('voided', ['change outside the juror lane'], release);
     await run('failed', ['killed after 1200000 ms'], release);
+    await run('voided', ['read_file (missing or invalid in-lane path) [a.txt]', 'completed state-changing tool call(s): run_command'], release);
+    await run('voided', ['read_file (missing or invalid in-lane path) [a.txt]'], release, 'gemini-3-pro');
     expect(release).toHaveBeenCalledTimes(1);
   });
   it('the live decision is identical with the release on, off and throwing', async () => {
     const reasons = ['read_file (missing or invalid in-lane path) [a.txt]'];
     const on = await run('voided', reasons, vi.fn());
-    const off = await run('voided', reasons, undefined);
+    const off = await run('voided', reasons, null);
     const throwing = await run('voided', reasons, () => { throw new Error('release failed'); });
     expect(off).toBe(on);
     expect(throwing).toBe(on);

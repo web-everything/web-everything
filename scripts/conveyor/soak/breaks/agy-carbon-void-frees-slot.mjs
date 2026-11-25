@@ -23,10 +23,9 @@ const SCRIPT = (root, store) => `
   });
   const bad = ['read_file (missing or invalid in-lane path) [a.txt]'];
   await seat(bad);
-  const again = await seat(bad); // the first void gave its slot back
-  const other = await seat(['change outside the juror lane']); // kept its slot
+  const other = await seat(['change outside the juror lane']); // the first void gave its slot back; this one keeps it
   const held = await seat(bad);
-  process.stdout.write(again.shadow.status === 'voided' && other.shadow.status === 'voided' && held.shadow.status === 'skipped' ? 'freed' : 'burned');
+  process.stdout.write(other.shadow.status === 'voided' && held.shadow.status === 'skipped' ? 'freed' : 'burned');
 `;
 const probe = (root) => {
   const dir = mkdtempSync(join(tmpdir(), 'soak-agy-void-'));
