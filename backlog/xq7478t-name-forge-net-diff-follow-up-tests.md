@@ -19,9 +19,9 @@ separate from the pagination repair, as the review requests.
 - [A1] **Must** — map the rename card's A1 to `pure test rename matches real git tamper scan`,
   A2 to `rename proof binds both immutable endpoints and refuses incomplete metadata`,
   and A3 to `unsupported rename variants remain held`, planned in
-  `scripts/lib/__tests__/drain-api-reads.test.mjs`.
+  `we:scripts/lib/__tests__/drain-api-reads.test.mjs`.
 - [A2] **Must** — map the rename card's A4 to `proven pure test rename delivers and missing
-  mode-type proof parks`, planned in `scripts/__tests__/merge-ai-prs-forge-net-diff.test.mjs`.
+  mode-type proof parks`, planned in `we:scripts/__tests__/merge-ai-prs-forge-net-diff.test.mjs`.
   Names describe future coverage; do not claim the rename feature already exists.
 - [A3] **Must** — give the frontierui #53 acceptance a named, explicitly opt-in live test
   `frontierui 53 pinned compare scores the recorded base and complete diff`, with the

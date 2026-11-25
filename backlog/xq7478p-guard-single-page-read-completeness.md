@@ -18,7 +18,7 @@ class in future readers without changing unrelated admission policies in that re
 
 - [A1] **Must** — flag a single-page `per_page=N` read that accepts N results without
   proof of exhaustion. Planned test: `single-page reader accepting a full page is flagged`
-  in `scripts/lib/__tests__/paged-read-completeness-rule.test.mjs`.
+  in `we:scripts/lib/__tests__/paged-read-completeness-rule.test.mjs`.
 - [A2] **Must** — accept a bound shared by request and refusal, and a reader that follows
   pagination to exhaustion. Planned tests: `shared request and refusal bound passes` and
   `exhaustive pagination passes` in the same file.
