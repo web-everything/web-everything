@@ -594,9 +594,21 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
 // module's imports by the repo's import-graph scanner (`we:scripts/operations/__tests__/import-graph.mjs`),
 // which then resolved them against `scripts/lib/` and failed.
 /** Validate the stub's captured prompt; self-contained so the dry-run child embeds this same function. */
-export function checkFilled(promptText, label, canonicalize, requiredNames) {
+export function checkFilled(promptText, label, canonicalize, requiredNames, result) {
   const text = String(promptText ?? '');
   if (!text.trim()) {
+    if (arguments.length >= 5) {
+      const outcome = result?.held === true ? 'held:true' : result?.status
+        ?? (result?.refused ? 'refused' : result?.wrapped ? 'wrapped:true' : typeof result);
+      let evidence;
+      try { evidence = JSON.stringify(result?.reason ?? result?.outcome ?? result?.why ?? result); }
+      catch { evidence = '[unserializable result]'; }
+      evidence = String(evidence);
+      if (evidence.length > 200) evidence = evidence.slice(0, 199) + '…';
+      const dispatcher = label.startsWith('ci-heal') ? 'dispatchCiHeal' : 'dispatchFix';
+      throw new Error(label + ': no prompt captured: ' + dispatcher + ' returned ' + outcome
+        + ' (' + evidence + ') — the stub spawner was never called');
+    }
     throw new Error(label + ': no prompt captured (the stub spawner was never called — a real worker may have been launched)');
   }
   const tokenRe = /\{\{\s*([^{}\n]*?)\s*\}\}/g;
@@ -667,12 +679,14 @@ const DISPATCH_DRY_RUN_LINES = [
   "  // This is a brief-fill dry run: availability must describe the injected Claude spawner, not the host's CLIs.",
   "  let captured = null;",
   "  const spawn = (argv) => { captured = argv[argv.length - 1]; return 'stub-fix-900002'; };",
-  "  dispatchFix(",
+  "  const result = dispatchFix(",
   "    { itemNum: null, pr: 900002, laneRef: 'lane/900002-smoke-fix', scope: ['we:scripts/lib/daemon-live-smoke.mjs'], lane: 90101, headRefOid: null },",
   "    // recordAdvisor: a dry run is not a real fix run, so it never lands in the advisor trial's per-run ledger (#x331b7u).",
-  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {}, readPushHold: () => null },",
+  "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {}, readPushHold: () => null,",
+  "    // Sentinel fix isolation: exercise the injected spawner regardless of live claims, history or routing.",
+  "      readFixClaim: () => null, readHistoryInputs: () => null, postNotice: () => {}, postTakeover: () => {}, postTakeoverVoidMark: () => {}, readTakeoverDiff: () => null, executorDecision: { executor: 'claude', mode: 'direct', source: 'smoke', reason: 'existing provider routing' }, wrapFix: false },",
   "  );",
-  "  checkFilled(captured, 'fix PR #900002', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND.fix);",
+  "  checkFilled(captured, 'fix PR #900002', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND.fix, result);",
   "});",
   "",
   "// 3a. ci-heal — WORST CASE, the exact a6cbfced4 live-crash shape: an item-less PR with an EMPTY",
@@ -682,22 +696,22 @@ const DISPATCH_DRY_RUN_LINES = [
   "await recordAsync('ci-heal-worst-case', 900003, async () => {",
   "  let captured = null;",
   "  const sinks = { [DISPATCH_EFFECT]: async (payload) => { captured = payload.prompt; return { handle: 'stub-cih-a' }; } };",
-  "  await dispatchCiHeal(",
+  "  const result = await dispatchCiHeal(",
   "    { itemNum: null, pr: 900003, laneRef: 'lane/900003-smoke-cih', scope: [], lane: 90102, headRefOid: null },",
   "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease },",
   "  );",
-  "  checkFilled(captured, 'ci-heal-worst-case PR #900003', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal']);",
+  "  checkFilled(captured, 'ci-heal-worst-case PR #900003', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal'], result);",
   "});",
   "",
   "// 3b. ci-heal — ordinary: an item-less PR with a non-empty diff-derived scope.",
   "await recordAsync('ci-heal-ordinary', 900004, async () => {",
   "  let captured = null;",
   "  const sinks = { [DISPATCH_EFFECT]: async (payload) => { captured = payload.prompt; return { handle: 'stub-cih-b' }; } };",
-  "  await dispatchCiHeal(",
+  "  const result = await dispatchCiHeal(",
   "    { itemNum: null, pr: 900004, laneRef: 'lane/900004-smoke-cih', scope: ['we:scripts/operations/ci-heal-pr-dispatch.mjs'], lane: 90103, headRefOid: null },",
   "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease },",
   "  );",
-  "  checkFilled(captured, 'ci-heal-ordinary PR #900004', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal']);",
+  "  checkFilled(captured, 'ci-heal-ordinary PR #900004', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal'], result);",
   "});",
   "",
   "}",
