@@ -1773,7 +1773,7 @@ function repoRootFromCwd() {
 /** RS-7179-1: keep the caller's lane lease(s) renewed for the whole run, stopped in `finally`. */
 export async function withLaneLeaseHeartbeat(cwds, fn, start = startLaneLeaseHeartbeat) {
   let stop = () => {};
-  try { stop = start({ cwds }) || stop; } catch { /* best-effort: a renewal fault never blocks the run */ }
+  try { stop = start({ cwds }) || stop; } catch (e) { console.error(`codex-direct-task: lane lease heartbeat did not start (${e?.message}); the run continues without lease renewal`); }
   try { return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
 }
 

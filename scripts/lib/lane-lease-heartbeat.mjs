@@ -13,7 +13,7 @@
 import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { LEASE_FILENAME, renewedLease } from './lane-lease.mjs';
+import { LEASE_FILENAME, renewedLease, isLeaseStale } from './lane-lease.mjs';
 
 export const DEFAULT_LEASE_HEARTBEAT_MS = 10 * 60_000;
 
@@ -36,12 +36,16 @@ const defaultLeaseDir = (cwd) => {
   } catch { return null; }
 };
 
-const ownerKey = (lease) => `${lease?.session ?? ''}|${lease?.acquiredAt ?? ''}`;
+const ownerKey = (lease) => `${lease?.session ?? ''}|${lease?.holder ?? ''}|${lease?.acquiredAt ?? ''}`;
 
+/** A lease with credentials: a session, an acquire time, and (when present) a numeric ttl. Anything else is no lease. */
 function readLease(file, fs) {
   try {
     const lease = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return lease && typeof lease === 'object' && !Array.isArray(lease) ? lease : null;
+    if (!lease || typeof lease !== 'object' || Array.isArray(lease)) return null;
+    if (typeof lease.session !== 'string' || !lease.session || Number.isNaN(Date.parse(lease.acquiredAt))) return null;
+    if (lease.ttlMinutes !== undefined && !Number.isFinite(lease.ttlMinutes)) return null;
+    return lease;
   } catch { return null; }
 }
 
@@ -59,11 +63,16 @@ export function renewLaneLeaseOnce({ cwd, owner = null, now = () => new Date(), 
     const lease = readLease(file, fs);
     if (!lease) return false;
     if (owner && ownerKey(lease) !== owner) return false;
+    // An expired lease may already be reclaimable: it comes back only through the allocator, never a renewal.
+    if (isLeaseStale(lease, now().getTime())) return false;
     const next = renewedLease(lease, now().toISOString());
     if (!next || next === lease) return false;
     const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
     try {
       fs.writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, { flag: 'wx' });
+      // Re-read right before the swap: a lease replaced or released meanwhile is never overwritten.
+      const again = readLease(file, fs);
+      if (!again || ownerKey(again) !== ownerKey(lease)) return false;
       fs.renameSync(tmp, file);
     } finally {
       fs.rmSync(tmp, { force: true });
@@ -77,16 +86,24 @@ export function renewLaneLeaseOnce({ cwd, owner = null, now = () => new Date(), 
  * now; a checkout with no readable lease is skipped for good. Returns `stop()`.
  */
 export function startLaneLeaseHeartbeat({ cwds, everyMs = DEFAULT_LEASE_HEARTBEAT_MS, now, leaseDirFn = defaultLeaseDir,
-  fs = { existsSync, readFileSync, writeFileSync, renameSync, rmSync }, setIntervalFn = setInterval, clearIntervalFn = clearInterval } = {}) {
+  fs = { existsSync, readFileSync, writeFileSync, renameSync, rmSync }, setIntervalFn = setInterval, clearIntervalFn = clearInterval,
+  warn = (line) => process.stderr.write(`${line}\n`) } = {}) {
   const targets = [...new Set((cwds ?? []).filter(Boolean))].flatMap((cwd) => {
-    const gitDir = leaseDirFn(cwd);
-    const lease = gitDir ? readLease(join(gitDir, LEASE_FILENAME), fs) : null;
-    return lease ? [{ cwd, owner: ownerKey(lease) }] : [];
+    const dir = leaseDirFn(cwd);
+    const lease = dir ? readLease(join(dir, LEASE_FILENAME), fs) : null;
+    return lease ? [{ cwd, owner: ownerKey(lease), ttlMs: Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : Infinity, lost: false }] : [];
   });
   if (!targets.length) return () => {};
-  const tick = () => { for (const t of targets) renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, now, leaseDirFn, fs }); };
+  // The interval never exceeds a third of the shortest lease ttl, so a short lease cannot lapse between beats.
+  const period = Math.max(1000, Math.min(everyMs, ...targets.map((t) => t.ttlMs / 3)));
+  const tick = () => {
+    for (const t of targets) {
+      if (renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, now, leaseDirFn, fs })) { t.lost = false; continue; }
+      if (!t.lost) { t.lost = true; try { warn(`lane-lease-heartbeat: could not renew the lease for ${t.cwd} (lost, replaced, expired or unreadable); the run continues unprotected`); } catch { /* best-effort */ } }
+    }
+  };
   tick();
-  const timer = setIntervalFn(tick, everyMs);
+  const timer = setIntervalFn(tick, period);
   timer?.unref?.();
   return () => clearIntervalFn(timer);
 }
