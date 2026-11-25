@@ -92,7 +92,8 @@ export { EXTRA_SEATS_ENV, RED_TEAM_ENV, extraSeatsEnabled, redTeamEnabled, redTe
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
-import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
+import { resolveBuilder } from './review-builder.mjs';
+export { resolveBuilder } from './review-builder.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { RED_TEAM_UNVERIFIABLE_TAG, readRedTeamProbes, RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker, redTeamForHead } from '../lib/red-team-gate.mjs';
@@ -1388,16 +1389,6 @@ function missRowRecorded(records, row) {
  * provider/model/taskType), else the `Co-Authored-By: Claude …` trailer of the reviewed head commit, else unknown. PURE.
  * @returns {{provider:string, model:string, taskType:(string|null), delegated:boolean, source:string}}
  */
-export function resolveBuilder({ body = '', headMessage = '' } = {}) {
-  const d = parseDelegationMarker(String(body ?? ''));
-  if (d) return { provider: d.provider, model: d.model, taskType: d.taskType, delegated: true, source: 'delegation-marker' };
-  const m = String(headMessage ?? '').match(/^Co-Authored-By:\s*Claude\s+([^<\n]+?)\s*</im);
-  if (m) {
-    const model = `claude-${m[1].replace(/\([^)]*\)/g, '').trim().toLowerCase().replace(/\s+/g, '-')}`;
-    return { provider: 'claude', model, taskType: null, delegated: false, source: 'co-authored-by' };
-  }
-  return { provider: 'unknown', model: 'unknown', taskType: null, delegated: false, source: 'none' };
-}
 
 /**
  * The red team's brief. PURE. Same two shapes as {@link buildSeatTask}: `inline` for a tool-free seat (Gemini),

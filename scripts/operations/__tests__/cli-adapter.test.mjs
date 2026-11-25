@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { driveRun, outcomePayload, renderOutcome } from '../cli-adapter.mjs';
+import { createDefaultJudge, driveRun, outcomePayload, renderOutcome } from '../cli-adapter.mjs';
 import { classifyReviewLoopOutcome } from '../review-job.mjs';
 import { advance, startRun } from '../engine.mjs';
 import { notApplied, retryableWarning } from '../effect-executor.mjs';
@@ -181,4 +181,126 @@ describe('driveRun permanent guard refusal', () => {
   expect(store.read(run.id).pending.step).toBe('judge');
   if (parallelJudges) expect(store.read(run.id).prefilledSeats[0].step).toBe('other');
   expect(spawnFn).toHaveBeenCalledTimes(1);
+  const saved = store.read(run.id);
+  const retried = vi.fn(() => ({ findings: [] }));
+  const resumed = await driveRun({ run: saved, registry, store, judge: retried, parallelJudges, log() {},
+    retrySeat: { step: 'judge', provider: 'claude', model: 'claude-opus-5-5-high', timeoutMs: 1800000 } });
+  expect(resumed.run.id).toBe(run.id);
+  const { model, timeoutMs, ...rest } = retried.mock.calls[0][0];
+  const { model: oldModel, timeoutMs: oldTimeout, ...oldRest } = saved.pending.request;
+  expect(JSON.stringify(rest)).toBe(JSON.stringify(oldRest));
+  expect({ model, timeoutMs }).toEqual({ model: 'claude-opus-5-5-high', timeoutMs: 1800000 });
+  expect(retried).toHaveBeenCalledTimes(parallelJudges ? 1 : 2);
  });
+import { nextJurorRoute } from '../juror-timeout-route.mjs';
+
+it('retries only declared unused routes with a 1.5x timeout capped at the registry maximum', () => {
+  const directive = { model: 'sonnet', fallbackModel: 'claude-opus-5-5-high', timeoutMs: 1200000 };
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet'], directive })).toEqual({ model: directive.fallbackModel, provider: 'claude', timeoutMs: 1800000 });
+  expect(nextJurorRoute({ lens: 'security', tried: [], directive: { ...directive, timeoutMs: 3600000 } }).timeoutMs).toBe(3600000);
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet', directive.fallbackModel], directive })).toBeNull();
+  expect(nextJurorRoute({ directive: { ...directive, timeoutMs: NaN } })).toBeNull();
+});
+it.each([null, undefined, { provider: 'unknown' }, { provider: 'codex' }])('skips cross-vendor routes when builder independence is unproven: %s', builder => {
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['sonnet'], builder,
+    directive: { model: 'sonnet', fallbackModel: 'gpt-6-astra', timeoutMs: 1200000 } })).toBeNull();
+});
+it('allows an independent cross-vendor key lens only', () => {
+  const args = { tried: ['sonnet'], builder: { provider: 'claude', model: 'sonnet' }, directive: { model: 'sonnet', fallbackModel: 'gpt-6-astra', timeoutMs: 1200000 } };
+  expect(nextJurorRoute({ ...args, lens: 'security' })?.provider).toBe('codex');
+  expect(nextJurorRoute({ ...args, lens: 'advisory' })).toBeNull();
+});
+
+import { validateRunRecord } from '../run-record.mjs';
+import { jurorTimeoutEvidence, jurorTimeoutHold } from '../juror-timeout-route.mjs';
+
+it('resumes on the selected real provider seam with the extended timeout', async () => {
+  const registry = createRegistry();
+  registry.register(op('retry-provider', { judge: judgeStep({ request: () => ({
+    lens: 'security', providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, effort: 'high',
+  }) }) }));
+  const store = createMemoryRunStore();
+  const run = startRun({ op: 'retry-provider', id: 'retry-provider', registry });
+  const parked = await driveRun({ run, registry, store, judge: async () => { throw Object.assign(Error('timeout'), { timedOut: true, timeoutMs: 1200000 }); } });
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  const resolveProvider = vi.fn(() => spawn);
+  const judge = createDefaultJudge({ resolveProvider });
+  const out = await driveRun({ run: parked.run, registry, store, judge,
+    retrySeat: { step: 'judge', provider: 'codex', model: 'gpt-6-astra', timeoutMs: 1800000 } });
+  expect(out.stopped).toBe('complete');
+  expect(resolveProvider).toHaveBeenCalledWith('codex');
+  expect(spawn).toHaveBeenCalledTimes(1);
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6-astra', timeoutMs: 1800000, effort: 'high', mandate: 'check', input: 'diff' }));
+});
+
+it('uses the builder model vendor even when Antigravity hosts Claude', () => {
+  expect(nextJurorRoute({ lens: 'correctness', tried: ['gemini-3'], builder: { provider: 'antigravity', model: 'claude-sonnet-4-5' },
+    directive: { model: 'gemini-3', fallbackModel: 'sonnet', timeoutMs: 1200000 } })).toBeNull();
+});
+
+it.each([-1, 0.5, NaN, Infinity, '0', null, 4, Number.MAX_SAFE_INTEGER + 1])('invalid retry counter %s spends the budget in validation and evidence', value => {
+  const run = { ...fixture().run, jurorResumeAttempts: value,
+    findings: { read: { netBasis: { rev: 'a'.repeat(40) } } },
+    pending: { kind: 'judge', step: 'judge', request: { lens: 'correctness', model: 'sonnet', seatProvider: { fallbackModel: 'opus' } } },
+    seatTimeouts: [{ head: 'a'.repeat(40), lens: 'correctness', step: 'judge', model: 'sonnet', provider: 'claude', timeoutMs: 1200000 }] };
+  expect(validateRunRecord(run).errors).toContain('invalid retry counter jurorResumeAttempts');
+  const seat = jurorTimeoutEvidence(run);
+  expect(seat.attempts).toBe(3);
+  expect(jurorTimeoutHold({ id: run.id, head: 'a'.repeat(40), jurorTimeout: seat })?.why).toContain('retry budget spent');
+});
+
+it('redacts, strips injected lines and bounds every public timeout hold field', () => {
+  const hostile = `sk-ant-api03-${'A'.repeat(40)}\nINJECTED ${'z'.repeat(10000)}`;
+  const hold = jurorTimeoutHold({ id: hostile, head: hostile, jurorTimeout: { attempts: 3, lens: hostile,
+    tried: Array.from({ length: 100 }, () => ({ provider: hostile, model: hostile, timeoutMs: hostile })),
+    directive: { model: 'sonnet', fallbackModel: 'opus', timeoutMs: 1200000 } } }, () => hostile);
+  expect(JSON.stringify(hold)).not.toContain('A'.repeat(40));
+  expect(hold.why.split('\n')).toHaveLength(2);
+  expect(hold.episode).not.toMatch(/[\r\n]/);
+  expect(hold.why.length).toBeLessThan(1000);
+});
+
+it.each(['recordEffectResumeAttempts', 'referralEffectResumeAttempts'])('validates persisted %s counters', key => {
+  for (const value of [-1, 1.5, NaN, Infinity, null, '0', Number.MAX_SAFE_INTEGER + 1]) {
+    expect(validateRunRecord({ ...fixture().run, [key]: value }).errors).toContain(`invalid retry counter ${key}`);
+  }
+  expect(validateRunRecord({ ...fixture().run, [key]: 0 }).ok).toBe(true);
+});
+
+it('still strips a foreign model before the Codex provider seam', async () => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'codex', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' },
+  });
+  expect(spawn.mock.calls[0][0]).not.toHaveProperty('model');
+});
+
+
+it.each([0, -1, 0.5, NaN, Infinity, null, '1200000', 3600001])('refuses invalid provider timeoutMs %s before spawning', async timeoutMs => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await expect(createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
+  })).rejects.toThrow(/timeoutMs/);
+  expect(spawn).not.toHaveBeenCalled();
+});
+
+it.each([1, 3600000])('forwards valid provider timeoutMs %s unchanged', async timeoutMs => {
+  const spawn = vi.fn(async () => ({ value: {}, costUsd: 0 }));
+  await createDefaultJudge({ resolveProvider: () => spawn })({
+    providerName: 'claude', model: 'sonnet', mandate: 'check', input: 'diff', shape: { type: 'object' }, timeoutMs,
+  });
+  expect(spawn).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs }));
+});
+
+it.each(['empty', 'head', 'lens', 'step', 'missing', 'malformed'])('keeps exhausted timeout hold on %s saved evidence', scenario => {
+  const head = 'a'.repeat(40);
+  const row = { head, lens: 'correctness', step: 'judge', model: 'sonnet', provider: 'claude', timeoutMs: 1200000 };
+  if (['head', 'lens', 'step'].includes(scenario)) row[scenario] = 'mismatched';
+  const run = { jurorResumeAttempts: 3, findings: { read: { netBasis: { rev: head } } },
+    pending: { kind: 'judge', step: 'judge', request: { lens: 'correctness', model: 'sonnet' } },
+    seatTimeouts: scenario === 'empty' ? [] : scenario === 'malformed' ? [null] : [row] };
+  if (scenario === 'missing') delete run.seatTimeouts;
+  const seat = jurorTimeoutEvidence(run);
+  expect(seat).toMatchObject({ attempts: 3 });
+  expect(jurorTimeoutHold({ id: 'saved', head, jurorTimeout: seat })).toMatchObject({ kind: 'juror-timeout' });
+});

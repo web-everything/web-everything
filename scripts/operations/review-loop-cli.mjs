@@ -82,6 +82,9 @@ import { unattendedAcceptableVerdict, unattendedAcceptHold, unattendedAcceptPoli
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { RESUME_MAX_ATTEMPTS, ciHeldRecordRetryCountersValid, findResumableParkedRun, refusedReferralsAreRuled, persistRetryBudgetSpent, readReviewRunEvidence, reviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { nextJurorRoute, jurorTimeoutHold } from './juror-timeout-route.mjs';
+import { providerQuotaHold } from '../lib/provider-quota-hold.mjs';
+import { createRedTeamIo } from './review-extra-seats.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -400,17 +403,22 @@ export { RESUME_MAX_ATTEMPTS } from '../conveyor/review-referral-hold.mjs';
 
 /**
  * Card xq1xbsl — THE PARKED RUN AN OPERATOR'S RULING RESUMES, if there is one. Reads the PR's live head and thread and
- * the local run evidence, and asks the same pure rule the hold uses ({@link findResumableParkedRun}). Never throws: an
- * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
+ * the local run evidence, and asks the same pure rule the hold uses ({@link findResumableParkedRun}). Unreadable
+ * timeout evidence preserves the saved hold; an unreadable store refuses lookup rather than starting a panel.
  * @returns {string|null} the run id to resume.
  */
-export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
+export function defaultFindResumableRun({ repo, pr, ciHeldRecordRetryMax, jurorOnly = false }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence, env = process.env } = {}) {
+  const runs = readRuns();
+  const timeoutRun = runs.filter(r => r.repo === repo && r.pr === Number(pr))
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
+  const heldId = timeoutRun?.jurorTimeout ? timeoutRun.id : null;
   try {
     const view = readPr({ repo, pr });
-    if (!view?.headRefOid) return null;
-    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo,
-      ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id ?? null;
-  } catch { return null; }
+    if (!view?.headRefOid) return heldId;
+    const id = findResumableParkedRun({ ...view, number: Number(pr) }, runs, { repo,
+      ciHeldRecordRetryMax: ciHeldRecordRetryMax ?? resolveReviewRedTeamOnSkip({ env }).value.ciHeldRecordRetryMax })?.id;
+    return id && (!jurorOnly || runs.find(r => r.id === id)?.jurorTimeout) ? id : null;
+  } catch { return heldId; }
 }
 
 /** Does this `review-pr` declaration seat the security juror? PURE. */
@@ -668,6 +676,7 @@ export async function runReviewLoopOnce({
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
   parallelJudges = false, seatLanes = null,
+  providerCapacity = provider => providerQuotaHold(createRedTeamIo().readRecords({ strict: true }), provider, Date.now()),
   readResumePr = createReviewPassPrReader(),
   readAcceptancePr = input => readResumePr(input, { refreshHead: true }), cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
@@ -777,21 +786,25 @@ export async function runReviewLoopOnce({
   };
 
   let run;
+  let retrySeat = null;
+  const pendingTimeout = record => record?.pending?.kind === 'judge' && Object.hasOwn(record, 'seatTimeouts');
   if (parsed.control.resume) {
-    run = store.read(parsed.control.resume);
+    try { run = store.read(parsed.control.resume); }
+    catch { return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved run is unreadable; inspect the saved hold before re-arming.'] }; }
     if (!run) return { code: 2, lines: [`error: no run record for ${JSON.stringify(parsed.control.resume)}`], run: null, stopped: 'refused' };
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
+    if (pendingTimeout(run)) parsed.input = run.input;
   }
-  if (parsed.control.resume && reviewRunEvidence(run)?.ciHeldRecordRetry) {
+  if (parsed.control.resume && !pendingTimeout(run) && reviewRunEvidence(run)?.ciHeldRecordRetry) {
     const { ciHeldRecordRetryMax } = redTeamOnSkipSettings({ log: advisoryLog }).value;
     const prepared = resumeCiHeldRecord(run, ciHeldRecordRetryMax);
     if (prepared.refusal) return prepared.refusal;
     run = prepared.run;
     store.write(run);
   }
-  if (!parsed.control.resume || reviewRunEvidence(run)?.referralStageRefused) {
+  if (!parsed.control.resume || pendingTimeout(run) || reviewRunEvidence(run)?.referralStageRefused) {
     // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
     // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
     // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
@@ -801,13 +814,21 @@ export async function runReviewLoopOnce({
     if (!resumedId && parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
       try { resumedId = findResumableRun === defaultFindResumableRun
         ? defaultFindResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }, { readPr: readResumePr })
-        : findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }); } catch { resumedId = null; }
+        : findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr, ciHeldRecordRetryMax }); }
+      catch { return { code: 2, run: null, stopped: 'refused', lines: ['review-blocked-on-infra: saved review lookup is unreadable; inspect the saved hold before re-arming.'] }; }
     }
-    // Any doubt (an unreadable record, a run that cannot be rewound) falls back to a fresh review, never aborts the round.
+    // Timeout evidence must prove a safe retry or a moved head before a saved hold can be left behind.
     let rewound = null;
     let persistSpent = null;
+    let timeoutParked = null;
     try {
       const parked = resumedId ? store.read(resumedId) : null;
+      if (pendingTimeout(parked)) timeoutParked = parked;
+      const timeoutEvidence = reviewRunEvidence(parked);
+      const timeoutSeat = timeoutEvidence?.jurorTimeout;
+      const liveTimeoutHead = timeoutParked && readResumePr(parked.input, { refreshHead: true })?.headRefOid;
+      if (timeoutParked && (!timeoutSeat || !/^[a-f0-9]{40}$/i.test(liveTimeoutHead ?? ''))) throw new Error('unreadable timeout evidence or live head');
+      const resumeJuror = timeoutSeat && liveTimeoutHead === timeoutEvidence.head;
       // A run parked on a confirm, or one an earlier resume rewound and never finished (it died or threw part-way).
       // "Unfinished" = the earlier resume never got through `advise` (the same test `reviewRunEvidence` applies).
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
@@ -856,7 +877,18 @@ export async function runReviewLoopOnce({
       if (retryableRecordEffect && !ciHeldRecordRetry && recordAttempts >= RESUME_MAX_ATTEMPTS) {
         return { code: 2, run: parked, stopped: 'refused', lines: [`error: run ${parked.id} record effect resume attempts spent; inspect run store and body-file refusal before retrying.`] };
       }
-      if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
+      if (resumeJuror) {
+        const next = nextJurorRoute(timeoutSeat);
+        const blocked = next ? await providerCapacity(next.provider) : null;
+        const hold = jurorTimeoutHold(timeoutEvidence, () => blocked);
+        if (hold) return { code: 2, run: parked, stopped: 'refused', lines: [hold.why] };
+        if (!rosterMatches) return { code: 2, run: parked, stopped: 'refused',
+          lines: ['review-blocked-on-infra: saved timeout roster changed on the same head; inspect the saved run before re-arming.'] };
+      }
+      if (resumeJuror && rosterMatches) {
+        retrySeat = { step: timeoutSeat.step, ...nextJurorRoute(timeoutSeat) };
+        rewound = { ...parked, jurorResumeAttempts: timeoutSeat.attempts + 1 };
+      } else if (parkedEvidence?.persistenceFailed && (persistRetryBudgetSpent(parkedEvidence) || attempts >= RESUME_MAX_ATTEMPTS)) {
         persistSpent = parked.id;
       } else if (parked && parked.op === declaration.name && (resumeAdvise ? adviseAttempts : attempts) < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume || parkedEvidence?.referralStageRefused || suspendedEffect || retryableRecordEffect)) {
@@ -885,7 +917,11 @@ export async function runReviewLoopOnce({
             adviseFinishedAt: parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt ?? null, attempts: 1,
             ...(persistRetries ? { persistRetries } : {}) } };
       }
-    } catch { rewound = null; }
+    } catch {
+      if (timeoutParked || resumedId) return { code: 2, run: timeoutParked ?? run, stopped: 'refused',
+        lines: ['review-blocked-on-infra: saved review evidence or provider capacity is unreadable; inspect the saved hold before re-arming.'] };
+      rewound = null;
+    }
     if (persistSpent) {
       return { code: 2, run: null, stopped: 'refused', lines: [`error: run ${persistSpent} failed to persist its mandatory `
         + 'referrals and its automatic persist retries are spent; no fresh panel is started in its place. It waits on the '
@@ -941,7 +977,7 @@ export async function runReviewLoopOnce({
   // reader of the run's own step-timing record can tell this pass apart from a human at a terminal — the same
   // distinction `applyPendingEffects`'s `attemptedBy` already threads for its effect rows.
   const outcome = await drive({
-    run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
+    run, registry, store, sinks, judge: activeJudge, resume, retrySeat, autoConfirm, attemptedBy: 'agent',
   });
 
   if (outcome.stopped === 'juror-timeout') {

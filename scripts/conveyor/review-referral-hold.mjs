@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
 import { liveReferralState } from '../lib/referral-live-context.mjs';
 import { isValidRunId, resolveRunsDir, reportInvalidRunEntry, runFileEntries, tryReadRun } from '../operations/run-store.mjs';
-import { validateRunRecord } from '../operations/run-record.mjs';
+import { validateRunRecord, retryCounterValid } from '../operations/run-record.mjs';
 import { parseOperatorRulingComment, readReferralRecords, REFERRAL_RECORD_MARKER, activeReferrals,
   referralRecordState, AUTO_POLICY_ACTOR, findingIdentityTable, VERDICTS } from '../lib/jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -21,6 +21,8 @@ import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
 import { publishAttention } from '../operations/needs-you-feed.mjs';
+import { jurorTimeoutEvidence } from '../operations/juror-timeout-route.mjs';
+import { resolveBuilder } from '../operations/review-builder.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
@@ -125,7 +127,9 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (!Number.isFinite(completedAt) || (requireVerdict && !Object.values(VERDICTS).includes(verdict?.verdict))) {
     // Crashes before/during advise still consumed a retry. Keep them in the cached projection, without
     // inventing a completed panel or clean referral evidence for acceptance/carry readers.
+    const jurorTimeout = jurorTimeoutEvidence(run, resolveBuilder(read));
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
+      ...(jurorTimeout ? { jurorTimeout } : {}),
       ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
@@ -161,7 +165,8 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
     rulings: records.flatMap(r => r?.rulings ?? []).map(r => JSON.stringify(r)),
     // How many times this run was already resumed to retry a failed referral persist (card 5752 below). Each such
     // resume is one spent slot of the 15/30/60 retry budget, though it stays the same run.
-    persistRetries: Math.max(0, Number(run.resumeOf?.persistRetries) || 0),
+    persistRetries: run.resumeOf?.persistRetries === undefined ? 0
+      : retryCounterValid(run.resumeOf.persistRetries) ? run.resumeOf.persistRetries : REFERRAL_RETRY_MS.length,
   };
 }
 
@@ -175,6 +180,7 @@ export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
 /** A warm process with at most this many changed records parses them directly instead of the whole on-disk file. */
 export const EVIDENCE_DISK_MIN_MISSES = 32;
 const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).update(String(ciHeldRecordRetryCountersValid))
+  .update(String(jurorTimeoutEvidence))
   .update(String(isQuotaError)).digest('hex').slice(0, 16);
 function readEvidenceDiskCache(file) {
   try {
@@ -325,6 +331,10 @@ function operatorWakeTime(pr, run) {
   return Math.max(0, ...wakeEvents(pr, run).filter(e => e.operator).map(e => e.at));
 }
 
+export function jurorTimeoutWoken(pr, run) {
+  return operatorWakeTime(pr, run) > run.startedAt;
+}
+
 /** Has this run, on its own, spent the persist-retry budget? Its failed pass plus each resume that retried it. Pure. */
 export function persistRetryBudgetSpent(run) {
   return Boolean(run?.persistenceFailed) && 1 + (Number(run.persistRetries) || 0) > REFERRAL_RETRY_MS.length;
@@ -376,6 +386,9 @@ function latestReviewAttempt(history) {
 export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
   const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
+  if (last?.jurorTimeout && last.head === pr.headRefOid) {
+    return operatorWakeTime(pr, last) > last.startedAt ? null : { id: last.id, head: last.head };
+  }
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
     && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;
