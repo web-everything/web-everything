@@ -32,11 +32,12 @@ function gateScript() {
   return body.join('\n');
 }
 
-function runGate({ scopeResult, run, shardResult, event = 'merge_group', changesResult = 'success', reuse = 'false' }) {
+function runGate({ scopeResult, run, shardResult, event = 'merge_group', shards, changesResult = 'success', reuse = 'false' }) {
   const values = {
     'github.event_name': event,
     'needs.daemon-soak-scope.result': scopeResult,
     'needs.daemon-soak-scope.outputs.run': run,
+    'needs.daemon-soak-scope.outputs.shards': shards ?? (run === 'false' ? '[1]' : '[1,2,3,4,5,6,7,8]'),
     'needs.soak-shard.result': shardResult,
     'needs.changes.result': changesResult,
     'needs.changes.outputs.reuse': reuse,
@@ -58,10 +59,34 @@ describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
     }
   });
 
-  it('fails in merge_group / push / dispatch when scope says run=false (soak may not be skipped)', () => {
-    for (const event of ['merge_group', 'push', 'workflow_dispatch']) {
-      expect(runGate({ event, scopeResult: 'success', run: 'false', shardResult: 'skipped' }), event).not.toBe(0);
+  it('fails on push / dispatch when scope says run=false (soak may not be skipped)', () => {
+    for (const event of ['push', 'workflow_dispatch']) {
+      expect(runGate({ event, scopeResult: 'success', run: 'false', shardResult: 'success' }), event).not.toBe(0);
     }
+  });
+
+  // CI-SOAK-SCOPE-MQ: the merge queue may skip shards 2-8 on a docs-only change, but shard 1 must still pass.
+  it('merge_group with run=false passes only when shard 1 succeeded', () => {
+    expect(runGate({ event: 'merge_group', scopeResult: 'success', run: 'false', shardResult: 'success' })).toBe(0);
+    for (const shardResult of ['skipped', 'failure', 'cancelled', '']) {
+      expect(runGate({ event: 'merge_group', scopeResult: 'success', run: 'false', shardResult }), shardResult).not.toBe(0);
+    }
+  });
+
+  it('fails when the shards output disagrees with run (run=true with [1], run=false with other shards)', () => {
+    expect(runGate({ scopeResult: 'success', run: 'true', shards: '[1]', shardResult: 'success' })).not.toBe(0);
+    expect(runGate({ scopeResult: 'success', run: 'false', shards: '[2]', shardResult: 'success' })).not.toBe(0);
+    expect(runGate({ scopeResult: 'success', run: 'false', shards: '', shardResult: 'success' })).not.toBe(0);
+  });
+
+  it('the shard matrix is decided by the scope job: shard 1 always, shards 2-8 only on run=true or any error', () => {
+    const yml = readFileSync(CI_YML, 'utf8');
+    expect(yml).toContain('shard: ${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}');
+    expect(yml).toContain("echo 'shards=[1]' >> \"$GITHUB_OUTPUT\"");
+    expect(yml).toContain('trap ');
+    // The shard total is fixed at 8: strategy.job-total would be 1 when only shard 1 runs.
+    expect(yml).not.toMatch(/--shard=\$\{\{ matrix\.shard \}\}\/\$\{\{ strategy\.job-total \}\}.*soak-shard/);
+    expect(yml).toContain('npm run test:soak:shard -- --shard=${{ matrix.shard }}/8');
   });
 
   it('fails in merge_group when the shards are skipped, failed, cancelled or timed out', () => {
@@ -80,6 +105,10 @@ describe('daemon-soak aggregator gate (ci.yml) fails closed', () => {
 
   it('passes on main push with skipped shards when successful changes explicitly proves reuse', () => {
     expect(runGate({ event: 'push', scopeResult: 'success', run: 'true', shardResult: 'skipped', reuse: 'true' })).toBe(0);
+  });
+
+  it.each(['[1]', '[2]', ''])('reuse cannot bypass invalid shards evidence: %s', shards => {
+    expect(runGate({ event: 'push', scopeResult: 'success', run: 'true', shards, shardResult: 'skipped', reuse: 'true' })).not.toBe(0);
   });
 
   it.each(['failure', 'cancelled', 'skipped', ''])('rejects reuse from a non-success changes result: %s', changesResult => {
@@ -141,8 +170,9 @@ describe('daemon-soak runs on main pushes, not only on PRs', () => {
     }
   });
 
-  it('on a non-PR event the scope step always says run (no path filter on main)', () => {
+  it('on push / dispatch the scope step always says run all 8 (no path filter on main); only merge_group is scoped', () => {
     const yml = readFileSync(CI_YML, 'utf8');
-    expect(yml).toContain(`if [ "\${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi`);
+    expect(yml).toContain(`if [ "\${{ github.event_name }}" != "pull_request" ] && [ "\${{ github.event_name }}" != "merge_group" ]; then`);
+    expect(yml).toContain(`echo "run=true" >> "$GITHUB_OUTPUT"; echo 'shards=[1,2,3,4,5,6,7,8]' >> "$GITHUB_OUTPUT"; exit 0`);
   });
 });

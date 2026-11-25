@@ -113,7 +113,7 @@ import {
   isTrustRefusal, grantDispatchTrust,
 } from '../operations/dispatch-lane-io.mjs';
 import { stopSession } from '../operations/dispatch-abort.mjs';
-import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from '../operations/worker-wrapper-launch.mjs';
+import { assertWrappedClaudeStarted, launchWrappedClaudeWorker, workerWrapperEnabledFor } from '../operations/worker-wrapper-launch.mjs';
 import { assertMainNotStale } from '../operations/review-dispatch.mjs';
 import { armSelfReexecOnFastForward, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
@@ -172,7 +172,7 @@ import {
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { mainRedPriorityRank } from './main-ci-red-core.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs';
-import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
+import { claudeSpawnAlias, claudeLaunchRouteFor, claudeSupervisorRouteFor } from '../lib/dispatch-routing-policy.mjs';
 import { resolveOperationRoute, resolvePolicyModel } from '../lib/dispatch-routing-policy-io.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
@@ -1728,7 +1728,10 @@ export function dispatchFix(planned, {
       const launched = launchWrapped({
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
         model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+        route: claudeLaunchRouteFor({ policyRoute: claudeSupervisorRouteFor(decision) ?? decision.policyRoute,
+          executor: decision.executor, reason: 'reconcile-fix-dispatch: claude fix launch' }),
       });
+      assertWrappedClaudeStarted(launched);
       if (launched.wrapperPid) {
         try { stampRunner({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, pid: launched.wrapperPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
       }
@@ -1757,7 +1760,8 @@ export function dispatchFix(planned, {
     // call ran, or a launch that failed in a way that cannot have started a session. A launch timeout (the CLI
     // killed mid-spawn) is indeterminate: the session may be live, so the marker stands and the bound holds. Best
     // effort: if the void cannot be posted the marker stands (the conservative side of the bound).
-    if (takeoverMarked && (!launchAttempted || launchProvedNotStarted(e))) {
+    const wrapperRefused = e?.notApplied === true && e.code === 'WORKER_LAUNCH_REFUSED';
+    if (takeoverMarked && (!launchAttempted || wrapperRefused || launchProvedNotStarted(e))) {
       try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid }); } catch { /* the bound stays spent */ }
     }
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked

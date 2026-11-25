@@ -1,5 +1,6 @@
 export { validateRaisedBy } from './lib/raised-by.mjs';
 import { readTestsFirstPolicy } from './lib/tests-first-policy.mjs';
+import { DEFAULT_LEASE_TTL_MINUTES } from './lib/lane-lease.mjs';
 /**
  * check-standards-rules.mjs — pure, individually-testable rule bodies for the validator.
  *
@@ -4622,6 +4623,70 @@ export function findUnjournaledLaneMutations(files) {
         reason: `${hit.what} with no journalLaneEvent(...) call within ${LANE_JOURNAL_WINDOW} lines — record it in the lane lifecycle journal, or mark it \`// journal-exempt: <why>\``,
       });
     });
+  }
+  return findings;
+}
+
+/** Literal CLI argv arrays must opt into short leases. Parse arrays rather than matching a nearby flag
+ * in a different invocation. Dynamic TTLs are outside this literal-only rule; the CLI validates those. */
+export function findImplicitShortLaneTtls(files) {
+  const ts = loadTs();
+  const findings = [];
+  for (const { file, content } of files) {
+    const { sf, ok } = parse(ts, file, content, file.slice(file.lastIndexOf('.')));
+    if (!ok) {
+      findings.push({ file, line: 1, reason: 'cannot parse lane-pool caller to check literal TTLs' });
+      continue;
+    }
+    const staticArg = node => {
+      const literal = literalSource(ts, node);
+      if (literal !== null) return literal;
+      if (ts.isNumericLiteral(node)) return node.text;
+      if (ts.isCallExpression(node) && /(?:^|\.)(?:join|resolve)$/.test(node.expression.getText(sf))) {
+        const last = node.arguments.at(-1);
+        return last ? literalSource(ts, last) : null;
+      }
+      return null;
+    };
+    const visit = node => {
+      if (ts.isArrayLiteralExpression(node)) {
+        const argv = node.elements.map(staticArg);
+        const script = argv.findIndex(s => /(?:^|\/)lane-pool\.mjs$/.test(s || ''));
+        if (script >= 0 && argv[script + 1] === 'acquire' && !argv.includes('--exact-ttl')) {
+          const index = argv.findIndex(s => s === '--ttl-minutes' || s?.startsWith('--ttl-minutes='));
+          const raw = index < 0 ? null : argv[index] === '--ttl-minutes' ? argv[index + 1] : argv[index].slice(14);
+          if (raw !== null && raw?.trim() && Number.isFinite(Number(raw)) && Number(raw) < DEFAULT_LEASE_TTL_MINUTES) {
+            findings.push({ file, line: sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1,
+              reason: `literal --ttl-minutes=${raw} is below ${DEFAULT_LEASE_TTL_MINUTES}; add --exact-ttl for a deliberate short lease` });
+          }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return findings;
+}
+
+/** Lease removal sites must pin stale evidence, or declare why this is an owner operation. */
+export function findUnsafeLaneLeaseTakes(files) {
+  const ts = loadTs();
+  const findings = [];
+  for (const { file, content } of files) {
+    if (file !== 'scripts/lane-pool.mjs') continue;
+    const { sf, ok } = parse(ts, file, content, '.mjs');
+    if (!ok) { findings.push({ file, line: 1, reason: 'cannot parse lease removal sites' }); continue; }
+    const lines = content.split('\n');
+    const visit = node => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'takeMarkerIf') {
+        const i = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
+        const staleGuard = /\bsameStaleLease\s*\(/.test(node.arguments[1]?.getText(sf) || '');
+        const owner = lines.slice(Math.max(0, i - 2), i + 1).some(l => /^\s*\/\/ owner-operation:\s*\S/.test(l));
+        if (!staleGuard && !owner) findings.push({ file, line: i + 1, reason: 'takeMarkerIf needs sameStaleLease or an owner-operation annotation' });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
   }
   return findings;
 }

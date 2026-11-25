@@ -146,6 +146,7 @@ import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
 import { verifyGateDecision, readVerifyMarker, resolveVerifyOptions, readCiCheckRuns, readCiWorkflowRuns, repoSlugFromRemote } from './lib/lane-verify.mjs'; // #2833 — the lane-verification finish-guard: refuse to land a HEAD whose synchronous suite run never finished (or, under --require-verified, was never recorded green). readVerifyMarker/resolveVerifyOptions are the SHARED marker reader + option resolver (findings 2/5) both this gate and verify-lane use, so the two can never drift (readVerifyMarker owns the VERIFY_FILENAME path — no bare JSON.parse of the marker here).
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuck-queued ci.yml window (ciMissingAfterPushMin) for the CI verification source
+import { readApprovalRecord } from './lib/approval-record.mjs'; // AUTH-BOUND-APPROVAL — the head-bound operator approval record replaces the forgeable body line
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
 import { laneRelevantChangeSinceForRecord } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
@@ -354,15 +355,32 @@ export function resolveDraft(_options = {}) {
 }
 
 /** R502 item 2 — does this PR skip the draft step? Fail closed; BOTH conditions are required: an
- *  `Operator-pre-approved: R<id>[+R<id>]` body line AND a non-empty net diff confined to the guard-config
- *  `guardConfigPaths` (read from the BASE branch, scripts/settings/pr-land-ready.json). A marker alone (any diff)
- *  or a guard-config diff alone (no marker) stays a draft. Review still happens (the review label is unchanged) and
+ *  head-bound operator approval record (scripts/lib/approval-record.mjs; the old body line is ignored) AND a
+ *  non-empty net diff confined to the guard-config `guardConfigPaths` (read from the BASE branch,
+ *  scripts/settings/pr-land-ready.json). A record alone (any diff) or a guard-config diff alone stays a draft. Review still happens (the review label is unchanged) and
  *  required CI still gates the merge: this removes only the draft step for operator-ruled entry PRs. */
-export function decideReadyOnOpen({ body = '', changedFiles = [], guardConfigPaths = null } = {}) {
-  const marked = /^Operator-pre-approved:[ \t]*R\d+(?:\+R\d+)*[ \t]*$/m.test(String(body));
+export function decideReadyOnOpen({ approval = null, changedFiles = [], guardConfigPaths = null } = {}) {
+  // The PR body is never read: a body line is forgeable and survives pushes. `approval` is the result of
+  // readApprovalRecord for the exact head (App-authored check run bound to the 40-hex head and a ruling id).
+  const marked = approval?.ok === true && typeof approval.rulingId === 'string' && approval.rulingId !== '';
   const confined = Array.isArray(guardConfigPaths) && guardConfigPaths.length > 0 && Array.isArray(changedFiles) && changedFiles.length > 0
     && changedFiles.every((f) => guardConfigPaths.includes(f));
-  return marked && confined ? { ready: true, why: 'pre-approved-guard-config' } : { ready: false, why: marked ? 'marker-outside-guard-config' : 'not-flagged' };
+  return marked && confined ? { ready: true, why: 'pre-approved-guard-config' } : { ready: false, why: marked ? 'approval-outside-guard-config' : 'not-flagged' };
+}
+
+/** Acquire readiness evidence only when it can affect draft state. Injection keeps the production call path testable. */
+export function classifyReadyOnOpen({ repo, headSha, remote, base,
+  active = resolveDraft({ readyOnOpen: false }) !== resolveDraft({ readyOnOpen: true }) } = {},
+{ runGit, reader = readApprovalRecord } = {}) {
+  if (!active) return { ready: false, why: 'readiness-inactive' };
+  if (!repo || !/^[a-f0-9]{40}$/i.test(headSha ?? '')) return { ready: false, why: 'approval-identity-unresolved' };
+  try {
+    // The branch cannot authorise itself; disabling rename detection preserves BOTH sides of a rename.
+    const guardConfigPaths = JSON.parse(runGit(['show', `${remote}/${base}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
+    const changedFiles = String(runGit(['diff', '--name-only', '--no-renames', `${remote}/${base}...${headSha}`])).split('\n').filter(Boolean);
+    const approval = reader({ repo, headSha });
+    return decideReadyOnOpen({ approval, changedFiles, guardConfigPaths });
+  } catch { return { ready: false, why: 'classification-unavailable' }; }
 }
 
 /** R502 item 2 — apply a label with bounded retries (a single transient gh failure left #6339/#6343 with no review
@@ -934,11 +952,8 @@ async function runCli() {
   // All modes open ready for review; parked PRs carry their review hold label.
   let readyOnOpen = false;
   try {
-    // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
-    const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
-    let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
-    readyOnOpen = decideReadyOnOpen({ body: CREATE_BODY, changedFiles, guardConfigPaths }).ready;
+    const slug = repoSlugFromRemote(tryGit(['remote', 'get-url', REMOTE]));
+    readyOnOpen = classifyReadyOnOpen({ repo: slug, headSha: refSha, remote: REMOTE, base: BASE }, { runGit: gitC }).ready;
   } catch { /* classification unavailable */ }
   const DRAFT = resolveDraft({ mode: PLAN.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle ?? '', readyOnOpen });
   // Existing PRs keep their title even when their latest commit is a merge/repair. Only CREATE (or its

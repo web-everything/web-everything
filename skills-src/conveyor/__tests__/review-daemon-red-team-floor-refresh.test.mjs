@@ -184,7 +184,7 @@ it.each([false, true])('queue maintenance runs before a failed reconcile, includ
 it('production maintenance evicts a merged persisted entry without invoking redTeamOnSkip', async () => {
   const file = join(directory, 'queue.json');
   writeFileSync(file, JSON.stringify([{ key: 'example/project#7012', repo: 'example/project', pr: 7012,
-    head: 'a'.repeat(40), blocked: 'planner-skip', attempts: 1, enqueuedAt: 1 }]));
+    head: 'a'.repeat(40), blocked: 'planner-skip', blockedReason: 'fixture evidence', attempts: 1, enqueuedAt: 1 }]));
   const readLivePr = vi.fn(() => ({ state: 'MERGED', headRefOid: 'a'.repeat(40) }));
   const { cliReviewTickOpts } = await import('../review-daemon.mjs');
   const opts = cliReviewTickOpts({ log, readLivePr });
@@ -197,7 +197,7 @@ it('production maintenance evicts a merged persisted entry without invoking redT
 it('production maintenance retains planner skips while re-keying heads and deferring unreadable PRs', async () => {
   const file = join(directory, 'queue.json');
   const entries = [1, 2, 3, 4, 5, 6].map(pr => ({ key: `example/project#${pr}`, repo: 'example/project', pr,
-    head: 'a'.repeat(40), blocked: 'planner-skip', attempts: 1, enqueuedAt: 1 }));
+    head: 'a'.repeat(40), blocked: 'planner-skip', blockedReason: 'fixture evidence', attempts: 1, enqueuedAt: 1 }));
   writeFileSync(file, JSON.stringify(entries));
   const { cliReviewTickOpts } = await import('../review-daemon.mjs');
   const opts = cliReviewTickOpts({ log, readLivePr: ({ pr }) => {

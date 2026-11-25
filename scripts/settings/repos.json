@@ -1,0 +1,33 @@
+{
+  "$comment": "REPO-REGISTRY-HEALTH: the one registry of constellation repos. Other settings files (prototype-load, pr-sweep, review) may only name repos listed here (drift test: scripts/lib/__tests__/repo-registry.test.mjs). aliases are other spellings those files use.",
+  "health": { "noMergeHours": 24, "oldPrHours": 48 },
+  "repos": [
+    {
+      "name": "web-everything",
+      "slug": "web-everything/web-everything",
+      "aliases": ["chalbert/web-everything"],
+      "ownerPath": "webeverything",
+      "daemons": ["review", "fix", "build", "verify", "drain"],
+      "mergePath": "merge-queue drain",
+      "appInstallationId": null
+    },
+    {
+      "name": "plateau-app",
+      "slug": "plateauapp/plateau-app",
+      "aliases": [],
+      "ownerPath": "plateau-app",
+      "daemons": ["drain-plateau"],
+      "mergePath": "plateau drain daemon",
+      "appInstallationId": null
+    },
+    {
+      "name": "frontierui",
+      "slug": "frontier-ui/frontierui",
+      "aliases": ["chalbert/frontierui"],
+      "ownerPath": "frontierui",
+      "daemons": [],
+      "mergePath": "normal PR",
+      "appInstallationId": null
+    }
+  ]
+}

@@ -6,6 +6,7 @@ import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
 import { parseOperationArgv } from '../cli-adapter.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const sha = 'a'.repeat(40), now = Date.parse('2026-11-18T12:00:00Z');
 const key = Buffer.alloc(32, 7);
@@ -977,5 +978,253 @@ describe('urgent-verify signing isolation', () => {
     expect(result.exitCode).toBe(126);
     expect(exec).not.toHaveBeenCalled();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('the command was NOT run'));
+  });
+});
+
+describe('urgent-verify wall-clock limit', () => {
+  const env = { PATH: '/bin', HOME: '/home/test' };
+  it('allows twice the recorded longest successful default run', () => {
+    // Review #7455: full 17-step greens took 85.6 min (8e5fde5d1, 2026-11-19)
+    // and 78.0 min (c673c976e, 2026-11-24). Keep headroom when changing defaults.
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env, spawnSync }).standards();
+    expect(spawnSync.mock.calls[0][2].timeout).toBeGreaterThanOrEqual(85.6 * 2 * 60_000);
+  });
+  it('caps every child at the remaining limit (default 180 min) and runs it in its own process group', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env, spawnSync }).standards();
+    const opts = spawnSync.mock.calls[0][2];
+    expect(opts.detached).toBe(true);
+    expect(opts.timeout).toBeLessThanOrEqual(180 * 60_000);
+    expect(opts.timeout).toBeGreaterThan(179 * 60_000);
+  });
+  it.each([
+    ['default', {}, undefined, 180],
+    ['environment override only', { WE_URGENT_VERIFY_MAX_MINUTES: '5' }, undefined, 5],
+    ['explicit override wins', { WE_URGENT_VERIFY_MAX_MINUTES: '5' }, 7, 7],
+    ['explicit cap', {}, 10000, 240],
+    ['environment cap', { WE_URGENT_VERIFY_MAX_MINUTES: '10000' }, undefined, 240],
+  ])('sets the exact child timeout for %s', (_name, settings, maxMinutes, minutes) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+      createUrgentDeps({ cwd: '/repo', env: { ...env, ...settings }, spawnSync, maxMinutes }).standards();
+      expect(spawnSync.mock.calls[0][2].timeout).toBe(minutes * 60_000);
+    } finally { clock.mockRestore(); }
+  });
+  it('isolated dependencies retain the original deadline after setup consumes time', () => {
+    let elapsed = 0;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now + elapsed);
+    const spawnSync = vi.fn((_cmd, args) => {
+      elapsed += 1000;
+      return { status: 0, stdout: args[0] === 'status' ? '' : args[0] === 'rev-parse' && args[1] === 'HEAD' ? sha : '/repo/.git' };
+    });
+    const fs = { accessSync() {}, statSync: () => ({ isFile: () => true }), readdirSync: () => [],
+      mkdtempSync: () => '/tmp/uv-clock-home', rmSync() {}, writeFileSync() {} };
+    try {
+      const parent = createUrgentDeps({ cwd: '/repo', env, fs, spawnSync, isolated: true, maxMinutes: 5 });
+      elapsed = 60_000;
+      const scoped = parent.isolate(sha);
+      try {
+        const remaining = 5 * 60_000 - elapsed;
+        expect(remaining).toBeLessThan(4 * 60_000);
+        scoped.deps.standards();
+        expect(spawnSync.mock.calls.at(-1)[2].timeout).toBe(remaining);
+        elapsed = 5 * 60_000;
+        const calls = spawnSync.mock.calls.length;
+        expect(() => scoped.deps.standards()).toThrow(expect.objectContaining({
+          failure: expect.objectContaining({ timedOut: true, limitMinutes: 5 }),
+        }));
+        expect(spawnSync).toHaveBeenCalledTimes(calls);
+      } finally { scoped.cleanup(); }
+    } finally { clock.mockRestore(); }
+  });
+  it('honours maxMinutes', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env, spawnSync, maxMinutes: 5 }).standards();
+    expect(spawnSync.mock.calls[0][2].timeout).toBeLessThanOrEqual(5 * 60_000);
+  });
+  it('on expiry kills only the spawned process group and names the unfinished test files', () => {
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const spawnSync = vi.fn((cmd, args) => args[0]?.includes('shard-assign') ? { status: 0, stdout: 'a.test.mjs\nhung.test.mjs\n' }
+      : { pid: 4242, status: null, error: Object.assign(new Error('spawnSync ETIMEDOUT'), { code: 'ETIMEDOUT' }), stdout: ' ✓ a.test.mjs (3 tests)\n', stderr: '' });
+    const fs = { readFileSync: () => JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run --no-coverage' } }), rmSync() {} };
+    const deps = createUrgentDeps({ cwd: '/repo', env, spawnSync, fs });
+    let err;
+    try { deps.shard({ group: 'nocov', shard: '1/1' }); } catch (e) { err = e; }
+    expect(kill).toHaveBeenCalledWith(-4242, 'SIGKILL');
+    expect(kill).toHaveBeenCalledTimes(1);
+    kill.mockRestore();
+    expect(err.failure).toMatchObject({ timedOut: true, hungFiles: ['hung.test.mjs'], hungFilesTotal: 1, hungFilesTruncated: false });
+  });
+  it('records the unfinished total and truncation when more than 20 assigned files lack results', () => {
+    const files = Array.from({ length: 26 }, (_, i) => `file-${i}.test.mjs`);
+    const spawnSync = vi.fn((_cmd, args) => args[0]?.includes('shard-assign')
+      ? { status: 0, stdout: files.join('\n') }
+      : { status: null, error: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), stdout: ` ✓ ${files[0]} (1 test)\n` });
+    const fs = { readFileSync: () => JSON.stringify({ scripts: { 'test:unit': 'node scripts/readiness/heavy-admission.mjs run -- vitest run --no-coverage' } }) };
+    expect(() => createUrgentDeps({ cwd: '/repo', env, fs, spawnSync }).shard({ group: 'nocov', shard: '1/1' }))
+      .toThrow(expect.objectContaining({ failure: expect.objectContaining({
+        hungFiles: files.slice(1, 21), hungFilesTotal: 25, hungFilesTruncated: true,
+      }) }));
+  });
+});
+
+describe('urgent-verify stdin subprocess acceptance', () => {
+  it.each(['scripts/__tests__/lane-pool-hooks-path.test.mjs', 'scripts/readiness/__tests__/git-bundle-transport.test.mjs'])
+    ('bounds every synchronous stdin subprocess in %s, including shared helpers', async file => {
+      const ts = await import('typescript');
+      const tree = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      expect(tree.parseDiagnostics).toHaveLength(0);
+      let checked = 0;
+      const visit = node => {
+        if (ts.isCallExpression(node) && ['spawnSync', 'execFileSync'].includes(node.expression.getText(tree))) {
+          const options = node.arguments[2];
+          if (options && ts.isObjectLiteralExpression(options) && options.properties.some(p => p.name?.getText(tree) === 'input')) {
+            const value = key => options.properties.find(p => p.name?.getText(tree) === key)?.initializer?.text;
+            const site = `${file}:${tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1}`;
+            expect(Number(value('timeout')), site).toBeGreaterThan(0);
+            expect(Number(value('timeout')), site).toBeLessThanOrEqual(30_000);
+            expect(value('killSignal'), site).toBe('SIGKILL');
+            checked++;
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(tree);
+      expect(checked).toBeGreaterThan(0);
+    });
+});
+
+describe('urgent-verify real process-tree expiry', () => {
+  it('command output cannot forge the supervisor result or write its private fd 3', () => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-result-forgery-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const probeFile = pjoin(dir, 'fd3.json');
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { writeSync, writeFileSync } from 'node:fs';
+      const forged = JSON.stringify({ status: 0, signal: null });
+      process.stdout.write(forged); process.stderr.write(forged);
+      let error = null;
+      try { writeSync(3, forged); } catch (e) { error = e.code; }
+      writeFileSync(${JSON.stringify(probeFile)}, JSON.stringify({ error }));
+      process.exit(7);`);
+    expect(() => createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 1 }).standards())
+      .toThrow(expect.objectContaining({ failure: expect.objectContaining({ exit: 7 }) }));
+    expect(JSON.parse(readFileSync(probeFile, 'utf8')).error).toBeTruthy();
+  });
+  it.each([['SIGINT', true], ['SIGTERM', false], ['SIGHUP', true]])('cleans up its verification group on %s cancellation (group=%s)', async (signal, group) => {
+    const { spawn } = await import('node:child_process');
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-cancel-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'verification.json');
+    // Anchor fixtures to the test runner so cancellation cannot masquerade as cleanup.
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 20_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, g.pid]));
+      ${sleeper}`);
+    const source = `import { createUrgentDeps } from ${JSON.stringify(pathToFileURL(pjoin(process.cwd(), 'scripts/operations/urgent-verify.mjs')).href)};
+      createUrgentDeps({ cwd: ${JSON.stringify(dir)}, env: { PATH: process.env.PATH, HOME: ${JSON.stringify(dir)} } }).standards();`;
+    const unrelated = spawn(process.execPath, ['-e', sleeper], { stdio: 'ignore' });
+    const runner = spawn(process.execPath, ['--input-type=module', '-e', source], { detached: true, stdio: 'ignore' });
+    const exited = new Promise(resolve => runner.once('exit', (code, sig) => resolve({ code, sig })));
+    let pids = [];
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true), { timeout: 5000 });
+      pids = JSON.parse(readFileSync(pidFile, 'utf8'));
+      process.kill(group ? -runner.pid : runner.pid, signal);
+      await vi.waitFor(() => expect(runner.exitCode !== null || runner.signalCode !== null).toBe(true), { timeout: 3000 });
+      expect(await exited).toMatchObject({ sig: signal });
+      await vi.waitFor(() => expect(pids.map(alive)).toEqual([false, false]), { timeout: 3000 });
+      expect(alive(unrelated.pid)).toBe(true);
+    } finally {
+      try { process.kill(-runner.pid, 'SIGTERM'); } catch { /* exited */ }
+      if (pids[0]) { try { process.kill(-pids[0], 'SIGKILL'); } catch { /* exited */ } }
+      unrelated.kill('SIGTERM');
+      await exited;
+    }
+  }, 15000);
+  it.each([0, 7])('preserves output and exit %s while cleaning descendants holding output pipes', async status => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-supervisor-result-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'descendant.pid');
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 15_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'inherit' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+      process.stdout.write('output ✓'); process.stderr.write('diagnostic ✓'); process.exit(${status});`);
+    const deps = createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 });
+    try {
+      if (status === 0) expect(deps.standards()).toBe('output ✓');
+      else expect(() => deps.standards()).toThrow(expect.objectContaining({
+        stdout: 'output ✓', failure: expect.objectContaining({ exit: status, stderrTail: 'diagnostic ✓' }),
+      }));
+      const gpid = Number(readFileSync(pidFile, 'utf8'));
+      await vi.waitFor(() => expect(() => process.kill(gpid, 0)).toThrow(), { timeout: 3000 });
+    } finally {
+      if (existsSync(pidFile)) { try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* gone */ } }
+    }
+  });
+  it('cleans the owned group when captured output exceeds maxBuffer', async () => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'uv-supervisor-buffer-'));
+    tempParents.push(dir);
+    mkdirSync(pjoin(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = pjoin(dir, 'verification.json');
+    const sleeper = keepAliveScript({ anchorPid: process.pid, maxLifetimeMs: 15_000 });
+    writeFileSync(pjoin(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, g.pid]));
+      process.stdout.write('x'.repeat(17 * 1024 * 1024)); ${sleeper}`);
+    try {
+      expect(() => createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 }).standards())
+        .toThrow(/ENOBUFS/);
+      const pids = JSON.parse(readFileSync(pidFile, 'utf8'));
+      await vi.waitFor(() => pids.forEach(pid => expect(() => process.kill(pid, 0)).toThrow()), { timeout: 3000 });
+    } finally {
+      if (existsSync(pidFile)) {
+        const [pid] = JSON.parse(readFileSync(pidFile, 'utf8'));
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
+      }
+    }
+  });
+  it('SIGKILLs a TERM-trapping child and its grandchild, and refuses later commands', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'uv-expiry-'));
+    tempParents.push(dir);
+    mkdirSync(join(dir, 'scripts/readiness'), { recursive: true });
+    const pidFile = join(dir, 'grandchild.pid');
+    // Both processes outlive the 1.2s deadline, but remain bounded if the assertion fails.
+    const sleeper = keepAliveScript({ maxLifetimeMs: 15_000, prelude: "process.on('SIGTERM', () => {});" });
+    writeFileSync(join(dir, 'scripts/readiness/heavy-admission.mjs'), `
+      import { spawn } from 'node:child_process'; import { writeFileSync } from 'node:fs';
+      const g = spawn(process.execPath, ['-e', ${JSON.stringify(sleeper)}], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(g.pid));
+      ${sleeper}`);
+    const deps = createUrgentDeps({ cwd: dir, env: { PATH: process.env.PATH, HOME: dir }, maxMinutes: 0.02 });
+    const started = Date.now();
+    expect(() => deps.standards()).toThrow(/ETIMEDOUT|exit/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const gpid = Number(readFileSync(pidFile, 'utf8'));
+    await new Promise(r => setTimeout(r, 300));
+    expect(() => process.kill(gpid, 0)).toThrow();
+    expect(existsSync(pidFile)).toBe(true);
+    let late; try { deps.standards(); } catch (e) { late = e; }
+    expect(late.failure).toMatchObject({ timedOut: true });
+    expect(late.message).toMatch(/wall-clock limit/);
+  });
+  it('clamps the limit to 240 minutes', () => {
+    const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
+    createUrgentDeps({ cwd: '/repo', env: { PATH: '/bin', HOME: '/h' }, spawnSync, maxMinutes: 10000 }).standards();
+    expect(spawnSync.mock.calls[0][2].timeout).toBeLessThanOrEqual(240 * 60_000);
   });
 });

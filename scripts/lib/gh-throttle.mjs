@@ -196,6 +196,7 @@ import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs'
 export { isGhDeferred, isGhThrottled } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
+import { readOperatorOverrides } from './operator-override-reader.mjs';
 import { resolveFinishedCiCacheSettings, finishedCiAuthScope, classifyFinishedCiRead, finishedCiCacheable, finishedCiStorable, finishedCiProofArgs, recordFinishedCiProof, finishedCiCacheGeneration, lookupFinishedCi, storeFinishedCi, invalidateForWrite } from './finished-ci-cache.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
@@ -243,7 +244,12 @@ export const GH_POINTS_WINDOW_MS = 60_000;
  * Per-minute GitHub REST "points" budget for `gh` calls routed through this wrapper — distinct from
  * `DEFAULT_GH_CONCURRENCY_CAP` above: that bounds how many calls run AT ONCE, this bounds how many POINTS are
  * spent over a rolling 60s window (see the module header's #3670 section). Overridable via
- * `WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN`.
+ * `WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN`, then the operator capacity leaf
+ * `gh.throttle.pointsBudgetPerMin` (integer 1..600), else 300. Env keeps its >=1
+ * validation and fractional flooring; values above 600 warn and use 300.
+ * Operator reads are lock-free; invalid/unreadable overrides use 300.
+ * Provenance and warnings go to `points-budget-settings.jsonl` under the throttle lock root,
+ * keeping stdout/stderr transparent for the shim and callers that parse GitHub errors.
  *
  * DERIVED 2026-09-22, from three inputs, not invented:
  *   1. GitHub's documented secondary ceiling — 900 REST points/minute, ACCOUNT-WIDE (this module header's own
@@ -266,9 +272,37 @@ export const GH_POINTS_WINDOW_MS = 60_000;
  */
 export const DEFAULT_GH_POINTS_BUDGET_PER_MIN = 300;
 
-export function resolveGhPointsBudgetPerMin(env = process.env) {
+let pointsBudgetSourceLogged = false;
+export function resolveGhPointsBudgetPerMin(env = process.env, { overrideFile, lockRoot } = {}) {
+  const log = entry => {
+    try {
+      const root = lockRoot || ghThrottleLockRoot(undefined, env);
+      mkdirSync(root, { recursive: true });
+      recordGhCallLogEntry(join(root, 'points-budget-settings.jsonl'), { op: 'points-budget', ...entry });
+    } catch { /* diagnostics never change a call or its output */ }
+  };
+  const warn = message => log({ outcome: 'settings_warning', message });
   const n = Number(env.WE_GH_THROTTLE_POINTS_BUDGET_PER_MIN);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_GH_POINTS_BUDGET_PER_MIN;
+  let budget = DEFAULT_GH_POINTS_BUDGET_PER_MIN;
+  let source = 'default';
+  if (Number.isFinite(n) && n > 600) {
+    warn('gh-throttle: env pointsBudgetPerMin exceeds 600; using 300');
+  } else if (Number.isFinite(n) && n >= 1) {
+    budget = Math.floor(n);
+    source = 'env';
+  } else {
+    const overrides = readOperatorOverrides({ file: overrideFile, log: warn });
+    const value = overrides.values['gh.throttle.pointsBudgetPerMin'];
+    if (overrides.readable && value !== undefined) {
+      budget = value;
+      source = 'override';
+    }
+  }
+  if (!pointsBudgetSourceLogged) {
+    pointsBudgetSourceLogged = true;
+    log({ outcome: 'settings', pointsBudgetPerMin: budget, source });
+  }
+  return budget;
 }
 
 /**
@@ -747,6 +781,49 @@ const SUBDIR = join('.admission', 'gh');
 const POINTS_BUDGET_LOCK_KEY = 'points-budget';
 const POINTS_BUDGET_LOCK_LEASE_MINUTES = 1; // short — the mutex is held only across one tiny JSON read/write
 const POINTS_BUDGET_STATE_FILENAME = 'points-budget-state.json';
+// Best-effort observational counter: UTC-hour buckets retain timestamps for an exact
+// trailing-60-minute count across the hour boundary. Never delays a GitHub call.
+const SECONDARY_HITS_FILENAME = 'gh-secondary-hits.json';
+const HOUR_MS = 3600000;
+const utcHour = ms => new Date(ms).toISOString().slice(0, 13);
+function secondaryHitBuckets(lockRoot, nowMs) {
+  try {
+    const stored = JSON.parse(readFileSync(join(lockRoot, SECONDARY_HITS_FILENAME), 'utf8'));
+    const buckets = {};
+    for (const [hour, hits] of Object.entries(stored)) {
+      if (!Array.isArray(hits)) continue;
+      const recent = hits.filter(ms => Number.isFinite(ms) && ms > nowMs - 48 * HOUR_MS && ms <= nowMs && utcHour(ms) === hour);
+      if (recent.length) buckets[hour] = recent;
+    }
+    return buckets;
+  } catch { return {}; }
+}
+/** Lock-free, fail-open telemetry read; missing/unreadable evidence returns zero counts. */
+export function readGhSecondaryHits({ lockRoot = ghThrottleLockRoot(), nowMs = Date.now() } = {}) {
+  const buckets = secondaryHitBuckets(lockRoot, nowMs);
+  return {
+    currentHour: buckets[utcHour(nowMs)]?.length || 0,
+    last60Min: Object.values(buckets).reduce((sum, hits) => sum + hits.filter(ms => ms > nowMs - HOUR_MS).length, 0),
+  };
+}
+function recordGhSecondaryHit({ lockRoot, nowMs }) {
+  let tmp;
+  try {
+    mkdirSync(lockRoot, { recursive: true });
+    const key = 'gh-secondary-hits';
+    const locked = reserve(lockRoot, key, `${process.pid}:${randomUUID()}`, nowMs, new Date(nowMs).toISOString(), process.pid, 'unknown', 1);
+    if (!locked.ok) return; // fail-open: telemetry never waits for a busy writer
+    try {
+      const buckets = secondaryHitBuckets(lockRoot, nowMs);
+      (buckets[utcHour(nowMs)] ??= []).push(nowMs);
+      const path = join(lockRoot, SECONDARY_HITS_FILENAME);
+      tmp = `${path}.${randomUUID()}.tmp`;
+      writeFileSync(tmp, JSON.stringify(buckets));
+      renameSync(tmp, path);
+    } finally { releaseLockDir(lockRoot, key); }
+  } catch { /* fail-open: counter failure must not change a call or its backoff */ }
+  finally { if (tmp) { try { unlinkSync(tmp); } catch { /* published or unavailable */ } } }
+}
 const CALL_LOG_FILENAME = 'calls.jsonl';
 const WRITE_BUDGET_LOCK_KEY = 'write-budget';
 const WRITE_BUDGET_STATE_FILENAME = 'write-budget-state.json';
@@ -2014,7 +2091,7 @@ function runGhSyncUnmemoized(args, opts = {}) {
     return settleLikeExecFileSync(bin, a, o, lastCapture.result);
   });
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env, { lockRoot });
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   // Header self-calibration is OPT-IN per call (see the module header) — OFF unless a caller explicitly asks,
@@ -2163,6 +2240,9 @@ function runGhSyncUnmemoized(args, opts = {}) {
     // stderr) beats the guessed backoff — see `calibratedBackoffMs`'s own docblock for the fallback contract.
     // `text` above is the STRIPPED stderr, so a response body mentioning a rate limit never classifies as one.
     const headers = parseGhDebugResponseHeaders(captured ? captured.rawStderrText : failure && failure.stderr);
+    if (classifyRateLimitSignal(headers).kind === 'secondary' || /secondary rate limit|abuse detection/i.test(text)) {
+      recordGhSecondaryHit({ lockRoot, nowMs: now() });
+    }
 
     // #gh-graphql-budget — a PRIMARY exhaustion cannot clear before the bucket's reset: record the shared block
     // and give up NOW instead of spending the retry ladder on calls GitHub will refuse.
@@ -2312,7 +2392,7 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
   const pid = throttle.pid || process.pid;
   const owner = throttle.owner || `${pid}:${randomUUID()}`;
   const points = throttle.points != null ? throttle.points : 1;
-  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env);
+  const budgetPerMin = throttle.budgetPerMin != null ? throttle.budgetPerMin : resolveGhPointsBudgetPerMin(env, { lockRoot });
   const pointsWindowMs = throttle.pointsWindowMs != null ? throttle.pointsWindowMs : GH_POINTS_WINDOW_MS;
   const logPath = throttle.logPath || ghThrottleLogPath(lockRoot);
   const headerCapMs = throttle.headerCapMs != null ? throttle.headerCapMs : resolveHeaderWaitCapMs(env);
@@ -2464,6 +2544,9 @@ function runGhCliPassthroughUncached(argv, { throttle = {}, spawn = spawnSync, b
       return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
     }
     const headers = parseGhDebugResponseHeaders(rawStderrText); // the LAST response block's headers, pre-strip
+    if (classifyRateLimitSignal(headers).kind === 'secondary' || /secondary rate limit|abuse detection/i.test(stderrText)) {
+      recordGhSecondaryHit({ lockRoot, nowMs: now() });
+    }
     // #gh-graphql-budget — PRIMARY exhaustion → record the shared block and return now (see runGhSync).
     const exhausted = primaryExhaustedResource(stderrText);
     if (exhausted) {

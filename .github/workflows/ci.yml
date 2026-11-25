@@ -722,6 +722,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       run: ${{ steps.scope.outputs.run }}
+      shards: ${{ steps.scope.outputs.shards }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -738,8 +739,18 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # CI-SOAK-SCOPE-MQ: only a merge_group may narrow the soak (shard 1 still runs); push and dispatch run all 8.
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ github.event_name }}" != "merge_group" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo 'shards=[1,2,3,4,5,6,7,8]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Any error below (unknown shas, failed diff) must run everything: fail toward the full soak.
+          trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "run=true" >> "$GITHUB_OUTPUT"; echo "shards=[1,2,3,4,5,6,7,8]" >> "$GITHUB_OUTPUT"; exit 0; fi' EXIT
+          if [ "${{ github.event_name }}" = "merge_group" ]; then
+            BASE_SHA="$MQ_BASE_SHA"; HEAD_SHA="$MQ_HEAD_SHA"
+          fi
           # Only the PR's contribution: base may have advanced, and HEAD is checkout's synthetic merge.
           # --no-renames preserves the source path when daemon code is moved outside the scope.
           # core.quotePath=false keeps non-ASCII paths unquoted, so they compare equal to the scope keys.
@@ -749,9 +760,11 @@ jobs:
           if [ -n "$hits" ] || [ "$derived" != "run=false" ]; then
             echo "Daemon code touched — running the soak:"; printf '  %s\n' $hits
             echo "run=true" >> "$GITHUB_OUTPUT"
+            echo 'shards=[1,2,3,4,5,6,7,8]' >> "$GITHUB_OUTPUT"
           else
-            echo "No daemon code touched — soak not needed."
+            echo "No daemon code touched — soak not needed (merge queue still runs shard 1)."
             echo "run=false" >> "$GITHUB_OUTPUT"
+            echo 'shards=[1]' >> "$GITHUB_OUTPUT"
           fi
 
   # One shard of the soak: shard 1 is the 50-tick baseline alone, shards 2-8 balance the break scenarios by
@@ -761,8 +774,10 @@ jobs:
   soak-shard:
     needs: [daemon-soak-scope, changes]
     # R1068: shards run in the merge queue / on main / on dispatch, never on a pull_request push (~28k CI min/day).
+    # CI-SOAK-SCOPE-MQ: the matrix comes from the scope job. Shard 1 (the baseline) always runs; shards 2-8 run
+    # only when daemon code was touched (or the scope is unknown). Total stays 8, so it is not strategy.job-total.
     # CI-MAIN-REUSE-MQ: skipped when main reuses the merge queue's full run of this exact sha.
-    if: needs.daemon-soak-scope.outputs.run == 'true' && github.event_name != 'pull_request' && needs.changes.outputs.reuse != 'true'
+    if: needs.daemon-soak-scope.result == 'success' && (needs.daemon-soak-scope.outputs.run == 'true' || needs.daemon-soak-scope.outputs.run == 'false') && github.event_name != 'pull_request' && needs.changes.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     # Measured 2026-10-14: time-balanced shards finish in ~8-14 min on main (shard 3: 13m24s and 13m48s on two
     # green main runs), so the old 15-min cap sat ~1 min above a healthy run. PR #5187's shard 3 was CANCELLED at
@@ -775,7 +790,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: ${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}
     steps:
       - name: Record shard start
         continue-on-error: true
@@ -798,10 +813,10 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Soak shard ${{ matrix.shard }}/${{ strategy.job-total }}
+      - name: Soak shard ${{ matrix.shard }}/8
         id: suite
         run: |
-          test_args=(npm run test:soak:shard -- --shard=${{ matrix.shard }}/${{ strategy.job-total }} $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})"))
+          test_args=(npm run test:soak:shard -- --shard=${{ matrix.shard }}/8 $(node scripts/ci/quarantine-skip.mjs --job="soak-shard (${{ matrix.shard }})"))
           "${test_args[@]}"
           case " ${test_args[*]} " in
             *" --exclude"*|*" --quarantined"*) ;;
@@ -887,8 +902,17 @@ jobs:
           fi
           case "${{ needs.daemon-soak-scope.outputs.run }}" in
             true) ;;
-            false) echo "Outside a pull_request the soak always runs, but scope said run=false — refusing to skip it."; exit 1 ;;
+            false)
+              # CI-SOAK-SCOPE-MQ: only the merge queue may narrow the soak, and then shard 1 must have run and passed.
+              if [ "${{ github.event_name }}" != "merge_group" ]; then
+                echo "Outside a pull_request and the merge queue the soak always runs, but scope said run=false — refusing to skip it."; exit 1
+              fi ;;
             *) echo "daemon-soak-scope emitted no usable run output (got: '${{ needs.daemon-soak-scope.outputs.run }}')."; exit 1 ;;
+          esac
+          # The matrix comes from a separate `shards` output: it must agree with `run`, or the coverage is unproven.
+          case "${{ needs.daemon-soak-scope.outputs.run }}/${{ needs.daemon-soak-scope.outputs.shards }}" in
+            true/\[1,2,3,4,5,6,7,8\]|false/\[1\]) ;;
+            *) echo "daemon-soak-scope run/shards outputs disagree (run/shards: '${{ needs.daemon-soak-scope.outputs.run }}/${{ needs.daemon-soak-scope.outputs.shards }}')."; exit 1 ;;
           esac
           # CI-MAIN-REUSE-MQ: after the scope checks above, only an explicit reuse=true from a successful
           # `changes` job lets the (skipped) soak shards count as passed.

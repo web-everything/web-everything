@@ -458,6 +458,21 @@ it.each(['outside', 'missing', 'empty', 'non-string', 'changed', 'symlink', 'nes
     expect(out.status).toBe(kind === 'consistent' ? 'ok' : 'voided');
     if (kind !== 'consistent') expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
   });
+it('a read_file step naming one in-lane file in two path params is not a void', async () => {
+  const fx = fixture();
+  const out = await fx.run(undefined, cwd => [tool('', { tool_name: 'read_file',
+    tool_info: { parameters: { path: 'file.txt', file_path: join(cwd, 'file.txt') } } })]);
+  expect(out.status).toBe('ok');
+});
+it('a read_file void reason names the offending path', async () => {
+  const fx = fixture();
+  const out = await fx.run(undefined, cwd => [tool('', { tool_name: 'read_file',
+    tool_info: { parameters: { path: 'file.txt', file_path: 'untouched.txt' } } })]);
+  expect(out.status).toBe('voided');
+  expect(out.reasons.join(' ')).toContain('read_file (missing or invalid in-lane path)');
+  expect(out.reasons.join(' ')).toContain('file.txt');
+  expect(out.reasons.join(' ')).toContain('untouched.txt');
+});
 it('read_file refuses a symlink escape and accepts a direct in-lane read', async () => {
   const fx = fixture();
   symlinkSync(fx.shared, join(fx.home, 'escape'));
@@ -486,7 +501,7 @@ it('read_file realpath containment refuses a link inside the lane targeting outs
   symlinkSync(fx.shared, join(fx.lane, 'escape'));
   const evidence = transcript([tool('escape/file.txt', { tool_name: 'read_file' })]);
   expect(stateChangingToolCalls(evidence, { allowedRoots: [fx.lane] }))
-    .toEqual(['read_file (missing or invalid in-lane path)']);
+    .toEqual(['read_file (missing or invalid in-lane path) [<outside lane>]']);
 });
 
 it('preserves first-output failure telemetry for the advisory skip boundary', async () => {

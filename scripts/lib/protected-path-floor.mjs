@@ -13,6 +13,8 @@
  * of this family is most of scripts/, so a module two imports away is protected only if it is named here.
  */
 export const REVIEW_AUTH_FLOOR = Object.freeze([
+  // AUTH-BOUND-APPROVAL: the pinned approval trust root (App id, operator allowlist) and its writer.
+  'scripts/lib/approval-record.mjs', 'scripts/operations/approve-head.mjs',
   'scripts/lib/review-independence.mjs', 'scripts/lib/marker-authorship.mjs', 'scripts/lib/ai-pr-authorship.mjs',
   'scripts/operations/build-pr-authorship.mjs', 'scripts/**/human-clearance-carry*', 'scripts/settings/*human-clearance*',
   'scripts/**/accept-carry-*', 'scripts/lib/unattended-review-accept.mjs', 'scripts/lib/trust-chain-tier.mjs',
@@ -165,6 +167,8 @@ export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', '
   'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
   'scripts/ci/rerun-failed-once.mjs',
+  // Red-team reprobe requests dedupe across gate sources and restarts with an exclusive `wx` create.
+  'scripts/lib/red-team-queue-state.mjs',
   'scripts/conveyor/health-file-request.mjs', 'scripts/lib/review-seat-pool.mjs', 'scripts/daemon-overlay.mjs',
   'scripts/lib/daemon-overlays.mjs', 'scripts/lib/lane-repair.mjs', 'scripts/lib/overlay-adoption.mjs', 'scripts/lib/we-scan-cache.mjs',
   'scripts/readiness/forge-exec-run.mjs', 'scripts/lib/review-shadow-budget.mjs', 'scripts/readiness/reservations.mjs',
