@@ -259,9 +259,7 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
         siblings = { reason: 'sibling-base-unreadable', detail: `Cannot read complete sibling PR evidence: ${error.message}. Restore the local refs/objects or GitHub read access and retry --check.` };
       }
       if (Array.isArray(siblings) && siblings.length) {
-        const branch = arg('ref') || arg('branch') || '<branch>';
-        const quote = value => /^[A-Za-z0-9_./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
-        const detail = siblings.map(pr => `PR #${pr.number} (${pr.headRefName}): ${pr.count} unlanded shared commits; git rebase --onto origin/main ${quote(pr.headRefName)} ${quote(branch)} (or wait for the sibling to land)`).join('; ');
+        const detail = siblings.map(pr => `PR #${pr.number} (${pr.headRefName}): head incorporated with ${pr.count} unlanded shared commits; ancestry does not establish commit ownership`).join('; ');
         collect('sibling-base', 'sibling-base', detail);
       } else if (!Array.isArray(siblings)) collect('sibling-base', siblings.reason, siblings.detail);
     };

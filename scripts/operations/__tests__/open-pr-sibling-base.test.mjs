@@ -76,7 +76,7 @@ describe('sibling base admission', () => {
     expect(f.check({ sha: 'lane/child' })).toEqual([]);
   });
 
-  it('the refusal names the sibling lanes and the fix command', () => {
+  it('the refusal names the sibling lanes and requires ownership inspection before changing history', () => {
     const f = fixture();
     f.sibling(7357); f.sibling(7366); f.sibling(7374);
     f.git('checkout', '-b', 'lane/child'); f.commit('child');
@@ -85,8 +85,9 @@ describe('sibling base admission', () => {
     for (const pr of f.openPrs) {
       expect(result.detail).toContain(`#${pr.number}`);
       expect(result.detail).toContain(pr.headRefName);
-      expect(result.detail).toContain(`git rebase --onto origin/main ${pr.headRefName} lane/child`);
+      expect(result.detail).toContain('confirm which commits belong to each branch');
     }
+    expect(JSON.stringify(result)).not.toContain('git rebase --onto');
   });
 
   it('allows a stacked PR whose declared base is the sibling lane', () => {
@@ -129,20 +130,70 @@ describe('sibling base admission', () => {
     expect(readSiblingBase(opts, () => JSON.stringify([grandchild, child, parent]))).toEqual([]);
   });
 
+  it.each([false, true])('allows a parent when an undeclared child shares its commits (parent advanced: %s)', advanced => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    f.git('checkout', parent.headRefName);
+    if (advanced) f.commit('parent-review-fix');
+    const gh = () => JSON.stringify([parent, child]);
+    const siblingBase = opts => readSiblingBase({ ...opts, cwd: f.dir }, gh);
+    const result = runner(f, { siblingBase })({ argv: [`--ref=${parent.headRefName}`, '--check'] });
+    expect(result).toMatchObject({ outcome: 'checked', reason: 'check-ok' });
+    expect(result.blockers ?? []).toEqual([]);
+  });
+
+  it.each([false, true, undefined])('does not infer ownership from divergent or descendant overlap (cross-repository: %s)', isCrossRepository => {
+    const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
+    const openPrs = [{ ...child, isCrossRepository }];
+    f.git('checkout', parent.headRefName);
+    expect(f.check({ branch: parent.headRefName, openPrs })).toEqual([]);
+    f.commit('parent-review-fix');
+    expect(f.check({ branch: parent.headRefName, openPrs })).toEqual([]);
+  });
+
+  it('still blocks an incorporated sibling when an undeclared child is also open', () => {
+    const f = fixture(), sibling = f.sibling(235), parent = f.sibling(236), child = f.sibling(237);
+    f.git('checkout', parent.headRefName); f.commit('parent-review-fix');
+    expect(f.check({ branch: parent.headRefName, openPrs: [child, sibling] }))
+      .toEqual([{ number: sibling.number, headRefName: sibling.headRefName, count: 1 }]);
+  });
+
+  it('does not prescribe dropping shared commits whose ownership is unknown', () => {
+    const f = fixture(); f.sibling(236); f.commit('child');
+    const result = runner(f)({ argv: ['--ref=lane/child', '--check'] });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });
+    expect(result.detail).toContain('confirm which commits belong to each branch');
+    expect(JSON.stringify(result)).not.toContain('git rebase --onto');
+  });
+
+  it.each(['error', 'malformed'])('fails closed on unreadable directional ancestry (%s)', failure => {
+    const f = fixture(); f.sibling(236); f.commit('child');
+    const real = createGitReader(f.dir);
+    const git = (args, opts) => {
+      if (args.includes('--max-count=1')) {
+        if (failure === 'error') throw new Error('ancestry read unavailable');
+        return 'invalid-commit-identity\n';
+      }
+      return real(args, opts);
+    };
+    expect(f.check({ git })).toMatchObject({ reason: 'sibling-base-unreadable' });
+  });
+
   it.each([true, undefined])('does not exempt a child without same-repository proof (%s)', isCrossRepository => {
     const f = fixture(), parent = f.sibling(236), child = f.sibling(237);
     child.baseRefName = parent.headRefName;
     child.isCrossRepository = isCrossRepository;
-    f.git('checkout', parent.headRefName);
+    // The proposed head incorporates the fork tip; only the claimed stack metadata
+    // could exempt it. A parent that does not incorporate the tip is covered above.
+    f.commit('proposed-head');
     expect(f.check({ branch: parent.headRefName, openPrs: [child] }))
-      .toEqual([{ number: child.number, headRefName: child.headRefName, count: 1 }]);
+      .toEqual([{ number: child.number, headRefName: child.headRefName, count: 2 }]);
   });
 
   it('does not follow a fork branch-name collision as an intermediate stack base', () => {
     const f = fixture(), parent = f.sibling(236), fork = f.sibling(237), grandchild = f.sibling(238);
     fork.baseRefName = parent.headRefName; fork.isCrossRepository = true;
     grandchild.baseRefName = fork.headRefName;
-    f.git('checkout', parent.headRefName);
+    f.commit('proposed-head');
     expect(f.check({ branch: parent.headRefName, openPrs: [grandchild, fork] }).map(pr => pr.number))
       .toEqual([grandchild.number, fork.number]);
   });

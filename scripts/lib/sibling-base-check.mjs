@@ -69,7 +69,14 @@ export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = ''
       if (descendants.has(pr.number)) continue;
       const reachable = new Set(lines(read(['rev-list', sibling, `^${main}`, '--'])).map(oid));
       const count = unlanded.filter(commit => reachable.has(commit)).length;
-      if (count) siblings.push({ number: pr.number, headRefName: pr.headRefName, count });
+      if (!count) continue;
+      // Shared ancestors alone cannot establish dependency direction: this may be an
+      // undeclared child, including one cut before this branch's latest review fix.
+      // Only an incorporated sibling tip supplies directional ancestry evidence.
+      // Divergent overlap is intentionally inconclusive; do not infer commit ownership.
+      const outside = lines(read(['rev-list', '--max-count=1', sibling, `^${head}`, '--'])).map(oid);
+      if (outside.length) continue;
+      siblings.push({ number: pr.number, headRefName: pr.headRefName, count });
     }
     return siblings;
   } catch {
