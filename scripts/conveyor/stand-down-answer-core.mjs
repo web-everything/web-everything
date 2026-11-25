@@ -2,6 +2,8 @@
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { standDownComments, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
+import { rearmWindow } from './rearm-review.mjs';
+import { parseReviewedSha } from '../lib/review-escalation.mjs';
 import { REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER } from './rearm-round-count.mjs';
 
 export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
@@ -205,20 +207,35 @@ export function isCloseSupersededExecuted(comments) {
 /** STANDDOWN-EMPTY-ROUND (D2): the orchestrator's `rearm-review --no-code-owed` ruling, executed once by the conveyor. */
 export const isNoCodeRearmAnswer = (answer) => answerDisposition(answer) === 'rearm-review' && answer?.noCodeOwed === true;
 
-/**
- * True once a TRUSTED re-arm marker (success) or empty-round note (the guard refused) postdates the latest answer.
- * Either one spends the ruling: the conveyor never retries it, so a refused rearm cannot loop (bounded at one).
+/** Durable, trusted receipts are scoped to the latest answer and its execution head.
+ * Legacy child notes still spend their answer; its preceding reviewed head binds old rulings.
  */
-export function isNoCodeRearmExecuted(comments) {
-  if (!Array.isArray(comments)) return false;
-  let answerAt = -1;
-  for (let i = comments.length - 1; i >= 0; i -= 1) {
-    const answer = parseOperatorAnswer(comments[i]);
-    if (answer && answersEarlierStandDown(comments, i, answer)) { answerAt = i; break; }
-  }
-  if (answerAt < 0) return false;
-  return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
-    && [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some((m) => c.body.trimStart().startsWith(m)));
+export function noCodeRearmState(comments, head) {
+  const empty = { applicable: true, executed: false, intent: false, confirmed: false, failed: false };
+  if (!Array.isArray(comments)) return empty;
+  const answerId = latestOperatorAnswerCommentId(comments);
+  const answerAt = comments.findLastIndex(c => c?.id != null && String(c.id) === answerId);
+  if (answerAt < 0) return empty;
+  const later = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
+  const receipts = later.flatMap(c => {
+    const m = String(c?.body ?? '').match(/^<!-- no-code-rearm (state=(intent|confirm)|attempt=(failed)) answer=([\w=-]+) head=([0-9a-f]{40}) -->$/i);
+    return m && m[4] === answerId ? [{ state: m[2] ?? m[3], head: m[5].toLowerCase() }] : [];
+  });
+  const before = comments.slice(0, answerAt);
+  const window = rearmWindow(before);
+  const boundHead = receipts[0]?.head ?? window.claims?.at(-1) ?? window.reviewedHead ?? parseReviewedSha(before);
+  if (/^[0-9a-f]{40}$/i.test(String(head ?? '')) && boundHead && !head.toLowerCase().startsWith(boundHead)) return { ...empty, applicable: false };
+  const matching = receipts.filter(r => !head || r.head === head.toLowerCase());
+  const intent = matching.some(r => r.state === 'intent');
+  const confirmed = matching.some(r => r.state === 'confirm');
+  const failed = matching.some(r => r.state === 'failed');
+  const legacy = later.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER]
+    .some(m => String(c?.body ?? '').trimStart().startsWith(m)));
+  return { applicable: true, executed: intent || confirmed || failed || legacy, intent, confirmed, failed };
+}
+
+export function isNoCodeRearmExecuted(comments, head) {
+  return noCodeRearmState(comments, head).executed;
 }
 
 /** The comment id of the same "latest answer" `latestOperatorAnswer` returns (null when absent or unnumbered). */

@@ -153,7 +153,7 @@ import {
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
-import { answerDisposition, isCloseSupersededExecuted, isNoCodeRearmAnswer, isNoCodeRearmExecuted, latestOperatorAnswerCommentId } from './stand-down-answer-core.mjs';
+import { answerDisposition, isCloseSupersededExecuted, isNoCodeRearmAnswer, noCodeRearmState, latestOperatorAnswerCommentId } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -303,7 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
-  'fix-join-wait',
+  'fix-join-wait', 'no-code-rearm-held', 'no-code-rearm-spent', 'no-code-rearm-failed',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
@@ -2859,43 +2859,6 @@ export function planReconcile({
       continue;
     }
 
-    // ── STANDDOWN-EMPTY-ROUND (D2) — the orchestrator's `rearm-review --no-code-owed` ruling is EXECUTED once by the
-    // conveyor and NEVER handed to a fixer. After every refusal above (live claim, pause, liveness) and before every
-    // round-cap or fix branch. The branch always ends in `continue`: no review row is pushed from here — the review
-    // comes from the ordinary planner after the label swap, with all its refusals. At plan time every guard is
-    // rechecked; rearm-review.mjs rechecks head and labels again at write time (`--expect-head`).
-    if ((pr?.state ?? 'OPEN') === 'OPEN' && isNoCodeRearmAnswer(operatorAnswer)) {
-      const names = Array.isArray(pr?.labels) && pr.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
-        ? labelNames(pr.labels) : null;
-      if (isNoCodeRearmExecuted(pr?.comments)) {
-        if (names?.includes('review:changes') || names === null) {
-          refuse('no-code-rearm-spent', { why: 'the no-code rearm ruling was executed once and the PR still carries review:changes' });
-          notes.push({ kind: 'no-code-rearm-spent', prNumber,
-            text: `PR #${prNumber}: the no-code rearm ruling was executed once and the PR is still review:changes — a fresh operator answer is needed.` });
-        }
-        continue;
-      }
-      const window = Array.isArray(pr?.comments) ? rearmWindow(pr.comments) : null;
-      const held = !/^[0-9a-f]{40}$/i.test(String(pr?.headRefOid ?? '')) ? 'the live head is not a full sha'
-        : names === null ? 'the label list is incomplete'
-        : !names.includes('review:changes') ? 'the PR no longer carries review:changes'
-        : names.includes('red-team:blocked') || names.includes('red-team:pending') ? 'a red-team label stands, a fix or security verdict is owed'
-        : !window ? 'the comment thread is unreadable'
-        : window.claims === null ? 'a fix claim in the thread is unparseable'
-        : window.claims.length > 0 ? 'a fix-begin was posted after the ruling; the ruling must be re-answered'
-        : window.rearmed !== true ? 'the rearm window does not honour this answer (no unanswered stand-down for it)'
-        : null;
-      if (held) {
-        refuse('no-code-rearm-held', { why: held });
-        notes.push({ kind: 'no-code-rearm-held', prNumber,
-          text: `PR #${prNumber}: the no-code rearm ruling cannot run — ${held}.` });
-        continue;
-      }
-      dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: latestOperatorAnswerCommentId(pr?.comments),
-        why: `the orchestrator ruled no code is owed (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — re-arm review once on the unchanged head, no fix agent` });
-      continue;
-    }
-
     // ── PHASE, BORROWED. `classifyPr` for the labels, `reduceCheckState` for CI truth. Not re-derived.
     const phase = classifyPr({
       // The planner accepts strings and GraphQL label objects; the board classifier
@@ -2932,6 +2895,50 @@ export function planReconcile({
             ' should be closed and its backlog card resolved, never dispatched.',
       });
       continue;
+    }
+
+    // ── STANDDOWN-EMPTY-ROUND (D2) — the orchestrator's `rearm-review --no-code-owed` ruling is EXECUTED once by the
+    // conveyor and NEVER handed to a fixer. After every refusal above (live claim, pause, liveness) and before every
+    // round-cap or fix branch. Spent rulings suppress only the rearm; ordinary planning continues. At plan time every guard is
+    // rechecked; rearm-review.mjs rechecks head and labels again at write time (`--expect-head`).
+    const noCodeState = noCodeRearmState(pr?.comments, pr?.headRefOid);
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && isNoCodeRearmAnswer(operatorAnswer) && noCodeState.applicable) {
+      const names = Array.isArray(pr?.labels) && pr.labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
+        ? labelNames(pr.labels) : null;
+      if (noCodeState.executed) {
+        if (noCodeState.intent && !noCodeState.confirmed && !noCodeState.failed) {
+          notes.push({ kind: 'no-code-rearm-crashed', prNumber,
+            text: `PR #${prNumber}: no-code rearm intent has no confirmation — a person must check the labels before issuing a fresh answer.` });
+        }
+        if (noCodeState.failed && (names?.includes('review:changes') || names === null)) {
+          refuse('no-code-rearm-failed', { why: 'the no-code rearm attempt failed; check labels and issue a fresh operator answer' });
+        }
+        if (names?.includes('review:changes') || names === null) {
+          refuse('no-code-rearm-spent', { why: 'the no-code rearm ruling was executed once and the PR still carries review:changes' });
+          notes.push({ kind: 'no-code-rearm-spent', prNumber,
+            text: `PR #${prNumber}: the no-code rearm ruling was executed once and the PR is still review:changes — a fresh operator answer is needed.` });
+        }
+      } else {
+        const window = Array.isArray(pr?.comments) ? rearmWindow(pr.comments) : null;
+        const held = !/^[0-9a-f]{40}$/i.test(String(pr?.headRefOid ?? '')) ? 'the live head is not a full sha'
+          : names === null ? 'the label list is incomplete'
+          : !names.includes('review:changes') ? 'the PR no longer carries review:changes'
+          : names.includes('red-team:blocked') || names.includes('red-team:pending') ? 'a red-team label stands, a fix or security verdict is owed'
+          : !window ? 'the comment thread is unreadable'
+          : window.claims === null ? 'a fix claim in the thread is unparseable'
+          : window.claims.length > 0 ? 'a fix-begin was posted after the ruling; the ruling must be re-answered'
+          : window.rearmed !== true ? 'the rearm window does not honour this answer (no unanswered stand-down for it)'
+          : null;
+        if (held) {
+          refuse('no-code-rearm-held', { why: held });
+          notes.push({ kind: 'no-code-rearm-held', prNumber,
+            text: `PR #${prNumber}: the no-code rearm ruling cannot run — ${held}.` });
+          continue;
+        }
+        dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: latestOperatorAnswerCommentId(pr?.comments),
+          why: `the orchestrator ruled no code is owed (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — re-arm review once on the unchanged head, no fix agent` });
+        continue;
+      }
     }
 
     // ── `promote-draft` (draft-first PRs, operator-approved 2026-09-27) — its OWN branch, ahead of `ci-red`

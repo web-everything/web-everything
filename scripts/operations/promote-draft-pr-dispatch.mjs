@@ -188,15 +188,39 @@ export function defaultClosePr({ repoSlug, prNumber, comment, runGh = runGhSync 
  * rearm-review.mjs keeps every guard of its own (head pin via --expect-head, decideSetLabel, the empty-round
  * check, `review:human` kept). One attempt per tick; a non-zero exit throws and the caller refuses.
  */
-export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, run = spawnSync } = {}) {
-  const script = new URL('../conveyor/rearm-review.mjs', import.meta.url).pathname;
-  const result = run(process.execPath, [script, String(prNumber), `--repo=${repoSlug}`, `--expect-head=${expectHead}`,
-    `--actor=conveyor (operator no-code ruling ${answerId ?? 'unknown'})`],
-  { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 });
-  if (result?.status !== 0) {
-    throw new Error(String(result?.stderr || result?.stdout || result?.error?.message || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
+export function defaultPostNoCodeRearmComment({ repoSlug, prNumber, comment, runGh = runGhSync } = {}) {
+  runGh(['pr', 'comment', String(prNumber), '--repo', repoSlug, '--body', comment], {
+    encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-comment', repo: repoSlug },
+  });
+}
+
+export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, run = spawnSync,
+  postComment = defaultPostNoCodeRearmComment } = {}) {
+  if (!/^[\w=-]+$/.test(String(answerId ?? '')) || !/^[0-9a-f]{40}$/i.test(String(expectHead ?? ''))) {
+    throw new Error('no-code rearm requires an answer id and full head sha');
   }
-  return String(result.stdout ?? '');
+  const post = state => postComment({ repoSlug, prNumber,
+    comment: `<!-- no-code-rearm ${state === 'failed' ? 'attempt' : 'state'}=${state} answer=${answerId} head=${expectHead} -->` });
+  try {
+    // Persist BEFORE spawning the label writer: a crash here must never launch another attempt next tick.
+    post('intent');
+    const script = new URL('../conveyor/rearm-review.mjs', import.meta.url).pathname;
+    const result = run(process.execPath, [script, String(prNumber), `--repo=${repoSlug}`, `--expect-head=${expectHead}`,
+      `--actor=conveyor (operator no-code ruling ${answerId})`],
+    { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 });
+    if (result?.status !== 0) {
+      throw new Error(String(result?.stderr || result?.stdout || result?.error?.message || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
+    }
+    post('confirm');
+    return String(result.stdout ?? '');
+  } catch (error) {
+    // Intent still spends the ruling if this second write also fails. Never retry the child.
+    try { post('failed'); } catch (recordError) {
+      throw new Error(`${error.message}; failed to persist rearm failure: ${recordError.message} — a person must check labels`);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -508,7 +532,14 @@ export function runReconcilePromoteDraftDispatch({
   }
   // ── rearm-no-code half (STANDDOWN-EMPTY-ROUND D2): the orchestrator's no-code ruling, executed once, never a fixer.
   // ONE attempt per tick, no retry: either rearm-review marker (re-armed, or the empty-round note) spends the ruling.
-  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code')) {
+  const rearms = (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code');
+  for (const [index, entry] of rearms.entries()) {
+    yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
+      deferred.push(...rearms.slice(index).map(row => row.prNumber));
+      break;
+    }
+    handled += 1;
     try {
       rearm({ repoSlug, prNumber: entry.prNumber, expectHead: entry.expectHead, answerId: entry.answerId });
       dispatched.push({ pr: entry.prNumber, kind: 'rearm-no-code' });

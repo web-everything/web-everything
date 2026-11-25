@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
+import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
 import { buildOperatorAnswer, isNoCodeRearmAnswer, isNoCodeRearmExecuted, latestOperatorAnswerCommentId } from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 import { buildNoChangeComment, buildRearmComment, decideRearm } from '../rearm-review.mjs';
@@ -26,6 +27,145 @@ const plan = (over = {}) => planReconcile({ prs: [pr(over)], agents: [], durable
 const kinds = (p, kind) => p.dispatch.filter((d) => d.kind === kind);
 const noFixers = (p) => expect(p.dispatch.filter((d) => ['fix', 'ci-heal', 'review'].includes(d.kind))).toEqual([]);
 const refusalKinds = (p) => p.refusals.map((r) => r.kind);
+const receipt = (state, head = HEAD, answerId = 'IC_200') => ({ id: `IC_${state}`, author: BOT,
+  body: `<!-- no-code-rearm ${state === 'failed' ? 'attempt' : 'state'}=${state} answer=${answerId} head=${head} -->` });
+
+describe('round-1 negative regressions', () => {
+  it.each(['no-code-rearm-held', 'no-code-rearm-spent', 'no-code-rearm-failed'])('reconcileHolds reports %s', kind => {
+    expect(reconcileHolds([{ prNumber: 7448, kind, why: 'check manually' }])['we#7448']).toMatchObject({ kind, holds: ['review', 'fix'] });
+  });
+  it('already-landed refuses before planning a no-code rearm', () => {
+    const p = plan({ alreadyLandedInMain: { carrierPr: 7451 } });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(refusalKinds(p)).toContain('already-landed');
+  });
+  it.each([[[]], [[receipt('confirm')]]])('a newer head ignores the old ruling and receipts (%j)', receipts => {
+    const p = plan({ headRefOid: 'a'.repeat(40), comments: [...base, ...receipts] });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-spent');
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
+  });
+  it.each(['intent', 'confirm', 'failed'])('%s spends only its answer/head and never blocks ordinary pending-review planning', state => {
+    const p = plan({ labels: [{ name: 'review:pending' }], comments: [...base, receipt(state)] });
+    const ordinary = plan({ labels: [{ name: 'review:pending' }], comments: [...base, answer({ noCodeOwed: false }, 'IC_201')] });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
+    expect(p.dispatch).toEqual(ordinary.dispatch);
+    expect(refusalKinds(p)).toEqual(refusalKinds(ordinary));
+    expect(refusalKinds(p)).toContain('already-reviewed-head');
+    if (state === 'intent') expect(p.notes).toContainEqual(expect.objectContaining({ kind: 'no-code-rearm-crashed', text: expect.stringMatching(/check.*labels/i) }));
+  });
+  it('pending labels after an intent still dispatch a review with complete green CI evidence', () => {
+    const comments = [ { ...verdict, body: '🔁 review — changes requested' }, ...base.slice(1), receipt('intent') ];
+    const p = planReconcile({ prs: [pr({ labels: [{ name: 'review:pending' }], comments,
+      rowsComplete: true, rowsHead: HEAD, statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }] })],
+      agents: [], requiredChecks: ['gate'], reviewTiming: { startEarly: 'off', startBeforeCi: false, startAfter: 'ci-green' }, durableCounts: {}, now: Date.parse('2026-11-24T22:00:00Z') });
+    expect(kinds(p, 'review')).toHaveLength(1);
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-spent');
+  });
+  it('failed and crash receipts are trusted, answer-bound, and a new answer permits a new attempt', () => {
+    expect(isNoCodeRearmExecuted([...base, receipt('failed')], HEAD)).toBe(true);
+    expect(isNoCodeRearmExecuted([...base, { ...receipt('intent'), author: { login: 'outsider' } }], HEAD)).toBe(false);
+    expect(isNoCodeRearmExecuted([...base, receipt('failed', HEAD, 'IC_other')], HEAD)).toBe(false);
+    expect(kinds(plan({ comments: [...base, receipt('failed'), answer({}, 'IC_201')] }), 'rearm-no-code')).toHaveLength(1);
+  });
+  it('spent on review:changes still reaches normal planning', () => {
+    const p = plan({ comments: [...base, receipt('confirm')] });
+    const ordinary = plan({ comments: [...base, answer({ noCodeOwed: false }, 'IC_201')] });
+    expect(refusalKinds(p)).toContain('no-code-rearm-spent');
+    expect(kinds(p, 'fix')).toHaveLength(1);
+    expect(p.dispatch.map(d => d.kind)).toEqual(ordinary.dispatch.map(d => d.kind));
+  });
+  it.each(['head mismatch', 'read failure', 'timeout', 'failed note post'])('%s persists failure even when the child posts nothing, across two ticks', why => {
+    const comments = [...base];
+    let calls = 0;
+    for (let tick = 0; tick < 2; tick++) {
+      for (const entry of kinds(plan({ comments }), 'rearm-no-code')) {
+        expect(() => defaultRearmNoCode({ ...entry, repoSlug: 'o/r',
+          postComment: ({ comment }) => comments.push({ id: `IC_post${comments.length}`, author: BOT, body: comment }),
+          run: () => { calls++; throw new Error(why); },
+        })).toThrow(why);
+      }
+    }
+    expect(calls).toBe(1);
+    expect(comments.some(c => c.body.includes('attempt=failed'))).toBe(true);
+    expect(refusalKinds(plan({ comments }))).toContain('no-code-rearm-failed');
+  });
+  it('intent precedes child launch, confirm follows it; failed confirm remains spent', () => {
+    const comments = [...base];
+    const events = [];
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200',
+      postComment: ({ comment }) => {
+        events.push(comment);
+        if (comment.includes('state=confirm')) throw new Error('confirm failed');
+        comments.push({ author: BOT, body: comment });
+      }, run: () => { events.push('child'); return { status: 0 }; },
+    })).toThrow('confirm failed');
+    expect(events[0]).toContain('state=intent');
+    expect(events[1]).toBe('child');
+    expect(events[2]).toContain('state=confirm');
+    expect(isNoCodeRearmExecuted(comments, HEAD)).toBe(true);
+  });
+  it('failed intent post never launches the child and attempts a durable failed receipt', () => {
+    const events = [];
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200',
+      postComment: ({ comment }) => { events.push(comment); if (comment.includes('state=intent')) throw new Error('intent post failed'); },
+      run: () => { throw new Error('must not launch'); },
+    })).toThrow('intent post failed');
+    expect(events).toHaveLength(2);
+    expect(events[1]).toContain('attempt=failed');
+  });
+  it('a failed failure-note post still leaves the intent spent and asks for a label check', () => {
+    const comments = [...base];
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200',
+      postComment: ({ comment }) => {
+        if (comment.includes('attempt=failed')) throw new Error('comment unavailable');
+        comments.push({ author: BOT, body: comment });
+      }, run: () => ({ status: null, error: new Error('timeout') }),
+    })).toThrow(/person must check labels/);
+    const p = plan({ comments });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(p.notes.some(n => n.kind === 'no-code-rearm-crashed')).toBe(true);
+  });
+  it.each(['deadline', 'yield'])('defers remaining rearms after %s changes between children', mode => {
+    let calls = 0;
+    const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      reconcile: () => ({ dispatch: [7448, 7449].map(prNumber => ({ kind: 'rearm-no-code', prNumber, expectHead: HEAD, answerId: 'IC_200' })) }),
+      rearm: () => { calls++; }, deadlineAt: 10, now: () => mode === 'deadline' && calls ? 11 : 0,
+      shouldYield: () => mode === 'yield' && calls > 0,
+    });
+    expect(calls).toBe(1);
+    expect(r.deferred).toContain(7449);
+    expect(r.dispatched).toEqual([{ pr: 7448, kind: 'rearm-no-code' }]);
+  });
+  it('an adoption yield already detected by the promotion loop also defers rearms', () => {
+    let probes = 0;
+    const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      provider: { ready: () => {} }, readPrLabels: () => ['review:pending'], readComments: () => [],
+      readHeadCheckState: () => ({ state: 'green', counts: {} }), clearAwaitingCi: () => {},
+      shouldYield: () => ++probes === 2,
+      reconcile: () => ({ dispatch: [
+        { kind: 'promote-draft', prNumber: 1, headRefOid: HEAD },
+        { kind: 'promote-draft', prNumber: 2, headRefOid: HEAD },
+        { kind: 'rearm-no-code', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200' },
+      ] }), rearm: () => { throw new Error('must not launch'); },
+    });
+    expect(r.yieldedForAdoption).toBe(true);
+    expect(r.deferred).toEqual([2, 7448]);
+    expect(r.refusals.some(r => r.kind === 'rearm-no-code-failed')).toBe(false);
+  });
+  it('planning that exceeds the deadline defers even the first rearm', () => {
+    let planned = false;
+    const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+      deadlineAt: 10, now: () => planned ? 11 : 0,
+      reconcile: () => { planned = true; return { dispatch: [{ kind: 'rearm-no-code', prNumber: 7448 }] }; },
+      rearm: () => { throw new Error('must not launch'); },
+    });
+    expect(r.deferred).toEqual([7448]);
+    expect(r.refusals).toEqual([]);
+  });
+});
 
 describe('predicates', () => {
   it('only an explicit rearm-review + noCodeOwed answer is a no-code rearm answer', () => {
@@ -55,11 +195,11 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
       noFixers(p);
     }
   });
-  it('2: once a success marker or the empty-round note postdates the answer, nothing is planned; review:changes standing notes spent', () => {
+  it('2: legacy success and empty-round notes suppress rearm, note spent, and retain ordinary fix planning', () => {
     for (const body of [buildRearmComment({ actor: 'x', decision: decideRearm({ currentLabels: ['review:changes'] }) }), buildNoChangeComment({ actor: 'x', since: 'abc' })]) {
       const spent = plan({ comments: [...base, { id: 'IC_300', author: BOT, body }] });
       expect(kinds(spent, 'rearm-no-code')).toEqual([]);
-      noFixers(spent);
+      expect(kinds(spent, 'fix')).toHaveLength(1);
       expect(refusalKinds(spent)).toContain('no-code-rearm-spent');
       expect(spent.notes.some((n) => n.kind === 'no-code-rearm-spent')).toBe(true);
     }
@@ -130,9 +270,9 @@ describe('executor: one attempt per tick, rearm-review is the only writer', () =
   });
   it('the default writer shells rearm-review.mjs with --expect-head and a conveyor actor, and throws on non-zero', () => {
     const seen = [];
-    defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200', run: (cmd, args) => { seen.push([cmd, args]); return { status: 0, stdout: 'ok' }; } });
+    defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200', postComment: () => {}, run: (cmd, args) => { seen.push([cmd, args]); return { status: 0, stdout: 'ok' }; } });
     expect(seen[0][1].some((a) => a.endsWith('rearm-review.mjs'))).toBe(true);
     expect(seen[0][1]).toEqual(expect.arrayContaining(['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--actor=conveyor (operator no-code ruling IC_200)']));
-    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 1, expectHead: HEAD, run: () => ({ status: 1, stderr: 'refused' }) })).toThrow('refused');
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 1, expectHead: HEAD, answerId: 'IC_200', postComment: () => {}, run: () => ({ status: 1, stderr: 'refused' }) })).toThrow('refused');
   });
 });
