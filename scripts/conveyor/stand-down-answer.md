@@ -13,7 +13,8 @@ judgment questions still require an explicit operator answer.
 The CLI requires a PR, `--repo`, nonblank `--reason`, `--actor` (GitHub login), and `--channel`. It reads
 comments and posts one machine-marked answer targeting the latest unresolved terminal stand-down's
 comment ID. No unresolved stand-down means refusal. A repeated invocation after the answer is visible
-refuses unless a different unresolved escalation exists. A failed or ambiguous write is never retried
+refuses unless a different unresolved escalation exists or an attempted no-code ruling qualifies for
+the explicit recovery ceremony below. A failed or ambiguous write is never retried
 automatically: inspect the thread before retrying. Concurrent invocations are not serialized by GitHub;
 the orchestrator must run this ceremony once per explicit instruction.
 
@@ -25,7 +26,7 @@ their explicit instruction by an allowlisted automation identity using its inher
 readers recognize that same posted answer, so it needs no second post under human credentials.
 A new trusted stand-down after a later fix-begin reopens the answer window for that newest stand-down,
 even on the same head. A later fix-begin alone preserves the answered rearm; its new claims still count.
-Each stand-down can be rearmed only once, and a stale target cannot clear newer claims.
+Each unattempted ruling can be honored only once, and a stale target cannot clear newer claims.
 Unrelated or nonexistent targets and other answers do not grant this exception.
 `--disposition=close-superseded` retains its existing close behavior.
 
@@ -36,11 +37,27 @@ stand-down, consumes no waiver, and cannot be replayed to clear later fix claims
 while `red-team:blocked` stands (a security fix is owed), or when labels cannot be read completely.
 Only one cap override is available per changes-verdict window. After it is spent, both a fresh answer
 and a retry superseding an ignored answer refuse before posting; a new changes verdict resets it.
+An attempted ruling has a separate recovery path described below; it does not grant another cap override.
 The CLI uses the reader's `rearmWindow().wouldHonour(answer)` for both paths.
 A no-code rearm ruling (`--disposition=rearm-review --no-code-owed`) is executed by the conveyor, once,
 and never by a fixer: the reconcile planner emits one `rearm-no-code` row and promote-draft-pr-dispatch runs
-`rearm-review.mjs --expect-head=<head>` itself. Any later fix-begin, a red-team label, a moved head or an
-already-spent ruling refuses with a note (`no-code-rearm-held` / `no-code-rearm-spent`); re-answer to retry.
+`rearm-review.mjs --expect-head=<head>` itself. New no-code answer records include the live full head SHA,
+even when a push occurred after fix-begin. Receipts cannot rebind that ruling to another head.
+A later fix-begin, unparseable claim, newer changes verdict, red-team label, moved head or review-label
+handoff makes the ruling stale: ordinary planning resumes without passing the no-code instruction to a fixer.
+Incomplete head, label or thread evidence holds the ruling until readable evidence is restored.
+An intent, confirmation or failure receipt spends the attempt. While `review:changes` still stands and
+the ruling is current, neither fix nor CI healing is dispatched. Check the live labels and thread, then
+explicitly run `stand-down-answer` again with `--disposition=rearm-review --no-code-owed` to authorize one
+fresh attempt on the same stand-down and head. This supersedes the spent answer, requires live
+`review:changes`, and refuses after a newer fix claim/verdict or a security hold. Unattempted answers
+still cannot be replayed. The deterministic test `%s on review:changes waits without fix or CI healing
+and accepts a fresh CLI answer` in `scripts/conveyor/__tests__/no-code-rearm.test.mjs` covers all three
+receipt states and legacy rearm/empty-round notes through the CLI and back into planning.
+After the label handoff, remaining red required checks resume ordinary `ci-heal` planning. The tests
+`incident #%s ruling rearms once with no refusals, then resumes required-check CI healing` cover both
+incident IDs with reconstructed required-check evidence; captured real-state rollups were unavailable
+in the offline repair context.
 The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
 we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-command workflow,
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.

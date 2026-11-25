@@ -2,12 +2,14 @@
  * @file no-code-rearm.test.mjs — STANDDOWN-EMPTY-ROUND (D2). The orchestrator's `rearm-review --no-code-owed` ruling
  *   is executed ONCE by the conveyor and never handed to a fixer (live #7448, #7451: the answered stand-down fell
  *   through to fix dispatch, the new fixer posted a fix-begin on the same head, and rearm-review refused again).
- *   Negative tests first: every case below must plan zero fixers, and at most one `rearm-no-code`.
+ *   Active rulings must plan zero fixers and at most one `rearm-no-code`; stale rulings resume ordinary work.
  */
 import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
-import { buildOperatorAnswer, isNoCodeRearmAnswer, isNoCodeRearmExecuted, latestOperatorAnswerCommentId } from '../stand-down-answer-core.mjs';
+import { buildOperatorAnswer, isNoCodeRearmAnswer, isNoCodeRearmExecuted, latestOperatorAnswerCommentId, parseOperatorAnswer, noCodeRearmState, noCodeRearmGuard } from '../stand-down-answer-core.mjs';
+import { runStandDownAnswer } from '../stand-down-answer.mjs';
+import { decideSetLabel, runReviewLabelCli } from '../../review-set-label.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 import { buildNoChangeComment, buildRearmComment, decideRearm } from '../rearm-review.mjs';
 import { runReconcilePromoteDraftDispatch, defaultRearmNoCode } from '../../operations/promote-draft-pr-dispatch.mjs';
@@ -27,8 +29,143 @@ const plan = (over = {}) => planReconcile({ prs: [pr(over)], agents: [], durable
 const kinds = (p, kind) => p.dispatch.filter((d) => d.kind === kind);
 const noFixers = (p) => expect(p.dispatch.filter((d) => ['fix', 'ci-heal', 'review'].includes(d.kind))).toEqual([]);
 const refusalKinds = (p) => p.refusals.map((r) => r.kind);
+const workRows = p => p.dispatch.map(({ operatorAnswer: _ruling, ...row }) => row);
 const receipt = (state, head = HEAD, answerId = 'IC_200') => ({ id: `IC_${state}`, author: BOT,
   body: `<!-- no-code-rearm ${state === 'failed' ? 'attempt' : 'state'}=${state} answer=${answerId} head=${head} -->` });
+
+describe('review recovery regressions', () => {
+  it.each([
+    [{ headRefOid: 'abc1234' }, 'held', 'the live head is not a full sha'],
+    [{ labels: [{ id: 1 }] }, 'held', 'the label list is incomplete'],
+    [{ comments: null }, 'held', 'the comment thread is unreadable'],
+    [{ labels: [{ name: 'review:pending' }] }, 'stale', 'the PR no longer carries review:changes'],
+    ...['red-team:blocked', 'red-team:pending'].map(name => [
+      { labels: [{ name: 'review:changes' }, { name }] }, 'stale', 'a red-team label stands, a fix or security verdict is owed']),
+    [{ comments: [...base, { ...begin('IC_bad'), body: '🔒 conveyor fix-begin — fix claim held\nno sha' }] }, 'stale', 'a fix claim in the thread is unparseable'],
+    [{ comments: [...base, begin('IC_210')] }, 'stale', 'a fix-begin was posted after the ruling'],
+    [{ comments: [...base, { ...verdict, id: 'IC_211' }] }, 'stale', 'the rearm window does not honour this answer (a newer verdict or stand-down stands)'],
+  ])('names the exact guard reason for %j (%s)', (over, disposition, why) => {
+    expect(noCodeRearmGuard(pr(over))[disposition]).toBe(why);
+    if (disposition === 'held') expect(noCodeRearmGuard(pr())).toEqual({ held: null, stale: null });
+  });
+  it.each([7448, 7451])('incident #%s ruling rearms once with no refusals, then resumes required-check CI healing', number => {
+    // Incident IDs and ruling shape come from the review context. The red required-check row is a
+    // deterministic reconstruction: the launcher's offline pack contains no captured incident rollups.
+    const snapshot = pr({ number, rowsComplete: true, rowsHead: HEAD,
+      statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure' }] });
+    const tick = () => planReconcile({ prs: [snapshot], agents: [], durableCounts: {}, requiredChecks: ['merge-gate'] });
+    const first = tick();
+    expect(first.dispatch).toEqual([expect.objectContaining({ kind: 'rearm-no-code', prNumber: number })]);
+    expect(first.refusals).toEqual([]);
+    defaultRearmNoCode({ ...first.dispatch[0], repoSlug: 'o/r', postComment: ({ comment }) => {
+      snapshot.comments = [...snapshot.comments, { author: BOT, body: comment }];
+    }, run: () => { snapshot.labels = [{ name: 'review:pending' }]; return { status: 0 }; } });
+    const second = tick();
+    expect(second.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: number })]);
+    expect(second.refusals).toEqual([]);
+  });
+  it.each([
+    ['intent', receipt('intent')], ['confirm', receipt('confirm')], ['failed', receipt('failed')],
+    ['legacy rearm', { author: BOT, body: buildRearmComment({ actor: 'x', decision: decideRearm({ currentLabels: ['review:changes'] }) }) }],
+    ['legacy empty round', { author: BOT, body: buildNoChangeComment({ actor: 'x', since: HEAD }) }],
+  ])('%s on review:changes waits without fix or CI healing and accepts a fresh CLI answer', (_state, spent) => {
+    const snapshot = pr({ comments: [...base, spent], rowsComplete: true, rowsHead: HEAD,
+      statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure' }] });
+    const held = planReconcile({ prs: [snapshot], agents: [], requiredChecks: ['gate'], durableCounts: {} });
+    expect(held.dispatch).toEqual([]);
+    const args = ['7448', '--repo=web-everything/web-everything', '--actor=chalbert', '--channel=chat',
+      '--reason=Retry after checking the live labels', '--disposition=rearm-review', '--no-code-owed'];
+    runStandDownAnswer(args, { gh: a => {
+      if (a[1] === 'view') return JSON.stringify(snapshot);
+      snapshot.comments.push({ id: 'IC_201', author: BOT, body: a[a.indexOf('--body') + 1] });
+      return 'posted';
+    } });
+    expect(parseOperatorAnswer(snapshot.comments.at(-1))).toMatchObject({ supersedes: 'IC_200', head: HEAD });
+    expect(kinds(plan({ comments: snapshot.comments }), 'rearm-no-code')).toHaveLength(1);
+  });
+  it.each([
+    ['later fix claim', { comments: [...base, receipt('failed'), begin('IC_210')] }],
+    ['newer verdict', { comments: [...base, receipt('failed'), { ...verdict, id: 'IC_211' }] }],
+    ['moved head', { headRefOid: 'b'.repeat(40) }],
+    ['red-team block', { labels: [{ name: 'review:changes' }, { name: 'red-team:blocked' }] }],
+    ['red-team pending', { labels: [{ name: 'review:changes' }, { name: 'red-team:pending' }] }],
+    ['label handoff', { labels: [{ name: 'review:pending' }] }],
+    ['incomplete labels', { labels: null }],
+  ])('retry CLI refuses %s without posting', (_why, over) => {
+    const snapshot = pr({ comments: [...base, receipt('failed')], ...over });
+    let posts = 0;
+    expect(() => runStandDownAnswer(['7448', '--repo=web-everything/web-everything', '--actor=chalbert', '--channel=chat',
+      '--reason=Retry', '--disposition=rearm-review', '--no-code-owed'], { gh: a => {
+      if (a[1] === 'view') return JSON.stringify(snapshot);
+      posts++;
+    } })).toThrow();
+    expect(posts).toBe(0);
+  });
+  it('a later ignored answer cannot borrow an earlier honoured answer to authorize rearm', () => {
+    const p = plan({ comments: [...base, answer({}, 'IC_201')] });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(p.notes).toContainEqual(expect.objectContaining({ kind: 'no-code-rearm-stale' }));
+  });
+  it('records the live ruling head after a push between fix-begin and the answer', () => {
+    const moved = 'b'.repeat(40);
+    const snapshot = pr({ headRefOid: moved, comments: base.slice(0, -1) });
+    runStandDownAnswer(['7448', '--repo=web-everything/web-everything', '--actor=chalbert', '--channel=chat',
+      '--reason=No code owed on the pushed head', '--disposition=rearm-review', '--no-code-owed'], { gh: a => {
+      if (a[1] === 'view') return JSON.stringify(snapshot);
+      snapshot.comments.push({ id: 'IC_200', author: BOT, body: a[a.indexOf('--body') + 1] });
+      return 'posted';
+    } });
+    expect(parseOperatorAnswer(snapshot.comments.at(-1))).toMatchObject({ head: moved });
+    expect(kinds(plan(snapshot), 'rearm-no-code')).toHaveLength(1);
+    expect(noCodeRearmState(snapshot.comments, HEAD).applicable).toBe(false);
+    expect(noCodeRearmState([...snapshot.comments, receipt('confirm', HEAD)], moved).executed).toBe(false);
+  });
+  it.each(['red-team:blocked', 'red-team:pending'])('a pinned rearm refuses live %s without removing labels', label => {
+    expect(decideSetLabel({ to: 'rearm', currentLabels: ['review:changes', label], pinnedRearm: true }))
+      .toMatchObject({ allowed: false, removeLabels: [], reason: expect.stringContaining(label) });
+  });
+  it.each(['red-team:blocked', 'red-team:pending'])('the shared writer preserves %s arriving between the first read and label write', label => {
+    let reads = 0;
+    const writes = [];
+    const output = [];
+    const exit = process.exit;
+    process.exit = code => { throw Object.assign(new Error('exit'), { exitCode: code }); };
+    try {
+      expect(() => runReviewLabelCli({ fixedTo: 'rearm',
+        argv: ['7448', '--repo=o/r', `--expect-head=${HEAD}`, '--actor=conveyor'],
+        defaultActor: 'conveyor', usage: 'test', buildComment: () => 'rearm',
+        successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ reason: decision.reason }),
+        emit: line => output.push(line), appendLedgerVerdict: () => ({ ok: true }),
+        provider: {
+          readPostingIdentity: () => ({ login: 'web-everything', type: 'User' }),
+          readPrState: () => ({ state: 'OPEN', isDraft: false, headRefOid: HEAD, comments: [],
+            labels: [{ name: 'review:changes' }, ...(reads++ ? [{ name: label }] : [])] }),
+          readComments: () => [], readPrReviews: () => [],
+          setLabels: () => writes.push('labels'), postComment: () => writes.push('comment'),
+        },
+      })).toThrow('exit');
+    } finally { process.exit = exit; }
+    expect(reads).toBeGreaterThan(1);
+    expect(output.join('')).toContain(`pinned re-arm refused: ${label} stands`);
+    expect(writes).toEqual([]);
+  });
+  it.each([
+    JSON.stringify({ ok: false, reason: 'live head differs from --expect-head' }),
+    JSON.stringify({ error: 'live head differs from --expect-head' }),
+    `child log\n${JSON.stringify({ error: { message: 'live head differs from --expect-head' } })}\n`,
+  ])('reports child stdout refusal JSON ahead of Node warning noise on stderr (%s)', stdout => {
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200',
+      postComment: () => {}, run: () => ({ status: 1, stdout,
+        stderr: '(node:42) [DEP0040] DeprecationWarning: The punycode module is deprecated.\n' }) }))
+      .toThrow('live head differs from --expect-head');
+  });
+  it.each([{ answerId: '' }, { answerId: 'IC_200\nforged' }, { expectHead: 'abc1234' }, { expectHead: 'g'.repeat(40) }])('bad executor input %j writes nothing', bad => {
+    let effects = 0;
+    expect(() => defaultRearmNoCode({ repoSlug: 'o/r', prNumber: 7448, expectHead: HEAD, answerId: 'IC_200', ...bad,
+      postComment: () => { effects++; }, run: () => { effects++; } })).toThrow('answer id and full head sha');
+    expect(effects).toBe(0);
+  });
+});
 
 describe('round-1 negative regressions', () => {
   it.each(['no-code-rearm-held', 'no-code-rearm-spent', 'no-code-rearm-failed'])('reconcileHolds reports %s', kind => {
@@ -50,7 +187,7 @@ describe('round-1 negative regressions', () => {
     const ordinary = plan({ labels: [{ name: 'review:pending' }], comments: [...base, answer({ noCodeOwed: false }, 'IC_201')] });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
     expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
-    expect(p.dispatch).toEqual(ordinary.dispatch);
+    expect(workRows(p)).toEqual(workRows(ordinary));
     expect(refusalKinds(p)).toEqual(refusalKinds(ordinary));
     expect(refusalKinds(p)).toContain('already-reviewed-head');
     if (state === 'intent') expect(p.notes).toContainEqual(expect.objectContaining({ kind: 'no-code-rearm-crashed', text: expect.stringMatching(/check.*labels/i) }));
@@ -68,14 +205,12 @@ describe('round-1 negative regressions', () => {
     expect(isNoCodeRearmExecuted([...base, receipt('failed')], HEAD)).toBe(true);
     expect(isNoCodeRearmExecuted([...base, { ...receipt('intent'), author: { login: 'outsider' } }], HEAD)).toBe(false);
     expect(isNoCodeRearmExecuted([...base, receipt('failed', HEAD, 'IC_other')], HEAD)).toBe(false);
-    expect(kinds(plan({ comments: [...base, receipt('failed'), answer({}, 'IC_201')] }), 'rearm-no-code')).toHaveLength(1);
+    expect(kinds(plan({ comments: [...base, receipt('failed'), answer({ supersedes: 'IC_200', head: HEAD }, 'IC_201')] }), 'rearm-no-code')).toHaveLength(1);
   });
-  it('spent on review:changes still reaches normal planning', () => {
+  it('spent on review:changes waits for an operator rather than dispatching a fixer', () => {
     const p = plan({ comments: [...base, receipt('confirm')] });
-    const ordinary = plan({ comments: [...base, answer({ noCodeOwed: false }, 'IC_201')] });
     expect(refusalKinds(p)).toContain('no-code-rearm-spent');
-    expect(kinds(p, 'fix')).toHaveLength(1);
-    expect(p.dispatch.map(d => d.kind)).toEqual(ordinary.dispatch.map(d => d.kind));
+    expect(p.dispatch).toEqual([]);
   });
   it.each(['head mismatch', 'read failure', 'timeout', 'failed note post'])('%s persists failure even when the child posts nothing, across two ticks', why => {
     const comments = [...base];
@@ -155,14 +290,15 @@ describe('round-1 negative regressions', () => {
     expect(r.deferred).toEqual([2, 7448]);
     expect(r.refusals.some(r => r.kind === 'rearm-no-code-failed')).toBe(false);
   });
-  it('planning that exceeds the deadline defers even the first rearm', () => {
+  it('planning that exceeds the deadline still handles the first rearm to prevent starvation', () => {
     let planned = false;
     const r = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
       deadlineAt: 10, now: () => planned ? 11 : 0,
       reconcile: () => { planned = true; return { dispatch: [{ kind: 'rearm-no-code', prNumber: 7448 }] }; },
-      rearm: () => { throw new Error('must not launch'); },
+      rearm: () => {},
     });
-    expect(r.deferred).toEqual([7448]);
+    expect(r.deferred).toEqual([]);
+    expect(r.dispatched).toEqual([{ pr: 7448, kind: 'rearm-no-code' }]);
     expect(r.refusals).toEqual([]);
   });
 });
@@ -193,13 +329,14 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
       expect(kinds(p, 'rearm-no-code')).toHaveLength(1);
       expect(kinds(p, 'rearm-no-code')[0]).toMatchObject({ prNumber: 7448, expectHead: HEAD, answerId: 'IC_200' });
       noFixers(p);
+      expect(p.refusals).toEqual([]);
     }
   });
-  it('2: legacy success and empty-round notes suppress rearm, note spent, and retain ordinary fix planning', () => {
+  it('2: legacy success and empty-round notes suppress rearm and wait for an operator on review:changes', () => {
     for (const body of [buildRearmComment({ actor: 'x', decision: decideRearm({ currentLabels: ['review:changes'] }) }), buildNoChangeComment({ actor: 'x', since: 'abc' })]) {
       const spent = plan({ comments: [...base, { id: 'IC_300', author: BOT, body }] });
       expect(kinds(spent, 'rearm-no-code')).toEqual([]);
-      expect(kinds(spent, 'fix')).toHaveLength(1);
+      expect(spent.dispatch).toEqual([]);
       expect(refusalKinds(spent)).toContain('no-code-rearm-spent');
       expect(spent.notes.some((n) => n.kind === 'no-code-rearm-spent')).toBe(true);
     }
@@ -219,26 +356,38 @@ describe('planner: exactly one rearm-no-code and zero fixers (findings 1-5)', ()
     expect(kinds(p, 'review')).toEqual([]);
     expect(kinds(p, 'fix')).toEqual([]);
   });
-  it.each(['red-team:blocked', 'red-team:pending'])('4: %s added after the answer refuses held, no fixer', (label) => {
+  it.each(['red-team:blocked', 'red-team:pending'])('4: %s added after the answer makes the ruling stale and resumes ordinary planning', (label) => {
     const p = plan({ labels: [{ name: 'review:changes' }, { name: label }] });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
-    noFixers(p);
-    expect(refusalKinds(p)).toContain('no-code-rearm-held');
+    expect(kinds(p, 'fix')).toHaveLength(1);
+    expect(refusalKinds(p)).not.toContain('no-code-rearm-held');
   });
-  it('4: a head that is not a full sha, an incomplete label list, or a missing review:changes is held', () => {
-    for (const over of [{ headRefOid: 'abc1234' }, { labels: [{ name: 'review:changes' }, { id: 1 }] }, { labels: [{ name: 'review:pending' }] }]) {
+  it('4: a head that is not a full sha or an incomplete label list is held until evidence recovers', () => {
+    for (const over of [{ headRefOid: 'abc1234' }, { labels: [{ name: 'review:changes' }, { id: 1 }] }]) {
       const p = plan(over);
       expect(kinds(p, 'rearm-no-code'), JSON.stringify(over)).toEqual([]);
       noFixers(p);
       expect(refusalKinds(p)).toContain('no-code-rearm-held');
+      expect(kinds(plan(), 'rearm-no-code')).toHaveLength(1);
     }
   });
-  it('5: a fix-begin posted after the ruling refuses held, zero fixers', () => {
-    const p = plan({ comments: [...base, begin('IC_210')] });
+  it.each([
+    ['a later fix-begin', { comments: [...base, begin('IC_210')] }],
+    ['a newer changes verdict', { comments: [...base, { ...verdict, id: 'IC_211' }] }],
+    ['a label handoff', { labels: [{ name: 'review:pending' }] }],
+    ['a hand acceptance', { labels: [{ name: 'review:accepted' }] }],
+  ])('%s makes the ruling stale and resumes the ordinary plan', (_why, over) => {
+    const p = plan(over);
+    const ordinary = plan({ ...over, comments: [...(over.comments ?? base), answer({ noCodeOwed: false }, 'IC_299')] });
     expect(kinds(p, 'rearm-no-code')).toEqual([]);
-    noFixers(p);
-    expect(refusalKinds(p)).toContain('no-code-rearm-held');
-    expect(p.notes.some((n) => n.kind === 'no-code-rearm-held')).toBe(true);
+    expect(workRows(p)).toEqual(workRows(ordinary));
+    expect(refusalKinds(p)).toEqual(refusalKinds(ordinary));
+  });
+  it('an unparseable fix claim cannot rearm and resumes the ordinary plan', () => {
+    const comments = [...base, { ...begin('IC_210'), body: '🔒 conveyor fix-begin — fix claim held\nclaim without a starting sha' }];
+    const p = plan({ comments });
+    expect(kinds(p, 'rearm-no-code')).toEqual([]);
+    expect(workRows(p)).toEqual(workRows(plan({ comments: [...comments, answer({ noCodeOwed: false }, 'IC_299')] })));
   });
   it('an answer without noCodeOwed (plain rearm-review) never plans rearm-no-code', () => {
     const p = plan({ comments: [verdict, begin('IC_105'), stop, answer({ noCodeOwed: undefined })] });

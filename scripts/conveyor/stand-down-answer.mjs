@@ -16,10 +16,21 @@ function requireNoCodeHead(snapshot, target) {
 /**
  * ONLY an operator `rearm-review` may supersede an ALREADY-ANSWERED stand-down (#6748: the answer is exactly what
  * deadlocked the PR). Requires `status:answered-waiting-fixer` AND an unchanged head (no commit newer than the
- * stand-down). Fails closed on a missing label, id, or unreadable date. Returns {target, supersedes} or null.
+ * stand-down). An attempted no-code answer can also be replaced while review:changes remains live, bound to
+ * its receipt and head. Fails closed on missing recovery evidence. Returns {target, supersedes} or null.
  */
 function answeredStandDownToRearm(snapshot, noCodeOwed) {
   const { comments, labels, commits } = snapshot;
+  const win = rearmWindow(comments);
+  // Explicit operator recovery after an attempted no-code ruling. The same answer/head must still
+  // own the window, and live review:changes proves that another handoff is actually needed.
+  if (noCodeOwed && win.retryAnswer && labels?.some(l => l?.name === 'review:changes')
+    && String(snapshot.headRefOid ?? '').toLowerCase().startsWith(win.retryAnswer.head)) {
+    const target = comments.find(c => String(c.id) === win.retryAnswer.standDownId && isTerminalStandDown(c));
+    if (target && win.wouldHonour({ ...win.retryAnswer, head: String(snapshot.headRefOid ?? '').toLowerCase(), disposition: 'rearm-review', noCodeOwed: true })) {
+      return { target, supersedes: win.retryAnswer.supersedes };
+    }
+  }
   if (!Array.isArray(labels) || !labels.some((l) => l?.name === 'status:answered-waiting-fixer')) return null;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const c = comments[i];
@@ -101,7 +112,8 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   }
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
   if (flags.noCodeOwed) requireNoCodeHead(snapshot, target);
-  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
+  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}),
+    ...(flags.noCodeOwed ? { head: snapshot.headRefOid.toLowerCase() } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
   // ONE durable write; no label swap, deletion, or automatic retry after an ambiguous write failure.
   return gh(['pr', 'comment', pr, `--repo=${flags.repo}`, '--body', body]);

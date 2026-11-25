@@ -47,17 +47,26 @@ export default {
       { id: 'IC_106', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) },
       { id: 'IC_200', author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_106', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }) },
     ];
+    // Offline reconstruction of the two incident paths; no captured GitHub rollup was supplied.
     const pr = { number: 7448, state: 'OPEN', isDraft: false, headRefName: 'lane/x', headRefOid: HEAD,
-      labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], comments, commits: [], statusCheckRollup: [], mergeStateStatus: 'CLEAN' };
+      rowsComplete: true, rowsHead: HEAD,
+      labels: [{ name: 'review:changes' }, { name: 'review-round:1' }], comments, commits: [],
+      statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure' }], mergeStateStatus: 'CLEAN' };
     const violations = [];
-    for (const fails of [false, true]) {
+    for (const { number, fails } of [7448, 7451].flatMap(number => [false, true].map(fails => ({ number, fails })))) {
+      pr.number = number;
       const thread = [...comments];
       let executions = 0;
       let fixDispatches = 0;
       for (let tick = 0; tick < 2; tick += 1) {
-        const plan = planReconcile({ prs: [{ ...pr, comments: [...thread] }], agents: [], durableCounts: {}, now: Date.parse('2026-11-24T22:00:00Z') });
-        // Failed/spent rulings return to ordinary planning on tick 2. The unspent ruling must never go to a fixer.
-        if (!fails || tick === 0) fixDispatches += plan.dispatch.filter(d => ['fix', 'ci-heal'].includes(d.kind)).length;
+        const plan = planReconcile({ prs: [{ ...pr, comments: [...thread] }], agents: [], durableCounts: {}, requiredChecks: ['merge-gate'], now: Date.parse('2026-11-24T22:00:00Z') });
+        // A failed ruling waits for operator recovery on review:changes. Success must resume CI healing.
+        fixDispatches += plan.dispatch.filter(d => d.kind === 'fix' || ((fails || tick === 0) && d.kind === 'ci-heal')).length;
+        const expected = tick === 0 ? ['rearm-no-code'] : fails ? [] : ['ci-heal'];
+        if (JSON.stringify(plan.dispatch.map(d => d.kind)) !== JSON.stringify(expected)) violations.push({
+          invariant: 'complete-two-tick-dispatch', detail: `#${number} ${fails ? 'failure' : 'success'} tick ${tick + 1}: ${JSON.stringify(plan.dispatch.map(d => d.kind))}, want ${JSON.stringify(expected)}` });
+        if ((tick === 0 || !fails) && plan.refusals.length) violations.push({
+          invariant: 'no-refusals', detail: `#${number} tick ${tick + 1}: ${JSON.stringify(plan.refusals)}` });
         runReconcilePromoteDraftDispatch({
           root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }), clearAwaitingCi: () => {},
           readHeadCheckState: () => ({ state: 'green', why: '', counts: {} }), provider: { ready: () => {} },

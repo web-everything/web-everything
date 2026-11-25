@@ -214,10 +214,16 @@ export function rearmWindow(comments) {
   let capBlockedId = null;
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
   let overrides = 0;
+  let retryAnswer = null;
+  let noCodeAnswer = null;
+  let honouredAnswerId = null;
   const overrideAvailable = () => overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
-  const wouldHonour = answer => answer?.disposition === 'rearm-review'
-    && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
-    && (!rearmed || (answer.noCodeOwed === true && overrideAvailable()));
+  const wouldHonour = answer => answer?.disposition === 'rearm-review' && (
+    (standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
+      && (!rearmed || (answer.noCodeOwed === true && overrideAvailable())))
+    || (retryAnswer !== null && answer.noCodeOwed === true
+      && answer.standDownId === retryAnswer.standDownId && answer.supersedes === retryAnswer.supersedes
+      && typeof answer.head === 'string' && answer.head.startsWith(retryAnswer.head)));
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -228,20 +234,38 @@ export function rearmWindow(comments) {
     const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
     const capOverride = answer?.noCodeOwed === true && overrideAvailable();
     if (wouldHonour(answer) && operatorPoster) {
+      const answerHead = answer.head ?? claims.at(-1) ?? reviewedHead;
       claims = [];
       reviewedHead = null;
       standDownIds = [];
       rearmed = true;
+      honouredAnswerId = c.id != null ? String(c.id) : null;
       capBlockedId = null;
       // An explicit no-code ruling closes the round without spending a bounded waiver.
       if (answer.noCodeOwed !== true) waivers += 1;
       if (capOverride) overrides += 1;
+      noCodeAnswer = answer.noCodeOwed === true && c.id != null
+        ? { id: String(c.id), standDownId: answer.standDownId, head: answerHead } : null;
+      retryAnswer = null;
       continue;
     }
     const body = typeof c === 'string' ? '' : c?.body;
     if (typeof body !== 'string' || !isTrustedMarkerAuthor(c)) continue;
     const text = body.trimStart();
+    // A durable attempt spends execution, not the operator's ability to issue a new ruling.
+    // Only this answer/head can reopen; a newer verdict or claim below invalidates recovery.
+    const receipt = body.match(/^<!-- no-code-rearm (?:state=(?:intent|confirm)|attempt=failed) answer=([\w=-]+) head=([0-9a-f]{40}) -->$/i);
+    if (receipt && noCodeAnswer && receipt[1] === noCodeAnswer.id
+      && (!noCodeAnswer.head || receipt[2].toLowerCase().startsWith(noCodeAnswer.head))) {
+      retryAnswer = { standDownId: noCodeAnswer.standDownId, supersedes: noCodeAnswer.id, head: receipt[2].toLowerCase() };
+    }
+    if (noCodeAnswer?.head && [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(marker => text.startsWith(marker))) {
+      retryAnswer = { standDownId: noCodeAnswer.standDownId, supersedes: noCodeAnswer.id, head: noCodeAnswer.head };
+    }
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
+      honouredAnswerId = null;
+      retryAnswer = null;
+      noCodeAnswer = null;
       claims = [];
       reviewedHead = verdictReviewedHead(c);
       standDownIds = [];
@@ -250,6 +274,8 @@ export function rearmWindow(comments) {
       overrides = 0;
       capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+      retryAnswer = null;
+      noCodeAnswer = null;
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false, capBlocked: false, wouldHonour: () => false };
       claims.push(sha);
@@ -265,6 +291,7 @@ export function rearmWindow(comments) {
     }
   }
   return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed, wouldHonour,
+    retryAnswer, honouredAnswerId,
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 

@@ -420,7 +420,15 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+function pinnedRearmSecurityRefusal(labels) {
+  const names = Array.isArray(labels) && labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
+    ? labels.map(l => typeof l === 'string' ? l : l.name) : null;
+  const hold = names?.find(l => l === 'red-team:blocked' || l === 'red-team:pending');
+  return names === null ? 'pinned re-arm refused: labels unreadable'
+    : hold ? `pinned re-arm refused: ${hold} stands` : null;
+}
+
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, pinnedRearm = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -525,6 +533,10 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // gap (a stale-accepted PR was never re-planned for review); it is not what was standing between a stale
   // acceptance and a bad merge — that gate already held.
   if (to === 'rearm') {
+    if (pinnedRearm) {
+      const security = pinnedRearmSecurityRefusal(currentLabels);
+      if (security) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: security };
+    }
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
     const missing = requireLive === 'missing';
     if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
@@ -1649,6 +1661,7 @@ export function runReviewLabelCli({
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
+    pinnedRearm,
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
@@ -2073,6 +2086,10 @@ export function runReviewLabelCli({
       fresh = provider.readPrState(repo, pr);
       assertPinnedRearmHead(fresh);
     } catch (e) { return readError(e); }
+    if (pinnedRearm) {
+      const security = pinnedRearmSecurityRefusal(fresh.labels);
+      if (security) return refuse(security);
+    }
     if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuse('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments, fresh.headRefOid, refuse).filter(isTrustedMarkerAuthor);

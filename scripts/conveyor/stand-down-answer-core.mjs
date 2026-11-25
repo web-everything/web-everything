@@ -35,7 +35,7 @@ export function answerDisposition(answer) {
     && !/\b(?:continue|keep|retain|but|however|instead)\b/.test(head) ? 'close-superseded' : null;
 }
 
-export function buildOperatorAnswer({ standDownId, reason, actor, channel, disposition, supersedes, noCodeOwed }) {
+export function buildOperatorAnswer({ standDownId, reason, actor, channel, disposition, supersedes, noCodeOwed, head }) {
   for (const [key, value] of Object.entries({ standDownId, reason, actor, channel })) {
     if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} must be non-empty`);
   }
@@ -45,6 +45,9 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   if (noCodeOwed !== undefined && (typeof noCodeOwed !== 'boolean' || disposition !== 'rearm-review')) {
     throw new Error('noCodeOwed must be boolean and is only valid with --disposition=rearm-review');
   }
+  if (head !== undefined && (noCodeOwed !== true || typeof head !== 'string' || !/^[0-9a-f]{40}$/.test(head))) {
+    throw new Error('head must be a full lowercase sha on a no-code ruling');
+  }
   if (!/^[\w=-]+$/.test(standDownId)) throw new Error('invalid stand-down comment id');
   if (supersedes !== undefined && (disposition !== 'rearm-review' || !/^[\w=-]+$/.test(String(supersedes)))) {
     throw new Error('supersedes is only valid with --disposition=rearm-review and a comment id');
@@ -52,7 +55,7 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   if (!/^[\w-]+$/.test(actor)) throw new Error('actor must be a GitHub login');
   if (/[\r\n]/.test(channel)) throw new Error('channel must be one line');
   // Encode the record separately so arbitrary operator prose cannot manufacture another marker.
-  const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}), ...(supersedes !== undefined ? { supersedes } : {}), ...(noCodeOwed !== undefined ? { noCodeOwed } : {}) })).toString('base64');
+  const record = Buffer.from(JSON.stringify({ standDownId, reason, actor, channel, ...(disposition ? { disposition } : {}), ...(supersedes !== undefined ? { supersedes } : {}), ...(noCodeOwed !== undefined ? { noCodeOwed } : {}), ...(head !== undefined ? { head } : {}) })).toString('base64');
   const surface = channel.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;');
   const quote = reason.replace(/<!--/g, '&lt;!--').replace(/-->/g, '--&gt;').split('\n').map((line) => `> ${line}`).join('\n');
   const dispositionText = disposition === 'rearm-review'
@@ -207,6 +210,24 @@ export function isCloseSupersededExecuted(comments) {
 /** STANDDOWN-EMPTY-ROUND (D2): the orchestrator's `rearm-review --no-code-owed` ruling, executed once by the conveyor. */
 export const isNoCodeRearmAnswer = (answer) => answerDisposition(answer) === 'rearm-review' && answer?.noCodeOwed === true;
 
+/** Missing evidence holds execution; evidence that superseded the ruling resumes ordinary work. */
+export function noCodeRearmGuard({ headRefOid, labels, comments } = {}) {
+  const names = Array.isArray(labels) && labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
+    ? labels.map(l => typeof l === 'string' ? l : l.name) : null;
+  const window = Array.isArray(comments) ? rearmWindow(comments) : null;
+  const held = !/^[0-9a-f]{40}$/i.test(String(headRefOid ?? '')) ? 'the live head is not a full sha'
+    : names === null ? 'the label list is incomplete'
+    : !window ? 'the comment thread is unreadable' : null;
+  const stale = names && !names.includes('review:changes') ? 'the PR no longer carries review:changes'
+    : names?.includes('red-team:blocked') || names?.includes('red-team:pending') ? 'a red-team label stands, a fix or security verdict is owed'
+    : window?.claims === null ? 'a fix claim in the thread is unparseable'
+    : window?.claims.length > 0 ? 'a fix-begin was posted after the ruling'
+    : window && (window.rearmed !== true || window.honouredAnswerId !== latestOperatorAnswerCommentId(comments))
+      ? 'the rearm window does not honour this answer (a newer verdict or stand-down stands)'
+    : null;
+  return { held, stale };
+}
+
 /** Durable, trusted receipts are scoped to the latest answer and its execution head.
  * Legacy child notes still spend their answer; its preceding reviewed head binds old rulings.
  */
@@ -219,13 +240,14 @@ export function noCodeRearmState(comments, head) {
   const later = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
   const receipts = later.flatMap(c => {
     const m = String(c?.body ?? '').match(/^<!-- no-code-rearm (state=(intent|confirm)|attempt=(failed)) answer=([\w=-]+) head=([0-9a-f]{40}) -->$/i);
-    return m && m[4] === answerId ? [{ state: m[2] ?? m[3], head: m[5].toLowerCase() }] : [];
+    return m && m[4] === answerId ? [{ state: (m[2] ?? m[3]).toLowerCase(), head: m[5].toLowerCase() }] : [];
   });
   const before = comments.slice(0, answerAt);
   const window = rearmWindow(before);
-  const boundHead = receipts[0]?.head ?? window.claims?.at(-1) ?? window.reviewedHead ?? parseReviewedSha(before);
+  const boundHead = parseOperatorAnswer(comments[answerAt])?.head
+    ?? receipts[0]?.head ?? window.claims?.at(-1) ?? window.reviewedHead ?? parseReviewedSha(before);
   if (/^[0-9a-f]{40}$/i.test(String(head ?? '')) && boundHead && !head.toLowerCase().startsWith(boundHead)) return { ...empty, applicable: false };
-  const matching = receipts.filter(r => !head || r.head === head.toLowerCase());
+  const matching = receipts.filter(r => (!head || r.head === head.toLowerCase()) && (!boundHead || r.head.startsWith(boundHead)));
   const intent = matching.some(r => r.state === 'intent');
   const confirmed = matching.some(r => r.state === 'confirm');
   const failed = matching.some(r => r.state === 'failed');

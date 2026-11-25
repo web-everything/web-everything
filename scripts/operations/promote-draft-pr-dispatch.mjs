@@ -210,7 +210,16 @@ export function defaultRearmNoCode({ repoSlug, prNumber, expectHead, answerId, r
       `--actor=conveyor (operator no-code ruling ${answerId})`],
     { encoding: 'utf8', timeout: 120_000, maxBuffer: 1024 * 1024 });
     if (result?.status !== 0) {
-      throw new Error(String(result?.stderr || result?.stdout || result?.error?.message || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
+      // The child emits refusal JSON on stdout; Node can independently warn on stderr.
+      const stdout = String(result?.stdout ?? '').trim();
+      const reason = [stdout, ...stdout.split('\n').reverse()].map(line => {
+        try {
+          const parsed = JSON.parse(line);
+          return typeof parsed.reason === 'string' ? parsed.reason
+            : typeof parsed.error === 'string' ? parsed.error : parsed.error?.message;
+        } catch { return null; }
+      }).find(value => typeof value === 'string' && value.trim());
+      throw new Error(String(reason || result?.error?.message || stdout || result?.stderr || `rearm-review exited ${result?.status}`).trim().split('\n')[0]);
     }
     post('confirm');
     return String(result.stdout ?? '');
@@ -365,6 +374,8 @@ export function runReconcilePromoteDraftDispatch({
     if (start > 0) entries = [...entries.slice(start), ...entries.slice(0, start)];
   }
   let handled = 0;
+  // Each bounded phase makes at least one unit of progress when planning consumed its budget.
+  const deadlineReachedAfterProgress = completed => completed > 0 && deadlineAt != null && now() > deadlineAt;
   let deferred = [];
   const dispatched = [];
   const refusals = [];
@@ -383,7 +394,7 @@ export function runReconcilePromoteDraftDispatch({
     // Always finish the first entry: when planning alone outlasts the budget, yielding before it would defer
     // the same PR every pass (reconcile re-runs before the cursor is read) and nothing would ever promote.
     if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if ((deadlineAt != null && now() > deadlineAt && handled > 0) || yieldedForAdoption) {
+    if (deadlineReachedAfterProgress(handled) || yieldedForAdoption) {
       deferred = entries.slice(handled).map(row => row.prNumber);
       break;
     }
@@ -535,7 +546,7 @@ export function runReconcilePromoteDraftDispatch({
   const rearms = (reconciled.dispatch ?? []).filter((e) => e.kind === 'rearm-no-code');
   for (const [index, entry] of rearms.entries()) {
     yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
+    if (yieldedForAdoption || deadlineReachedAfterProgress(index)) {
       deferred.push(...rearms.slice(index).map(row => row.prNumber));
       break;
     }
