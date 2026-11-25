@@ -21,7 +21,8 @@ This check remains open until a deployed daemon produces the evidence.
 - Keep load/core at least 0.4 throughout the sampled window and record the deployed
   SHA and daemon settings with the artifact. Exercise ordinary maintenance and real
   evidence reads; record main changes or refused admission rather than excluding them.
-- Run `node scripts/operations/review-fast-pass-acceptance.mjs <evidence.json>`.
+- Run `node we:scripts/operations/review-fast-pass-acceptance.mjs <evidence>`
+  from the WE checkout, stripping the `we:` locus prefix before execution.
   Require all ten intervals at most 180000 ms and the median strictly below 180000 ms.
   Missing logs, missing/gapped load evidence, duplicates and timeout observations fail.
 - Attach input and output evidence to the deployment record; do not close this card

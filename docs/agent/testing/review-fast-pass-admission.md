@@ -38,7 +38,7 @@ load/core at least 0.4, no sampling gaps over 15 seconds, maximum latency at mos
 180000 ms and median strictly below 180000 ms. Missing evidence fails the gate.
 Preserve the captured input, output, deployed SHA and settings. Synthetic fixtures
 test this checker, not the LIVE guarantee. The offline repair has not run this probe
-on deployed PRs; [the deployment card](../../../backlog/x7fp746-review-fast-pass-live-load-acceptance.md)
+on deployed PRs; the deployment card #x7fp746
 remains open.
 
 Prevention coverage: strict stack/freshness forwarding and lost ownership are pinned
@@ -54,5 +54,5 @@ checks the resolved local revision, and the label, advisory and stack-hold sinks
 enforce the same pin before the existing live publication check. The session soak
 executes the reader and sink using the settings captured from the spawned argv.
 
-Prevention cards cover [affected-break PR selection](../../../backlog/x7fp745-review-soak-import-closure-pr-gate.md)
-and [mutation/explicit ownership gates](../../../backlog/x7fp747-review-admission-mutation-and-ownership.md).
+Prevention cards cover affected-break PR selection (#x7fp745)
+and mutation/explicit ownership gates (#x7fp747).
