@@ -284,15 +284,21 @@ describe('refresh-timings atomic replacement', () => {
 describe('refresh-timings CI artifact download trust boundary', () => {
   const recorder = (runList = '[{"databaseId":4242}]') => {
     const calls = [];
-    const exec = (cmd, args, options) => { calls.push({ cmd, args, options }); return args[1] === 'list' ? runList : ''; };
+    const exec = (cmd, args, options) => {
+      calls.push({ cmd, args, options });
+      if (args[1] === 'list') return runList;
+      if (args[0] === 'api') return JSON.stringify({ total_count: 1, artifacts: [{ name: 'timing-unit-1', expired: false }] });
+      return '';
+    };
     return { calls, exec };
   };
 
-  it('latest selects only the newest successful ci.yml push on main, then downloads unit artifacts by argv', async () => {
+  it('latest selects the newest successful ci.yml push on main with timing artifacts, then downloads by argv', async () => {
     const { calls, exec } = recorder();
     await downloadReports('latest', '/scratch/reports', { exec });
     expect(calls.map(({ cmd, args }) => [cmd, args])).toEqual([
-      ['gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=1', '--json=databaseId']],
+      ['gh', ['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=50', '--json=databaseId']],
+      ['gh', ['api', 'repos/{owner}/{repo}/actions/runs/4242/artifacts?per_page=100']],
       ['gh', ['run', 'download', '4242', '--pattern=timing-unit-*', '--dir', '/scratch/reports']],
     ]);
     for (const { options } of calls) expect(options).toMatchObject({ cwd: REPO_ROOT, timeout: 120_000, maxBuffer: 1024 * 1024 });
@@ -311,7 +317,7 @@ describe('refresh-timings CI artifact download trust boundary', () => {
     ['a run id with a trailing newline', '[{"databaseId":"4242\\n"}]'],
   ])('refuses before any download when latest finds %s', async (_, runList) => {
     const { calls, exec } = recorder(runList);
-    await expect(downloadReports('latest', '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run ID/);
+    await expect(downloadReports('latest', '/scratch/reports', { exec })).rejects.toThrow(/No valid CI run window|No timing artifacts/);
     expect(calls.map(({ args }) => args[1])).toEqual(['list']);
   });
 
@@ -350,6 +356,27 @@ describe('refresh-timings CI artifact download trust boundary', () => {
 });
 
 describe('rolling timing refresh', () => {
+  it('refreshes through reused artifact-less main runs and downloads only runs with timing artifacts', async () => {
+    const calls = [];
+    const download = rollingExec([1000, 3000], calls);
+    const exec = (cmd, args, options) => {
+      if (args[1] === 'list') {
+        const limit = Number(args.find(a => a.startsWith('--limit=')).slice(8));
+        return JSON.stringify([99, 100, 98, 101].slice(0, limit).map(databaseId => ({ databaseId })));
+      }
+      if (args[0] === 'api') {
+        const hasTimings = /runs\/(100|101)\//.test(args[1]);
+        const artifacts = hasTimings ? [{ name: 'timing-unit-1', expired: false }] : [];
+        return JSON.stringify({ total_count: artifacts.length, artifacts });
+      }
+      if (['99', '98'].includes(args[2])) throw new Error('no artifacts match timing-unit-*');
+      return download(cmd, args, options);
+    };
+    expect(await main(['--runs=2'], { exec, timingsFile, repoRoot })).toBe(0);
+    expect(calls.map(c => c.args[2])).toEqual(['100', '101']);
+    expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 2])));
+  });
+
   it('takes odd and even medians across only runs containing each file', () => {
     expect(medianTimings([{ a: 1, b: 2 }, { a: 100, b: 4 }, { a: 3, c: 9 }])).toEqual({ a: 3, b: 3, c: 9 });
     expect(medianTimings([])).toEqual({});
@@ -359,6 +386,7 @@ describe('rolling timing refresh', () => {
     return (cmd, args, options) => {
       calls.push({ cmd, args, options });
       if (args[1] === 'list') return JSON.stringify(samples.map((_, i) => ({ databaseId: 100 + i })));
+      if (args[0] === 'api') return JSON.stringify({ total_count: 1, artifacts: [{ name: 'timing-unit-1', expired: false }] });
       const index = Number(args[2]) - 100;
       const target = args.at(-1);
       const sample = samples[index];
@@ -375,9 +403,10 @@ describe('rolling timing refresh', () => {
     expect(readFileSync(timingsFile, 'utf8')).toBe(original);
     calls.length = 0;
     expect(await main(['--runs=5'], { exec: rollingExec([1000, 3000, 2000, 4000, 99000], calls), timingsFile, repoRoot })).toBe(0);
-    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=5', '--json=databaseId']);
-    expect(calls.slice(1).map(c => c.args.slice(0, 4))).toEqual([100, 101, 102, 103, 104].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
-    expect(new Set(calls.slice(1).map(c => c.args.at(-1))).size).toBe(5);
+    expect(calls[0].args).toEqual(['run', 'list', '--workflow=ci.yml', '--branch=main', '--status=success', '--event=push', '--limit=50', '--json=databaseId']);
+    const downloads = calls.filter(c => c.args[1] === 'download');
+    expect(downloads.map(c => c.args.slice(0, 4))).toEqual([100, 101, 102, 103, 104].map(id => ['run', 'download', String(id), '--pattern=timing-unit-*']));
+    expect(new Set(downloads.map(c => c.args.at(-1))).size).toBe(5);
     expect(calls.every(c => c.cmd === 'gh' && c.options.timeout === 120000 && c.options.maxBuffer === 1024 * 1024 && !c.options.shell)).toBe(true);
     expect(JSON.parse(readFileSync(timingsFile, 'utf8')).unit).toEqual(Object.fromEntries(files.map(file => [file, 3])));
   });
@@ -392,7 +421,7 @@ describe('rolling timing refresh', () => {
     const measured = `${JSON.stringify({ unit: Object.fromEntries(files.map(file => [file, 1])), soak: {} }, null, 1)}\n`;
     writeFileSync(timingsFile, measured);
     expect(await main(['--min-stale=1.9'], { exec: rollingExec([1000], calls), timingsFile, repoRoot })).toBe(0);
-    expect(calls[0].args).toContain('--limit=5');
+    expect(calls[0].args).toContain('--limit=50');
     expect(readFileSync(timingsFile, 'utf8')).toBe(measured);
   });
 
@@ -434,10 +463,52 @@ describe('rolling timing refresh', () => {
     expect(calls).toEqual([]);
   });
 
-  it.each(['[]', '[{}]', '[{"databaseId":"1;x"}]', '[{"databaseId":1},{"databaseId":1}]', '[{"databaseId":1},{"databaseId":2}]'])('refuses invalid or oversized run evidence %s before downloads', async evidence => {
+  it.each(['[{}]', '[{"databaseId":"1;x"}]', '[{"databaseId":1},{"databaseId":1}]', JSON.stringify(Array.from({ length: 51 }, (_, i) => ({ databaseId: i + 1 })))])('refuses invalid or oversized run evidence %s before downloads', async evidence => {
     const calls = [];
     await expect(downloadRuns(1, dir, { exec: (_, args) => { calls.push(args); return evidence; } })).rejects.toThrow(/valid CI run window/);
     expect(calls).toHaveLength(1);
+  });
+
+  it.each(['--run=latest', '--runs=2'])('%s skips reused, unrelated and expired-only runs', async source => {
+    const calls = [];
+    const download = rollingExec([1000], calls);
+    const exec = (cmd, args, options) => {
+      if (args[1] === 'list') return JSON.stringify([103, 102, 101, 100].map(databaseId => ({ databaseId })));
+      if (args[0] === 'api') {
+        const id = Number(args[1].match(/runs\/(\d+)\//)[1]);
+        const artifacts = id === 103 ? [] : [{ name: id === 102 ? 'coverage-1' : 'timing-unit-1', expired: id === 101 }];
+        return JSON.stringify({ total_count: artifacts.length, artifacts });
+      }
+      return download(cmd, args, options);
+    };
+    expect(await main([source], { exec, timingsFile, repoRoot })).toBe(0);
+    expect(calls.map(c => c.args[2])).toEqual(['100']);
+  });
+
+  it.each([[[]], [Array.from({ length: 50 }, (_, i) => ({ databaseId: i + 1 }))]])('no artifact-bearing run within the bounded lookback preserves timings and names the explicit fallback', async candidates => {
+    const calls = [];
+    const exec = (_, args) => {
+      calls.push(args);
+      return JSON.stringify(args[1] === 'list' ? candidates : { total_count: 0, artifacts: [] });
+    };
+    await expect(main(['--runs=5'], { exec, timingsFile, repoRoot })).rejects.toThrow(/No timing artifacts.*50.*--run=<id>/);
+    expect(calls.filter(a => a[0] === 'api')).toHaveLength(candidates.length);
+    expect(calls.some(a => a[1] === 'download')).toBe(false);
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
+  });
+
+  it.each([{}, { total_count: 1, artifacts: [] }, { total_count: 101, artifacts: [] },
+    { total_count: 1, artifacts: [{ name: 'timing-unit-1' }] }, 'invalid JSON', 'API failure', 'download failure',
+  ])('refuses incomplete artifact evidence or IO failure without changing timings: %j', async evidence => {
+    const exec = (_, args) => {
+      if (args[1] === 'list') return '[{"databaseId":100}]';
+      if (evidence === 'API failure') throw new Error('API failure');
+      if (args[1] === 'download') throw new Error('download failure');
+      if (evidence === 'invalid JSON') return '{';
+      return JSON.stringify(evidence === 'download failure' ? { total_count: 1, artifacts: [{ name: 'timing-unit-1', expired: false }] } : evidence);
+    };
+    await expect(main(['--runs=1'], { exec, timingsFile, repoRoot })).rejects.toThrow();
+    expect(readFileSync(timingsFile, 'utf8')).toBe(original);
   });
 
   it.each(['--runs=0', '--runs=6', '--runs=1.5', '--min-stale=NaN', '--min-stale=0.5'])('rejects invalid CLI bounds %s', async arg => {

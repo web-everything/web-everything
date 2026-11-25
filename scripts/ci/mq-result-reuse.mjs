@@ -70,9 +70,13 @@ export async function decide({ listQueueRuns, listRunJobs, sha, event, quarantin
 }
 
 /** GitHub adapter for the two reads (the only place that knows the provider). */
-export function githubReads({ repo, token, fetchImpl = fetch }) {
+export function githubReads({ repo, token, fetchImpl = fetch, timeoutMs = 30_000 }) {
+  // One budget for all pages and response bodies, not a fresh budget for every request.
+  const signal = AbortSignal.timeout(timeoutMs);
   const api = async (path) => {
+    signal.throwIfAborted();
     const res = await fetchImpl(`https://api.github.com${path}`, {
+      signal,
       headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' },
     });
     if (!res.ok) throw new Error(`GitHub API ${res.status}`);
@@ -118,13 +122,20 @@ export async function quarantineClear({ readQuarantine, activeEntries, board = p
   activeEntries ??= rules.activeEntries;
   if (!readQuarantine) {
     // This checkout-only job must not load the quarantine writer's npm dependencies.
-    // Reuse the shared transport and schema, with the same read timeout as the writer's reader.
+    // Reuse the shared transport and schema, within the optional step's one-minute budget.
     const { readFromTransportBranch } = await import('../lib/git-transport-branch.mjs');
-    readQuarantine = ({ board, run = (args, options) => execFileSync('git', args, {
-      ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
-    }) }) => {
+    readQuarantine = ({ board, run = (args, options) => execFileSync('git', args, options) }) => {
+      const deadline = Date.now() + 15_000;
+      const boundedRun = (args, options) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('quarantine read timed out');
+        return run(args, {
+          ...options, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: Math.min(5000, remaining), maxBuffer: 16 * 1024 * 1024,
+        });
+      };
       try {
-        const got = readFromTransportBranch({ board, branch: rules.QUARANTINE_BRANCH, paths: [rules.QUARANTINE_LIST_PATH], run });
+        const got = readFromTransportBranch({ board, branch: rules.QUARANTINE_BRANCH, paths: [rules.QUARANTINE_LIST_PATH], run: boundedRun });
         const text = got[rules.QUARANTINE_LIST_PATH];
         const list = text == null ? { version: 1, entries: [] } : JSON.parse(text);
         return { ok: rules.validateQuarantineList(list).ok, list };

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import yaml from 'js-yaml';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { decide, githubReads, main, quarantineClear, EXPECTED_MATRIX_JOBS, REQUIRED_JOBS } from '../mq-result-reuse.mjs';
 import { activeEntries, addEntries } from '../../lib/red-main-quarantine.mjs';
 
@@ -36,6 +36,46 @@ const fakeFetch = (runs, body) => async (url) => {
 const without = (name) => fullJobs().filter((j) => j.name !== name);
 
 describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha, full run)', () => {
+  it.each(['response', 'body'])('a never-resolving API %s aborts and selects a full run', async phase => {
+    let observedSignal;
+    const fetchImpl = async (_url, { signal }) => {
+      observedSignal = signal;
+      const pending = () => new Promise((_, reject) => {
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+      return phase === 'response' ? pending() : { ok: true, json: pending };
+    };
+    const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl, timeoutMs: 10 });
+    let watchdog;
+    try {
+      const verdict = await Promise.race([
+        decide({ ...reads, sha: SHA, event: 'push', quarantineClear: async () => true }),
+        new Promise((_, reject) => { watchdog = setTimeout(() => reject(new Error('reuse read hung')), 1000); }),
+      ]);
+      expect(observedSignal?.aborted).toBe(true);
+      expect(verdict).toMatchObject({ reuse: false, why: expect.stringMatching(/error:.*(timeout|aborted)/i) });
+    } finally { clearTimeout(watchdog); }
+  });
+  it('bounds the optional reuse step below its job budget and tolerates timeout failure', () => {
+    const job = workflow.jobs.changes;
+    const reuse = job.steps.find(s => s.id === 'reuse');
+    expect(reuse['continue-on-error']).toBe(true);
+    expect(reuse['timeout-minutes']).toBe(1);
+    expect(job['timeout-minutes']).toBeGreaterThan(job.steps.find(s => s.id === 'detect')['timeout-minutes'] + reuse['timeout-minutes']);
+  });
+  it('pins soak consumers to changes and gives the reuse reader actions permission', () => {
+    expect(workflow.jobs.changes.permissions.actions).toBe('read');
+    for (const name of ['daemon-soak', 'soak-shard']) expect(workflow.jobs[name].needs).toContain('changes');
+  });
+  it('every needs reference declares its dependency in the workflow job', () => {
+    for (const [name, job] of Object.entries(workflow.jobs)) {
+      const dependencies = Array.isArray(job.needs) ? job.needs : [job.needs];
+      for (const match of JSON.stringify(job).matchAll(/\bneeds\.([\w-]+)\./g)) {
+        expect(dependencies, `${name} reads needs.${match[1]}`).toContain(match[1]);
+      }
+    }
+  });
   it('uses the recorded repository runs endpoint and filters the queue workflow identity', async () => {
     const reads = githubReads({ repo: 'o/r', token: 't', fetchImpl: fakeFetch([
       run(), run({ id: 99, workflow_id: 305968843, conclusion: 'failure' }),
@@ -233,9 +273,32 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
     expect(options).toEqual({ board: '/fixture' });
   });
   it('pins workflow light/reuse outputs and the soak-shard reuse condition', () => {
-    expect(workflow.jobs.changes.outputs.light).toBe("${{ steps.reuse.outputs.reuse == 'true' && 'true' || steps.detect.outputs.light }}");
-    expect(workflow.jobs.changes.outputs.reuse).toBe('${{ steps.reuse.outputs.reuse }}');
+    expect(workflow.jobs.changes.outputs.light).toBe("${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse == 'true' && 'true' || steps.detect.outputs.light }}");
+    expect(workflow.jobs.changes.outputs.reuse).toBe("${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse || 'false' }}");
     expect(workflow.jobs['soak-shard'].if).toContain("needs.changes.outputs.reuse != 'true'");
+  });
+  it.each(['failure', 'cancelled', 'skipped'])('ignores even a true output from a reuse step with outcome %s', outcome => {
+    const evaluate = expression => Function(`return (${expression.slice(3, -2)
+      .replaceAll('steps.reuse.outcome', JSON.stringify(outcome))
+      .replaceAll('steps.reuse.outputs.reuse', "'true'")
+      .replaceAll('steps.detect.outputs.light', "'false'")})`)();
+    expect(evaluate(workflow.jobs.changes.outputs.light)).toBe('false');
+    expect(evaluate(workflow.jobs.changes.outputs.reuse)).toBe('false');
+  });
+  it('refuses a quarantine read after its total git budget expires', async () => {
+    let clock = 1000;
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    const calls = [];
+    try {
+      const clear = await quarantineClear({ board: '/fixture', run: (args, options) => {
+        calls.push(args);
+        expect(options.timeout).toBe(5000);
+        clock += 15_001;
+        return '';
+      } });
+      expect(clear).toBe(false);
+      expect(calls.map(args => args[0])).toEqual(['fetch']);
+    } finally { now.mockRestore(); }
   });
   it.each(['active', 'expired', 'empty', 'unreadable', 'absent', 'malformed', 'invalid'])('reads %s quarantine through the real IO adapter and predicate', async kind => {
     const dir = mkdtempSync(join(tmpdir(), 'mq-quarantine-'));
@@ -246,6 +309,8 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       const clear = await quarantineClear({ board: dir, now: kind === 'expired' ? 3000 : 1500, run: (args, options) => {
         calls.push(args);
         expect(options.cwd).toBe(dir);
+        expect(options.timeout).toBeGreaterThan(0);
+        expect(options.timeout).toBeLessThanOrEqual(5000);
         if (args[0] === 'fetch') {
           if (kind === 'unreadable') throw new Error('unreadable quarantine');
           return '';

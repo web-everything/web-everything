@@ -82,12 +82,13 @@ jobs:
   # success. `daemon-soak` already finishes in seconds when no daemon code is touched (a card-only PR never is).
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Room for checkout, the four-minute detector and the one-minute optional reuse step.
+    timeout-minutes: 7
     outputs:
       # CI-MAIN-REUSE-MQ: a main push whose exact sha the merge queue already ran in full is treated as light
       # (heavy jobs skip, required checks still report). `reuse` is only ever 'true' from mq-result-reuse.mjs.
-      light: ${{ steps.reuse.outputs.reuse == 'true' && 'true' || steps.detect.outputs.light }}
-      reuse: ${{ steps.reuse.outputs.reuse }}
+      light: ${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse == 'true' && 'true' || steps.detect.outputs.light }}
+      reuse: ${{ steps.reuse.outcome == 'success' && steps.reuse.outputs.reuse || 'false' }}
     permissions:
       contents: read
       pull-requests: read
@@ -124,7 +125,9 @@ jobs:
       - name: Reuse the merge-queue result for this exact sha (main push only)
         id: reuse
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        # Any doubt or API error prints reuse=false: the full suite runs.
+        timeout-minutes: 1
+        continue-on-error: true
+        # Timeout/error leaves reuse false; only a successful step can authorize skipping.
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/ci/mq-result-reuse.mjs

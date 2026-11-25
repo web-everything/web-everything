@@ -295,7 +295,9 @@ function mirroredRunContext(job, text) {
       : job === 'integration-part' && (setup || index === 1) ? fullIntegration
         : job === 'integration-part' && index === 2 ? "${{ steps.suite.outputs.full == 'true' }}" : undefined;
   return {
-    'working-directory': directory, if: condition, shell: undefined, 'continue-on-error': job === 'test-shard' && [3, 4].includes(index) ? true : undefined,
+    'working-directory': directory, if: condition, shell: undefined,
+    'continue-on-error': (job === 'test-shard' && [3, 4].includes(index)) || (job === 'changes' && index === 2) ? true : undefined,
+    ...(job === 'changes' && index === 2 ? { 'timeout-minutes': 1 } : {}),
     env: job === 'changes' && index === 1 ? {
       GITHUB_EVENT_NAME: '${{ github.event_name }}', GH_TOKEN: '${{ github.token }}',
       REPO: '${{ github.repository }}', PR_NUMBER: '${{ github.event.pull_request.number }}',

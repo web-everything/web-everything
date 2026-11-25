@@ -285,7 +285,8 @@ describe('CI gate mirroring fails closed', () => {
   });
   it.each([
     ['if', undefined], ['if', "github.event_name == 'push'"], ['if', "github.event_name == 'pull_request'"],
-    ['env', undefined], ['env', { GITHUB_TOKEN: 'unexpected' }], ['continue-on-error', true],
+    ['env', undefined], ['env', { GITHUB_TOKEN: 'unexpected' }], ['continue-on-error', undefined], ['continue-on-error', false],
+    ['timeout-minutes', undefined], ['timeout-minutes', 5],
   ])('pins the reuse step execution context: %s=%j', (field, value) => {
     const changed = yaml.safeLoad(workflow);
     const step = changed.jobs.changes.steps.find(step => step.id === 'reuse');
