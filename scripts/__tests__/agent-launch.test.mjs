@@ -28,8 +28,8 @@ function fixture() {
     ghShimDir: ghDir, codexShimDir: codexDir, shellsFile: shells, execPath: join(nodeDir, 'node'), ...extra,
   });
 }
-const codex = (extra = {}) => ({ agent: 'codex', cwd: process.cwd(), sandbox: 'workspace-write', model: 'gpt-5.6-sol', env: { PATH: binDir }, ...extra });
-const claude = (extra = {}) => ({ agent: 'claude', cwd: process.cwd(), print: true, sessionId: SID, prompt: 'hello', env: { PATH: binDir }, ...extra });
+const codex = (extra = {}) => ({ agent: 'codex', githubRole: 'worker', cwd: process.cwd(), sandbox: 'workspace-write', model: 'gpt-5.6-sol', env: { PATH: binDir }, ...extra });
+const claude = (extra = {}) => ({ agent: 'claude', githubRole: 'worker', cwd: process.cwd(), print: true, sessionId: SID, prompt: 'hello', env: { PATH: binDir }, ...extra });
 const refuses = (d, io, re) => expect(() => buildAgentInvocation(d, io)).toThrow(re);
 beforeEach(fixture);
 afterEach(() => vi.restoreAllMocks());
@@ -151,7 +151,7 @@ describe('8 claude argv carries the launcher --settings', () => {
   it('emits one settings JSON with the same PATH, before the prompt delimiter', () => {
     const spec = buildAgentInvocation(claude(), seam());
     const i = spec.args.indexOf('--settings');
-    expect(JSON.parse(spec.args[i + 1])).toEqual({ env: { PATH: spec.options.env.PATH, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' } });
+    expect(JSON.parse(spec.args[i + 1])).toEqual({ env: { PATH: spec.options.env.PATH, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: 'worker' } });
     expect(spec.args.slice(-2)).toEqual(['--', 'hello']);
     expect(spec.args.indexOf('--settings')).toBe(spec.args.lastIndexOf('--settings'));
     expect(spec.guards.map(g => g.name)).toEqual(['gh']);
@@ -191,6 +191,63 @@ describe('9 admission', () => {
     for (const admit of [() => false, () => { throw new Error('no'); }]) {
       const io = seam({ admit }); expect(() => launchAgent(codex(), io)).toThrow(/not admitted/); expect(io.spawn).not.toHaveBeenCalled();
     }
+  });
+});
+
+describe('11 githubRole (finding 14)', () => {
+  it('refuses a missing role and an unknown role', () => {
+    const { githubRole, ...rest } = codex();
+    refuses(rest, seam(), /githubRole must be/);
+    refuses(codex({ githubRole: 'admin' }), seam(), /githubRole must be/);
+    refuses(claude({ githubRole: 'admin' }), seam(), /githubRole must be/);
+  });
+  it('carries the role into env and argv, and drops a caller-set one', () => {
+    const c = buildAgentInvocation(codex({ githubRole: 'reviewer', env: { PATH: binDir, WE_GITHUB_APP_ROLE: 'merger', GH_CALLER: 'x' } }), seam());
+    expect(c.options.env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+    expect(c.options.env).not.toHaveProperty('GH_CALLER');
+    expect(c.args).toContain('shell_environment_policy.set.WE_GITHUB_APP_ROLE="reviewer"');
+    const l = buildAgentInvocation(claude({ githubRole: 'reviewer', env: { PATH: binDir, WE_GITHUB_APP_ROLE: 'merger' } }), seam());
+    expect(l.options.env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+    expect(JSON.parse(l.args[l.args.indexOf('--settings') + 1]).env.WE_GITHUB_APP_ROLE).toBe('reviewer');
+  });
+});
+
+describe('12 manifest validation (finding 5)', () => {
+  const clone = () => JSON.parse(JSON.stringify(MANIFEST));
+  it('refuses empty, missing and malformed manifests', () => {
+    const empty = clone(); empty.codex.pinned = {};
+    refuses(codex(), seam({ manifest: empty }), /manifest/);
+    const noGen = clone(); noGen.codex.generated = [];
+    refuses(codex(), seam({ manifest: noGen }), /manifest/);
+    const noGenClaude = clone(); noGenClaude.claude.generated = [];
+    refuses(claude(), seam({ manifest: noGenClaude }), /manifest/);
+    const badHash = clone(); badHash.codex.pinned.npm = 'abc';
+    refuses(codex(), seam({ manifest: badHash }), /manifest/);
+    const extra = clone(); extra.codex.pinned.node = MANIFEST.codex.pinned.npm;
+    refuses(codex(), seam({ manifest: extra }), /manifest/);
+    const sourced = clone(); sourced.codex.sourced = {};
+    refuses(codex(), seam({ manifest: sourced }), /manifest/);
+    refuses(codex(), seam({ manifest: {} }), /manifest/);
+  });
+  it('accepts the tracked manifest', () => {
+    expect(() => buildAgentInvocation(codex(), seam({ manifest: clone() }))).not.toThrow();
+    expect(() => buildAgentInvocation(claude(), seam({ manifest: clone() }))).not.toThrow();
+  });
+});
+
+describe('13 shim dirs hold only guard names (finding 8)', () => {
+  it('refuses an extra node, dirname or basename in either dir', () => {
+    for (const name of ['node', 'dirname', 'basename']) {
+      put(codexDir, name, '#!/bin/sh\n'); refuses(codex(), seam(), /unexpected file/);
+      unlinkSync(join(codexDir, name));
+      put(ghDir, name, '#!/bin/sh\n'); refuses(codex(), seam(), /unexpected file/); refuses(claude(), seam(), /unexpected file/);
+      unlinkSync(join(ghDir, name));
+    }
+  });
+  it('tolerates the gh shim atomic-rename temp file only', () => {
+    put(ghDir, 'gh.tmp-123-456', GH_BODY);
+    expect(() => buildAgentInvocation(codex(), seam())).not.toThrow();
+    put(ghDir, 'gh.tmp-x', GH_BODY); refuses(codex(), seam(), /unexpected file/);
   });
 });
 

@@ -44,6 +44,7 @@ const PROTECTION_PATH_RES = [
   /(^|\/)\.github\/branch-protection[^/]*\.json$/,
   /(^|\/)scripts\/lib\/required-status-checks\.mjs$/,
   /(^|\/)scripts\/lib\/we-only-checks\.json$/,
+  /(^|\/)scripts\/lib\/agent-launch-(guards|approved)\.json$/,
 ];
 
 // Every script-like extension, not just `.mjs`: a grant spelled in `.ts`/`.js`/`.sh` widens a sandbox the same way.

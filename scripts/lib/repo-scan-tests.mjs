@@ -64,7 +64,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
     test: 'scripts/__tests__/agent-launch-structure.test.mjs',
     scope: 'full',
     why: 'counts literal agent process launches under scripts and symlinked skills; a new launch site anywhere must be seen',
-    matches: (f) => f.startsWith('scripts/lib/agent-launch'),
+    matches: (f) => /\.mjs$/.test(f) && /^(scripts|skills-src)\//.test(f) && !/(?:^|\/)__tests__\//.test(f) && !/\.(test|spec)\./.test(f),
     inputs: ['scripts/__tests__/agent-launch-structure.test.mjs', 'scripts/lib/agent-launch-approved.json'],
   },
   {

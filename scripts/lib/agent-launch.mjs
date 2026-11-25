@@ -8,18 +8,19 @@
  * io seams (admit, spawn, resolveBinary, ghShimDir, codexShimDir, manifest, shellsFile, execPath, user) are trusted test seams; any other io key is refused.
  */
 import { spawn } from 'node:child_process';
-import { accessSync, constants, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { types } from 'node:util';
 import { resolveOrgAwareShimDir, shimGhPath } from './gh-app-shim.mjs';
+import { GITHUB_APP_ROLES } from './github-app-identity.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXED_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin', '/usr/local/bin', '/opt/homebrew/bin'];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const COMMON = ['agent', 'cwd', 'processGroup', 'tempRoot', 'env'];
+const COMMON = ['agent', 'githubRole', 'cwd', 'processGroup', 'tempRoot', 'env'];
 const CODEX = ['sandbox', 'outputSchemaFile', 'outputLastMessageFile', 'ephemeral', 'addDirs', 'model', 'config', 'resumeThreadId'];
 const CLAUDE = ['print', 'sessionId', 'resumeId', 'model', 'outputFormat', 'verbose', 'prompt'];
 const IO_KEYS = ['admit', 'spawn', 'resolveBinary', 'ghShimDir', 'codexShimDir', 'manifest', 'shellsFile', 'execPath', 'user'];
@@ -112,6 +113,7 @@ function argsFrom(d, launcher) {
   record(d, 'descriptor');
   choice(d.agent, ['claude', 'codex'], 'agent');
   for (const key of Object.keys(d)) if (![...COMMON, ...(d.agent === 'codex' ? CODEX : CLAUDE)].includes(key)) fail(`unknown field ${key}`);
+  choice(d.githubRole, GITHUB_APP_ROLES, 'githubRole');
   absolute(d.cwd, 'cwd'); flag(d.processGroup, 'processGroup');
   if (d.tempRoot !== undefined) absolute(d.tempRoot, 'tempRoot');
   if (d.env !== undefined) envRecord(d.env);
@@ -206,14 +208,33 @@ function trustedDir(dir, what) {
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 
 // Returns { dirs: [guard dirs in PATH order], guards: [{name, path, sha256}] }, or refuses.
+const HEX64 = /^[0-9a-f]{64}$/;
+const CODEX_PINNED = ['npm', 'npx', 'playwright', 'vitest'];
+// The manifest is itself a guard input: demand the exact name sets so an emptied or trimmed one cannot disable a guard.
+function validManifest(manifest, agent) {
+  const same = (obj, names) => obj && typeof obj === 'object' && !Array.isArray(obj)
+    && JSON.stringify(Object.keys(obj).sort()) === JSON.stringify(names)
+    && Object.values(obj).every(h => typeof h === 'string' && HEX64.test(h));
+  const entry = manifest?.[agent];
+  const codex = agent === 'codex';
+  if (!entry || !same(entry.pinned, codex ? CODEX_PINNED : []) || !same(entry.sourced, codex ? ['_guard.sh'] : [])
+    || JSON.stringify(entry.generated) !== '["gh"]') fail(`guard manifest for ${agent} is invalid; restore agent-launch-guards.json and retry`);
+  return entry;
+}
+// A guard directory may hold only its manifest names (plus the gh shim's atomic-rename temp file).
+function onlyNames(dir, names, what, tempPattern) {
+  for (const name of readdirSync(dir)) {
+    if (!names.includes(name) && !(tempPattern && tempPattern.test(name))) fail(`${what} directory has an unexpected file ${name}; remove it and retry`);
+  }
+}
 function guardSet(agent, io) {
-  const manifest = io.manifest ?? JSON.parse(readFileSync(join(HERE, 'agent-launch-guards.json'), 'utf8'));
-  const entry = manifest[agent];
-  if (!entry) fail(`no guard manifest for ${agent}`);
+  const manifest = io.manifest ?? JSON.parse(trustedFile(join(HERE, 'agent-launch-guards.json'), 'guard manifest').toString('utf8'));
+  const entry = validManifest(manifest, agent);
   const dirs = [], guards = [];
   if (Object.keys(entry.pinned).length) {
     const dir = io.codexShimDir ?? join(HERE, '..', 'codex-shims');
     trustedDir(dir, `${agent} guard shim`);
+    onlyNames(dir, [...Object.keys(entry.pinned), ...Object.keys(entry.sourced)], `${agent} guard shim`);
     for (const [name, want] of [...Object.entries(entry.pinned), ...Object.entries(entry.sourced)]) {
       const path = join(dir, name), got = sha(trustedFile(path, `guard shim ${name}`));
       if (got !== want) fail(`guard shim ${name} differs from agent-launch-guards.json; review the change and update the manifest`);
@@ -226,6 +247,7 @@ function guardSet(agent, io) {
     const dir = io.ghShimDir ?? resolveOrgAwareShimDir();
     if (!dir) fail('org-aware gh shim not found; regenerate it by dispatching through the daemon and retry');
     absolute(dir, 'gh shim dir'); trustedDir(dir, 'gh shim');
+    onlyNames(dir, ['gh'], 'gh shim', /^gh\.tmp-\d+-\d+$/);
     const path = shimGhPath(dir), bytes = trustedFile(path, 'gh shim'), body = bytes.toString('utf8');
     const lines = body.split('\n');
     if (!lines[0].startsWith('#!') || !lines[1]?.startsWith(GH_HEADER)) fail('gh shim has the wrong header; regenerate it and retry');
@@ -265,15 +287,15 @@ export function buildAgentInvocation(descriptor, io = {}) {
     ...callerEnv(caller, d.agent),
     PATH: path, HOME: home, USER: user.username, LOGNAME: user.username, SHELL: accountShell(user, io),
     TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
-    WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse',
+    WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: d.githubRole,
   };
   let launcher;
   if (d.agent === 'codex') {
     env.CODEX_HOME = join(home, '.codex');
-    launcher = { 'shell_environment_policy.set.PATH': path };
+    launcher = { 'shell_environment_policy.set.PATH': path, 'shell_environment_policy.set.WE_GITHUB_APP_ROLE': d.githubRole };
     if (d.tempRoot !== undefined) for (const key of ['TMPDIR', 'TMP', 'TEMP']) launcher[`shell_environment_policy.set.${key}`] = tempRoot;
   } else {
-    launcher = JSON.stringify({ env: { PATH: path, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse' } });
+    launcher = JSON.stringify({ env: { PATH: path, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: d.githubRole } });
   }
   const args = argsFrom(d, launcher);
   try { if (!statSync(d.cwd).isDirectory()) fail('cwd must be an existing directory'); }
