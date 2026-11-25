@@ -8,7 +8,7 @@ import { listOpenPrsPagedHydrated, HEAVY_VALIDATORS, PrListUnreadableError, reso
 const repo = 'owner/name';
 const baseNode = (number, extra = {}) => ({ number, title: `PR ${number}`, url: `https://example.com/${number}`,
   isDraft: false, createdAt: '2026-10-12T00:00:00Z', updatedAt: '2026-10-13T00:00:00Z',
-  headRefName: `branch-${number}`, headRefOid: `head-${number}`, baseRefName: 'main',
+  headRefName: `branch-${number}`, headRefOid: `head-${number}`, baseRefName: 'main', baseRefOid: 'base-oid',
   isCrossRepository: false, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', reviewDecision: null, ...extra });
 
 /** A fake gh: `state.nodes` is the live page; `state.views` logs the --json field list of every `pr view`. */
@@ -31,8 +31,9 @@ const run = (state, o = {}) => listOpenPrsPagedHydrated({ repo, exec: fakeGh(sta
 
 describe('DRAIN-LIST-DELTA', () => {
   it('declares per-field validators', () => {
-    expect(HEAVY_VALIDATORS.files).toEqual(['headRefOid', 'baseRefName']);
-    expect(HEAVY_VALIDATORS.body).toEqual(['updatedAt']);
+    expect(HEAVY_VALIDATORS.files).toEqual(['headRefOid', 'baseRefName', 'baseRefOid']);
+    expect(HEAVY_VALIDATORS.body).toEqual(['updatedAt', 'headRefOid']);
+    expect(HEAVY_VALIDATORS.comments).toEqual(['updatedAt', 'headRefOid']);
   });
 
   it('a label-only change re-reads body but reuses files', () => {
@@ -57,16 +58,50 @@ describe('DRAIN-LIST-DELTA', () => {
     expect(state.views).toEqual([{ number: 1, fields: ['files'] }]);
     expect(second.stats.byReason.base).toBe(1);
     state.views.length = 0;
+    // A head change invalidates both: files by head, body by updatedAt AND head.
     state.nodes = [baseNode(1, { baseRefName: 'release', headRefOid: 'other' })];
     run(state, { cache: second.cache, nowMs: 1_002_000 });
-    expect(state.views).toEqual([{ number: 1, fields: ['files'] }]);
+    expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
   });
 
-  it('an unchanged non-candidate is not re-read after 600 s within the backstop', () => {
+  it('a base tip move (same base branch name) re-reads files only', () => {
     const state = { nodes: [baseNode(1)], views: [] };
     const first = run(state);
     state.views.length = 0;
-    const second = run(state, { cache: first.cache, nowMs: 1_000_000 + 700_000 });
+    state.nodes = [baseNode(1, { baseRefOid: 'moved' })];
+    const second = run(state, { cache: first.cache, nowMs: 1_001_000 });
+    expect(state.views).toEqual([{ number: 1, fields: ['files'] }]);
+    expect(second.stats.byReason.base).toBe(1);
+  });
+
+  it('a head change with an unchanged updatedAt re-reads the body', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    const first = run(state);
+    state.views.length = 0;
+    state.nodes = [baseNode(1, { headRefOid: 'new-head' })];
+    run(state, { cache: first.cache, nowMs: 1_001_000 });
+    expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
+  });
+
+  it('delta mode without an isCandidate predicate throws, never defaults to false', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    expect(() => listOpenPrsPagedHydrated({ repo, exec: fakeGh(state), paging: paging(), heavyFields: ['body', 'files'],
+      delta: {}, cache: {}, nowMs: 1_000_000, seed: [] })).toThrow(/isCandidate/);
+  });
+
+  it('heavyMaxAgeSeconds is an upper bound in delta mode, even with a longer backstop', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    const first = run(state);
+    state.views.length = 0;
+    run(state, { cache: first.cache, nowMs: 1_000_000 + 700_000 });
+    expect(state.views).toEqual([{ number: 1, fields: ['body', 'files'] }]);
+  });
+
+  it('an unchanged non-candidate is not re-read within the age bound', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    const first = run(state);
+    state.views.length = 0;
+    const second = run(state, { cache: first.cache, nowMs: 1_000_000 + 500_000 });
     expect(state.views).toEqual([]);
     expect(second.stats.reused).toBe(1);
     expect(second.rows[0].body).toBe('body-0');
@@ -109,12 +144,18 @@ describe('DRAIN-LIST-DELTA', () => {
   });
 
   it('same head, changed check result: gate fields come from the live page, never the seed or cache', () => {
-    const state = { nodes: [baseNode(1, { mergeStateStatus: 'BLOCKED' })], views: [] };
-    const seed = [{ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main', heavyFetchedAtMs: 999_000, body: 'seedbody', files: [],
+    const live = { commits: { nodes: [{ commit: { oid: 'a'.repeat(40), statusCheckRollup: { contexts: {
+      pageInfo: { hasNextPage: false }, totalCount: 1, nodes: [{ __typename: 'StatusContext', context: 'live-ci', state: 'FAILURE' }] } } } }] } };
+    const state = { nodes: [baseNode(1, { mergeStateStatus: 'BLOCKED', ...live })], views: [] };
+    const seed = [{ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main', baseRefOid: 'base-oid',
+      heavyFetchedAtMs: 999_000, body: 'seedbody', files: [],
       statusCheckRollup: [{ name: 'x', conclusion: 'SUCCESS', foreignApp: 1 }], mergeStateStatus: 'CLEAN' }];
     const out = run(state, { seed, isCandidate: () => false });
     expect(out.rows[0].mergeStateStatus).toBe('BLOCKED');
-    expect(out.rows[0].statusCheckRollup).not.toEqual(seed[0].statusCheckRollup);
+    expect(out.rows[0].statusCheckRollup).toHaveLength(1);
+    expect(JSON.stringify(out.rows[0].statusCheckRollup)).toContain('live-ci');
+    expect(JSON.stringify(out.rows[0].statusCheckRollup)).toContain('FAILURE');
+    expect(out.rows[0].rowsComplete).toBe(true);
     expect(out.cache[1].statusCheckRollup).toBeUndefined();
     expect(out.rows[0].body).toBe('seedbody');
     expect(state.views).toEqual([]);
@@ -156,7 +197,7 @@ describe('DRAIN-LIST-DELTA call sites', () => {
 
 describe('DRAIN-LIST-DELTA audit hardening', () => {
   const seedRow = (extra = {}) => ({ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main',
-    heavyFetchedAtMs: 999_000, body: 'seedbody', files: [{ path: 's' }], ...extra });
+    baseRefOid: 'base-oid', heavyFetchedAtMs: 999_000, body: 'seedbody', files: [{ path: 's' }], ...extra });
   it('a seed with the wrong base or no retrieval time is ignored for files', () => {
     for (const extra of [{ baseRefName: 'release' }, { heavyFetchedAtMs: undefined }]) {
       const state = { nodes: [baseNode(1)], views: [] };
@@ -187,5 +228,39 @@ describe('DRAIN-LIST-DELTA audit hardening', () => {
       : JSON.stringify({ body: null, files: null });
     expect(() => listOpenPrsPagedHydrated({ repo, exec, paging: paging(), heavyFields: ['body', 'files'],
       delta: { isCandidate: () => false }, cache: {}, nowMs: 1_000_000, seed: [] })).toThrow(PrListUnreadableError);
+  });
+});
+
+describe('DRAIN-LIST-DELTA round 3', () => {
+  const seedRow = (extra = {}) => ({ number: 1, updatedAt: '2026-10-13T00:00:00Z', headRefOid: 'head-1', baseRefName: 'main',
+    baseRefOid: 'base-oid', heavyFetchedAtMs: 999_000, body: 'seedbody', files: [{ path: 's }' }], ...extra });
+  it('a seed with null body or files is re-read, like readHeavy', () => {
+    for (const extra of [{ body: null }, { files: null }]) {
+      const state = { nodes: [baseNode(1)], views: [] };
+      const out = run(state, { seed: [seedRow(extra)] });
+      expect(state.views.length).toBe(1);
+      expect(typeof out.rows[0].body).toBe('string');
+      expect(Array.isArray(out.rows[0].files)).toBe(true);
+    }
+  });
+  it('a valid seed under matching validators is used without a read', () => {
+    const state = { nodes: [baseNode(1)], views: [] };
+    const out = run(state, { seed: [seedRow()] });
+    expect(state.views).toEqual([]);
+    expect(out.rows[0].body).toBe('seedbody');
+  });
+  it('the async drain entry executes the delta path: candidates re-read, others reused', async () => {
+    const { listOpenPrsPagedHydratedCompleteAsync } = await import('../pr-list-paged.mjs');
+    const state = { nodes: [baseNode(1), baseNode(2)], views: [] };
+    const exec = fakeGh(state);
+    const execAsync = async (...a) => ({ stdout: exec(...a) });
+    const call = (cache, nowMs) => listOpenPrsPagedHydratedCompleteAsync({ repo, exec, execAsync, paging: paging(),
+      heavyFields: ['body', 'files'], delta: { isCandidate: r => r.number === 2 }, cache, nowMs, seed: [] });
+    const first = await call({}, 1_000_000);
+    state.views.length = 0;
+    const second = await call(first.cache, 1_001_000);
+    expect(state.views).toEqual([{ number: 2, fields: ['body', 'files'] }]);
+    expect(second.stats.reused).toBe(1);
+    expect(second.stats.candidates).toBe(1);
   });
 });

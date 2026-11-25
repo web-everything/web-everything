@@ -31,9 +31,12 @@ export const PAGED_LIGHT_FIELDS = Object.freeze(['number', 'title', 'url', 'isDr
 export const PR_LIST_PAGING_DEFAULTS = Object.freeze({ pageSize: 20, pageRetries: 1, heavyMaxAgeSeconds: 600 });
 /** SHIP-API-004: each heavy field is valid while ITS validators still equal the live page row (equality only, never order).
  *  `files` changes only with head/base; `body` and `comments` can change under the same head, so updatedAt validates them. */
-export const HEAVY_VALIDATORS = Object.freeze({ files: Object.freeze(['headRefOid', 'baseRefName']),
-  body: Object.freeze(['updatedAt']), comments: Object.freeze(['updatedAt']) });
-const VALIDATOR_REASON = Object.freeze({ headRefOid: 'head', baseRefName: 'base', updatedAt: 'updatedAt' });
+export const HEAVY_VALIDATORS = Object.freeze({ files: Object.freeze(['headRefOid', 'baseRefName', 'baseRefOid']),
+  body: Object.freeze(['updatedAt', 'headRefOid']), comments: Object.freeze(['updatedAt', 'headRefOid']) });
+const VALIDATOR_REASON = Object.freeze({ headRefOid: 'head', baseRefName: 'base', baseRefOid: 'base', updatedAt: 'updatedAt' });
+/** PURE: the same shape check readHeavy applies, shared with seeded values. */
+export const heavyValueValid = (field, value) => field === 'body' ? typeof value === 'string'
+  : (field === 'files' || field === 'comments') ? Array.isArray(value) : true;
 
 /** PURE: why a cached field must be re-read, or null while it is valid. Delta mode only. `backstopMs` has no code
  *  default: absent (null/undefined) re-reads (SHIP-API-006/-017). Candidates ignore the cache entirely. */
@@ -110,7 +113,7 @@ export function buildOpenPrPageQuery({ repo, pageSize, after = null, inventoryOn
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new TypeError('pageSize must be an integer from 1 to 100');
   const [owner, name] = repo.split('/');
   const cursor = after === null ? '' : `,after:${JSON.stringify(after)}`;
-  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
+  const fields = inventoryOnly ? 'number headRefOid updatedAt baseRefName isDraft state' : 'number title url isDraft createdAt updatedAt headRefName headRefOid baseRefName baseRefOid isCrossRepository mergeable mergeStateStatus reviewDecision labels(first:100){nodes{id name description color}} commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){pageInfo{hasNextPage} totalCount nodes{__typename ...on CheckRun{name status conclusion startedAt completedAt detailsUrl databaseId checkSuite{app{slug databaseId} workflowRun{databaseId workflow{name}}}} ...on StatusContext{context state targetUrl createdAt}}}}}}}';
   return `query{repository(owner:"${owner}",name:"${name}"){pullRequests(states:OPEN,first:${pageSize}${cursor},orderBy:{field:CREATED_AT,direction:DESC}){totalCount pageInfo{hasNextPage endCursor} nodes{${fields}}}}}`;
 }
 
@@ -267,7 +270,7 @@ export function rollupEvidence(commit) {
 /** PURE: exactly gh pr list --json's labels and flattened statusCheckRollup shape, plus evidence metadata. */
 export function mapGraphqlPr(n) {
   return { ...rollupEvidence(n.commits?.nodes?.[0]?.commit), number: n.number, title: n.title, url: n.url, isDraft: n.isDraft, createdAt: n.createdAt, updatedAt: n.updatedAt,
-    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, isCrossRepository: n.isCrossRepository,
+    headRefName: n.headRefName, headRefOid: n.headRefOid, baseRefName: n.baseRefName, ...(n.baseRefOid !== undefined ? { baseRefOid: n.baseRefOid } : {}), isCrossRepository: n.isCrossRepository,
     mergeable: n.mergeable, mergeStateStatus: n.mergeStateStatus, reviewDecision: n.reviewDecision ?? '',
     labels: n.labels?.nodes ?? [],
     statusCheckRollup: (n.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? []).map(mapCtx) };
@@ -341,7 +344,7 @@ function readHeavy({ repo, row, exec, fields, execOpts }) {
     const text = exec('gh', heavyArgs(repo, row, fields), execOptions(execOpts));
     const data = JSON.parse(String(text));
     if (!isObj(data) || isGhDeferred(data) || fields.some(field => !Object.hasOwn(data, field))
-      || (fields.includes('files') && !Array.isArray(data.files)) || (fields.includes('body') && typeof data.body !== 'string')) {
+      || fields.some(field => !heavyValueValid(field, data[field]))) {
       throw new Error('missing PR heavy-field data');
     }
     return data;
@@ -433,18 +436,24 @@ function* pagedHydration({ repo, exec, paging, heavyFields, needsHeavy = () => t
   const byNumber = new Map(light.rows.map(row => [row.number, row]));
   const maxAgeMs = paging.heavyMaxAgeSeconds * 1000;
   const hasFields = entry => !!entry && heavyFields.every(field => Object.hasOwn(entry, field));
+  if (delta && typeof delta.isCandidate !== 'function') {
+    throw new TypeError('delta hydration requires an isCandidate predicate (it never defaults to false)');
+  }
+  // heavyMaxAgeSeconds stays an upper bound in delta mode; the backstop may only tighten it. No backstop = re-read.
   const deltaOpts = delta && { isCandidate: delta.isCandidate,
-    backstopMs: Number.isFinite(paging.heavyBackstopSeconds) ? paging.heavyBackstopSeconds * 1000 : null };
+    backstopMs: Number.isFinite(paging.heavyBackstopSeconds)
+      ? Math.min(paging.heavyBackstopSeconds, Number.isFinite(paging.heavyMaxAgeSeconds) ? paging.heavyMaxAgeSeconds : Infinity) * 1000 : null };
   for (const row of seed) {
     const live = byNumber.get(row.number);
     if (deltaOpts) {
       // Seed carries only fields declared in HEAVY_VALIDATORS, and only under the live row's updatedAt + head.
-      if (!live || row.updatedAt !== live.updatedAt || row.headRefOid !== live.headRefOid) continue;
+      if (!live) continue;
       for (const field of heavyFields) {
         if (!HEAVY_VALIDATORS[field] || !Object.hasOwn(row, field) || Object.hasOwn(working[row.number] ?? {}, field)) continue;
-        // A seed is usable only with its own real retrieval time, and (for files) the base it was read under.
-        if (!Number.isFinite(row.heavyFetchedAtMs)) continue;
-        if (HEAVY_VALIDATORS[field].includes('baseRefName') && row.baseRefName !== live.baseRefName) continue;
+        // A seed is usable only with its own real retrieval time, every validator of the field equal to the live
+        // row (and present), and the same shape check readHeavy applies.
+        if (!Number.isFinite(row.heavyFetchedAtMs) || !heavyValueValid(field, row[field])) continue;
+        if (HEAVY_VALIDATORS[field].some(key => live[key] == null || live[key] === '' || row[key] !== live[key])) continue;
         const entry = working[row.number] = { ...working[row.number], stamps: { ...working[row.number]?.stamps } };
         entry[field] = row[field];
         entry.stamps[field] = stampFor(field, live, row.heavyFetchedAtMs);
