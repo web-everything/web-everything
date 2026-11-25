@@ -35,6 +35,8 @@ if (!claim.ok) throw new Error('fixture claim acquisition failed: ' + claim.reas
 if (!readLiveFixClaim({ repo: 'we', pr: 900002 })) throw new Error('fixture claim is not live');
 let script = DISPATCH_DRY_RUN_SCRIPT;
 if (${restoreLiveClaimReader}) {
+  // Restore both the live reader and its non-smoke context for this RED control.
+  delete process.env.WE_SMOKE_DRYRUN_ONLY;
   script = script.replace('readFixClaim: () => null,', '');
   if (script === DISPATCH_DRY_RUN_SCRIPT) throw new Error('RED control did not restore the default claim reader');
 }

@@ -605,7 +605,7 @@ export function checkFilled(promptText, label, canonicalize, requiredNames, resu
       catch { evidence = '[unserializable result]'; }
       evidence = String(evidence);
       if (evidence.length > 200) evidence = evidence.slice(0, 199) + '…';
-      const dispatcher = label.startsWith('ci-heal') ? 'dispatchCiHeal' : 'dispatchFix';
+      const dispatcher = label.startsWith('ci-heal') ? 'dispatchCiHeal' : label.startsWith('review') ? 'dispatchReview' : 'dispatchFix';
       throw new Error(label + ': no prompt captured: ' + dispatcher + ' returned ' + outcome
         + ' (' + evidence + ') — the stub spawner was never called');
     }
@@ -667,8 +667,8 @@ const DISPATCH_DRY_RUN_LINES = [
   "  let captured = null;",
   "  const spawn = (argv) => { captured = argv[argv.length - 1]; return 'stub-review-900001'; };",
   "  // A synthetic PR has no live CI; this check exercises brief filling and the injected spawner.",
-  "  dispatchReview({ pr: 900001, repo: WE_SLUG, expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) }, spawnAgent: spawn, ciGate: () => ({ allowed: true }), extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude' });",
-  "  checkFilled(captured, 'review PR #900001', canonicalReviewPlaceholder, REVIEW_BRIEF_PLACEHOLDERS);",
+  "  const result = dispatchReview({ pr: 900001, repo: WE_SLUG, expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) }, spawnAgent: spawn, ciGate: () => ({ allowed: true }), extraArgs: [], checkStaleness: skipStaleness, judgeProvider: 'claude', wrapReview: false });",
+  "  checkFilled(captured, 'review PR #900001', canonicalReviewPlaceholder, REVIEW_BRIEF_PLACEHOLDERS, result);",
   "});",
   "",
   "// 2. fix — direct dispatchFix call: an item-less PR with a NON-EMPTY diff-derived scope, the one legal shape",
@@ -684,7 +684,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "    // recordAdvisor: a dry run is not a real fix run, so it never lands in the advisor trial's per-run ledger (#x331b7u).",
   "    { repo: 'we', spawnAgent: spawn, providerAvailable: p => p === 'claude', extraArgs: [], acquireClaim: noopAcquire, releaseClaim: noopRelease, recordAdvisor: () => {}, readPushHold: () => null,",
   "    // Sentinel fix isolation: exercise the injected spawner regardless of live claims, history or routing.",
-  "      readFixClaim: () => null, readHistoryInputs: () => null, postNotice: () => {}, postTakeover: () => {}, postTakeoverVoidMark: () => {}, readTakeoverDiff: () => null, executorDecision: { executor: 'claude', mode: 'direct', source: 'smoke', reason: 'existing provider routing' }, wrapFix: false },",
+  "      readFixClaim: () => null, readHistoryInputs: () => null, packFixBrief: template => template, stampExecutor: () => {}, postNotice: () => {}, postTakeover: () => {}, postTakeoverVoidMark: () => {}, readTakeoverDiff: () => null, executorDecision: { executor: 'claude', mode: 'direct', source: 'smoke', reason: 'existing provider routing' }, wrapFix: false },",
   "  );",
   "  checkFilled(captured, 'fix PR #900002', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND.fix, result);",
   "});",
@@ -698,7 +698,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "  const sinks = { [DISPATCH_EFFECT]: async (payload) => { captured = payload.prompt; return { handle: 'stub-cih-a' }; } };",
   "  const result = await dispatchCiHeal(",
   "    { itemNum: null, pr: 900003, laneRef: 'lane/900003-smoke-cih', scope: [], lane: 90102, headRefOid: null },",
-  "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease },",
+  "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease, readFixClaim: () => null, packCiBrief: template => template, pollAttempts: () => [], routeHeal: () => null },",
   "  );",
   "  checkFilled(captured, 'ci-heal-worst-case PR #900003', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal'], result);",
   "});",
@@ -709,7 +709,7 @@ const DISPATCH_DRY_RUN_LINES = [
   "  const sinks = { [DISPATCH_EFFECT]: async (payload) => { captured = payload.prompt; return { handle: 'stub-cih-b' }; } };",
   "  const result = await dispatchCiHeal(",
   "    { itemNum: null, pr: 900004, laneRef: 'lane/900004-smoke-cih', scope: ['we:scripts/operations/ci-heal-pr-dispatch.mjs'], lane: 90103, headRefOid: null },",
-  "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease },",
+  "    { repo: 'we', sinks, acquireClaim: noopAcquire, releaseClaim: noopRelease, readFixClaim: () => null, packCiBrief: template => template, pollAttempts: () => [], routeHeal: () => null },",
   "  );",
   "  checkFilled(captured, 'ci-heal-ordinary PR #900004', canonicalPlaceholder, BRIEF_REQUIRED_BY_KIND['ci-heal'], result);",
   "});",
