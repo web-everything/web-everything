@@ -35,6 +35,31 @@ const refuses = (d, io, re) => expect(() => buildAgentInvocation(d, io)).toThrow
 beforeEach(fixture);
 afterEach(() => vi.restoreAllMocks());
 
+describe('prompt text stays separate from flag values', () => {
+  it.each([
+    '- Review the diff\n- Report concrete failures',
+    '--model=other',
+    '- quotes: "single\'" `literal` ../path\r\u2028\u200b\uff0d',
+    ' ',
+  ])('preserves prompt %j after the option delimiter', prompt => {
+    const descriptor = claude({ prompt });
+    expect(buildAgentArgs(descriptor).slice(-2)).toEqual(['--', prompt]);
+    expect(buildAgentInvocation(descriptor, seam()).args.slice(-2)).toEqual(['--', prompt]);
+  });
+  it.each(['', null, 42, 'review\0diff'])('refuses invalid prompt %j', prompt => {
+    const descriptor = claude({ prompt });
+    expect(() => buildAgentArgs(descriptor)).toThrow(/prompt/);
+    refuses(descriptor, seam(), /prompt/);
+  });
+  it('still refuses leading hyphens in model flag values for both agents', () => {
+    for (const make of [claude, codex]) {
+      const descriptor = make({ model: '--other-model' });
+      expect(() => buildAgentArgs(descriptor)).toThrow(/model/);
+      refuses(descriptor, seam(), /model/);
+    }
+  });
+});
+
 describe('1 pathPrefix and launcher-owned config are not grammar', () => {
   it('refuses pathPrefix', () => refuses(codex({ pathPrefix: codexDir }), seam(), /unknown field pathPrefix/));
   it('refuses shell_environment_policy config keys', () => {

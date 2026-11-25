@@ -66,6 +66,10 @@ function text(value, name) {
   if (typeof value !== 'string' || !value || value.startsWith('-') || value.includes('\0')) fail(`${name} must be a non-option, NUL-free string`);
   return value;
 }
+function promptText(value) {
+  if (typeof value !== 'string' || !value || value.includes('\0')) fail('prompt must be a non-empty, NUL-free string');
+  return value;
+}
 function absolute(value, name) {
   if (!isAbsolute(text(value, name))) fail(`${name} must be absolute`);
   return value;
@@ -133,7 +137,7 @@ function argsFrom(d, launcher) {
     option('outputFormat', '--output-format', (v, k) => choice(v, ['text', 'json', 'stream-json'], k));
     if (flag(d.verbose, 'verbose')) args.push('--verbose');
     if (launcher) args.push('--settings', launcher);
-    if (d.prompt !== undefined) args.push('--', text(d.prompt, 'prompt'));
+    if (d.prompt !== undefined) args.push('--', promptText(d.prompt));
     return args;
   }
   args.push('exec', '--json', '-s', choice(d.sandbox, ['read-only', 'workspace-write'], 'sandbox'), '--skip-git-repo-check', '-C', d.cwd);
