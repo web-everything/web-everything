@@ -103,9 +103,17 @@ describe('hotpatch admission', () => {
       expect((await receiptGuard(SHA, readers)).outcome).not.toBe('pass');
     },
   );
-  it('missing or queued shards wait and shards from another suite cannot fill gaps', async () => {
+  it('a shard bound to another workflow cannot fill a missing CI shard', async () => {
     const { data, readers } = hotpatchFixture(); data.checks.check_runs[1].check_suite = { id: 99 };
-    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait' });
+    data.workflows.workflow_runs.push({ check_suite_id: 99, head_sha: SHA, path: '.github/workflows/review.yml', event: 'workflow_dispatch' });
+    data.workflows.total_count++;
+    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'wait', detail: 'hotpatch-needs-ci-receipt' });
+  });
+  it('an unbound Actions shard stays unknown even alongside a complete green receipt', async () => {
+    const { data, readers } = hotpatchFixture();
+    data.checks.check_runs.push({ ...data.checks.check_runs[1], id: 50, check_suite: { id: 99 } });
+    data.checks.total_count++;
+    expect(await receiptGuard(SHA, readers)).toMatchObject({ outcome: 'unknown', detail: 'hotpatch-evidence-unreadable' });
   });
   it('oversized evidence is unknown with an operator fallback', async () => {
     const { data, readers } = hotpatchFixture(); data.checks.total_count = 101;
