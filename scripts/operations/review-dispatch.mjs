@@ -641,10 +641,7 @@ export function dispatchReview({
   resolveRoute = resolveOperationRoute,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
-  // TEMPORARY (SMOKE-GUARD-RELAND): `required` is off so the OLD installed rebuild-smoke harness (which passes no
-  // expectedHead) still reaches its stub spawner. A PROVIDED expectedHead is still checked. Re-land `required: true`
-  // once every daemon has adopted the harness that passes expectedHead.
-  const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: false });
+  const refusal = expectedHeadRefusal(expectedHead, { pr: planned.pr, repo: planned.repo }, io, { required: true });
   if (refusal) return { pr: planned.pr, repo: planned.repo, ...refusal };
   assertNotALaneCheckout(root);
   // #3439 — refuse (not silently spawn) when this checkout is behind origin/main: see `assertMainNotStale`.
