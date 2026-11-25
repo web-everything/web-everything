@@ -16,7 +16,9 @@ import { resolveHotpatchKnobs } from './hotpatch-guards.mjs';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export function createHotpatchReaders({ cwd = root, env = process.env, exec = execFileSync, files = fs } = {}) {
   const opts = { cwd, env, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024 };
-  const git = args => String(exec('git', args, { ...opts, env: laneHistoryProofEnv(scrubGitLocationEnv(env)) }));
+  // Read-only git only (fetch objects, rev-parse, show, diff, merge-base): never a publish, so no push-gate site.
+  const injected = exec;
+  const readRepo = args => String(injected('git', args, { ...opts, env: laneHistoryProofEnv(scrubGitLocationEnv(env)) }));
   let calls = 0;
   const gh = args => {
     if (++calls > 100) throw new Error('hotpatch API budget exceeded');
@@ -28,8 +30,8 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
     if (prepared === sha) return;
     if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('invalid hotpatch sha');
     // Populate only objects and remote-tracking main; no working tree or lifecycle operation.
-    git(['fetch', '--no-tags', 'origin', 'main', sha]);
-    if (git(['rev-parse', '--verify', `${sha}^{commit}`]).trim() !== sha) throw new Error('unreadable hotpatch commit');
+    readRepo(['fetch', '--no-tags', 'origin', 'main', sha]);
+    if (readRepo(['rev-parse', '--verify', `${sha}^{commit}`]).trim() !== sha) throw new Error('unreadable hotpatch commit');
     prepared = sha;
   };
   const preferences = () => {
@@ -41,7 +43,7 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
     }
   };
   const api = path => {
-    origin ??= resolveOriginRepository({ git: args => ({ code: 0, stdout: git(args) }), gh });
+    origin ??= resolveOriginRepository({ git: args => ({ code: 0, stdout: readRepo(args) }), gh });
     if (!origin.repo) throw new Error('unreadable hotpatch repository');
     const r = origin.gh(['api', `repos/${origin.repo}/${path}`]);
     if (r.code !== 0) throw new Error('unreadable hotpatch CI');
@@ -83,10 +85,10 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
       }
       return true;
     },
-    ciPlan: sha => { prepare(sha); return ciUnitPlan(git(['show', 'origin/main:.github/workflows/ci.yml'])); },
+    ciPlan: sha => { prepare(sha); return ciUnitPlan(readRepo(['show', 'origin/main:.github/workflows/ci.yml'])); },
     paths: sha => {
       prepare(sha);
-      const raw = git(['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', `origin/main...${sha}`]);
+      const raw = readRepo(['diff', '--name-only', '-z', '--no-renames', '--no-ext-diff', '--no-textconv', `origin/main...${sha}`]);
       if (raw && !raw.endsWith('\0')) throw new Error('incomplete hotpatch diff');
       return raw ? raw.slice(0, -1).split('\0') : [];
     },
@@ -107,7 +109,7 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
     },
     covers: (base, sha) => {
       prepare(sha);
-      try { git(['merge-base', '--is-ancestor', base, 'origin/main']); return true; }
+      try { readRepo(['merge-base', '--is-ancestor', base, 'origin/main']); return true; }
       catch (e) { if (e.status === 1) return false; throw e; }
     },
     ruledWeakened: () => {
