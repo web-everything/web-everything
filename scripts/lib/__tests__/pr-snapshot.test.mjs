@@ -18,7 +18,7 @@ import {
 } from '../pr-snapshot.mjs';
 import { PrListUnreadableError } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
-import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
+import { prSnapshotEnabled, markPrSnapshotDirty, latestDirtyMs, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
@@ -53,7 +53,7 @@ function fakeExec(prs = PRS) {
       return JSON.stringify({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
         pageInfo: { hasNextPage: end < prs.length, endCursor: String(end) } } } } });
     }
-    expect(argv).toEqual(['pr', 'view', argv[2], '--repo', REPO, '--json', 'comments,body,files']);
+    expect(argv).toEqual(['pr', 'view', argv[2], '--repo', REPO, '--json', 'comments,body,files,headRefOid']);
     const { comments, body, files } = prs.find(p => p.number === Number(argv[2]));
     return JSON.stringify({ comments, body, files });
   };
@@ -434,4 +434,20 @@ it('snapshot v2 projects check evidence metadata without losing completeness', (
   expect(SNAPSHOT_FIELDS).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
   const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
   expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
+});
+
+describe('unreadable dirty marker', () => {
+  it('unreadable dirty marker forces a refresh', () => {
+    const { exec, calls } = fakeExec();
+    readSharedOpenPrs(opts({ fields: 'number', exec }));
+    // A directory where the marker file belongs: stat succeeds, but make it unreadable via a bad path component.
+    const marker = join(dir, 'web-everything__web-everything.dirty');
+    writeFileSync(marker, '');
+    chmodSync(dir, 0o600); // no search permission: statSync on the marker fails with EACCES, not ENOENT
+    let n;
+    try { clock += 1_000; n = latestDirtyMs(dir, REPO); } finally { chmodSync(dir, 0o700); }
+    expect(n).toBe(Infinity);
+    expect(isServable({ fields: ['number'], fetchedAtMs: clock - 1_000, prs: [] }, { fields: ['number'], nowMs: clock, ttlMs: 75_000, dirtyMs: Infinity })).toBe(false);
+    expect(pageCalls(calls)).toHaveLength(1);
+  });
 });

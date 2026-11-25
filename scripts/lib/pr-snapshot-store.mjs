@@ -80,7 +80,10 @@ export function latestDirtyMs(dir, repo) {
   const key = snapshotKey(repo);
   for (const k of [key, ALL_DIRTY]) {
     if (!k) continue;
-    try { latest = Math.max(latest, statSync(dirtyPath(dir, k)).mtimeMs); } catch { /* no marker */ }
+    try { latest = Math.max(latest, statSync(dirtyPath(dir, k)).mtimeMs); } catch (e) {
+      // Only a genuinely absent marker means "no marker"; an unreadable one is treated as dirty (fail closed).
+      if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') return Infinity;
+    }
   }
   return latest;
 }
