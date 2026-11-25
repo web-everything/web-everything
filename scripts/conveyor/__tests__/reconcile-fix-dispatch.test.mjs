@@ -13,7 +13,7 @@ import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mj
 import { spawnSync } from 'node:child_process';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold,fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -2852,11 +2852,57 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   it('a hold added after lane selection returns the lane and spawns nothing (:2152)', () => {
     let laneSelected = false;
     const dispatch = vi.fn(p => ok(p.pr));
-    const readPushHold = vi.fn(() => (laneSelected ? { code: 'hold-label', reason: 'review:human' } : null));
+    const readPushHold = vi.fn(({ pr }) => (laneSelected && pr === 1764 ? { code: 'hold-label', reason: 'review:human' } : null));
     const pickFreeLanes = () => { laneSelected = true; return [4]; };
-    const result = run({ dispatch, readPushHold, pickFreeLanes, dryRun: false });
+    const second = { kind: 'fix', prNumber: 1765, headRefName: 'lane/3439-other-thing' };
+    const result = run({ dispatch, readPushHold, pickFreeLanes, dryRun: false }, [entry, second]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    // The held PR's lane went back to the pool, so the next PR still got lane 4.
+    expect(dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ pr: 1765, lane: 4 }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('a held ordinary (non-conflict) PR is not resumed either', () => {
+    const tryResume = vi.fn(() => ({ resumed: true, result: { pr: 1764 } }));
+    const dispatch = vi.fn(p => ok(p.pr));
+    const result = run({ dispatch, tryResume, tryResumeRound: vi.fn(), readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }), dryRun: false });
+    expect(tryResume).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('dispatchFix re-reads the hold after the slow prep and spawns nothing; the claim is released', () => {
+    const spawnAgent = vi.fn(() => '');
+    const releaseClaim = vi.fn();
+    expect(() => dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, releaseClaim, grantConflictHelper: vi.fn(),
+        readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }) },
+    )).toThrow(/push-hold/);
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+  });
+
+  describe('readLivePushHold parses live evidence (no env bypass when hermetic is off)', () => {
+    const view = (v) => vi.fn(() => JSON.stringify(v));
+    const read = (run) => readLivePushHold({ repo: 'we', pr: 7 }, { run, hermetic: false });
+    it('clear when open with no hold label, and reads without the memo', () => {
+      const run = view({ state: 'OPEN', labels: [{ name: 'review:pending' }] });
+      expect(read(run)).toBeNull();
+      expect(run.mock.calls[0][1].throttle).toEqual({ noMemo: true });
+    });
+    it.each(['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical'])('refuses %s', (name) => {
+      expect(read(view({ state: 'OPEN', labels: [{ name }] }))).toEqual({ code: 'hold-label', reason: name });
+    });
+    it.each(['CLOSED', 'MERGED'])('refuses a %s PR', (state) => {
+      expect(read(view({ state, labels: [] }))?.code).toBe('pr-not-open');
+    });
+    it.each([{ state: 'OPEN', labels: 'x' }, { state: 'OPEN', labels: [{}] }, { state: 'WEIRD', labels: [] }, null])(
+      'refuses malformed evidence %j', (v) => { expect(read(view(v))?.code).toBe('unreadable'); });
+    it('a throw or bad JSON propagates so the caller fails closed', () => {
+      expect(() => read(vi.fn(() => { throw new Error('timeout'); }))).toThrow();
+      expect(() => read(vi.fn(() => 'not json'))).toThrow();
+    });
   });
 
   it('dryRun never calls the dispatcher or the hold gate (:2114)', () => {

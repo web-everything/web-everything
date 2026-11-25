@@ -99,9 +99,9 @@ import { PUSH_HOLD_LABELS } from '../lib/review-hold-model.mjs';
  * field is a refusal, never a spawn. A hold seen here is read-only: it grants nothing, it only stops a launch.
  * Hermetic under a test runner unless a test injects its own reader.
  */
-export function readLivePushHold({ repo, pr }) {
-  if (isUnderTestEnv()) return null;
-  const view = JSON.parse(runGhSync(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
+export function readLivePushHold({ repo, pr }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
+  if (hermetic) return null;
+  const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
     || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };
@@ -1571,6 +1571,8 @@ export function dispatchFix(planned, {
   postTakeoverVoidMark = postTakeoverVoid,
   // Takeover budget — the previous takeover's diff for a takeover 2+ brief. Hermetic under a test runner.
   readTakeoverDiff = ({ repo: r, from, to }) => (isUnderTestEnv() ? null : readTakeoverDiffViaGh({ repo: r, from, to })),
+  // PUSH-GATE-S4 — live hold read right before the launch; injectable so a test reads nothing.
+  readPushHold = readLivePushHold,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -1671,6 +1673,14 @@ export function dispatchFix(planned, {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${decision.executor === 'claude' ? ladderTable?.model ?? 'default-fix-route' : decision.policyRoute?.model ?? 'codex default'}`);
     }
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
+    // PUSH-GATE-S4 — re-read the live hold AFTER the slow brief, notice and takeover work, right before any launch.
+    // A throw here releases the claim in the catch below and nothing is spawned.
+    {
+      let hold;
+      try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef }); }
+      catch { hold = { code: 'unreadable', reason: 'Cannot read push authority' }; }
+      if (hold) throw new Error(`push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})`);
+    }
     stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
     if (decision.executor !== 'claude' && decision.mode !== 'wrapped') {
       // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
@@ -2108,6 +2118,14 @@ export function runReconcileFixDispatch({
     const reviews = readUnsupported({ path: unsupportedPath }).filter((row) => row.repo === repoKey && row.action === 'review');
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
   }
+  // PUSH-GATE-S4 — live hold read; a hold or any unreadable evidence is a refusal, never a launch or a push.
+  const pushHoldRefusal = (entry) => {
+    let hold;
+    try { hold = readPushHold({ repo: repoKey, pr: Number(entry.pr ?? entry.prNumber), branch: entry.laneRef ?? entry.headRefName }); }
+    catch { hold = { code: 'unreadable', reason: 'Cannot read push authority; restore evidence before retrying' }; }
+    return hold ? { pr: Number(entry.pr ?? entry.prNumber), kind: 'push-hold',
+      why: `PR #${entry.pr ?? entry.prNumber} not launched: ${hold.code} (${hold.reason})` } : null;
+  };
   const mqRefreshRefusals = [];
   let mqDiffReads = 0;
   dispatchEntries = dispatchEntries.filter(entry => {
@@ -2155,6 +2173,11 @@ export function runReconcileFixDispatch({
             refreshNote: 'Changed files are in-diff, unavailable, stale or over the read bound; normal fix required' };
           return true;
         }
+      }
+      if (!fallback && !dryRun) {
+        // The mechanical refresh pushes directly: a hold added after planning stops it here.
+        const hold = pushHoldRefusal(entry);
+        if (hold) { mqRefreshRefusals.push({ pr: hold.pr, kind: 'push-hold', why: hold.why }); return false; }
       }
       result = fallback
         ? { action: 'fix', note: 'Persisted MQ refresh failure; normal fix still required' }
@@ -2291,13 +2314,6 @@ export function runReconcileFixDispatch({
   const queueBudget = queueBudgetFrom(queueAdmission, { root, repo: repoKey });
   refusals.push(...mqRefreshRefusals);
   const dispatched = [];
-  // PUSH-GATE-S4 — live hold read; a hold or any unreadable evidence is a refusal, never a launch.
-  const pushHoldRefusal = (entry) => {
-    let hold;
-    try { hold = readPushHold({ repo: repoKey, pr: entry.pr, branch: entry.laneRef ?? entry.headRefName }); }
-    catch { hold = { code: 'unreadable', reason: 'Cannot read push authority; restore evidence before retrying' }; }
-    return hold ? { pr: entry.pr, kind: 'push-hold', why: `PR #${entry.pr} not launched: ${hold.code} (${hold.reason})` } : null;
-  };
   let handled = 0;
   let deferred = [];
   let conflictHandled = 0;
@@ -2394,7 +2410,7 @@ export function runReconcileFixDispatch({
       continue;
     }
     // PUSH-GATE-S4 — the resume path also launches a fixer, so it reads the live hold first (the fresh path re-reads after its lane pop).
-    if (entry.isConflict) {
+    {
       const resumeHold = pushHoldRefusal(entry);
       if (resumeHold) { refusals.push(resumeHold); continue; }
     }
