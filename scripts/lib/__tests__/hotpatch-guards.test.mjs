@@ -95,7 +95,7 @@ describe('hotpatch admission', () => {
 });
 
 describe('hotpatch production readers', () => {
-  const workflow = 'jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}';
+  const workflow = 'jobs:\n  test-shard:\n    strategy:\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: vitest run --shard=${{ matrix.shard }}/${{ strategy.job-total }}\n  integration-part:\n    strategy:\n      matrix:\n        group: [daemon-core]\n  soak-shard:\n    strategy:\n      matrix:\n        shard: [1]\n';
   function production() {
     const fixture = hotpatchFixture(), calls = [];
     Object.assign(fixture.data.workflows.workflow_runs[0], { id: 70, status: 'completed', conclusion: 'success' });
@@ -161,6 +161,18 @@ describe('hotpatch production readers', () => {
     const next = production(); next.data.checks.check_runs[0].conclusion = 'failure';
     expect(await admitHotpatch(SHA, next.readers)).toMatchObject({ outcome: 'fail' });
     expect(f.calls.every(c => ['git', 'gh'].includes(c.command))).toBe(true);
+  });
+  it('audit findings 1-4: partial matrix, delta basis record, executable CI dependencies and memoized reads refuse', async () => {
+    const partial = production(); partial.jobs.splice(2, 1);
+    expect(await admitHotpatch(SHA, partial.readers)).toMatchObject({ outcome: 'unknown' });
+    const delta = hotpatchFixture(); delta.data.audits[0].basis = { head: 'b'.repeat(40) };
+    expect(await auditGuard(SHA, delta.readers)).toMatchObject({ outcome: 'unknown' });
+    for (const p of ['scripts/readiness/heavy-admission.mjs', 'scripts/conveyor/soak/run-shard.mjs', 'scripts/conveyor/soak/shard-files.mjs']) {
+      const f = hotpatchFixture(); f.data.paths = [p];
+      expect(await ciDefinitionGuard(SHA, f.readers)).toMatchObject({ outcome: 'fail' });
+    }
+    // The shared transport honours throttle.noMemo (gh-throttle runGhSyncReadMemo); the reader must set it on every gh read.
+    expect(readFileSync(new URL('../hotpatch-readers.mjs', import.meta.url), 'utf8')).toMatch(/caller: 'hotpatch-admission', noMemo: true/);
   });
   it('production receipts refuse successful jobs whose suite step was skipped', async () => {
     const f = production(); f.jobs[0].steps[0].conclusion = 'skipped';

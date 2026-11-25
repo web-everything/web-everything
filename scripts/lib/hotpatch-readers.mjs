@@ -1,5 +1,6 @@
 /** Bounded production readers shared by prototype-load and direct overlay add. */
 import { execFileSync } from 'node:child_process';
+import yaml from 'js-yaml';
 import fs from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,7 +24,7 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
   const gh = args => {
     if (++calls > 100) throw new Error('hotpatch API budget exceeded');
     return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { ...opts,
-    throttle: { caller: 'hotpatch-admission', ...(exec !== execFileSync ? { exec: (a, o) => exec('gh', a, o) } : {}) } })) };
+    throttle: { caller: 'hotpatch-admission', noMemo: true, ...(exec !== execFileSync ? { exec: (a, o) => exec('gh', a, o) } : {}) } })) };
   };
   let origin, platform, tool, prepared;
   const prepare = sha => {
@@ -66,9 +67,18 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
           [/^soak-shard \(/, /^Soak shard /],
           [/^smoke$/, /^(?:Build WE docs \(deploy smoke\)|Interaction lane)$/],
         ];
-        for (const [jobName, stepName] of groups) {
+        // Expected matrix size comes from the (unchanged-checked) CI definition: a partial matrix never passes.
+        prepare(sha);
+        const jobsDef = yaml.safeLoad(readRepo(['show', 'origin/main:.github/workflows/ci.yml']))?.jobs ?? {};
+        const expected = [
+          jobsDef['test-shard']?.strategy?.matrix?.shard?.length,
+          jobsDef['integration-part']?.strategy?.matrix?.group?.length,
+          jobsDef['soak-shard']?.strategy?.matrix?.shard?.length,
+        ];
+        if (!expected.every(n => Number.isInteger(n) && n > 0)) throw new Error('unreadable CI matrix');
+        for (const [index, [jobName, stepName]] of groups.entries()) {
           const jobs = data.jobs.filter(j => jobName.test(j.name));
-          if (!jobs.length) return false;
+          if (!jobs.length || (index < 3 && jobs.length !== expected[index])) return false;
           for (const job of jobs) {
             if (!Number.isSafeInteger(job.id) || job.head_sha !== sha || job.status !== 'completed' || job.conclusion !== 'success'
               || !Array.isArray(job.steps) || !job.steps.some(s => stepName.test(s.name) && s.status === 'completed' && s.conclusion === 'success')) return false;

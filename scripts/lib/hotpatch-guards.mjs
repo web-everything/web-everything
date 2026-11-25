@@ -59,6 +59,8 @@ export async function auditGuard(sha, readers) {
     // No fingerprint argument: only the requested head can contribute canonical evidence.
     const own = records.filter(r => r?.head?.toLowerCase() === sha);
     // Judge each record on its own: an older pass must never conceal unusable newer evidence.
+    // A delta-only record (carrying a basis) never stands in for the full own-sha review.
+    if (own.some(r => Object.hasOwn(r, 'basis'))) return unknown();
     if (own.some(r => !Array.isArray(r.findings) || r.findings.some(f => typeof f !== 'string')
       || findAudit([r], { head: r.head, base: r.base, questionHash: QUESTION_HASH, now, priorQuestionHashes }) !== r)) return unknown();
     const evidence = canonicalAuditEvidence(own, sha, base => {
@@ -76,7 +78,7 @@ export async function ciDefinitionGuard(sha, readers) {
   try {
     const paths = await readers.paths(sha);
     if (!Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !p)) return unknown();
-    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|hermetic-tests[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|vitest[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
+    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|hermetic-tests[^/]*$|readiness\/heavy-admission[^/]*$|conveyor\/soak\/(?:run-shard|shard-files)[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|vitest[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
       ? result('fail', 'hotpatch-ci-definition-change') : result('pass', 'hotpatch-ci-definition-unchanged');
   } catch { return unknown(); }
 }
