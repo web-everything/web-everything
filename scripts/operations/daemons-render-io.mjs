@@ -4,7 +4,7 @@
  */
 import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 import { execFileSync } from 'node:child_process';
-import { constants, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { constants, closeSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
@@ -66,7 +66,10 @@ export function readInstalled(label, { home = process.env.HOME, exec = execFileS
     }));
   } catch (error) {
     // A plist that is simply absent is "not installed", distinct from unreadable evidence.
-    if (!existsSync(path)) throw Object.assign(new Error('plist not installed'), { code: 'ENOENT' });
+    // Only a genuinely absent path is "not installed"; EACCES, dangling symlinks etc. stay unreadable evidence.
+    let absent = false;
+    try { lstatSync(path); } catch (statError) { absent = statError.code === 'ENOENT'; }
+    if (absent) throw Object.assign(new Error('plist not installed'), { code: 'ENOENT' });
     throw error;
   }
 }
@@ -91,12 +94,18 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
     const table = readTable();
     const gaps = missingSiblingPasses(table);
     for (const gap of gaps) log(`missing from table: ${terminal(gap.pass)} (repo ${terminal(gap.repo)})`);
-    const notInstalled = table.tasks.filter((task) => {
-      try { installedReader(task.label, { home: checkHome }); return false; } catch (error) { return error.code === 'ENOENT'; }
-    });
+    const notInstalled = [];
+    const unreadable = [];
+    for (const task of table.tasks) {
+      try {
+        const installed = installedReader(task.label, { home: checkHome });
+        if (installed === null || typeof installed !== 'object' || Array.isArray(installed)) unreadable.push(task);
+      } catch (error) { (error.code === 'ENOENT' ? notInstalled : unreadable).push(task); }
+    }
     for (const task of notInstalled) log(`not installed: ${terminal(task.label)}${task.manifestPass ? ` (pass ${terminal(task.manifestPass)})` : ''}`);
-    log(`${gaps.length} missing from table, ${notInstalled.length} not installed`);
-    if (gaps.length || notInstalled.length) process.exitCode = 1;
+    for (const task of unreadable) log(`installed evidence unreadable: ${terminal(task.label)}`);
+    log(`${gaps.length} missing from table, ${notInstalled.length} not installed, ${unreadable.length} unreadable`);
+    if (gaps.length || notInstalled.length || unreadable.length) process.exitCode = 1;
     return [];
   }
   if (Boolean(options.out) === Boolean(options.dryRun)) throw new Error('choose exactly one of --out=<dir> or --dry-run');
@@ -107,6 +116,7 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
   const files = renderAll(readTable(), host);
   if (options.out) writeOutDir(options.out, files, { home });
   let incomplete = false;
+  let notInstalled = 0;
   for (const file of files) {
     if (options.dryRun) {
       try {
@@ -116,16 +126,17 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
         if (error.code === 'ENOENT') {
           const repo = (DAEMON_MANIFEST[file.manifestPass]?.args ?? []).find(arg => arg.startsWith('--repo='));
           log(`${terminal(file.file)}: not installed: would create${repo ? ` (scoped to ${terminal(repo.slice(7))})` : ''}`);
-          continue;
+          notInstalled += 1;
+        } else {
+          incomplete = true;
+          log(`${terminal(file.file)}: installed evidence unreadable; inspect this installed plist and rerun --dry-run`);
         }
-        incomplete = true;
-        log(`${terminal(file.file)}: installed evidence unreadable; inspect this installed plist and rerun --dry-run`);
       }
     } else log(`${terminal(file.file)}: rendered`);
     if (file.pendingHostEnv.length) log(`${terminal(file.file)}: pendingHostEnv: ${file.pendingHostEnv.join(', ')}`);
   }
   if (incomplete) throw new Error('dry-run incomplete: installed evidence could not be compared');
-  log(`${files.length} plists ${options.dryRun ? 'compared' : 'rendered'}`);
+  log(`${files.length} plists ${options.dryRun ? 'compared' : 'rendered'}${notInstalled ? ` (${notInstalled} not installed)` : ''}`);
   return files;
 }
 

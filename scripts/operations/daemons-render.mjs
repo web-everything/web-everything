@@ -56,16 +56,23 @@ export function validateTable(table) {
 }
 
 /**
+ * Per-repo siblings deliberately NOT scheduled yet: ci-red-recovery-watch rebuilds and pushes branches, and its
+ * fail-open guards (rebase-drop-manifest) need hardening before it runs on other repos. Carded separately.
+ */
+export const DEFERRED_SIBLING_PASSES = ['ci-red-recovery-watch-frontierui', 'ci-red-recovery-watch-plateau-app'];
+
+/**
  * Drift check (pure): per-repo manifest passes (`<pass>-<repoKey>`) whose `<pass>-we` sibling has a table task
  * but which have no table task themselves. Returns [{ pass, label, repo }] sorted by pass; repo is the `--repo=` arg.
  */
-export function missingSiblingPasses(table, manifest = DAEMON_MANIFEST) {
-  const have = new Set(table.tasks.map(task => task.manifestPass).filter(Boolean));
+export function missingSiblingPasses(table, manifest = DAEMON_MANIFEST, deferred = DEFERRED_SIBLING_PASSES) {
+  // Coverage counts only a task that actually runs the pass (`--pass=<name>`), not bare manifestPass metadata.
+  const have = new Set(table.tasks.filter(task => task.program.includes(`--pass=${task.manifestPass}`)).map(task => task.manifestPass));
   const out = [];
   for (const pass of [...have].filter(name => name.endsWith('-we'))) {
     const base = pass.slice(0, -3);
     for (const name of Object.keys(manifest).filter(key => key.startsWith(`${base}-`) && key !== pass)) {
-      if (have.has(name) || !manifest[name].args?.some(arg => arg.startsWith('--repo='))) continue;
+      if (have.has(name) || deferred.includes(name) || !manifest[name].args?.some(arg => arg.startsWith('--repo='))) continue;
       out.push({ pass: name, label: `com.we.conveyor-pass-daemon.${name}`, repo: manifest[name].args.find(arg => arg.startsWith('--repo=')).slice(7) });
     }
   }

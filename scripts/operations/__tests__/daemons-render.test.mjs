@@ -19,12 +19,12 @@ const temp = () => { const dir = mkdtempSync(join(process.env.TMPDIR, 'daemons-r
 afterEach(() => { vi.unstubAllEnvs(); for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('daemon renderer', () => {
-  it('validates the shipped table and covers all 27 labels deterministically', () => {
+  it('validates the shipped table and covers all 25 labels deterministically', () => {
     const source = readTable();
     expect(() => validateTable(source)).not.toThrow();
     const files = renderAll(source, host);
-    expect(files).toHaveLength(27);
-    expect(new Set(files.map(file => file.label)).size).toBe(27);
+    expect(files).toHaveLength(25);
+    expect(new Set(files.map(file => file.label)).size).toBe(25);
     expect(files).toEqual(renderAll(source, host));
     for (const file of files) {
       expect(file.file).toBe(`${file.label}.plist`);
@@ -202,7 +202,7 @@ describe('daemon renderer', () => {
     const source = readTable();
     expect(missingSiblingPasses(source)).toEqual([]);
     const passes = source.tasks.map(t => t.manifestPass);
-    for (const name of ['advisory-label-sweep-frontierui', 'advisory-label-sweep-plateau-app', 'ci-red-recovery-watch-frontierui', 'ci-red-recovery-watch-plateau-app']) expect(passes).toContain(name);
+    for (const name of ['advisory-label-sweep-frontierui', 'advisory-label-sweep-plateau-app']) expect(passes).toContain(name);
     const fui = DAEMON_MANIFEST['advisory-label-sweep-frontierui'].args.filter(a => a.startsWith('--repo='));
     expect(fui).toEqual([expect.stringMatching(/frontierui$/)]);
     const gaps = missingSiblingPasses({ version: 1, tasks: source.tasks.filter(t => t.manifestPass !== 'advisory-label-sweep-frontierui') });
@@ -219,8 +219,19 @@ describe('daemon renderer', () => {
     expect(process.exitCode).toBe(1);
     process.exitCode = saved;
     expect(log.mock.calls.flat().join('\n')).toContain('not installed: com.we.conveyor-pass-daemon.advisory-label-sweep-frontierui');
+    for (const bad of [() => { throw Object.assign(new Error('x'), { code: 'EACCES' }); }, () => null]) {
+      process.exitCode = undefined;
+      log.mockClear();
+      main(['--check', `--host-home=${host.home}`], { log, installedReader: bad });
+      expect(process.exitCode).toBe(1);
+      expect(log.mock.calls.flat().join('\n')).toContain('installed evidence unreadable');
+    }
+    process.exitCode = saved;
+    const noRunPass = readTable().tasks.map(t => (t.manifestPass === 'advisory-label-sweep-frontierui' ? { ...t, program: ['{node}', '{home}/other.mjs'] } : t));
+    expect(missingSiblingPasses({ version: 1, tasks: noRunPass }).map(g => g.pass)).toEqual(['advisory-label-sweep-frontierui']);
     log.mockClear();
     main(['--dry-run', `--host-home=${host.home}`], { log, installedReader: reader });
+    expect(log.mock.calls.flat().join('\n')).toContain('pendingHostEnv:');
     expect(log.mock.calls.flat().join('\n')).toMatch(/advisory-label-sweep-frontierui\.plist: not installed: would create \(scoped to [^)]*frontierui\)/);
   });
 
@@ -228,8 +239,8 @@ describe('daemon renderer', () => {
     const log = vi.fn();
     const installedReader = vi.fn(() => ({}));
     const files = main(['--dry-run', `--host-home=${host.home}`, `--node=${host.nodePath}`], { log, installedReader });
-    expect(installedReader).toHaveBeenCalledTimes(27);
-    expect(files).toHaveLength(27);
+    expect(installedReader).toHaveBeenCalledTimes(25);
+    expect(files).toHaveLength(25);
     expect(log.mock.calls.flat().join('\n')).toContain('differences: EnvironmentVariables');
     expect(log.mock.calls.flat().join('\n')).toContain('pendingHostEnv:');
     expect(log.mock.calls.flat().join('\n')).not.toContain(host.home);
