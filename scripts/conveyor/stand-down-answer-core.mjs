@@ -219,6 +219,35 @@ export function parseNoCodeRearmReceipt(comment) {
   return match ? { answerId: match[1], head: match[2] } : null;
 }
 
+/** An explicit replacement may retry a receipted failure, never reopen a completed or newer window. */
+export function noCodeRearmWindowHonours(comments, answer, headRefOid) {
+  let beforeAt = comments.length;
+  let candidate = answer;
+  // Walk backwards through explicit replacements; every link must have its own trusted receipt.
+  // Indices strictly decrease; replay the root window once instead of rescanning it for every retry.
+  while (isNoCodeRearmAnswer(candidate) && candidate.supersedes) {
+    let priorAt = -1, prior;
+    for (let i = beforeAt - 1; i >= 0; i--) {
+      const parsed = parseOperatorAnswer(comments[i]);
+      if (parsed && answersEarlierStandDown(comments, i, parsed)) { priorAt = i; prior = parsed; break; }
+    }
+    if (priorAt < 0 || !isNoCodeRearmAnswer(prior)
+      || String(comments[priorAt].id) !== candidate.supersedes || prior.standDownId !== candidate.standDownId) break;
+    const between = comments.slice(priorAt + 1, beforeAt);
+    if (!between.some(c => {
+      const receipt = parseNoCodeRearmReceipt(c);
+      return receipt?.answerId === candidate.supersedes && receipt.head.toLowerCase() === headRefOid?.toLowerCase();
+    })) break;
+    if (between.some(c => isTrustedMarkerAuthor(c) && (
+      isTerminal(c) || /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
+      || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body)
+      || [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m))))) break;
+    candidate = prior;
+    beforeAt = priorAt;
+  }
+  return rearmWindow(comments.slice(0, beforeAt)).wouldHonour(candidate);
+}
+
 /** Pure, fail-closed admission on complete evidence supplied by either caller. */
 export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   const result = (state, why, answerId = null) => ({ state, answerId, why });
@@ -243,13 +272,13 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
   // A ruling only owns its original window. Later work/verdicts and pushes retire it for
   // ordinary planning, while the executor still refuses every result except `ready`.
-  if (ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return result('none', 'ruling superseded by a changed head', answerId);
+  if (!headRefOid.toLowerCase().startsWith(ruledHead.toLowerCase())) return result('none', 'ruling superseded by a changed head', answerId);
   const after = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
   if (after.some(c => /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
     || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) {
     return result('none', 'ruling superseded by a later fix claim or changes verdict', answerId);
   }
-  if (!rearmWindow(comments.slice(0, answerAt)).wouldHonour(answer)) return held('answer does not clear the rearm window');
+  if (!noCodeRearmWindowHonours(comments.slice(0, answerAt), answer, headRefOid)) return held('answer does not clear the rearm window');
   if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
   if (comments.some(c => parseNoCodeRearmReceipt(c)?.answerId === answerId)
     || after.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m)))) {

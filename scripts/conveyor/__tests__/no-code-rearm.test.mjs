@@ -4,6 +4,7 @@ import { buildStandDownComment } from '../stand-down.mjs';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER } from '../rearm-review.mjs';
+import { runStandDownAnswer } from '../stand-down-answer.mjs';
 
 const HEAD = 'a'.repeat(40);
 const c = (id, body, login = 'web-everything') => ({ id, body, author: { login } });
@@ -88,6 +89,84 @@ describe('no-code rearm predicate', () => {
 });
 
 describe('no-code rearm planning', () => {
+  it.each([7, 9, 39, 40])('ceremony and planner agree on an unchanged %i-character stand-down SHA', length => {
+    const body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD.slice(0, length) });
+    const pinned = c('stop', body.replace(/head=([0-9a-f]+)/, (_, sha) => `head=${sha.toUpperCase()}`));
+    const thread = [verdict, begin, pinned];
+    runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=No code owed',
+      '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: args => {
+        if (args[1] === 'view') return JSON.stringify({ comments: thread, labels: [{ name: 'review:changes' }], headRefOid: HEAD });
+        thread.push(c('answer', args.at(-1), 'chalbert'));
+        return '';
+      },
+    });
+    expect(plan(thread).dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(plan(thread, { headRefOid: HEAD.toUpperCase() }).dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(plan(thread, { headRefOid: 'b'.repeat(40) }).dispatch.map(d => d.kind)).toEqual(['fix']);
+    expect(() => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=Retry', '--actor=chalbert',
+      '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: () => JSON.stringify({ comments: thread.slice(0, -1), labels: [{ name: 'review:changes' }], headRefOid: 'b'.repeat(40) }),
+    })).toThrow(/head moved/);
+  });
+  it('explicit ceremony replaces a receipted failed attempt and spends each replacement once', () => {
+    const thread = [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))];
+    const replace = id => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=Inspected failed writer; retry once',
+      '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: args => {
+        if (args[1] === 'view') return JSON.stringify({ comments: thread, labels: [{ name: 'review:changes' }], headRefOid: HEAD });
+        thread.push(c(id, args.at(-1), 'chalbert'));
+        return '';
+      },
+    });
+    expect(plan(thread).dispatch).toEqual([]);
+    replace('replacement');
+    expect(core.parseOperatorAnswer(thread.at(-1))).toMatchObject({ supersedes: 'answer' });
+    expect(plan(thread).dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+    thread.push(c('replacement-receipt', core.NO_CODE_REARM_RECEIPT('replacement', HEAD)));
+    expect(plan(thread).dispatch).toEqual([]);
+    replace('replacement-2');
+    expect(core.parseOperatorAnswer(thread.at(-1))).toMatchObject({ supersedes: 'replacement' });
+    expect(plan(thread).dispatch).toHaveLength(1);
+    expect(plan(thread).dispatch[0]).toMatchObject({ kind: 'rearm-no-code', answerId: 'replacement-2' });
+  });
+  it('a manually relayed replacement of the latest receipted ruling clears its original window', () => {
+    const replacement = c('replacement', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat',
+      reason: 'Inspected failure', disposition: 'rearm-review', noCodeOwed: true, supersedes: 'answer' }), 'chalbert');
+    expect(plan([...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), replacement]).dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
+  });
+  it.each([
+    ['no receipt', []],
+    ['forged receipt', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD), 'outsider')]],
+    ['wrong receipt answer', [c('r', core.NO_CODE_REARM_RECEIPT('other', HEAD))]],
+    ['wrong receipt head', [c('r', core.NO_CODE_REARM_RECEIPT('answer', 'b'.repeat(40)))]],
+    ['later fix claim', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), begin]],
+    ['later changes verdict', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), verdict]],
+    ['completed rearm', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), c('done', REARM_COMMENT_MARKER)]],
+    ['completed no-change', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), c('done', NO_CHANGE_COMMENT_MARKER)]],
+    ['newer stand-down', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), c('new-stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'New question', head: HEAD }))]],
+    ['newer ordinary answer', [c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), c('ordinary', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat', reason: 'Code is owed' }), 'chalbert')]],
+  ])('a replacement cannot bypass %s', (_, between) => {
+    const replacement = c('replacement', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat',
+      reason: 'Retry', disposition: 'rearm-review', noCodeOwed: true, supersedes: 'answer' }), 'chalbert');
+    expect(predicate({ comments: [...comments, ...between, replacement] }).state).not.toBe('ready');
+  });
+  it.each([undefined, 'missing-answer'])('replacement must explicitly supersede the latest answer (%s)', supersedes => {
+    const replacement = c('replacement', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat',
+      reason: 'Retry', disposition: 'rearm-review', noCodeOwed: true, supersedes }), 'chalbert');
+    expect(predicate({ comments: [...comments, c('r', core.NO_CODE_REARM_RECEIPT('answer', HEAD)), replacement] }).state).toBe('held');
+  });
+  it('ceremony refuses an unspent ruling without posting a replacement', () => {
+    let writes = 0;
+    expect(() => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=Retry',
+      '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
+      gh: args => {
+        if (args[1] === 'view') return JSON.stringify({ comments, labels: [{ name: 'review:changes' }], headRefOid: HEAD });
+        writes++;
+      },
+    })).toThrow(/no unresolved stand-down/);
+    expect(writes).toBe(0);
+  });
   it('after a spent rearm, a later changes verdict resumes ordinary fix planning', () => {
     const thread = [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))];
     expect(plan(thread, { labels: ['review:pending'] }).dispatch.filter(d => d.kind === 'fix')).toEqual([]);

@@ -25,7 +25,7 @@ their explicit instruction by an allowlisted automation identity using its inher
 readers recognize that same posted answer, so it needs no second post under human credentials.
 A new trusted stand-down after a later fix-begin reopens the answer window for that newest stand-down,
 even on the same head. A later fix-begin alone preserves the answered rearm; its new claims still count.
-Each stand-down can be rearmed only once, and a stale target cannot clear newer claims.
+Each ruling can be executed only once, and a stale target cannot clear newer claims.
 Unrelated or nonexistent targets and other answers do not grant this exception.
 `--disposition=close-superseded` retains its existing close behavior.
 
@@ -36,7 +36,8 @@ stand-down, consumes no waiver, and cannot be replayed to clear later fix claims
 while `red-team:blocked` stands (a security fix is owed), or when labels cannot be read completely.
 Only one cap override is available per changes-verdict window. After it is spent, both a fresh answer
 and a retry superseding an ignored answer refuse before posting; a new changes verdict resets it.
-The CLI uses the reader's `rearmWindow().wouldHonour(answer)` for both paths.
+The CLI uses the reader's `rearmWindow().wouldHonour(answer)` for both paths. A failed mechanical
+attempt with a trusted receipt has the explicit replacement exception described below.
 The deterministic test `rearm-review succeeds after a cap-blocked no-code-owed answer` in
 we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-command workflow,
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.
@@ -81,3 +82,11 @@ job. The #3181 live ceremony and observation remain intentionally pending until 
 An explicit `--disposition=rearm-review --no-code-owed` ruling is executed mechanically: the conveyor takes a cross-checkout PR lock, reads the complete thread and fresh labels inside that exclusion, posts one durable receipt, and invokes the existing head-pinned rearm writer without launching a fixer. Only observed writer labels confirm success. A receipt spends the ruling even if the child crashes or cannot confirm. A later trusted changes verdict, fix-begin, or changed head retires that ruling and resumes ordinary planning; the old answer is never passed to a fixer.
 
 If the original window still carries `review:changes`, a spent ruling requires an operator to inspect the failed handoff and post a replacement answer naming the same earlier stand-down. A held ruling has an explicit exit: clear the red-team hold, restore readable evidence, answer the newer unresolved stand-down, or post a replacement answer naming a stand-down with the current head. A lock with unknown ownership requires operator inspection; proven process death permits recovery, while a live holder has no expiry-based takeover. Planner branches that `continue` on a held state must document such an operator exit; superseded windows must fall through to ordinary planning.
+
+After inspecting a receipted failure, invoke the same `--disposition=rearm-review --no-code-owed`
+ceremony with the new explicit instruction. The CLI records `supersedes` for the latest ruling without
+requiring `status:answered-waiting-fixer`. Each replacement grants one attempt and needs its own receipt
+before another replacement. The receipt must name the prior answer and the current full head. Missing or
+untrusted receipts, an intervening stand-down, fix claim, changes verdict, successful rearm or no-change
+marker, or a moved head refuse recovery. This exception does not replenish the shared writer's waiver
+or cap-override budget. Full and abbreviated stand-down SHAs use the same case-insensitive prefix match.
