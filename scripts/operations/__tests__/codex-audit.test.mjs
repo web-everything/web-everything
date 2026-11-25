@@ -296,7 +296,7 @@ describe('audit IO with injected filesystem and subprocesses', () => {
     expect(f.spawnSync.mock.calls[0][2].env).toBeUndefined();
     expect(f.fs.copyFileSync).toHaveBeenCalledWith(indexPath.startsWith('/') ? indexPath : '/repo/' + indexPath,
       '/scratch/audit-1/index');
-    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_INDEX_FILE: '/scratch/audit-1/index' });
+    expect(f.spawnSync.mock.calls[1][2].env).toEqual({ ...process.env, GIT_NO_REPLACE_OBJECTS: '1', GIT_INDEX_FILE: '/scratch/audit-1/index' });
     expect(f.fs.copyFileSync.mock.invocationCallOrder[0]).toBeLessThan(f.spawnSync.mock.invocationCallOrder[1]);
     expect(f.fs.rmSync).toHaveBeenCalledWith('/scratch/audit-1', { recursive: true, force: true });
   });
@@ -606,6 +606,7 @@ describe('debounce and delta audits', () => {
       const f = delta(records, files);
       f.deps.runCodex.mockResolvedValue(answer);
       Object.assign(f.deps, {
+        branchTip: vi.fn(() => HEAD),
         readWaivers: vi.fn(() => [{ ref, sha: PREV, ruling, findings: [...findings] }]),
         mergesBetween: vi.fn(() => false), mergeBaseOf: vi.fn(() => BASE),
       });
@@ -626,6 +627,48 @@ describe('debounce and delta audits', () => {
       delete process.env.WE_AUDIT_DELTA_WAIVED_MAX_FILES;
     });
     afterEach(() => vi.unstubAllEnvs());
+
+    it.each(['0', '1', 'invalid'])('global delta env cap %s also limits waived carry', async bound => {
+      vi.stubEnv('WE_AUDIT_DELTA_MAX_FILES', bound);
+      await refused(waived());
+    });
+    it.each([
+      { base: NEXT }, { base: NEXT, verdict: 'NOT WEAKENED' },
+      { verdict: 'NOT WEAKENED' }, { basis: NEXT }, { findings: ['docs/a.md:12 changed'] },
+      { at: 'unreadable' }, { at: undefined }, { verdict: 'UNKNOWN' },
+      { questionHash: 'unknown' }, { findings: null }, { at: '2099-01-01' },
+    ])('any conflicting or unusable record for candidate vetoes reuse: %j', async conflict => {
+      for (const records of [[waivedBasis(conflict), waivedBasis()], [waivedBasis(), waivedBasis(conflict)]]) {
+        await refused(waived({ records }));
+      }
+    });
+    it.each(['absent', 'throws', 'mismatch', 'unreadable'])('branch binding refuses %s with an explicit reason', async mode => {
+      const f = waived();
+      if (mode === 'absent') delete f.deps.branchTip;
+      else f.deps.branchTip.mockImplementation(() => {
+        if (mode === 'throws') throw new Error('denied');
+        return mode === 'mismatch' ? NEXT : null;
+      });
+      expect(await main([...args, '--explain-basis'], f.deps)).toBe(0);
+      expect(f.output.join('')).toBe('refused: branch tip differs from head\n');
+      expect(f.deps.runCodex).not.toHaveBeenCalled();
+    });
+    it.each(['docs/a.md:99 first waived issue', 'docs/a.md:12 a different issue', findings[0] + ' ', findings[0] + '\x1b[0m'])(
+      'KNOWN requires byte-equal text: %s', async text => {
+        const line = `KNOWN 1: ${text}`, f = waived({ answer: `WEAKENED\n${line}` });
+        expect(await main(args, f.deps)).toBe(1);
+        expect(f.records[0].findings).toContain(line.replace('\x1b[0m', ''));
+      });
+    it('WEAKENED without valid KNOWN appends synthetic evidence and retains delta evidence', async () => {
+      const f = waived({ answer: 'WEAKENED' });
+      expect(await main(args, f.deps)).toBe(1);
+      expect(f.records[0]).toMatchObject({ deltaVerdict: 'WEAKENED', deltaFindings: [],
+        findings: [...findings, 'delta audit reported WEAKENED without a waived finding to attribute it to'] });
+    });
+    it.each(['package.json', 'package-lock.json', 'vitest.config.ts', 'vitest.config.mjs',
+      'scripts/check-standards.mjs', 'scripts/lib/related-test-selection.mjs',
+      'scripts/operations/urgent-verify-marker.mjs', 'scripts/verify-lane.mjs', 'scripts/verify-lane-io.mjs'])(
+      'merge protection refuses build or verification path %s', async file => { await refused(waived({ files: [file] })); });
 
     it('selects a waived full basis, numbers its findings and records the exact canonical binding', async () => {
       const f = waived();
@@ -671,7 +714,7 @@ describe('debounce and delta audits', () => {
         expect(f.deps.appendRecord).not.toHaveBeenCalled();
       });
     it.each([
-      ['only KNOWN findings', ['KNOWN 1: docs/a.md:99 same first issue', 'KNOWN 2: docs/b.md:80 same second issue'], []],
+      ['only KNOWN findings', findings.map((f, i) => `KNOWN ${i + 1}: ${f}`), []],
       ['a new finding', ['docs/c.md:9 new issue'], ['docs/c.md:9 new issue']],
       ['KNOWN with a different cited file', ['KNOWN 1: docs/c.md:9 different issue'], ['KNOWN 1: docs/c.md:9 different issue']],
       ['KNOWN with out-of-range index', ['KNOWN 3: docs/a.md:9 issue'], ['KNOWN 3: docs/a.md:9 issue']],
@@ -682,7 +725,7 @@ describe('debounce and delta audits', () => {
       const f = waived({ answer: ['WEAKENED', ...deltaFindings].join('\n') });
       expect(await main(args, f.deps)).toBe(1);
       expect(f.records[0]).toMatchObject({ basis: PREV, verdict: 'WEAKENED', deltaVerdict: 'WEAKENED',
-        deltaFindings, findings: [...findings, ...added] });
+        deltaFindings, findings: [...findings, ...added, ...(deltaFindings.some(f => findings.some((w, i) => f === `KNOWN ${i + 1}: ${w}`)) ? [] : ['delta audit reported WEAKENED without a waived finding to attribute it to'])] });
       expect(JSON.stringify(f.records[0].findings) === JSON.stringify(findings)).toBe(added.length === 0);
     });
     it.each([
@@ -795,11 +838,12 @@ describe('debounce and delta audits', () => {
     expect(b.records).toHaveLength(1);
     expect(b.records[0].head).toBe(NEXT);
   });
-  it('--now runs immediately without branchTip or sleep', async () => {
+  it('--now skips debounce but still checks the branch for waived eligibility', async () => {
     const f = fixture();
     Object.assign(f.deps, { branchTip: vi.fn(), sleep: vi.fn(), nowMs: () => time });
     expect(await main([...ARGS, '--now', '--branch=lane/test'], f.deps)).toBe(0);
-    expect(f.deps.branchTip).not.toHaveBeenCalled();
+    expect(f.deps.branchTip).toHaveBeenCalledOnce();
+    expect(f.deps.branchTip).toHaveBeenCalledWith('lane/test');
     expect(f.deps.sleep).not.toHaveBeenCalled();
   });
   it('an undetermined branch runs immediately', async () => {
@@ -915,7 +959,7 @@ describe('debounce and delta real adapters', () => {
     expect(f.deps.isAncestor(HEAD, HEAD)).toBe(false);
     f.spawnSync.mockReturnValue({ status: 0, stdout: 'docs/a.md\0docs/b.md\0' });
     expect(f.deps.diffFiles(BASE, HEAD)).toEqual(['docs/a.md', 'docs/b.md']);
-    expect(f.spawnSync.mock.calls.at(-1)[1]).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', `${BASE}..${HEAD}`, '--']);
+    expect(f.spawnSync.mock.calls.at(-1)[1]).toEqual(['diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--name-only', '--no-renames', '-z', `${BASE}..${HEAD}`, '--']);
     f.spawnSync.mockReturnValue({ status: 128, stdout: '' });
     expect(() => f.deps.isAncestor(BASE, HEAD)).toThrow();
   });
@@ -1038,6 +1082,17 @@ describe('waived audit real evidence adapters', () => {
       ? JSON.stringify(entry) + '\ninvalid\n' : read(path));
     expect(() => f.deps.readWaivers(entry.ref)).toThrow();
   });
+  it('diff evidence includes submodules and auditor and fingerprint ignore replacement objects', () => {
+    const execFileSync = vi.fn(() => Buffer.from(BASE + '\n'));
+    const f = adapter(undefined, { execFileSync });
+    f.deps.diffFiles(BASE, HEAD);
+    expect(f.spawnSync.mock.calls.at(-1)[1]).toContain('--ignore-submodules=none');
+    f.deps.runCodex('prompt');
+    expect(f.spawnSync.mock.calls.at(-1)[2].env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+    f.deps.fingerprint(BASE, HEAD);
+    expect(execFileSync).toHaveBeenCalled();
+    for (const [, , options] of execFileSync.mock.calls) expect(options.env.GIT_NO_REPLACE_OBJECTS).toBe('1');
+  });
   it('pins local merge and diff evidence to bounded Git calls without replacements or external transforms', () => {
     const f = adapter();
     f.spawnSync.mockReturnValue({ status: 0, stdout: '' });
@@ -1061,7 +1116,11 @@ describe('waived audit real evidence adapters', () => {
 
 describe('waived bound policy cascade', () => {
   const resolve = (audit, extra = {}) => resolveWaivedMaxFiles({ readFile: () => JSON.stringify({ audit }),
-    platform: null, env: {}, log: () => {}, ...extra });
+    platform: {}, env: {}, log: () => {}, ...extra });
+  it.each([null, [], 'bad', 1, false])('malformed platform or tool audit %j disables waived carry', audit => {
+    expect(resolve({}, { platform: audit })).toBe(0);
+    expect(resolve(audit)).toBe(0);
+  });
   it('defaults to 40 and logs tool/platform/environment provenance', () => {
     expect(resolve({})).toBe(40);
     const log = vi.fn();

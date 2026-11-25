@@ -2,7 +2,7 @@
 import { readStore, storePath, withdrawnRevocations } from './ruled-weakened-store.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
-import { spawnSync as realSpawnSync } from 'node:child_process';
+import { execFileSync as realExecFileSync, spawnSync as realSpawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
@@ -49,7 +49,7 @@ function readReport(stdout) {
  * Run the op from a trusted checkout's script path against the audited repo as cwd.
  */
 export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
-  scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync,
+  scratchRoot = tmpdir(), fs = realFs, spawnSync = realSpawnSync, execFileSync = realExecFileSync,
   launcherPath = fileURLToPath(new NodeURL('../codex-direct-task.mjs', import.meta.url)) } = {}) {
   const run = (command, args, timeout, env, maxBuffer = 8 * 1024 * 1024) => {
     const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer, timeout, ...(env ? { env } : {}) });
@@ -101,9 +101,11 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error('ancestry unavailable');
       return result.status === 0;
     },
-    diffFiles: (basis, head) => run('git', ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000, gitEnv)
+    diffFiles: (basis, head) => run('git', ['diff', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', '--name-only', '--no-renames', '-z', `${basis}..${head}`, '--'], 30_000, gitEnv)
       .split('\0').filter(Boolean),
-    fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
+    fingerprint: (base, head) => netDiffFingerprint(cwd, base, head, {
+      exec: (command, args, options) => execFileSync(command, args, { ...options, env: gitEnv }),
+    }),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
     runCodex(prompt) {
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
@@ -119,7 +121,7 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
         fs.writeFileSync(taskFile, prompt, { encoding: 'utf8', mode: 0o600 });
         const report = readReport(run(process.execPath, [launcherPath, '--review', '--json',
           '--gate=none', `--task-file=${taskFile}`, `--dir=${cwd}`], 30 * 60_000,
-          { ...process.env, GIT_INDEX_FILE: scratchIndex }, 32 * 1024 * 1024));
+          { ...gitEnv, GIT_INDEX_FILE: scratchIndex }, 32 * 1024 * 1024));
         if (!report) throw new Error('codex report missing');
         if (report.timedOut !== false) throw new Error('codex timed out');
         if (report.exitCode !== 0) throw new Error(`codex exit code ${report.exitCode}`);
