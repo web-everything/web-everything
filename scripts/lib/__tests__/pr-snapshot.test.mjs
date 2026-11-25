@@ -7,7 +7,7 @@
  *   every wired pass reader actually reads the snapshot instead of calling `gh`.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, chmodSync, existsSync, readFileSync, utimesSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, chmodSync, symlinkSync, existsSync, readFileSync, utimesSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -18,7 +18,7 @@ import {
 } from '../pr-snapshot.mjs';
 import { PrListUnreadableError } from '../pr-list-paged.mjs';
 import { ghThrottleLogPath } from '../gh-throttle.mjs';
-import { prSnapshotEnabled, markPrSnapshotDirty, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
+import { prSnapshotEnabled, markPrSnapshotDirty, latestDirtyMs, repoFromGhArgs, snapshotPath, PR_SNAPSHOT_VERSION } from '../pr-snapshot-store.mjs';
 
 const REPO = 'web-everything/web-everything';
 const PRS = Array.from({ length: 14 }, (_, i) => ({
@@ -53,9 +53,9 @@ function fakeExec(prs = PRS) {
       return JSON.stringify({ data: { repository: { pullRequests: { nodes, totalCount: prs.length,
         pageInfo: { hasNextPage: end < prs.length, endCursor: String(end) } } } } });
     }
-    expect(argv).toEqual(['pr', 'view', argv[2], '--repo', REPO, '--json', 'comments,body,files']);
-    const { comments, body, files } = prs.find(p => p.number === Number(argv[2]));
-    return JSON.stringify({ comments, body, files });
+    expect(argv).toEqual(['pr', 'view', argv[2], '--repo', REPO, '--json', 'comments,body,files,headRefOid']);
+    const { comments, body, files, headRefOid } = prs.find(p => p.number === Number(argv[2]));
+    return JSON.stringify({ comments, body, files, headRefOid });
   };
   return { exec, calls };
 }
@@ -115,7 +115,7 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
         if (args[1] === 'graphql') return JSON.stringify({ data: { repository: { pullRequests: {
           nodes, totalCount: nodes.length, pageInfo: { hasNextPage: false, endCursor: null }
         } } } });
-        if (args[0] === 'pr') return JSON.stringify({ comments: [], body: '', files: [] });
+        if (args[0] === 'pr') return JSON.stringify({ comments: [], body: '', files: [], headRefOid: 'head-' + (Number(args[2]) - 1) });
         lookups++;
         return JSON.stringify({ app: { id: 5037855, slug: 'web-everything' } });
       };
@@ -429,9 +429,35 @@ it('cache-only planner reads never wait for or initiate a snapshot refresh', () 
 });
 
 
-it('snapshot v2 projects check evidence metadata without losing completeness', () => {
-  expect(PR_SNAPSHOT_VERSION).toBe(2);
+it('snapshot v3 projects check evidence metadata without losing completeness', () => {
+  expect(PR_SNAPSHOT_VERSION).toBe(3); // v3 invalidates v2 snapshots whose heavy entries were stamped with an unverified head
   expect(SNAPSHOT_FIELDS).toEqual(expect.arrayContaining(['rowsHead', 'rowsComplete']));
   const pr = { number: 1, rowsHead: 'a'.repeat(40), rowsComplete: true };
   expect(projectPrs([pr], SNAPSHOT_FIELDS)).toEqual([pr]);
+});
+
+describe('unreadable dirty marker', () => {
+  it('unreadable dirty marker forces a refresh', () => {
+    const { exec, calls } = fakeExec();
+    readSharedOpenPrs(opts({ fields: 'number', exec }));
+    // A self-referencing symlink makes statSync fail with ELOOP (not ENOENT): the marker is unreadable.
+    const marker = join(dir, 'web-everything__web-everything.dirty');
+    symlinkSync(marker, marker);
+    clock += 1_000;
+    expect(latestDirtyMs(dir, REPO)).toBe(Infinity);
+    expect(isServable({ fields: ['number'], fetchedAtMs: clock - 1_000, prs: [] }, { fields: ['number'], nowMs: clock, ttlMs: 75_000, dirtyMs: Infinity })).toBe(false);
+    // Integration: inside TTL and inside the dirty floor, the next read still refreshes instead of serving.
+    readSharedOpenPrs(opts({ fields: 'number', exec }));
+    expect(pageCalls(calls)).toHaveLength(2);
+  });
+
+  it('an unreadable dirty marker also defeats the stale-ok allowance', () => {
+    const { exec, calls } = fakeExec();
+    const env = { VITEST: '1', WE_PR_SNAPSHOT_STALE_OK_MS: '900000' };
+    readSharedOpenPrs(opts({ fields: 'number', exec, env }));
+    symlinkSync(join(dir, 'web-everything__web-everything.dirty'), join(dir, 'web-everything__web-everything.dirty'));
+    clock += 80_000; // past the TTL, inside the stale-ok window: normally served stale
+    readSharedOpenPrs(opts({ fields: 'number', exec, env }));
+    expect(pageCalls(calls)).toHaveLength(2);
+  });
 });

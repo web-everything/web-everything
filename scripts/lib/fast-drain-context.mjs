@@ -153,6 +153,20 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     return Number.isFinite(age) && age >= 0 && age < ttlSec * 1000;
   };
   if (ttlSec === 0) throw new Error('pass snapshot disabled — use live listing or enable snapshot TTL');
+  // The evidence is as old as its oldest source rows: a snapshot-sourced array carries fetchedAtMs; an
+  // invalid one counts as stale (NaN fails the freshness check). Arrays without it keep the read time.
+  // When every source is timestamped its own age is the evidence age (a refreshed replacement supersedes
+  // the older pass time); any untimestamped source keeps the caller's floor in the bound.
+  const oldestSource = (sources, floor) => {
+    let oldest = Infinity, unstamped = false;
+    for (const rows of sources.values()) {
+      if (!Object.hasOwn(rows, 'fetchedAtMs')) { unstamped = true; continue; }
+      // Future-dated or non-finite source time is stale: never clamp it to the observation time.
+      if (!Number.isFinite(rows.fetchedAtMs) || rows.fetchedAtMs > now()) return NaN;
+      oldest = Math.min(oldest, rows.fetchedAtMs);
+    }
+    return unstamped || oldest === Infinity ? Math.min(oldest, floor) : oldest;
+  };
   const readSources = () => new Map(repos.map(repo => {
     const rows = readSnapshot(repo);
     if (!Array.isArray(rows)) throw new Error('snapshot unavailable/disabled/stale/dirty — retry next pass');
@@ -191,15 +205,17 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
       throw new Error('pass main changed while reading — use live listing or retry next pass');
     }
-    if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
-    // Keep the current cache-only rows: a refreshed source cannot validate older pass evidence.
-    return readSources();
+    // The evidence is as old as the FINAL source rows actually used (a refreshed replacement is judged by its own age).
+    const sources = readSources();
+    const evidenceAt = oldestSource(sources, writtenAt);
+    if (!fresh(evidenceAt)) throw new Error('pass inventory expired while reading (source rows too old) — retry next pass');
+    return { sources, writtenAt: evidenceAt };
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
   const revalidateMembership = async base => {
     const inventories = await readInventories();
-    const snapshots = await revalidateAfterMembership(base.writtenAt);
+    const { sources: snapshots } = await revalidateAfterMembership(base.writtenAt);
     return { ...base, inventories, snapshots };
   };
   const hit = cached();
@@ -209,10 +225,10 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
     heads = await readHeads();
     const hit = cached();
     if (hit) return revalidateMembership(hit);
-    const writtenAt = observedAt; // Include main-read/lock wait time in the freshness bound.
-    readSources();
+    readSources(); // fail early when no source is available
+    // Main-read/lock wait time bounds the pass; the persisted time is the final source rows' own age.
     const inventories = Object.fromEntries(await readInventories());
-    const snapshots = await revalidateAfterMembership(writtenAt);
+    const { sources: snapshots, writtenAt } = await revalidateAfterMembership(observedAt);
     if (typeof stillHeld !== 'function' || !stillHeld()) throw new Error('pass snapshot lock unavailable (lock-lost) — retry next pass');
     write(path, { v: 1, repo: targetRepo, repos, heads, inventories, snapshots: Object.fromEntries(snapshots), writtenAt,
       rows: snapshots.get(targetRepo), defaultBranch: heads[targetRepo].defaultBranch });

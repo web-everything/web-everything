@@ -20,7 +20,8 @@ import { existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSyn
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-export const PR_SNAPSHOT_VERSION = 2;
+// v3: heavy entries carry head-verified provenance; older snapshots stamped the listing head unverified.
+export const PR_SNAPSHOT_VERSION = 3;
 export const PR_SNAPSHOT_DIR_ENV = 'WE_PR_SNAPSHOT_DIR';
 export const PR_SNAPSHOT_DISABLE_ENV = 'WE_PR_SNAPSHOT';
 const ALL_DIRTY = '_all';
@@ -80,7 +81,10 @@ export function latestDirtyMs(dir, repo) {
   const key = snapshotKey(repo);
   for (const k of [key, ALL_DIRTY]) {
     if (!k) continue;
-    try { latest = Math.max(latest, statSync(dirtyPath(dir, k)).mtimeMs); } catch { /* no marker */ }
+    try { latest = Math.max(latest, statSync(dirtyPath(dir, k)).mtimeMs); } catch (e) {
+      // Only a genuinely absent marker means "no marker"; an unreadable one is treated as dirty (fail closed).
+      if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') return Infinity;
+    }
   }
   return latest;
 }

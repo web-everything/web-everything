@@ -112,6 +112,8 @@ export function sampleContextDeclared(env = process.env) { return sampleDeclared
 function smokeProjection(snap, fields, env) {
   const rows = smokeProjectionRows(snap, fields, env);
   if (!Array.isArray(rows)) return rows;
+  // Carry the snapshot's own fetch time so consumers bound freshness by the data's age, not the read time.
+  Object.defineProperty(rows, 'fetchedAtMs', { value: snap.fetchedAtMs, configurable: true });
   const declared = sampleDeclared(env);
   if (declared && rows.length < (snap?.prs?.length ?? 0)) Object.defineProperty(rows, 'sampled', { value: true });
   if (snap?.truncated === true || (!declared && Array.isArray(snap?.prs) && rows.length < snap.prs.length)) {
@@ -169,6 +171,7 @@ export function isServable(snap, { fields, nowMs, ttlMs, dirtyMs = 0 }) {
   if (!fields.every((f) => have.has(f))) return false;
   const age = nowMs - snap.fetchedAtMs;
   if (age < 0 || age >= ttlMs) return false;
+  if (dirtyMs === Infinity) return false; // unreadable dirty marker: never serve
   if (dirtyMs > snap.fetchedAtMs && age >= DIRTY_REFRESH_FLOOR_MS) return false;
   return true;
 }
@@ -253,7 +256,7 @@ export function readSharedOpenPrs({
   if (exec === undefined) exec = execFileSyncThrottled;
   const servable = () => {
     const snap = readSnapshotFile(path);
-    if (staleOkMs && !cacheOnly && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
+    if (staleOkMs && !cacheOnly && latestDirtyMs(root, repo) !== Infinity && isServable(snap, { fields: want, nowMs: now(), ttlMs: staleOkMs })) {
       if (now() - snap.fetchedAtMs >= ttl && !injectedExec
         && (spawnRefresh || (!isUnderTest(env) && !isUnderTest())) && !refreshStarted.has(snapshotKey(repo))) {
         refreshStarted.add(snapshotKey(repo));

@@ -26,6 +26,8 @@ const failure = (stderr) => Object.assign(new Error('gh failed'), { stderr: Buff
 const timeout = 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)';
 const heavy = { comments: [{ body: 'hello' }], body: 'description', files: [{ path: 'a.js' }] };
 const row = number => mapGraphqlPr(node(number));
+// A well-formed `gh pr view` response names the head it was read at; mocks echo the requested PR's head.
+const hv = (args, extra = {}) => JSON.stringify({ ...heavy, ...extra, headRefOid: `head-${args[2]}` });
 const cached = (r, extra = {}) => ({ updatedAt: r.updatedAt, headRefOid: r.headRefOid,
   fetchedAtMs: 9500, ...heavy, ...extra });
 const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -483,11 +485,11 @@ describe('heavy hydration', () => {
     const before = structuredClone(rows);
     const cache = { 1: cached(rows[0], { updatedAt: 'old' }), 2: cached(rows[1], { fetchedAtMs: 8000 }),
       4: cached(rows[3], { headRefOid: 'old' }) };
-    const exec = vi.fn(() => JSON.stringify(heavy));
+    const exec = vi.fn((_c, args) => hv(args));
     const result = hydrateHeavyFields({ repo, rows, exec, cache, nowMs: 10000, maxAgeMs: 1000 });
     expect(result).toMatchObject({ fetched: 4, reused: 0, rows: rows.map(r => ({ ...r, ...heavy })) });
     for (const [i, call] of exec.mock.calls.entries()) {
-      expect(call).toEqual(['gh', ['pr', 'view', String(i + 1), '--repo', repo, '--json', 'comments,body,files'], opts]);
+      expect(call).toEqual(['gh', ['pr', 'view', String(i + 1), '--repo', repo, '--json', 'comments,body,files,headRefOid'], opts]);
       expect(result.cache[i + 1]).toEqual(cached(rows[i], { fetchedAtMs: 10000 }));
     }
     expect(rows).toEqual(before);
@@ -587,19 +589,40 @@ describe('paged hydrated listing', () => {
     delete cache[2].files;
     const before = structuredClone(cache);
     const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2))
-      .mockReturnValueOnce(JSON.stringify(heavy));
+      .mockImplementationOnce((_c, args) => hv(args));
     const result = list(exec, { cache, needsHeavy: r => r.number === 1, execOpts: { timeout: 123 } });
     expect(result.rows).toEqual([{ ...row(1), body: heavy.body, files: heavy.files }, row(2)]);
     expect(result).toMatchObject({ hydrated: 1, reused: 0 });
-    expect(exec.mock.calls[1]).toEqual(['gh', ['pr', 'view', '1', '--repo', repo, '--json', 'body,files'],
+    expect(exec.mock.calls[1]).toEqual(['gh', ['pr', 'view', '1', '--repo', repo, '--json', 'body,files,headRefOid'],
       { ...opts, timeout: 123 }]);
     expect(Object.keys(result.cache)).toEqual(['1', '2']);
     expect(result.cache[2]).toEqual(cache[2]);
     expect(cache).toEqual(before);
   });
 
+  it('a seed is aged by its own fetchedAtMs through the same predicate as the cache, never renewed', () => {
+    for (const fetchedAtMs of [1, 20000, undefined, NaN]) { // old, future, missing, invalid
+      const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1)).mockReturnValueOnce(JSON.stringify({ ...heavy, headRefOid: row(1).headRefOid }));
+      const result = list(exec, { seed: [{ ...row(1), ...heavy, fetchedAtMs }] });
+      expect(result, String(fetchedAtMs)).toMatchObject({ hydrated: 1, reused: 0 });
+    }
+  });
+
+  it('future-dated or non-finite heavy cache evidence is never fresh', () => {
+    const r = row(1);
+    for (const fetchedAtMs of [20000, NaN, undefined, Infinity]) {
+      expect(heavyIsFresh(cached(r, { fetchedAtMs }), r, { nowMs: 10000, maxAgeMs: 1000 })).toBeFalsy();
+      expect(heavyIsFresh(cached(r, { fetchedAtMs }), r, { nowMs: 10000, maxAgeMs: 0 })).toBeFalsy();
+    }
+  });
+
+  it('a hydration response without headRefOid is refused', () => {
+    expect(() => hydrateHeavyFields({ repo, rows: [row(1)], exec: () => JSON.stringify(heavy), nowMs: 10000, maxAgeMs: 1000 }))
+      .toThrow(PrListUnreadableError);
+  });
+
   it('reuses matching snapshot seeds without view calls', () => {
-    const seed = [{ ...row(1), ...heavy }, { ...row(2), ...heavy }];
+    const seed = [{ ...row(1), ...heavy, fetchedAtMs: 10000 }, { ...row(2), ...heavy, fetchedAtMs: 10000 }];
     const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2));
     const result = list(exec, { seed });
     expect(result).toMatchObject({ hydrated: 0, reused: 2 });
@@ -614,13 +637,13 @@ describe('paged hydrated listing', () => {
     const seedRow = { ...row(1), ...heavy, ...extra };
     if (extra.files === undefined && Object.hasOwn(extra, 'files')) delete seedRow.files;
     const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1))
-      .mockReturnValueOnce(JSON.stringify(heavy));
+      .mockImplementationOnce((_c, args) => hv(args));
     expect(list(exec, { seed: [seedRow] })).toMatchObject({ hydrated: 1, reused: 0 });
     expect(exec).toHaveBeenCalledTimes(2);
   });
 
   it('prefers a fresh cache over seeds and replaces stale or incomplete entries', () => {
-    const seed = [{ ...row(1), ...heavy }];
+    const seed = [{ ...row(1), ...heavy, fetchedAtMs: 9500 }];
     for (const entry of [cached(row(1), { fetchedAtMs: 8000 }), cached(row(1), { headRefOid: 'old' }),
       { updatedAt: row(1).updatedAt, headRefOid: row(1).headRefOid, fetchedAtMs: 9500 }]) {
       const exec = vi.fn().mockReturnValueOnce(page([node(1)], false, null, 1));
@@ -645,7 +668,7 @@ describe('paged hydrated listing', () => {
     const cache = { 99: cached(row(99)) };
     const before = structuredClone(cache);
     const exec = vi.fn().mockReturnValueOnce(page([node(1), node(2)], false, null, 2))
-      .mockReturnValueOnce(JSON.stringify(heavy)).mockImplementation(() => { throw failure(timeout); });
+      .mockImplementationOnce((_c, args) => hv(args)).mockImplementation(() => { throw failure(timeout); });
     let error;
     try { list(exec, { cache }); } catch (e) { error = e; }
     expect(error).toBeInstanceOf(PrListUnreadableError);
@@ -734,7 +757,7 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
   const recorded = [page([node(1), node(2)], true, 'next', 4), page([node(3), node(4)], false, null, 4)];
   const options = { repo, paging, heavyFields: ['body', 'files'], nowMs: 10000 };
   const reader = () => vi.fn((_cmd, args) => args[0] === 'api'
-    ? recorded[args[3].includes('after:') ? 1 : 0] : JSON.stringify(heavy));
+    ? recorded[args[3].includes('after:') ? 1 : 0] : hv(args));
 
   it.each(['cold', 'seed', 'cache', 'stale', 'selected'])('listing hydrates heavy fields with bounded concurrency: sync equivalence (%s)', async mode => {
     const cache = { 99: cached(row(99)) };
@@ -774,7 +797,7 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
         const number = Number(args[2]);
         await new Promise(resolve => setTimeout(resolve, number === 1 ? 20 : 0));
         completed.push(number); active--;
-        return { stdout: JSON.stringify({ ...heavy, body: String(number) }) };
+        return { stdout: hv(args, { body: String(number) }) };
       } });
     expect(peak).toBe(6);
     expect(active).toBe(0);
@@ -808,7 +831,7 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
               }
               await outstandingReads;
             } else await Promise.resolve();
-            return { stdout: JSON.stringify(heavy) };
+            return { stdout: hv(args) };
           } finally { active--; }
         } });
     }, { repo, backoffMs: [0], sleep: () => {}, persist: false });
@@ -838,7 +861,7 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
     const published = vi.fn();
     const result = listOpenPrsPagedHydratedCompleteAsync({ ...options, cache, exec: reader(),
       execAsync: async (_cmd, args) => {
-        if (args[2] !== '2') return { stdout: JSON.stringify(heavy) };
+        if (args[2] !== '2') return { stdout: hv(args) };
         if (mode === 'failed') throw failure(timeout);
         return { stdout: mode === 'missing' ? JSON.stringify({ body: 'no files' })
           : mode === 'deferred' ? JSON.stringify({ outcome: 'deferred-low-budget' }) : '{' };
@@ -851,7 +874,7 @@ describe('listing hydrates heavy fields with bounded concurrency', () => {
 
   it('listing hydrates heavy fields with bounded concurrency: incomplete inventory still fails closed', async () => {
     await expect(listOpenPrsPagedHydratedCompleteAsync({ ...options,
-      exec: () => page([node(1)], false, null, 2), execAsync: async () => ({ stdout: JSON.stringify(heavy) })
+      exec: () => page([node(1)], false, null, 2), execAsync: async (_c, args) => ({ stdout: hv(args) })
     })).rejects.toBeInstanceOf(PrListUnreadableError);
   });
 });
@@ -872,4 +895,17 @@ it('listing hydrates heavy fields with bounded concurrency: async list retry pre
   const unreadable = vi.fn().mockRejectedValue(new PrListUnreadableError({ repo, stage: 'hydrate', number: 2, cause: new Error('missing data') }));
   await expect(withListRetryAsync(unreadable, options)).rejects.toBeInstanceOf(PrListUnreadableError);
   expect(unreadable).toHaveBeenCalledTimes(1);
+});
+
+describe('hydrated head provenance', () => {
+  it('hydrated data for a different head is refused, not stamped with the listing head', () => {
+    const r = row(1);
+    const stale = JSON.stringify({ ...heavy, headRefOid: 'f'.repeat(40) });
+    expect(() => hydrateHeavyFields({ repo, rows: [r], exec: () => stale, nowMs: 10000, maxAgeMs: 1000 }))
+      .toThrow(PrListUnreadableError);
+    const same = JSON.stringify({ ...heavy, headRefOid: r.headRefOid });
+    const ok = hydrateHeavyFields({ repo, rows: [r], exec: () => same, nowMs: 10000, maxAgeMs: 1000 });
+    expect(ok.cache[1].headRefOid).toBe(r.headRefOid);
+    expect(ok.cache[1]).not.toHaveProperty('headRefOid', 'f'.repeat(40));
+  });
 });
