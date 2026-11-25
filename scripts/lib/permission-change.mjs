@@ -77,6 +77,7 @@ const MAX_WORKFLOW_LINE_CHARS = 4000;
  * tokens actually present in `scripts/`, so a new sandbox-bearing script forces an update here.
  */
 export const SANDBOX_BEARING_FILES = [
+  'scripts/lib/agent-launch.mjs',
   'scripts/bootstrap-session.mjs',
   'scripts/codex-direct-task.mjs',
   'scripts/conveyor/health-investigate-dispatch.mjs',
