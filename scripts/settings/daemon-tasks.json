@@ -165,6 +165,106 @@
       "manifestPass": "ci-red-recovery-watch-we"
     },
     {
+      "label": "com.we.conveyor-pass-daemon.advisory-label-sweep-frontierui",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=advisory-label-sweep-frontierui"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-frontierui.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-frontierui.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "advisory-label-sweep-frontierui"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.advisory-label-sweep-plateau-app",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=advisory-label-sweep-plateau-app"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-plateau-app.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.advisory-label-sweep-plateau-app.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "advisory-label-sweep-plateau-app"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-frontierui",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=ci-red-recovery-watch-frontierui"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-frontierui.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-frontierui.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "ci-red-recovery-watch-frontierui"
+    },
+    {
+      "label": "com.we.conveyor-pass-daemon.ci-red-recovery-watch-plateau-app",
+      "program": [
+        "{node}",
+        "{home}/workspace/wev-pass-readers/skills-src/conveyor/pass-daemon.mjs",
+        "--pass=ci-red-recovery-watch-plateau-app"
+      ],
+      "workingDir": "{home}/workspace/wev-pass-readers",
+      "runAtLoad": true,
+      "keepAlive": true,
+      "throttleInterval": 10,
+      "stdout": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-plateau-app.log",
+      "stderr": "{home}/workspace/wev-pass-readers/.conveyor/pass-daemon.ci-red-recovery-watch-plateau-app.log",
+      "env": {
+        "PASS_DAEMON_SELF_SYNC": "1",
+        "WE_DAEMON_RESTART_MIN_INTERVAL_MS": "120000"
+      },
+      "hostEnvKeys": [
+        "WE_GITHUB_APP_ID",
+        "WE_GITHUB_APP_INSTALLATION_ID",
+        "WE_GITHUB_APP_KEY_DIR",
+        "WE_GITHUB_APP_PRIVATE_KEY_PATH"
+      ],
+      "manifestPass": "ci-red-recovery-watch-plateau-app"
+    },
+    {
       "label": "com.we.conveyor-pass-daemon.load-flake-reverify",
       "program": [
         "{node}",

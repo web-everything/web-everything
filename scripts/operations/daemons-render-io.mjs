@@ -4,10 +4,11 @@
  */
 import { pinDeveloperDir } from '../lib/lane-git-hardening.mjs';
 import { execFileSync } from 'node:child_process';
-import { constants, closeSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { constants, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { diffPlists, renderAll, validateTable } from './daemons-render.mjs';
+import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
+import { diffPlists, missingSiblingPasses, renderAll, validateTable } from './daemons-render.mjs';
 
 const TABLE = join(dirname(fileURLToPath(import.meta.url)), '../settings/daemon-tasks.json');
 
@@ -58,9 +59,16 @@ export function writeOutDir(out, files, { home = process.env.HOME } = {}) {
 export function readInstalled(label, { home = process.env.HOME, exec = execFileSync } = {}) {
   filename(label);
   if (!home) throw new Error('host home is required');
-  return JSON.parse(exec('plutil', ['-convert', 'json', '-o', '-', join(home, 'Library/LaunchAgents', `${label}.plist`)], {
-    encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
-  }));
+  const path = join(home, 'Library/LaunchAgents', `${label}.plist`);
+  try {
+    return JSON.parse(exec('plutil', ['-convert', 'json', '-o', '-', path], {
+      encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024,
+    }));
+  } catch (error) {
+    // A plist that is simply absent is "not installed", distinct from unreadable evidence.
+    if (!existsSync(path)) throw Object.assign(new Error('plist not installed'), { code: 'ENOENT' });
+    throw error;
+  }
 }
 
 const terminal = value => value.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
@@ -70,9 +78,26 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
   const options = {};
   for (const arg of argv) {
     if (arg === '--dry-run' && !options.dryRun) { options.dryRun = true; continue; }
+    if (arg === '--check' && !options.check) { options.check = true; continue; }
     const match = /^--(out|host-home|node)=(.+)$/.exec(arg);
     if (!match || Object.hasOwn(options, match[1])) throw new Error('unknown, duplicate or incomplete option; use --out=<dir> or --dry-run, with --host-home=<dir> and --node=<path>');
     options[match[1]] = match[2];
+  }
+  if (options.check) {
+    // Read-only drift check: manifest per-repo passes missing from the table, and table jobs with no installed plist.
+    if (options.out || options.dryRun) throw new Error('--check cannot combine with --out or --dry-run');
+    const checkHome = options['host-home'] ?? process.env.HOME;
+    if (!checkHome || !isAbsolute(checkHome)) throw new Error('host home must be an absolute path');
+    const table = readTable();
+    const gaps = missingSiblingPasses(table);
+    for (const gap of gaps) log(`missing from table: ${terminal(gap.pass)} (repo ${terminal(gap.repo)})`);
+    const notInstalled = table.tasks.filter((task) => {
+      try { installedReader(task.label, { home: checkHome }); return false; } catch (error) { return error.code === 'ENOENT'; }
+    });
+    for (const task of notInstalled) log(`not installed: ${terminal(task.label)}${task.manifestPass ? ` (pass ${terminal(task.manifestPass)})` : ''}`);
+    log(`${gaps.length} missing from table, ${notInstalled.length} not installed`);
+    if (gaps.length || notInstalled.length) process.exitCode = 1;
+    return [];
   }
   if (Boolean(options.out) === Boolean(options.dryRun)) throw new Error('choose exactly one of --out=<dir> or --dry-run');
   const home = options['host-home'] ?? process.env.HOME;
@@ -87,7 +112,12 @@ export function main(argv, { log = console.log, installedReader = readInstalled 
       try {
         const differences = diffPlists(file.xml, installedReader(file.label, { home }));
         log(`${terminal(file.file)}: differences: ${differences.map(terminal).join(', ') || 'none'}`);
-      } catch {
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          const repo = (DAEMON_MANIFEST[file.manifestPass]?.args ?? []).find(arg => arg.startsWith('--repo='));
+          log(`${terminal(file.file)}: not installed: would create${repo ? ` (scoped to ${terminal(repo.slice(7))})` : ''}`);
+          continue;
+        }
         incomplete = true;
         log(`${terminal(file.file)}: installed evidence unreadable; inspect this installed plist and rerun --dry-run`);
       }

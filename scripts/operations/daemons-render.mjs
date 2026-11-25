@@ -55,7 +55,24 @@ export function validateTable(table) {
   return table;
 }
 
-const escapeXml = value => value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]);
+/**
+ * Drift check (pure): per-repo manifest passes (`<pass>-<repoKey>`) whose `<pass>-we` sibling has a table task
+ * but which have no table task themselves. Returns [{ pass, label, repo }] sorted by pass; repo is the `--repo=` arg.
+ */
+export function missingSiblingPasses(table, manifest = DAEMON_MANIFEST) {
+  const have = new Set(table.tasks.map(task => task.manifestPass).filter(Boolean));
+  const out = [];
+  for (const pass of [...have].filter(name => name.endsWith('-we'))) {
+    const base = pass.slice(0, -3);
+    for (const name of Object.keys(manifest).filter(key => key.startsWith(`${base}-`) && key !== pass)) {
+      if (have.has(name) || !manifest[name].args?.some(arg => arg.startsWith('--repo='))) continue;
+      out.push({ pass: name, label: `com.we.conveyor-pass-daemon.${name}`, repo: manifest[name].args.find(arg => arg.startsWith('--repo=')).slice(7) });
+    }
+  }
+  return out.sort((a, b) => a.pass.localeCompare(b.pass));
+}
+
+const escapeXml =value => value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char]);
 const HEADER = '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n';
 
 function xmlValue(value, depth = 0) {
@@ -83,7 +100,7 @@ export function renderPlist(task, host) {
 /** Pending host environment names are metadata, never plist values. */
 export function renderAll(table, host) {
   validateTable(table);
-  return table.tasks.map(task => ({ label: task.label, file: `${task.label}.plist`, xml: renderPlist(task, host), pendingHostEnv: [...(task.hostEnvKeys ?? [])].sort() }));
+  return table.tasks.map(task => ({ label: task.label, file: `${task.label}.plist`, manifestPass: task.manifestPass, xml: renderPlist(task, host), pendingHostEnv: [...(task.hostEnvKeys ?? [])].sort() }));
 }
 
 // Parse only the deterministic plist subset this module emits. Never resolve XML entities/DTDs.
