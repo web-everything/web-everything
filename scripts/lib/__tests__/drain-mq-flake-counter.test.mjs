@@ -12,12 +12,11 @@ const run = (attempt, conclusion, extra = {}) => ({
 const ev = (checks, o = {}) => evaluateMqFlakeCounter({ checks, head: HEAD, name: 'test', appId: APP, threshold: 3, ...o });
 
 describe('drain-mq-flake-counter', () => {
-  it('two failures then a pass of the same check on the same tree does not eject', () => {
-    expect(ev([run(1, 'failure'), run(2, 'failure'), run(3, 'success')]).action).toBe('pass');
+  it('one failure then a pass of the same check on the same tree does not eject', () => {
+    expect(ev([run(1, 'failure'), run(2, 'success')]).action).toBe('pass');
   });
   it('one failure asks for a rerun, not an ejection, at threshold 3', () => {
     expect(ev([run(1, 'failure')]).action).toBe('rerun');
-    expect(ev([run(1, 'failure'), run(2, 'failure')]).action).toBe('rerun');
   });
   it('three consecutive failures eject, even if a later attempt is green', () => {
     expect(ev([run(1, 'failure'), run(2, 'failure'), run(3, 'failure')]).action).toBe('eject');
@@ -41,7 +40,7 @@ describe('drain-mq-flake-counter', () => {
   });
   it('counts are ordered by attempt number, not timestamps', () => {
     const t = (a, c, ts) => run(a, c, { started_at: ts, completed_at: ts });
-    const r = ev([t(3, 'success', '2026-01-01T00:00:00Z'), t(1, 'failure', '2026-01-03T00:00:00Z'), t(2, 'failure', '2026-01-02T00:00:00Z')]);
+    const r = ev([t(2, 'success', '2026-01-01T00:00:00Z'), t(1, 'failure', '2026-01-03T00:00:00Z')]);
     expect(r.action).toBe('pass');
   });
   it('unreadable or incomplete attempts eject', () => {
@@ -61,6 +60,26 @@ describe('drain-mq-flake-counter', () => {
     expect(ev([run(1, 'failure')], { appId: 'bogus' }).action).toBe('eject');
     expect(ev([run(1, 'failure')], { threshold: Infinity }).action).toBe('eject');
     expect(ev([run(1, 'failure')], { threshold: NaN }).action).toBe('eject');
+  });
+  it('a missing run id is unknown, never a shared identity', () => {
+    expect(ev([run(1, 'failure', { run_id: undefined }), run(2, 'success', { run_id: undefined })]).action).toBe('eject');
+    expect(ev([run(1, 'failure', { run_id: null }), run(2, 'success', { run_id: null })]).action).toBe('eject');
+  });
+  it('the threshold is checked before waiting on a pending attempt', () => {
+    expect(ev([run(1, 'failure'), run(2, 'failure'), run(3, 'failure'), run(4, null)]).action).toBe('eject');
+    expect(ev([run(1, 'failure'), run(2, null)], { threshold: 1 }).action).toBe('eject');
+  });
+  it('skipped and neutral attempts never reset the failure streak', () => {
+    const r = ev([run(1, 'failure'), run(2, 'failure'), run(3, 'skipped'), run(4, 'failure'), run(5, 'success')]);
+    expect(r.action).toBe('eject');
+    expect(ev([run(1, 'failure'), run(2, 'neutral'), run(3, 'success')]).action).toBe('eject');
+  });
+  it('never passes where inspectMqReruns rejects: a second failure is head-failure evidence', () => {
+    expect(ev([run(1, 'failure'), run(2, 'failure'), run(3, 'success')]).action).toBe('eject');
+    expect(ev([run(1, 'failure'), run(2, 'success')]).action).toBe('pass');
+  });
+  it('thresholds above the resolver maximum are refused', () => {
+    expect(ev([run(1, 'failure')], { threshold: 11 }).action).toBe('eject');
   });
   it('an in-progress latest attempt waits', () => {
     expect(ev([run(1, 'failure'), run(2, null)]).action).toBe('wait');
