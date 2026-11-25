@@ -247,7 +247,7 @@ describe('audit safeguards', () => {
     expect(run(path, exec).sent).toBe(false);
     expect(exec).toHaveBeenCalledOnce();
     expect(exec.mock.calls[0][0]).toBe('gh');
-    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7196', '--repo=o/r', '--json=headRefOid,comments']);
+    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7196', '--repo=o/r', '--json=headRefOid']);
     expect(existsSync(path)).toBe(false);
   }));
   it('skips contention and preserves different-PR ledger updates on the next locked read', () => withLedger(path => {
@@ -364,12 +364,13 @@ describe('stale merge-gate run vs later review verdict', () => {
     const directory = mkdtempSync(join(tmpdir(), 'drain-stale-'));
     try { fn(join(directory, 'ledger.json')); } finally { rmSync(directory, { recursive: true, force: true }); }
   };
-  const exec = (comments, writes = []) => vi.fn((command, argv) => {
+  const exec = (comments, writes = []) => Object.assign(vi.fn((command, argv) => {
     if (command === 'gh' && argv[0] === 'run') { writes.push(argv); return { status: 0 }; }
-    if (command === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: head, ...(comments ? { comments } : {}) }) };
+    if (command === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: head }) };
     writes.push(argv); return { status: 0 };
-  });
-  const go = (ledgerPath, ex, pr) => sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: ex });
+  }), { comments });
+  const go = (ledgerPath, ex, pr) => sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: ex,
+    readComments: () => { if (!ex.comments) throw Error('unreadable'); return ex.comments; } });
   const reruns = writes => writes.filter(a => a[0] === 'run');
   const sends = writes => writes.filter(a => a[0] !== 'run');
 

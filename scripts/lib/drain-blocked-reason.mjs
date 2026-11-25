@@ -1,5 +1,6 @@
 /** Required-check diagnostics and a strictly changes-only, head-deduplicated send-back. */
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { spawnSync } from 'node:child_process';
@@ -62,13 +63,16 @@ const VERDICT_PREFIXES = ['✅ review — accepted', '🔁 review — changes re
 
 /** Pure. Non-null only when merge-gate is the ONLY failed required check, its run completed BEFORE the latest trusted
  * review verdict, and both times and the run id are readable. Anything else returns null (today's send-back). */
-export function staleMergeGate({ pr, requiredChecks, comments } = {}) {
+export function staleMergeGate({ pr, requiredChecks, readComments } = {}) {
   try {
     const failed = describeBlockedChecks(pr, requiredChecks)?.failed ?? [];
-    if (failed.length !== 1 || !failed[0].startsWith('required check "merge-gate"') || !Array.isArray(comments)) return null;
+    if (failed.length !== 1 || !failed[0].startsWith('required check "merge-gate"')) return null;
     const gate = latestCheckNamed(pr.statusCheckRollup, 'merge-gate');
     const doneAt = Date.parse(gate?.completedAt ?? gate?.completed_at ?? '');
     const runId = /\/actions\/runs\/(\d+)/.exec(String(gate?.detailsUrl ?? gate?.details_url ?? ''))?.[1];
+    if (!runId || !Number.isFinite(doneAt)) return null;
+    const comments = readComments();
+    if (!Array.isArray(comments)) return null;
     let latest = null, latestAt = -Infinity;
     for (const c of comments) {
       const at = Date.parse(c?.createdAt ?? c?.created_at ?? '');
@@ -84,7 +88,7 @@ export function staleMergeGate({ pr, requiredChecks, comments } = {}) {
 /** CLI uses argv/body-file, never a shell. Persist only AFTER the sanctioned label writer succeeds.
  * An unreadable ledger refuses send-back; the drain still skips the red PR and logs the retry reason.
  */
-export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, exec = (command, args, options) => command === 'gh'
+export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, readComments = readCompletePrComments, exec = (command, args, options) => command === 'gh'
     ? spawnSync(process.execPath, [new URL('./gh-throttle.mjs', import.meta.url).pathname, ...args], options)
     : spawnSync(command, args, options) } = {}) {
   let temp, lockPath, lockFd, refusalPath;
@@ -128,12 +132,11 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     temp = mkdtempSync(join(tmpdir(), 'drain-gate-send-back-'));
     const bodyPath = join(temp, 'findings.md');
     writeFileSync(bodyPath, decision.body, { mode: 0o600 });
-    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid,comments'],
-      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
-    const liveView = live?.status === 0 ? JSON.parse(live.stdout) : null;
-    if (liveView?.headRefOid !== headSha)
+    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'],
+      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha)
       return { sent: false, reason: 'live head changed or unreadable; kept skipped; retry next pass' };
-    const stale = staleMergeGate({ pr, requiredChecks, comments: liveView.comments });
+    const stale = staleMergeGate({ pr, requiredChecks, readComments: () => readComments(pr.number, { repo }) });
     if (stale) {
       // A merge-gate run that finished before the latest review verdict only reflects the lifted hold: ask for a fresh run, once.
       const rerunMarker = `${ledgerPath}.${headSha.toLowerCase()}.${stale.verdictKey}.rerun`;
