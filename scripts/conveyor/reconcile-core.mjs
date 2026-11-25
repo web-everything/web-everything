@@ -2983,6 +2983,9 @@ export function planReconcile({
       continue;
     }
     if (noCode.state === 'held' || noCode.state === 'spent') {
+      // Only the original window is held. `none` falls through after a new head,
+      // verdict or fix claim. Same-window exits: clear the named hold, repair
+      // unreadable evidence, or post a replacement answer to the named stand-down.
       const kind = noCode.state === 'held' ? 'no-code-rearm-held' : 'no-code-rearm-spent';
       refuse(kind, { why: noCode.why, answerId: noCode.answerId });
       notes.push({ kind, prNumber, answerId: noCode.answerId,

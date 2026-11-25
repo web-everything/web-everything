@@ -65,6 +65,9 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
+import { acquireLiveOwnerWatchLock } from '../conveyor/pr-live-owner-lock.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -184,6 +187,13 @@ export function defaultNoCodeRearm({ repoSlug, prNumber, expectHead, answerId, s
   { encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024 });
 }
 
+/** Cross-checkout exclusion through admission, receipt and child readback. No TTL takeover:
+ * a living or unreadable holder stays exclusive, including a slow writer. */
+export function acquireNoCodeRearmLock({ repoSlug, prNumber, root = resolveCoordinationRoot() }, lockOptions) {
+  const key = createHash('sha256').update(`${repoSlug}#${prNumber}`).digest('hex');
+  return acquireLiveOwnerWatchLock(resolve(root, 'no-code-rearm', key), lockOptions);
+}
+
 /** `gh pr view --json files` returns at most this many entries, silently. */
 export const PR_FILES_JSON_CAP = 100;
 
@@ -292,6 +302,7 @@ export function runReconcilePromoteDraftDispatch({
   })) }),
   postComment = ({ repoSlug, prNumber, comment }) => createGhProvider().postComment(repoSlug, prNumber, comment),
   rearm = defaultNoCodeRearm,
+  acquireRearmLock = acquireNoCodeRearmLock,
   readClaim = readLiveDrainClaim,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
@@ -499,59 +510,73 @@ export function runReconcilePromoteDraftDispatch({
     }
     handled += 1;
     const prNumber = entry.prNumber;
-    let comments, labels;
+    let release;
     try {
-      comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-      labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
-      if (!Array.isArray(comments)) throw Error('comments unreadable');
+      release = acquireRearmLock({ repoSlug, prNumber });
     } catch (e) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
-      continue;
-    }
-    const plan = noCodeRearmPlan({ comments, labels, headRefOid: entry.expectHead });
-    if (plan.state !== 'ready' || plan.answerId !== entry.answerId) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: plan.why });
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-unavailable', why: String(e?.message ?? e).split('\n')[0] });
       continue;
     }
     try {
-      const claim = readClaim({ repo: repoKey, pr: prNumber });
-      if (claim?.uncertain) {
-        throw Error('fix claim store unreadable; operator must inspect the claim store');
-      }
-      if (claim) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-claimed', why: 'a live fix claim appeared; wait for its owner to finish' });
+      // Admission is deliberately inside exclusion: a contender must see its predecessor's receipt.
+      let comments, labels;
+      try {
+        comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+        labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
+        if (!Array.isArray(comments)) throw Error('comments unreadable');
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
         continue;
       }
-    } catch (e) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
-      continue;
-    }
-    try {
-      const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
-      const priorIds = new Set(comments.map(c => c.id));
-      postComment({ repoSlug, prNumber, comment: receipt });
-      const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-      if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
-        && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
-        throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
+      const plan = noCodeRearmPlan({ comments, labels, headRefOid: entry.expectHead });
+      if (plan.state !== 'ready' || plan.answerId !== entry.answerId) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: plan.why });
+        continue;
       }
-    } catch (e) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
-      continue;
-    }
-    let child, observed;
-    try {
-      child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: plan.answerId });
-      observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
-      if (child.status !== 0 || observed?.ok !== true || observed.labelsObserved !== true
-        || !Array.isArray(observed.labels) || !observed.labels.every(l => typeof l === 'string')
-        || observed.labels.includes('review:changes')
-        || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
-        throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
+      try {
+        const claim = readClaim({ repo: repoKey, pr: prNumber });
+        if (claim?.uncertain) {
+          throw Error('fix claim store unreadable; operator must inspect the claim store');
+        }
+        if (claim) {
+          refusals.push({ pr: prNumber, kind: 'rearm-no-code-claimed', why: 'a live fix claim appeared; wait for its owner to finish' });
+          continue;
+        }
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
+        continue;
       }
-      dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
-    } catch (e) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
+      try {
+        const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
+        const priorIds = new Set(comments.map(c => c.id));
+        postComment({ repoSlug, prNumber, comment: receipt });
+        const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+        if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
+          && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
+          throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
+        }
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
+        continue;
+      }
+      let child, observed;
+      try {
+        child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: plan.answerId });
+        observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
+        if (child.status !== 0 || observed?.ok !== true || observed.labelsObserved !== true
+          || !Array.isArray(observed.labels) || !observed.labels.every(l => typeof l === 'string')
+          || observed.labels.includes('review:changes')
+          || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
+          throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
+        }
+        dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
+      }
+    } finally {
+      try { release(); } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-release-failed', why: String(e?.message ?? e).split('\n')[0] });
+      }
     }
   }
   // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.

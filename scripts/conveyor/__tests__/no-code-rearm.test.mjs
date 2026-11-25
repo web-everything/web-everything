@@ -22,6 +22,12 @@ const plan = (thread = comments, over = {}) => planReconcile({ requiredChecks: [
 
 describe('no-code rearm predicate', () => {
   it('is ready for an eligible operator answer', () => expect(predicate()).toMatchObject({ state: 'ready', answerId: 'answer' }));
+  it.each([begin, verdict])('only a trusted later lifecycle marker retires the ruling: $id', marker => {
+    expect(predicate({ comments: [...comments, marker] }).state).toBe('none');
+    expect(predicate({ comments: [...comments, { ...marker, author: { login: 'outsider' } }] }).state).toBe('ready');
+    expect(predicate({ comments: [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD)),
+      { ...marker, author: { login: 'outsider' } }] }).state).toBe('spent');
+  });
   it.each([
     ['head unreadable', { headRefOid: 'bad' }],
     ['head has trailing newline', { headRefOid: HEAD + '\n' }],
@@ -30,8 +36,6 @@ describe('no-code rearm predicate', () => {
     ['comments unreadable', { comments: null }],
     ['red-team blocked', { labels: ['review:changes', 'red-team:blocked'] }],
     ['red-team pending', { labels: ['review:changes', 'red-team:pending'] }],
-    ['later fix-begin', { comments: [...comments, begin] }],
-    ['later changes verdict', { comments: [...comments, verdict] }],
     ['ineligible window', { comments: [stop, answer] }],
     ['poster is not operator', { comments: [...comments.slice(0, -1), { ...answer, author: { login: 'outsider' } }] }],
   ])('holds when %s', (_, over) => expect(predicate(over).state).toBe('held'));
@@ -39,7 +43,7 @@ describe('no-code rearm predicate', () => {
     const newer = c('newer', buildStandDownComment({ reason: 'needs-judgment', detail: 'A new question' }));
     expect(predicate({ comments: [...comments, newer] })).toMatchObject({ state: 'held', answerId: 'answer' });
   });
-  it.each([[HEAD, 'ready'], ['b'.repeat(40), 'held']])('binds the ruling to stand-down head %s: %s', (head, state) => {
+  it.each([[HEAD, 'ready'], ['b'.repeat(40), 'none']])('binds the ruling to stand-down head %s: %s', (head, state) => {
     const pinned = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?', head }));
     expect(predicate({ comments: [verdict, begin, pinned, answer] }).state).toBe(state);
   });
@@ -84,6 +88,17 @@ describe('no-code rearm predicate', () => {
 });
 
 describe('no-code rearm planning', () => {
+  it('after a spent rearm, a later changes verdict resumes ordinary fix planning', () => {
+    const thread = [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))];
+    expect(plan(thread, { labels: ['review:pending'] }).dispatch.filter(d => d.kind === 'fix')).toEqual([]);
+    thread.push(c('rearmed', REARM_COMMENT_MARKER), { ...verdict, id: 'new-verdict' });
+    const result = plan(thread);
+    expect(result.dispatch.map(d => d.kind)).toEqual(['fix']);
+    expect(result.refusals.filter(r => r.kind.startsWith('no-code-rearm'))).toEqual([]);
+  });
+  it('a new push retires the old no-code ruling and resumes ordinary fix planning', () => {
+    expect(plan(comments, { headRefOid: 'b'.repeat(40) }).dispatch.map(d => d.kind)).toEqual(['fix']);
+  });
   it('a no-code answer dispatches rearm-no-code and zero fix rows', () => {
     const result = plan();
     expect(result.dispatch.map(d => d.kind)).toEqual(['rearm-no-code']);
@@ -106,11 +121,10 @@ describe('no-code rearm planning', () => {
     expect(result.dispatch[0]).toMatchObject({ kind: 'fix', mode: 'ruling-not-addressed',
       rulingNotAddressed: { items: [expect.objectContaining({ id: 'send-back' })] } });
   });
-  it('fix-begin after answer holds with zero fix rows', () => {
+  it('fix-begin after answer retires the ruling and resumes ordinary fix planning', () => {
     const result = plan([...comments, begin]);
-    expect(result.dispatch).toEqual([]);
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'no-code-rearm-held' }));
-    expect(result.notes).toHaveLength(1);
+    expect(result.dispatch.map(d => d.kind)).toEqual(['fix']);
+    expect(result.refusals.filter(r => r.kind.startsWith('no-code-rearm'))).toEqual([]);
   });
   it('ticks 2 and 3 plan nothing, spent plus one note while changes stands', () => {
     const thread = [...comments, c('receipt', core.NO_CODE_REARM_RECEIPT('answer', HEAD))];

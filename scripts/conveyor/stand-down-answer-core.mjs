@@ -238,15 +238,19 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   if (typeof headRefOid !== 'string' || headRefOid.length !== 40 || !/^[a-f0-9]{40}$/i.test(headRefOid)) return held('head unreadable');
   const ruledHead = standDownHead(comments[namedStandDownIndex(comments, answerAt, answer)].body);
   if (!ruledHead) return held('stand-down has no head; a fresh answer is needed');
-  if (ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return held('stand-down head differs from current head');
   if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
   if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
   if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
-  if (!rearmWindow(comments.slice(0, answerAt)).wouldHonour(answer)) return held('answer does not clear the rearm window');
-  if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
+  // A ruling only owns its original window. Later work/verdicts and pushes retire it for
+  // ordinary planning, while the executor still refuses every result except `ready`.
+  if (ruledHead.toLowerCase() !== headRefOid.toLowerCase()) return result('none', 'ruling superseded by a changed head', answerId);
   const after = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
   if (after.some(c => /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
-    || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) return held('fix claim or changes verdict after answer');
+    || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) {
+    return result('none', 'ruling superseded by a later fix claim or changes verdict', answerId);
+  }
+  if (!rearmWindow(comments.slice(0, answerAt)).wouldHonour(answer)) return held('answer does not clear the rearm window');
+  if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
   if (comments.some(c => parseNoCodeRearmReceipt(c)?.answerId === answerId)
     || after.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m)))) {
     return result('spent', 'the no-code ruling was already spent', answerId);

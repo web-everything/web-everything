@@ -4,12 +4,14 @@
  *   `reconcile-core.mjs` planned `kind:'promote-draft'` for. No process is started and no real `gh` is
  *   shelled — `reconcile` and `provider` are injected, mirroring `ci-heal-pr-dispatch.test.mjs`'s own shape.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { fixDispatchClaimRoot, fixDispatchResource } from '../../conveyor/fix-claim-store.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
-import { runReconcilePromoteDraftDispatch, defaultNoCodeRearm, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
+import { runReconcilePromoteDraftDispatch, defaultNoCodeRearm, acquireNoCodeRearmLock, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
 
 const FRESH = () => ({ fresh: true, behind: 0 });
 // Every pre-existing test in this file promotes cleanly, so it pins a fresh re-read that always says green —
@@ -693,6 +695,9 @@ import { runReviewLabelCli } from '../../review-set-label.mjs';
 import { formatPromoteActionLine, runPromoteDraftDispatchAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 
 describe('operator no-code rearm executor', () => {
+  let lockRoot;
+  beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'no-code-executor-')); });
+  afterEach(() => rmSync(lockRoot, { recursive: true, force: true }));
   const head = 'a'.repeat(40);
   const c = (id, body) => ({ id, body, author: { login: 'chalbert' } });
   const begin = c('begin', `🔒 conveyor fix-begin — fix claim held
@@ -709,9 +714,104 @@ Fix defect`);
   function setup(over = {}) {
     const posted = [];
     const postComment = vi.fn(({ comment }) => posted.push(c('receipt', comment))), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
-    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm, ...over };
+    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm,
+      acquireRearmLock: args => acquireNoCodeRearmLock({ ...args, root: lockRoot }, {
+        stamp: () => ({ runnerStart: 'test-process-birth' }), identity: () => ({ alive: true }),
+      }), ...over };
     return { options, postComment, rearm, run: () => runReconcilePromoteDraftDispatch(options) };
   }
+  it('overlapping executors consume one answer only once', () => {
+    const posted = [];
+    let overlap, contender;
+    const postComment = vi.fn(({ comment }) => posted.push(c(`receipt-${posted.length}`, comment)));
+    const rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    const first = setup({ readThread: () => [...thread(), ...posted], postComment, rearm,
+      readClaim: () => { overlap = contender.run(); return null; } });
+    contender = setup({ ...first.options, readClaim: () => null });
+    const result = first.run();
+    expect(result.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(overlap.dispatched).toEqual([]);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(rearm).toHaveBeenCalledTimes(1);
+  });
+  it('rechecks admission inside exclusion and releases the lock on a stale plan', () => {
+    const comments = thread();
+    const s = setup({ readThread: () => comments });
+    const acquire = s.options.acquireRearmLock;
+    s.options.acquireRearmLock = args => {
+      const release = acquire(args);
+      comments.push(c('receipt-by-predecessor', NO_CODE_REARM_RECEIPT('answer', head)));
+      return release;
+    };
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+    const release = acquire({ repoSlug: 'web-everything/web-everything', prNumber: 42 });
+    release();
+  });
+  it('unreadable lock ownership refuses before reading evidence or writing', () => {
+    const s = setup({ acquireRearmLock: () => { throw Error('operator must inspect lock ownership'); }, readThread: vi.fn() });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-lock-unavailable' }));
+    expect(s.options.readThread).not.toHaveBeenCalled();
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['thread-read', 'claim-read', 'receipt-post', 'writer'])('releases exclusion after %s fails', stage => {
+    const fail = () => { throw Error('fixture failure'); };
+    const s = setup({ ...(stage === 'thread-read' ? { readThread: fail } : {}),
+      ...(stage === 'claim-read' ? { readClaim: fail } : {}),
+      ...(stage === 'receipt-post' ? { postComment: fail } : {}),
+      ...(stage === 'writer' ? { rearm: fail } : {}) });
+    expect(s.run().dispatched).toEqual([]);
+    const release = s.options.acquireRearmLock({ repoSlug: 'web-everything/web-everything', prNumber: 42 });
+    release();
+  });
+  it('actual rearm-review writer transitions labels once across two executor ticks', () => {
+    const stateFile = join(lockRoot, 'state.json');
+    const ghPath = join(lockRoot, 'gh');
+    writeFileSync(stateFile, JSON.stringify({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments: thread(), writes: [] }));
+    writeFileSync(ghPath, [
+      `#!${process.execPath}`,
+      "const fs = require('node:fs');",
+      "const a = process.argv.slice(2), p = process.env.REARM_TEST_STATE, s = JSON.parse(fs.readFileSync(p, 'utf8'));",
+      "const save = () => fs.writeFileSync(p, JSON.stringify(s));",
+      "if (a[0] === 'pr' && a[1] === 'view') console.log(JSON.stringify(s));",
+      "else if (a[0] === 'api' && a[1].includes('/comments')) console.log(JSON.stringify([s.comments]));",
+      "else if (a[0] === 'pr' && a[1] === 'edit') { s.labels = s.labels.filter(l => !a.some((v,i) => v === '--remove-label' && a[i+1] === l)); const i = a.indexOf('--add-label'); if (i >= 0) s.labels.push(a[i+1]); s.writes.push('labels'); save(); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { const body = fs.readFileSync(a[a.indexOf('--body-file')+1], 'utf8'); s.comments.push({ id: 'writer-comment', body, author: { login: 'web-everything' } }); s.writes.push('comment'); save(); }",
+      "else { console.error('unexpected hermetic gh call', a); process.exit(1); }",
+    ].join('\n'));
+    chmodSync(ghPath, 0o755);
+    const read = () => JSON.parse(readFileSync(stateFile, 'utf8'));
+    const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
+    const writer = vi.fn(args => defaultNoCodeRearm({ ...args, spawn: (exe, argv, opts) => spawnSync(exe, argv, { ...opts,
+      env: { ...cleanEnv, PATH: `${lockRoot}:${process.env.PATH}`, HOME: lockRoot, WE_COORDINATION_ROOT: lockRoot,
+        WE_GH_THROTTLE_LOCK_ROOT: join(lockRoot, 'throttle'), REARM_TEST_STATE: stateFile },
+    }) }));
+    const postComment = vi.fn(({ comment }) => { const s = read(); s.comments.push(c('receipt', comment)); s.writes.push('receipt'); writeFileSync(stateFile, JSON.stringify(s)); });
+    const planned = [];
+    const reconcile = () => {
+      const result = planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ ...read(), number: 42,
+        headRefName: 'lane/test', mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+      }] });
+      planned.push(...result.dispatch.map(row => row.kind));
+      return result;
+    };
+    const s = setup({ reconcile, readThread: () => read().comments, readPrLabels: () => read().labels, postComment, rearm: writer });
+    const first = s.run();
+    expect(first.refusals).toEqual([]);
+    expect(first.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(read().labels).toEqual(['review:pending']);
+    const after = read();
+    expect(s.run().dispatched).toEqual([]);
+    expect(read()).toEqual(after);
+    expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
+    expect(planned.filter(kind => kind === 'fix')).toEqual([]);
+    expect(planned.filter(kind => kind === 'rearm-no-code')).toEqual(['rearm-no-code']);
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+  }, 120000);
   it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {
     const readClaim = vi.fn(() => { if (mode === 'unreadable') throw Error('store unreadable'); return { meta: { who: 'fixer' } }; });
     const s = setup({ readClaim });
