@@ -1,0 +1,6 @@
+{
+  "description": "Hotpatch receipts come from the bound full CI suite.",
+  "owner": "scripts/settings/hotpatch.json",
+  "changeVia": "pr",
+  "instant": true
+}
