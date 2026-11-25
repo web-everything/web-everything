@@ -3,6 +3,7 @@ import { inspectMqReruns, requestMqReruns } from './drain-mq-flake-rerun.mjs';
 import { redTeamEnabled, redTeamOwedOnHead } from './review-red-team-policy.mjs';
 import { execFileSync } from 'node:child_process';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -409,7 +410,7 @@ function readQuarantineCover({ repo, commit, failed, exec, quarantine, flake }) 
     }
     const unitRe = new RegExp(QUARANTINE_SAFETY_NET_DEFAULTS.unitJobPattern);
     const derived = new Set(QUARANTINE_SAFETY_NET_DEFAULTS.derivedJobs);
-    const read1 = (endpoint, max) => String(exec('gh', ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
+    const read1 = (endpoint, max) => String(exec('gh', endpoint.endsWith('/logs') ? ciJobLogApiArgs(endpoint) : ['api', endpoint], { encoding: 'utf8', timeout: 60_000,
       maxBuffer: max, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
     let units = 0;
     for (const check of failed) {
@@ -489,7 +490,8 @@ function readMqExactTestEvidence({ repo, pr, head, timeline, exec, now }) {
     if (!oid || !Number.isFinite(removedAt) || !Number.isFinite(now) || removedAt > now) return null;
     const read = (endpoint, binary = false) => {
       // The staged executor owns the shared allowance, including base-reader IO and cached requests.
-      return exec('gh', ['api', `repos/${repo}/${endpoint}`], { encoding: binary ? 'buffer' : 'utf8',
+      const path = `repos/${repo}/${endpoint}`;
+      return exec('gh', endpoint.endsWith('/logs') ? ciJobLogApiArgs(path) : ['api', path], { encoding: binary ? 'buffer' : 'utf8',
         timeout: binary ? 120_000 : 60_000, maxBuffer: binary ? 64 * 1024 * 1024 : 4 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } });
     };
@@ -810,7 +812,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         const jobPath = /^\/([^/]+)\/([^/]+)\/actions\/runs\/([1-9][0-9]*)\/job\/([1-9][0-9]*)$/.exec(new URL(gates[0].details_url).pathname);
         if (jobPath && `${jobPath[1]}/${jobPath[2]}` === repo && new URL(gates[0].details_url).origin === 'https://github.com') {
           budget--;
-          const log = String(exec('gh', ['api', `repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`], {
+          const log = String(exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${Number(jobPath[4])}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES, stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 } }));
           // The WHOLE gate log must be read (a hold outside a tail window would be missed): oversize fails closed.
           if (Buffer.byteLength(log, 'utf8') >= MQ_INFRA_LOG_BYTES) throw new Error('gate log too large to classify');
@@ -895,7 +897,7 @@ function readMqBaseRetryEvidence({ repo, pr, head, timeline, exec, rerunScope, d
         if (budget <= 2) throw new Error('retry evidence budget exhausted');
         try {
           budget--;
-          const text = exec('gh', ['api', `repos/${repo}/actions/jobs/${jobId}/logs`], {
+          const text = exec('gh', ciJobLogApiArgs(`repos/${repo}/actions/jobs/${jobId}/logs`), {
             encoding: 'utf8', timeout: 60_000, maxBuffer: MQ_INFRA_LOG_BYTES,
             stdio: ['ignore', 'pipe', 'pipe'], throttle: { maxAttempts: 1 },
           });
