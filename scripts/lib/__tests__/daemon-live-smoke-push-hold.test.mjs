@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+
+// Resolve filesystem paths first so Vite cannot rewrite the child's imports to HTTP asset URLs.
+const testDir = dirname(fileURLToPath(import.meta.url));
 
 describe('dispatch dry-run smoke live hold isolation', () => {
   it('the actual synthetic fix call spawns with test flags removed and a failing gh port', () => {
@@ -11,8 +15,8 @@ describe('dispatch dry-run smoke live hold isolation', () => {
     delete env.VITEST;
     delete env.WE_UNDER_TEST;
     const child = `
-      import { dispatchFix as realDispatch } from ${JSON.stringify(new URL('../../conveyor/reconcile-fix-dispatch.mjs', import.meta.url).href)};
-      import { DISPATCH_DRY_RUN_SCRIPT } from ${JSON.stringify(new URL('../daemon-live-smoke.mjs', import.meta.url).href)};
+      import { dispatchFix as realDispatch } from ${JSON.stringify(pathToFileURL(join(testDir, '../../conveyor/reconcile-fix-dispatch.mjs')).href)};
+      import { DISPATCH_DRY_RUN_SCRIPT } from ${JSON.stringify(pathToFileURL(join(testDir, '../daemon-live-smoke.mjs')).href)};
       let spawned = 0, ghReads = 0, outcome;
       const dispatchFix = (planned, options) => realDispatch(planned, {
         root: process.cwd(), readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
