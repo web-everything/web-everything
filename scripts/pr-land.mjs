@@ -149,7 +149,8 @@ import { resolveHandoffSettings } from './lib/handoff-settings.mjs'; // the stuc
 import { readApprovalRecord } from './lib/approval-record.mjs'; // AUTH-BOUND-APPROVAL — the head-bound operator approval record replaces the forgeable body line
 import { MAIN_CI_RED_DEFAULTS } from './conveyor/main-ci-red-core.mjs'; // card xu1nixv — a red-main fix PR never opens as a draft
 
-import { laneRelevantChangeSinceForRecord, computeWorkingTreeHash } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
+import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening.mjs';
+import { laneRelevantChangeSinceForRecord, computeWorkingTreeHash, verifyPolicyKey } from './lib/verify-lane-gate.mjs'; // #4296 — keys the finish-guard's marker match to what LANE-RELEVANT files changed since the marker's recorded sha, not the exact commit (a no-op merge of BASE that conflicts only outside the lane's own touch-set must not force a fresh full re-verify).
 
 // ── flag parsing (mirrors push-if-green.mjs) ──────────────────────────────────────────────────────────
 const argv = process.argv.slice(2);
@@ -1049,13 +1050,15 @@ async function runCli() {
         // VERIFY-MARKER-PER-SHA: a marker for another sha (or none) falls back to the shared per-sha copy, which the
         // reader only honours at an identical, recomputed working-tree hash.
         const local = readVerifyMarker(dir);
+        // The hash and slug come from the SAME hardened git env the producer uses (no external diff/textconv/filters/inherited overrides).
+        const hardened = (args) => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: laneGitHardeningEnv(process.env) }).trim();
         return resolveMarkerWithShared({ local, headSha: refSha, readShared: () => {
           try {
-            const repoSlug = repoSlugFromRemote(gitC(['remote', 'get-url', REMOTE]));
+            const repoSlug = repoSlugFromRemote(hardened(['remote', 'get-url', REMOTE]));
             if (!repoSlug) return null;
-            const treeHash = computeWorkingTreeHash({ base: `${REMOTE}/${BASE}`, runGit: gitC, fileMode: (f) => lstatSync(join(REPO, f)).mode });
-            return readSharedVerifyMarker({ dir: sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repo: repoSlug, sha: refSha, treeHash });
-          } catch { return null; }
+            const treeHash = computeWorkingTreeHash({ base: `${REMOTE}/${BASE}`, runGit: hardened, fileMode: (f) => lstatSync(join(REPO, f)).mode });
+            return readSharedVerifyMarker({ dir: sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repo: repoSlug, sha: refSha, treeHash, policyKey: verifyPolicyKey(process.env) });
+          } catch { return { corrupt: true }; }
         } });
       },
       breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,

@@ -227,6 +227,15 @@ export function verifySetting(key, env, fileConfig = defaultFileConfig) {
   return resolveVerifySettings({ fileConfig, env }).values[key];
 }
 
+/** VERIFY-MARKER-PER-SHA — a stable key for the CURRENT verification policy (every resolved verify setting). The shared
+ *  marker stores the producer's key and the consumer accepts only an equal one, so a green produced under a weaker policy
+ *  (e.g. `standards: ci-only`) can never satisfy a lane whose policy is stronger. */
+export function verifyPolicyKey(env = process.env, fileConfig = defaultFileConfig) {
+  const values = resolveVerifySettings({ fileConfig, env }).values;
+  const stable = Object.fromEntries(Object.keys(values).sort().map((k) => [k, values[k]]));
+  return createHash('sha256').update(JSON.stringify(stable)).digest('hex');
+}
+
 /** Where {@link verifySetting}'s value came from: 'env' | 'file' | 'default' (for the logged-source lines). */
 export function verifySettingSource(key, env, fileConfig = defaultFileConfig) {
   return resolveVerifySettings({ fileConfig, env }).sources[key];

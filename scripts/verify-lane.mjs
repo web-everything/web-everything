@@ -89,7 +89,8 @@ import { homedir, tmpdir } from 'node:os';
 import { join, resolve, basename } from 'node:path';
 import { recordLocalSlotFallback } from './lib/remote-fallback-log.mjs';
 import { recordTerminalVerifyOutcome, clearDeferredMarker } from './lib/lane-verify-deferred.mjs'; // R893 — own file; no other marker reader can see it
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger, writeSharedVerifyMarker, clearSharedVerifyMarker, sharedMarkerDir, repoSlugFromRemote } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure as baseInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger, publishSharedVerifyMarker, withdrawSharedVerifyMarker, newSharedGeneration, sharedMarkerDir, repoSlugFromRemote } from './lib/lane-verify.mjs';
+import { verifyPolicyKey } from './lib/verify-lane-gate.mjs';
 import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
@@ -205,15 +206,21 @@ function writeMarker(record) {
   renameSync(tmp, MARKER);
   // VERIFY-MARKER-PER-SHA — ANY non-green write for this sha (running, red, ...) first withdraws the shared green, so a
   // stale shared green can never outlive a later blocking local result. Only `maybeRecordGreen` publishes a green.
-  if (record?.status !== 'green') sharedStore((dir, repo) => clearSharedVerifyMarker({ dir, repo, sha: headSha }));
+  // Withdrawal is NOT limited to pool lanes (a failing run in any checkout must kill a stale shared green) and a failed
+  // withdrawal is loud: the run will not publish, and says so.
+  if (record?.status !== 'green') {
+    const outcome = sharedStore((dir, repo) => withdrawSharedVerifyMarker({ dir, repo, sha: headSha, generation: SHARED_GENERATION, reason: record?.status }), { publish: false });
+    if (outcome === 'failed') process.stderr.write('⚠ verify-lane: could not withdraw the shared verify marker; this run will not publish one\n');
+  }
 }
 
-function sharedStore(fn) {
+const SHARED_GENERATION = newSharedGeneration();
+function sharedStore(fn, { publish = false } = {}) {
   try {
-    if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
+    if (publish && !greenLedgerWritable({ repo: REPO, env: process.env })) return null;
     const repoSlug = repoSlugFromRemote(git(['remote', 'get-url', 'origin']));
-    if (repoSlug) fn(sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repoSlug);
-  } catch { /* the lane-local marker stays authoritative for this lane */ }
+    return repoSlug ? fn(sharedMarkerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() }), repoSlug) : null;
+  } catch { return null; /* the lane-local marker stays authoritative for this lane */ }
 }
 
 // #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
@@ -384,7 +391,11 @@ function maybeRecordGreen({ status, treeHash, skipped = null }) {
   if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree: treeIsClean(), skipped })) return;
   // The shared per-sha copy rides the SAME conditions as the ledger: default gate (this process's own `resolvedGate`, never the
   // on-disk request), clean tree, stable tree hash, not skipped, green.
-  sharedStore((dir, repo) => writeSharedVerifyMarker({ dir, repo, lane: basename(REPO), record: { sha: headSha, status: 'green', exitCode: 0, treeHash, suites: GATE, finishedAt: new Date().toISOString() } }));
+  // Explicit-gate and --local runs are never published; the record carries the executed gate and the policy key.
+  if (!gateExplicit && !FORCE_LOCAL) {
+    sharedStore((dir, repo) => publishSharedVerifyMarker({ dir, repo, sha: headSha, generation: SHARED_GENERATION, lane: basename(REPO),
+      record: { sha: headSha, status: 'green', exitCode: 0, treeHash, suites: GATE, executedGate: resolvedGate?.command ?? GATE, policyKey: verifyPolicyKey(process.env), gateExplicit: false, local: false, finishedAt: new Date().toISOString() } }), { publish: true });
+  }
   if (recordGreenLedger({ dir: GREEN_LEDGER_DIR, sha: headSha, record: { status: 'green', repo: REPO, recordedAt: new Date().toISOString(),
     suites: GATE, selectionMode: resolvedGate?.decision?.selectionMode?.mode ?? null } })) {
     process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);
