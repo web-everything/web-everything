@@ -5,13 +5,14 @@
  * no writer remains before removing it and retrying. No automatic stale takeover.
  */
 import { mkdirSync, rmdirSync, realpathSync } from 'node:fs';
-import { basename, dirname } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 export function laneLeaseLockPath(file) {
   const gitDir = realpathSync(dirname(file));
   // Outside the checkout for ordinary clones: git clean, quarantine and reclone
   // must not remove the mutex while an old writer still holds it.
-  return `${basename(gitDir) === '.git' ? dirname(gitDir) : gitDir}.lane-lease-lock`;
+  const target = basename(gitDir) === '.git' ? dirname(gitDir) : gitDir;
+  return join(dirname(target), `.${basename(target)}.lane-lease-lock`);
 }
 
 export function withLaneLeaseMutation(file, run) {
