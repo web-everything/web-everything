@@ -37,11 +37,13 @@ export function manualDaemonPassOperation() {
     input: {
       daemon: { type: 'string', enum: [...MANUAL_DAEMONS] },
       pr: 'number', repo: 'string', reason: 'string',
+      'expected-head': { type: 'string', required: false },
       'force-while-healthy': { type: 'boolean', required: false, default: false },
     },
     verdictFrom: 'plan',
-    plan: compute({ reads: ['input.daemon', 'input.pr', 'input.repo', 'input.reason', 'input.force-while-healthy'],
-      fn: ({ input }) => validateManualPass(input) }),
+    plan: compute({ reads: ['input.daemon', 'input.pr', 'input.repo', 'input.reason', 'input.expected-head', 'input.force-while-healthy'],
+      fn: ({ input }) => validateManualPass({ ...input,
+        ...(input['expected-head'] === undefined ? {} : { expectedHead: input['expected-head'] }) }) }),
     run: effect({ reads: ['verdict'], effects: ({ verdict }) => [{
       type: MANUAL_DAEMON_PASS_EFFECT, idempotent: false, payload: verdict,
     }] }),

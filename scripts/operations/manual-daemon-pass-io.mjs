@@ -61,9 +61,9 @@ export async function dispatchManualPass(input, { env, load = () => import('./re
     if (head.toLowerCase() !== input.expectedHead.toLowerCase()) {
       throw new Error('manual-daemon-pass: PR head changed; operator must inspect before retrying');
     }
+    options.expectedHead = input.expectedHead;
   }
   return input.daemon === 'red-team' ? dispatchReviewJob({ ...options, redTeamOnly: true,
-    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
     ...(input.redTeamMode === undefined ? {} : { redTeamMode: input.redTeamMode }) }) : dispatchReviewByMode(options);
 }
 
@@ -96,6 +96,8 @@ export function createManualDaemonPassSinks({
       assertManualPassAllowed(input, readStatus());
       result = { status: 'dispatching' };
       const outcome = await dispatch(input);
+      // A head-guard refusal started nothing: no "Manual R247 pass" note (accept-carry-forward reads it) and no returned status.
+      if (outcome?.refused === true) { result = { status: 'refused', outcome }; return result; }
       // The reader (accept-carry-forward) recognises this note by this exact template: build it with the shared builder.
       await postComment({ ...input, body: manualPassNote({ daemon: input.daemon, reason: input.reason, sha }) });
       result = { status: 'returned', outcome: outcome ?? null };

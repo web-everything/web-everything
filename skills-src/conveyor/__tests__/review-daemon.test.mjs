@@ -123,6 +123,36 @@ describe('live review cap with Node configuration options', () => {
     expect(dispatch).toHaveBeenCalledTimes(3);
   });
 
+  it('daemon dispatch passes the planned head as expectedHead (an unpinned job would refuse)', async () => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '' });
+    const head = 'c'.repeat(40);
+    const dispatch = vi.fn(() => ({ agentId: 'started-review' }));
+    runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, headRefOid: head }], refusals: [] }),
+      dispatch, holdReconcile: () => [], tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [],
+      acquirableLanes: () => 40 });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ pr: 1, expectedHead: head }));
+  });
+
+  it.each([['head-moved', false], ['refused-no-expected-head', true]])('counts a dispatch refusal (%s) as refused: seat refunded, no tag, no take', async (outcome, attention) => {
+    const { liveReviewRoundBudget } = await import('../review-daemon.mjs');
+    const budget = liveReviewRoundBudget({ env: { WE_REVIEW_MAX_LIVE_ROUNDS: '3' }, listCommands: () => '' });
+    const tagRound = vi.fn(), take = vi.fn();
+    const tick = runReviewTickAllRepos({ startIndex: 0, repos: ['web-everything/web-everything'], liveReviewBudget: budget,
+      authGateOverride: () => ({ paused: false, reason: null }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 1, headRefOid: 'c'.repeat(40) }], refusals: [] }),
+      dispatch: () => ({ refused: true, outcome, reason: 'x' }), holdReconcile: () => [], tagRound, tagStatus: () => {},
+      statusCandidates: () => [], acquirableLanes: () => 40, host: { admitted: true, take } });
+    expect(tick.refused).toEqual([expect.objectContaining({ prNumber: 1, outcome })]);
+    expect(tick.dispatched).toEqual([]);
+    expect(tick.attention ?? []).toHaveLength(attention ? 1 : 0);
+    expect(budget.left).toBe(3);
+    expect(tagRound).not.toHaveBeenCalled();
+    expect(take).not.toHaveBeenCalled();
+  });
+
   it.each([
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs --files=changed.mjs',
     'node scripts/verify-lane.mjs Work/scripts/operations/review-job.mjs run --files=changed.mjs',
@@ -3232,10 +3262,11 @@ it('x6n7c2p required checks before review — synthetic #3432 four-tick soak spe
   const dispatched = [];
   for (const [head, status, conclusion] of sequence) {
     const out = runReviewTick({ repo: 'web-everything/web-everything',
-      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2 }], refusals: [] }),
+      reconcile: () => ({ dispatch: [{ kind: 'review', prNumber: 3432, attempts: 2, headRefOid: head.repeat(40) }], refusals: [] }),
       readPrs: () => [{ number: 3432, labels: [{ name: 'review:pending' }] }], readAgents: () => [],
       acquirableLanes: () => 1, tagRound, tagStatus: () => {}, statusCandidates: () => [], holdReconcile: () => [],
       dispatch: options => dispatchReview({ ...options, root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }),
+        io: { liveHead: () => head.repeat(40) },
         ciGate: args => readReviewCiGate({ ...args, policy: { startAfter: 'ci-green' }, readHead: () => head.repeat(40),
           readRequired: () => ({ source: 'live', checks: ['test', 'daemon-soak'] }),
           readChecks: ({ headSha: rowsHead }) => completeCheckRows([{ name: 'test', status: 'completed', conclusion: 'success' }, { name: 'daemon-soak', status, conclusion }], rowsHead),

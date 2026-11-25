@@ -109,6 +109,7 @@ describe('(a) every dispatch path isolates its session through the shared helper
     let seen = null;
     dispatchReview({
       pr: 1234, repo: 'web-everything/web-everything', root: '/repo', checkStaleness: FRESH,
+      expectedHead: 'a'.repeat(40), io: { liveHead: () => 'a'.repeat(40) },
       ciGate: () => ({ allowed: true, headSha: 'a'.repeat(40) }),
       readBrief: () => '# review {{PR}} {{REPO}} {{SESSION_SLUG}}',
       mintSessionId: () => 'sid-review',

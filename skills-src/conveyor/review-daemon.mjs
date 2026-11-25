@@ -824,6 +824,8 @@ export function runReviewTick({
   // x26lw6u — NOT named `skipped`: `withSelfSync` already returns `{skipped: true}` for a whole skipped tick,
   // and `onTick` reads both shapes.
   const notStarted = [];
+  const refused = [];
+  const attention = [];
   for (const d of reviews) {
     if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
@@ -839,7 +841,10 @@ export function runReviewTick({
         notStarted.push({ prNumber: d.prNumber, reason: refusal.why });
         continue;
       }
+      // The head this review was planned against: the job refuses (no verdict) unless live head still matches it.
+      const plannedHead = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(plannedHead ? { expectedHead: plannedHead } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
         escalationReason: parseEscalationReason(subject?.body ?? ''),
@@ -855,6 +860,14 @@ export function runReviewTick({
           || (Number.isInteger(result.jobPid) && counted instanceof Set && counted.has(result.jobPid));
         if (reserved && refundable) liveReviewBudget.left++;
         notStarted.push({ prNumber: d.prNumber, reason: result.skipped });
+        continue;
+      }
+      // RHE-1 (admission only) — a head-guard refusal started nothing: like skipped it refunds the seat and gets no round
+      // tag, no lastDispatched, no lane or host take. head-moved is re-planned next tick; a missing head raises attention.
+      if (result?.refused) {
+        if (reserved) liveReviewBudget.left++;
+        refused.push({ prNumber: d.prNumber, outcome: result.outcome ?? null, reason: result.reason ?? null });
+        if (result.outcome === 'refused-no-expected-head') attention.push({ prNumber: d.prNumber, reason: result.reason ?? result.outcome });
         continue;
       }
       dispatched.push({
@@ -950,7 +963,7 @@ export function runReviewTick({
     ...(owedCiReruns ? { owedCiReruns } : {}),
     ...(endedNoVerdict.length ? { endedNoVerdict } : {}),
     ...(redTeamOnSkipResult !== undefined ? { redTeamOnSkip: redTeamOnSkipResult } : {}),
-    reviewsOwed: reviews.length, dispatched, failed, notStarted, refusals: (plan.refusals ?? []).length,
+    reviewsOwed: reviews.length, dispatched, failed, notStarted, ...(refused.length ? { refused } : {}), ...(attention.length ? { attention } : {}), refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({
       prs: rawPrs, plan, dispatchable, deferredForLanes: reviews.slice(dispatchable.length), paused, deferReason,
     }),
@@ -1106,6 +1119,8 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
   const dispatched = [];
   const failed = [];
   const notStarted = [];
+  const refused = [];
+  const attention = [];
   const pendingNotDispatched = [];
   // #xvzwiew — a RECONCILE-PHASE failure (`runReviewTick` now catches it and returns `reconcileError` instead
   // of throwing) reports through this SEPARATE bucket, never folded into `failed` as a bogus `prNumber: null`
@@ -1148,13 +1163,15 @@ export function runReviewTickAllRepos({ repos = REVIEW_DAEMON_REPOS, tick = runR
     deferredForAuth += result.deferredForAuth ?? 0;
     for (const d of result.dispatched) dispatched.push({ ...d, repo });
     for (const k of (result.notStarted ?? [])) notStarted.push({ ...k, repo });
+    for (const k of (result.refused ?? [])) refused.push({ ...k, repo });
+    for (const k of (result.attention ?? [])) attention.push({ ...k, repo });
     for (const p of (result.pendingNotDispatched ?? [])) pendingNotDispatched.push({ ...p, repo });
     for (const f of result.failed) failed.push({ ...f, repo });
     for (const prNumber of (result.liveProcessPrs ?? [])) liveProcessPrs.push({ repo, prNumber });
     if (result.operatorHolds) operatorHoldSnapshots.push({ repo, ...result.operatorHolds });
   }
   return {
-    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
+    repos: perRepo, perRepoMs, reviewsOwed, dispatched, failed, notStarted, ...(refused.length ? { refused } : {}), ...(attention.length ? { attention } : {}), pendingNotDispatched, refusals, reconcileFailed, deferredForLanes, deferredForCap, deferredForCapReason,
     deferredForAuth, authPaused: authGate.paused, authPauseReason: authGate.reason,
     holdReconcile: holdReconcileRemoved, holdReconcileFailed,
     operatorHoldSnapshots,
@@ -2191,6 +2208,8 @@ export function buildCliDaemonEffects({
       }
       if (result.authPaused) log.error(`review-daemon: ${result.authPauseReason ?? 'paused: Claude login expired — run /login'}`);
       for (const k of (Array.isArray(result.notStarted) ? result.notStarted : [])) log.error(`review-daemon: ${k.repo}#${k.prNumber} not dispatched — ${k.reason}`);
+      for (const k of (Array.isArray(result.refused) ? result.refused : [])) log.error(`review-daemon: ${k.repo}#${k.prNumber} dispatch refused (${k.outcome ?? 'unknown'}) — re-planned next tick`);
+      for (const k of (Array.isArray(result.attention) ? result.attention : [])) log.error(`review-daemon: ATTENTION ${k.repo}#${k.prNumber} dispatched without an expected head — ${k.reason}`);
       for (const d of (Array.isArray(result.dispatched) ? result.dispatched : [])) log.error(`review-daemon: ${d.repo}#${d.prNumber} dispatched as ${d.mode ?? 'session'}${d.jobPid ? ` (job pid ${d.jobPid})` : ''}${d.agentId ? ` (agent ${d.agentId})` : ''}`);
       for (const p of (Array.isArray(result.pendingNotDispatched) ? result.pendingNotDispatched : [])) log.error(`review-daemon: ${p.repo}#${p.prNumber} ${(p.labels ?? []).join('+') || 'held'}, no review dispatched — ${p.reasons.join('; ')}`);
       for (const f of result.failed) log.error(`review-daemon: ${f.repo}#${f.prNumber ?? '?'} failed (non-fatal): ${f.error}`);

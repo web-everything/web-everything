@@ -52,7 +52,7 @@ export default {
       }
       const production = j.createReviewJobIo({ root: dir, env, readWitness, readEvidence: () => ({}) });
       let calls = 0, out;
-      const arc = { root: dir, now: Date.now, newActorId: () => 'soak', readPrevCompletion: () => null,
+      const arc = { liveHead: () => head, root: dir, now: Date.now, newActorId: () => 'soak', readPrevCompletion: () => null,
         claim: () => ({ ok: true }), updateRecord: () => {}, unclaim: () => {}, acquireLane: () => ({ lanePath: dir }),
         releaseLane: () => {}, report: () => {}, log: () => {}, prepareLane: () => ({ head }), fetchRedTeamHead: () => ({ head }),
         readRedTeamOnlyPayload: production.readRedTeamOnlyPayload, redTeamStatus: production.redTeamStatus,
@@ -63,6 +63,7 @@ export default {
         setting: { enabled: true, retryCooldownMin: 0 }, lastDispatch: new Map(),
         abandon: () => { const result = r.abandonStaleRedTeamRun(key, { readWitness, ...(claimProbe ? { probe: claimProbe } : {}) }); events.push('abandon'); return result; },
         dispatch: options => j.dispatchReviewJob({ ...options, root: dir, dir: join(dir, 'jobs'),
+          io: { ...j.createReviewJobIo({ root: dir }), liveHead: () => head },
           checkStaleness: () => ({ stale: false }), readCompletion: () => null, resolveSettingsEnv: () => ({}), checkoutExists: () => true,
           spawnJob: ({ argv }) => { events.push('spawn'); j.runReviewJobCli(argv.slice(1), { runJob: input => (out = j.runReviewJob(input, arc)) }); return 123; } }) });
       const first = tick(), second = tick();
