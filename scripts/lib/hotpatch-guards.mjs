@@ -90,7 +90,8 @@ export async function ciDefinitionGuard(sha, readers) {
   try {
     const paths = await readers.paths(sha);
     if (!Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !p)) return unknown();
-    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|(?:check-standards|merge-coverage|lint-host-paths)\.mjs$|hermetic-tests[^/]*$|readiness\/heavy-admission[^/]*$|conveyor\/soak\/(?:run-shard|shard-files|soak-scope)[^/]*$|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|(?:vitest|playwright)[^/]*\.[^/]+$|package(?:-lock)?\.json$)/.test(p))
+    // CI control families include imported rules/selectors and install/module-resolution config.
+    return paths.some(p => /^(?:\.github\/(?:workflows|actions)\/|scripts\/(?:ci(?:\/|[^/]*$)|check-standards[^/]*(?:\/|$)|(?:merge-coverage|lint-host-paths)\.mjs$|hermetic-tests[^/]*$|readiness\/heavy-admission[^/]*$|conveyor\/soak\/|lib\/(?:hermetic|red-main-quarantine)[^/]*$)|(?:vitest|playwright)[^/]*\.[^/]+$|package(?:-lock)?\.json$|\.npmrc$|tsconfig(?:\.[^/]+)?\.json$)/.test(p))
       ? result('fail', 'hotpatch-ci-definition-change') : result('pass', 'hotpatch-ci-definition-unchanged');
   } catch { return unknown(); }
 }

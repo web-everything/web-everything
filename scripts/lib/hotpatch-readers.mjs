@@ -34,14 +34,14 @@ export function createHotpatchReaders({ cwd = root, env = process.env, exec = ex
     return { code: 0, stdout: String(execFileSyncThrottled('gh', args, { ...opts,
     throttle: { caller: 'hotpatch-admission', noMemo: true, ...(exec !== execFileSync ? { exec: (a, o) => exec('gh', a, o) } : {}) } })) };
   };
-  let origin, platform, tool, prepared;
+  let origin, platform, tool;
   const prepare = sha => {
-    if (prepared === sha) return;
     if (typeof sha !== 'string' || !/^[a-f0-9]{40}$/.test(sha)) throw new Error('invalid hotpatch sha');
+    // A reader instance can outlive an admission. Refresh main on every git evidence read,
+    // including repeated reads of the same head; a failed refresh must never reuse old evidence.
     // Populate only objects and remote-tracking main; no working tree or lifecycle operation.
     readRepo(['fetch', '--no-tags', 'origin', `+refs/heads/main:${mainRef}`, sha]);
     if (readRepo(['rev-parse', '--verify', `${sha}^{commit}`]).trim() !== sha) throw new Error('unreadable hotpatch commit');
-    prepared = sha;
   };
   const preferences = () => {
     if (!platform) {
