@@ -13,6 +13,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { expireLaneLease } from './fixtures/expired-lane-lease.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -48,13 +49,13 @@ function provision(count, extra = []) {
   return r;
 }
 
-// Lease a specific lane as a FOREIGN session (leaves a live lease, no reset). `ttlMinutes` is stamped INTO the
-// lease (it overrides a reader's --ttl-minutes), so pass 0 to mint an already-stale lease.
-function leaseLane(n, { session = 'foreign-holder', ttlMinutes } = {}) {
-  const ttl = ttlMinutes === undefined ? [] : [`--ttl-minutes=${ttlMinutes}`];
-  const r = runPool(['acquire', `--lane=${n}`, ...REPO(), '--no-reset', `--session=${session}`, ...ttl], ENV());
+// Lease a specific lane as a FOREIGN session; stale fixtures age the persisted lease after acquire.
+function leaseLane(n, { session = 'foreign-holder', stale = false } = {}) {
+  const r = runPool(['acquire', `--lane=${n}`, ...REPO(), '--no-reset', `--session=${session}`], ENV());
   expect(r.code).toBe(0);
-  return join(poolRoot, 'acqtest', `lane-${n}`);
+  const lane = join(poolRoot, 'acqtest', `lane-${n}`);
+  if (stale) expireLaneLease(lane);
+  return lane;
 }
 
 // One origin + reference per FILE (built once, restored after every test) instead of one per test — see
@@ -135,7 +136,7 @@ describe('lane-pool list --acquirable (#2426)', () => {
 
   it('a STALE lease does NOT drop the lane (reclaimable ⇒ acquirable)', () => {
     provision(1);
-    leaseLane(1, { ttlMinutes: 0 }); // an already-stale lease (0-minute TTL) is reclaimable, so not "held"
+    leaseLane(1, { stale: true }); // an expired lease is reclaimable, so not "held"
     expect(listLanes(['--acquirable'])).toEqual([1]);
   });
 });

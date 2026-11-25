@@ -148,7 +148,7 @@ export async function publishBatch(input, opts = {}) {
     writeFileSync(bodyPath, renderBatchBody(state));
     const acquireCheckout = async () => {
       const acquire = pin => run('node', [join(root, 'scripts/lane-pool.mjs'), 'acquire',
-        '--purpose=card-batch-seal', '--ttl-minutes=180', ...(reference !== root ? [`--reference=${reference}`] : []),
+        '--purpose=card-batch-seal', '--ttl-minutes=180', '--exact-ttl', ...(reference !== root ? [`--reference=${reference}`] : []),
         ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
       // The remembered lane is a preference, not a requirement: once released it may be leased by anyone (live
       // 2026-10-10: lane-2 went to a fix worker and every retry failed). The verify receipt is restored from

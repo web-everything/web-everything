@@ -15,6 +15,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
+import { expireLaneLease } from './fixtures/expired-lane-lease.mjs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -64,8 +65,9 @@ beforeEach(() => {
   const provision = runPool(['provision', '--count=1', ...REPO()]);
   expect(provision.code).toBe(0);
   // Seed a long-TTL-stale lease on lane-1 — both reclaimers will judge it stale the same way.
-  const seed = runPool(['acquire', '--lane=1', ...REPO(), '--session=long-dead', '--ttl-minutes=0']);
+  const seed = runPool(['acquire', '--lane=1', ...REPO(), '--session=long-dead']);
   expect(seed.code).toBe(0);
+  expireLaneLease(join(poolRoot, 'stalereclaim', 'lane-1'));
 });
 
 afterEach(() => {
