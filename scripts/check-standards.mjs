@@ -90,6 +90,7 @@ import {
   scanUnauthenticatedCommentMarkerParsers,
   findHandMaintainedRegistryIndex, REGISTRY_DISCOVERY_INDEX_FILES,
   findUnjournaledLaneMutations, LANE_MUTATION_FILES,
+  findImplicitShortLaneTtls, findUnsafeLaneLeaseTakes,
   findGitHookAllFlags,
   gitHookAllFlagError,
   buildTrackedPathIndex, scopeBasenameMismatches, scopeBasenameMismatchMessage,
@@ -1697,6 +1698,28 @@ mark("6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448)");
   }
   for (const { file, line, reason } of findUnjournaledLaneMutations(laneFiles)) {
     err(`${file}:${line} ${reason} (#4370).`, { kind: 'lane-mutation-unjournaled', file });
+  }
+  for (const { file, line, reason } of findUnsafeLaneLeaseTakes(laneFiles)) {
+    err(`${file}:${line} ${reason}`, { kind: 'lane-unsafe-lease-take', file });
+  }
+}
+
+// Literal short lane acquires must acknowledge the TTL floor. Include new callers before staging.
+{
+  let listed = '';
+  try {
+    listed = execFileSync('git', ['grep', '-l', '--untracked', '-F', 'lane-pool.mjs', '--', 'scripts/', 'tools/',
+      ':!**/__tests__/**', ':!**/*.test.*', ':!**/fixtures/**'], { cwd: ROOT, encoding: 'utf8' });
+  } catch (e) {
+    if (e.status !== 1) err(`lane TTL scan could not list callers: ${e.message}`, { kind: 'lane-short-ttl' });
+  }
+  const files = [];
+  for (const file of listed.split('\n').filter(f => /\.(?:[cm]?js|[cm]?ts)$/.test(f))) {
+    try { files.push({ file, content: readFileSync(join(ROOT, file), 'utf8') }); }
+    catch (e) { err(`lane TTL scan could not read ${file}: ${e.message}`, { kind: 'lane-short-ttl', file }); }
+  }
+  for (const { file, line, reason } of findImplicitShortLaneTtls(files)) {
+    err(`${file}:${line} ${reason}`, { kind: 'lane-short-ttl', file });
   }
 }
 

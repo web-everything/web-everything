@@ -18,6 +18,19 @@ it('exact-ttl preserves an explicitly requested 30 minutes', () => {
   expect(r.status, r.stderr).toBe(0);
   expect(lease().ttlMinutes).toBe(30);
 });
+it.each(['garbage', '', { invalid: true }])('reclaims an unchanged expired lease with malformed renewedAt %j', (renewedAt) => {
+  writeFileSync(pool.marker, JSON.stringify({ session: 'dead', acquiredAt: '2020-01-01T00:00:00Z', renewedAt }));
+  const r = acquire();
+  expect(r.status, r.stderr).toBe(0);
+  expect(lease().session).toBe('worker');
+});
+it('release by an expired holder names takeover after the taker releases', () => {
+  writeFileSync(pool.marker, JSON.stringify({ session: 'expired-worker', acquiredAt: '2020-01-01T00:00:00Z' }));
+  expect(acquire().status).toBe(0);
+  expect(pool.run('release', '--session=worker').status).toBe(0);
+  const r = pool.run('release', '--session=expired-worker');
+  expect(r.stdout + r.stderr).toMatch(/lease expired-worker expired and was taken over at/);
+});
 it('exact-ttl rejects zero, negative, and non-finite TTLs before creating a lease', () => {
   for (const ttl of ['0', '-1', 'NaN', 'Infinity', '-Infinity']) {
     const r = acquire(`--ttl-minutes=${ttl}`, '--exact-ttl');
