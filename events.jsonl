@@ -126,3 +126,5 @@
 {"type":"quarantine-removed","at":1795616843718,"actor":"red-main-safety-net","test":"scripts/operations/__tests__/update-branch.test.mjs","brokenSha":"4239129c0d1d880c03cb5ffabda5225a2b2c82b4","why":"main-green"}
 {"type":"quarantine-added","at":1795618169134,"actor":"operator","test":"scripts/operations/__tests__/update-branch.test.mjs","brokenSha":"4239129c0d1d880c03cb5ffabda5225a2b2c82b4","owner":"#7504","reason":"flaky cold-import timeout in update-branch.test.mjs (fails 2 of 2 CI attempts on loaded runners; passes locally); deflake #7504 moves the import to beforeAll; orchestrator R1087","addedAt":1795618169134,"expiresAt":1795704569134}
 {"type":"quarantine-fix-prs","at":1795618344420,"actor":"red-main-safety-net","fixPrs":[7504]}
+{"type":"quarantine-removed","at":1795619245739,"actor":"red-main-safety-net","test":"scripts/operations/__tests__/update-branch.test.mjs","brokenSha":"4239129c0d1d880c03cb5ffabda5225a2b2c82b4","why":"main-green"}
+{"type":"quarantine-fix-prs","at":1795619245739,"actor":"red-main-safety-net","fixPrs":[]}

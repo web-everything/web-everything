@@ -1,17 +1,5 @@
 {
   "version": 1,
-  "entries": [
-    {
-      "test": "scripts/operations/__tests__/update-branch.test.mjs",
-      "brokenSha": "4239129c0d1d880c03cb5ffabda5225a2b2c82b4",
-      "owner": "#7504",
-      "reason": "flaky cold-import timeout in update-branch.test.mjs (fails 2 of 2 CI attempts on loaded runners; passes locally); deflake #7504 moves the import to beforeAll; orchestrator R1087",
-      "addedAt": 1795618169134,
-      "expiresAt": 1795704569134
-    }
-  ],
-  "mode": "quarantine",
-  "fixPrs": [
-    7504
-  ]
+  "entries": [],
+  "mode": "quarantine"
 }
