@@ -1574,7 +1574,8 @@ export function acquireGhPointsSync({
       } finally { releaseLockDir(lockRoot, POINTS_BUDGET_LOCK_KEY); }
     }
     if (expired) {
-      if (closed || algorithm === 'window') return { ok: false, closed, waitedMs, timedOut: true };
+      if (algorithm === 'window') return { ok: false, waitedMs, timedOut: true }; // legacy shape, unchanged
+      if (closed) return { ok: false, closed, waitedMs, timedOut: true };
       log({ outcome: 'points_bypass_uncharged', reason: 'lock-timeout', points });
       return { ok: true, waitedMs, timedOut: true, bypass: 'uncharged' };
     }
