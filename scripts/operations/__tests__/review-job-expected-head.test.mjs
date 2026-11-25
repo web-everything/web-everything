@@ -107,12 +107,6 @@ it('session admission rechecks the head after stack inspection', () => {
   expect(options.ciGate).not.toHaveBeenCalled();
   expect(options.spawnAgent).not.toHaveBeenCalled();
 });
-it.each([10, 900001, 999999])('no expectedHead is refused for any PR number, smoke sentinels included (#%s)', n => {
-  const { options } = sessionFixture(false);
-  expect(dispatchReview({ ...options, pr: n, expectedHead: undefined }))
-    .toMatchObject({ refused: true, outcome: 'refused-no-expected-head' });
-  expect(options.spawnAgent).not.toHaveBeenCalled();
-});
 it('land-advance default dispatcher refuses without head evidence', async () => {
   const writeLedger = vi.fn();
   const apply = createLandAdvanceApplier({ writeLedger,

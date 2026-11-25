@@ -25,8 +25,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript, runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
-import { resolveCandidateRunSmoke } from './candidate-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -508,10 +507,7 @@ export async function smokeAndAdopt({
         });
         log.error?.(`daemon-rebuild: smoke-fallback-reuse ${JSON.stringify({ candidate: label, checks: reuseRows.map(row => row.name), budgets: Object.fromEntries(Object.values(SMOKE_BUDGET_ENV).map(key => [key, fallbackEnv[key]])) })}`);
       }
-      // The harness comes from the candidate commit it judges, never the installed copy (PR #7430 skew, 2026-11-24).
-      const candidateRunSmoke = await resolveCandidateRunSmoke({
-        candidatePath: candidate.path, runSmoke, installedRunSmoke: runLiveSmokeWithRetry, log });
-      smokeResult = await candidateRunSmoke({ root: candidate.path, env: freshComparison ? fallbackEnv : smokeEnv,
+      smokeResult = await runSmoke({ root: candidate.path, env: freshComparison ? fallbackEnv : smokeEnv,
         changedFiles: proven ? null : changedFiles, reuseCode: !!proven, reuseRows, runChild, clock: now });
       if (!freshComparison) {
         firstSmoke = smokeResult;
