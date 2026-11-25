@@ -13,6 +13,18 @@ import { describe, it, expect, vi } from 'vitest';
 
 import * as cli from '../review-loop-cli.mjs';
 
+// Vitest snapshots named builtin imports, so syncBuiltinESMExports alone does not
+// make the CLI observe spies on the default fs object. Forward these named calls
+// through that same object; unspied calls still use the real, hermetic filesystem.
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    ...Object.fromEntries(['openSync', 'fstatSync', 'closeSync']
+      .map(key => [key, (...args) => actual.default[key](...args)])),
+  };
+});
+
 const SOURCE = readFileSync(join(process.cwd(), 'scripts/operations/review-loop-cli.mjs'), 'utf8');
 const CLASSES = ['auth', 'network', 'rate-limit', 'not-found', 'parse', 'unknown'];
 
