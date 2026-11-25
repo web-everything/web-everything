@@ -566,7 +566,8 @@ export async function runAgyReviewJuror({ request, laneCwd, model, watch = [], d
       }
     }
 
-    const common = { telemetry: spawnError?.telemetry, sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
+    const timeout = spawnError?.reason === 'juror-timeout' || spawnError?.name === 'JudgeTimeoutError';
+    const common = { ...(timeout ? { jurorTimeout: { reason: 'juror-timeout', lens: request.lens, provider: /^claude/i.test(model) ? 'agy-claude' : 'agy-gemini', model } } : {}), telemetry: spawnError?.telemetry, sessionId: outcome?.sessionId || null, servedModel: outcome?.servedModel, transcriptFile };
     // A voided run that ALSO failed keeps the failure, so the agreement row says why there was no answer.
     if (spawnError) reasons.push(`and the juror gave no answer: ${scrubPaths(spawnError.message ?? spawnError, [jurorLane, laneCwd, repoRoot])}`);
     if (reasons.length > (spawnError ? 1 : 0)) return result('voided', { ...common, reasons });

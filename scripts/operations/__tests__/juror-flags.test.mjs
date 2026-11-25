@@ -415,3 +415,12 @@ describe('#3151 `run.mjs review-pr --help` documents the flag', () => {
     expect(stdout).toContain('[--model=<alias>]');
   });
 });
+
+
+it('passes daemon exclusions from the job environment into the real judge factory', () => {
+  const exclusions = [{ lens: 'security', provider: 'claude' }];
+  const factory = vi.fn(() => async () => {});
+  createCliJudgeFactory({ env: { WE_REVIEW_JUROR_TIMEOUT_EXCLUSIONS: JSON.stringify(exclusions) }, factory })({});
+  expect(factory.mock.calls[0][0].jurorTimeoutExclusions).toEqual(exclusions);
+  expect(() => createCliJudgeFactory({ env: { WE_REVIEW_JUROR_TIMEOUT_EXCLUSIONS: '{' }, factory })({})).toThrow();
+});

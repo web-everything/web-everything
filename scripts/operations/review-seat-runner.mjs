@@ -104,6 +104,10 @@ export async function runSeatWithProvider(request, {
       }
       return ran;
     } catch (e) {
+      if (e?.reason === 'juror-timeout' || e?.name === 'JudgeTimeoutError') {
+        Object.assign(e, { reason: 'juror-timeout', lens: plain.lens, provider: /claude/i.test(runModel) ? 'agy-claude' : 'agy-gemini', model: runModel });
+        throw e;
+      }
       // A thrown error's text reaches the run record and a skipped advisory seat's PR summary: no local paths there.
       return { status: 'failed', telemetry: e?.telemetry, reasons: [scrubPaths(e?.message ?? e, [cwd])] };
     }
@@ -158,6 +162,9 @@ export async function runSeatWithProvider(request, {
 
   // mode === 'agy'
   const agyRun = await runAgy();
+  if (agyRun.jurorTimeout?.reason === 'juror-timeout') {
+    throw Object.assign(new Error(`juror-timeout lens=${plain.lens} provider=${agyRun.jurorTimeout.provider} model=${model}`), agyRun.jurorTimeout, { lens: plain.lens });
+  }
   if (agyRun.status === 'ok' && agyRun.sessionId) {
     const t = agyRun.telemetry ?? {};
     return wrap(
@@ -172,6 +179,7 @@ export async function runSeatWithProvider(request, {
     const reason = `agy seat ${fellBack.status}: ${why.join('; ') || 'no reason given'}`.slice(0, 600);
     return wrap({ summary: `skipped: ${reason}`, findings: [], skipped: { provider: 'agy', reason: agyRun.telemetry?.quotaState === 'provider-unresponsive' ? 'provider-unresponsive' : reason }, seatProvider: fellBack }, agyRun.telemetry);
   }
+  if (directive.onEscape === 'refuse') throw new Error(`juror-timeout: replacement seat ${plain.lens} failed; excluded fallback refused: ${why.join('; ')}`);
   const claude = unwrap(await claudeJudge(plain));
   return wrap({ ...claude.value, seatProvider: { provider: 'claude', fellBackFrom: fellBack } }, claude.telemetry);
 }

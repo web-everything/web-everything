@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { jurorTimeoutDetails } from '../lib/juror-timeout-retry.mjs';
 /**
  * @file scripts/operations/review-loop-cli.mjs
  * @description #3072's REMAINING SLICE, MADE CALLABLE — drives ONE `review-pr` run unattended, using
@@ -572,6 +573,12 @@ function defaultReadResumePr(input) {
 export async function runReviewLoopCliOnce(options) {
   try { return await runReviewLoopOnce(options); }
   catch (error) {
+    const jurorTimeout = jurorTimeoutDetails(error);
+    if (jurorTimeout) {
+      return { code: 1, lines: [JSON.stringify({ outcome: 'blocked-on-infra', stopped: 'juror-timeout',
+        error: `juror-timeout lens=${jurorTimeout.lens} provider=${jurorTimeout.provider} model=${jurorTimeout.model}`,
+        jurorTimeout, verdict: null })], run: null, stopped: 'juror-timeout' };
+    }
     return { code: 1, lines: [`error: ${String(error?.message ?? error)}`], run: null, stopped: 'refused' };
   }
 }

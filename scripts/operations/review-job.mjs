@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { jurorTimeoutDetails, validateJurorTimeoutExclusions } from '../lib/juror-timeout-retry.mjs';
 import { proveCardOnlyHeadMove } from '../lib/card-only-head-move.mjs';
 import { settleGhFor, syncRedTeamStatusLabels } from '../lib/red-team-status-labels.mjs';
 import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTeamStatusDir, readRecoveryWitness, restoreRecoveryWriter, createCarriedCheckPublisher, markCarriedCheckUnpublished } from '../lib/drain-red-team-evidence.mjs';
@@ -629,11 +630,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, jurorTimeoutExclusions = [], readSink = null }) => {
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
-      ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
+      ], { actorId, timeoutMs, extraEnv: { WE_REVIEW_JUROR_TIMEOUT_EXCLUSIONS: JSON.stringify(validateJurorTimeoutExclusions(jurorTimeoutExclusions)), ...(readSink ? { [READ_SINK_ENV]: readSink } : {}) } });
       return {
         status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
         timedOut: r.error?.code === 'ETIMEDOUT' || (r.signal === 'SIGKILL' && r.status === null),
@@ -1299,8 +1300,9 @@ function finalHeadSeatsGate(input, io) {
 export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 
 function runReviewArc({
-  pr, repo, expectedHead, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
+  pr, repo, expectedHead, jurorTimeoutExclusions = [], redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
+  validateJurorTimeoutExclusions(jurorTimeoutExclusions);
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
   onSessionSlug?.(slug);
@@ -1308,7 +1310,7 @@ function runReviewArc({
   const timings = { acquireMs: null, loopMs: null, totalMs: 0 };
   const result = (fields) => ({
     pr: planned.pr, repo: planned.repo, sessionSlug: slug, lanePath: null, verdict: null, loopOutcome: null, runId: null,
-    label: null, ...fields, timings: { ...timings, totalMs: io.now() - t0 },
+    label: null, ...(expectedHead ? { expectedHead } : {}), ...fields, timings: { ...timings, totalMs: io.now() - t0 },
   });
 
   const record = { slug, pr: planned.pr, repo: planned.repo, pid, startedAt: new Date(t0).toISOString(), cwd: io.root };
@@ -1559,7 +1561,7 @@ function runReviewArc({
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, jurorTimeoutExclusions, readSink: seatsBox.speculative?.readSink ?? seatsBox.concurrent?.readSink ?? null });
     if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
@@ -1571,7 +1573,9 @@ function runReviewArc({
       // THE REAL ERROR, NEVER SILENT: a loop that stopped before judging prints `{stopped, error}` (e.g.
       // `step-refused` + the refusal text). The label used to be only `exit 1`, and the added-seats arc then
       // reported "printed no diff" — the outage of 2026-10-03 hid its cause for hours.
-      classified = { ...classifyReviewLoopOutcome(parsed), label: loopFailureLabel(parsed, loop.status) };
+      classified = { ...classifyReviewLoopOutcome(parsed), label: loopFailureLabel(parsed, loop.status),
+        ...(jurorTimeoutDetails(parsed.jurorTimeout) ? { outcome: BLOCKED_ON_INFRA, jurorTimeout: jurorTimeoutDetails(parsed.jurorTimeout),
+          label: `juror-timeout lens=${parsed.jurorTimeout.lens} provider=${parsed.jurorTimeout.provider} model=${parsed.jurorTimeout.model}` } : {}) };
     } else {
       classified = {
         outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: null,
@@ -1619,6 +1623,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
+  jurorTimeoutExclusions = [],
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
   dir = reviewJobsDir(env, root),
@@ -1666,6 +1671,7 @@ export function dispatchReviewJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
+      ...(jurorTimeoutExclusions.length ? [`--juror-timeout-exclusions=${JSON.stringify(validateJurorTimeoutExclusions(jurorTimeoutExclusions))}`] : []),
       ...(Number.isInteger(preferLane) && preferLane > 0 ? [`--prefer-lane=${preferLane}`] : [])], cwd: root, env: childEnv, logPath,
   });
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
@@ -1803,18 +1809,24 @@ export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env
 /** CLI-only registration. Returns the callback used when the arc first knows its slug. */
 export function installReviewJobExitHooks({ proc = process, dir = reviewJobsDir() } = {}) {
   let slug;
+  let terminal = {};
   const record = (exitCode, signal) => {
     try {
       if (!slug) return;
       const path = diagnosticPath(slug, dir, 'exit');
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, endedAt: new Date().toISOString() })}\n`);
+      writeFileSync(path, `${JSON.stringify({ pid: proc.pid, exitCode, signal, ...terminal, endedAt: new Date().toISOString() })}\n`);
     } catch { /* Exit diagnostics must never prevent termination. */ }
   };
   // No signal handlers: installing one would stop a SIGTERM from killing the process during the synchronous arc.
   // A signal death therefore fires no 'exit' event and leaves no marker, which the daemon reports as such.
   proc.on('exit', code => record(code, null));
-  return value => { if (value) slug = value; };
+  return (value, result) => {
+    if (value) slug = value;
+    if (jurorTimeoutDetails(result?.jurorTimeout) && /^[a-f0-9]{40}$/i.test(result?.expectedHead ?? '')) {
+      terminal = { head: result.expectedHead, outcome: result.outcome, jurorTimeout: jurorTimeoutDetails(result.jurorTimeout) };
+    }
+  };
 }
 
 /** CLI boundary; injected job and rating effects keep recovery guard tests hermetic. */
@@ -1845,8 +1857,9 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       }
       const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
+        ...(flag('juror-timeout-exclusions') === undefined ? {} : { jurorTimeoutExclusions: validateJurorTimeoutExclusions(JSON.parse(flag('juror-timeout-exclusions'))) }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
-      onSessionSlug?.(out.sessionSlug);
+      onSessionSlug?.(out.sessionSlug, out);
       writeAllSync(1, `${JSON.stringify(out)}\n`);
       // #4075/run-rating slice 1 — mechanical grading for this now-finished job-mode review, read back from
       // THIS job's own log file (stdout/stderr above were redirected there by `dispatchReviewJob`'s spawn — see

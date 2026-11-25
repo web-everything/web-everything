@@ -1,3 +1,4 @@
+import { validateJurorTimeoutExclusions } from '../lib/juror-timeout-retry.mjs';
 import { carbonNonShadowAllowed } from '../lib/review-seat-settings.mjs';
 import { seatTiming, withSeatTiming } from './review-seat-timing-core.mjs';
 /**
@@ -798,6 +799,7 @@ function judgeTelemetryFrom(outcome, effective) {
  *   process streams.
  */
 export function createDefaultJudge({
+  jurorTimeoutExclusions = [], timeoutRoutes = null,
   provider, providerName: factoryProviderName, cwd: factoryCwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
   checkProviderHold = defaultProviderQuotaHold,
   now = () => Date.now(),
@@ -806,6 +808,7 @@ export function createDefaultJudge({
   // runner alone) with no agy; the default is a dynamic import (see the call site).
   seatRunner = async (...args) => (await import('./review-seat-runner.mjs')).runSeatWithProvider(...args),
 } = {}) {
+  validateJurorTimeoutExclusions(jurorTimeoutExclusions);
   const providerName = factoryProviderName ?? 'claude';
   // `opts.cwd` — a seat given a lane of its OWN by a concurrent batch (`./parallel-judges.mjs`) runs there instead of
   // in the factory's lane. Absent, the factory's `cwd` applies exactly as before.
@@ -919,6 +922,10 @@ export function createDefaultJudge({
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
       } catch (e) {
+        if (e?.reason === 'juror-timeout' || e?.name === 'JudgeTimeoutError') {
+          Object.assign(e, { reason: 'juror-timeout', lens: request.lens, provider: spawnProviderName, model: effective.model ?? e.model ?? 'default' });
+          throw e;
+        }
         // Antigravity may skip only with explicit provider-unavailability evidence.
         // Missing/malformed output, schema failures and tool denials remain seat failures.
         if (spawnProviderName === 'antigravity' && ![
@@ -943,7 +950,14 @@ export function createDefaultJudge({
       : (provider ?? resolveProvider(providerName));
     // #3383 mechanical-dispatcher Gap 2 root cause fix — see `buildProviderRequest`'s own comment for the full
     // account of why `model`/`cwd` are conditionally spread rather than always present.
-    const outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName));
+    let outcome;
+    try { outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName)); }
+    catch (e) {
+      if (e?.reason === 'juror-timeout' || e?.name === 'JudgeTimeoutError') {
+        Object.assign(e, { reason: 'juror-timeout', lens: request.lens, provider: effectiveProviderName, model: effective.model ?? e.model ?? 'default' });
+      }
+      throw e;
+    }
     // NOT a spread of `outcome`: it also carries `argv` (which embeds the whole mandate) and the answer itself.
     // The record keeps the meter, never the material. `normalizeJudgeTelemetry` whitelists again on arrival.
     return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, effective));
@@ -955,6 +969,18 @@ export function createDefaultJudge({
     // #4815 — a request that already carries its own answer (`skipSpawn.answer`) spawns nothing: the step declared a judge turn
     // whose work turned out to be empty (no claim to verify) or impossible (no readable diff), and says what to record instead.
     if (request?.skipSpawn && typeof request.skipSpawn === 'object' && request.skipSpawn.answer != null) return judgeOutcome(request.skipSpawn.answer);
+    if (jurorTimeoutExclusions.some(row => row.lens === request?.lens)) {
+      const { selectJurorTimeoutRoute, jurorTimeoutRoutes } = await import('../lib/review-seat-provider.mjs');
+      const route = selectJurorTimeoutRoute({ lens: request.lens,
+        routes: (timeoutRoutes ?? jurorTimeoutRoutes)(request.lens), exclusions: jurorTimeoutExclusions,
+        forbiddenVendor: request.forbiddenVendor ?? null });
+      const { seatProvider, providerName: priorProvider, model: priorModel, ...plain } = request;
+      if (route.provider.startsWith('agy-')) {
+        request = { ...plain, gracefulOnUnavailable: false, seatProvider: { ...seatProvider, mode: 'agy', model: route.model, onEscape: 'refuse' } };
+      } else {
+        request = { ...plain, gracefulOnUnavailable: false, providerName: route.provider, model: route.model, effort: route.effort ?? plain.effort };
+      }
+    }
     if (request?.seatProvider == null) return judge(request, opts);
     const laneCwd = opts?.cwd || factoryCwd;
     return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });

@@ -51,6 +51,7 @@ function fixture() {
       spawnJudge: async ({ cwd }) => {
         act(cwd);
         mutated = true;
+        if (options.timeoutError) throw options.timeoutError;
         if (options.spawnError) { const error = new Error('failed without transcript'); error.telemetry = options.telemetry; throw error; }
         const t = join(root, 'transcript.jsonl');
         writeFileSync(t, options.transcriptText ?? transcript(steps(cwd)));
@@ -510,4 +511,14 @@ it('preserves first-output failure telemetry for the advisory skip boundary', as
   const run = await f.run(() => {}, undefined, { spawnError: true, telemetry });
   expect(run.status).toBe('failed');
   expect(run.telemetry).toMatchObject(telemetry);
+});
+
+
+it('preserves a juror timeout through escape checks and cleanup instead of returning a generic failed seat', async () => {
+  const { JudgeTimeoutError } = await import('../judge-spawn.mjs');
+  const timeoutError = new JudgeTimeoutError({ timeoutMs: 1, wallMs: 2 });
+  const fx = fixture();
+  const out = await fx.run(undefined, undefined, { timeoutError });
+  expect(out.jurorTimeout).toMatchObject({ reason: 'juror-timeout', provider: 'agy-gemini', model: 'test' });
+  expect(out.status).toBe('failed');
 });

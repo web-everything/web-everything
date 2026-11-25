@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { jurorTimeoutDetails } from '../../scripts/lib/juror-timeout-retry.mjs';
+import { jurorTimeoutRouteAvailable } from '../../scripts/lib/review-seat-provider.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -463,6 +465,7 @@ export function runReviewTick({
   isPidAlive = pidAlive,
   diagnoseJob = diagnoseEndedJob,
   writeJobDiagnosis = writeEndedJobDiagnosis,
+  timeoutRouteAvailable = jurorTimeoutRouteAvailable,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
@@ -655,18 +658,26 @@ export function runReviewTick({
   const owedKeys = new Set(reviews.map(d => keyFor(d.prNumber)));
   const refusedKeys = new Set((plan.refusals ?? []).map(d => keyFor(d.prNumber)));
   const openPrs = Array.isArray(rawPrs) ? new Map(rawPrs.map(p => [keyFor(p?.number), p])) : null;
+  const jurorTimeouts = dispatchState.jurorTimeouts ??= new Map();
   const noVerdictCounts = dispatchState.noVerdictCounts ??= new Map();
-  for (const key of new Set([...dispatchState.firstOwedAt.keys(), ...noVerdictCounts.keys()])) {
+  const timeoutRouteHold = (history, pr) => {
+    try { return { held: timeoutRouteAvailable({ exclusions: history.exclusions, repo, pr, head: history.head }) !== true }; }
+    catch (error) { return { held: true, detail: String(error?.message ?? error).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 300) }; }
+  };
+  for (const key of new Set([...dispatchState.firstOwedAt.keys(), ...noVerdictCounts.keys(), ...jurorTimeouts.keys()])) {
     if (!key.startsWith(`${repo}#`)) continue;
     if ((!owedKeys.has(key) && !refusedKeys.has(key)) || (openPrs && !openPrs.has(key))) {
       dispatchState.firstOwedAt.delete(key);
       noVerdictCounts.delete(key);
-    } else if (openPrs?.get(key)?.headRefOid && noVerdictCounts.get(key)?.head !== openPrs.get(key).headRefOid) {
-      noVerdictCounts.delete(key);
+      jurorTimeouts.delete(key);
+    } else if (openPrs?.get(key)?.headRefOid) {
+      if (noVerdictCounts.get(key)?.head !== openPrs.get(key).headRefOid) noVerdictCounts.delete(key);
+      if (jurorTimeouts.get(key)?.head !== openPrs.get(key).headRefOid) jurorTimeouts.delete(key);
     }
   }
   const owedSince = new Map();
   const endedNoVerdict = [];
+  const endedJurorTimeouts = [];
   const observedAt = now();
   for (const d of reviews) {
     const key = keyFor(d.prNumber);
@@ -675,22 +686,38 @@ export function runReviewTick({
     const head = d.headRefOid ?? d.headSha ?? d.head
       ?? rawPrs?.find(p => Number(p?.number) === Number(d.prNumber))?.headRefOid;
     if (head && noVerdictCounts.get(key)?.head !== head) noVerdictCounts.delete(key);
+    if (head && jurorTimeouts.get(key)?.head !== head) jurorTimeouts.delete(key);
     if (prior && head && prior.head === head && isPidAlive(prior.pid) === false) {
       const count = (noVerdictCounts.get(key)?.count ?? 0) + 1;
       noVerdictCounts.set(key, { head, count });
       // One immediate retry keeps its place; repeated failures yield to waiting peers.
       if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
+      let timeout = null;
       let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
       try {
         const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
         const job = { slug, pid: prior.pid };
         const detail = diagnoseJob(job);
+        if (detail?.marker === true && detail.head === head && /^[a-f0-9]{40}$/i.test(head)) timeout = jurorTimeoutDetails(detail.jurorTimeout);
         diagnosis = summarizeDiagnosis(detail);
         writeJobDiagnosis(job, detail);
       } catch { /* Diagnostics must never interrupt a retry. */ }
-      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
       dispatchState.lastDispatched.delete(key);
-      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+      if (timeout) {
+        noVerdictCounts.delete(key);
+        const previous = jurorTimeouts.get(key) ?? { head, count: 0, exclusions: [] };
+        const exclusions = previous.exclusions.some(row => row.lens === timeout.lens && row.provider === timeout.provider)
+          ? previous.exclusions : [...previous.exclusions, { lens: timeout.lens, provider: timeout.provider }];
+        const next = { head, count: previous.count + 1, exclusions, lens: timeout.lens };
+        // Route reads fail closed. Exhaustion never turns a mandatory lens into a skipped seat.
+        Object.assign(next, timeoutRouteHold(next, d.prNumber));
+        jurorTimeouts.set(key, next);
+        endedJurorTimeouts.push({ prNumber: d.prNumber, jobPid: prior.pid, ...timeout });
+        try { log(`review-daemon: ${key} juror-timeout lens=${timeout.lens} provider=${timeout.provider} model=${timeout.model} (job pid ${prior.pid}) - ${next.held ? 'held' : 'will retry with exclusions'}`); } catch {}
+      } else {
+        endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
+        try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+      }
     }
     owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
   }
@@ -827,6 +854,14 @@ export function runReviewTick({
   const refused = [];
   const attention = [];
   for (const d of reviews) {
+    const timeoutHistory = jurorTimeouts.get(keyFor(d.prNumber));
+    if (timeoutHistory && !timeoutHistory.held) Object.assign(timeoutHistory, timeoutRouteHold(timeoutHistory, d.prNumber));
+    if (timeoutHistory?.held) {
+      const reason = `review-blocked-on-infra: juror timeout x${timeoutHistory.count}`;
+      notStarted.push({ prNumber: d.prNumber, reason });
+      try { log(`review-daemon: ${keyFor(d.prNumber)} ${reason}; orchestrator ask: restore an allowed provider for ${timeoutHistory.lens} at head ${timeoutHistory.head}${timeoutHistory.detail ? ` (${timeoutHistory.detail})` : ''}`); } catch {}
+      continue;
+    }
     if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
     // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
@@ -844,6 +879,7 @@ export function runReviewTick({
       // The head this review was planned against: the job refuses (no verdict) unless live head still matches it.
       const plannedHead = d.headRefOid ?? d.headSha ?? d.head ?? subject?.headRefOid;
       const result = dispatch({ pr: d.prNumber, repo,
+        ...(timeoutHistory?.exclusions?.length ? { jurorTimeoutExclusions: timeoutHistory.exclusions } : {}),
         ...(plannedHead ? { expectedHead: plannedHead } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
@@ -962,6 +998,7 @@ export function runReviewTick({
   return {
     ...(owedCiReruns ? { owedCiReruns } : {}),
     ...(endedNoVerdict.length ? { endedNoVerdict } : {}),
+    ...(endedJurorTimeouts.length ? { endedJurorTimeouts } : {}),
     ...(redTeamOnSkipResult !== undefined ? { redTeamOnSkip: redTeamOnSkipResult } : {}),
     reviewsOwed: reviews.length, dispatched, failed, notStarted, ...(refused.length ? { refused } : {}), ...(attention.length ? { attention } : {}), refusals: (plan.refusals ?? []).length,
     pendingNotDispatched: explainPendingNotDispatched({

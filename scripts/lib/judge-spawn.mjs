@@ -266,7 +266,7 @@ export class JudgeUnparseableError extends Error {
  * tool-bearing juror has usually done most of the review, and discarding that is the loss this exists to end.
  */
 export class JudgeTimeoutError extends Error {
-  constructor({ timeoutMs, wallMs, stdout = '', stderr = '' }) {
+  constructor({ timeoutMs, wallMs, stdout = '', stderr = '', lens, provider = 'claude', model }) {
     super(
       `judge-spawn: the juror exceeded ${timeoutMs}ms and was killed (ran ${wallMs}ms). `
       + 'Its output did not parse, so no partial verdict is available — but this is a BOUND being hit, not a '
@@ -276,6 +276,10 @@ export class JudgeTimeoutError extends Error {
     );
     this.name = 'JudgeTimeoutError';
     this.timedOut = true;
+    this.reason = 'juror-timeout';
+    this.lens = lens;
+    this.provider = provider;
+    this.model = model;
     this.timeoutMs = timeoutMs;
     this.wallMs = wallMs;
     this.partialStdout = String(stdout);
@@ -976,7 +980,7 @@ export async function judgeSpawn({
     if (timedOut) {
       let outcome = null;
       try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
-      if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
+      if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr, lens, provider: 'claude', model });
       return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
     }
     // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.

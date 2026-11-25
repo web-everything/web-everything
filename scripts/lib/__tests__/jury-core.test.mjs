@@ -1,3 +1,4 @@
+import { keepAliveScript } from '../test-keepalive.mjs';
 import { sameAsLinkAllowed, findCarriedReviewerRuling, reviewerCarryBacking, REFERRAL_CARRY_REASON } from '../jury-core.mjs';
 import { FINDING_ID_PATTERN, findingIdentityTable, bindFindingIds, mintFindingId, normalizeFindingIdentity } from '../jury-core.mjs';
 import { validateOperatorRuling } from '../jury-core.mjs';
@@ -3220,4 +3221,101 @@ describe('#4815 the `verified` list on a referral record', () => {
     expect(readReferralRecords([first, dropped].map(r => post(renderReferralRecord(r)))).malformed).toBe(true);
     expect(readReferralRecords([rec(), first].map(r => post(renderReferralRecord(r)))).malformed).toBe(false);
   });
+});
+
+
+describe('juror timeout recovery', () => {
+  it('names the lens, actual provider and model when a sleeping juror hits the wall', async () => {
+    const { spawn } = await import('node:child_process');
+    const { judgeSpawn } = await import('../judge-spawn.mjs');
+    const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
+    let child;
+    const judge = createDefaultJudge({ providerName: 'claude', provider: request => judgeSpawn({
+      ...request, timeoutMs: 20, retries: 0,
+      spawnFn: () => (child = spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 10000 })])),
+    }) });
+    await expect(judge({ lens: 'security', model: 'sonnet', mandate: 'Judge carefully', input: 'review this', shape: { type: 'object' } }))
+      .rejects.toMatchObject({ name: 'JudgeTimeoutError', reason: 'juror-timeout',
+        lens: 'security', provider: 'claude', model: 'sonnet' });
+    expect(['SIGTERM', 'SIGKILL']).toContain(child.signalCode);
+  });
+
+  it('swaps only the timed-out lens in routing order', async () => {
+    const { selectJurorTimeoutRoute } = await import('../jury-core.mjs');
+    const routes = [{ provider: 'claude', model: 'sonnet' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }];
+    const exclusions = [{ lens: 'security', provider: 'claude' }];
+    expect(selectJurorTimeoutRoute({ lens: 'security', routes, exclusions })).toEqual(routes[1]);
+    expect(selectJurorTimeoutRoute({ lens: 'correctness', routes, exclusions })).toEqual(routes[0]);
+  });
+
+  it('never chooses the forbidden author vendor, even through another provider', async () => {
+    const { selectJurorTimeoutRoute } = await import('../jury-core.mjs');
+    const routes = [{ provider: 'claude', model: 'claude-sonnet-4' },
+      { provider: 'agy-claude', model: 'claude-opus-4' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }];
+    expect(selectJurorTimeoutRoute({ lens: 'security', routes,
+      exclusions: [{ lens: 'security', provider: 'claude' }], forbiddenVendor: 'Anthropic' })).toEqual(routes[2]);
+  });
+
+  it('never skips a mandatory lens when all allowed providers timed out', async () => {
+    const { selectJurorTimeoutRoute } = await import('../jury-core.mjs');
+    expect(() => selectJurorTimeoutRoute({ lens: 'security', routes: [{ provider: 'claude', model: 'sonnet' }],
+      exclusions: [{ lens: 'security', provider: 'claude' }] })).toThrow(/no alternative.*security/);
+  });
+
+  it.each([null, {}, [{ lens: 'security' }]])('refuses incomplete exclusion evidence %j', async exclusions => {
+    const { selectJurorTimeoutRoute } = await import('../jury-core.mjs');
+    expect(() => selectJurorTimeoutRoute({ lens: 'security', routes: [], exclusions })).toThrow(/exclusion/);
+  });
+});
+
+
+describe('judge honours daemon timeout exclusions', () => {
+  it('runs the replacement through the seat runner without permitting fallback to the excluded provider', async () => {
+    const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
+    const seatRunner = vi.fn(async request => ({ value: { summary: 'reviewed', findings: [] }, directive: request.seatProvider }));
+    const primary = vi.fn();
+    const judge = createDefaultJudge({ provider: primary, providerName: 'claude',
+      jurorTimeoutExclusions: [{ lens: 'security', provider: 'claude' }],
+      timeoutRoutes: () => [{ provider: 'claude', model: 'sonnet' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }], seatRunner });
+    await judge({ lens: 'security', mandate: 'Judge carefully', input: 'diff', shape: { type: 'object' } });
+    expect(primary).not.toHaveBeenCalled();
+    expect(seatRunner.mock.calls[0][0].seatProvider).toMatchObject({ mode: 'agy', model: 'gemini-3-pro', onEscape: 'refuse' });
+  });
+  it('refuses an exhausted mandatory lens before any juror or skip path runs', async () => {
+    const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
+    const primary = vi.fn(), seatRunner = vi.fn();
+    const judge = createDefaultJudge({ provider: primary, providerName: 'claude', seatRunner,
+      jurorTimeoutExclusions: [{ lens: 'security', provider: 'claude' }],
+      timeoutRoutes: () => [{ provider: 'claude', model: 'sonnet' }] });
+    await expect(judge({ lens: 'security', mandate: 'Judge', input: 'diff', shape: { type: 'object' } })).rejects.toThrow(/no alternative/);
+    expect(primary).not.toHaveBeenCalled(); expect(seatRunner).not.toHaveBeenCalled();
+  });
+});
+
+
+it('never promotes a shadow-only provider to count for an excluded mandatory seat', async () => {
+  const { selectJurorTimeoutRoute } = await import('../jury-core.mjs');
+  expect(() => selectJurorTimeoutRoute({ lens: 'security', exclusions: [{ lens: 'security', provider: 'claude' }],
+    routes: [{ provider: 'agy-claude', model: 'claude-opus-5-5-high', mode: 'shadow' }, { provider: 'claude', model: 'sonnet' }] })).toThrow(/no alternative/);
+});
+
+
+it('retry exclusions cannot be evaded by a graceful quota fallback or skip', async () => {
+  const { createDefaultJudge } = await import('../../operations/cli-adapter.mjs');
+  const alternate = vi.fn(async () => ({ value: { summary: 'checked', findings: [] } }));
+  const checkProviderHold = vi.fn(async () => 'quota held');
+  const judge = createDefaultJudge({ providerName: 'codex',
+    jurorTimeoutExclusions: [{ lens: 'quality', provider: 'codex' }],
+    timeoutRoutes: () => [{ provider: 'codex', model: 'gpt-6.1-sol' }, { provider: 'agy-gemini', model: 'gemini-3-pro' }],
+    seatRunner: async request => { expect(request.gracefulOnUnavailable).toBe(false); return alternate(); }, checkProviderHold });
+  await judge({ lens: 'quality', mandate: 'judge', input: 'diff', shape: {}, gracefulOnUnavailable: true });
+  expect(alternate).toHaveBeenCalledTimes(1);
+  expect(checkProviderHold).not.toHaveBeenCalled();
+});
+
+
+it('oversized exclusions refuse with an orchestrator fallback instead of silently truncating', async () => {
+  const { validateJurorTimeoutExclusions } = await import('../juror-timeout-retry.mjs');
+  expect(() => validateJurorTimeoutExclusions(Array.from({ length: 129 }, () => ({ lens: 'security', provider: 'claude' }))))
+    .toThrow(/orchestrator must inspect/);
 });

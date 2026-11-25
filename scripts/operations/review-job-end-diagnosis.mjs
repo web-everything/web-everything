@@ -1,3 +1,4 @@
+import { jurorTimeoutDetails } from '../lib/juror-timeout-retry.mjs';
 /** Bounded, read-only evidence collection; no job lifecycle decisions live here. */
 import { closeSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -38,12 +39,15 @@ export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   const lastErrorLine = (lines.filter(line => /error|exception|fatal|ETIMEDOUT|ENOENT|killed|timed out/i.test(line)).at(-1)
     ?? lines.at(-1) ?? '').slice(0, 200);
   return { exitCode: marker ? marker.exitCode : UNKNOWN, signal: marker ? marker.signal : UNKNOWN,
-    marker: Boolean(marker), lastErrorLine, tail };
+    marker: Boolean(marker), lastErrorLine, tail,
+    ...(marker?.head && /^[a-f0-9]{40}$/i.test(marker.head) && jurorTimeoutDetails(marker.jurorTimeout)
+      ? { head: marker.head, jurorTimeout: jurorTimeoutDetails(marker.jurorTimeout) } : {}) };
 }
 
 /** Pure, terminal-safe single-line summary of the collected evidence. */
 export function summarizeDiagnosis(d) {
   const safe = value => String(value ?? '?').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+  if (jurorTimeoutDetails(d.jurorTimeout)) return `juror-timeout lens=${safe(d.jurorTimeout.lens)} provider=${safe(d.jurorTimeout.provider)} model=${safe(d.jurorTimeout.model)}`;
   return `exit=${safe(d.exitCode)} signal=${safe(d.signal)} last=${JSON.stringify(safe(d.lastErrorLine))}`;
 }
 

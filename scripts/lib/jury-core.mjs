@@ -4098,3 +4098,6 @@ export function mandatoryReferralState(comments, context = {}) {
     // other hold token (a malformed record, a missing author stamp). `pending` stays the gate's own list.
     pendingFindings, pendingReasons: pendingAll.filter((p) => !listedKeys.has(p)) };
 }
+
+// Shared retry derivation: no alternate roster or mandatory-seat skip path.
+export { selectJurorTimeoutRoute } from './review-seat-provider.mjs';

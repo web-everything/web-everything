@@ -1,3 +1,5 @@
+import { validateJurorTimeoutExclusions } from './juror-timeout-retry.mjs';
+import { rosterForKey } from './dispatch-routing-providers.mjs';
 /**
  * review-seat-provider.mjs — WHICH PROVIDER SITS EACH review-pr SEAT (card 84, review half).
  *
@@ -190,6 +192,44 @@ export function assertCrossVendorPanel(models, builder) {
   const vendor = vendorOfModel(builder);
   if (!panel.length || panel.some(v => !v) || !vendor || !panel.some(v => v !== vendor)) {
     throw new Error('review panel lacks proven cross-vendor independence; operator must replace an existing seat before review');
+  }
+  return true;
+}
+
+
+/** Retry only inside the existing resolved route chain. Exhaustion never removes a seat. */
+export function selectJurorTimeoutRoute({ lens, routes, exclusions, forbiddenVendor = null }) {
+  validateJurorTimeoutExclusions(exclusions);
+  const excluded = new Set(exclusions.filter(row => row.lens === lens).map(row => row.provider));
+  const allowed = rosterForKey(`review-seat:${SEAT_PROVIDER_LENSES.includes(lens) ? mandatorySeatTask(lens) : lens}`);
+  const selected = Array.isArray(routes) && routes.find(route => allowed.includes(route?.provider) && route.mode !== 'shadow'
+    && (!route.provider.startsWith('agy-') || carbonNonShadowAllowed(route.model))
+    && typeof route.model === 'string' && route.model.length > 0 && !excluded.has(route.provider)
+    && (!forbiddenVendor || ((vendorOfModel(route.model) ?? vendorOfModel(route.provider))
+      && (vendorOfModel(route.model) ?? vendorOfModel(route.provider)) !== forbiddenVendor)));
+  if (!selected) {
+    const error = new Error(`juror-timeout: no alternative provider for mandatory/required lens ${lens}; orchestrator must restore an allowed provider`);
+    error.reason = 'juror-timeout-no-alternative';
+    error.lens = lens;
+    throw error;
+  }
+  return selected;
+}
+
+/** Resolve with the same policy, overlay, disabled-provider and capability filters as normal seats. */
+export function jurorTimeoutRoutes(lens) {
+  const policy = readRoutingPolicy();
+  const task = SEAT_PROVIDER_LENSES.includes(lens) ? mandatorySeatTask(lens) : lens;
+  const available = rosterForKey(`review-seat:${task}`);
+  const route = resolveOperationRoute({ operation: REVIEW_SEAT_OPERATION, taskType: task, available, policy,
+    aiRouting: aiRoutingInputs('review', resolveAiRouting()).coordinator, operatorKeys: readRoutingPolicy.operatorKeys() });
+  // Inheritance grants no new fallback. The caller must hold rather than invent providers.
+  return route ? [route, ...(route.fallback ?? [])] : [];
+}
+
+export function jurorTimeoutRouteAvailable({ exclusions }) {
+  for (const lens of new Set(exclusions.map(row => row.lens))) {
+    selectJurorTimeoutRoute({ lens, routes: jurorTimeoutRoutes(lens), exclusions });
   }
   return true;
 }

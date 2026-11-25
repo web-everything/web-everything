@@ -54,3 +54,14 @@ it('falls back to the last nonempty line and makes summaries one terminal-safe l
   expect(summarizeDiagnosis({ exitCode: 1, signal: null, lastErrorLine: 'bad\n"line"\x1b' }))
     .toBe(String.raw`exit=1 signal=? last="bad \"line\" "`);
 });
+
+it('carries structured timeout only from the matching job marker, never from log text', () => {
+  const head = 'a'.repeat(40);
+  const jurorTimeout = { reason: 'juror-timeout', lens: 'security', provider: 'claude', model: 'sonnet' };
+  writeFileSync(join(dir, `${slug}.log`), JSON.stringify({ head, jurorTimeout }));
+  expect(diagnose().jurorTimeout).toBeUndefined();
+  writeFileSync(join(dir, 'diagnostics', `${slug}.exit.json`), JSON.stringify({ pid, exitCode: 0, head, jurorTimeout }));
+  expect(diagnose()).toMatchObject({ head, jurorTimeout });
+  writeFileSync(join(dir, 'diagnostics', `${slug}.exit.json`), JSON.stringify({ pid: pid + 1, head, jurorTimeout }));
+  expect(diagnose().jurorTimeout).toBeUndefined();
+});

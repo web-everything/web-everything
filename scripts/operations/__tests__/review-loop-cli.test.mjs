@@ -1,3 +1,4 @@
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 /**
  * @file review-loop-cli.test.mjs — #3072's remaining slice, exercised end to end with no `gh`, no juror
  * subprocess and no real learnings-pool/backlog file: a stub `readPr`, a canned judge, recording sinks, an
@@ -2339,4 +2340,22 @@ it('default review-loop minting keys the persisted run by its parsed PR', async 
   });
   expect(out.code).toBe(0);
   expect(out.run.id.match(NAME_RE)?.[1]).toBe(String(out.run.input.pr));
+});
+
+
+it('a sleeping juror emits structured timeout JSON and no verdict or review effects', async () => {
+  const { spawn } = await import('node:child_process');
+  const { judgeSpawn } = await import('../../lib/judge-spawn.mjs');
+  const { declaration, registry } = registryFor({ rev: HEAD_A });
+  const effects = [];
+  const out = await runReviewLoopCliOnce({ declaration, registry, argv: [...BASE_ARGV, '--json'],
+    store: createMemoryRunStore(), sinks: recordingSinks(effects), mintRunId: () => 'r-sleeping-juror',
+    makeJudge: () => request => judgeSpawn({ ...request, allowedTools: null, timeoutMs: 20, retries: 0,
+      spawnFn: () => spawn(process.execPath, ['-e', keepAliveScript({ maxLifetimeMs: 10000 })]) }),
+  });
+  const payload = JSON.parse(out.lines[0]);
+  expect(out.code).toBe(1);
+  expect(payload.jurorTimeout).toMatchObject({ reason: 'juror-timeout', lens: 'correctness', provider: 'claude', model: 'sonnet' });
+  expect(payload.verdict).toBeNull();
+  expect(effects).toEqual([]);
 });

@@ -894,6 +894,7 @@ export function createCliJudgeFactory({ env = process.env, factory = createDefau
   // THE FLAG WINS, and the env var is the fallback — the explicit act beats the ambient one. `|| null` on both,
   // never a fallback to this process's directory: see the `makeJudge` note at the call site.
   return ({ cwd, model, provider } = {}) => factory({
+    ...(env.WE_REVIEW_JUROR_TIMEOUT_EXCLUSIONS === undefined ? {} : { jurorTimeoutExclusions: JSON.parse(env.WE_REVIEW_JUROR_TIMEOUT_EXCLUSIONS) }),
     cwd: cwd || env.JUDGE_LANE_CWD || null,
     model: model || null,
     providerName: provider || env.JUDGE_PROVIDER || 'claude',

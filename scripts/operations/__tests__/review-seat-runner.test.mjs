@@ -779,3 +779,26 @@ describe('carbon shadow seat vs the agy-gemini live seat cap (R1062a)', () => {
     expect(reserved).toEqual([7]);
   });
 });
+
+
+it('rethrows an alternate juror timeout with its lens and actual provider; never falls back to the failed vendor', async () => {
+  const claudeJudge = vi.fn();
+  await expect(runSeatWithProvider({ ...REQUEST, seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'refuse' } }, io({
+    claudeJudge, agyJuror: async () => ({ status: 'failed', jurorTimeout: { reason: 'juror-timeout', lens: 'correctness', provider: 'agy-claude', model: 'claude-opus-5-5-high' } }),
+  }))).rejects.toMatchObject({ reason: 'juror-timeout', lens: 'correctness', provider: 'agy-claude' });
+  expect(claudeJudge).not.toHaveBeenCalled();
+});
+
+it('rejects an ordinary failed replacement without calling the excluded Claude fallback', async () => {
+  const claudeJudge = vi.fn(async () => judgeOutcome({ summary: 'clean fallback', findings: [] }));
+  const agyJuror = vi.fn(async () => ({ status: 'failed', reasons: ['ordinary provider failure'] }));
+  await expect(runSeatWithProvider({
+    ...REQUEST,
+    gracefulOnUnavailable: false,
+    seatProvider: { mode: 'agy', model: 'claude-opus-5-5-high', onEscape: 'refuse' },
+  }, io({ claudeJudge, agyJuror }))).rejects.toThrow(
+    'replacement seat correctness failed; excluded fallback refused: ordinary provider failure',
+  );
+  expect(agyJuror).toHaveBeenCalledTimes(1);
+  expect(claudeJudge).not.toHaveBeenCalled();
+});

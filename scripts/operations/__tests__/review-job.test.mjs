@@ -761,3 +761,27 @@ describe('CLI exit evidence', () => {
     expect(() => proc.emit('exit', 1)).not.toThrow();
   });
 });
+
+
+describe('juror timeout job evidence', () => {
+  it('forwards exclusions to the loop and keeps the timeout identity in the final job result', () => {
+    const jurorTimeout = { reason: 'juror-timeout', lens: 'security', provider: 'claude', model: 'sonnet' };
+    const jurorTimeoutExclusions = [{ lens: 'correctness', provider: 'claude' }];
+    const runLoop = vi.fn(() => ({ status: 1, stdout: JSON.stringify({ stopped: 'judge-error', error: 'wall', jurorTimeout }) }));
+    const { io } = fakeIo({ runLoop });
+    const out = runReviewJob({ pr: 10, repo: REPO, jurorTimeoutExclusions }, io);
+    expect(out).toMatchObject({ outcome: BLOCKED_ON_INFRA, jurorTimeout });
+    expect(runLoop.mock.calls[0][0].jurorTimeoutExclusions).toEqual(jurorTimeoutExclusions);
+  });
+});
+
+
+it('exit marker binds the timeout to this pid and expected head even with wrapper exit zero', () => {
+  const proc = new EventEmitter(); proc.pid = 123;
+  const done = installReviewJobExitHooks({ proc, dir });
+  const jurorTimeout = { reason: 'juror-timeout', lens: 'security', provider: 'claude', model: 'sonnet' };
+  done('review-we-42', { expectedHead: HEAD, outcome: BLOCKED_ON_INFRA, jurorTimeout });
+  proc.emit('exit', 0);
+  expect(JSON.parse(readFileSync(join(dir, 'diagnostics', 'review-we-42.exit.json'), 'utf8')))
+    .toMatchObject({ pid: 123, head: HEAD, exitCode: 0, outcome: BLOCKED_ON_INFRA, jurorTimeout });
+});
