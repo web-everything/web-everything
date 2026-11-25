@@ -1345,9 +1345,9 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
 // Shadow changes ONLY the exit code: every rule is evaluated and reported exactly as in enforce.
 
 describe('mergeGate.mode resolves through the policy cascade', () => {
-  it('defaults to the standard value, shadow, with its source named', () => {
-    expect(resolveMergeGateMode({})).toMatchObject({ mode: 'shadow', source: 'standard' });
-    expect(STANDARD_MERGE_GATE_MODE).toBe('shadow');
+  it('defaults to the standard value, enforce, with its source named', () => {
+    expect(resolveMergeGateMode({})).toMatchObject({ mode: 'enforce', source: 'standard' });
+    expect(STANDARD_MERGE_GATE_MODE).toBe('enforce');
   });
 
   it('each higher layer wins: standard < platform < repo < env', () => {
@@ -1376,7 +1376,7 @@ describe('mergeGate.mode resolves through the policy cascade', () => {
     expect(loadMergeGateMode({ env: {}, readFile, readDeclared: read('shadow') })).toMatchObject({ mode: 'shadow', source: 'repo' });
     expect(loadMergeGateMode({ env: { MERGE_GATE_MODE: 'enforce' }, readFile, readDeclared: read('shadow') })).toMatchObject({ mode: 'enforce', source: 'env' });
     const enoent = () => { throw Object.assign(new Error('nope'), { code: 'ENOENT' }); };
-    expect(loadMergeGateMode({ env: {}, readFile: enoent, readDeclared: read(null) })).toMatchObject({ mode: 'shadow', source: 'standard' });
+    expect(loadMergeGateMode({ env: {}, readFile: enoent, readDeclared: read(null) })).toMatchObject({ mode: 'enforce', source: 'standard' });
   });
 
   it('an unreadable layer fails closed to enforce (a skipped file could be the one that says enforce)', () => {
@@ -1395,14 +1395,14 @@ describe('applyGateMode changes only the exit code', () => {
   const passing = evaluatePrGates(facts(), {});
   const report = (prs) => ({ ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs });
 
-  it('shadow: a HOLD verdict exits 0 and names the holding rules', () => {
+  it('shadow: a HOLD exits 1 and names the holding rules', () => {
     expect(held.ok).toBe(false);
     const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: report([held]) });
-    expect(out.exitCode).toBe(0);
-    expect(out.text).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+    expect(out.exitCode).toBe(1);
+    expect(out.text).toMatch(/SHADOW \(log only\): HOLD on red-main-freeze/);
     expect(out.text).toMatch(/fail-closed\s+red-main-freeze\s+no shared red-main freeze source yet/);
     expect(out.text).toMatch(/merge-gate: HOLD/);
-    expect(out.summary).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+    expect(out.summary).toMatch(/SHADOW \(log only\): HOLD on red-main-freeze/);
     expect(out.summary).toMatch(/mode: shadow \(source: standard\)/);
   });
 
@@ -1425,8 +1425,8 @@ describe('applyGateMode changes only the exit code', () => {
 
   it('a hold that is not one rule (workflow self-check) is still named in shadow', () => {
     const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: { ok: false, reason: 'workflow self-check failed — fail closed: x', prs: [passing] } });
-    expect(out.exitCode).toBe(0);
-    expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
+    expect(out.exitCode).toBe(1);
+    expect(out.text).toMatch(/SHADOW \(log only\): HOLD on workflow self-check failed/);
   });
 
   it('no verdict (crash, usage error, unparsable or inconsistent output) is never masked, even in shadow', () => {
@@ -1434,6 +1434,80 @@ describe('applyGateMode changes only the exit code', () => {
       const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus, report: rep });
       expect(out.exitCode, JSON.stringify([childStatus, rep])).toBe(childStatus === 0 ? 1 : childStatus);
       expect(out.text).toMatch(/no verdict/);
+    }
+  });
+});
+
+describe('shadow mode never changes the exit code (PRT-SHADOW-HOLD v2)', () => {
+  const pr = (over) => evaluatePrGates(facts(over), {});
+  const rep = (prs, extra = {}) => ({ ok: prs.every((p) => p.ok), reason: 'held', prs, ...extra });
+  const humanOnly = pr({ gatePaths: { files: ['.github/workflows/merge-gate.yml'] } });
+  const redMainStates = [
+    ['no shared source', { redMain: { source: null } }, 'fail-closed'],
+    ['unreadable freeze', { redMain: { source: 'ops/red-main', error: 'boom' } }, 'fail-closed'],
+    ['main CI unreadable', { redMain: { source: 'ops/red-main', error: 'main CI unreadable' } }, 'fail-closed'],
+    ['manual freeze', { redMain: { source: 'ops/red-main', frozen: true, reason: 'manual freeze: ops' } }, 'hold'],
+    ['main CI red since', { redMain: { source: 'ops/red-main', frozen: true, reason: 'main CI red since 12:00' } }, 'hold'],
+  ];
+  const reports = [
+    ['null', null],
+    ['passing', rep([pr({})], { ok: true })],
+    ['human-only hold', rep([humanOnly])],
+    ...redMainStates.map(([name, over]) => [`red-main: ${name}`, rep([pr(over)])]),
+    ['recheck: freeze unreadable at verdict time', rep([pr({})], { ok: false, reason: 'red-main freeze unreadable at verdict time — fail closed' })],
+    ['recheck: main CI went RED', rep([pr({})], { ok: false, reason: 'main CI went RED during this run' })],
+    ['workflow self-check failed', rep([pr({})], { ok: false, reason: 'workflow self-check failed — fail closed: x' })],
+    ['status that does not fit its gate', rep([{ ...pr({}), results: [{ id: 'red-main-freeze', status: 'queue', reason: 'x' }] }], { ok: false })],
+    ['unrequested PR #999', rep([{ ...pr({}), num: 999 }], { ok: false })],
+    ['malformed', { ok: 'yes', prs: 'x' }],
+  ];
+  const modes = ['shadow', 'enforce', '', undefined, 'SHADOW', 'off'];
+  const statuses = [0, 1, 2, 3, null];
+
+  it('T1: exit code is the same for every mode, and 0 only for child 0 + report.ok', () => {
+    for (const [name, report] of reports) {
+      for (const childStatus of statuses) {
+        const strict = applyGateMode({ mode: 'enforce', source: 's', childStatus, report }).exitCode;
+        for (const mode of modes) {
+          const got = applyGateMode({ mode, source: 's', childStatus, report }).exitCode;
+          expect(got, `${name} status=${childStatus} mode=${String(mode)}`).toBe(strict);
+          if (got === 0) expect(childStatus === 0 && report?.ok === true, `${name} ${childStatus}`).toBe(true);
+        }
+      }
+    }
+  });
+
+  it('shadow mode keeps a human-only workflow-edit hold failing', () => {
+    expect(humanOnly.ok).toBe(false);
+    expect(humanOnly.results.find((x) => x.id === 'review-acceptance')).toMatchObject({ status: 'hold', reason: expect.stringMatching(/human-only/) });
+    expect(applyGateMode({ mode: 'shadow', childStatus: 1, report: { ok: false, reason: 'held', prs: [humanOnly] } }).exitCode).toBe(1);
+  });
+
+  it('shadow mode never changes the exit code', () => {
+    const out = applyGateMode({ mode: 'shadow', source: 'env', childStatus: 1, report: rep([pr({ redMain: { source: 'ops/red-main', frozen: true, reason: 'manual freeze: ops' } })]) });
+    expect(out.exitCode).toBe(1);
+  });
+
+  it('shadow still logs what enforce holds on', () => {
+    const out = applyGateMode({ mode: 'shadow', source: 'env', childStatus: 1, report: rep([humanOnly]) });
+    expect(out.text).toMatch(/SHADOW \(log only\): HOLD on .*review-acceptance.* — exit 1, same as enforce/);
+    expect(out.summary).not.toMatch(/exit 0/);
+  });
+
+  for (const [name, over, status] of redMainStates) {
+    it(`T4: red-main state "${name}" is ${status} and exits 1 in shadow`, () => {
+      const p = pr(over);
+      expect(p.results.find((x) => x.id === 'red-main-freeze').status).toBe(status);
+      expect(applyGateMode({ mode: 'shadow', childStatus: 1, report: rep([p]) }).exitCode).toBe(1);
+    });
+  }
+
+  it('T5: the cascade standard is enforce, and shadow from a layer stays valid but strict', () => {
+    expect(resolveMergeGateMode({})).toMatchObject({ mode: 'enforce', source: 'standard' });
+    for (const layer of ['platform', 'repo', 'env']) {
+      const r = resolveMergeGateMode({ [layer]: 'shadow' });
+      expect(r).toMatchObject({ mode: 'shadow', source: layer });
+      expect(applyGateMode({ ...r, childStatus: 1, report: rep([humanOnly]) }).exitCode).toBe(1);
     }
   });
 });
@@ -1457,13 +1531,20 @@ describe('runGate (the workflow wrapper around merge-gate-check.mjs)', () => {
     };
   };
 
-  it('runs merge-gate-check.mjs with --json, logs the mode source, and exits 0 in shadow on a hold', () => {
+  it('runGate in shadow passes the hold through as exit 1, logs the mode source', () => {
     const h = harness(heldReport(), 1);
     const code = runGate({ argv: ['--', 'scripts/merge-gate-check.mjs', '--repo=o/r', '--pr=5'], modeInfo: { mode: 'shadow', source: 'standard' }, ...h.deps });
-    expect(code).toBe(0);
+    expect(code).toBe(1);
     expect(h.calls[0].slice(1)).toEqual([script, '--repo=o/r', '--pr=5', '--json']);
     expect(h.written.join('')).toMatch(/merge-gate mode: shadow \(source: standard\)/);
-    expect(h.summary.join('')).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+    expect(h.summary.join('')).toMatch(/SHADOW \(log only\): HOLD on red-main-freeze/);
+  });
+
+  it('T3: a human-only workflow-edit hold in shadow exits 1 end to end', () => {
+    const p = evaluatePrGates(facts({ gatePaths: { files: ['.github/workflows/merge-gate.yml'] } }), {});
+    const h = harness(JSON.stringify({ ok: false, reason: 'held', prs: [p] }), 1);
+    expect(runGate({ argv: ['--', 'scripts/merge-gate-check.mjs', '--pr=5'], modeInfo: { mode: 'shadow' }, ...h.deps })).toBe(1);
+    expect(h.written.join('')).toMatch(/SHADOW \(log only\)/);
   });
 
   it('enforce passes the hold through as exit 1', () => {
