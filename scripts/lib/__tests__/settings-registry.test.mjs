@@ -293,6 +293,8 @@ function originalFixture(t) {
   Object.assign(f.meta, structuredClone(originalMetadata));
   // Capacity declarations come from live code even with historical owner files.
   Object.assign(f.meta.capacityLeaves, structuredClone(poolMetadata.capacityLeaves));
+  // The new capacity leaf is live; keep the original metadata/byte oracle immutable.
+  f.meta.capacityLeaves['gh.throttle.pointsBudgetPerMin'] = { description: 'Host GitHub points budget.', range: 'integer 1–600' };
   return f;
 }
 function split(f) {
