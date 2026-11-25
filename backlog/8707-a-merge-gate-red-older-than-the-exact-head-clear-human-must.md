@@ -1,4 +1,5 @@
 ---
+bornAs: x7otjhx
 kind: story
 size: 3
 status: open
