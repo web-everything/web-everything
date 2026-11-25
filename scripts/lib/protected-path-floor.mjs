@@ -286,6 +286,8 @@ export const LOCK_USERS = Object.freeze([
   'scripts/lib/daemon-rebuild/overlay-main-sync.mjs', 'scripts/lib/daemon-rebuild/rebuild-job.mjs',
   'scripts/lib/drain-queue-safety.mjs', 'scripts/lib/drain-red-team-evidence.mjs', 'scripts/lib/fix-slot-borrow.mjs',
   'scripts/lib/gh-throttle-holders.mjs', 'scripts/lib/gh-throttle.mjs', 'scripts/lib/host-load.mjs',
+  // Heavy PR cache persistence serializes writers through atomic-json-file.mjs#withFileLock.
+  'scripts/lib/heavy-cache.mjs',
   'scripts/lib/merge-queue-adaptive-batching.mjs', 'scripts/lib/pr-limit.mjs', 'scripts/lib/pr-list-paged.mjs', 'scripts/lib/pr-snapshot.mjs',
   // Gate refresh takes withFileLock; enqueue reserves the pending-refresh reader lock.
   'scripts/lib/merge-gate-refresh.mjs', 'scripts/lib/merge-queue-enqueue.mjs',
