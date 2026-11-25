@@ -181,6 +181,7 @@ import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBase
 import { mergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
 import { DERIVED_REGEN, DERIVED_OUTPUT_PATHS, numberPendingHashes, isPostLandTreeDirty, landedNumberFor, resolveLandedItem } from './lane-drain.mjs'; // #2899 A5 — `resolveLandedItem` shares lane-drain's ONE resolve-on-land home, exactly as `numberPendingHashes` shares its numbering (never a fork)
 import { isHash } from './backlog/id.mjs'; // #2393 — a stackParent hash's bornAs-on-main lookup is hash-only
+import { checkDrainFence } from './readiness/drain-fence.mjs'; // BLUE-GREEN-SWAP S1.2 — per-merge lease-fence re-read
 import { withNumberingLock, withLandWriteLock, acquireDrainLease, heartbeatDrainLease, releaseDrainLease, drainLeaseStatus, drainOwner, DRAIN_LOCK_ROOT, localRepoSlug } from './readiness/drain-lock.mjs'; // #2391 — numbering-critical-section mutex + (#2683) the merge-write mutex (withLandWriteLock, same lock key) + (#2395) whole-process drain lease a `--watch` monitor holds for its lifetime + (#3440) localRepoSlug keys that lease per-repo
 import { findDuplicateIds, summarizeDuplicates } from './lib/duplicate-id-tripwire.mjs';
 import { autoStrandedSweepPass } from './backlog-stranded-sweep.mjs'; // xvr2o8r — the strict #3916 auto-resolve backstop, run once per pass (see runStrandedSweepStep below); never a second resolver, shares resolveLandedItem via that module
@@ -5021,6 +5022,8 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // daemon that already holds the lease (#2449) — run without acquiring, the parent owns the heartbeat.
   const NO_DRAIN_LEASE = !!flags['no-drain-lease'];
   const UNDER_LEASE = (typeof flags['under-lease'] === 'string' && flags['under-lease']) ? flags['under-lease'] : (env.DRAIN_UNDER_LEASE || null);
+  // BLUE-GREEN-SWAP S1.2 — `--fence=<n>`: the lease fence the daemon held when it started this child; re-read before each merge.
+  const UNDER_FENCE = (UNDER_LEASE && Number.isInteger(Number(flags.fence)) && flags.fence !== true && flags.fence !== '') ? Number(flags.fence) : null;
   // #2395 — `--max-runtime-min=N`: a wall-clock lifetime cap on a `--watch` monitor. The bounded-max-lifetime
   // backstop push-at-close needs: when its detached drain has no batch feed, `--until-batches-idle` is INERT
   // and would poll forever, so this hard-stops the watch after N minutes regardless of idle/feed state. 0/unset
@@ -7906,6 +7909,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'branch-preparation', reason: revalidationAborted.at(-1)?.reason || prepared.reason || prepared.detail || 'branch preparation refused' }); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }
           const landLock = withLandWriteLock(() => {
+            // BLUE-GREEN-SWAP S1.2 (FLOW-DMN-012/013/014/015) — re-read the lease fence right before the write: a lease that
+            // moved on (or is unreadable) refuses this merge; the PR rides the next pass.
+            const fenceCheck = checkDrainFence({ lockRoot: DRAIN_LOCK_ROOT, owner: UNDER_LEASE, fence: UNDER_FENCE, repoKey: localSlug });
+            if (!fenceCheck.ok) return { skipped: 'drain-fence', reason: fenceCheck.reason };
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
             // xym8nt4 — re-check group ownership under the mutex: a group may have claimed this PR since the pre-pass hold.
             const groupHeld = cardGrouping.holdFor(c);
@@ -7917,6 +7924,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
             return { merged: true };
           }, (mergeStrategy.enqueues(c.repo) || cardGrouping.mayHold()) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; xym8nt4 — nor may a direct merge's group re-check (a group claim holds this lock); a refused lock retries next pass
           if (landLock.ran === false) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'merge-lock-held', reason: `merge-write mutex held by ${landLock.heldBy || '?'}` }); if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
+          if (landLock.result?.skipped === 'drain-fence') {
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'drain-fence', reason: landLock.result.reason });
+            if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: drain lease fence refused (${landLock.result.reason}) — rides the next pass\n`);
+            c.decision = 'skip'; c.reason = `drain-fence:${landLock.result.reason}`;
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) { cc.decision = 'skip'; cc.reason = c.reason; }
+            continue;
+          }
           if (landLock.result?.skipped === 'card-group-hold') {
             recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', kind: 'card-group-hold', reason: landLock.result.reason });
             if (!AS_JSON) process.stderr.write(`  ⏸ ${repoTag(c.repo)}${c.num} not landed: ${landLock.result.reason} — claimed by a card group after the pass-start check (xym8nt4)\n`);

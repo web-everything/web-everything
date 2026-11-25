@@ -52,13 +52,13 @@
  * scripts/readiness/__tests__/drain-lock.test.mjs.
  */
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, renameSync, appendFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { canonicalizeSlug } from '../lib/constellation-repos.mjs';
 import {
-  reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired, DEFAULT_LEASE_MINUTES,
+  reserve, readLockEntry, releaseLockDir, heartbeat, isLeaseExpired, DEFAULT_LEASE_MINUTES, lockDirFor, makeLockEntry,
 } from './file-locks.mjs';
 
 /** Machine-global lock home — shared across every checkout on the host so lands in DIFFERENT clones contend
@@ -338,7 +338,51 @@ export function acquireDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwner
   // existing recorded scope forward — mirrors heartbeatDrainLease so a re-acquire never silently drops it.
   const cur = readLockEntry(lockRoot, path);
   const keep = normalizeScope(scope) || (cur && cur.owner === owner && cur.meta && normalizeScope(cur.meta.scope)) || null;
-  return reserve(lockRoot, path, owner, nowMs, nowIsoFrom(nowMs), pid, 'unknown', leaseMinutes, keep ? { scope: keep } : null);
+  // S1.2 — fence: an own re-acquire keeps the stored fence (and handover record); a fresh/reclaimed lease rises past any prior fence.
+  const prevFence = fenceOf(cur);
+  const fence = cur && cur.owner === owner && prevFence ? prevFence : prevFence + 1;
+  const handover = cur && cur.owner === owner && cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {};
+  return reserve(lockRoot, path, owner, nowMs, nowIsoFrom(nowMs), pid, 'unknown', leaseMinutes, { ...(keep ? { scope: keep } : {}), fence, ...handover });
+}
+
+/** The integer fence stored in a lease entry's meta (0 when absent/invalid). */
+function fenceOf(entry) { const f = entry && entry.meta ? entry.meta.fence : 0; return Number.isInteger(f) && f > 0 ? f : 0; }
+
+/** The current drain-lease fence, or `null` when no lease entry is readable. Throws nothing. */
+export function readDrainFence(lockRoot = DRAIN_LOCK_ROOT, { repoKey = null } = {}) {
+  try { const e = readLockEntry(lockRoot, drainLeasePathFor(repoKey)); return e ? (fenceOf(e) || null) : null; } catch { return null; }
+}
+
+/**
+ * S1.2 (FLOW-DMN-012/046/048) — atomic, fenced hand-over of the drain lease from `from` to `to`, never freeing
+ * the lock dir (so no mkdir-acquirer can win in between). CAS on owner==from AND fence==expectFence; writes the
+ * new entry at fence+1 via tmp+rename inside the existing lock dir, re-reads to verify, then appends
+ * `handovers.jsonl` (ordered by fence). Every unreadable/mismatch case refuses. Rollback = the same call reversed.
+ * @returns {{ok:true, fence:number}|{ok:false, reason:string}}
+ */
+export function handoverDrainLease(lockRoot = DRAIN_LOCK_ROOT, { from, to, toPid = null, expectFence, gen = null, codeDigest = null, nowMs = Date.now(), repoKey = null } = {}, { beforeRename = null } = {}) {
+  const path = drainLeasePathFor(repoKey);
+  let cur;
+  try { cur = readLockEntry(lockRoot, path); } catch { return { ok: false, reason: 'lease-unknown' }; }
+  if (!cur) return { ok: false, reason: 'no-lease' };
+  if (cur.owner !== from) return { ok: false, reason: 'not-owner' };
+  const f = fenceOf(cur);
+  if (!f || f !== expectFence) return { ok: false, reason: 'fence-mismatch' };
+  const next = f + 1;
+  const at = nowIsoFrom(nowMs);
+  const meta = { ...(cur.meta || {}), fence: next, handover: { from, fromFence: f, gen, codeDigest, at } };
+  const entry = makeLockEntry(to, path, at, Number.isInteger(toPid) ? toPid : null, meta);
+  const dir = lockDirFor(lockRoot, path);
+  const tmp = join(dir, `lock.json.handover-${process.pid}`);
+  try {
+    writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n', 'utf8');
+    if (beforeRename) beforeRename();
+    renameSync(tmp, join(dir, 'lock.json'));
+    const back = readLockEntry(lockRoot, path);
+    if (!back || back.owner !== to || fenceOf(back) !== next) return { ok: false, reason: 'verify-failed' };
+    try { appendFileSync(join(lockRoot, 'handovers.jsonl'), JSON.stringify({ fence: next, from, to, fromFence: f, gen, codeDigest, at }) + '\n'); } catch { /* the lease record is the truth; the log is advisory */ }
+    return { ok: true, fence: next };
+  } catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } return { ok: false, reason: 'write-failed' }; }
 }
 
 /** Refresh the drain lease heartbeat (a live drain extends its lease each pass). No-op if the lease was
@@ -351,7 +395,9 @@ export function heartbeatDrainLease(lockRoot = DRAIN_LOCK_ROOT, owner = drainOwn
   const cur = readLockEntry(lockRoot, path);
   if (!cur || cur.owner !== owner) return false;
   const keep = normalizeScope(scope) || (cur.meta && normalizeScope(cur.meta.scope)) || null;
-  return heartbeat(lockRoot, path, owner, nowIsoFrom(nowMs), pid, keep ? { scope: keep } : null);
+  const fence = fenceOf(cur); // S1.2 — a heartbeat rewrite must carry the fence (and handover record) forward
+  const meta = { ...(keep ? { scope: keep } : {}), ...(fence ? { fence } : {}), ...(cur.meta && cur.meta.handover ? { handover: cur.meta.handover } : {}) };
+  return heartbeat(lockRoot, path, owner, nowIsoFrom(nowMs), pid, Object.keys(meta).length ? meta : null);
 }
 
 /** Release the drain lease, but ONLY if `owner` still holds it (never stomp a reclaimer). Idempotent.

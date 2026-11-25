@@ -262,7 +262,7 @@ describe('drain lease REPO-SCOPE metadata (#2458)', () => {
   it('a lease acquired WITHOUT a scope has scope null (legacy/unscoped holder → gate treats as covers-all)', () => {
     acquireDrainLease(root, 'drainA', { nowMs: T0 });
     expect(drainLeaseStatus(root, { nowMs: T0 }).scope).toBeNull();
-    expect(readLockEntry(root, DRAIN_LEASE_PATH).meta).toBeUndefined(); // no meta key when there is nothing to record
+    expect(readLockEntry(root, DRAIN_LEASE_PATH).meta).toEqual({ fence: 1 }); // only the S1.2 fence; no scope key
   });
 
   it('the recorded scope SURVIVES a heartbeat that supplies no scope (the resident-daemon case)', () => {
