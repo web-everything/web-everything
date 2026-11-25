@@ -482,6 +482,17 @@ test('standalone timeout policy does not claim conveyor setting metadata', t => 
   assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
 });
 
+test('standalone selector documents do not claim metadata or collide with declared conveyor leaves', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/delivery-strategy-table.json', { version: 'draft', description: 'Table', inputs: [], rules: [] });
+  f.write('scripts/settings/delivery-strategy.json', { revision: 'draft', values: { 'overlay-cap': 3 } });
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.ok(!registry.rows.some(row => row.owners.some(owner => /\/delivery-strategy(?:-table)?\.json$/.test(owner))));
+  assert.ok(!registry.rows.some(row => ['version', 'description', 'inputs', 'rules', 'revision', 'values'].includes(row.key)));
+  assert.doesNotThrow(() => renderMarkdown(registry));
+});
+
 function authoredFixture(t) {
   const f = fixture(t); split(f);
   for (const key of ['instantGaps', 'toSettle', 'discoveryPasses']) f.write(`${META_DIR}/lists/${key}.json`, f.meta[key]);

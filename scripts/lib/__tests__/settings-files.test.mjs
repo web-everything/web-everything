@@ -182,6 +182,22 @@ describe('readSettingsChecked — fail-closed evidence', () => {
     expect(readSettingsChecked(options).taint).toEqual([{ source: 'settings/other-policy.json', reason: 'dotted key' }]);
   }));
 
+  it.each(['delivery-strategy-table.json', 'delivery-strategy.json'])('standalone %s stays out of shared settings while other files still fail closed', (name) => fixture((options) => {
+    writeFileSync(join(options.dir, 'feature.json'), '{"version":"owned","description":"owned"}');
+    for (const raw of ['{"version":"table","description":"proposal","values":{"overlay-cap":3}}', '{invalid']) {
+      writeFileSync(join(options.dir, name), raw);
+      expect(readSettingsChecked(options)).toEqual({ value: { version: 'owned', description: 'owned' }, taint: [], duplicates: [] });
+      expect(readDeclaredSettings(options)).toMatchObject({
+        settings: { version: 'owned', description: 'owned' }, sources: ['settings/feature.json'], errors: [], duplicates: [],
+      });
+      expect(readSettings(options)).toEqual({ version: 'owned', description: 'owned' });
+    }
+    // Exclusion is by exact filename, never by content or a broad strategy prefix.
+    writeFileSync(join(options.dir, 'delivery-strategy-extra.json'), '{invalid');
+    expect(readSettingsChecked(options).taint).toEqual([{ source: 'settings/delivery-strategy-extra.json', reason: 'invalid JSON' }]);
+    expect(readDeclaredSettings(options).errors).toHaveLength(1);
+  }));
+
   it('clean reads select whole trees, subtrees and leaves with empty taint', () => fixture((options) => {
     writeFileSync(options.legacyPath, '{"fixDispatch":{"parkedCapFactor":2}}');
     writeFileSync(join(options.dir, 'a.json'), '{"fixDispatch":{"other":3},"cap":4}');

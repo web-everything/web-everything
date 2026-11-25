@@ -74,7 +74,11 @@ export const LEGACY_FILE_GUARD_HINT = 'put a NEW setting in scripts/settings/<fe
 
 /** A feature file name: lower-case kebab words, `.json`. */
 /** Standalone spec documents have their own readers; they are not conveyor key namespaces. */
-export const STANDALONE_POLICY_FILES = Object.freeze(['test-timeout-policy.json']);
+export const STANDALONE_POLICY_FILES = Object.freeze([
+  'test-timeout-policy.json',
+  // The pure selector consumes these whole documents, not merged conveyor keys.
+  'delivery-strategy-table.json', 'delivery-strategy.json',
+]);
 
 export const FEATURE_FILE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.json$/;
 
