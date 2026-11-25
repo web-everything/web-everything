@@ -15,12 +15,15 @@ import { writeApprovalRecord, validRulingId } from '../lib/approval-record.mjs';
 
 const flag = (argv, name) => argv.find(a => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 
+/** A ruling exists only when a line DECLARES it: the id opens the line (after list/bold markers) and ends exactly
+ *  there (no trailing letters or digits). A passing mention, or `R474X` for `R474`, never matches. */
 export function rulingExistsIn(text) {
-  return id => new RegExp(`(^|[^A-Za-z0-9])${id}(?![0-9])`, 'm').test(String(text));
+  return id => validRulingId(id) && new RegExp(`^[ \\t>*_-]*R${id.slice(1)}(?![A-Za-z0-9])`, 'm').test(String(text));
 }
 
-export function runApproveHead(argv, { gh = runGhSync, env = process.env, readRulings = () => readFileSync(env.WE_RULINGS_FILE
-  || join(homedir(), 'workspace/.operations/handoff/rulings.md'), 'utf8') } = {}) {
+// The rulings source is fixed: no environment override can replace the approval authority (tests inject `readRulings`).
+const RULINGS_PATH = join(homedir(), 'workspace/.operations/handoff/rulings.md');
+export function runApproveHead(argv, { gh = runGhSync, env = process.env, readRulings = () => readFileSync(RULINGS_PATH, 'utf8') } = {}) {
   const repo = flag(argv, 'repo'), pr = flag(argv, 'pr'), rulingId = flag(argv, 'ruling');
   if (!repo || !/^[\w.-]+\/[\w.-]+$/.test(repo)) return { ok: false, reason: '--repo=<owner/name> required' };
   if (!validRulingId(rulingId)) return { ok: false, reason: '--ruling=R<id> required' };
@@ -33,8 +36,10 @@ export function runApproveHead(argv, { gh = runGhSync, env = process.env, readRu
   } catch (error) { return { ok: false, reason: `head unreadable: ${String(error?.message ?? error).split('\n')[0]}` }; }
   let rulingExists;
   try { rulingExists = rulingExistsIn(readRulings()); } catch { return { ok: false, reason: 'rulings file unreadable; nothing written' }; }
-  let approver = 'unknown';
-  try { approver = String(gh(['api', 'user', '--jq', '.login'], { encoding: 'utf8' })).trim() || approver; } catch { /* informational only */ }
+  // The operator's own login (personal auth); a missing identity refuses the approval (fail closed).
+  let approver = '';
+  try { approver = String(gh(['api', 'user', '--jq', '.login'], { encoding: 'utf8' })).trim(); } catch { return { ok: false, reason: 'operator identity unreadable; nothing written' }; }
+  if (!approver) return { ok: false, reason: 'operator identity empty; nothing written' };
   return writeApprovalRecord({ repo, headSha, rulingId, approver, rulingExists, gh, env });
 }
 

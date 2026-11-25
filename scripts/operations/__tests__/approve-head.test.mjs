@@ -19,6 +19,27 @@ describe('approve-head', () => {
     expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R47'], deps).ok).toBe(false);
     expect(posted(deps.gh)).toBe(false);
   });
+  it('a ruling id followed by letters or digits does not match (exact, anchored)', () => {
+    for (const text of ['R474X guard config\n', 'x mentions R474 in passing\n', 'R4745 other\n']) {
+      const deps = mk({ readRulings: () => text });
+      expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], deps).ok).toBe(false);
+      expect(posted(deps.gh)).toBe(false);
+    }
+    expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ readRulings: () => '- **R474** (operator): x\n' })).ok).toBe(true);
+  });
+  it('a missing or failed operator identity refuses and writes nothing', () => {
+    const gh = vi.fn((args) => { if (args[1] === 'user') throw new Error('401'); return args[1]?.includes('pulls') ? A : '1'; });
+    expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ gh })).ok).toBe(false);
+    expect(posted(gh)).toBe(false);
+    const empty = vi.fn((args) => args[1] === 'user' ? '' : args[1]?.includes('pulls') ? A : '1');
+    expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], mk({ gh: empty })).ok).toBe(false);
+    expect(posted(empty)).toBe(false);
+  });
+  it('WE_RULINGS_FILE in the environment is not an approval authority', () => {
+    const deps = { gh: mk().gh, env: { WE_RULINGS_FILE: '/nonexistent/forged.md' } };
+    expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R987654321'], deps).ok).toBe(false);
+    expect(posted(deps.gh)).toBe(false);
+  });
   it('an unreadable rulings file writes nothing', () => {
     const deps = mk({ readRulings: () => { throw new Error('nope'); } });
     expect(runApproveHead(['--repo=o/r', '--pr=5', '--ruling=R474'], deps).ok).toBe(false);

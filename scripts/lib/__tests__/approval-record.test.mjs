@@ -66,6 +66,16 @@ describe('readApprovalRecord', () => {
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh }).ok).toBe(true);
     expect(gh.mock.calls[0][0].join(' ')).toContain(`commits/${A}/check-runs`);
   });
+  it('a caller-set WE_APP_ID cannot choose the trusted app, and the read bypasses the memo', () => {
+    const forged = run({ app: { id: 777 } });
+    const gh = vi.fn(() => JSON.stringify({ total_count: 1, check_runs: [forged] }));
+    const seen = [];
+    const resolveApp = ({ env }) => { seen.push(env.WE_APP_ID); return { ok: true, appId: String(APP) }; };
+    const r = readApprovalRecord({ repo: 'o/r', headSha: A, gh, resolveApp, env: { WE_APP_ID: '777' } });
+    expect(seen).toEqual([undefined]);
+    expect(r.ok).toBe(false);
+    expect(gh.mock.calls[0][1].throttle.noMemo).toBe(true);
+  });
   it('a head that moved between read and land refuses', () => {
     const gh = () => JSON.stringify({ total_count: 1, check_runs: [run()] });
     expect(readApprovalRecord({ repo: 'o/r', headSha: A, appId: APP, gh, recheckHead: () => B }).ok).toBe(false);
@@ -84,6 +94,11 @@ describe('writeApprovalRecord', () => {
     const gh = vi.fn();
     expect(writeApprovalRecord({ ...base, rulingId: 'nope', gh }).ok).toBe(false);
     expect(writeApprovalRecord({ ...base, headSha: 'abc', gh }).ok).toBe(false);
+    expect(gh).not.toHaveBeenCalled();
+  });
+  it('a missing approver identity writes nothing', () => {
+    const gh = vi.fn();
+    for (const approver of [undefined, '', 'unknown']) expect(writeApprovalRecord({ ...base, approver, gh }).ok).toBe(false);
     expect(gh).not.toHaveBeenCalled();
   });
   it('a missing App token (probe fails) writes nothing', () => {

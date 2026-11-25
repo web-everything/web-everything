@@ -940,7 +940,7 @@ async function runCli() {
     // The allowlist is read from the BASE branch, never the PR's own tree: a branch cannot authorise itself.
     const guardConfigPaths = JSON.parse(gitC(['show', `${REMOTE}/${BASE}:scripts/settings/pr-land-ready.json`])).prLandReady?.guardConfigPaths;
     let changedFiles = [];
-    try { changedFiles = String(gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
+    try { changedFiles = String(gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`])).split('\n').filter(Boolean); } catch { /* classification unavailable */ }
     // The record is read for the exact pinned `refSha`, so a different head never matches it.
     const slug = repoSlugFromRemote(tryGit(['remote', 'get-url', REMOTE]));
     const approval = !slug ? { ok: false, reason: 'repo slug unresolved' } : readApprovalRecord({ repo: slug, headSha: refSha });

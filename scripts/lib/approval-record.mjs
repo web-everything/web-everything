@@ -48,12 +48,13 @@ export function evaluateApprovalRecord({ headSha, checkRuns, appId } = {}) {
 }
 
 /** Read the record for `headSha` live. `recheckHead()` re-reads the current head right after the read; a move refuses. */
-export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env = process.env, recheckHead } = {}) {
+export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env = process.env, recheckHead, resolveApp = resolveWeAppId } = {}) {
   let id = appId;
-  if (id === undefined) { const app = resolveWeAppId({ env }); if (app.ok !== true) return failure(app.reason); id = app.appId; }
+  // The trusted App comes from the setting only: a caller-set WE_APP_ID must never choose which App is trusted.
+  if (id === undefined) { const app = resolveApp({ env: { ...env, WE_APP_ID: undefined } }); if (app.ok !== true) return failure(app.reason); id = app.appId; }
   if (!validHead(headSha)) return failure('approval head missing or not a full 40-hex sha');
   let data;
-  try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=${APPROVAL_CHECK_NAME}&filter=all&per_page=100`], ioOptions)); }
+  try { data = JSON.parse(gh(['api', `repos/${repo}/commits/${headSha}/check-runs?check_name=${APPROVAL_CHECK_NAME}&filter=all&per_page=100`], { ...ioOptions, throttle: { noMemo: true, bin: 'gh' } })); }
   catch (error) { return failure(`approval record unreadable: ${message(error)}`); }
   if (!Array.isArray(data?.check_runs) || !Number.isSafeInteger(data.total_count) || data.total_count !== data.check_runs.length)
     return failure('approval record unreadable or incomplete');
@@ -68,6 +69,8 @@ export function readApprovalRecord({ repo, headSha, appId, gh = runGhSync, env =
 export function writeApprovalRecord({ repo, headSha, rulingId, approver, rulingExists, gh = runGhSync, env = process.env } = {}) {
   if (!validHead(headSha)) return failure('head must be a full 40-hex sha');
   if (!validRulingId(rulingId)) return failure('ruling id must look like R123 or R123+R124');
+  if (typeof approver !== 'string' || !approver.trim() || approver.trim().toLowerCase() === 'unknown')
+    return failure('operator identity missing; nothing written');
   if (typeof rulingExists !== 'function') return failure('no ruling verifier supplied');
   let known = false;
   try { known = rulingId.split('+').every(id => rulingExists(id) === true); } catch { known = false; }
