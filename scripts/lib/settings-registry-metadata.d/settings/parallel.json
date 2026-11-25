@@ -1,0 +1,6 @@
+{
+  "description": "Start hotpatch audit in parallel with CI.",
+  "owner": "scripts/settings/hotpatch.json",
+  "changeVia": "pr",
+  "instant": true
+}
