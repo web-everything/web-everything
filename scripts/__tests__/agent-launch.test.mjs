@@ -2,9 +2,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { URL as NodeURL } from 'node:url';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, readdirSync, symlinkSync, realpathSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, readdirSync, symlinkSync, realpathSync, unlinkSync } from 'node:fs';
 
 const mod = await import('../lib/agent-launch.mjs');
 const { launchAgent, buildAgentInvocation, buildAgentArgs } = mod;
@@ -119,6 +120,14 @@ describe('5/6 launcher-owned env, no git pins', () => {
     writeFileSync(shells, '/bin/sh\n');
     if (userInfo().shell !== '/bin/sh') refuses(codex(), seam(), /not listed/);
   });
+  it('refuses listed shells with unsupported startup controls', () => {
+    writeFileSync(shells, '/bin/fish\n');
+    for (const make of [codex, claude]) {
+      const io = seam({ user: { ...userInfo(), shell: '/bin/fish' } });
+      refuses(make(), io, /unsupported account shell startup/);
+      expect(io.resolveBinary).not.toHaveBeenCalled();
+    }
+  });
   it('still validates serialization of dropped keys', () => {
     refuses(codex({ env: { PATH: binDir, GIT_DIR: 'a\0b' } }), seam(), /NUL/);
   });
@@ -132,6 +141,55 @@ describe('7 codex argv carries the launcher PATH', () => {
       expect(i).toBeGreaterThan(0);
       expect(spec.args[i - 1]).toBe('-c');
       expect(spec.args.slice(0, 5)).toEqual(['exec', '--json', '-s', sandbox, '--skip-git-repo-check']);
+    });
+    it(`${sandbox}: disables login shells and snapshots that can replace the guard PATH`, () => {
+      const spec = buildAgentInvocation(codex({ sandbox }), seam());
+      expect(spec.args).toContain('allow_login_shell=false');
+      expect(spec.args).toContain('features.shell_snapshot=false');
+    });
+  }
+  it('refuses caller overrides of shell startup policy, including on resume', () => {
+    for (const key of ['allow_login_shell', 'features.shell_snapshot']) {
+      refuses(codex({ config: { [key]: true } }), seam(), /unknown config key/);
+      refuses(codex({ resumeThreadId: SID, config: { [key]: true } }), seam(), /unknown config key/);
+    }
+    const resumed = buildAgentInvocation(codex({ resumeThreadId: SID }), seam());
+    expect(resumed.args).toContain('allow_login_shell=false');
+    expect(resumed.args).toContain('features.shell_snapshot=false');
+    expect(resumed.args.indexOf('allow_login_shell=false')).toBeLessThan(resumed.args.indexOf('resume'));
+  });
+  it('replaces startup-file overrides in both the child env and agent policy', () => {
+    for (const make of [codex, claude]) {
+      const spec = buildAgentInvocation(make({ env: { PATH: binDir, BASH_ENV: '/evil/bash', ENV: '/evil/sh', ZDOTDIR: '/evil/zsh' } }), seam());
+      expect(spec.options.env).toMatchObject({ BASH_ENV: '/dev/null', ENV: '/dev/null', ZDOTDIR: make === codex ? codexDir : ghDir });
+      if (make === codex) {
+        for (const key of ['BASH_ENV', 'ENV', 'ZDOTDIR']) {
+          expect(spec.args).toContain(`shell_environment_policy.set.${key}=${JSON.stringify(spec.options.env[key])}`);
+        }
+      } else {
+        expect(JSON.parse(spec.args[spec.args.indexOf('--settings') + 1]).env).toMatchObject({ BASH_ENV: '/dev/null', ENV: '/dev/null', ZDOTDIR: ghDir });
+      }
+    }
+  });
+  for (const shell of ['/bin/bash', '/bin/zsh', '/bin/sh']) {
+    it.runIf(existsSync(shell))(`${shell}: real non-login startup cannot replace the guard PATH`, () => {
+      const evil = join(root, 'evil'); mkdirSync(evil);
+      for (const name of ['gh', 'npm']) put(evil, name, '#!/bin/sh\n');
+      for (const name of ['.zshenv', '.zprofile', '.zshrc', '.bash_profile', 'bash-env']) {
+        put(root, name, `export PATH=${JSON.stringify(evil)}\n`);
+      }
+      writeFileSync(shells, `${shell}\n`);
+      const spec = buildAgentInvocation(codex({ env: { PATH: binDir, BASH_ENV: join(root, 'bash-env'), ENV: join(root, 'bash-env'), ZDOTDIR: root } }),
+        seam({ user: { ...userInfo(), homedir: root, shell } }));
+      // Consume the emitted startup policy as well as the returned env. Without the
+      // policy, -lc reproduces the reviewer's PATH reset; -c also exercises .zshenv.
+      const flag = spec.args.includes('allow_login_shell=false') ? '-c' : '-lc';
+      const result = spawnSync(spec.options.env.SHELL, [flag, 'command -v gh; command -v npm'], {
+        ...spec.options, encoding: 'utf8', timeout: 5000, maxBuffer: 65536,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim().split('\n')).toEqual([join(ghDir, 'gh'), join(codexDir, 'npm')]);
     });
   }
   it('emits TMP keys only with tempRoot', () => {
@@ -155,7 +213,8 @@ describe('8 claude argv carries the launcher --settings', () => {
     const i = spec.args.indexOf('--settings');
     const e = spec.options.env;
     expect(JSON.parse(spec.args[i + 1])).toEqual({ env: { PATH: e.PATH, WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse',
-      WE_GITHUB_APP_ROLE: 'worker', WE_CONVEYOR_WORKER: '1', SHELL: e.SHELL, HOME: e.HOME, TMPDIR: e.TMPDIR } });
+      WE_GITHUB_APP_ROLE: 'worker', WE_CONVEYOR_WORKER: '1', SHELL: e.SHELL, HOME: e.HOME, TMPDIR: e.TMPDIR,
+      BASH_ENV: '/dev/null', ENV: '/dev/null', ZDOTDIR: ghDir } });
     expect(spec.args.slice(-2)).toEqual(['--', 'hello']);
     expect(spec.args.indexOf('--settings')).toBe(spec.args.lastIndexOf('--settings'));
     expect(spec.guards.map(g => g.name)).toEqual(['gh']);
@@ -239,7 +298,7 @@ describe('14 worker marker and one launcher-owned key list (round 3)', () => {
       expect(c.args).toContain(`shell_environment_policy.set.${key}=${JSON.stringify(c.options.env[key])}`);
       expect(JSON.parse(l.args[l.args.indexOf('--settings') + 1]).env[key]).toBe(l.options.env[key]);
     }
-    for (const key of ['PATH', 'WE_GITHUB_APP_ROLE', 'WE_GH_DAEMON_CALLER', 'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_CONVEYOR_WORKER', 'SHELL', 'HOME', 'TMPDIR']) {
+    for (const key of ['PATH', 'WE_GITHUB_APP_ROLE', 'WE_GH_DAEMON_CALLER', 'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_CONVEYOR_WORKER', 'SHELL', 'HOME', 'TMPDIR', 'BASH_ENV', 'ENV', 'ZDOTDIR']) {
       expect(LAUNCHER_POLICY_KEYS).toContain(key);
     }
   });
@@ -298,7 +357,7 @@ describe('12 manifest validation (finding 5)', () => {
 
 describe('13 shim dirs hold only guard names (finding 8)', () => {
   it('refuses an extra node, dirname or basename in either dir', () => {
-    for (const name of ['node', 'dirname', 'basename']) {
+    for (const name of ['node', 'dirname', 'basename', '.zshenv', '.zprofile', '.zshrc', '.zlogin']) {
       put(codexDir, name, '#!/bin/sh\n'); refuses(codex(), seam(), /unexpected file/);
       unlinkSync(join(codexDir, name));
       put(ghDir, name, '#!/bin/sh\n'); refuses(codex(), seam(), /unexpected file/); refuses(claude(), seam(), /unexpected file/);

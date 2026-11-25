@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir, userInfo } from 'node:os';
-import { dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { types } from 'node:util';
 import { resolveOrgAwareShimDir, shimGhPath } from './gh-app-shim.mjs';
@@ -20,7 +20,7 @@ import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE, markWorkerEnv } from '../operat
 import { loadAccountMap } from './claude-account.mjs';
 
 /** Launcher-owned env keys that the agent's own shells must also receive (codex policy.set, claude --settings env). */
-export const LAUNCHER_POLICY_KEYS = Object.freeze(['PATH', 'HOME', 'SHELL', 'TMPDIR', 'WE_GH_DAEMON_CALLER',
+export const LAUNCHER_POLICY_KEYS = Object.freeze(['PATH', 'HOME', 'SHELL', 'TMPDIR', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'WE_GH_DAEMON_CALLER',
   'WE_GH_AUTH_PERSONAL_FALLBACK', 'WE_GITHUB_APP_ROLE', WORKER_MARKER_ENV]);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -270,6 +270,7 @@ function accountShell(user, io) {
   let listed;
   try { listed = readFileSync(io.shellsFile ?? '/etc/shells', 'utf8').split('\n').map(l => l.trim()); } catch { fail('cannot read /etc/shells'); }
   if (!listed.includes(shell)) fail('account shell is not listed in /etc/shells');
+  if (!['bash', 'zsh', 'sh'].includes(basename(shell))) fail('unsupported account shell startup; use a bash, zsh or sh account shell and retry');
   return shell;
 }
 
@@ -300,6 +301,9 @@ export function buildAgentInvocation(descriptor, io = {}) {
     ...(d.agent === 'claude' ? claudeBase : callerEnv(caller, d.agent)),
     PATH: path, HOME: home, USER: user.username, LOGNAME: user.username, SHELL: accountShell(user, io),
     TMPDIR: tempRoot, TMP: tempRoot, TEMP: tempRoot,
+    // Non-login bash/sh can still source ENV/BASH_ENV; zsh always reads .zshenv.
+    // Guard directories have an exact contents allowlist, so cannot hold zsh startup files.
+    BASH_ENV: '/dev/null', ENV: '/dev/null', ZDOTDIR: guardDirs[0],
     WE_GH_DAEMON_CALLER: 'agent-launch', WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', WE_GITHUB_APP_ROLE: d.githubRole,
     [WORKER_MARKER_ENV]: WORKER_MARKER_VALUE,
   };
@@ -309,6 +313,11 @@ export function buildAgentInvocation(descriptor, io = {}) {
   if (d.agent === 'codex') {
     env.CODEX_HOME = join(home, '.codex');
     launcher = Object.fromEntries(Object.entries(pinned).map(([key, value]) => [`shell_environment_policy.set.${key}`, value]));
+    // Environment policy applies before shell startup: login profiles can replace PATH
+    // afterward. Refuse login shells and do not replay snapshots of that startup state.
+    // These are launcher-owned, so user config cannot re-enable them for this invocation.
+    launcher.allow_login_shell = false;
+    launcher['features.shell_snapshot'] = false;
     if (d.tempRoot !== undefined) for (const key of ['TMP', 'TEMP']) launcher[`shell_environment_policy.set.${key}`] = tempRoot;
   } else {
     launcher = JSON.stringify({ env: pinned });
