@@ -1,5 +1,5 @@
 /** Bounded, read-only evidence collection; no job lifecycle decisions live here. */
-import { closeSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { diagnosticPath, jobLogPath, reviewJobsDir } from './review-job-store.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
@@ -10,10 +10,15 @@ const MAX_TAIL = 8192;
 export function diagnoseEndedJob({ slug, pid, dir = reviewJobsDir() }) {
   let timeout = {};
   try {
-    const ended = JSON.parse(readFileSync(diagnosticPath(slug, dir, 'ended'), 'utf8'));
+    const endedPath = diagnosticPath(slug, dir, 'ended');
+    if (statSync(endedPath).size > 64 * 1024) throw new Error('ended record too large');
+    const ended = JSON.parse(readFileSync(endedPath, 'utf8'));
     if (ended.pid === pid && ended.reason === 'juror-timeout') {
-      const { reason, lens, provider, model, head, runId, timeoutMs, wallMs } = ended;
-      timeout = { reason, lens, provider, model, head, runId, timeoutMs, wallMs };
+      // Every field is untrusted text: redact credentials, strip controls and bound the length before it can reach a log.
+      const clean = (value, max = 80) => redactSpawnText(String(value ?? '?')).replace(/[\x00-\x1f\x7f-\x9f\p{Zl}\p{Zp}]/gu, ' ').slice(0, max);
+      const { lens, provider, model, head, runId, timeoutMs, wallMs } = ended;
+      timeout = { reason: 'juror-timeout', lens: clean(lens), provider: clean(provider), model: clean(model), head: clean(head, 40),
+        runId: clean(runId), timeoutMs: clean(timeoutMs, 12), wallMs: clean(wallMs, 12) };
     }
   } catch { /* Missing, stale or unreadable ended evidence cannot identify a timeout. */ }
   let marker;

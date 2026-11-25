@@ -5,6 +5,20 @@ import { join } from 'node:path';
 import { runReviewTick } from '../review-daemon.mjs';
 import { diagnoseEndedJob, writeEndedJobDiagnosis } from '../../../scripts/operations/review-job-end-diagnosis.mjs';
 
+it('bounds and redacts hostile timeout metadata and ignores an oversized ended record', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'juror-timeout-'));
+  try {
+    const job = { slug: 'review-11', pid: 7, dir };
+    const model = `sk-ant-api03-${'A'.repeat(40)} ${'x'.repeat(10000)}`;
+    writeEndedJobDiagnosis(job, { reason: 'juror-timeout', lens: 'l', provider: 'p', model, head: 'h', wallMs: 1, timeoutMs: 1, runId: 'r' });
+    const out = diagnoseEndedJob({ ...job });
+    expect(out.model.length).toBeLessThanOrEqual(80);
+    expect(out.model).not.toContain('A'.repeat(40));
+    writeEndedJobDiagnosis(job, { reason: 'juror-timeout', lens: 'l', provider: 'p', model: 'm', pad: 'z'.repeat(70000) });
+    expect(diagnoseEndedJob({ ...job }).reason).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 it('logs a persisted juror-timeout without no-verdict wording and keeps retry priority', () => {
   const dir = mkdtempSync(join(tmpdir(), 'juror-timeout-'));
   try {

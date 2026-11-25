@@ -693,7 +693,7 @@ export function runReviewTick({
       endedNoVerdict.push({ prNumber: d.prNumber, reason: timeout ? 'juror-timeout' : 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
       dispatchState.lastDispatched.delete(key);
       try {
-        const safe = value => String(value ?? '?').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
+        const safe = value => String(value ?? '?').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ').slice(0, 80);
         log(timeout
           ? `review-daemon: ${key} review-job-ended juror-timeout (${safe(timeout.lens)} ${safe(timeout.provider)}/${safe(timeout.model)} ${safe(timeout.wallMs)}ms; run ${safe(timeout.runId)}; head ${safe(timeout.head).slice(0, 12)})`
           : `review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`);
