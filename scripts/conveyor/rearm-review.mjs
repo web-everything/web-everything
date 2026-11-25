@@ -30,7 +30,7 @@ import { AUTOMATION_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorsh
 import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isHumanOperatorComment } from '../lib/operator-identity.mjs';
-import { parseOperatorAnswer, isAutoRearmAnswer } from './stand-down-answer-core.mjs';
+import { parseOperatorAnswer } from './stand-down-answer-core.mjs';
 import { standDownComments } from './stand-down.mjs';
 import { REARM_COMMENT_MARKER, SAME_HEAD_WAKE_TRAILER, isFixRoundRearmComment } from './rearm-round-count.mjs';
 
@@ -215,12 +215,9 @@ export function rearmWindow(comments) {
   let waivers = 0; // bounded: a verdict window never grants more than REARM_WAIVER_CAP rearm-review waivers
   let overrides = 0;
   const overrideAvailable = () => overrides < NO_CODE_OWED_CAP && capBlockedId !== null && capBlockedId === standDownIds.at(-1);
-  let autoRearms = 0; // the daemon's recover-class request: at most ONE per verdict window (resets on a new verdict)
-  const wouldHonour = answer => (answer?.disposition === 'rearm-review'
+  const wouldHonour = answer => answer?.disposition === 'rearm-review'
     && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
-    && (!rearmed || (answer.noCodeOwed === true && overrideAvailable())))
-    || (isAutoRearmAnswer(answer) && standDownIds.length > 0 && answer.standDownId === standDownIds.at(-1)
-      && !rearmed && autoRearms < 1);
+    && (!rearmed || (answer.noCodeOwed === true && overrideAvailable()));
   for (const raw of comments) {
     const c = normaliseComment(raw);
     const answer = parseOperatorAnswer(c);
@@ -230,17 +227,14 @@ export function rearmWindow(comments) {
     // allowlisted poster, as parseOperatorAnswer does; --actor and viewerDidAuthor alone never authorize a waiver.
     const operatorPoster = answer && (isHumanOperatorComment(c) || AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase()));
     const capOverride = answer?.noCodeOwed === true && overrideAvailable();
-    // The daemon's own request is honoured ONLY from an automation principal (never a human-looking forgery).
-    const autoPoster = isAutoRearmAnswer(answer) && AUTOMATION_LOGINS.includes(String(c?.author?.login ?? '').toLowerCase());
-    if (wouldHonour(answer) && (isAutoRearmAnswer(answer) ? autoPoster : operatorPoster)) {
-      if (isAutoRearmAnswer(answer)) autoRearms += 1;
+    if (wouldHonour(answer) && operatorPoster) {
       claims = [];
       reviewedHead = null;
       standDownIds = [];
       rearmed = true;
       capBlockedId = null;
       // An explicit no-code ruling closes the round without spending a bounded waiver.
-      if (answer.noCodeOwed !== true && !isAutoRearmAnswer(answer)) waivers += 1;
+      if (answer.noCodeOwed !== true) waivers += 1;
       if (capOverride) overrides += 1;
       continue;
     }
@@ -253,7 +247,6 @@ export function rearmWindow(comments) {
       standDownIds = [];
       rearmed = false;
       waivers = 0;
-      autoRearms = 0;
       overrides = 0;
       capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {

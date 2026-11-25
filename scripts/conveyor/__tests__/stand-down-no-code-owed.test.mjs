@@ -1,203 +1,181 @@
-import { describe, expect, it, vi } from 'vitest';
-import { buildStandDownComment } from '../stand-down.mjs';
+import { describe, expect, it } from 'vitest';
+import { buildStandDownComment, standDownComments } from '../stand-down.mjs';
 import { AUTOMATION_LOGINS } from '../../lib/marker-authorship.mjs';
-import { parseOperatorAnswer, buildOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { parseOperatorAnswer, latestOperatorAnswer, latestOperatorAnswerAt } from '../stand-down-answer-core.mjs';
 import { buildNoChangeComment, decideEmptyFixRound, rearmWindow } from '../rearm-review.mjs';
-import { classifyNoCodeOwedRearm, enrichPrsWithNoCodeOwedRearm, mergeGateOnlyReviewHold } from '../stand-down-no-code-owed.mjs';
+import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
+import { classifyNoCodeOwedRearm, enrichPrsWithNoCodeOwedRearm } from '../stand-down-no-code-owed.mjs';
+import { buildAutoRearmRequest, parseAutoRearmRequest, pendingAutoRearmRequest, isGateOnlyChangesVerdict } from '../auto-rearm-request.mjs';
 
 const head = 'a'.repeat(40);
 const author = { login: AUTOMATION_LOGINS[0] };
-const verdict = { id: 'V1', author, body: '🔁 review — changes requested\n\nfindings' };
+const human = { login: 'someone-else' };
+const gateVerdictBody = '🔁 review — changes requested\n\nRecorded by loop-console operator.\n\nrequired check "merge-gate" FAILURE';
+const verdict = { id: 'V1', author, body: gateVerdictBody };
 const begin = (sha = head) => ({ id: 'B1', author,
   body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->` });
-const note = (sha = head, actor = 'conveyor fix agent', a = author) => ({ id: 'N1', author: a, body: buildNoChangeComment({ actor, since: sha.slice(0, 9) }) });
-const stand = (id = 'SD1', reason = 'needs-judgment', a = author) =>
-  ({ id, author: a, body: buildStandDownComment({ reason, detail: 'whatever the fixer wrote' }) });
+const note = (sha = head) => ({ id: 'N1', author, body: buildNoChangeComment({ actor: 'conveyor fix agent', since: sha.slice(0, 9) }) });
+const stand = (id = 'SD1') => ({ id, author, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'whatever the fixer wrote' }) });
 const thread = (...extra) => [verdict, begin(), note(), stand(), ...extra];
 const labels = (...n) => n.map(name => ({ name }));
-const mkPr = (o = {}) => ({ number: 7448, headRefOid: head, labels: labels('review:changes'), comments: thread(), ...o });
+const JOB = 55;
+const rollup = [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: `https://github.com/o/r/actions/runs/1/job/${JOB}` }];
+const mkPr = (o = {}) => ({ number: 7448, headRefOid: head, labels: labels('review:changes'), comments: thread(), statusCheckRollup: rollup, ...o });
 const run = (name, conclusion = 'SUCCESS', id = 1, o = {}) => ({ id, name, app: { id: 15368 }, check_suite: { id: 900 }, head_sha: head,
-  status: 'completed', conclusion, completed_at: '2026-11-24T21:00:00Z', ...o });
-const names = ['test', 'smoke', 'merge-gate'];
+  status: 'completed', conclusion, completed_at: '2026-11-24T21:00:00Z', details_url: `https://github.com/o/r/actions/runs/1/job/${JOB + id}`, ...o });
+const names = ['test', 'merge-gate'];
 const bindings = names.map(context => ({ context, integration_id: 15368 }));
-const green = () => [run('test', 'SUCCESS', 1), run('smoke', 'SUCCESS', 2), run('merge-gate', 'FAILURE', 3)];
-const args = (o = {}) => ({ pr: mkPr(), requiredChecks: names, requiredCheckBindings: bindings,
-  checks: { head, complete: true, runs: green() }, mergeGateReviewOnly: true, ...o });
-const hold = d => d.action === 'hold';
+const gateRun = (o = {}) => run('merge-gate', 'FAILURE', 3, { details_url: `https://github.com/o/r/actions/runs/1/job/${JOB}`, ...o });
+const checks = (runs = [run('test', 'SUCCESS', 1), gateRun()]) => ({ head, complete: true, runs });
+const okVerdict = (o = {}) => ({ num: 7448, ok: false, head_sha: head, results: [{ status: 'hold', id: 'review-hold-labels', reason: 'labels: review:changes' }], ...o });
+const args = (o = {}) => ({ pr: mkPr(), requiredChecks: names, requiredCheckBindings: bindings, checks: checks(), rosterSource: 'live',
+  gate: { jobId: JOB, verdict: okVerdict() }, ...o });
+const isHold = d => d.action === 'hold';
 
-describe('auto-rearm: one daemon request for a fresh review of an unchanged head', () => {
-  it('plans a distinct recover-class record, not an operator ruling, that the rearm guard honours', () => {
-    const d = classifyNoCodeOwedRearm(args());
-    expect(d.action).toBe('auto-rearm');
-    const rec = { id: 'A1', author, body: d.body };
-    const parsed = parseOperatorAnswer(rec);
-    expect(parsed).toMatchObject({ disposition: 'auto-rearm', actor: 'auto-rearm', standDownId: 'SD1' });
-    expect(parsed.noCodeOwed).toBeUndefined();
-    expect(d.body).not.toContain('ruling to implement');
-    expect(d.body).toContain('NOT an operator ruling');
-    const pr = mkPr();
-    expect(decideEmptyFixRound({ comments: pr.comments, liveHead: head }).empty).toBe(true);
-    expect(decideEmptyFixRound({ comments: [...pr.comments, rec], liveHead: head }).empty).toBe(false);
+describe('auto-rearm request: a separate recover-class record', () => {
+  const body = buildAutoRearmRequest({ standDownId: 'SD1', head, reason: 'why' });
+  const req = { id: 'R1', author, body };
+
+  it('is ignored by parseOperatorAnswer and every operator-answer reader', () => {
+    expect(parseOperatorAnswer(req)).toBeNull();
+    const base = thread();
+    const withReq = [...base, req];
+    expect(latestOperatorAnswer(withReq)).toEqual(latestOperatorAnswer(base));
+    // fixers see no ruling and the load-flake accounting timestamp never moves
+    expect(latestOperatorAnswer(withReq)).toBeNull();
+    expect(latestOperatorAnswerAt(withReq)).toEqual(latestOperatorAnswerAt(base));
   });
 
-  it('a second request on the same head is refused, by the classifier and by the rearm window cap', () => {
-    const d = classifyNoCodeOwedRearm(args());
-    const rec = { id: 'A1', author, body: d.body };
-    const again = thread(rec, stand('SD2'));
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: again }) })))).toBe(true);
-    const win = rearmWindow(again);
-    expect(win.wouldHonour({ standDownId: 'SD2', disposition: 'auto-rearm', actor: 'auto-rearm' })).toBe(false);
-    // the cap resets only with a NEW reviewer verdict
-    const fresh = rearmWindow([...again, verdict, begin(), stand('SD3')]);
-    expect(fresh.wouldHonour({ standDownId: 'SD3', disposition: 'auto-rearm', actor: 'auto-rearm' })).toBe(true);
+  it('never resolves the stand-down: the unresolved count is unchanged', () => {
+    const o = { headRefOid: head };
+    expect(countUnresolvedStandDowns(thread(req), o)).toBe(countUnresolvedStandDowns(thread(), o));
+    expect(countUnresolvedStandDowns(thread(req), o)).toBe(1);
   });
 
-  it('a forged request never lifts the empty-round guard (non-automation poster, wrong actor, wrong target)', () => {
-    const body = classifyNoCodeOwedRearm(args()).body;
-    for (const forged of [{ id: 'F', author: { login: 'mallory' }, viewerDidAuthor: true, body },
-      { id: 'F', author: { login: 'chalbert' }, body }]) {
-      expect(decideEmptyFixRound({ comments: [...mkPr().comments, forged], liveHead: head }).empty).toBe(true);
+  it('never changes the rearm guard (no fixer path, no unchanged-head refusal change, no load-flake accounting)', () => {
+    expect(decideEmptyFixRound({ comments: thread(req), liveHead: head })).toEqual(decideEmptyFixRound({ comments: thread(), liveHead: head }));
+    expect(decideEmptyFixRound({ comments: thread(req), liveHead: head }).empty).toBe(true);
+    const w1 = rearmWindow(thread(req)); const w0 = rearmWindow(thread());
+    expect({ ...w1, wouldHonour: 0 }).toEqual({ ...w0, wouldHonour: 0 });
+  });
+
+  it('is accepted only from the automation identity', () => {
+    expect(parseAutoRearmRequest(req)).toEqual({ standDownId: 'SD1', head });
+    expect(parseAutoRearmRequest({ ...req, author: human })).toBeNull();
+    expect(parseAutoRearmRequest({ ...req, author: undefined, viewerDidAuthor: true })).toBeNull();
+    expect(pendingAutoRearmRequest(thread({ ...req, author: human }), head)).toBeNull();
+    expect(pendingAutoRearmRequest(thread(req), head)?.standDownId).toBe('SD1');
+  });
+
+  it('is pending once per head and consumed by a later verdict', () => {
+    expect(pendingAutoRearmRequest(thread(req, { ...req, id: 'R2' }), head)?.commentId).toBe('R1');
+    expect(pendingAutoRearmRequest(thread(req, { id: 'V2', author, body: '✅ review — accepted\n\nok' }), head)).toBeNull();
+    expect(pendingAutoRearmRequest(thread(req), 'b'.repeat(40))).toBeNull();
+    const other = { id: 'R9', author, body: buildAutoRearmRequest({ standDownId: 'OLD', head, reason: 'x' }) };
+    expect(pendingAutoRearmRequest(thread(other), head)).toBeNull();
+  });
+});
+
+describe('qualification: structured no-code signal only', () => {
+  it('requests one review for the live shape', () => {
+    const d = classifyNoCodeOwedRearm(args());
+    expect(d.action).toBe('request-review');
+    expect(parseOperatorAnswer({ author, body: d.body })).toBeNull();
+    expect(parseAutoRearmRequest({ author, body: d.body })).toMatchObject({ standDownId: 'SD1', head });
+  });
+
+  it('a reviewer finding in the verdict disqualifies, even with a fix-still-owed note', () => {
+    const real = { id: 'V1', author, body: '🔁 review — changes requested\n\n- src/x.mjs: the null case is unhandled' };
+    expect(isGateOnlyChangesVerdict([real])).toBe(false);
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [real, begin(), note(), stand()] }) })))).toBe(true);
+    const mixed = { ...verdict, body: `${gateVerdictBody}\n- src/x.mjs: a bug` };
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [mixed, begin(), note(), stand()] }) })))).toBe(true);
+  });
+
+  it('code owed (head moved) never qualifies', () => {
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [verdict, begin('b'.repeat(40)), note('b'.repeat(40)), stand()] }) })))).toBe(true);
+  });
+
+  it('a second request on the same head is refused', () => {
+    const r = { id: 'R1', author, body: buildAutoRearmRequest({ standDownId: 'SD1', head, reason: 'x' }) };
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: thread(r) }) })))).toBe(true);
+  });
+
+  it('merge-gate is bound to the CURRENT check run', () => {
+    expect(isHold(classifyNoCodeOwedRearm(args({ checks: checks([run('test', 'SUCCESS', 1)]) })))).toBe(true); // missing
+    expect(isHold(classifyNoCodeOwedRearm(args({ checks: checks([run('test', 'SUCCESS', 1), gateRun({ status: 'in_progress', conclusion: null, completed_at: null })]) })))).toBe(true); // pending
+    expect(isHold(classifyNoCodeOwedRearm(args({ gate: { jobId: 999, verdict: okVerdict() } })))).toBe(true); // another job's verdict
+    expect(isHold(classifyNoCodeOwedRearm(args({ checks: checks([run('test', 'SUCCESS', 1), gateRun({ details_url: 'https://github.com/o/r/actions/runs/1/job/77' })]) })))).toBe(true);
+    expect(isHold(classifyNoCodeOwedRearm(args({ gate: null })))).toBe(true);
+  });
+
+  it('a human-review hold or any other blocking hold disqualifies', () => {
+    const extra = id => okVerdict({ results: [{ status: 'hold', id: 'review-hold-labels', reason: 'labels: review:changes' }, { status: 'hold', id, reason: 'x' }] });
+    for (const id of ['test-gaming', 'review-acceptance', 'red-main-freeze']) {
+      expect(isHold(classifyNoCodeOwedRearm(args({ gate: { jobId: JOB, verdict: extra(id) } })))).toBe(true);
     }
-    expect(() => buildOperatorAnswer({ standDownId: 'SD1', reason: 'x', actor: 'chalbert', channel: 'chat', disposition: 'auto-rearm' })).toThrow();
-    const wrongTarget = { id: 'W', author, body: buildOperatorAnswer({ standDownId: 'OTHER', reason: 'x', actor: 'auto-rearm', channel: 'c', disposition: 'auto-rearm' }) };
-    expect(decideEmptyFixRound({ comments: [...mkPr().comments, wrongTarget], liveHead: head }).empty).toBe(true);
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: labels('review:changes', 'review:human') }) })))).toBe(true);
+    expect(isHold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: labels('review:changes', 'red-team:blocked') }) })))).toBe(true);
   });
 
-  it('never fires when code is owed (head moved since the fix began)', () => {
-    const comments = [verdict, begin('b'.repeat(40)), note('b'.repeat(40)), stand()];
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments }) })))).toBe(true);
+  it('a human-only workflow-touch hold alone qualifies; with a test finding it does not', () => {
+    const wf = { status: 'hold', id: 'review-acceptance', reason: 'human-only: the diff at aaaaaaaaa touches .github/workflows/x.yml — only a clear-human ceremony' };
+    expect(classifyNoCodeOwedRearm(args({ gate: { jobId: JOB, verdict: okVerdict({ results: [wf] }) } })).action).toBe('request-review');
+    const both = okVerdict({ results: [wf, { status: 'hold', id: 'test-gaming', reason: 'tests weakened' }] });
+    expect(isHold(classifyNoCodeOwedRearm(args({ gate: { jobId: JOB, verdict: both } })))).toBe(true);
   });
 
-  it('needs the fixer\'s structured no-change record, never prose', () => {
-    const prose = [verdict, begin(), { ...stand(), body: buildStandDownComment({ reason: 'needs-judgment', detail: 'no code defect to repair' }) }];
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: prose }) })))).toBe(true);
-    // a relayed operator re-arm attempt that the guard refused is the same structured record (#7451's shape)
-    const operatorNote = [verdict, begin(), stand(), note(head, 'chalbert')];
-    expect(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: operatorNote }) })).action).toBe('auto-rearm');
-    const beforeBegin = [verdict, note(), begin(), stand()];
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: beforeBegin }) })))).toBe(true);
-    const forgedNote = [verdict, begin(), note(head, 'conveyor fix agent', { login: 'mallory' }), stand()];
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: forgedNote }) })))).toBe(true);
-    const otherHead = [verdict, begin(), note('c'.repeat(40)), stand()];
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: otherHead }) })))).toBe(true);
-  });
-
-  it('holds on a stand-down that is not a trusted needs-judgment', () => {
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [verdict, begin(), note(), stand('SD1', 'gate-red')] }) })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [verdict, begin(), note(), stand('SD1', 'needs-judgment', { login: 'mallory' })] }) })))).toBe(true);
-  });
-
-  it.each(['red-team:blocked', 'red-team:pending'])('holds on %s', (l) => {
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: labels('review:changes', l) }) })))).toBe(true);
-  });
-
-  it('holds without review:changes or with a malformed/incomplete label list', () => {
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: labels('review:accepted') }) })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: [{ name: 'review:changes' }, {}] }) })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ labels: undefined }) })))).toBe(true);
-  });
-
-  it('holds on failing, missing, wrong-app, unbound-identity or wrong-head check evidence (shared R123 validation)', () => {
-    const swap = (fn) => args({ checks: { head, complete: true, runs: green().map(fn) } });
-    expect(hold(classifyNoCodeOwedRearm(swap(r => r.name === 'test' ? { ...r, conclusion: 'FAILURE' } : r)))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ checks: { head, complete: true, runs: green().slice(0, 1) } })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(swap(r => ({ ...r, app: { id: 1 } }))))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(swap(r => ({ ...r, check_suite: undefined }))))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(swap(r => ({ ...r, completed_at: undefined }))))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(swap(r => ({ ...r, status: 'in_progress' }))))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ checks: { head: 'c'.repeat(40), complete: true, runs: green() } })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ checks: { head, complete: false, runs: green() } })))).toBe(true);
-  });
-
-  it('does not exempt merge-gate without proof that its only red is the review hold', () => {
-    expect(hold(classifyNoCodeOwedRearm(args({ mergeGateReviewOnly: false })))).toBe(true);
-    expect(hold(classifyNoCodeOwedRearm(args({ mergeGateReviewOnly: undefined })))).toBe(true);
-  });
-
-  it('refuses an oversized thread', () => {
-    const filler = Array.from({ length: 2001 }, (_, i) => ({ id: `X${i}`, author, body: 'x' }));
-    expect(hold(classifyNoCodeOwedRearm(args({ pr: mkPr({ comments: [...filler, ...thread()] }) })))).toBe(true);
+  it('a stale or fallback roster disqualifies; a red code check disqualifies', () => {
+    for (const rosterSource of ['stale-cache', 'fallback', 'declared', 'unavailable', undefined]) {
+      expect(isHold(classifyNoCodeOwedRearm(args({ rosterSource })))).toBe(true);
+    }
+    expect(isHold(classifyNoCodeOwedRearm(args({ checks: checks([run('test', 'FAILURE', 1), gateRun()]) })))).toBe(true);
   });
 });
 
-describe('mergeGateOnlyReviewHold re-derives the proof from merge-gate\'s own head-bound verdict', () => {
-  const row = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/55' };
-  const pr = (o = {}) => ({ number: 7, headRefOid: head, labels: labels('review:changes'), statusCheckRollup: [row], ...o });
-  const read = (results, o = {}) => () => ({ num: 7, ok: false, head_sha: head, completed_at: '2026-11-24T21:00:00Z', results, ...o });
-  it('accepts only review-class holds', () => {
-    expect(mergeGateOnlyReviewHold(pr(), { repo: 'o/r', readVerdict: read([{ status: 'hold', id: 'review-hold-labels', reason: 'labels: review:changes' }]) })).not.toBeNull();
+describe('writer: re-reads after the final check read, immediately before the post', () => {
+  const mk = (over = {}) => {
+    const calls = []; let posted = 0; const reads = { n: 0 };
+    const state = () => ({ headRefOid: head, labels: labels('review:changes'), statusCheckRollup: rollup });
+    const deps = {
+      repo: 'o/r', readBindings: () => bindings, readComments: () => thread(), readState: () => { reads.n += 1; return state(); },
+      readRoster: () => ({ checks: names, source: 'live' }), readChecks: () => { calls.push('checks'); return checks(); },
+      readVerdict: () => okVerdict(), reserve: () => true, log: () => {},
+      post: ({ body }) => { posted += 1; calls.push('post'); return { id: 'R1', author, body }; }, ...over };
+    return { deps, calls, posted: () => posted, reads };
+  };
+  it('posts exactly once and appends the request to the returned thread', () => {
+    const { deps, calls, posted } = mk();
+    const [out] = enrichPrsWithNoCodeOwedRearm([mkPr()], deps);
+    expect(posted()).toBe(1);
+    expect(calls).toEqual(['checks', 'post']);
+    expect(pendingAutoRearmRequest(out.comments, head)).toBeTruthy();
   });
-  it.each([
-    ['an independent failing gate', read([{ status: 'hold', id: 'review-hold-labels', reason: 'x' }, { status: 'fail-closed', id: 'codeql', reason: 'x' }])],
-    ['a verdict for another head', read([{ status: 'hold', id: 'review-hold-labels', reason: 'x' }], { head_sha: 'd'.repeat(40) })],
-    ['an unreadable verdict', () => ({ error: 'no log' })],
-    ['a thrown read', () => { throw new Error('boom'); }],
-  ])('refuses %s', (_n, readVerdict) => {
-    expect(mergeGateOnlyReviewHold(pr(), { repo: 'o/r', readVerdict })).toBeNull();
+  it('a head change, new label, new comment or roster change during/after the check read vetoes the post', () => {
+    for (const mutate of ['head', 'label', 'comment', 'roster']) {
+      let phase = 0;
+      const m = mk({
+        readChecks: () => { phase = 1; return checks(); },
+        readState: () => (phase && mutate === 'head' ? { headRefOid: 'c'.repeat(40), labels: labels('review:changes'), statusCheckRollup: rollup }
+          : phase && mutate === 'label' ? { headRefOid: head, labels: labels('review:changes', 'red-team:blocked'), statusCheckRollup: rollup }
+          : { headRefOid: head, labels: labels('review:changes'), statusCheckRollup: rollup }),
+        readComments: () => (phase && mutate === 'comment' ? thread({ id: 'X', author: human, body: 'hi' }) : thread()),
+        readRoster: () => (phase && mutate === 'roster' ? { checks: ['test'], source: 'live' } : { checks: names, source: 'live' }),
+      });
+      enrichPrsWithNoCodeOwedRearm([mkPr()], m.deps);
+      expect(m.posted(), mutate).toBe(0);
+    }
   });
-  it('refuses when merge-gate did not fail', () => {
-    expect(mergeGateOnlyReviewHold(pr({ statusCheckRollup: [{ ...row, conclusion: 'SUCCESS' }] }), { repo: 'o/r', readVerdict: read([]) })).toBeNull();
+  it('a stale roster or a refused reservation posts nothing', () => {
+    const a = mk({ readRoster: () => ({ checks: names, source: 'stale-cache' }) });
+    enrichPrsWithNoCodeOwedRearm([mkPr()], a.deps);
+    expect(a.posted()).toBe(0);
+    const b = mk({ reserve: () => false });
+    enrichPrsWithNoCodeOwedRearm([mkPr()], b.deps);
+    expect(b.posted()).toBe(0);
   });
 });
 
-describe('enrichPrsWithNoCodeOwedRearm (the writer)', () => {
-  const okVerdict = () => ({ num: 7448, ok: false, head_sha: head, completed_at: '2026-11-24T21:00:00Z',
-    results: [{ status: 'hold', id: 'review-hold-labels', reason: 'labels: review:changes' }] });
-  const state = (o = {}) => ({ headRefOid: head, labels: labels('review:changes'),
-    statusCheckRollup: [{ name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/55' }], ...o });
-  const deps = (o = {}) => ({ repo: 'o/r', requiredChecks: names, readBindings: () => bindings,
-    readComments: () => mkPr().comments, readState: () => state(), readVerdict: okVerdict,
-    readChecks: () => ({ head, complete: true, runs: green() }), reserve: vi.fn(() => true),
-    post: vi.fn(({ body }) => ({ id: 'A1', author, body })), log: () => {}, ...o });
-
-  it('posts exactly once and keys the reservation by head', () => {
-    const d = deps();
-    const out = enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(d.post).toHaveBeenCalledTimes(1);
-    expect(d.reserve).toHaveBeenCalledWith(expect.objectContaining({ standDownId: `auto-rearm-head-${head}` }));
-    expect(out[0].comments.at(-1).id).toBe('A1');
-  });
-
-  it('a second stand-down on the same head cannot earn a second post (reservation is per head)', () => {
-    const d = deps({ reserve: vi.fn(() => false) });
-    enrichPrsWithNoCodeOwedRearm([mkPr({ comments: thread(stand('SD2')) })], d);
-    expect(d.post).not.toHaveBeenCalled();
-  });
-
-  it('a red-team label applied during the check reads vetoes the post', () => {
-    let n = 0;
-    const d = deps({ readState: () => state(++n > 1 ? { labels: labels('review:changes', 'red-team:blocked') } : {}) });
-    enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(d.post).not.toHaveBeenCalled();
-  });
-
-  it('a required check that fails on a reread, or a head that moved, vetoes the post', () => {
-    let n = 0;
-    const d = deps({ readChecks: () => ({ head, complete: true, runs: green().map(r => r.name === 'test' && ++n > 1 ? { ...r, conclusion: 'FAILURE' } : r) }) });
-    enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(d.post).not.toHaveBeenCalled();
-    const e = deps({ readState: () => state({ headRefOid: 'd'.repeat(40) }) });
-    enrichPrsWithNoCodeOwedRearm([mkPr()], e);
-    expect(e.post).not.toHaveBeenCalled();
-  });
-
-  it('a newer stand-down or answer arriving mid-evaluation vetoes the post and the refreshed thread is kept', () => {
-    let n = 0;
-    const d = deps({ readComments: () => (++n > 1 ? thread(stand('SD2')) : mkPr().comments) });
-    const out = enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(d.post).not.toHaveBeenCalled();
-    expect(out[0].comments.some(c => c.id === 'SD2')).toBe(true);
-  });
-
-  it('a failed write keeps the freshly read thread for downstream planning', () => {
-    const d = deps({ readComments: () => thread(stand('SD2')), post: vi.fn(() => { throw new Error('boom'); }) });
-    const out = enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(out[0].comments.some(c => c.id === 'SD2')).toBe(true);
-  });
-
-  it('does nothing without proof that merge-gate\'s only red is the review hold', () => {
-    const d = deps({ readVerdict: () => ({ ...okVerdict(), results: [{ status: 'fail-closed', id: 'codeql', reason: 'x' }] }) });
-    enrichPrsWithNoCodeOwedRearm([mkPr()], d);
-    expect(d.post).not.toHaveBeenCalled();
-  });
+it('standDownComments still sees the stand-down (sanity)', () => {
+  expect(standDownComments(thread()).length).toBe(1);
 });

@@ -1908,7 +1908,7 @@ export function runReconcilePass({
     repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, defaultBranch, env,
   }) : answerablePrs;
   const answeredPrs = !readOnly && allowStandDownAutoProceed === true ? enrichNoCodeOwedRearm(ciAnsweredPrs, {
-    repo: CONSTELLATION_REPOS[repoKey].slug, requiredChecks, env,
+    repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch, env,
   }) : ciAnsweredPrs;
   const answeredByNumber = new Map(answeredPrs.map(pr => [pr.number, pr]));
   const autoProceedPrs = skipStandDownPrs

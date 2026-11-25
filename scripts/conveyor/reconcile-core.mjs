@@ -155,6 +155,7 @@ import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { pendingAutoRearmRequest } from './auto-rearm-request.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
 import { sessionSlugFor } from '../operations/dispatch-lane.mjs';
@@ -2686,6 +2687,22 @@ export function planReconcile({
       lapseOnNewHead: standDownHoldsAcrossHeads.value ? 'off' : 'on',
     });
     if (stoodDown > 0) {
+      // STANDDOWN-EMPTY-ROUND: the daemon's separate recover-class request (auto-rearm-request.mjs) buys ONE review of
+      // the same head, through the same referral/unreviewable/CI gates as every review. The stand-down stays unresolved
+      // (the note below still posts), no fixer is dispatched, and nothing else reads the record.
+      const autoRearm = pendingAutoRearmRequest(pr?.comments, pr?.headRefOid);
+      if (autoRearm) {
+        const phaseFields = { phase: 'stood-down-auto-rearm', labels: labelNames(pr?.labels) };
+        if (!refuseReferralHold({ pr, refuse, withPhase: phaseFields }) && !refuseUnreviewable({ pr, requiredChecks, refuse, withPhase: phaseFields })
+          && reviewChecksAllow({ pr, requiredChecks, refuse, withPhase: phaseFields })) {
+          dispatch.push({ ...base, ...phaseFields, kind: 'review', findings: countFindings(pr?.comments), autoRearmReview: autoRearm,
+            why: `PR #${prNumber}: the daemon requested one fresh review of the unchanged head (no code owed); the stand-down stays unresolved` });
+        }
+        notes.push({ kind: 'stood-down', prNumber,
+          text: `PR #${prNumber}: needs your decision — unanswered stand-down on head ${pr.headRefOid ?? 'unknown'}`
+            + ` (question ${standDownComments(pr.comments).length}); one fresh review of the unchanged head was requested.` });
+        continue;
+      }
       refuse('stood-down', {
         standDowns: stoodDown,
         why: `a fix agent already stopped here to ask a question — re-dispatching would re-ask it forever. Terminal on this head until an explicit operator answer is recorded with stand-down-answer.mjs. fix.standDownHoldsAcrossHeads=${standDownHoldsAcrossHeads.value} (source: ${standDownHoldsAcrossHeads.source}).`,

@@ -29,17 +29,21 @@ export default {
     const { buildStandDownComment } = await load('scripts/conveyor/stand-down.mjs');
     const { buildNoChangeComment } = await load('scripts/conveyor/rearm-review.mjs');
     const { parseOperatorAnswer } = await load('scripts/conveyor/stand-down-answer-core.mjs');
+    const { parseAutoRearmRequest } = await load('scripts/conveyor/auto-rearm-request.mjs');
+    const { countUnresolvedStandDowns } = await load('scripts/conveyor/reconcile-core.mjs');
+    const { AUTOMATION_LOGINS } = await load('scripts/lib/marker-authorship.mjs');
     const { ghRepoSlug } = await load('scripts/lib/constellation-repos.mjs');
     const weSlug = ghRepoSlug('we'), frontierSlug = ghRepoSlug('frontierui');
-    const head = 'a'.repeat(40), author = { login: 'web-everything' };
+    const head = 'a'.repeat(40), author = { login: AUTOMATION_LOGINS[0] };
     const thread = (begunAt = head) => [
-      { id: 'V1', author, body: '🔁 review — changes requested\n\nfindings' },
+      { id: 'V1', author, body: '🔁 review — changes requested\n\nRecorded by loop-console operator.\n\nrequired check "merge-gate" FAILURE' },
       { id: 'B1', author, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${begunAt.slice(0, 9)}\`\n<!-- fix-claim who=f -->` },
       { id: 'N1', author, body: buildNoChangeComment({ actor: 'conveyor fix agent', since: begunAt.slice(0, 9) }) },
       { id: 'SD1', author, createdAt: '2026-11-24T21:39:00Z', body: buildStandDownComment({ reason: 'needs-judgment', detail: 'nothing to repair' }) },
     ];
     const run = (name, conclusion, id) => ({ id, name, app: { id: 15368 }, check_suite: { id: 900 }, head_sha: head,
-      status: 'completed', conclusion, completed_at: '2026-11-24T21:00:00Z' });
+      status: 'completed', conclusion, completed_at: '2026-11-24T21:00:00Z',
+      details_url: `https://github.com/o/r/actions/runs/1/job/${name === 'merge-gate' ? 55 : 60 + id}` });
     const checks = () => ({ head, complete: true, runs: [run('test', 'success', 1), run('merge-gate', 'failure', 2)] });
     const gateRow = { name: 'merge-gate', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://github.com/o/r/actions/runs/1/job/55' };
     const rollup = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }, gateRow];
@@ -56,6 +60,7 @@ export default {
       const writer = (prs, opts) => nco.enrichPrsWithNoCodeOwedRearm(prs, { ...opts, repo: weSlug, requiredChecks: ['test', 'merge-gate'],
         readBindings: () => [{ context: 'test', integration_id: 15368 }, { context: 'merge-gate', integration_id: 15368 }],
         readComments: () => thr, readState: () => ({ headRefOid: head, labels: [{ name: 'review:changes' }], statusCheckRollup: rollup }),
+        readRoster: () => ({ checks: ['test', 'merge-gate'], source: 'live' }),
         readChecks: checks, readVerdict: verdict,
         reserve: ({ standDownId }) => { writes.push('reserve'); if (reserved.has(standDownId)) return false; reserved.add(standDownId); return true; },
         post: ({ body }) => { writes.push('post'); const c = { id: `A${posted.length + 1}`, author, body }; posted.push(c); thr = [...thr, c]; return c; },
@@ -64,7 +69,10 @@ export default {
       const options = { readPrs: () => [pr()], readAgents: () => [], enrich: same, env: {},
         readRequiredChecks: () => ({ checks: ['test', 'merge-gate'] }),
         enrichNoCodeOwedRearm: writer, enrichStandDownAutoProceed: same,
-        excuseMergeGateHolds: same, enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
+        // The pass's own merge-gate excusal annotates a review-hold-only gate; replayed here from the same verdict.
+        excuseMergeGateHolds: prs => prs.map(p => ({ ...p, statusCheckRollup: p.statusCheckRollup.map(r => r.name === 'merge-gate'
+          ? { ...r, mergeGateReviewHold: { holds: ['review-hold-labels'], jobId: 55 } } : r) })),
+        enrichMainRed: prs => ({ prs, mainRedWindows: [] }),
         enrichAlreadyLanded: same, enrichBaseRef: same, enrichSystemFix: same, enrichEscalationBase: same,
         enrichFixClaims: same, enrichTimeouts: same, enrichReferralHolds: same, enrichReferralAutoResolve: same,
         enrichLedgerHolds: same, enrichRulings: same, enrichScopeBloat: same, enrichCodeQL: same,
@@ -72,7 +80,12 @@ export default {
         resolveMainSha: () => null, readPriority: () => null };
       const dispatchOptions = { repo: 'we', checkStaleness: () => ({ fresh: true }), netScope: null, prStack: null,
         resolveProfile: () => ({ capabilities: { fix: false } }) };
-      const reconcile = input => runReconcilePass({ ...options, ...input });
+      const plans = [];
+      const reconcile = input => { const out = runReconcilePass({ ...options, ...input }); plans.push(out); return out; };
+      const result = () => ({ writes, posted, plans, refusals: plans.flatMap(p => p.refusals ?? []).map(r => `${r.kind}:${String(r.why ?? '').slice(0, 80)}`).join(' | '),
+        unresolved: countUnresolvedStandDowns(thr, { headRefOid: head }),
+        reviews: plans.flatMap(p => p.dispatch ?? []).filter(d => d.kind === 'review' && d.autoRearmReview).length,
+        fixes: plans.flatMap(p => p.dispatch ?? []).filter(d => d.kind === 'fix').length });
       if (setting === 'dry') { planFixDispatchClaimStatus({ repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }), resolveProfile: dispatchOptions.resolveProfile }); return { writes, posted }; }
       const fixSettings = resolveFixSettings({ env: {}, platform: {}, read: () => JSON.stringify({ fix: { standDownAutoProceed: setting } }) });
       const emptyTick = () => ({ dispatched: [], refusals: [] });
@@ -82,12 +95,17 @@ export default {
           ciHealTick: emptyTick, hungCiTick: emptyTick, mainRedRebaseTick: emptyTick, missingRunTick: emptyTick,
           promoteDraftTick: emptyTick, notesTick: emptyTick });
       }
-      return { writes, posted };
+      return result();
     }
 
     const live = await scenario('live', { comments: thread(), setting: undefined, ticks: 2 });
     report.scenarios.liveWrites = live.writes.join(',');
-    report.scenarios.liveRecord = live.posted.length ? parseOperatorAnswer(live.posted[0]) : null;
+    report.scenarios.liveRecord = live.posted.length ? parseAutoRearmRequest(live.posted[0]) : null;
+    report.scenarios.liveAsAnswer = live.posted.length ? parseOperatorAnswer(live.posted[0]) : null;
+    report.scenarios.liveReviews = live.reviews;
+    report.scenarios.liveRefusals = live.refusals;
+    report.scenarios.liveFixes = live.fixes;
+    report.scenarios.liveUnresolved = live.unresolved;
     report.scenarios.dry = (await scenario('dry', { comments: thread(), setting: 'dry' })).writes.join(',');
     report.scenarios.optedOut = (await scenario('off', { comments: thread(), setting: false })).writes.join(',');
     report.scenarios.codeOwed = (await scenario('owed', { comments: thread('b'.repeat(40)), setting: undefined })).writes.join(',');
@@ -96,7 +114,11 @@ export default {
   judge(report) {
     const s = report.scenarios, out = [];
     if (s.liveWrites !== 'reserve,post') out.push(`deadlock/loop: two daemon ticks on the same head wrote "${s.liveWrites}" (want exactly reserve,post)`);
-    if (s.liveRecord?.disposition !== 'auto-rearm' || s.liveRecord?.noCodeOwed !== undefined) out.push('the request is not a distinct auto-rearm record (it must never be an operator no-code-owed ruling)');
+    if (!s.liveRecord) out.push('no auto-rearm request record was posted by the automation identity');
+    if (s.liveAsAnswer) out.push('the request parses as an operator answer (it must be a separate record type)');
+    if (!(s.liveReviews >= 1)) out.push('no fresh review dispatch was planned for the unchanged head');
+    if (s.liveFixes) out.push(`a fixer was dispatched (${s.liveFixes}); the request must never reach fixers`);
+    if (s.liveUnresolved !== 1) out.push(`the stand-down was resolved by the request (unresolved=${s.liveUnresolved}, want 1)`);
     if (s.dry) out.push(`dry-run wrote ${s.dry}`);
     if (s.optedOut) out.push(`opted-out daemon wrote ${s.optedOut}`);
     if (s.codeOwed) out.push(`code owed was re-reviewed mechanically (${s.codeOwed})`);
