@@ -76,6 +76,9 @@ export default {
       return { result, launches, admitted, demand };
     };
     for (const [labels, comments, expectedMode] of [
+      [['review:changes', 'review:human'], [{
+        body: '🔁 human review — changes requested\n\nRepair the admitted finding.',
+      }], undefined],
       [['review:human', 'advisory:changes'], [{ author: { login: 'web-everything' },
         body: `${ADVISORY_NOTE_MARKER}\n\nRepair the admitted finding.` }], 'advisory-fix'],
       [['review:changes', 'red-team:blocked'], [sendBack], undefined],

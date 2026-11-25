@@ -2911,16 +2911,16 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     expect(refreshMqFailure).toHaveBeenCalledTimes(1);
   });
 
-  it.each([{ isConflict: true }, { takeover: {} }])('MQ refresh never receives repair exemptions (%j)', repair => {
+  it.each([{ isConflict: true }, { takeover: {} }, { labels: ['review:human', 'review:changes'] }])('MQ refresh never receives repair exemptions (%j)', repair => {
     const refreshMqFailure = vi.fn(() => ({ action: 'refreshed' }));
-    const held = { ...entry, ...repair, labels: ['review:human'],
+    const held = { ...entry, labels: ['review:human'], ...repair,
       mqFailureRecovery: { repo: 'web-everything/web-everything', pr: entry.prNumber,
         head: entry.headRefOid, evidence: { complete: true, testFiles: ['tests/failure.test.mjs'], assertions: ['break'] } } };
     const contexts = [];
     const result = run({ refreshMqFailure, mqFailureLedger: { readFixFallback: () => false },
       mqFailureIo: { readHead: () => entry.headRefOid }, fetchItemlessDiffPaths: () => ['src/unrelated.mjs'],
       readPushHold: context => { contexts.push(context); return readLivePushHold(context, { hermetic: false,
-        run: () => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }) }); },
+        run: () => JSON.stringify({ state: 'OPEN', labels: held.labels.map(name => ({ name })) }) }); },
     }, [held]);
     expect(contexts).toHaveLength(1);
     expect(contexts[0]).not.toHaveProperty('repair');
@@ -2938,6 +2938,10 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   it.each([
+    [undefined, ['review:human', 'review:changes'], {}],
+    [undefined, ['review:human', 'review:changes', 'red-team:blocked'], {}],
+    [undefined, ['review:human', 'review:changes', 'red-team:pending'], {}, false],
+    [undefined, ['review:human', 'review:changes', 'review:held-mechanical'], {}, false],
     ['advisory-fix', ['review:human', 'advisory:changes'], {}],
     ['operator-send-back', ['review:human'], { operatorSendBack: { body: 'repair' } }],
     ['ruling-not-addressed', ['review:human'], { rulingNotAddressed: { matches: [] } }],
@@ -2983,6 +2987,8 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   it.each([
+    [['review:human', 'review:changes'], { labels: ['review:changes'] }],
+    [['review:human'], { labels: ['review:human', 'review:changes'] }],
     [['review:human'], { mode: 'advisory-fix', labels: ['review:human'] }],
     [['review:human', 'advisory:changes'], { mode: 'advisory-fix', labels: [] }],
     [['red-team:blocked', 'review:changes'], { labels: ['review:changes'] }],
@@ -2998,6 +3004,7 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   it.each([true, false].flatMap(itemBacked => [
+    { itemBacked, labels: ['review:human', 'review:changes'] },
     { itemBacked, mode: 'advisory-fix', labels: ['review:human', 'advisory:changes'] },
     { itemBacked, mode: 'operator-send-back', labels: ['review:human'], operatorSendBack: { body: 'repair' } },
     { itemBacked, labels: ['review:changes', 'red-team:blocked'] },
@@ -3007,6 +3014,32 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     expect(planned[0]).toMatchObject(context);
     expect(readLivePushHold({ repo: 'we', pr: 1764, repair: planned[0] }, { hermetic: false,
       run: () => JSON.stringify({ state: 'OPEN', labels: row.labels.map(name => ({ name })) }) })).toBeNull();
+  });
+
+  it.each([true, false])('real planner ordinary bounced repair launches with its existing human hold (item-backed=%s)', itemBacked => {
+    const labels = ['review:changes', 'review:human'];
+    const pr = { number: entry.prNumber, state: 'OPEN', isDraft: false,
+      headRefName: itemBacked ? entry.headRefName : 'topic', headRefOid: entry.headRefOid,
+      baseRefName: 'main', labels: labels.map(name => ({ name })), mergeStateStatus: 'CLEAN',
+      rowsComplete: true, rowsHead: entry.headRefOid,
+      statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      comments: [{ body: '🔁 human review — changes requested\n\nRepair the admitted finding.' }] };
+    const plan = planFreshBounce({ prs: [pr], agents: [], now: Date.parse('2026-11-25T00:00:00Z') });
+    expect(plan.dispatch).toHaveLength(1);
+    expect(plan.dispatch[0]).toMatchObject({ kind: 'fix', phase: 'bounced', findings: 1, labels });
+    expect(plan.dispatch[0].mode).toBeUndefined();
+    expect(plan.dispatch[0].operatorSendBack).toBeUndefined();
+    const dispatch = vi.fn(p => ok(p.pr));
+    const liveRead = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: pr.labels }));
+    const result = run({ dispatch, tryResume: () => ({ resumed: false }),
+      fetchItemlessDiffPaths: () => ['src/a.mjs'],
+      readPushHoldOptions: { hermetic: false, run: liveRead } }, plan.dispatch);
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(liveRead).toHaveBeenCalledTimes(2);
+    // Repair admission is read-only: human review remains owed before landing.
+    expect(pr.labels.map(label => label.name)).toEqual(labels);
   });
 
   it('dispatchFix re-reads the hold after the slow prep and spawns nothing; the claim is released', () => {

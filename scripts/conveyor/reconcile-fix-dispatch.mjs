@@ -110,8 +110,10 @@ export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermet
   // These labels hold landing/review, but the planner can owe a repair while they remain present.
   // Only exempt a hold already carried by that repair; a newly added hold still stops it. MQ refresh
   // supplies no repair context and never receives these exceptions. Check every remaining hold too.
+  // An ordinary review:changes bounce owes a repair without any special mode; the human landing hold stays.
   const humanRepair = (repair?.reviewHuman === true || repair?.labels?.includes('review:human'))
-    && ((repair.mode === 'advisory-fix' && labels.includes('advisory:changes'))
+    && (labels.includes('review:changes')
+      || (repair.mode === 'advisory-fix' && labels.includes('advisory:changes'))
       || repair.operatorSendBack || repair.rulingNotAddressed || repair.blockRuledReferrals?.length
       || repair.takeover || repair.scopeBloat || repair.staleBase || repair.isConflict);
   const label = labels.find(name => PUSH_HOLD_LABELS.includes(name)
