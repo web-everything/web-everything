@@ -111,14 +111,14 @@ describe('readHostMemoryReading Darwin pressure probe', () => {
   });
   it.each([
     ['1\n', 'normal', reclaimableMb],
-    ['2\n', 'warn', 0],
+    ['2\n', 'warn', reclaimableMb],
     ['4\n', 'critical', 0],
   ])('uses pressure %j first and returns finite headroom for %s', (pressure, level, mb) => {
     const probe = probes({ pressure });
     const reading = hostLoad.readHostMemoryReading(probe);
     expect(reading).toEqual({ mb, source: 'memory-pressure', level });
     expect(Number.isFinite(reading.mb)).toBe(true);
-    expect(probe.exec.mock.calls).toEqual(level === 'normal' ? [
+    expect(probe.exec.mock.calls).toEqual(level !== 'critical' ? [
       ['sysctl', pressureArgs, opts], ['vm_stat', [], opts], ['sysctl', ['vm.swapusage'], opts],
     ] : [['sysctl', pressureArgs, opts]]);
     expect(probe.free).not.toHaveBeenCalled();
@@ -215,11 +215,11 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     Object.defineProperty(process, 'platform', platformDescriptor);
   });
 
-  function admission({ pressure = '1', env = {}, load = () => [1], ...probeOptions } = {}) {
+  function admission({ pressure = '1', env = {}, load = () => [1], readSnap, now, ...probeOptions } = {}) {
     const probe = probes({ pressure, ...probeOptions });
     native.exec.mockImplementation(probe.exec);
     // Deliberately omit memory and memoryReading to exercise the default reader.
-    return hostLoad.hostLoadAdmission({ policy, interactive: false, env, load, cores: () => 8 });
+    return hostLoad.hostLoadAdmission({ policy, interactive: false, env, load, cores: () => 8, readSnap, now });
   }
 
   it('normal above floor admits', () => {
@@ -248,12 +248,34 @@ describe('hostLoadAdmission with the default memoryReading', () => {
     expect(native.exec).toHaveBeenCalledWith('vm_stat', [], opts);
   });
 
-  it('warn holds', () => {
-    const result = admission({ pressure: '2' });
+  const T = Date.parse('2026-11-25T12:00:10Z');
+  const snap = (memory, over = {}) => ({ sampledAt: '2026-11-25T12:00:00Z', freshUntil: '2026-11-25T12:00:20Z', memory, ...over });
+  const warn = (s) => admission({ pressure: '2', readSnap: () => s, now: () => T });
+
+  it('warn uncorroborated (free 27%, swap +0MB) admits with measured reclaimable MB', () => {
+    const result = warn(snap({ freePct: 27, swapGrowthMb: 0 }));
+    expect(result.admitted).toBe(true);
+    expect(result.reason).toContain('pressure warn uncorroborated');
+    expect(result.reason).toContain(`reclaimable headroom ${Math.round(reclaimableMb)}MB`);
+    expect(result.reason).not.toContain('0MB;');
+  });
+  it('warn with free 18% holds as corroborated', () => {
+    const result = warn(snap({ freePct: 18, swapGrowthMb: 0 }));
     expect(result.admitted).toBe(false);
-    expect(result.reason).toContain('source=memory-pressure');
-    expect(native.exec.mock.calls).toEqual([['sysctl', pressureArgs, opts]]);
-    expect(native.free).not.toHaveBeenCalled();
+    expect(result.reason).toContain('corroborated');
+  });
+  it('warn with swap growth +3428MB holds', () => {
+    expect(warn(snap({ freePct: 27, swapGrowthMb: 3428 })).admitted).toBe(false);
+  });
+  it('warn with a stale or unreadable snapshot holds', () => {
+    expect(warn(snap({ freePct: 27, swapGrowthMb: 0 }, { freshUntil: '2026-11-25T12:00:05Z' })).admitted).toBe(false);
+    expect(warn(null).admitted).toBe(false);
+  });
+  it('critical holds without claiming a measured 0MB', () => {
+    const result = admission({ pressure: '4' });
+    expect(result.admitted).toBe(false);
+    expect(result.reason).toContain('critical');
+    expect(result.reason).not.toContain('0MB');
   });
 
   it('holds on pages-only fallback when swap is denied after normal pressure', () => {
@@ -291,7 +313,7 @@ describe('hostLoadAdmission with the default memoryReading', () => {
   });
 
   it.each(['2', '4'])('holds at pressure level %s and reports memory-pressure provenance', (pressure) => {
-    const result = admission({ pressure });
+    const result = admission({ pressure, readSnap: () => null });
     expect(result.admitted).toBe(false);
     expect(result.reason).toContain('source=memory-pressure');
     expect(native.free).not.toHaveBeenCalled();

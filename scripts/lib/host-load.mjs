@@ -13,7 +13,10 @@ import { mkdirSync, lstatSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as childProcess from 'node:child_process';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
-import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB } from './host-overload-settings.mjs';
+import { loadHostOverloadSettings, hostStateRoot, boundedText, DEFAULT_MIN_MEMORY_HEADROOM_MB,
+  DEFAULT_SNAPSHOT_MAX_FRESH_MS, DEFAULT_SNAPSHOT_CLOCK_SKEW_MS } from './host-overload-settings.mjs';
+import { decideMemoryPressure } from './memory-warn-corroboration.mjs';
+import { readSnapshot } from './resource-admission.mjs';
 import { collectHostCapacity } from '../readiness/host-capacity.mjs';
 import { LEASE_FILENAME } from './lane-lease.mjs';
 
@@ -95,13 +98,14 @@ function readMemoryReading({ env = process.env, platform = process.platform, exe
       } catch {
         // Unavailable or unknown pressure must still pass the existing headroom checks.
       }
-      if (level === 'warn' || level === 'critical') return { mb: 0, source: 'memory-pressure', level };
+      if (level === 'critical') return { mb: 0, source: 'memory-pressure', level };
     }
     let vm;
     try {
       vm = exec('vm_stat', [], opts);
     } catch (e) {
       if (!isMemoryProbeDenied(e)) throw e;
+      if (level === 'warn') throw Error('warn reclaimable memory unmeasurable');
       return readFreeMemoryReading(free);
     }
     const pagesMb = parseDarwinMemoryHeadroomMb(vm, 'free = 0M');
@@ -110,11 +114,13 @@ function readMemoryReading({ env = process.env, platform = process.platform, exe
     try { swap = exec('sysctl', ['vm.swapusage'], opts); }
     catch (e) {
       if (!isMemoryProbeDenied(e)) throw e;
+      if (level === 'warn') throw Error('warn reclaimable memory unmeasurable');
       return { mb: pagesMb, source: 'vm_stat' };
     }
-    const mb = level === 'normal' ? parseDarwinReclaimableMemoryMb(vm, swap) : parseDarwinMemoryHeadroomMb(vm, swap);
+    const reclaim = level === 'normal' || level === 'warn';
+    const mb = reclaim ? parseDarwinReclaimableMemoryMb(vm, swap) : parseDarwinMemoryHeadroomMb(vm, swap);
     if (!Number.isFinite(mb) || mb < 0) throw Error('invalid swap headroom');
-    if (level === 'normal') return { mb, source: 'memory-pressure', level };
+    if (reclaim) return { mb, source: 'memory-pressure', level };
     return { mb, source: 'vm_stat+swap' };
   }
   return readFreeMemoryReading(free);
@@ -126,6 +132,7 @@ export function readHostMemoryHeadroomMb(options = {}) {
 export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => os.cpus().length, memory,
   capacity = collectHostCapacity,
   memoryReading = memory ? (options) => ({ mb: memory(options), source: 'injected' }) : readHostMemoryReading,
+  readSnap = () => { try { return readSnapshot(); } catch { return null; } }, now = Date.now,
   interactive = !!process.stdin.isTTY, env = process.env, log } = {}) {
   if (interactive) return { admitted: true, reason: 'operator interactive command' };
   let loadVerdict;
@@ -151,8 +158,22 @@ export function hostLoadAdmission({ policy, load = readHostLoad, cores = () => o
     if (!Number.isFinite(min) || min <= 0) throw Error('invalid host memory threshold');
     const { mb, source, level } = memoryReading({ env });
     if (!Number.isFinite(mb) || mb < 0) throw Error('unknown host memory');
+    if (source === 'memory-pressure' && level === 'critical') return { admitted: false, reason: 'host memory pressure critical (level 4); source=memory-pressure' };
+    let corroboration = '';
+    if (source === 'memory-pressure' && level === 'warn') {
+      // Warn alone is not scarcity (61% of samples): hold only when the shared rule corroborates it from a fresh snapshot.
+      const snap = readSnap();
+      const m = snap?.memory ?? {};
+      const sampledAt = Date.parse(snap?.sampledAt); const freshUntil = Date.parse(snap?.freshUntil); const t = now();
+      const fresh = Number.isFinite(sampledAt) && Number.isFinite(freshUntil)
+        && freshUntil - sampledAt <= DEFAULT_SNAPSHOT_MAX_FRESH_MS && sampledAt <= t + DEFAULT_SNAPSHOT_CLOCK_SKEW_MS && t <= freshUntil;
+      if (!fresh) return { admitted: false, reason: 'host memory pressure warn; resource snapshot stale or unreadable (fail closed); source=memory-pressure' };
+      const d = decideMemoryPressure({ pressureLevel: 2, freePct: m.freePct, swapGrowthMb: m.swapGrowthMb });
+      if (d.held) return { admitted: false, reason: `host memory pressure warn corroborated: ${d.reason}; source=memory-pressure` };
+      corroboration = `; pressure warn uncorroborated (free ${d.freePct}%, swap growth ${d.swapGrowthMb}MB)`;
+    }
     const description = source === 'memory-pressure'
-      ? `host memory pressure ${level}; reclaimable headroom ${Math.round(mb)}MB`
+      ? `host memory pressure ${level}${corroboration}; reclaimable headroom ${Math.round(mb)}MB`
       : `host memory headroom ${Math.round(mb)}MB (free+swap)`;
     const reason = `${description}; host.minMemoryHeadroomMb=${min} (${policy.sources?.['host.minMemoryHeadroomMb'] ?? 'standard'}); source=${source}`;
     return mb >= min ? { admitted: true, reason: `${loadVerdict.reason}; ${reason}` } : { admitted: false, reason };
