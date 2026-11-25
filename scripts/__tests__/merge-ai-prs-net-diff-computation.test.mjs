@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
 import { resolveProducerReviewLabel } from '../pr-land.mjs';
 import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
+import { describeUnverifiedNetDiff } from '../lib/forge-net-diff.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
 import { createPrestageWorld } from './fixtures/merge-ai-prs-prestage-world.mjs';
@@ -1320,9 +1321,9 @@ function drainScore(sig) {
   const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
   const start = source.indexOf('      const score = scoreEscalation({ changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, dismissedFindings: v.');
   const end = source.indexOf('      // #2766', start);
-  return new Function('sig', 'scoreEscalation',
+  return new Function('sig', 'scoreEscalation', 'describeUnverifiedNetDiff',
     'const { changedFiles, diffLines, humanBasisFiles, cumulativeDiffLines, diffHunks, basisNarrowed, netDiffText } = sig; const v = {};\n'
-    + source.slice(start, end) + '\nreturn score;')(sig, scoreEscalation);
+    + source.slice(start, end) + '\nreturn score;')(sig, scoreEscalation, describeUnverifiedNetDiff);
 }
 
 describe('R1105 pinned test-gaming evidence producer', () => {

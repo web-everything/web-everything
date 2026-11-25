@@ -41,6 +41,14 @@ serially, in a later session, under the same self-approved PR transport the prod
 
 ## Preconditions
 
+- A non-local repo’s net diff is read from the forge and needs no sibling clone.
+  An available sibling clone still supplies git's exact diff text when carrying a clearance to a moved head.
+  An unreadable forge compare holds even after clear-human. Once the compare is readable, run clear-human and
+  restore `ready-to-merge`; a parked PR does not automatically wake on the next drain pass. Changes the compare
+  cannot represent (including test renames without mode/type proof) require human review and a merge outside the drain.
+  The frontierui #53 compare proof (head `022d10e0a9d3`, base `d1371053c51b41b0bb3f4686eb03bee8cc43c1ec`,
+  8 files, 1091 diff lines; bogus head → `api-http-404`) is historical manual evidence, not an automated live test.
+
 - **Run from a LEASED lane-pool clone — NEVER the shared primary checkout (#2197 / ratified #2123).** The
   drain is an edit-action session (it advances `main` and, per #2198, rebuilds lane tips), so #2123's "every
   edit-action session runs in an isolated clone" applies. The primary tree almost always carries a peer
