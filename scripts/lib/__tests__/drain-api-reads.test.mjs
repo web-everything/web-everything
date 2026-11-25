@@ -795,6 +795,13 @@ describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
   ])('holds %s with forge-path-unsupported', (_n, file) => {
     expect(netRead(netDoc({ files: [file] }))).toMatchObject({ ok: false, reason: 'path-unsupported' });
   });
+  it.each([
+    ['@@ nonsense\n+x'], ['+x'], ['@@ -0,0 +1,2 @@\n+x'], ['@@ -1,2 +1 @@\n x\n+y'], ['@@ -0,0 +1 @@\n+x\n@@ bad @@\n+y'],
+  ])('holds a malformed patch as patch-malformed: %j', (patch) => {
+    const adds = patch.split('\n').filter(l => l.startsWith('+')).length;
+    expect(netRead(netDoc({ files: [netFile({ patch, additions: adds, changes: adds })] }))).toMatchObject({ ok: false, reason: 'patch-malformed' });
+    expect(drainReads.isPermanentReadReason('patch-malformed')).toBe(true);
+  });
   it('passes an opaque non-test patch and a non-test copy with correct headers', () => {
     const files = [netFile({ filename: 'a.png', status: 'modified', additions: 0, deletions: 0, changes: 0, patch: 'GIF89a opaque' }),
       netFile({ filename: 'c.ts', previous_filename: 'b.ts', status: 'copied', ...bare })];
@@ -832,7 +839,7 @@ describe('readCompareNetDiff / synthesizeUnifiedDiff', () => {
     ['path-unsupported', netDoc({ files: [netFile({ filename: 'a/../x.ts' })] })],
     ['path-unsupported', netDoc({ files: [netFile({ filename: 'x.ts\n' })] })],
     ['path-unsupported', netDoc({ files: [netFile({ status: 'copied', previous_filename: '../x.ts' })] })],
-    ['synth-mismatch', netDoc({ files: [netFile({ patch: '@@ -0,0 +1,2 @@\n+it.skip("x");' })] })],
+    ['patch-malformed', netDoc({ files: [netFile({ patch: '@@ -0,0 +1,2 @@\n+it.skip("x");' })] })],
   ])('refuses incomplete evidence: %s %#', (reason, doc) => expect(netRead(doc)).toMatchObject({ ok: false, reason }));
   it.each(['api-http-500', 'api-http-404', 'deadline', 'api-error'])('preserves transport failure %s', reason => {
     expect(netRead(null, { source: { read: () => ({ ok: false, reason }) } })).toMatchObject({ ok: false, reason });

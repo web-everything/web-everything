@@ -42,12 +42,27 @@ it.each([
   ['patch-omitted', compare({ files: [file({ patch: undefined })] })],
   ['patch-truncated', compare({ files: [file({ additions: 2, changes: 2 })] })],
   ['path-unsupported', compare({ files: [file({ filename: 'a b/c.ts' })] })],
+  ['patch-malformed', compare({ files: [file({ patch: '@@ nonsense\n+export const x = 1;' })] })],
+  ['patch-malformed', compare({ files: [file({ patch: '+export const x = 1;' })] })],
+  ['patch-malformed', compare({ files: [file({ patch: '@@ -0,0 +1,2 @@\n+export const x = 1;' })] })],
   ['compare-empty', compare({ status: 'identical' })], ['head-unbound', compare()],
 ])('every unknown holds: %s', (reason, doc) => world(async ({ pr, run }) => {
   ready(pr); pr.compare = doc;
   if (reason === 'head-unbound') pr.headRefOid = 'bad-head';
   held(await run(false, options), `net diff unverified (forge-${reason}); `);
 }, setup), 120_000);
+it('a stacked or unknown base is unscored with forge-stacked-base and never reads the compare', async () => {
+  const { forgeNetDiffSignals, describeUnverifiedNetDiff } = await import('../lib/forge-net-diff.mjs');
+  for (const baseRef of ['lane/other', null, '']) {
+    const read = vi.fn();
+    const s = forgeNetDiffSignals({ repo: 'o/r', headSha: 'a'.repeat(40), allowedRepos: ['o/r'], read, baseRef });
+    expect(s.scored).toBe(false);
+    expect(s.netDiffText).toMatchObject({ scored: false, reason: 'forge-stacked-base' });
+    expect(read).not.toHaveBeenCalled();
+    expect(describeUnverifiedNetDiff({ repo: 'o/r', headSha: 'a'.repeat(40), reason: s.netDiffText.reason, transient: s.netDiffText.transient }))
+      .toBe('net diff unverified (forge-stacked-base); stacked PR: net diff is read once its base lands. Wake: the base PR merges and this PR is retargeted to main.');
+  }
+});
 it.each([
   ['test-file-removed', file({ filename: 'blocks/__tests__/x.test.ts', status: 'removed', additions: 0, deletions: 1, patch: '@@ -1 +0,0 @@\n-it("works", () => {});' })],
   ['test-skipped', file({ filename: 'blocks/__tests__/x.test.ts', patch: '@@ -0,0 +1 @@\n+it.skip("works", () => {});' })],

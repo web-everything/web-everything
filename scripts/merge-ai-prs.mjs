@@ -6705,7 +6705,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // The clone-pinned git runner, kept for the test-gaming carry's SHA-bound re-read below (null = no clone).
       let diffExec = null;
       if (!isLocalRepo(v.repo)) {
-        const sig = forgeNetDiffSignals({ repo: v.repo, headSha: v.listedHeadSha, allowedRepos: REPOS });
+        const sig = forgeNetDiffSignals({ repo: v.repo, headSha: v.listedHeadSha, allowedRepos: REPOS, baseRef: v.baseRefName ?? null });
         if (sig.netDiffText.scored) process.stderr.write(`net-diff #${v.num}: base=${sig.netDiffText.base} head=${sig.netDiffText.rev} (forge)\n`);
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;

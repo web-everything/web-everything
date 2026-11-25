@@ -25,7 +25,7 @@ export const isTransientReadFailure = (text) => String(text ?? '').includes(DRAI
  * so consumers say "needs you" instead of "retry next pass". The old git path could judge such a PR; in `api` mode the
  * way out is to set `drain.reads.source=git`.
  */
-export const PERMANENT_READ_REASONS = new Set(['compare-ceiling', 'patch-omitted', 'patch-truncated', 'path-unsupported']);
+export const PERMANENT_READ_REASONS = new Set(['compare-ceiling', 'patch-omitted', 'patch-truncated', 'patch-malformed', 'path-unsupported']);
 export const isPermanentReadReason = (reason) => PERMANENT_READ_REASONS.has(reason);
 
 export class DrainReadError extends Error {
@@ -313,6 +313,31 @@ export function readAddedFiles(base, headSha, o = {}) {
 const hasHunks = (f) => typeof f.patch === 'string' && /^@@ /m.test(f.patch);
 
 /**
+ * Strict unified-hunk check: a file with counted changes needs at least one `@@ -a,b +c,d @@` header, every hunk's
+ * line counts must match its header, and no line may sit outside a hunk. A patch with no `@@` line and no counted
+ * changes is opaque (binary, mode-only), which the synthesis handles separately.
+ */
+export function wellFormedPatch(f) {
+  const patch = typeof f.patch === 'string' ? f.patch : '';
+  if (!/^@@/m.test(patch)) return !(f.changes > 0);
+  let oldLeft = 0, newLeft = 0, inHunk = false;
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('@@')) {
+      if (inHunk && (oldLeft !== 0 || newLeft !== 0)) return false;
+      const m = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/.exec(line);
+      if (!m) return false;
+      oldLeft = m[1] === undefined ? 1 : Number(m[1]); newLeft = m[2] === undefined ? 1 : Number(m[2]); inHunk = true;
+    } else if (!inHunk) return false;
+    else if (line.startsWith('\\')) continue;
+    else if (line.startsWith('+')) { if (--newLeft < 0) return false; }
+    else if (line.startsWith('-')) { if (--oldLeft < 0) return false; }
+    else if (line.startsWith(' ') || line === '') { if (line === '' && oldLeft === 0 && newLeft === 0) continue; if (--oldLeft < 0 || --newLeft < 0) return false; }
+    else return false;
+  }
+  return inHunk && oldLeft === 0 && newLeft === 0;
+}
+
+/**
  * A file whose change cannot be reconstructed faithfully (rename/copy/type change, or an opaque patch) must not touch a
  * test path: the scanner would read a reconstruction, not the real change. Fail closed, on either path.
  */
@@ -364,10 +389,10 @@ export function readCompareNetDiff(repo, headSha, o = {}) {
     if (!path(f?.filename) || ((f.previous_filename !== undefined || ['renamed', 'copied'].includes(f.status)) && !path(f.previous_filename))) return bad(r, 'path-unsupported');
     if (!KNOWN_STATUS.has(f.status) || ![f.additions, f.deletions, f.changes].every(n => Number.isSafeInteger(n) && n >= 0) || f.changes !== f.additions + f.deletions) return bad(r, 'api-malformed', 'file status or counts invalid');
     if (typeof f.patch !== 'string' && f.changes > 0) return bad(r, 'patch-omitted');
-    if (unsupportedTestChange(f)) return bad(r, 'path-unsupported', 'test path with a rename, copy, type change or opaque patch');
     if (f.patch != null && typeof f.patch !== 'string') return bad(r, 'api-malformed', 'patch is not text');
-    const lines = (f.patch ?? '').split('\n');
-    if (lines.filter(l => l.startsWith('+')).length !== f.additions || lines.filter(l => l.startsWith('-')).length !== f.deletions) return bad(r, 'patch-truncated');
+    { const t = (f.patch ?? '').split('\n'); if (t.filter(l => l.startsWith('+')).length !== f.additions || t.filter(l => l.startsWith('-')).length !== f.deletions) return bad(r, 'patch-truncated'); }
+    if (!wellFormedPatch(f)) return bad(r, 'patch-malformed', 'patch is not well-formed unified hunks');
+    if (unsupportedTestChange(f)) return bad(r, 'path-unsupported', 'test path with a rename, copy, type change or opaque patch');
   }
   const text = synthesizeUnifiedDiff(doc.files);
   const parsed = parseUnifiedDiff(text);
