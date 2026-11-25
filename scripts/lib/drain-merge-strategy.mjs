@@ -34,7 +34,7 @@ import { syncRedTeamStatusLabels } from './red-team-status-labels.mjs';
  *   (non-dry-run) pass ignores the variable and says so.
  */
 import { sweepStuckEntries } from './merge-queue-stuck-dequeue.mjs';
-import { createFastDrainWriteBoundary } from './fast-drain-scope.mjs';
+import { createFastDrainWriteBoundary, requireFastDrainDeferKind } from './fast-drain-scope.mjs';
 import { guardEnqueue } from './drain-poison-guard.mjs';
 import { countTrustedLeadingMarker } from './marker-authorship.mjs';
 import { appendDaemonEvent } from './daemon-events.mjs';
@@ -541,7 +541,7 @@ export function createDrainMergeStrategy({
           }
         }
         catch (e) { say(`red-team status labels #${c.num}: ${firstLine(e)}`); }
-        if (boundary.violations.length) return { enqueued: false, deferred: true, kind: boundary.violations.at(-1) };
+        if (boundary.violations.length) return { enqueued: false, deferred: true, kind: requireFastDrainDeferKind(boundary.violations.at(-1)) };
         if (reason) {
           before.redTeamPending ??= {};
           const wait = { headSha, firstPendingAt: sameHead ? pending.firstPendingAt : now(),
@@ -697,6 +697,7 @@ export function createDrainMergeStrategy({
         const hold = checkRunAdmission(c, headSha, before) || checkRunDispositionHold(c, headSha, fresh);
         if (hold) return hold;
       }
+      boundary.authorizeEnqueue(slugOf(c.repo), c.num, headSha);
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });

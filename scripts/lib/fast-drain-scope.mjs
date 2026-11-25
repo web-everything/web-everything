@@ -24,6 +24,12 @@ export function isFastDrainDeferKind(kind) {
     || kind.startsWith('defer-to-pass:write-boundary:') && FAST_DRAIN_WRITE_KINDS.has(kind.slice('defer-to-pass:write-boundary:'.length)));
 }
 
+/** Dynamic producer values must pass the same exhaustive taxonomy as literals. */
+export function requireFastDrainDeferKind(kind) {
+  if (!isFastDrainDeferKind(kind)) throw new Error(`Unclassified fast-drain defer kind: ${String(kind)}`);
+  return kind;
+}
+
 /** The cwd-repo sentinel must share the full pass's persistent cache namespace. */
 export function shaCacheRepo(repo, localSlug) {
   return repo || localSlug;
@@ -50,6 +56,9 @@ export function resolveFastDrainIndexSetting({ env = process.env, tool, platform
     for (const block of [tool, platform]) {
       if (block !== undefined && (block === null || typeof block !== 'object' || Array.isArray(block))) return closed();
       if (block && Object.hasOwn(block, 'index') && (!block.index || typeof block.index !== 'object' || Array.isArray(block.index))) return closed();
+      for (const [key, valid] of [['maxAgeMinutes', validAge], ['hydrateBudget', validBudget]]) {
+        if (block?.index && Object.hasOwn(block.index, key) && !valid(block.index[key])) return closed();
+      }
     }
     const parseEnv = key => env[key] === undefined ? undefined : /^\d+$/.test(env[key]) ? Number(env[key]) : null;
     const c = cascadePolicy('mergeQueue.fastDrain.index', tool?.index, { env, platform: platform?.index,
@@ -113,10 +122,63 @@ export function resolveFastDrainListingSetting({ env = process.env, tool, platfo
   return { listing, source, context, contextSource, line };
 }
 
+/** Keep subverbs and flags finite: several otherwise read-only Git verbs can write output or run helpers. */
+function safeGitRead(args) {
+  const [verb, ...rest] = args;
+  if (verb === 'config') return rest.length === 2 && ['--get', '--get-all'].includes(rest[0]) && !rest[1].startsWith('-')
+    || rest.join(' ') === '--null --list --includes';
+  if (verb === 'remote') return rest.length === 2 && rest[0] === 'get-url' && rest[1] === 'origin';
+  if (verb === 'commit-graph') return rest.join(' ') === 'verify';
+  // Fetch is only a remote read for pinned diff/manifest readers. Restrict local updates to origin tracking refs.
+  if (verb === 'fetch') {
+    const refs = rest.filter(a => !['--quiet', '--no-tags', '--end-of-options'].includes(a));
+    return refs.length > 1 && refs[0] === 'origin' && refs.slice(1).every(a =>
+      // Net-diff readers use branch shorthand; a source without a destination only updates FETCH_HEAD.
+      /^[\w][\w./-]*$/.test(a)
+      || /^\+(?:refs\/heads\/)?([\w][\w./-]*):refs\/remotes\/origin\/\1$/.test(a));
+  }
+  const flags = {
+    diff: /^(?:--(?:name-only|name-status|numstat|stat|no-renames|no-relative|no-ext-diff|no-textconv|no-color|cached|end-of-options)|--(?:src-prefix|dst-prefix|diff-filter)=[^\n]*|-z)$/,
+    show: /^(?:--(?:end-of-options|no-ext-diff|no-textconv)|--format=[^\n]*)$/,
+    log: /^(?:--(?:reverse|first-parent|numstat|end-of-options|no-ext-diff|no-textconv|no-color)|--(?:format|pretty|grep|diff-filter|diff-merges)=[^\n]*|-z)$/,
+    'ls-tree': /^(?:--(?:name-only|end-of-options)|-[rz])$/,
+    'rev-parse': /^(?:--(?:verify|quiet|end-of-options|abbrev-ref|is-shallow-repository|show-toplevel|git-common-dir|git-dir|absolute-git-dir)|--path-format=absolute)$/,
+    'ls-remote': /^(?:--(?:exit-code|heads|tags|refs))$/,
+    'cat-file': /^(?:-[ept]|--end-of-options)$/,
+    grep: /^(?:--threads=1|-[nE]+|-e)$/,
+    status: /^(?:--porcelain(?:=v[12])?|--untracked-files=no)$/,
+    'merge-base': /^(?:--(?:is-ancestor|end-of-options|all))$/,
+  };
+  if (!flags[verb]) return false;
+  let paths = false;
+  return rest.every(a => {
+    if (a === '--') { paths = true; return true; }
+    return paths || !a.startsWith('-') || flags[verb].test(a);
+  });
+}
+
+/** Split value flags, including --flag=value and compact -XPOST/-fkey=value. */
+function ghOptions(args, valueFlags, switches = []) {
+  const values = [], operands = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (switches.includes(arg)) continue;
+    const flag = valueFlags.find(f => arg === f || arg.startsWith(`${f}=`) || f.length === 2 && arg.startsWith(f));
+    if (flag) {
+      const value = arg === flag ? args[++i] : arg.slice(flag.length).replace(/^=/, '');
+      if (typeof value !== 'string' || !value || value.startsWith('-')) return null;
+      values.push([flag, value]);
+    } else if (arg.startsWith('-')) return null;
+    else operands.push(arg);
+  }
+  return { values, operands };
+}
+
 /** One boundary for injected writers and their subprocesses. Unknown mutations refuse. */
 export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, log = () => {} } = {}) {
   const limited = writeScope === 'enqueue-only';
   let confirmed = false;
+  let judgedHead = null, nodeId = null;
   const violations = [];
   const refuse = kind => {
     const reason = `defer-to-pass:write-boundary:${kind}`;
@@ -135,6 +197,12 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
   };
   return {
     limited, violations, refuse, target, repo, num,
+    authorizeEnqueue: (r, n, head) => {
+      if (!limited) return;
+      target(r, n);
+      if (!/^[a-f0-9]{40}$/.test(head)) refuse('graphql');
+      judgedHead = head; nodeId = null;
+    },
     fullPassDuty: (fn, fallback) => limited ? fallback : fn(),
     confirm: () => { confirmed = true; },
     helper: (kind, fn) => (...args) => {
@@ -162,18 +230,21 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
           verbArgs = verbArgs.slice(2);
         }
         if (verbArgs[0] === 'push') refuse('numbering-push');
-        if (!(verbArgs[0] === 'commit-graph' && verbArgs[1] === 'verify') && !['diff', 'show', 'ls-tree', 'rev-parse', 'ls-remote', 'fetch', 'cat-file', 'grep', 'remote', 'status', 'log', 'config', 'merge-base'].includes(verbArgs[0])) refuse('git');
+        if (!safeGitRead(verbArgs)) refuse('git');
       } else if (file === 'gh') {
         if (args[0] === 'pr' && !['view', 'list', 'diff', 'checks'].includes(args[1])) {
-          target(args.includes('--repo') ? value('--repo') : repo, args[2]);
+          const selectors = ghOptions(args.slice(3), ['--repo', '-R', '--add-label', '--remove-label', '--body', '--body-file', '--base', '--title', '-B', '-b', '-F', '-t']);
+          if (!selectors) refuse('pr-edit');
+          for (const [flag, r] of selectors.values) if (['--repo', '-R'].includes(flag)) target(r, args[2]);
+          target(repo, args[2]);
           if (args[1] === 'merge') refuse('merge');
           if (args[1] === 'update-branch') refuse('refresh');
           if (args[1] === 'edit') {
-            if (args.includes('--base')) refuse('retarget');
-            const add = args.flatMap((a, i) => a === '--add-label' ? args[i + 1].split(',') : []);
-            const remove = args.flatMap((a, i) => a === '--remove-label' ? args[i + 1].split(',') : []);
+            if (selectors.values.some(([f]) => ['--base', '-B'].includes(f))) refuse('retarget');
+            if (selectors.operands.length || selectors.values.some(([f]) => !['--repo', '-R', '--add-label', '--remove-label'].includes(f))) refuse('pr-edit');
+            const add = selectors.values.flatMap(([f, v]) => f === '--add-label' ? v.split(',') : []);
+            const remove = selectors.values.flatMap(([f, v]) => f === '--remove-label' ? v.split(',') : []);
             labels(repo, num, { add: add.length === 1 ? add[0] : add.length ? 'unknown' : null, remove });
-            if (args.some(a => a.startsWith('--') && !['--repo', '--add-label', '--remove-label'].includes(a))) refuse('pr-edit');
             allow('labels');
           } else if (args[1] === 'comment') {
             const body = value('--body');
@@ -182,19 +253,36 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
             allow(confirmed ? 'clearance-stamp' : 'hold-comment');
           } else refuse('pr');
         } else if (args[0] === 'api') {
-          const query = args.find(a => typeof a === 'string' && a.startsWith('query='));
+          const parsed = ghOptions(args.slice(1), ['--method', '-X', '--field', '--raw-field', '-f', '-F', '--input', '--jq', '-q', '--header', '-H', '--cache', '--hostname'], ['--paginate', '--slurp', '--silent', '--include']);
+          if (!parsed || parsed.operands.length !== 1) refuse('api');
+          const fields = parsed.values.filter(([f]) => ['--field', '--raw-field', '-f', '-F'].includes(f));
+          const queries = fields.filter(([, v]) => v.startsWith('query='));
+          const query = queries.length === 1 ? queries[0][1] : null;
+          const methods = parsed.values.filter(([f]) => ['--method', '-X'].includes(f));
+          const input = parsed.values.some(([f]) => f === '--input');
           if (query && /\bmutation\b/.test(query)) {
             if (query.includes('dequeuePullRequest')) refuse('dequeue');
-            if (!isPinnedQueueEntryCommand(args)) refuse('graphql');
+            if (!isPinnedQueueEntryCommand(args) || !nodeId || args[5] !== `id=${nodeId}` || args[7] !== `sha=${judgedHead}`) refuse('graphql');
             if (violations.length) refuse('prior-refusal');
             allow('enqueue');
-          } else if (args.includes('--method') && value('--method') !== 'GET' || args.includes('-X') && value('-X') !== 'GET'
-            || !query && args.some(a => ['-f', '-F', '--field', '--raw-field', '--input'].includes(a))) refuse('api');
+          } else if (input || methods.some(([, v]) => v !== 'GET')
+            || fields.length && (parsed.operands[0] !== 'graphql' || !query || !/^query=\s*(?:query\b|\{)/.test(query))) refuse('api');
         } else if (args[0] === 'run') {
           if (!['view', 'list'].includes(args[1])) refuse('workflow-run');
         } else if (!(args[0] === 'repo' && args[1] === 'view') && args[0] !== 'pr' && args[0] !== 'search') refuse('gh');
       } else refuse('exec');
-      return run(file, args, options);
+      const result = run(file, args, options);
+      // Bind only the target's live identity read made after the strategy authorizes the judged head.
+      if (file === 'gh' && args[0] === 'pr' && args[1] === 'view' && judgedHead) {
+        const parsed = ghOptions(args.slice(3), ['--repo', '-R', '--json', '--jq', '-q']);
+        if (Number(args[2]) === Number(num) && parsed && parsed.values.every(([f, v]) => !['--repo', '-R'].includes(f) || v === repo)) {
+          try {
+            const pr = JSON.parse(String(result));
+            nodeId = pr.headRefOid === judgedHead && typeof pr.id === 'string' && pr.id ? pr.id : null;
+          } catch { nodeId = null; }
+        }
+      }
+      return result;
     },
   };
 }

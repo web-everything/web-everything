@@ -17,7 +17,7 @@ import {
 } from '../enqueue-on-event.mjs';
 import { readFastDrainRoundSnapshot, readFastDrainRoundListing, readFastDrainRoundDefaultBranch } from '../fast-drain-scope.mjs';
 import * as enqueueModule from '../enqueue-on-event.mjs';
-import { isFastDrainDeferKind } from '../fast-drain-scope.mjs';
+import { isFastDrainDeferKind, requireFastDrainDeferKind, FAST_DRAIN_DEFER_KINDS, FAST_DRAIN_WRITE_KINDS } from '../fast-drain-scope.mjs';
 import { overlayFilePath, WE_DAEMON_OVERLAY_DIR_ENV } from '../daemon-overlays.mjs';
 import { WE_DAEMON_STATE_DIR_ENV } from '../daemon-rebuild/state.mjs';
 import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
@@ -666,9 +666,9 @@ describe('O1-O10 table', () => {
       [`O8 ${kind}`, { kind: `defer-to-pass:${kind}` }, null, true, true]),
     ['O9 timeout', { timeout: true }, null, false, false],
     ['O10 error', { error: true }, null, false, true],
-    ['REFINE BLOCKED skip', { skip: 'merge state BLOCKED' }, null, false, true],
-    ['REFINE merge-gate skip', { skip: 'merge-gate hold' }, null, false, true],
-    ['REFINE ordinary classifier skip', { skip: 'required check pending' }, null, false, true],
+    ['O5 BLOCKED skip', { skip: 'merge state BLOCKED' }, null, false, false],
+    ['O5 merge-gate skip', { skip: 'merge-gate hold' }, null, false, false],
+    ['O5 ordinary classifier skip', { skip: 'required check pending' }, null, false, false],
     ['REFINE absent target', { absent: true }, null, false, true],
     ['REFINE untyped refusal', { refused: true }, null, false, true],
   ];
@@ -700,6 +700,10 @@ describe('O1-O10 table', () => {
       expect(f.handle.missBackoff().size).toBe(0);
       await finish(run);
       expect(f.handle.misses().has(42)).toBe(missed);
+      if (result.skip) {
+        expect(f.handle.blocked().get(42)).toMatchObject({ rounds: 2 });
+        expect(f.handle.missBackoff().has(42)).toBe(false);
+      }
       if (result.enqueued && membership === 'yes') row.inQueue = true;
       f.advance(600_000);
       const second = f.handle.catchUp();
@@ -707,6 +711,21 @@ describe('O1-O10 table', () => {
       expect(f.calls.length).toBe(eligible ? 2 : 1);
       if (eligible) await finish(second); else await second;
     } finally { f.handle.kill(); vi.useRealTimers(); }
+  });
+  it.each(['merge state BLOCKED', 'merge-gate hold', 'required check pending'])('O5 skip returns room while retaining round backoff: %s', async reason => {
+    const f = catchUpSetup({ readPr: async () => ({ ...READY_PR, headRefOid: 'room-head' }),
+      readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 1)] }),
+      readCapacity: () => ({ capacity: 1 }),
+      drainResult: num => ({ skipReasons: [{ num, reason }] }) });
+    try {
+      await f.handle.catchUp();
+      expect(f.calls.map(c => Number(c.args[1].split('=')[1]))).toEqual([42, 43]);
+      expect([...f.handle.blocked().keys()]).toEqual([42, 43]);
+      expect(f.handle.misses().size).toBe(0);
+      expect(f.handle.missBackoff().size).toBe(0);
+      f.advance(600_000); await f.handle.catchUp();
+      expect(f.calls).toHaveLength(2);
+    } finally { f.handle.kill(); }
   });
   it('O8 transient defer returns room to the next candidate in the same round', async () => {
     const f = catchUpSetup({ readPr: async () => ({ ...READY_PR, headRefOid: 'room-head' }),
@@ -1949,27 +1968,27 @@ describe('BLOCKED catch-up back-off', () => {
     } });
   });
 
-  it('ordinary BLOCKED skips refill room and retry every round without suppression', async () => {
+  it('backs off BLOCKED skips for the configured rounds while refilling room', async () => {
     const { handle, calls, lines, advance } = blockedSetup();
     await handle.catchUp();
     expect(nums(calls)).toEqual([5193, 42, 43, 44]);
-    expect(handle.blocked().has(5193)).toBe(false);
+    expect(handle.blocked().has(5193)).toBe(true);
     handle.blocked().clear();
-    expect(handle.blocked().has(5193)).toBe(false);
+    expect(handle.blocked().has(5193)).toBe(true);
     for (let i = 0; i < 2; i++) {
       advance(600_000);
       const ran = await handle.catchUp();
-      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: 'skipped: merge state BLOCKED' });
-      expect(nums(calls).filter(n => n === 5193)).toHaveLength(i + 2);
+      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true });
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
       expect(nums(calls).slice(-3)).toEqual([42, 43, 44]);
-      expect(lines.some(line => line.includes('backed off: BLOCKED'))).toBe(false);
+      expect(lines.some(line => line.includes('backed off: BLOCKED'))).toBe(true);
       await handle.tick(); // another tick is not another listing
-      expect(nums(calls).filter(n => n === 5193)).toHaveLength(i + 2);
+      expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
     }
     advance(600_000);
     await handle.catchUp();
-    expect(nums(calls).filter(n => n === 5193)).toHaveLength(4);
-    expect(handle.blocked().has(5193)).toBe(false);
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(true);
   });
 
   it.each(['head', 'checks', 'unreadable'])('retries when the %s changes', async (change) => {
@@ -1996,17 +2015,17 @@ describe('BLOCKED catch-up back-off', () => {
     handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
     await handle.tick();
     expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
-    expect(handle.blocked().has(5193)).toBe(false);
+    expect(handle.blocked().has(5193)).toBe(true);
     blocked = false;
     handle.notePoll({ ok: true, marked: [mark(5193)] }); advance(15_000);
     await handle.tick();
     expect(handle.blocked().has(5193)).toBe(false);
   });
 
-  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('untyped classifier skips do not suppress catch-up (%s)', async (skip) => {
+  it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('backs off classifier skips for the configured rounds (%s)', async (skip) => {
     const { handle, calls, advance } = blockedSetup({ drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
     await handle.catchUp(); advance(600_000); await handle.catchUp();
-    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
   });
 
   it('bypasses back-off for an event folded into retained catch-up work', async () => {
@@ -2755,6 +2774,15 @@ describe('catch-up miss backoff', () => {
     expect(enqueueModule.isMissBackoffHoldEligible(kind)).toBe(eligible);
   });
 
+  it('runtime validation rejects unknown dynamic defer kinds and accepts the exhaustive taxonomy', () => {
+    for (const kind of [...FAST_DRAIN_DEFER_KINDS, ...[...FAST_DRAIN_WRITE_KINDS].map(k => `defer-to-pass:write-boundary:${k}`)]) {
+      expect(requireFastDrainDeferKind(kind)).toBe(kind);
+    }
+    for (const kind of [undefined, 'defer-to-pass:unknown', 'defer-to-pass:write-boundary:unknown', 'new-unknown-kind']) {
+      expect(() => requireFastDrainDeferKind(kind)).toThrow('Unclassified fast-drain defer kind');
+    }
+  });
+
   it('lints recordEnqueue kinds and delegated producers against the classification table', () => {
     const kinds = new Set();
     const literals = node => {
@@ -2762,11 +2790,14 @@ describe('catch-up miss backoff', () => {
         if (node.text.startsWith('defer-to-pass:')) { expect(isFastDrainDeferKind(node.text), node.text).toBe(true); kinds.add('defer-to-pass'); }
         else kinds.add(node.text);
       }
-      else if (['precondition.kind', 'rows.deferredKind', 'writeBoundary.violations[0]', 'boundary.violations.at(-1)', 'deferKind', 'boundaryDefer'].includes(node.getText())) kinds.add('defer-to-pass');
+      // Only a runtime-validated value may stand in for the finite defer taxonomy.
+      else if (ts.isCallExpression(node) && node.expression.getText() === 'requireFastDrainDeferKind') kinds.add('defer-to-pass');
       else if (ts.isConditionalExpression(node)) { literals(node.whenTrue); literals(node.whenFalse); }
       else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.BarBarToken) literals(node.right);
       else throw new Error(`Unclassified dynamic enqueue kind: ${node.getText()}`);
     };
+    const unknown = ts.createSourceFile('unknown.js', 'const kind = deferKind;', ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    expect(() => literals(unknown.statements[0].declarationList.declarations[0].initializer)).toThrow('Unclassified dynamic enqueue kind: deferKind');
     for (const file of ['../../merge-ai-prs.mjs', '../drain-merge-strategy.mjs', '../drain-poison-guard.mjs', '../card-group.mjs']) {
       const source = ts.createSourceFile(file, readFileSync(new URL(file, import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
       const visit = node => {
@@ -2991,7 +3022,7 @@ describe('catch-up miss backoff', () => {
       expect(await finish(f.handle.catchUp(), outcome)).toMatchObject([{ num: 42, catchUp: true, outcome: outcome === 'exit-error' ? 'error' : outcome }]);
       expect(attempts(f)).toHaveLength(3);
       expect(f.handle.missBackoff().size).toBe(0);
-      if (outcome === 'timeout') {
+      if (outcome === 'timeout' || outcome === 'skipped') {
         expect(f.handle.blocked().get(42)).toMatchObject({ rounds: 1,
           reason: outcome === 'timeout' ? 'timeout' : 'blocked' });
         f.advance(600_000);

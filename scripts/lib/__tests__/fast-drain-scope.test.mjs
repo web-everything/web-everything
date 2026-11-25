@@ -38,10 +38,10 @@ describe('fast-drain identity index bounds', () => {
     budget.take({ reason: 'related' }); budget.take({ reason: 'race' });
     expect(() => budget.take()).toThrow('defer-to-pass:budget');
   });
-  it.each([0, 121, 1.5, null, 'x'])("maxAgeMinutes 0, 121, 1.5, null or 'x', and unreadable settings: index-setting: %s", value => {
+  it.each([0, 121, 1.5, null, 'x', {}])("maxAgeMinutes invalid layers: index-setting: %s", value => {
     for (const layer of ['tool', 'platform']) expect(setting({ [layer]: { index: { maxAgeMinutes: value } } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
   });
-  it.each([-1, 0.5, null, 51, 'x'])('hydrateBudget invalid layers: %s', value => {
+  it.each([-1, 0.5, null, 51, 'x', {}])('hydrateBudget invalid layers: %s', value => {
     for (const layer of ['tool', 'platform']) expect(setting({ [layer]: { index: { hydrateBudget: value } } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
   });
   it('unreadable settings: index-setting', () => {

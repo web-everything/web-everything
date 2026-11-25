@@ -42,6 +42,23 @@ test('main moved between two reads: the second net-diff read is fresh, not cache
   assert.deepEqual(second.openPrRows[1].files.map(f => f.path), ['after-main-moved']);
 });
 
+test('capped, incomplete and unknown disjoint file lists require live net diffs', () => {
+  for (const patch of [
+    { files: Array.from({ length: 100 }, (_, i) => ({ path: `hidden-${i}` })) },
+    { filesComplete: false }, { files: undefined },
+  ]) {
+    const x = { repo, number: 7, headSha: 'target', baseRefName: 'main', files: [{ path: 'target-only' }], filesComplete: true };
+    const y = { ...x, number: 8, headSha: 'partner', files: [{ path: 'partner-only' }], ...patch };
+    const reads = [];
+    const options = { candidateRows: [x], openPrRows: [x, y], localSlug: repo, fastDrain: true };
+    const refined = refineOverlapRowsToNetDiff({ ...options, readFiles: ({ headSha }) => { reads.push(headSha); return { files: ['live-shared'] }; } });
+    assert.deepEqual(reads, ['target', 'partner']);
+    assert.deepEqual(refined.openPrRows[1].files, [{ path: 'live-shared', additions: 0, deletions: 0 }]);
+    assert.equal(refined.openPrRows[1].filesComplete, true);
+    assert.throws(() => refineOverlapRowsToNetDiff({ ...options, readFiles: () => ({ error: 'unreadable' }) }), /defer-to-pass:incomplete-context/);
+  }
+});
+
 test('an unreadable partner net diff defers fast drain and retains the full-pass listed hold', () => {
   const x = { repo, number: 7, headSha: 'c'.repeat(40), baseRefName: 'main', files: [{ path: 'shared' }] };
   const y = { ...x, number: 8, headSha: 'd'.repeat(40) };

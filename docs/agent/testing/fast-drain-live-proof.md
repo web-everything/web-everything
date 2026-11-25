@@ -23,6 +23,30 @@ p95 below 60 seconds, zero incomplete-context or unclassified errors, all
 outcomes in O1–O10, and at least one between-pass enqueue confirmed by a live
 `isInMergeQueue` read. Unknown outcomes or defer reasons fail the experiment.
 
+The O1–O10 regression table includes these O5 classifier outcomes alongside
+affirmative same-head queue failures. They retain the configured
+`blockedBackoffRounds` limiter without creating a decline-cache entry:
+
+| Outcome | Memory | Queue room | Next catch-up eligibility |
+| --- | --- | --- | --- |
+| BLOCKED skip | Head/check signature and round deadline | Returned | After the configured rounds, or changed head/checks; events bypass |
+| merge-gate skip | Head/check signature and round deadline | Returned | After the configured rounds, or changed head/checks; events bypass |
+| Other classifier skip | Head/check signature and round deadline | Returned | After the configured rounds, or changed head/checks; events bypass |
+
+Boundary regressions must exercise compact and equals-form CLI arguments as
+well as split flags, and bind an enqueue command to the target's live node id
+and judged head. The net-diff producer also fetches branch shorthand
+(`+main:refs/remotes/origin/main lane/readme`); cover that exact positive
+shape alongside refusals of non-origin or mismatched destinations. Also cover
+its isolated diff reader's `rev-parse --path-format=absolute --git-common-dir
+--absolute-git-dir` and diff/log `--no-color` flags. Prestage
+fixtures must return the target node id and full head SHA on the live identity
+read; do not bypass authorization to make them enqueue. Numeric index leaves
+must be validated before cascade flattening, which otherwise drops empty objects. An unknown or capped file
+list is a potential overlap even when its visible paths are disjoint; a failed
+live net-diff read defers to the full pass. Required-check tests must budget
+enough hydration to reach that gate and assert its actual refusal reason.
+
 Audit each child's writes using a child-specific correlation record containing
 repository, target, judged head, boot identity, PID and start/end timestamps.
 Collect mutations by the drain identity across both WE and Frontier UI,

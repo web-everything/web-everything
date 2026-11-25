@@ -660,8 +660,10 @@ for (const phase of ['cold', 'direct hit', 'locked hit']) {
 for (const number of [7, 8]) {
   it(`full scope resolves capped live checks for ${number === 7 ? 'the target gate' : 'unrelated lifecycle reconciliation'}`, () => {
     const sha = number.toString(16).padStart(40, '0');
-    const result = runFastDrainContextCli({ catchUp: true, scope: 'full', rowCount: 18,
-      livePatches: { [number]: {
+    const result = runFastDrainContextCli({ catchUp: true, scope: 'full', rowCount: 18, hydrateBudget: 50,
+      // Keep the target's required check red in both cases, so unrelated hydration
+      // is observed without proceeding into workflow/diff admission in this fixture.
+      livePatches: { 7: { liveCheckRuns: [{ id: 12344, name: 'test', status: 'completed', conclusion: 'failure', head_sha: '7'.padStart(40, '0') }] }, [number]: {
         statusCheckRollup: Array.from({ length: 100 }, (_, i) => ({ __typename: 'CheckRun', name: i ? `check-${i}` : 'test',
           status: 'COMPLETED', conclusion: 'SUCCESS' })),
         liveCheckRuns: [{ id: 12345, name: 'test', status: 'completed', conclusion: 'failure', head_sha: sha }],
@@ -670,7 +672,10 @@ for (const number of [7, 8]) {
     expect(result.calls.some(a => a[0] === 'api' && a[1]?.includes(`${sha}/check-runs?`)
       && a.includes('--paginate') && a.includes('--slurp'))).toBe(true);
     const decision = JSON.parse(result.stdout);
-    expect(decision.enqueueOutcomes[0].kind).toBe('defer-to-pass:budget');
+    expect(decision.enqueueOutcomes ?? []).toEqual([]);
+    expect(decision.skipReasons).toEqual(expect.arrayContaining([
+      expect.objectContaining({ num: 7, kind: 'checks-pending', reason: 'required check "test" is not green' }),
+    ]));
     expect(decision.toMerge).toEqual([]);
   });
 }

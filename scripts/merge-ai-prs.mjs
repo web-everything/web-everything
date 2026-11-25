@@ -133,7 +133,7 @@ import { resolveSkipRebaseApprovedHumanSurface, readApprovedHumanSurfaceHold, re
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
 import { runRenamedPrRefresh, resolveRefreshSettings, logRefreshSettings } from './lib/renamed-pr-refresh.mjs';
-import { createFastDrainWriteBoundary, isFastDrainDeferKind, shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, resolveFastDrainIndexSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
+import { createFastDrainWriteBoundary, isFastDrainDeferKind, requireFastDrainDeferKind, shaCacheRepo, resolveFastDrainScopeSetting, resolveFastDrainListingSetting, resolveFastDrainIndexSetting, readFastDrainRoundListing, readFastDrainRoundDefaultBranch, mergeLiveTargetIntoRows, shouldReadContextCommits, filterToFastDrainTarget, readLegacyManifestCached, readLegacyLocalManifestAt } from './lib/fast-drain-scope.mjs';
 import { listLeanOpenPrsPaged, useFastDrainContext, readFastDrainContext, readFastDrainPassInventory, readFastDrainFacts, fastDrainPrKey, fastDrainListingAfterBranches, validateFastDrainQueuePrecondition } from './lib/fast-drain-context.mjs';
 import { resolveCachedDefaultBranch, createLiveDefaultBranchReader, defaultBranchHold, validDefaultBranch } from './lib/default-branch-cache.mjs';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
@@ -2755,7 +2755,7 @@ export function buildOverlapRows({ candidates, verdicts, openPrContext, mergedPr
 const overlapNetDiffCache = new Map();
 /**
  * Overlap-yield compares NET diffs (merge-base...head), not GitHub's file list: after a refresh merge that list
- * still shows main's content and fakes an overlap. Only rows that overlap in the listing are re-read (one pinned
+ * still shows main's content and fakes an overlap. Potentially overlapping rows are re-read (one pinned
  * read per head+base, cached on full passes). Fast drains use a fresh map for every refinement;
  * an unreadable or oversized read keeps the listing (no new yield, no lost one).
  */
@@ -2776,13 +2776,15 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
   let unreadable = false;
   const netByKey = new Map();
   const refined = (r) => { const k = overlapRowKey(r); if (!netByKey.has(k)) netByKey.set(k, net(r)); return netByKey.get(k); };
+  const incomplete = r => r.filesComplete !== true || !Array.isArray(r.files) || r.files.length >= OVERLAP_FILES_PAGE_CAP
+    || r.files.some(f => typeof (f?.path ?? f) !== 'string' || !(f?.path ?? f));
+  const mayOverlap = (x, y) => x.number !== y.number && (y.repo || null) === (x.repo || null)
+    && (fastDrain && (incomplete(x) || incomplete(y)) || [...paths(y)].some(p => paths(x).has(p)));
   const out = candidateRows.map((x) => {
-    const px = paths(x);
-    return openPrRows.some((y) => y.number !== x.number && (y.repo || null) === (x.repo || null) && [...paths(y)].some((p) => px.has(p))) ? refined(x) : x;
+    return openPrRows.some((y) => mayOverlap(x, y)) ? refined(x) : x;
   });
   const ys = openPrRows.map((y) => {
-    const py = paths(y);
-    return candidateRows.some((x) => x.number !== y.number && (x.repo || null) === (y.repo || null) && [...paths(x)].some((p) => py.has(p))) ? refined(y) : y;
+    return candidateRows.some((x) => mayOverlap(x, y)) ? refined(y) : y;
   });
   // Any unreadable net diff keeps EVERY listing: mixing net and listed sets could erase an overlap on unread evidence.
   if (unreadable && fastDrain) throw new Error('defer-to-pass:incomplete-context');
@@ -5124,7 +5126,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
       { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 }).trim(); } catch { /* missing is a refusal */ }
     const precondition = validateFastDrainQueuePrecondition({ repo: onlyRepo || localSlug, defaultBranch, exec: execFileSync });
     if (!precondition.ok) {
-      const outcome = { num: Number(onlyPr), repo: onlyRepo || localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: precondition.kind };
+      const outcome = { num: Number(onlyPr), repo: onlyRepo || localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(precondition.kind) };
       process.stderr.write(`fast-drain: ${precondition.kind}\n`);
       const result = { ok: true, considered: 0, toMerge: [], merged: [], failed: [], skipped: [outcome], enqueueOutcomes: [outcome] };
       if (AS_JSON) writeStdout(JSON.stringify(result) + '\n');
@@ -5282,7 +5284,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
     // Best-effort full-pass helpers can swallow a boundary refusal. Preserve
     // its named defer before queue admission, rather than recording a failed mutation.
     if (enqueueOnly && writeBoundary.violations.length) return { enqueued: false, deferred: true,
-      kind: writeBoundary.violations[0], reason: writeBoundary.violations[0] };
+      kind: requireFastDrainDeferKind(writeBoundary.violations[0]), reason: writeBoundary.violations[0] };
     // Admission must precede same-head recovery, which can update the branch.
     const refusal = assertCapability(c.repo ?? localSlug, 'review');
     if (refusal) return { enqueued: false, ...refusal, reason: refusal.why };
@@ -5986,7 +5988,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
       throw error;
     });
     if (rows?.deferredKind) {
-      const outcome = { num: Number(onlyPr), repo: localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: rows.deferredKind };
+      const outcome = { num: Number(onlyPr), repo: localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(rows.deferredKind) };
       const result = { ok: true, considered: 0, toMerge: [], merged: [], failed: [], skipped: [outcome], enqueueOutcomes: [outcome] };
       return { result, merged: [], failedMerges: [], duplicateIdsOnMain: [] };
     }
@@ -7681,7 +7683,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
           const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
           const deferKind = /^defer-to-pass:[a-z-]+(?::[a-z-]+)?/.exec(String(e?.message ?? ''))?.[0];
           // A write-boundary refusal is a named defer to the full pass, not a failed merge.
-          if (deferKind && (flags['from-catch-up'] || flags['from-green-event'])) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: deferKind }); return; }
+          if (deferKind && (flags['from-catch-up'] || flags['from-green-event'])) { recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(deferKind) }); return; }
           failedMerges.push({ num: c.num, repo: c.repo, detail: ghListErrText(e), headSha: c.headSha ?? null });
         },
         run: async (candidate) => {
@@ -8021,7 +8023,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
           // lands it the next pass once green. Only a merge failure on a PR we did NOT just touch is a real fault.
           const boundaryDefer = (flags['from-catch-up'] || flags['from-green-event']) ? /^defer-to-pass:write-boundary:[a-z-]+/.exec(String(detail))?.[0] : null;
           if (boundaryDefer) { // a write-boundary refusal is a named defer to the full pass, not a failed merge
-            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: boundaryDefer });
+            recordEnqueue(enqueueOutcomes, localSlug, { num: c.num, repo: c.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(boundaryDefer) });
           } else if (c.rebaseDrop === 'rebased') {
             pendingRebased.push(c.num);
             if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(c.repo)}${c.num} rebuilt onto main — awaiting re-run of checks; will land on a later pass\n`);
@@ -8368,7 +8370,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   const result = { alerts, ok: duplicateIdsOnMain?.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain?.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text, retryable: !!l.err.retryable })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
   if (enqueueOutcomes.length) result.enqueueOutcomes = enqueueOutcomes;
   if (writeBoundary.violations.length) result.enqueueOutcomes = [{ num: Number(onlyPr), repo: onlyRepo || localSlug,
-    outcome: 'not-enqueued', enqueued: false, deferred: true, kind: writeBoundary.violations[0] }];
+    outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(writeBoundary.violations[0]) }];
   if (localWriteRefusal) result.localWriteRefusal = localWriteRefusal;
   if (duplicateIdsOnMain === null) {
     result.duplicateIdCheck = { status: 'unknown', reason: 'checkout-sync-refused', fallback: 'Operator must sync main and rerun the drain.' };

@@ -1301,7 +1301,10 @@ export function createEnqueueOnEvent({
           backoff.set(p.num, { signature, labelsDigest: digest, at: now(), rounds: blockedRounds,
             untilRound: catchUpRound + blockedRounds, reason: 'same-head-failed' });
         }
-        // Ordinary classifier skips carry no head-bound decline evidence and remain eligible.
+        // Classifier skips retain their configured round limiter; they do not create a decline cache entry.
+        if (p.catchUp && !spawnFailed && !r.timedOut && blockedRounds > 0 && signature && summary.startsWith('skipped:')) {
+          backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
+        }
         if (p.catchUp && r.timedOut && timeoutRounds > 0 && signature) {
           backoff.set(p.num, { signature, rounds: timeoutRounds, untilRound: catchUpRound + timeoutRounds, reason: 'timeout' });
         }
