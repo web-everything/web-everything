@@ -6,6 +6,39 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = resolve(fileURLToPath(import.meta.url), '../../../../..');
 const DISPATCH = 'scripts/conveyor/reconcile-fix-dispatch.mjs';
 
+// Exercise the real final launch gate through its other production caller. All effects are ports.
+export async function probeHeldLandAdvanceBatch({ sourceRoot = ROOT, hold = 'red-team:pending' } = {}) {
+  const { dispatchFix } = await import(pathToFileURL(join(sourceRoot, DISPATCH)).href);
+  const { createLandAdvanceApplier } = await import(pathToFileURL(join(sourceRoot, 'scripts/operations/land-advance-io.mjs')).href);
+  const calls = [], spawned = [], released = [], ledger = [], queued = [];
+  const rows = [1, 2].map(pr => ({ subject: `we#${pr}`, repo: 'we', pr, owedAction: 'dispatch-fix',
+    fixPlan: { itemNum: '3438', pr, laneRef: `topic-${pr}`, scope: [`we:src/pr-${pr}.mjs`],
+      labels: ['review:changes', hold], isConflict: hold === 'review:held-mechanical' } }));
+  const result = await createLandAdvanceApplier({
+    now: () => Date.parse('2026-11-25T00:00:00Z'), pickFixLane: () => 4,
+    readCapacity: () => ({ sessions: [], freeLanes: 1, load: 0 }),
+    writeLedger: entry => ledger.push(entry.target), queueItem: num => queued.push(num),
+    dispatchFix: (planned, options) => {
+      calls.push(planned.pr);
+      return dispatchFix(planned, { ...options, root: '/repo',
+        readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
+        readFixClaim: () => null, readHistoryInputs: () => null, acquireClaim: () => ({ ok: true }),
+        releaseClaim: ({ pr }) => released.push(pr), stampExecutor: () => {},
+        postNotice: () => {}, wrapFix: false, grantConflictHelper: () => {}, advisorFor: () => ({ enabled: false }),
+        sessionCwdFor: () => '/scratch/fix', ensureSessionCwd: p => p,
+        isolateSession: () => ({}), resolveSettingsEnv: () => null,
+        readPushHoldOptions: { hermetic: false, run: () => {
+          if (planned.pr === 1 && hold === 'unreadable') throw Error('gh timeout');
+          return JSON.stringify({ state: 'OPEN', labels: planned.pr === 1 ? [{ name: hold }] : [] });
+        } },
+        spawnAgent: () => { spawned.push(planned.pr); return `backgrounded · agent-${planned.pr} · fix-${planned.pr}`; },
+      });
+    },
+  })({ errors: [], rows, proposed: rows, capacity: { budget: 1 }, items: { proposed: [{ num: '7' }] } },
+    { prs: true, items: true });
+  return { result, calls, spawned, released, ledger, queued };
+}
+
 export default {
   id: 'fix-push-hold-repair-starvation',
   title: 'owed repairs survive their own holds and held work preserves dispatch capacity',
@@ -14,7 +47,8 @@ export default {
   fixPresent(root) {
     try {
       const source = readFileSync(join(root, DISPATCH), 'utf8');
-      return source.includes('const humanRepair =') && source.includes('const admissionHold =');
+      return source.includes('const humanRepair =') && source.includes('const admissionHold =')
+        && source.includes('if (pushHoldRefused) return pushHoldRefused;');
     } catch { return false; }
   },
   async run({ sourceRoot = ROOT, log } = {}) {
@@ -63,6 +97,11 @@ export default {
     const outcome = pass(entries, pr => pr === 1764 ? ['review:human'] : [], 1);
     if (outcome.launches.join(',') !== '1765' || outcome.admitted !== 1 || outcome.demand !== 1
       || outcome.result.handled !== 1) violations.push('held first entry consumed dispatch capacity');
+    const batch = await probeHeldLandAdvanceBatch({ sourceRoot });
+    log?.(JSON.stringify(batch));
+    if (batch.result.errors.length || batch.spawned.join(',') !== '2' || batch.released.join(',') !== '1'
+      || batch.ledger.join(',') !== 'we#2' || batch.queued.join(',') !== '7'
+      || batch.result.deferred[0]?.reason !== 'push-hold') violations.push('held land-advance row aborted later fixes or item queueing');
     return { violations };
   },
   judge: report => report.violations,

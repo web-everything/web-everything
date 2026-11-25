@@ -1506,7 +1506,7 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
  * @param {object} [o]
  * @param {object|null} [o.resumeAttempt] - carried forward from a prior {@link tryResumeFix} call for this same
  *   entry, purely for reporting on the returned result (this function never attempts a resume itself).
- * @returns {{sessionId:string, sessionSlug:string, pr:number, itemNum:string, lane:number, unknownTokens:string[], resumed:false, resumeAttempt?:object} | {held:true, reason:string, heldBy:string|null, pr:number, itemNum:string, lane:number}}
+ * @returns {{sessionId:string, sessionSlug:string, pr:number, itemNum:string, lane:number, unknownTokens:string[], resumed:false, resumeAttempt?:object} | {held:true, reason:string, heldBy:string|null, pr:number, itemNum:string, lane:number} | {refused:true, outcome:'push-hold', reason:string, hold:object, pr:number, itemNum:string, lane:number}}
  */
 export function dispatchFix(planned, {
   repo = 'we',
@@ -1632,6 +1632,7 @@ export function dispatchFix(planned, {
   let spawnCwd = null;
   let takeoverMarked = false; // card xx0055i — the takeover marker is up; a failure that proves no agent started must void it.
   let launchAttempted = false; // card xx0055i — a launch call (borrowed / wrapped / bg) has been issued: a failure may be indeterminate.
+  let pushHoldRefused = null;
   try {
     const sessionSlug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
     // #3960 — the repo-aware quintet, computed once from `repo`'s own profile (never re-derived here). The
@@ -1690,12 +1691,17 @@ export function dispatchFix(planned, {
     }
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
     // PUSH-GATE-S4 — re-read the live hold AFTER the slow brief, notice and takeover work, right before any launch.
-    // A throw here releases the claim in the catch below and nothing is spawned.
+    // Unwind through the common cleanup, then return a per-row refusal so land-advance can keep dispatching.
     {
       let hold;
       try { hold = readPushHold({ repo, pr: planned.pr, branch: planned.laneRef, repair: planned }, readPushHoldOptions); }
       catch { hold = { code: 'unreadable', reason: 'Cannot read push authority' }; }
-      if (hold) throw new Error(`push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})`);
+      if (hold) {
+        pushHoldRefused = { refused: true, outcome: 'push-hold', hold,
+          reason: `push-hold: PR #${planned.pr} not launched: ${hold.code} (${hold.reason})`,
+          pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane };
+        throw new Error(pushHoldRefused.reason);
+      }
     }
     stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
     if (decision.executor !== 'claude' && decision.mode !== 'wrapped') {
@@ -1807,6 +1813,7 @@ export function dispatchFix(planned, {
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
     releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+    if (pushHoldRefused) return pushHoldRefused;
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,
@@ -2495,6 +2502,11 @@ export function runReconcileFixDispatch({
           why: `a fix dispatch for PR #${entry.pr} is already claimed (${result.reason}, held by `
             + `${JSON.stringify(result.heldBy)})`,
         });
+        continue;
+      }
+      if (result?.refused) {
+        lanes.unshift(lane);
+        refusals.push({ pr: entry.pr, kind: result.outcome, why: result.reason });
         continue;
       }
       dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);

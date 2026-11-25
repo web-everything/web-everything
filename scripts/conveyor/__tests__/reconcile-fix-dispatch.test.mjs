@@ -11,6 +11,9 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
   createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold,fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
@@ -2908,6 +2911,23 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     expect(refreshMqFailure).toHaveBeenCalledTimes(1);
   });
 
+  it.each([{ isConflict: true }, { takeover: {} }])('MQ refresh never receives repair exemptions (%j)', repair => {
+    const refreshMqFailure = vi.fn(() => ({ action: 'refreshed' }));
+    const held = { ...entry, ...repair, labels: ['review:human'],
+      mqFailureRecovery: { repo: 'web-everything/web-everything', pr: entry.prNumber,
+        head: entry.headRefOid, evidence: { complete: true, testFiles: ['tests/failure.test.mjs'], assertions: ['break'] } } };
+    const contexts = [];
+    const result = run({ refreshMqFailure, mqFailureLedger: { readFixFallback: () => false },
+      mqFailureIo: { readHead: () => entry.headRefOid }, fetchItemlessDiffPaths: () => ['src/unrelated.mjs'],
+      readPushHold: context => { contexts.push(context); return readLivePushHold(context, { hermetic: false,
+        run: () => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }) }); },
+    }, [held]);
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]).not.toHaveProperty('repair');
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+  });
+
   it('held reads still obey the pass deadline without spending dispatch allowance', () => {
     let time = 0;
     const readPushHold = vi.fn(() => { time = 2; return { code: 'hold-label', reason: 'review:human' }; });
@@ -2955,8 +2975,9 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     expect(dispatch).not.toHaveBeenCalled();
     expect(gh).toHaveBeenCalledTimes(1);
     const spawnAgent = vi.fn();
-    expect(() => dispatchFix({ itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
-      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, readPushHoldOptions, grantConflictHelper: vi.fn() })).toThrow(/push-hold/);
+    expect(dispatchFix({ itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, readPushHoldOptions, grantConflictHelper: vi.fn() }))
+      .toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'hold-label', reason: 'review:human' } });
     expect(spawnAgent).not.toHaveBeenCalled();
     expect(gh).toHaveBeenCalledTimes(2);
   });
@@ -2991,13 +3012,104 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   it('dispatchFix re-reads the hold after the slow prep and spawns nothing; the claim is released', () => {
     const spawnAgent = vi.fn(() => '');
     const releaseClaim = vi.fn();
-    expect(() => dispatchFix(
+    expect(dispatchFix(
       { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], lane: 9 },
       { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, releaseClaim, grantConflictHelper: vi.fn(),
         readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }) },
-    )).toThrow(/push-hold/);
+    )).toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'hold-label', reason: 'review:human' } });
     expect(spawnAgent).not.toHaveBeenCalled();
     expect(releaseClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['red-team:pending', 'review:held-mechanical', 'unreadable'])(
+    'land-advance defers a held first fix (%s), dispatches the second and queues item 7', async hold => {
+      const { result, calls, spawned, released, ledger, queued } = await probeHeldLandAdvanceBatch({ hold });
+      expect(result.errors).toEqual([]);
+      expect(result.deferred).toEqual([{ target: 'we#1', reason: 'push-hold' }]);
+      expect(result.dispatched).toHaveLength(1);
+      expect(calls).toEqual([1, 2]);
+      expect(spawned).toEqual([2]);
+      expect(released).toEqual([1]);
+      expect(ledger).toEqual(['we#2']);
+      expect(queued).toEqual(['7']);
+    });
+
+  it('dispatchFix fails closed on a throwing final hold read and releases its claim', () => {
+    const spawnAgent = vi.fn();
+    const releaseClaim = vi.fn();
+    const events = [];
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => { events.push('brief'); return REAL_TEMPLATE_STUB; },
+        spawnAgent, releaseClaim, grantConflictHelper: vi.fn(),
+        readPushHold: () => { events.push('hold'); throw Error('gh timeout after slow prep'); } });
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold', pr: 1764, hold: { code: 'unreadable' } });
+    expect(events).toEqual(['brief', 'hold']);
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it('a final hold refusal voids an unlaunched takeover before releasing its claim', () => {
+    const events = [];
+    const spawnAgent = vi.fn();
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9,
+        takeover: { n: 1, budget: 1, attempts: 5, cap: 5 } },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, grantConflictHelper: vi.fn(),
+        postTakeover: () => events.push('mark'), postTakeoverVoidMark: () => events.push('void'),
+        releaseClaim: () => events.push('release'), readPushHold: () => ({ code: 'hold-label', reason: 'red-team:pending' }) });
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold' });
+    expect(events).toEqual(['mark', 'void', 'release']);
+    expect(spawnAgent).not.toHaveBeenCalled();
+  });
+
+  it('a final dispatch refusal returns the lane for the next reconcile entry', () => {
+    const dispatch = vi.fn(p => p.pr === 1764 ? { refused: true, outcome: 'push-hold', reason: 'late hold' } : ok(p.pr));
+    const result = run({ dispatch, readPushHold: () => null },
+      [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(dispatch.mock.calls.map(([p]) => [p.pr, p.lane])).toEqual([[1764, 4], [1765, 4]]);
+    expect(result.dispatched).toEqual([ok(1765)]);
+    expect(result.refusals).toContainEqual({ pr: 1764, kind: 'push-hold', why: 'late hold' });
+  });
+
+  it('default reader refuses held PRs outside the test environment through both dispatcher entry points', () => {
+    const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../reconcile-fix-dispatch.mjs')).href;
+    const env = { ...process.env, WE_FIX_SCOPE_OVERLAP_GRANULARITY: 'file' };
+    delete env.VITEST;
+    delete env.WE_UNDER_TEST;
+    const child = `
+      import { readLivePushHold, dispatchFix, runReconcileFixDispatch } from ${JSON.stringify(moduleUrl)};
+      let reads = 0, spawned = 0, released = 0;
+      const run = () => { reads++; return JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }); };
+      const hold = readLivePushHold({ repo: 'we', pr: 7 }, { run });
+      const planned = { pr: 7, itemNum: '3438', laneRef: 'topic', scope: ['we:src/a.mjs'], lane: 4 };
+      const direct = dispatchFix(planned, {
+        root: '/repo', readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
+        readFixClaim: () => null, readHistoryInputs: () => null, acquireClaim: () => ({ ok: true }),
+        releaseClaim: () => { released++; }, stampExecutor: () => {}, postNotice: () => {}, wrapFix: false,
+        sessionCwdFor: () => '/scratch/fix', ensureSessionCwd: p => p, isolateSession: () => ({}),
+        advisorFor: () => ({ enabled: false }), recordAdvisor: () => {}, resolveSettingsEnv: () => null,
+        grantConflictHelper: () => {}, readPushHoldOptions: { run }, spawnAgent: () => { spawned++; },
+      });
+      const pass = runReconcileFixDispatch({
+        root: '/repo', repo: 'we', dryRun: false, priorityShadow: null, tryResumeRound: null,
+        reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 7, headRefName: 'topic' }], refusals: [] }),
+        readPushHoldOptions: { run }, checkStaleness: () => ({ fresh: true, behind: 0 }),
+        listBuildClaims: () => [], listFixClaims: () => [], loadItems: () => [], findItemFn: () => null,
+        fetchItemlessDiffPaths: () => ['src/a.mjs'], pickFreeLanes: () => [4], stepLog: () => {},
+        dispatch: () => { spawned++; return { pr: 7 }; },
+      });
+      process.stdout.write(JSON.stringify({ reads, spawned, released, hold, direct, pass }));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', child], {
+      cwd: process.cwd(), env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report).toMatchObject({ reads: 3, spawned: 0, released: 1,
+      hold: { code: 'hold-label', reason: 'review:human' },
+      direct: { refused: true, outcome: 'push-hold' }, pass: { dispatched: [] } });
+    expect(report.pass.refusals).toContainEqual(expect.objectContaining({ pr: 7, kind: 'push-hold' }));
   });
 
   describe('readLivePushHold parses live evidence (no env bypass when hermetic is off)', () => {
