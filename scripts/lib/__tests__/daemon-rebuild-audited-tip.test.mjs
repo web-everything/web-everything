@@ -1081,10 +1081,11 @@ describe('RS-HP-3: rollback skips the revoked-evidence check only for the record
       writeFileSync(watchPath(f.root, env), JSON.stringify({ daemon: 'd', sha: f.base, lastGood: { head: lastGoodHead === 'target' ? built.finalSha : f.base }, ticksLeft: 3, bad: 0 }));
     }
     const run = (args, opts) => spawnSync('git', args, { ...opts, encoding: 'utf8' });
-    return finalizeRebuild({
+    const done = await finalizeRebuild({
       root: f.root, env, log: { error() {} }, run, now: () => Date.now(),
       lease: { token: 'force-adopt-rollback' }, prevHead: f.base, plan: built, auditedTip: makeAuditedTipGate(f.env),
     });
+    return Object.assign(done, { headNow: gitOk(f.root, ['rev-parse', 'HEAD']), base: f.base, target: built.finalSha });
   };
   it('the token with a non-last-good target is refused', async () => {
     expect(await finalizeWith('other')).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
@@ -1093,6 +1094,10 @@ describe('RS-HP-3: rollback skips the revoked-evidence check only for the record
     expect(await finalizeWith(null)).toMatchObject({ moved: false, reason: 'ready-audit-revoked' });
   });
   it('the recorded last-good target is allowed even with a revoked audit', async () => {
-    expect((await finalizeWith('target')).reason).not.toBe('ready-audit-revoked');
+    const done = await finalizeWith('target');
+    expect(done).toMatchObject({ moved: true, adopted: true });
+    expect(done.reason).not.toBe('ready-audit-revoked');
+    expect(done.headNow).toBe(done.target); // HEAD really moved to the recorded last-good
+    expect(done.headNow).not.toBe(done.base);
   });
 });
