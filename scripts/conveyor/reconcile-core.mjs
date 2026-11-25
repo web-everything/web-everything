@@ -114,6 +114,7 @@ import { openOperatorSendBacks, operatorSendBackRuling } from '../lib/operator-s
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
+import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated, openDefects, gateHoldReason } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { decideReviewChurn } from './review-churn.mjs';
@@ -153,7 +154,7 @@ import {
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
-import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
+import { answerDisposition, isCloseSupersededExecuted, isNoCodeRearmAnswer, noCodeRearmPlan } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -235,7 +236,7 @@ import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps
 // `fix`, so until the wiring slice (#4703 slice 5) lands, a rejected card batch keeps its in-place `fix` dispatch
 // instead of stalling on an entry nobody acts on. That slice flips this to true.
 export const CARD_BATCH_EXTRACT_WIRED = false;
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'card-batch-extract']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'card-batch-extract', 'rearm-no-code']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -303,6 +304,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
+  'no-code-rearm-held', 'no-code-rearm-spent',
   'fix-join-wait',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
@@ -2418,7 +2420,7 @@ export function planReconcile({
         caps: { fix: effectiveRoundCap, conflictFix: conflictFixCapHere, advisoryFix: advisoryFixCapHere },
       } } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
-      ...(operatorAnswer ? { operatorAnswer } : {}),
+      ...(operatorAnswer && !isNoCodeRearmAnswer(operatorAnswer) ? { operatorAnswer } : {}),
       // The red-main fix PR (published priority record): every fix / ci-heal row of it routes to Claude
       // (`fix-slot-borrow.mjs#claudeOnlyReason`), never a codex-first executor or a borrowed codex slot.
       ...(mainFixPriority ? { mainFix: true } : {}),
@@ -2490,8 +2492,8 @@ export function planReconcile({
     // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
     // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
     // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
-    if (threadMayBeTruncated(pr)) {
-      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+    if (pr.commentsComplete !== true && Array.isArray(pr.comments) && pr.comments.length >= LIST_COMMENTS_PAGE_SIZE) {
+      refuse('thread-truncated', { why: `the comment list has ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
       continue;
     }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
@@ -2873,6 +2875,22 @@ export function planReconcile({
           });
         }
       }
+      continue;
+    }
+
+    const noCode = isNoCodeRearmAnswer(operatorAnswer)
+      ? noCodeRearmPlan({ comments: pr.comments, headRefOid: pr.headRefOid,
+        labels: Array.isArray(pr.labels) ? pr.labels.map(l => typeof l === 'string' ? l : l?.name) : pr.labels })
+      : { state: 'none' };
+    if (noCode.state === 'ready') {
+      dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: noCode.answerId, why: noCode.why });
+      continue;
+    }
+    if (noCode.state === 'held' || noCode.state === 'spent') {
+      const kind = noCode.state === 'held' ? 'no-code-rearm-held' : 'no-code-rearm-spent';
+      refuse(kind, { why: noCode.why, answerId: noCode.answerId });
+      notes.push({ kind, prNumber, answerId: noCode.answerId,
+        text: `PR #${prNumber}: ${noCode.why} (answer ${noCode.answerId ?? 'unknown'}); a fresh answer is needed` });
       continue;
     }
 

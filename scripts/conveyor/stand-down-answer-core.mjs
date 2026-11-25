@@ -1,6 +1,7 @@
 /** Operator ceremony record for we:scripts/conveyor/stand-down-answer.mjs. Pure readers. */
 import { AUTOMATION_LOGINS, OPERATOR_LOGINS, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { standDownComments, isStandDownSuperseded, isLoadFlakeStandDown } from './stand-down.mjs';
+import { rearmWindow, REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER } from './rearm-review.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 
 export const OPERATOR_ANSWER_MARKER = '<!-- conveyor-stand-down-answer:v1 -->';
@@ -42,8 +43,8 @@ export function buildOperatorAnswer({ standDownId, reason, actor, channel, dispo
   if (noCodeOwed !== undefined && (typeof noCodeOwed !== 'boolean' || disposition !== 'rearm-review')) {
     throw new Error('noCodeOwed must be boolean and is only valid with --disposition=rearm-review');
   }
-  if (!/^[\w=-]+$/.test(standDownId)) throw new Error('invalid stand-down comment id');
-  if (supersedes !== undefined && (disposition !== 'rearm-review' || !/^[\w=-]+$/.test(String(supersedes)))) {
+  if (!/^[\w=-]+$/.test(standDownId) || /[\r\n]/.test(standDownId)) throw new Error('invalid stand-down comment id');
+  if (supersedes !== undefined && (disposition !== 'rearm-review' || (!/^[\w=-]+$/.test(String(supersedes)) || /[\r\n]/.test(String(supersedes))))) {
     throw new Error('supersedes is only valid with --disposition=rearm-review and a comment id');
   }
   if (!/^[\w-]+$/.test(actor)) throw new Error('actor must be a GitHub login');
@@ -199,4 +200,52 @@ export function isCloseSupersededExecuted(comments) {
   if (answerAt < 0) return false;
   return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'
     && c.body.trimStart().startsWith(CLOSE_SUPERSEDED_MARKER));
+}
+
+/** A no-code ruling is consumed mechanically, never passed to a fixer. */
+export function isNoCodeRearmAnswer(answer) {
+  return answerDisposition(answer) === 'rearm-review' && answer.noCodeOwed === true;
+}
+
+export function NO_CODE_REARM_RECEIPT(answerId, head) {
+  if (typeof answerId !== 'string' || !/^[\w=-]+$/.test(answerId) || /[\r\n]/.test(answerId)
+    || typeof head !== 'string' || head.length !== 40 || !/^[a-f0-9]{40}$/i.test(head)) throw Error('invalid no-code rearm receipt');
+  return `<!-- no-code-rearm answer=${answerId} head=${head} -->`;
+}
+
+export function parseNoCodeRearmReceipt(comment) {
+  if (!isTrustedMarkerAuthor(comment)) return null;
+  const match = /^<!-- no-code-rearm answer=([\w=-]+) head=([a-f0-9]{40}) -->$/i.exec(comment?.body ?? '');
+  return match ? { answerId: match[1], head: match[2] } : null;
+}
+
+/** Pure, fail-closed admission on complete evidence supplied by either caller. */
+export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
+  const result = (state, why, answerId = null) => ({ state, answerId, why });
+  if (!Array.isArray(comments)) return result('held', 'comments unreadable');
+  let answerAt = -1, answer;
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const candidate = parseOperatorAnswer(comments[i]);
+    if (candidate && answersEarlierStandDown(comments, i, candidate)) { answerAt = i; answer = candidate; break; }
+  }
+  if (!answer && comments.some(c => isNoCodeRearmAnswer(parseOperatorAnswer({ ...c, author: { login: OPERATOR_LOGINS[0] } })))) {
+    return result('held', 'poster is not an operator or trusted relay');
+  }
+  if (!isNoCodeRearmAnswer(answer)) return result('none', 'no no-code ruling');
+  const answerId = String(comments[answerAt].id ?? '');
+  const held = why => result('held', why, answerId);
+  if (!/^[\w=-]+$/.test(answerId) || /[\r\n]/.test(answerId)) return held('answer id unreadable');
+  if (typeof headRefOid !== 'string' || headRefOid.length !== 40 || !/^[a-f0-9]{40}$/i.test(headRefOid)) return held('head unreadable');
+  if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
+  if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
+  if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
+  if (!rearmWindow(comments.slice(0, answerAt)).wouldHonour(answer)) return held('answer does not clear the rearm window');
+  const after = comments.slice(answerAt + 1).filter(isTrustedMarkerAuthor);
+  if (after.some(c => /^\s*🔒 conveyor fix-begin — fix claim held/.test(c.body)
+    || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) return held('fix claim or changes verdict after answer');
+  if (comments.some(c => parseNoCodeRearmReceipt(c)?.answerId === answerId)
+    || after.some(c => [REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER].some(m => c.body?.trimStart().startsWith(m)))) {
+    return result('spent', 'the no-code ruling was already spent', answerId);
+  }
+  return result('ready', 'operator ruled no code owed', answerId);
 }

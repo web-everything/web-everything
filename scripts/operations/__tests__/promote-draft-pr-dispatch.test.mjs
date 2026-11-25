@@ -5,7 +5,7 @@
  *   shelled — `reconcile` and `provider` are injected, mirroring `ci-heal-pr-dispatch.test.mjs`'s own shape.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { runReconcilePromoteDraftDispatch, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
+import { runReconcilePromoteDraftDispatch, defaultNoCodeRearm, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
 
 const FRESH = () => ({ fresh: true, behind: 0 });
 // Every pre-existing test in this file promotes cleanly, so it pins a fresh re-read that always says green —
@@ -676,5 +676,164 @@ describe('fresh review-status:draft-withdrawn label guard', () => {
     const result = run(() => { if (labels instanceof Error) throw labels; return labels; }, ready);
     expect(result.refusals).toEqual([expect.objectContaining({ kind: 'draft-state-unreadable' })]);
     expect(ready).not.toHaveBeenCalled();
+  });
+});
+
+import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
+// D2: the real mechanical executor, with hermetic IO and writer stdout.
+import { buildOperatorAnswer, NO_CODE_REARM_RECEIPT } from '../../conveyor/stand-down-answer-core.mjs';
+import { buildStandDownComment } from '../../conveyor/stand-down.mjs';
+import { planReconcile } from '../../conveyor/reconcile-core.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { runReviewLabelCli } from '../../review-set-label.mjs';
+import { formatPromoteActionLine, runPromoteDraftDispatchAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+
+describe('operator no-code rearm executor', () => {
+  const head = 'a'.repeat(40);
+  const c = (id, body) => ({ id, body, author: { login: 'chalbert' } });
+  const begin = c('begin', `🔒 conveyor fix-begin — fix claim held
+
+**Branch:** \`lane/x\` at \`${head}\``);
+  const verdict = c('verdict', `🔁 review — changes requested
+
+Fix defect
+<!-- reviewed-sha: ${head} -->`);
+  const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }));
+  const answer = c('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }));
+  const thread = () => [verdict, begin, stop, answer];
+  const entry = { kind: 'rearm-no-code', prNumber: 42, expectHead: head, answerId: 'answer' };
+  const json = labels => JSON.stringify({ ok: true, labelsObserved: true, labels });
+  function setup(over = {}) {
+    const postComment = vi.fn(), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => thread(), postComment, rearm, ...over };
+    return { options, postComment, rearm, run: () => runReconcilePromoteDraftDispatch(options) };
+  }
+  it.each(['review:pending', 'review:human'])('confirms exactly once from observed %s and pins the head', label => {
+    const s = setup({ rearm: vi.fn(() => ({ status: 0, stdout: `diagnostic\n${json([label])}\n` })) });
+    expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(s.postComment).toHaveBeenCalledTimes(1);
+    expect(s.postComment).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 42, comment: NO_CODE_REARM_RECEIPT('answer', head) }));
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+    expect(s.options.rearm).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 42, expectHead: head, answerId: 'answer' }));
+  });
+  it.each([
+    ['empty stdout', { status: 0, stdout: '' }],
+    ['malformed JSON', { status: 0, stdout: 'not json' }],
+    ['ok only without labelsObserved', { status: 0, stdout: JSON.stringify({ ok: true }) }],
+    ['missing labelsObserved', { status: 0, stdout: JSON.stringify({ ok: true, labels: ['review:pending'] }) }],
+    ['labels null', { status: 0, stdout: JSON.stringify({ ok: true, labelsObserved: true, labels: null }) }],
+    ['changes still present', { status: 0, stdout: json(['review:pending', 'review:changes']) }],
+    ['exit 1', { status: 1, stdout: json(['review:pending']) }],
+    ['ok false', { status: 0, stdout: JSON.stringify({ ok: false, labelsObserved: true, labels: ['review:pending'] }) }],
+    ['non-string labels', { status: 0, stdout: json(['review:pending', {}]) }],
+    ['no pending or human', { status: 0, stdout: json([]) }],
+  ])('zero confirms for %s', (_, child) => {
+    const s = setup({ rearm: () => child });
+    const result = s.run();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(s.postComment).toHaveBeenCalledTimes(1);
+  });
+  it.each(['throw', 'over 10 pages', 'count mismatch', 'bad labels'])('unreadable %s gives zero writes', mode => {
+    const readThread = (number, opts) => {
+      expect(opts).toMatchObject({ maxPages: 10 });
+      if (mode === 'throw') throw Error('thread unavailable');
+      if (mode === 'bad labels') return thread();
+      return readCompletePrComments(number, { ...opts, gh: args => {
+        if (args[1] === 'graphql') return { data: { repository: { pullRequest: { comments: { totalCount: 999 } } } } };
+        return mode === 'over 10 pages' ? Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: 'chalbert' }, body: 'filler' })) : thread();
+      } });
+    };
+    const s = setup({ readThread, ...(mode === 'bad labels' ? { readPrLabels: () => null } : {}) });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unreadable' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['over 10 pages', 'count mismatch'])('default full-thread reader refuses %s with zero writes', async mode => {
+    const ghThrottle = await import('../../lib/gh-throttle.mjs');
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args => JSON.stringify(args[1] === 'graphql'
+      ? { data: { repository: { pullRequest: { comments: { totalCount: 999 } } } } }
+      : mode === 'over 10 pages' ? Array.from({ length: 100 }, (_, i) => c(`f${i}`, 'filler')) : thread()));
+    try {
+      const s = setup({ readThread: undefined });
+      const result = s.run();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unreadable', why: expect.stringContaining('operator must inspect') }));
+      expect(gh).toHaveBeenCalledTimes(mode === 'over 10 pages' ? 10 : 2);
+      expect(gh.mock.calls.every(([args]) => !args.includes('--paginate'))).toBe(true);
+      expect(s.postComment).not.toHaveBeenCalled();
+      expect(s.rearm).not.toHaveBeenCalled();
+    } finally { gh.mockRestore(); }
+  });
+  it.each(['changed answer', 'red-team hold', 'fix-begin raced', 'invalid answer id'])('fresh %s refuses before receipt', mode => {
+    const s = setup({ readThread: () => mode === 'changed answer' ? thread().slice(0, -1) : mode === 'fix-begin raced' ? [...thread(), begin] : mode === 'invalid answer id' ? [...thread().slice(0, -1), { ...answer, id: 'answer\nattack' }] : thread(), readPrLabels: () => mode === 'red-team hold' ? ['review:changes', 'red-team:pending'] : ['review:changes'] });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('receipt failure never spawns rearm; child throw leaves ruling spent', () => {
+    const s = setup({ postComment: () => { throw Error('post failed'); } });
+    expect(s.run().dispatched).toEqual([]);
+    expect(s.rearm).not.toHaveBeenCalled();
+    const crashed = setup({ rearm: () => { throw Error('child crashed'); } });
+    expect(crashed.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(crashed.postComment).toHaveBeenCalledTimes(1);
+  });
+  it('101st-comment answer executes once over two ticks; tick 3 resumes ordinary review', () => {
+    const comments = [...Array.from({ length: 97 }, (_, i) => c(`f${i}`, 'filler')), ...thread()];
+    let labels = ['review:changes'];
+    const plan = () => planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ number: 42, state: 'OPEN', headRefName: 'lane/test', headRefOid: head, labels, comments, commentsComplete: true, mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }] }] });
+    const s = setup({ reconcile: plan, readThread: (number, opts) => readCompletePrComments(number, { ...opts, gh: args => {
+        if (args[1] === 'graphql') return { data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } };
+        const page = Number(/page=(\d+)$/.exec(args[1])[1]);
+        return comments.slice((page - 1) * 100, page * 100);
+      } }), readPrLabels: () => labels,
+      postComment: vi.fn(({ comment }) => comments.push(c('receipt', comment))),
+      rearm: vi.fn(() => { labels = ['review:pending']; comments.push(c('rearmed', '🔧 conveyor fix — re-armed for re-review')); return { status: 0, stdout: json(labels) }; }),
+    });
+    const first = s.run(), second = s.run(), third = plan();
+    expect([...first.dispatched, ...second.dispatched].map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(s.options.postComment).toHaveBeenCalledTimes(1);
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+    expect(third.dispatch.every(d => d.kind === 'review')).toBe(true);
+  });
+  it('head-of-list promote failure still runs restore-review-label and rearm-no-code', () => {
+    const addLabel = vi.fn();
+    const s = setup({ reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 1, headRefOid: head }, { kind: 'restore-review-label', prNumber: 2 }, entry] }), readHeadCheckState: () => { throw Error('failed promote'); }, readPrLabels: ({ prNumber }) => prNumber === 42 ? ['review:changes'] : [], addLabel });
+    expect(s.run().dispatched.map(d => d.kind)).toEqual(['restore-review-label', 'rearm-no-code']);
+    expect(addLabel).toHaveBeenCalledTimes(1);
+  });
+  it('daemon logs mechanical rearm without launching an agent', async () => {
+    const s = setup();
+    const launchAgent = vi.fn();
+    const fixes = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH, reconcile: s.options.reconcile,
+      dispatch: launchAgent, pickFreeLanes: () => [], findItemFn: () => null, loadItems: () => [], priorityShadow: null });
+    expect(fixes.dispatched).toEqual([]);
+    expect(launchAgent).not.toHaveBeenCalled();
+    const result = await runPromoteDraftDispatchAllRepos({ repos: ['we'], tick: () => s.run() });
+    expect(result.dispatched).toHaveLength(1);
+    expect(s.rearm).toHaveBeenCalledTimes(1);
+    expect(formatPromoteActionLine({ ...result.dispatched[0], repo: 'we' })).toMatch(/rearm-no-code.*no fix agent/);
+  });
+  it('default rearm spawns only the head-pinned writer with inert argv and bounded output', () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    expect(setup({ rearm: args => defaultNoCodeRearm({ ...args, spawn }) }).run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const [file, args, options] = spawn.mock.calls[0];
+      expect(file).toBe(process.execPath);
+      expect(args[0].endsWith('/scripts/conveyor/rearm-review.mjs')).toBe(true);
+      expect(args.slice(1)).toEqual(['42', '--repo=web-everything/web-everything', `--expect-head=${head}`, '--actor=conveyor (operator no-code ruling answer)']);
+      expect(options).toMatchObject({ encoding: 'utf8', timeout: 120000, maxBuffer: 4 * 1024 * 1024 });
+    expect(options.shell).not.toBe(true);
+  });
+  it('real writer fallback stdout lacks labelsObserved and cannot confirm', () => {
+    const chunks = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(Error('exit'), { exitCode: code }); });
+    try {
+      try { runReviewLabelCli({ argv: ['42', '--repo=o/n'], fixedTo: 'rearm', defaultActor: 'test', usage: 'test', buildComment: () => 'rearm', successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: line => chunks.push(line), provider: { readPrState: () => ({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments: [] }), setLabels: () => {}, postComment: () => {}, readLabels: () => { throw Error('readback unavailable'); } } }); } catch (e) { expect(e.exitCode).toBe(0); }
+    } finally { exit.mockRestore(); }
+    const stdout = chunks.join('');
+    expect(JSON.parse(stdout)).toMatchObject({ ok: true, labels: ['review:pending'] });
+    expect(JSON.parse(stdout)).not.toHaveProperty('labelsObserved');
+    expect(setup({ rearm: () => ({ status: 0, stdout }) }).run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
   });
 });

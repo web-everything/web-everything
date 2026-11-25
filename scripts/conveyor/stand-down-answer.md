@@ -77,3 +77,5 @@ claiming the answer path has proved end-to-end recovery.
 
 Copy the command and live-proof checklist above into the eventual PR description. No PR is opened by this
 job. The #3181 live ceremony and observation remain intentionally pending until after merge.
+
+An explicit `--disposition=rearm-review --no-code-owed` ruling is executed mechanically: the conveyor reads the complete thread and fresh labels, posts one durable receipt, and invokes the existing head-pinned rearm writer without launching a fixer. Only observed writer labels confirm success. A receipt spends the ruling even if the child crashes or cannot confirm; if `review:changes` remains, the conveyor asks for a fresh answer instead of retrying. Red-team holds, later fix claims or changes verdicts, and unreadable evidence block this path.

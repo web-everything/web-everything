@@ -64,6 +64,8 @@ import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
+import { spawnSync } from 'node:child_process';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
@@ -77,7 +79,7 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
-import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
+import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -170,6 +172,15 @@ export { CLOSE_SUPERSEDED_MARKER };
 export function closeSupersededComment(answer = {}) {
   const quote = String(answer.reason ?? '').replace(/<!--/g, '&lt;!--').split('\n').map((l) => `> ${l}`).join('\n');
   return `${CLOSE_SUPERSEDED_MARKER}\n## Closed as superseded — operator disposition\n\nRuled by @${answer.actor ?? 'operator'} via ${answer.channel ?? 'unknown'} (\`close-superseded\`), executed mechanically by the conveyor. No files were changed and no fix agent was dispatched.\n\n${quote}`;
+}
+
+/** Mechanical rearm only: the existing writer owns the label transition and head pin. */
+export function defaultNoCodeRearm({ repoSlug, prNumber, expectHead, answerId, spawn = spawnSync }) {
+  // Validate before forming even argv: the actor is also rendered in a durable comment.
+  NO_CODE_REARM_RECEIPT(answerId, expectHead);
+  return spawn(process.execPath, [resolve(THIS_CODE_ROOT, 'scripts/conveyor/rearm-review.mjs'), String(prNumber),
+    `--repo=${repoSlug}`, `--expect-head=${expectHead}`, `--actor=conveyor (operator no-code ruling ${answerId})`],
+  { encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024 });
 }
 
 /** `gh pr view --json files` returns at most this many entries, silently. */
@@ -273,6 +284,13 @@ export function runReconcilePromoteDraftDispatch({
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
   readComments = readCompletePrComments,
+  // The shared reader enforces maxPages on its parsed-JSON seam; the legacy exec path paginates itself.
+  readThread = (pr, options) => readCompletePrComments(pr, { ...options, gh: args => JSON.parse(runGhSync(args, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    throttle: { op: 'pr-comments', repo: options.repo },
+  })) }),
+  postComment = ({ repoSlug, prNumber, comment }) => createGhProvider().postComment(repoSlug, prNumber, comment),
+  rearm = defaultNoCodeRearm,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
@@ -467,6 +485,44 @@ export function runReconcilePromoteDraftDispatch({
       dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
+    }
+  }
+  // One receipt spends one ruling before the child runs. No retries, cursor or deadline in this half.
+  for (const entry of (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code')) {
+    const prNumber = entry.prNumber;
+    let comments, labels;
+    try {
+      comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+      labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
+      if (!Array.isArray(comments)) throw Error('comments unreadable');
+    } catch (e) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
+      continue;
+    }
+    const plan = noCodeRearmPlan({ comments, labels, headRefOid: entry.expectHead });
+    if (plan.state !== 'ready' || plan.answerId !== entry.answerId) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: plan.why });
+      continue;
+    }
+    try {
+      postComment({ repoSlug, prNumber, comment: NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead) });
+    } catch (e) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
+      continue;
+    }
+    let child, observed;
+    try {
+      child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: plan.answerId });
+      observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
+      if (child.status !== 0 || observed?.ok !== true || observed.labelsObserved !== true
+        || !Array.isArray(observed.labels) || !observed.labels.every(l => typeof l === 'string')
+        || observed.labels.includes('review:changes')
+        || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
+        throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
+      }
+      dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
+    } catch (e) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
     }
   }
   // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.
