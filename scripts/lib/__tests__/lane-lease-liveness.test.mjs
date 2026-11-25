@@ -29,6 +29,10 @@ describe('liveCwdPids', () => {
   it('matches the lane itself and anything under it, never our own process', () => {
     expect(liveCwdPids(DIR, { selfPids: [9], isAlive: alive, listCwds: rows([5, DIR], [6, `${DIR}/a/b`], [9, DIR]) })).toEqual([5, 6]);
   });
+  it('resolves aliases so /var and /private/var spellings match, and counts a parent shell', () => {
+    const realpath = (p) => p.replace(/^\/var\//, '/private/var/');
+    expect(liveCwdPids('/var/pool/lane-3', { realpath, isAlive: alive, selfPids: [1], listCwds: rows([process.ppid, '/private/var/pool/lane-3']) })).toEqual([process.ppid]);
+  });
   it('is null (unknown) when the probe throws', () => {
     expect(liveCwdPids(DIR, { listCwds: () => { throw new Error('no lsof'); } })).toBeNull();
   });

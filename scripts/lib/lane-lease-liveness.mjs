@@ -8,6 +8,7 @@
  * ttl behaviour. IO is injected (`listCwds`, `isAlive`) so tests need no real process.
  */
 import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { sep } from 'node:path';
 
 /** Parse `lsof -d cwd -Fpn` output into `[{pid, cwd}]`; anything that is not a `p<pid>`/`n<path>` line is ignored. */
@@ -26,7 +27,8 @@ const defaultListCwds = () => {
   try {
     out = execFileSync('lsof', ['-d', 'cwd', '-Fpn'], { encoding: 'utf8', timeout: 10_000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
   } catch (e) {
-    if (e && typeof e.stdout === 'string' && e.stdout) out = e.stdout; // lsof exits 1 when some rows were unreadable
+    // lsof exits 1 when some rows were unreadable; a timeout, signal or buffer overflow is partial output = unknown.
+    if (e && e.status === 1 && !e.signal && !e.code && typeof e.stdout === 'string' && e.stdout) out = e.stdout;
     else throw e;
   }
   return parseLsofCwd(out);
@@ -37,14 +39,16 @@ const defaultIsAlive = (pid) => {
 };
 
 /** Pids with a cwd inside `dir` (never ours), or `null` when the probe fails. */
-export function liveCwdPids(dir, { listCwds = defaultListCwds, isAlive = defaultIsAlive, selfPids = [process.pid, process.ppid] } = {}) {
+export function liveCwdPids(dir, { listCwds = defaultListCwds, isAlive = defaultIsAlive, selfPids = [process.pid], realpath = realpathSync } = {}) {
   if (!dir || typeof dir !== 'string') return [];
-  const root = dir.replace(/[\\/]+$/, '');
+  const real = (p) => { try { return realpath(p); } catch { return p; } };
+  const root = real(dir.replace(/[\\/]+$/, ''));
   try {
     const pids = [];
     for (const { pid, cwd } of listCwds()) {
       if (selfPids.includes(pid) || pids.includes(pid)) continue;
-      if ((cwd === root || cwd.startsWith(root + sep)) && isAlive(pid)) pids.push(pid);
+      const at = real(cwd);
+      if ((at === root || at.startsWith(root + sep)) && isAlive(pid)) pids.push(pid);
     }
     return pids;
   } catch { return null; }
