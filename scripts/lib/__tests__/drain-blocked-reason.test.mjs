@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync, chmodSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describeBlockedChecks, decideGateSendBack, sendBackBlockedGate, sendBackBlockedGates } from '../drain-blocked-reason.mjs';
+import { describeBlockedChecks, markReviewOwnedGate, decideGateSendBack, sendBackBlockedGate, sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { classifyPr, unlandableStateReason } from '../../merge-ai-prs.mjs';
 import { classifySkipReason } from '../drain-skip-reasons.mjs';
 import { deriveWaitingOn } from '../../operations/pr-sweep-core.mjs';
@@ -362,7 +362,8 @@ describe('audit safeguards', () => {
 describe('D1: review-owned merge-gate red is never sent back', () => {
   const gateRow = () => row('merge-gate', 'FAILURE', { detailsUrl: 'https://github.com/o/r/actions/runs/1/job/555' });
   const prWith = (rows, extra = {}) => fixture({ statusCheckRollup: rows, ...extra });
-  const verdict = results => ({ num: 7196, head_sha: head, ok: false, results });
+  const verdict = (results, extra = {}) => ({ num: 7196, head_sha: head, ok: false, results,
+    failedSteps: ["Evaluate the drain's merge gates"], ...extra });
   const hold = (id, status = 'hold') => ({ id, status, reason: 'x' });
   const run = (pr, readVerdict, extra = {}) => {
     const directory = mkdtempSync(join(tmpdir(), 'drain-d1-'));
@@ -402,8 +403,37 @@ describe('D1: review-owned merge-gate red is never sent back', () => {
   it('keeps today\'s send-back when the setting is off', () => {
     expect(run(prWith([row('test'), gateRow()]), () => verdict([hold('review-acceptance')]), { mergeGateSetting: 'off' }).out.sent).toBe(true);
   });
+  it('R2.3: test-gaming is a code finding and is never review-owned for the send-back', () => {
+    const r = run(prWith([row('test'), gateRow()]), () => verdict([hold('test-gaming')]));
+    expect(r.out.sent).toBe(true);
+    const mixed = run(prWith([row('test'), gateRow()]), () => verdict([hold('review-acceptance'), hold('test-gaming')]));
+    expect(mixed.out.sent).toBe(true);
+  });
+  it.each([
+    ['another failed step', () => verdict([hold('review-acceptance')], { failedSteps: ["Evaluate the drain's merge gates", 'Validate'] })],
+    ['unknown steps', () => verdict([hold('review-acceptance')], { failedSteps: null })],
+    ['no step evidence', () => { const v = verdict([hold('review-acceptance')]); delete v.failedSteps; return v; }],
+  ])('R2.4: a failed job step outside the hold table is not review-owned (%s)', (_n, reader) => {
+    expect(run(prWith([row('test'), gateRow()]), reader).out.sent).toBe(true);
+  });
+  it('R2.1: a review-hold annotation on any check other than merge-gate is ignored', () => {
+    const pr = prWith([{ ...row('test', 'FAILURE'), mergeGateReviewHold: { holds: ['review-acceptance'], sendBackValidatedHead: head } }]);
+    expect(decideGateSendBack({ pr, headSha: head, requiredChecks: ['test'], ledger: {} }).send).toBe(true);
+  });
+  it('R2.2: a pre-existing annotation without the local validation stamp, or for another head, is not trusted', () => {
+    const base = { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555 } };
+    expect(decideGateSendBack({ pr: prWith([row('test'), base]), headSha: head, requiredChecks, ledger: {} }).send).toBe(true);
+    const other = { ...base, mergeGateReviewHold: { ...base.mergeGateReviewHold, sendBackValidatedHead: 'b'.repeat(40) } };
+    expect(decideGateSendBack({ pr: prWith([row('test'), other]), headSha: head, requiredChecks, ledger: {} }).send).toBe(true);
+  });
+  it('R2.2: a stale PR head or an unreadable setting fails closed (send back as today)', () => {
+    const pr = prWith([row('test'), gateRow()]);
+    const stale = markReviewOwnedGate(pr, { headSha: 'c'.repeat(40), repo: 'o/r', readVerdict: () => verdict([hold('review-acceptance')]), setting: 'on' });
+    expect(stale).toBe(pr);
+    expect(run(pr, () => verdict([hold('review-acceptance')]), { mergeGateSetting: null }).out.sent).toBe(true);
+  });
   it('decideGateSendBack reports the review-owned reason and keeps merge-gate failed in the rollup', () => {
-    const pr = prWith([row('test'), { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555 } }]);
+    const pr = prWith([row('test'), { ...gateRow(), mergeGateReviewHold: { holds: ['review-acceptance'], jobId: 555, sendBackValidatedHead: head } }]);
     expect(decideGateSendBack({ pr, headSha: head, requiredChecks, ledger: {} }))
       .toMatchObject({ send: false, reason: expect.stringContaining('review-owned (review-acceptance)') });
     expect(pr.statusCheckRollup[1].conclusion).toBe('FAILURE');

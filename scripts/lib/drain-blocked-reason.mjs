@@ -1,7 +1,7 @@
 /** Required-check diagnostics and a strictly changes-only, head-deduplicated send-back. */
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
-import { excusePrMergeGateHolds, readMergeGateVerdict, loadMergeGateHoldSetting } from './merge-gate-hold-class.mjs';
+import { excuseMergeGateRows, readMergeGateVerdict, loadMergeGateHoldSetting } from './merge-gate-hold-class.mjs';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, openSync, closeSync, statSync, accessSync, constants, fsyncSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -13,8 +13,43 @@ const clean = value => value.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '').trim(
 const firstLine = row => [row.summary, row.output?.summary, row.title, row.output?.title, row.description]
   .filter(value => typeof value === 'string').flatMap(value => value.split(/\r?\n/).map(clean)).find(Boolean) || '';
 
+// The local validation stamp: only markReviewOwnedGate sets it, for the exact head it validated.
+const STAMP = 'sendBackValidatedHead';
+const trustedReviewOwned = (row, name, headSha) => name === 'merge-gate' && typeof headSha === 'string'
+  && Array.isArray(row.mergeGateReviewHold?.holds) && row.mergeGateReviewHold.holds.length > 0
+  && row.mergeGateReviewHold[STAMP] === headSha.toLowerCase()
+  && !row.mergeGateReviewHold.holds.some(id => id === 'test-gaming');
+
+/**
+ * D1 local proof (fail closed: any doubt returns pr unchanged, so the send-back works as today).
+ * Only the check named exactly merge-gate; head-bound verdict at decision time; hold setting on;
+ * hold table is review-only (excuseMergeGateRows `reviewHold`, never its SUCCESS rewrite); no test-gaming
+ * hold (a code finding, excluded here without touching the shared classifier); and the job's only failed
+ * step is the gate evaluator, so no other job failure hides behind the table.
+ */
+export function markReviewOwnedGate(pr, { headSha, repo, readVerdict, readFreeze, setting } = {}) {
+  try {
+    if (typeof headSha !== 'string' || !shaPattern.test(headSha) || headSha !== pr?.headRefOid
+      || (typeof setting === 'string' ? setting : setting?.value) !== 'on' || !Array.isArray(pr.statusCheckRollup)) return pr;
+    let verdict;
+    const out = excuseMergeGateRows(pr.statusCheckRollup, { prNumber: pr.number, headSha, labels: pr.labels, setting,
+      readVerdict: args => (verdict = readVerdict({ ...args, repo })), freeze: readFreeze });
+    if (out.excused || !out.reviewHold || !verdict) return pr;
+    const target = out.rows.find(r => r.mergeGateReviewHold);
+    const holds = target?.mergeGateReviewHold?.holds;
+    if (!target || (target.name ?? target.context) !== 'merge-gate' || !Array.isArray(holds)
+      || verdict.head_sha?.toLowerCase() !== headSha.toLowerCase()
+      || verdict.results?.some(r => r.id === 'test-gaming' && (r.status === 'hold' || r.status === 'fail-closed'))
+      || holds.includes('test-gaming')) return pr;
+    const failed = verdict.failedSteps;
+    if (!Array.isArray(failed) || failed.some(s => s !== "Evaluate the drain's merge gates")) return pr;
+    const stamped = { ...target, mergeGateReviewHold: { ...target.mergeGateReviewHold, [STAMP]: headSha.toLowerCase() } };
+    return { ...pr, statusCheckRollup: out.rows.map(r => r === target ? stamped : r) };
+  } catch { return pr; }
+}
+
 /** Pure; unknown evidence retains the caller's original BLOCKED reason. Missing rows wait. */
-export function describeBlockedChecks(pr, requiredChecks) {
+export function describeBlockedChecks(pr, requiredChecks, headSha) {
   try {
     if (!record(pr) || pr.requiredCheckReadError || !Array.isArray(pr.statusCheckRollup)
       || pr.statusCheckRollup.some(row => !record(row) || typeof (row.name || row.context) !== 'string')
@@ -32,9 +67,9 @@ export function describeBlockedChecks(pr, requiredChecks) {
       if (!row) { waiting.push(`waiting on required check ${label} (absent)`); continue; }
       const conclusion = String(row.conclusion || row.state || '').toUpperCase();
       const status = String(row.status || row.state || '').toUpperCase();
-      if (isFailedCheckRow(row) && (row.mergeGateReviewHold || row.mergeGateHoldExcused)) {
-        // Review-owned merge-gate red (proved from the head-bound job log): review work, not a code finding.
-        reviewOwned.push(...(row.mergeGateReviewHold?.holds ?? row.mergeGateHoldExcused?.holds ?? []).map(String));
+      if (isFailedCheckRow(row) && trustedReviewOwned(row, name, headSha)) {
+        // Review-owned merge-gate red (proved locally from the head-bound job log): review work, not a code finding.
+        reviewOwned.push(...row.mergeGateReviewHold.holds.map(String));
       } else if (isFailedCheckRow(row)) {
         const detail = firstLine(row);
         failed.push(`required check ${label} ${conclusion}${detail ? `: ${detail}` : ''}`);
@@ -55,7 +90,7 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
       || pr.rowsComplete !== true || pr.rowsHead !== headSha
       || !validLedger(ledger) || ledger[headSha.toLowerCase()]
       || !Array.isArray(pr.labels) || !pr.labels.some(label => (typeof label === 'string' ? label : label?.name) === 'ready-to-merge')) return { send: false };
-    const description = describeBlockedChecks(pr, requiredChecks);
+    const description = describeBlockedChecks(pr, requiredChecks, headSha);
     if (!description?.failed.length) {
       return description?.reviewOwned?.length
         ? { send: false, reason: `merge-gate red is review-owned (${[...new Set(description.reviewOwned)].join(', ')}); no code finding to send back` }
@@ -105,10 +140,7 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     const key = `${repo}#${pr.number}`;
     // D1: a review-owned merge-gate red (proved from the head-bound job log) is review work, never a code finding.
     // Any unreadable/mismatched/off evidence leaves the rows unchanged, so the send-back behaves as before.
-    let gatePr = pr;
-    try {
-      gatePr = excusePrMergeGateHolds([pr], { repo, readMergeGateVerdict: readVerdict, readFreeze, mergeGateSetting })[0] ?? pr;
-    } catch { gatePr = pr; }
+    const gatePr = markReviewOwnedGate(pr, { headSha, repo, readVerdict, readFreeze, setting: mergeGateSetting });
     const decision = decideGateSendBack({ pr: gatePr, headSha, requiredChecks, ledger: ledger[key] || {} });
     if (!decision.send) return decision.reason ? { sent: false, reason: decision.reason } : { sent: false };
     refusalPath = `${ledgerPath}.${headSha.toLowerCase()}.refused`;

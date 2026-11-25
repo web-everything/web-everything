@@ -252,7 +252,11 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
       cache.set(key, { job, log });
     }
     const { job, log } = cache.get(key);
-    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at };
+    // failedSteps: additive evidence for callers that must prove the hold table is the ONLY failure in the job.
+    const failedSteps = Array.isArray(job.steps) && job.steps.length && job.status === 'completed'
+      && job.steps.every(s => s?.status === 'completed')
+      ? job.steps.filter(s => s.conclusion !== 'success' && s.conclusion !== 'skipped').map(s => String(s.name)) : null;
+    return { ...(parseWorkflowProtection(job, log, prNumber) ?? parsePrResultTable(log, prNumber)), head_sha: job.head_sha, completed_at: job.completed_at, failedSteps };
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }
 
