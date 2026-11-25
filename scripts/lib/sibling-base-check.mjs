@@ -1,10 +1,20 @@
 import { laneHistoryProofEnv, scrubInheritedGitEnv } from './lane-git-hardening.mjs';
 
+/** Constrain the injected Git port to history reads before dispatching dynamic argv. */
+export function createSiblingHistoryReader(readGit) {
+  return args => {
+    if (!Array.isArray(args) || !['rev-parse', 'check-ref-format', 'rev-list', 'cherry'].includes(args[0])) {
+      throw new Error('Unsupported sibling history command');
+    }
+    return readGit(args, { timeout: 5000, maxBuffer: 8 * 1024 * 1024,
+      env: laneHistoryProofEnv(scrubInheritedGitEnv(process.env)) });
+  };
+}
+
 /** Read-only ancestry/patch evidence. Returns sibling counts, or an unreadable refusal. */
 export function checkSiblingBase({ git, base = 'main', sha = 'HEAD', branch = '', openPrs }) {
   try {
-    const read = args => git(args, { timeout: 5000, maxBuffer: 8 * 1024 * 1024,
-      env: laneHistoryProofEnv(scrubInheritedGitEnv(process.env)) });
+    const read = createSiblingHistoryReader(git);
     const oid = value => {
       if (!/^[a-f0-9]{40}$/.test(value)) throw new Error('invalid commit identity');
       return value;
