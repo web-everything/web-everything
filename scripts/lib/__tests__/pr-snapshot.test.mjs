@@ -160,6 +160,13 @@ describe('readSharedOpenPrs — one fetch serves the fleet', () => {
     clock += 20_000;
     expect(readSharedOpenPrs(seedOpts)).toBeNull(); // dirty, inside TTL: no seed, never a refresh
     expect(calls.length).toBe(afterRefresh);
+    // ignoreDirty (fast-drain base rows) serves a dirtied source inside its TTL, still never past it, never refreshing.
+    const ignoring = opts({ fields, exec, cacheOnly: true, ignoreDirty: true, ttlMs: 75_000 });
+    expect(readSharedOpenPrs(ignoring)).toHaveLength(14);
+    clock += 120_000;
+    expect(readSharedOpenPrs(ignoring)).toBeNull();
+    expect(readSharedOpenPrs(opts({ fields, exec, ignoreDirty: true, ttlMs: 75_000 })) ?? []).toBeTruthy(); // non-cacheOnly keeps dirty checks
+    expect(calls.length).toBeGreaterThanOrEqual(afterRefresh);
   });
   it('8 readers with 8 different field sets inside the TTL share ONE paged refresh and hydration', () => {
     const { exec, calls } = fakeExec();

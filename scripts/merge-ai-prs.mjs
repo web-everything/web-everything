@@ -192,6 +192,7 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+const FAST_DRAIN_SOURCE_MAX_AGE_MS = 10 * 60_000;
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
 export function backfillDrainReviewRuns(context, {
@@ -5930,7 +5931,12 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return stdout;
       },
     });
-    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    // Source rows are only BASE facts: every non-target row is identity-checked (head/updatedAt) against a live lean
+    // inventory and re-read when it differs, and the target plus its related set are read live. A mutation-dirtied
+    // source therefore stays usable, bounded by an age cap that covers a full pass (a refresh itself takes ~80s,
+    // longer than the 75s snapshot TTL, so a TTL-only source could never be served).
+    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
+      cacheOnly: true, ignoreDirty: true, ttlMs: FAST_DRAIN_SOURCE_MAX_AGE_MS });
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
