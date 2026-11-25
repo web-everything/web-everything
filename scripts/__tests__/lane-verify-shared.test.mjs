@@ -494,7 +494,23 @@ function countedRunner(run, { maxBytes = 1024 * 1024, listing, listingError = fa
   });
   return { runCounted: runner.runCountedTestGate, sharedTestCounts, fullComplete: runner.complete };
 }
-it('counted runner reads JSON from direct shell and argv test phases and sums execution', async () => {
+it('selected shell, scan and retry phases preserve their commands for admission', async () => {
+  const calls = [];
+  const runner = countedRunner(async (_phase, command, argv) => {
+    calls.push({ command, argv });
+    return { exitCode: 0 };
+  });
+  const selected = 'npx vitest run scripts/a.test.mjs --testTimeout=15000';
+  const scan = "VERIFY_SCAN_FILES='[\"source.mjs\"]' npx vitest run scripts/scan.test.mjs";
+  const retry = ['vitest', 'run', '--maxWorkers=1', './scripts/a.test.mjs'];
+  await runner.runCounted('vitestMs', selected);
+  await runner.runCounted('scanMs', scan);
+  await runner.runCounted('vitestMs', 'npx', retry);
+  expect(calls).toEqual([{ command: selected, argv: undefined }, { command: scan, argv: undefined }, { command: 'npx', argv: retry }]);
+  expect(runner.sharedTestCounts).toEqual([null, null, null]);
+  expect(runner.fullComplete()).toBe(false);
+});
+it('counted full runner reads JSON from direct shell and argv test phases and sums execution', async () => {
   let index = 0;
   const runner = countedRunner(async (_phase, command, argv) => {
     const file = argv ? argv.find(a => a.startsWith('--outputFile.json=')).slice('--outputFile.json='.length)
@@ -502,8 +518,8 @@ it('counted runner reads JSON from direct shell and argv test phases and sums ex
     writeFileSync(file, index++ ? runnerReport({ numTotalTests: 3, numPassedTests: 0, numFailedTests: 0 }) : runnerReport());
     return { exitCode: 0 };
   });
-  await runner.runCounted('vitestMs', 'npx vitest run scripts/a.test.mjs');
-  await runner.runCounted('vitestMs', 'npx', ['vitest', 'run', 'scripts/b.test.mjs']);
+  await runner.runCounted('vitestMs', 'npx vitest run scripts/a.test.mjs', undefined, { fullPhase: true });
+  await runner.runCounted('vitestMs', 'npx', ['vitest', 'run', 'scripts/b.test.mjs'], { fullPhase: true });
   expect(runner.sharedTestCounts).toEqual([3, 0]);
 });
 it.each(['missing', 'oversized', 'sharded', 'opaque npm'])('counted runner fails closed for %s execution evidence', async kind => {
@@ -512,7 +528,7 @@ it.each(['missing', 'oversized', 'sharded', 'opaque npm'])('counted runner fails
     return { exitCode: 0 };
   }, { maxBytes: 512 });
   await runner.runCounted('vitestMs', kind === 'sharded' ? 'node scripts/lib/verify-shard-run.mjs -- npx vitest run'
-    : kind === 'opaque npm' ? 'npm run test:unit' : 'npx vitest run');
+    : kind === 'opaque npm' ? 'npm run test:unit' : 'npx vitest run', undefined, { fullPhase: kind !== 'opaque npm' });
   expect(runner.sharedTestCounts).toEqual([null]);
 });
 it('counted runner reuses the always-run guard report without replacing its output path', async () => {
@@ -627,7 +643,9 @@ it.each(['missing file', 'skipped file', 'absent full report', 'unreadable enume
       : kind === 'oversized enumeration' ? [files[0] + 'x'.repeat(1024 * 1024)] : files });
     await runner.runCounted('vitestMs', 'npx vitest run', undefined, { fullPhase: true });
     expect(runner.fullComplete()).toBe(false);
-    await runner.runCounted('scanMs', 'npx vitest run');
+    const guardReport = join(root, 'guard-report.json');
+    await runner.runCounted('scanMs', `npx vitest run --reporter=json --outputFile.json=${gate.shellQuote(guardReport)}`, undefined, { reportFile: guardReport });
+    expect(runner.sharedTestCounts.at(-1)).toBe(2);
     expect(runner.fullComplete()).toBe(false);
   });
 it('F6 full npm phase appends its own reporter flags and proves all enumerated files', async () => {

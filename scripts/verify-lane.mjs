@@ -1171,6 +1171,8 @@ const alwaysRun = guardGate
   ? alwaysRunPlan({ declared: verifySetting('alwaysRunTests', process.env), fileExists: (p) => existsSync(join(REPO, p)),
     scanCommands: resolvedGate.scanCommands ?? [], testTimeoutFactor: resolvedGate.decision?.testTimeoutFactor ?? 1, reportFile: alwaysRunReport })
   : { command: null, declared: [], files: [], skipped: [] };
+// Only the full phase needs a new reporter for shared publication. Changing selected-test or legacy
+// retry argv also changes remote admission/routing; those commands retain their original arguments.
 // Direct Vitest and the proven hook-free full npm wrapper can receive a phase-owned JSON reporter.
 // Shard wrappers and opaque npm scripts retain null evidence and cannot authorize shared publication.
 // Existing guard/retry reports are reused so their execution-inventory consumers keep the same file.
@@ -1191,7 +1193,7 @@ async function runCountedTestGate(phase, command, args, { reportFile = null, ful
         fullFiles = JSON.parse(listing);
       } catch { /* Unknown inventory only disables shared publication; local verification still runs. */ }
     }
-    if (!reportFile && direct) {
+    if (!reportFile && direct && fullPhase) {
       reportDir = mkdtempSync(join(tmpdir(), 'verify-test-count-'));
       reportFile = join(reportDir, 'results.json');
       const flags = ['--reporter=default', '--reporter=json', `--outputFile.json=${reportFile}`];
