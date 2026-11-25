@@ -1189,6 +1189,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
     ...(checkEvidenceIncomplete ? { checkEvidenceIncomplete: true } : {}),
     ...(workflowHoldRepark ? { workflowHoldRepark: true } : {}),
     ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
+    ...(pr?.heavyReadError ? { heavyReadError: pr.heavyReadError } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
 
@@ -1440,6 +1441,8 @@ export async function repollUnknownListings({ prsByRepo, read, sleep, setting = 
  */
 export function isRebaseDropCandidate(v) {
   if (!v || v.decision !== 'skip') return false;
+  // A deferred heavy read cannot authorize a rebuild or the subsequent promotion to merge.
+  if (v.heavyReadError) return false;
   // #3674 — a non-default-base hold is never rebuilt onto main: the rebase pass would flip it back to `merge`.
   if (v.offDefaultBase) return false;
   const certified = !!(v.certifyLabel || v.aiGenerated);
@@ -6333,7 +6336,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // lane/* ref (renumbers the NNN), moving the head out from under an active reviewer and invalidating any
       // #2409 acceptance stamped against the old SHA. The heal's premise ("a red required check is the symptom")
       // never held for a green-held PR: it has no collision to heal. Excluding `reviewHeld` restores that premise.
-      if (!certified || v.prestagePendingCi || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError) continue;
+      if (!certified || v.prestagePendingCi || v.decision === 'merge' || v.reviewHeld || v.requiredCheckReadError || v.heavyReadError) continue;
       if (!isLocalRepo(v.repo) || !v.headRef) continue;
       // #2276 — a rebase-drop candidate (stale-green + BEHIND/CONFLICTING) is healed INSIDE the rebase-drop
       // rebuild below (one rebuilt tip drops the manifest AND renumbers), so skip it here to avoid a double

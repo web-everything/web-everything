@@ -12,7 +12,7 @@ import { fastDrainArgs } from '../../lib/enqueue-on-event.mjs';
 import { daemonAppEnv } from './daemon-app-env.mjs';
 
 export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(import.meta.url)), '../../..'), killSwitch = false,
-  cacheWriteFailure = false, watchDirty = false, pinnedPatches = {},
+  cacheWriteFailure = false, watchDirty = false, pinnedPatches = {}, rebaseDrop = true,
   catchUp = false, scope = 'target', livePatches = {}, targetLabels = null, failDefaultBranch = false, outputAsJson = true, cachedBranch = null, liveDefaultBranch = 'main', branchAfterMembership = null, roundBranch = null, rowCount = 48, leanIncomplete = false, fullIncomplete = false, leanPageError = false, targetBaseRefName = 'main', workflowEditSetting = null, extraContextRows = false } = {}) {
   const dir = mkdtempSync(join(process.env.TMPDIR, 'fast-context-cli-'));
   try {
@@ -48,7 +48,15 @@ export function runFastDrainContextCli({ root = resolve(dirname(fileURLToPath(im
     writeFileSync(join(dir, 'rows.json'), JSON.stringify(liveRows));
     writeFileSync(join(dir, 'calls.jsonl'), '');
     writeFileSync(join(dir, 'live-branch'), liveDefaultBranch);
-    writeFileSync(join(bin, 'git'), '#!/bin/sh\nif [ "$1 $2" = "remote get-url" ]; then echo https://github.com/fixture/web-everything.git; exit 0; fi\nexit 1\n', { mode: 0o755 });
+    writeFileSync(join(bin, 'git'), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.CONTEXT_CALLS + '.git', JSON.stringify(args) + '\\n');
+if (args[0] === 'remote' && args[1] === 'get-url') {
+  fs.writeSync(1, 'https://github.com/fixture/web-everything.git\\n'); process.exit(0);
+}
+process.exit(1);
+`, { mode: 0o755 });
     // The async test transport resolves gh via PATH; both that path and the binary
     // hook must reach gh-throttle before the fake serves check/status evidence.
     writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node
@@ -134,6 +142,7 @@ out({});
       : [join(root, 'scripts/merge-ai-prs.mjs'), '--this-repo', '--only=7', '--from-green-event', '--label=ready-to-merge',
         ...(outputAsJson ? ['--json'] : []), ...(roundBranch ? [`--listing-snapshot=${roundPath}`] : [])];
     const result = spawnSync(process.execPath, [...args, '--dry-run', '--no-drain-lease',
+      ...(!rebaseDrop ? ['--no-rebase-drop'] : []),
       ...(watchDirty ? ['--watch', '--max-idle=2', '--interval=1'] : []),
       '--no-red-main-freeze', '--no-review-escalation', '--repoll-delay=0'], {
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
@@ -153,6 +162,8 @@ out({});
     });
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
     return { status: result.status, stdout: result.stdout, stderr: result.stderr, calls,
+      gitCalls: existsSync(join(dir, 'calls.jsonl.git'))
+        ? readFileSync(join(dir, 'calls.jsonl.git'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [],
       bareCheckReads: existsSync(join(dir, 'calls.jsonl.bare-checks'))
         ? readFileSync(join(dir, 'calls.jsonl.bare-checks'), 'utf8').trim().split('\n').map(JSON.parse) : [],
       prViews: existsSync(join(dir, 'calls.jsonl.views'))

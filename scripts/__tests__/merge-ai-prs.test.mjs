@@ -22,6 +22,43 @@ import { pinnedLeafDiffFixture } from './fixtures/pinned-leaf-diff-fixture.mjs';
 import { openPrPageFixture } from './fixtures/open-pr-page-fixture.mjs';
 import { buildManifest, manifestBodyBlock } from '../readiness/lane-manifest.mjs';
 import { deriveResolutionBasis, graduatedToFromBody } from '../lib/review-render.mjs';
+import { hydrateDeltaAsync } from '../lib/pr-list-paged.mjs';
+
+describe('deferred heavy reads never admit branch preparation', () => {
+  it.each([
+    ['CONFLICTING', 'DIRTY', 'updatedAt'],
+    ['CONFLICTING', 'CLEAN', 'headRefOid'],
+    ['MERGEABLE', 'BEHIND', 'updatedAt'],
+    ['MERGEABLE', 'DIRTY', 'baseRefOid'],
+  ])('%s/%s with unreadable %s stays untouched until a successful heavy read', async (mergeable, state, field) => {
+    const repo = 'fixture/repo';
+    const row = { number: 42, labelsComplete: true, labels: [{ name: 'ready-to-merge' }],
+      headRefOid: 'a'.repeat(40), baseRefOid: 'b'.repeat(40), baseRefName: 'main',
+      updatedAt: '2026-11-25T12:00:00Z', headRefName: 'lane/42', mergeable, mergeStateStatus: state,
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] };
+    if (field === 'baseRefOid') row.baseRefOid = null;
+    const hydrate = (moved) => hydrateDeltaAsync({ repo, rows: [row], nowMs: Date.parse(row.updatedAt),
+      bounds: null, isCandidate: () => true, execAsync: async () => ({ stdout: JSON.stringify({
+        ...row, body: 'Current summary', files: [{ path: 'src/current.mjs' }],
+        ...(moved ? { [field]: field === 'updatedAt' ? '2026-11-25T12:00:01Z' : 'f'.repeat(40) } : {}),
+      }) }) });
+    const verdictOf = (p) => buildDrainVerdicts({ repos: [repo], prsByRepo: new Map([[repo, [p]]]),
+      readOf: () => ({ manifest: null }), defaultBranchOf: () => 'main' })[0];
+    const deferred = (await hydrate(true)).rows[0];
+    expect(deferred.heavyReadError).toMatch(/heavy PR evidence (moved|row-invalid)/);
+    const verdict = verdictOf(deferred);
+    // Exercise the real admission predicate before checking propagation so the red proof shows the unsafe path.
+    expect(isRebaseDropCandidate(verdict)).toBe(false);
+    expect(verdict).toMatchObject({ decision: 'skip', testGreen: true, heavyReadError: deferred.heavyReadError });
+    expect(isBehindButClean(verdict)).toBe(false);
+    const plan = planLabelDrain([verdict]);
+    expect(plan.ready).toEqual([]);
+    if (field === 'baseRefOid') row.baseRefOid = 'b'.repeat(40);
+    const recovered = (await hydrate(false)).rows[0];
+    expect(recovered.heavyReadError).toBeUndefined();
+    expect(isRebaseDropCandidate(verdictOf(recovered))).toBe(true);
+  });
+});
 
 describe('incomplete round targets retain live dependency ordering', () => {
   it.each([true, false])('keeps incomplete checks skipped when the live blocker is open=%s', open => {

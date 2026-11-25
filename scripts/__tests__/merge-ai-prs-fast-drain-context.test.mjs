@@ -517,6 +517,19 @@ test('deferred heavy evidence stays blocked after fresh checks and cannot certif
   assert.equal(context.prsByRepo.get(repo).length,1);
 });
 
+for (const rebaseDrop of [true, false]) test(`real CLI leaves conflicting deferred heavy evidence untouched (rebaseDrop=${rebaseDrop})`, () => {
+  const result = runFastDrainContextCli({ killSwitch: true, rowCount: 2, rebaseDrop, outputAsJson: false,
+    livePatches: { 7: { mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } },
+    pinnedPatches: { 7: { body: 'Changed after listing', updatedAt: '2026-11-25T12:00:00Z' } } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /heavy PR evidence moved/);
+  assert.doesNotMatch(result.stderr, /would rebase-drop/);
+  assert.equal(result.gitCalls.some(a => a[0] === 'fetch' && a.includes('lane/7')), false,
+    'deferred PR must not enter standalone collision healing');
+  assert.equal(result.calls.some(a => a[0] === 'pr' && a[1] === 'merge'
+    || a.some(v => v.includes('enqueuePullRequest'))), false);
+});
+
 test('watch reloads heavy evidence after a dirty marker between two passes', () => {
   const result = runFastDrainContextCli({killSwitch:true,rowCount:2,watchDirty:true,
     targetLabels:[],livePatches:{8:{labels:[]}}});
