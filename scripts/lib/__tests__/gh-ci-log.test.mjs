@@ -111,20 +111,18 @@ const deferredFindingReaders = new Map([
   ['scripts/review-hold-probe.mjs', 1],
 ]);
 
-// Follow-up: timeout classifier on unfiltered logs: treat as unknown and retry, never eligible.
-// Generic path arguments are invisible to the endpoint scanner; pin these deferred transports explicitly.
-const deferredTimeoutReaders = new Map([
+// Generic path arguments are invisible to the endpoint scanner; pin their raw/JSON split explicitly.
+const timeoutReaders = new Map([
   ['scripts/conveyor/reconcile-pass.mjs', 'plainApi'],
   ['scripts/lib/fix-facts.mjs', 'plain'],
 ]);
 
 describe('CI log reader structural guard', () => {
-  it('keeps deferred timeout classifier log reads on plain API transport without the allow flag', () => {
-    for (const [name, reader] of deferredTimeoutReaders) {
+  it('uses the shared transport only for raw timeout classifier reads', () => {
+    for (const [name, reader] of timeoutReaders) {
       const source = readFileSync(resolve(name), 'utf8');
       expect(source, name).toContain(`const ${reader} = (path, raw`);
-      expect(source, name).toContain("const value = exec('gh', ['api', path],");
-      expect(source, name).not.toMatch(/ciJobLogApiArgs|readCiJobLog|--allow-escape-sequences/);
+      expect(source, name).toContain("const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path],");
     }
   });
   it('rejects direct API arrays, endpoint aliases, run-view arrays and shell readers', () => {
@@ -154,7 +152,7 @@ describe('CI log reader structural guard', () => {
         if (name === 'scripts/conveyor/reconcile-pass.mjs') {
           // Pin the signature reader; the generic-path timeout reader is pinned separately above.
           expect(issues).toEqual(["['api', `repos/${repo}/actions/jobs/${jobId}/logs`]"]);
-        } else if (deferredTimeoutReaders.has(name)) {
+        } else if (timeoutReaders.has(name)) {
           expect(issues, name).toEqual([]);
         } else if (deferredFindingReaders.has(name)) {
           expect({ name, bypasses: issues.length }).toEqual({ name, bypasses: deferredFindingReaders.get(name) });

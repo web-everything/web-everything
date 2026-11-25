@@ -26,6 +26,7 @@ import { lookupReviewFacts, warmReviewFacts } from './review-facts.mjs';
 import { ghRestGetJson } from './gh-rest-read.mjs';
 import { readShaCache, writeShaCache } from './pr-snapshot.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { ciJobLogApiArgs } from './gh-ci-log.mjs';
 
 export const FIX_FACTS_ENV = 'WE_FIX_FACTS';
 export const FIX_FACTS_CALLER = 'reconcile-fix-dispatch-daemon.mjs';
@@ -77,7 +78,7 @@ export function makeFixEvidenceReader({ repo, pr, head, exec = execFileSyncThrot
   const enabled = fixFactsEnabled(env);
   const remaining = () => { const left = deadline - Date.now(); if (left <= 0) throw new Error('evidence-read-deadline'); return left; };
   const plain = (path, raw) => {
-    const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining(), maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path], { encoding: 'utf8', timeout: remaining(), maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     stats.live += 1;
     return raw ? String(value) : JSON.parse(value);
   };

@@ -86,6 +86,7 @@ import { resolve, join, dirname } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
+import { ciJobLogApiArgs } from '../lib/gh-ci-log.mjs';
 import { readSharedOpenPrs, sampleContextDeclared } from '../lib/pr-snapshot.mjs';
 import { prSnapshotEnabled, prSnapshotDir } from '../lib/pr-snapshot-store.mjs';
 import { listOpenPrsPagedHydrated, resolvePrListPaging, assertInventoryComplete, parseListOutput, resolveCheckAppsByCommit } from '../lib/pr-list-paged.mjs';
@@ -2226,7 +2227,7 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
   const plainApi = (path, raw = false) => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('evidence-read-deadline');
-    const value = exec('gh', ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
+    const value = exec('gh', raw ? ciJobLogApiArgs(path) : ['api', path], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     return raw ? String(value) : JSON.parse(value);
   };
   const api = reader?.api ?? plainApi;
@@ -2282,9 +2283,14 @@ function readTimeoutEvidenceOnce(pr, { repo, exec = execFileSyncThrottled, ts, r
       // was refused forever. Classify first; never read a log that cannot exist.
       const cancelledShard = /^(?:test|soak)-shard(?:\s|$)/.test(job.name ?? '') && String(job.conclusion).toLowerCase() === 'cancelled';
       const infra = cancelledShard || isInfraCancelledJob(job);
+      const log = infra ? '' : readLog(job);
+      // The shared transport makes escape-coded whole-job logs newly readable. Without failed-step
+      // attribution, a passing step's timeout fixture could authorize a rerun of an unrelated failure.
+      // Keep these logs available to CI-heal, but refuse timeout eligibility until attribution exists.
+      if (/[\x1b\x9b]/.test(log)) throw new Error('unattributed-job-log');
       return { repo, head, run: run.id, job: job.id, name: job.name, attempt: job.run_attempt, workflow: run.path,
         aggregateGate: isAggregateGateFailure(job), status: job.status, conclusion: job.conclusion, logJob: job.id, logAttempt: job.run_attempt,
-        url: job.html_url, infra, cancelledShard, log: infra ? '' : readLog(job) };
+        url: job.html_url, infra, cancelledShard, log };
     });
     const infraClass = classifyInfraCancelled(jobs);
     if (infraClass.kind === 'infra-only') {

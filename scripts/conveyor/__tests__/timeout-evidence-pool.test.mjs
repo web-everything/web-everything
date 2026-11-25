@@ -453,7 +453,7 @@ describe('real collector API fixture parity', () => {
     };
     const exec = vi.fn((cmd, args) => {
       expect(cmd).toBe('gh'); expect(args[0]).toBe('api');
-      const value = readLive(args[1]);
+      const value = readLive(args.at(-1));
       return typeof value === 'string' ? value : JSON.stringify(value);
     });
     const collect = p => readTimeoutEvidence(p, { repo, exec });
