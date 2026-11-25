@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keepAliveScript } from '../test-keepalive.mjs';
 import {
   awaitGroupDeath, decidePromotion, mayHandOver, settleDecision, scanNewSessionSpawns, MERGE_CAPABLE_SPAWN_ALLOWLIST,
 } from '../daemon-generation-barrier.mjs';
@@ -15,7 +16,8 @@ const errCode = (code) => Object.assign(new Error(code), { code });
 // Host capability, measured with raw kill(-pgid, 0) and NOT with the code under test: a container whose pid 1 never
 // reaps leaves an exited orphan as a zombie, so a real group never reads ESRCH there (the Forge exec container).
 const canReap = await (async () => {
-  const l = spawn(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},50)'],{stdio:'ignore'});process.exit(0)"], { detached: true, stdio: 'ignore' });
+  const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 50);' });
+  const l = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});process.exit(0)`], { detached: true, stdio: 'ignore' });
   await new Promise((r) => l.on('exit', r));
   for (let i = 0; i < 100; i++) { try { process.kill(-l.pid, 0); } catch (e) { return e.code === 'ESRCH'; } await realSleep(20); }
   return false;
@@ -23,7 +25,8 @@ const canReap = await (async () => {
 
 describe('awaitGroupDeath', () => {
   it.skipIf(!canReap)('is dead after a straggler grandchild of a real group exits', async () => {
-    const leader = spawn(process.execPath, ['-e', "require('node:child_process').spawn(process.execPath,['-e','setTimeout(()=>{},400)'],{stdio:'ignore'});setTimeout(()=>process.exit(0),50)"], { detached: true, stdio: 'ignore' });
+    const childScript = keepAliveScript({ maxLifetimeMs: 3000, postlude: 'setTimeout(() => process.exit(0), 400);' });
+    const leader = spawn(process.execPath, ['-e', `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});setTimeout(()=>process.exit(0),50)`], { detached: true, stdio: 'ignore' });
     const pgid = leader.pid;
     await new Promise((r) => leader.on('exit', r));
     expect(() => process.kill(-pgid, 0)).not.toThrow(); // grandchild still alive
