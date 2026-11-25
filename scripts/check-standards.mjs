@@ -1709,7 +1709,7 @@ mark("6f-i-b. HARNESS-SCAFFOLDING leak sweep on the committed corpus (#3448)");
   let listed = '';
   try {
     listed = execFileSync('git', ['grep', '-l', '--untracked', '-F', 'lane-pool.mjs', '--', 'scripts/', 'tools/',
-      ':!**/__tests__/**', ':!**/*.test.*', ':!**/fixtures/**'], { cwd: ROOT, encoding: 'utf8' });
+      ':!**/__tests__/**', ':!**/*.test.*', ':!**/fixtures/**'], { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   } catch (e) {
     if (e.status !== 1) err(`lane TTL scan could not list callers: ${e.message}`, { kind: 'lane-short-ttl' });
   }
