@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "3383"
 status: open
-scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/operations/promote-draft-pr-dispatch.mjs", "we:scripts/merge-ai-prs.mjs"]
+
 dateOpened: "2026-10-03"
 tags: []
 ---
@@ -18,3 +18,12 @@ Operator request 2026-10-03: a quick way to take a PR out of all daemon handling
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-11-24)
+
+The build-dispatch daemon held #5020 with:
+
+> worker-declined: Not prepared: #5020 — could-not-prepare. One policy choice remains: when an active fixer cannot be stopped or its claim cannot be released, should hands-off remain pending, or immediately block new daemon actions while reporting incomplete takeover? Existing reclamation preserves the claim on stop failure and cannot release token-bound claims without the token ('we:scripts/conveyor/fixer-stuck-reclaim.mjs:318–340'). The card requires release before activation, but also promises immediate exclusion. No files changed or stamped; no tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
