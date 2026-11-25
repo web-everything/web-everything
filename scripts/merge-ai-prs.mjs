@@ -5935,8 +5935,10 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // inventory and re-read when it differs, and the target plus its related set are read live. A mutation-dirtied
     // source therefore stays usable, bounded by an age cap that covers a full pass (a refresh itself takes ~80s,
     // longer than the 75s snapshot TTL, so a TTL-only source could never be served).
+    // mergeQueue.fastDrain.selfRefresh (standard OFF): while off, every read below is exactly what main does.
+    const selfRefresh = fastDrainListing.selfRefresh === true;
     const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
-      cacheOnly: true, ignoreDirty: true, ttlMs: FAST_DRAIN_SOURCE_MAX_AGE_MS });
+      cacheOnly: true, ...(selfRefresh ? { ignoreDirty: true, ttlMs: FAST_DRAIN_SOURCE_MAX_AGE_MS } : {}) });
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
@@ -5948,12 +5950,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     let passBranchChanged = false;
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
+      ...(selfRefresh ? { targetMaxAgeMs: 60_000 } : {}),
       readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
         repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
         // A stale cache-only source would otherwise fail every catch-up child until the next full pass.
         // Strict TTL/dirty only: the stale-ok allowance must never serve a source that catch-up already rejected.
-        refreshSnapshot: repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
-          env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_PR_SNAPSHOT_STALE_OK_MS')) }),
+        refreshSnapshot: selfRefresh ? repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
+          env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_PR_SNAPSHOT_STALE_OK_MS')) }) : null,
         log: line => process.stderr.write(`${line}\n`),
         concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
         readMain: async repo => {

@@ -204,14 +204,14 @@ export async function readFastDrainPassInventory({ path, repos, targetRepo, snap
   const revalidateAfterMembership = async (writtenAt, { refresh = false } = {}) => {
     // Building a round: EVERY repo's source is re-read here (refreshing only the ones that went stale or dirty), and the
     // main-head and TTL checks run after that last, possibly slow, source read.
-    const sources = readSources({ refresh });
+    const sources = refresh ? readSources({ refresh }) : null; // refresh off: the original check order is preserved
     const currentHeads = await readHeads();
     if (repos.some(repo => currentHeads[repo].sha !== heads[repo].sha
       || currentHeads[repo].defaultBranch !== heads[repo].defaultBranch)) {
       throw new Error('pass main changed while reading — use live listing or retry next pass');
     }
     if (!fresh(writtenAt)) throw new Error('pass inventory expired while reading — retry next pass');
-    return sources;
+    return sources ?? readSources();
   };
   // The pass shares base row facts, never membership authority. Fresh head/updatedAt identities
   // also force hydration of new/changed PRs before dependency, couple or overlap gates run.
@@ -295,7 +295,7 @@ async function refreshRelatedContext({ byRepo, readGroups, readManifests, target
 export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnapshot, listLean, readFull,
   readManifest, concurrency = 4, readInventory, failClosed = false, refreshPr = () => false,
   readManifests = entries => readManifestEntries(entries, readManifest, concurrency),
-  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {}, now = Date.now, targetMaxAgeMs = 60_000 }) {
+  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {}, now = Date.now, targetMaxAgeMs = Infinity }) {
   try {
     const loadInventory = () => {
       if (readInventory) return readInventory();

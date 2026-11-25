@@ -728,7 +728,7 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
 
   it('finding 3: a target read that outlived the bound while the inventory built is read again', async () => {
     let t = 1000, targetReads = 0;
-    const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t,
+    const context = await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t, targetMaxAgeMs: 60_000,
       readInventory: async () => { await setImmediate(); t += 90_000; return { snapshots: new Map([[repo, rows]]) }; },
       readSnapshot: () => rows, listLean: async () => inventory(rows),
       readFull: async (_repo, n) => { if (n === 7) targetReads++; return rows.find(p => p.number === n); },
@@ -761,6 +761,29 @@ describe('stale cache-only snapshot on the first catch-up child (drain-fastdrain
       } finally { f.close(); }
     });
   }
+
+  it('selfRefresh OFF: catch-up child refuses exactly as main (classified incomplete-context)', async () => {
+    const f = pass();
+    let refreshCalls = 0;
+    try {
+      // OFF means merge-ai-prs passes no refreshSnapshot (and no targetMaxAgeMs): a stale source refuses, nothing is refreshed.
+      await expect(readFastDrainPassInventory({ ...f.options, readSnapshot: () => null })).rejects.toThrow('snapshot unavailable/disabled/stale/dirty — retry next pass');
+      expect(existsSync(f.options.path)).toBe(false);
+      await expect(readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true,
+        readInventory: () => readFastDrainPassInventory({ ...f.options, readSnapshot: () => null }),
+        readSnapshot: () => null, listLean: async () => inventory(rows), readFull: async (_r, n) => { refreshCalls++; return rows.find(p => p.number === n); },
+        readManifest: async (_r, p) => p.manifest })).rejects.toThrow(/incomplete pass context \(snapshot unavailable\/disabled\/stale\/dirty/);
+      expect(classifyChildFailure('merge-ai-prs ✗ Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty — retry next pass) — retry next pass'))
+        .toBe('incomplete-context');
+      // A slow target read is not re-read while OFF (default bound is unlimited), as on main.
+      let t = 0, reads = 0;
+      await readFastDrainContext({ repos: [repo], targetRepo: repo, onlyPr: 7, failClosed: true, now: () => t,
+        readInventory: async () => { await setImmediate(); t += 90_000; return { snapshots: new Map([[repo, rows]]) }; },
+        readSnapshot: () => rows, listLean: async () => inventory(rows),
+        readFull: async (_r, n) => { if (n === 7) reads++; return rows.find(p => p.number === n); }, readManifest: async (_r, p) => p.manifest });
+      expect(reads).toBe(1);
+    } finally { f.close(); }
+  });
 
   it('classifies the incomplete pass context failure instead of "unknown"', () => {
     expect(classifyChildFailure('merge-ai-prs Error: fast-drain: incomplete pass context (snapshot unavailable/disabled/stale/dirty) — retry next pass'))

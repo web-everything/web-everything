@@ -40,14 +40,18 @@ export function resolveFastDrainListingSetting({ env = process.env, tool, platfo
   const raw = String(env?.WE_FAST_DRAIN_LISTING ?? '').trim().toLowerCase();
   const contextRaw = String(env?.WE_FAST_DRAIN_CONTEXT ?? '').trim().toLowerCase();
   const c = cascadePolicy('mergeQueue.fastDrain', block, {
-    env, standard: { listing: 'snapshot', context: 'snapshot' }, envValues: { listing: raw || undefined, context: contextRaw || undefined },
-    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live' },
+    env, standard: { listing: 'snapshot', context: 'snapshot', selfRefresh: 'off' },
+    envValues: { listing: raw || undefined, context: contextRaw || undefined, selfRefresh: String(env?.WE_FAST_DRAIN_SELF_REFRESH ?? '').trim().toLowerCase() || undefined },
+    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live', selfRefresh: (v) => v === 'on' || v === 'off' },
     ...(platform !== undefined ? { platform } : {}), log: () => {},
   });
   const listing = c.value.listing, source = c.sources.listing;
   const context = c.value.context, contextSource = c.sources.context;
   const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source}), context=${context} (${contextSource})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
-  return { listing, source, context, contextSource, line };
+  // mergeQueue.fastDrain.selfRefresh (on|off, standard off, env WE_FAST_DRAIN_SELF_REFRESH): catch-up children may refresh a
+  // stale base snapshot themselves. Off, the fast drain refuses on a stale source exactly as before.
+  const selfRefresh = c.value.selfRefresh === 'on';
+  return { listing, source, context, contextSource, selfRefresh, line };
 }
 
 /** Replace the live target while preserving snapshot context without mutating either input. */
