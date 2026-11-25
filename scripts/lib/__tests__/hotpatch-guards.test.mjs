@@ -172,7 +172,7 @@ describe('hotpatch production readers', () => {
       expect(await ciDefinitionGuard(SHA, f.readers)).toMatchObject({ outcome: 'fail' });
     }
     // The shared transport honours throttle.noMemo (gh-throttle runGhSyncReadMemo); the reader must set it on every gh read.
-    expect(readFileSync(new URL('../hotpatch-readers.mjs', import.meta.url), 'utf8')).toMatch(/caller: 'hotpatch-admission', noMemo: true/);
+    expect(readFileSync('scripts/lib/hotpatch-readers.mjs', 'utf8')).toMatch(/caller: 'hotpatch-admission', noMemo: true/);
   });
   it('production receipts refuse successful jobs whose suite step was skipped', async () => {
     const f = production(); f.jobs[0].steps[0].conclusion = 'skipped';
