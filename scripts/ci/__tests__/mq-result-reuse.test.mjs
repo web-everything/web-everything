@@ -229,7 +229,31 @@ describe('mq-result-reuse (forge.merge-queue: reuse only for the exact same sha,
       expect(job.name, name).toBeUndefined();
       const { include = [], exclude = [], ...dimensions } = job.strategy.matrix;
       expect(exclude).toEqual([]);
+      if (name === 'soak-shard') {
+        expect(dimensions).toEqual({ shard: '${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}' });
+        const scope = workflow.jobs['daemon-soak-scope'];
+        expect(job.needs).toContain('daemon-soak-scope');
+        expect(scope.outputs.shards).toBe('${{ steps.scope.outputs.shards }}');
+        // Resolve the dynamic axis from the real full-run producer, independently of the reuse roster.
+        // Push always selects the full soak; merge_group may select only the baseline shard.
+        const dir = mkdtempSync(join(tmpdir(), 'mq-full-soak-'));
+        try {
+          const output = join(dir, 'output');
+          const script = scope.steps.find(step => step.id === 'scope').run
+            .replaceAll('${{ github.event_name }}', 'push');
+          const result = spawnSync('bash', ['-e', '-c', script], {
+            cwd: dir, encoding: 'utf8', timeout: 5000, env: { ...process.env, GITHUB_OUTPUT: output },
+          });
+          expect(result.status, result.stderr).toBe(0);
+          const lines = readFileSync(output, 'utf8').trim().split('\n');
+          expect(lines).toHaveLength(2);
+          expect(lines[0]).toBe('run=true');
+          expect(lines[1]).toMatch(/^shards=\[/);
+          dimensions.shard = JSON.parse(lines[1].slice('shards='.length));
+        } finally { rmSync(dir, { recursive: true, force: true }); }
+      }
       const axes = Object.entries(dimensions);
+      for (const [key, values] of axes) expect(Array.isArray(values), `${name}.${key}`).toBe(true);
       const combinations = axes.reduce((rows, [key, values]) => rows.flatMap(row => values.map(value => ({ ...row, [key]: value }))), [{}]);
       // Current include rows only attach metadata to an existing combination; a new combination requires review.
       for (const entry of include) expect(combinations.some(row => axes.every(([key]) => row[key] === entry[key]))).toBe(true);
