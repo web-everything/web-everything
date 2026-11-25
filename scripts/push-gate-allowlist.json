@@ -136,6 +136,7 @@
     "scripts/conveyor/soak/breaks/unrecognized-session-lease-outlives-merged-pr.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":8},
     "scripts/conveyor/soak/invariants.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
     "scripts/conveyor/soak/red-green.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
+    "scripts/conveyor/standards-status-pass.mjs": {"status":"pending-migration","reason":"Unresolved-argv git helper calls for a bare mirror and read-only worktrees (fetch, rev-parse, worktree add/remove); the pass never pushes.","sites":9},
     "scripts/conveyor/stale-base-refresh.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/conveyor/verified-push-salvage.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/daemon-overlay.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":14},

@@ -28,6 +28,7 @@
   "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.mjs": 2,
   "scripts/conveyor/soak/invariants.mjs": 1,
   "scripts/conveyor/soak/red-green.mjs": 4,
+  "scripts/conveyor/standards-status-pass.mjs": 1,
   "scripts/daemon-edge.mjs": 1,
   "scripts/daemon-overlay.mjs": 1,
   "scripts/dev/check-fresh.mjs": 1,
