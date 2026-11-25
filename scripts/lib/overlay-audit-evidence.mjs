@@ -7,7 +7,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { readPlatformPreferences } from './policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
 import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
-import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead } from '../operations/prototype-load.mjs';
+import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened } from '../operations/prototype-load.mjs';
 import { QUESTION_HASH, findAudit, isAcceptedQuestionHash, resolvePriorQuestionHashes } from '../operations/codex-audit.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
@@ -50,10 +50,12 @@ export function mainCovers(base, { cwd = process.cwd(), env = process.env } = {}
 }
 
 /** Canonical evaluation. Supplying covers keeps evaluation pure; default IO is read-only Git. */
-export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, covers = mainCovers, now = Date.now() } = {}) {
-  const missing = { ok: false, kind: null, detail: describeMissing(sha) };
+export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], auditError = false, waiverError = false, ref, covers = mainCovers, now = Date.now() } = {}) {
+  const missing = { ok: false, kind: 'missing', detail: describeMissing(sha) };
+  const damaged = { ok: false, kind: 'damaged', detail: 'malformed or unreadable evidence; repair the ledger before registration' };
   // Damaged records require ledger repair; dropping them could conceal negative evidence.
-  if (!fullSha(sha) || !Array.isArray(auditRecords) || !auditRecords.every(auditShape)) return missing;
+  if (auditError || !fullSha(sha) || !Array.isArray(auditRecords) || !auditRecords.every(auditShape)) return damaged;
+  const weakened = { ok: false, kind: 'weakened', detail: `unwaived WEAKENED canonical audit record for ${sha}` };
   const records = auditRecords.map(record => ({ ...record, head: record.head.toLowerCase(), base: record.base.toLowerCase() }));
   const priorQuestionHashes = resolvePriorQuestionHashes();
   const options = { questionHash: QUESTION_HASH, priorQuestionHashes, now };
@@ -64,43 +66,49 @@ export function auditEvidenceFor(sha, { auditRecords = [], waivers = [], ref, co
       || findAudit([record], { ...options, head: record.head, base: record.base })) continue;
     const later = findAudit(records.slice(index + 1), { ...options, head: record.head, base: record.base });
     // An unusable negative still vetoes an older pass, until a usable re-audit supersedes it.
-    if (!later || (record.questionHash === QUESTION_HASH && later.questionHash !== QUESTION_HASH)) return missing;
+    if (!later || (record.questionHash === QUESTION_HASH && later.questionHash !== QUESTION_HASH)) return weakened;
   }
   const covered = base => { try { return !!covers(base); } catch { return false; } };
   const evaluate = ruledWeakened => canonicalAuditEvidence(records, sha, covered, null, { ruledWeakened, priorQuestionHashes, now });
-  if (evaluate().ok) return { ok: true, kind: 'audit', detail: `NOT WEAKENED canonical audit record for ${sha}` };
+  const verdict = evaluate();
+  if (verdict.ok) return { ok: true, kind: 'audit', detail: `NOT WEAKENED canonical audit record for ${sha}` };
+  if (waiverError) return damaged;
   for (const entry of Array.isArray(waivers) ? waivers : []) {
-    // Settings rulings have the prototype loader's schema; only ledger entries require actor/quote/at.
+    // Layer identifies provenance; every waiver otherwise follows the ledger schema.
     const settingsWaiver = entry?.layer === 'tool' || entry?.layer === 'platform';
-    if ((!settingsWaiver || Object.hasOwn(entry, 'at')) && !validTime(entry?.at, now)) continue;
-    if (!(settingsWaiver ? waiverForHead([entry], { branch: ref, sha }) : validateEntry(entry))
+    const { layer, ...record } = entry ?? {};
+    if (!validTime(entry?.at, now)) continue;
+    if (!validateEntry(settingsWaiver ? record : entry)
       || !fullSha(entry.sha) || entry.ref !== ref || entry.sha.toLowerCase() !== sha.toLowerCase()) continue;
     if (evaluate({ record: entry, ruledWeakened: entry }).ok)
       return { ok: true, kind: 'waiver', detail: `waiver in ${settingsWaiver ? `${entry.layer} prototypeLoad.ruledWeakened settings` : 'ruled-weakened.jsonl'} for ${ref} ${sha}` };
   }
-  return missing;
+  return verdict.reason === 'weakened' ? weakened : missing;
 }
 
 /** Read settings and shared ledgers using their existing readers/resolvers. Unreadable evidence grants nothing. */
 export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cwd = process.cwd(), now = Date.now() } = {}) {
-  let auditRecords = [], waivers = [];
+  let auditRecords = [], waivers = [], auditError = false, waiverError = false;
   if (typeof env.HOME !== 'string' || !env.HOME.trim()) return { auditRecords, waivers };
   try {
     const path = resolveAuditRecordPath(readAuditSettings((path, encoding) => fs.readFileSync(path, encoding)), { home: env.HOME, cwd });
     const body = fs.readFileSync(path, 'utf8');
     const records = jsonLines(body);
     if (records.length === body.split(/\r?\n/).filter(line => line.trim()).length) auditRecords = records;
-  } catch { /* Missing, corrupt or unreadable audit ledger: no audit evidence. */ }
+    else auditError = true;
+  } catch (error) { auditError = error.code !== 'ENOENT'; }
   try {
     let damaged = false;
     const store = readStore({ path: storePath(env), fs, warn: () => { damaged = true; } });
+    if (store.error) damaged = true;
     const revoked = withdrawnRevocations({ env, fs, warn: message => {
       damaged = true;
       console.warn(`${message}; no waiver evidence admitted until the request log is repaired.`);
     } });
+    waiverError = damaged;
     if (!damaged) {
       const platform = readPlatformPreferences({ env, readFile: (path, encoding) => fs.readFileSync(path, encoding) });
-      if (platform.errors.length) return { auditRecords, waivers: [] };
+      if (platform.errors.length) return { auditRecords, waivers: [], ...(auditError ? { auditError } : {}), waiverError: true };
       let tool;
       try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
       catch { /* Missing or unreadable tool settings supply no waivers. */ }
@@ -111,6 +119,6 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
       const seen = new Set(waivers.map(key));
       if (!store.error) waivers = [...waivers, ...store.entries.filter(entry => validTime(entry.at, now) && !revoked(entry) && !seen.has(key(entry)))];
     }
-  } catch { /* Missing or unreadable waiver ledger: no waiver evidence. */ }
-  return { auditRecords, waivers };
+  } catch { waivers = []; waiverError = true; }
+  return { auditRecords, waivers, ...(auditError ? { auditError } : {}), ...(waiverError ? { waiverError } : {}) };
 }

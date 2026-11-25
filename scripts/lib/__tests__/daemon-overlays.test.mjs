@@ -261,7 +261,8 @@ describe('CLI (spawnSync, --no-lock — never imports daemon-clone-lock.mjs)', (
     const r = run(['add', `--clone=${cloneDir}`, '--ref=lane/cli-test', '--pr=7', '--by=tester', '--no-lock', '--json']);
     expect(r.status, r.stderr).toBe(0);
     const out = JSON.parse(r.stdout);
-    expect(out.list).toEqual([{ ref: 'lane/cli-test', pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null }]);
+    expect(out.list).toEqual([{ ref: 'lane/cli-test', pr: 7, addedAt: expect.any(String), addedBy: 'tester', reason: null,
+      auditedSha: gitOk(originDir, ['rev-parse', 'refs/heads/lane/cli-test']).trim() }]);
     const events = readFileSync(join(overlayDir, `${cloneKey(cloneDir)}.events.jsonl`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ kind: 'added', ref: 'lane/cli-test', pr: 7 });

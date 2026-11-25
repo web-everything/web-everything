@@ -94,12 +94,21 @@ export function findRawPushes(source, filename = 'scripts/source.mjs', commands)
   };
   const fullyStatic = node => ts.isStringLiteralLike(node)
     || (ts.isArrayLiteralExpression(node) && node.elements.every(fullyStatic));
+  // A pin proves argv execution only. Unknown options can enable a shell and turn operands into commands.
+  const pinnableOptions = node => {
+    const options = node.arguments[2];
+    return node.arguments.length <= 3 && (!options || (ts.isObjectLiteralExpression(options)
+      && options.properties.every(property => (ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property))
+        && (ts.isIdentifier(property.name) || ts.isStringLiteralLike(property.name))
+        && nameOf(property.name) !== '__proto__'
+        && (nameOf(property.name) !== 'shell' || (ts.isPropertyAssignment(property) && property.initializer.kind === ts.SyntaxKind.FalseKeyword)))));
+  };
   // Normalize only a literal git argv prefix: discard global options and their values, then retain the
   // subcommand and its literal flags. Positional/dynamic operands are not command identity. Shells and
   // unknown global options cannot supply a command pin.
   const commandOf = node => {
     if (!node.arguments[0] || staticText(node.arguments[0]) !== 'git'
-      || !node.arguments[1] || !ts.isArrayLiteralExpression(node.arguments[1])) return null;
+      || !node.arguments[1] || !ts.isArrayLiteralExpression(node.arguments[1]) || !pinnableOptions(node)) return null;
     const args = node.arguments[1].elements;
     let i = 0;
     const valued = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--exec-path']);
@@ -133,6 +142,7 @@ export function findRawPushes(source, filename = 'scripts/source.mjs', commands)
         const argv = gitCommand ? Array.from(node.arguments).slice(1, 2)
           : Array.from(node.arguments).filter(arg => !ts.isObjectLiteralExpression(arg));
         if ((gitCommand || /git/i.test(name)) && !argv.every(fullyStatic)) kind = { kind: 'unresolved', count: kind?.count || 1 };
+        if (gitCommand && commands !== undefined && !pinnableOptions(node)) kind = { kind: 'unresolved', count: kind?.count || 1 };
         if (kind) for (let i = 0; i < kind.count; i++) {
           if (commands !== undefined) {
             const command = commandOf(node);

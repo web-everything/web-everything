@@ -259,7 +259,7 @@ export function registrationIdentity(entry) {
 }
 
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases, conflictOverride, auditedSha,
 } = {}, { env = process.env, expectedOverlay } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
@@ -283,6 +283,7 @@ export function addOverlay(root, {
         ...(pinned === true ? { pinned: true } : {}),
         ...(bases ? { stackBases: bases } : {}),
         ...(conflictOverride ? { conflictOverride } : {}),
+        ...(auditedSha ? { auditedSha } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
@@ -290,6 +291,7 @@ export function addOverlay(root, {
       else if (pinned === false) delete next.pinned;
       if (bases) next.stackBases = bases;
       if (conflictOverride) next.conflictOverride = conflictOverride;
+      if (auditedSha) next.auditedSha = auditedSha;
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });

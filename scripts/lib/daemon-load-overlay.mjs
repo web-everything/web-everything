@@ -89,17 +89,24 @@ export async function guardedRegister({ root, ref, pr, env, gate, register, sett
       root, ref, pr, existingOverlays: st.overlays.filter((o) => o?.ref !== ref), env,
     });
     if (!check.ok) return { registered: false, reason: 'conflict-check-failed', check };
-    const mode = settings.auditEvidence === 'warn' ? 'warn' : 'refuse';
-    log.error?.(`daemon-load-overlay: overlaySafety.auditEvidence=${mode} (source=${settings.auditEvidenceSource ?? 'default'})`);
-    const audit = auditEvidenceFor(check.candSha, { ...loadAuditEvidence({ env, cwd: root }), ref,
-      covers: base => mainCovers(base, { cwd: root, env }) });
-    if (!audit.ok) {
-      log.error?.(`daemon-load-overlay: ${mode === 'warn' ? 'WARNING' : 'REFUSED'} — ${ref}: ${audit.detail}. Run codex-audit for this SHA or record a matching operator waiver.`);
-      if (mode === 'refuse') return { registered: false, reason: 'no-audit-evidence', check: { ...check, ok: false, reason: 'no-audit-evidence', detail: audit.detail } };
-      warnings.push('no-audit-evidence');
+    const envMode = env.WE_OVERLAY_AUDIT_EVIDENCE?.trim();
+    const tightened = !!envMode && envMode !== 'warn';
+    const mode = settings.auditEvidence === 'warn' && !tightened ? 'warn' : 'refuse';
+    log.error?.(`daemon-load-overlay: overlaySafety.auditEvidence=${mode} (source=${tightened ? 'environment' : settings.auditEvidenceSource ?? 'default'})`);
+    const options = { ...loadAuditEvidence({ env, cwd: root }), ref, covers: base => mainCovers(base, { cwd: root, env }) };
+    const existing = st.overlays.find(o => o?.ref === ref);
+    const shas = [check.candSha, ...(existing?.edgeResolution !== undefined ? [existing.edgeResolution?.sha] : [])];
+    for (const sha of shas) {
+      const audit = auditEvidenceFor(sha, options);
+      if (!audit.ok) {
+        const refuse = mode === 'refuse' || audit.kind !== 'missing';
+        log.error?.(`daemon-load-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${ref}: ${audit.detail}. Run codex-audit for this SHA or record a matching operator waiver.`);
+        if (refuse) return { registered: false, reason: 'no-audit-evidence', check: { ...check, ok: false, reason: 'no-audit-evidence', detail: audit.detail } };
+        warnings.push('no-audit-evidence');
+      }
     }
     if (!check.clean && !gate.override) return { registered: false, reason: 'conflict', check };
-    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null);
+    register(!check.clean ? { ...gate.override, files: check.files, conflicting: check.conflicting } : null, check.candSha);
     return { registered: true, check };
   });
 }
@@ -736,8 +743,8 @@ export async function runDaemonLoadOverlay({
 
   // Every REAL registration goes through add's guard (guardedRegister). An injected `addOverlayFn` (unit wiring tests)
   // registers nothing real, so it is not guarded unless the caller also injects `admit`.
-  const register = (override) => addOverlayFn(root, {
-    ref, pr, addedBy: by, reason, now, ...(override ? { conflictOverride: override } : {}),
+  const register = (override, auditedSha) => addOverlayFn(root, {
+    ref, pr, addedBy: by, reason, now, ...(auditedSha ? { auditedSha } : {}), ...(override ? { conflictOverride: override } : {}),
   }, { env });
   const admitFn = admit ?? (addOverlayFn === addOverlay ? guardedRegister : null);
   if (admitFn) {

@@ -193,3 +193,12 @@ test('inventory requires evidence for the approved edge SHA as well as the branc
   assert.equal(check([pass]).ok, false);
   assert.equal(check([pass, { ...pass, head: edgeSha }]).ok, true);
 });
+
+test('inventory flags a tip differing from the admitted audited SHA even with green tip evidence', () => {
+  const auditedSha = 'a'.repeat(40), tip = 'c'.repeat(40);
+  const pass = { head: tip, base: 'b'.repeat(40), verdict: 'NOT WEAKENED', findings: [], questionHash: QUESTION_HASH, at: '2026-11-10T00:00:00Z' };
+  const check = sha => checkOverlays({ states: [{ clone: '/clone', overlays: [{ ref: 'lane/fix', auditedSha }] }],
+    evidence: { auditRecords: [pass, { ...pass, head: auditedSha }] }, resolveSha: () => sha, covers: () => true })[0];
+  assert.equal(check(tip).ok, false);
+  assert.equal(check(auditedSha).ok, true);
+});

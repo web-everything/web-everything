@@ -661,6 +661,15 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!check.ok) return { ok: false, refused: check.reason, containment, check, code: 1 };
     if (check.candSha !== expectedSha) return { ok: false, refused: 'sha-moved', containment, check, code: 3 };
     if (!check.clean) return { ok: false, refused: 'conflict', containment, check, code: 3 };
+    const { auditEvidence, auditEvidenceSource } = overlaySafetySettings(env);
+    const evidence = auditEvidenceFor(check.candSha, { ...loadAuditEvidence({ env, cwd: root }), ref,
+      covers: base => mainCovers(base, { cwd: root, env }) });
+    process.stderr.write(`daemon-overlay: overlaySafety.auditEvidence=${auditEvidence} (source=${auditEvidenceSource})\n`);
+    if (!evidence.ok) {
+      const refuse = auditEvidence === 'refuse' || evidence.kind !== 'missing';
+      process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${ref}: ${evidence.detail}. Run codex-audit for this SHA or record a matching operator waiver.\n`);
+      if (refuse) return { ok: false, refused: 'no-audit-evidence', containment, check, code: 3 };
+    }
     return { ok: true, oldEntry, containment, check };
   };
   if (checkOnly) return prove();
@@ -670,7 +679,7 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
     if (!proof.ok) return { ...proof, settled };
     // The replacement carries the old work, so it inherits an explicit pin unless the caller set one itself.
     const pin = pinned !== undefined ? pinned : (proof.oldEntry.pinned === true ? true : undefined);
-    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin }, { env });
+    addOverlay(root, { ref, pr, addedBy: by, reason, pinned: pin, auditedSha: proof.check.candSha }, { env });
     appendOverlayEvent(root, {
       kind: 'added', ref, pr, by, reason, replaces: old, ...(pin !== undefined ? { pinned: pin } : {}), ...(pr == null ? { noPr: true } : {}),
     }, { env });
@@ -966,8 +975,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         const evidence = auditEvidenceFor(sha, { ...loadAuditEvidence({ env, cwd: root }), ref: flags.ref,
           covers: base => mainCovers(base, { cwd: root, env }) });
         if (!evidence.ok) {
-          process.stderr.write(`daemon-overlay: ${auditEvidence === 'warn' ? 'WARNING' : 'REFUSED'} — ${flags.ref}: ${evidence.detail} (overlaySafety.auditEvidence=${auditEvidence}, source=${auditEvidenceSource}). Run codex-audit for this SHA or record a matching operator waiver.\n`);
-          if (auditEvidence === 'refuse') return { ...check, ok: false, reason: 'no-audit-evidence', detail: evidence.detail };
+          const refuse = auditEvidence === 'refuse' || evidence.kind !== 'missing';
+          process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${flags.ref}: ${evidence.detail} (overlaySafety.auditEvidence=${auditEvidence}, source=${auditEvidenceSource}). Run codex-audit for this SHA or record a matching operator waiver.\n`);
+          if (refuse) return { ...check, ok: false, reason: 'no-audit-evidence', detail: evidence.detail };
         }
       }
       return check;
@@ -1046,7 +1056,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // mutex and returns immediately — this never touches the clone's tree or its reader/writer lock. See the
       // file header for why that lock was dropped here.
       const list = addOverlay(root, {
-        ref: flags.ref, pr, addedBy: by, reason, pinned,
+        ref: flags.ref, pr, addedBy: by, reason, pinned, auditedSha: check.candSha,
         ...(!check.clean && gate.override ? { conflictOverride: { ...gate.override, files: check.files } } : {}),
       }, { env });
       appendOverlayEvent(root, {

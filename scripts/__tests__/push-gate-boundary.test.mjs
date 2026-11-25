@@ -95,3 +95,18 @@ it('command pins reject a raw git push even when the site count stays unchanged'
   expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['-C', dir, 'rev-parse', '--verify', ref]);" }, entries)).not.toThrow();
   expect(() => admit({ [fixtureFile]: cp + "spawnSync('git', ['push', ref]);" }, entries)).toThrow(/command/);
 });
+
+it.each([
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:true});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:'/bin/sh'});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], options);",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {...options});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {shell:enabled});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {get shell() { return true; }});",
+  "spawnSync('git', ['rev-parse', '--verify', 'HEAD'], {shell:true});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {...options, shell:false});",
+  "spawnSync('git', ['rev-parse', '--verify', ref], {[option]:true});",
+])('command pins refuse shell execution and unknown spawn options: %s', call => {
+  const entries = { [fixtureFile]: { ...pinned[fixtureFile], commands: [['rev-parse', '--verify']] } };
+  expect(() => admit({ [fixtureFile]: cp + call }, entries)).toThrow(/command/);
+});

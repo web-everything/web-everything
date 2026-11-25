@@ -14,7 +14,7 @@ const sha = 'a'.repeat(40), base = 'b'.repeat(40);
 test('loads tool waivers from the running checkout in the DOM test environment, independent of the candidate cwd', () => {
   const toolPath = join(dirname(fileURLToPath(import.meta.url)), '../../settings/prototype-load.json');
   const reads = [];
-  const entry = { ref, sha, ruling: 'R12', findings: ['accepted'] };
+  const entry = { ...waiver };
   const fs = { readFileSync(path) {
     reads.push(path);
     if (path === toolPath) return JSON.stringify({ ruledWeakened: [entry] });
@@ -25,7 +25,7 @@ test('loads tool waivers from the running checkout in the DOM test environment, 
   assert.deepEqual(result.waivers, [{ ...entry, layer: 'tool' }]);
 });
 test('tool and platform settings waivers survive prototype readiness and downstream admission', () => {
-  const entry = { ref, sha: sha.toUpperCase(), ruling: 'R12', findings: ['accepted'] };
+  const entry = { ...waiver, sha: sha.toUpperCase() };
   const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
   const ready = { ref, sha, tests: 'green', audit: 'WEAKENED', auditRuling: 'R12', auditDisclosed: ['accepted'] };
   for (const layer of ['tool', 'platform']) {
@@ -68,9 +68,34 @@ test('tool and platform settings waivers survive prototype readiness and downstr
   }
 });
 test('rejects absent evidence and invalid SHA types, including a trailing newline', () => {
-  for (const value of [sha, null, [sha], sha.slice(1), sha + '\n'])
+  for (const value of [sha, null, [sha], { toString: null }, sha.slice(1), sha + '\n'])
     assert.equal(auditEvidenceFor(value, { auditRecords: [], waivers: [] }).ok, false);
   assert.match(describeMissing(sha), /no NOT WEAKENED canonical audit record and no waiver in ruled-weakened.jsonl/);
+});
+
+test('settings waivers require the ledger actor, quote and bounded timestamp in every layer', () => {
+  const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: waiver.findings };
+  for (const layer of ['tool', 'platform']) {
+    for (const patch of [{ actor: undefined }, { actor: '' }, { quote: undefined }, { quote: '' }, { at: undefined }, { at: 'bad' }, { at: '2099-01-01T00:00:00Z' }]) {
+      assert.equal(auditEvidenceFor(sha, { ref, covers, auditRecords: [weak], waivers: [{ ...waiver, layer, ...patch }] }).ok, false, `${layer}: ${JSON.stringify(patch)}`);
+    }
+    assert.equal(auditEvidenceFor(sha, { ref, covers, auditRecords: [weak], waivers: [{ ...waiver, layer }] }).ok, true);
+  }
+});
+
+test('waiver store read errors block otherwise valid settings waivers from every layer', () => {
+  for (const layer of ['tool', 'platform']) {
+    const fs = { readFileSync(path) {
+      if (String(path).endsWith('/ruled-weakened.jsonl')) throw Object.assign(Error('denied'), { code: 'EACCES' });
+      if (String(path).endsWith('/scripts/settings/prototype-load.json')) return JSON.stringify({ ruledWeakened: layer === 'tool' ? [waiver] : [] });
+      if (path === '/fixture/prefs.json') return JSON.stringify({ prototypeLoad: { ruledWeakened: layer === 'platform' ? [waiver] : [] } });
+      throw Object.assign(Error('missing'), { code: 'ENOENT' });
+    } };
+    const evidence = loadAuditEvidence({ env: { HOME: '/fixture', WE_PLATFORM_PREFERENCES_FILE: '/fixture/prefs.json' }, fs });
+    assert.deepEqual(evidence.waivers, [], layer);
+    assert.equal(evidence.waiverError, true, layer);
+    assert.equal(auditEvidenceFor(sha, { ...evidence, ref, covers }).kind, 'damaged', layer);
+  }
 });
 test('latest record per base decides; another weakened base blocks; waiver covers it', () => {
   const pass = { ...valid, head: sha.toUpperCase(), base, verdict: 'NOT WEAKENED' };
