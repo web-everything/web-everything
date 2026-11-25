@@ -1051,7 +1051,7 @@ async function runCli() {
         // reader only honours at an identical, recomputed working-tree hash.
         const local = readVerifyMarker(dir);
         // The hash and slug come from the SAME hardened git env the producer uses (no external diff/textconv/filters/inherited overrides).
-        const hardened = (args) => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: laneGitHardeningEnv(process.env) }).trim();
+        const hardened = (args) => execFileSync('git', hardenLaneGitArgs(args), { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, env: laneGitHardeningEnv(process.env) }).trim();
         return resolveMarkerWithShared({ local, headSha: refSha, readShared: () => {
           try {
             const repoSlug = repoSlugFromRemote(hardened(['remote', 'get-url', REMOTE]));
