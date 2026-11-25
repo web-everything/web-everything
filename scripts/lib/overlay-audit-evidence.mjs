@@ -78,11 +78,17 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
       damaged = true;
       console.warn(`${message}; no waiver evidence admitted until the request log is repaired.`);
     } });
+    const platform = readPlatformPreferences({ env, readFile: (path, encoding) => fs.readFileSync(path, encoding) });
+    let tool;
+    try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
+    catch (error) {
+      if (error?.code === 'ENOENT') tool = undefined;
+      else {
+        damaged = true;
+        console.warn('Unreadable or corrupt tool settings; no waiver evidence admitted until the tool settings are repaired.');
+      }
+    }
     if (!damaged) {
-      const platform = readPlatformPreferences({ env, readFile: (path, encoding) => fs.readFileSync(path, encoding) });
-      let tool;
-      try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
-      catch { /* Missing or unreadable tool settings supply no waivers. */ }
       waivers = mergeRuledWeakened(platform.prefs.prototypeLoad?.ruledWeakened, tool, console.warn)
         .filter(entry => !revoked(entry));
       // Keep the loader's tool > platform > store precedence for the same ref/SHA/ruling.

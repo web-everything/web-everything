@@ -94,6 +94,40 @@ test('loads tool waivers from the running checkout in the DOM test environment, 
   assert.ok(reads.includes(toolPath), 'reads settings from the running checkout');
   assert.deepEqual(result.waivers, [{ ...entry, layer: 'tool' }]);
 });
+for (const failure of ['invalid JSON', 'EACCES', 'EISDIR', 'ENOENT']) {
+  test(`tool settings ${failure}: ${failure === 'ENOENT' ? 'admits' : 'refuses'} lower-precedence waiver evidence`, () => {
+    const env = { HOME: '/fixture', WE_PLATFORM_PREFERENCES_FILE: '/fixture/prefs.json' };
+    const entry = { ref, sha, ruling: 'R12', findings: ['accepted'] };
+    const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
+    const fs = { readFileSync(path) {
+      if (String(path).endsWith('/scripts/settings/prototype-load.json')) {
+        if (failure === 'invalid JSON') return '{broken';
+        throw Object.assign(Error('tool settings unavailable'), { code: failure });
+      }
+      if (path === env.WE_PLATFORM_PREFERENCES_FILE)
+        return JSON.stringify({ prototypeLoad: { ruledWeakened: [entry] } });
+      if (path.endsWith('/audits.jsonl')) return JSON.stringify(weak) + '\n';
+      if (path.endsWith('/ruled-weakened.jsonl')) return JSON.stringify({ ...waiver, ruling: 'R13' }) + '\n';
+      throw Object.assign(Error('missing fixture'), { code: 'ENOENT' });
+    } };
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = message => warnings.push(message);
+    try {
+      const evidence = loadAuditEvidence({ env, fs });
+      const result = auditEvidenceFor(sha, { ...evidence, ref, covers });
+      if (failure === 'ENOENT') {
+        assert.equal(result.kind, 'waiver');
+        assert.deepEqual(evidence.waivers, [{ ...entry, layer: 'platform' }, { ...waiver, ruling: 'R13' }]);
+        assert.deepEqual(warnings, []);
+      } else {
+        assert.deepEqual(evidence.waivers, []);
+        assert.equal(result.ok, false);
+        assert.ok(warnings.some(message => /tool settings.*no waiver evidence/i.test(message)), 'warns about damaged tool settings');
+      }
+    } finally { console.warn = originalWarn; }
+  });
+}
 test('tool and platform settings waivers survive prototype readiness and downstream admission', () => {
   const entry = { ref, sha: sha.toUpperCase(), ruling: 'R12', findings: ['accepted'] };
   const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
