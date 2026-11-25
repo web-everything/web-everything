@@ -247,7 +247,7 @@ describe('audit safeguards', () => {
     expect(run(path, exec).sent).toBe(false);
     expect(exec).toHaveBeenCalledOnce();
     expect(exec.mock.calls[0][0]).toBe('gh');
-    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7196', '--repo=o/r', '--json=headRefOid']);
+    expect(exec.mock.calls[0][1]).toEqual(['pr', 'view', '7196', '--repo=o/r', '--json=headRefOid,comments']);
     expect(existsSync(path)).toBe(false);
   }));
   it('skips contention and preserves different-PR ledger updates on the next locked read', () => withLedger(path => {
@@ -353,4 +353,60 @@ describe('audit safeguards', () => {
     expect(classifyStall({ row: { ...row, liveJob: 'ci' }, head })).toBeNull();
     expect(classifyStall({ row: { ...row, actor: 'operator' }, head }).reason).toContain('does not fit');
   });
+});
+
+describe('stale merge-gate run vs later review verdict', () => {
+  const runUrl = 'https://github.com/o/r/actions/runs/45545719563/job/1';
+  const gate = (extra = {}) => restRow('merge-gate', 'failure', { detailsUrl: runUrl, completedAt: '2026-11-25T04:18:00Z', ...extra });
+  const prWith = (g = gate(), more = []) => fixture({ statusCheckRollup: [row('test'), g, ...more] });
+  const verdictAt = (createdAt, body = '✅ review — accepted') => ({ id: 'C_1', body, createdAt, viewerDidAuthor: true });
+  const withDir = fn => {
+    const directory = mkdtempSync(join(tmpdir(), 'drain-stale-'));
+    try { fn(join(directory, 'ledger.json')); } finally { rmSync(directory, { recursive: true, force: true }); }
+  };
+  const exec = (comments, writes = []) => vi.fn((command, argv) => {
+    if (command === 'gh' && argv[0] === 'run') { writes.push(argv); return { status: 0 }; }
+    if (command === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: head, ...(comments ? { comments } : {}) }) };
+    writes.push(argv); return { status: 0 };
+  });
+  const go = (ledgerPath, ex, pr) => sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: ex });
+  const reruns = writes => writes.filter(a => a[0] === 'run');
+  const sends = writes => writes.filter(a => a[0] !== 'run');
+
+  it('run older than the verdict: no send-back, one re-run request, none on the second pass', () => withDir(ledgerPath => {
+    const writes = [];
+    const ex = exec([verdictAt('2026-11-25T07:30:00Z')], writes);
+    expect(go(ledgerPath, ex, prWith())).toMatchObject({ sent: false, reason: expect.stringContaining('re-run requested') });
+    expect(reruns(writes)).toEqual([['run', 'rerun', '45545719563', '--repo=o/r']]);
+    expect(sends(writes)).toEqual([]);
+    expect(go(ledgerPath, ex, prWith())).toMatchObject({ sent: false });
+    expect(reruns(writes)).toHaveLength(1);
+    expect(sends(writes)).toEqual([]);
+  }));
+  it('run newer than the verdict still sends back', () => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T03:00:00Z')], writes), prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it.each([
+    ['no comments read', undefined],
+    ['verdict time unreadable', [verdictAt('not-a-date')]],
+    ['no verdict comment', [{ id: 'C', body: 'hello', createdAt: '2026-11-25T07:30:00Z', viewerDidAuthor: true }]],
+    ['verdict from an untrusted author', [{ ...verdictAt('2026-11-25T07:30:00Z'), viewerDidAuthor: false, author: { login: 'rando' } }]],
+  ])('unreadable evidence sends back as today: %s', (_name, comments) => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec(comments, writes), prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('run completion time unreadable sends back as today', () => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), prWith(gate({ completedAt: undefined }))).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('another failed check besides merge-gate sends back', () => withDir(ledgerPath => {
+    const writes = [];
+    const pr = fixture({ statusCheckRollup: [row('test', 'FAILURE'), gate()] });
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), pr).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
 });

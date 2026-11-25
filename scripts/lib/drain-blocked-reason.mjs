@@ -1,5 +1,6 @@
 /** Required-check diagnostics and a strictly changes-only, head-deduplicated send-back. */
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, openSync, closeSync, statSync, accessSync, constants, fsyncSync } from 'node:fs';
@@ -57,6 +58,29 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
   } catch { return { send: false }; }
 }
 
+const VERDICT_PREFIXES = ['✅ review — accepted', '🔁 review — changes requested'];
+
+/** Pure. Non-null only when merge-gate is the ONLY failed required check, its run completed BEFORE the latest trusted
+ * review verdict, and both times and the run id are readable. Anything else returns null (today's send-back). */
+export function staleMergeGate({ pr, requiredChecks, comments } = {}) {
+  try {
+    const failed = describeBlockedChecks(pr, requiredChecks)?.failed ?? [];
+    if (failed.length !== 1 || !failed[0].startsWith('required check "merge-gate"') || !Array.isArray(comments)) return null;
+    const gate = latestCheckNamed(pr.statusCheckRollup, 'merge-gate');
+    const doneAt = Date.parse(gate?.completedAt ?? gate?.completed_at ?? '');
+    const runId = /\/actions\/runs\/(\d+)/.exec(String(gate?.detailsUrl ?? gate?.details_url ?? ''))?.[1];
+    let latest = null, latestAt = -Infinity;
+    for (const c of comments) {
+      const at = Date.parse(c?.createdAt ?? c?.created_at ?? '');
+      if (isTrustedMarkerAuthor(c) && VERDICT_PREFIXES.some(p => String(c?.body ?? '').trimStart().startsWith(p))
+        && Number.isFinite(at) && at >= latestAt) { latest = c; latestAt = at; }
+    }
+    const id = String(latest?.id ?? latest?.node_id ?? '').replace(/[^A-Za-z0-9_-]/g, '');
+    if (!latest || !id || !runId || !Number.isFinite(doneAt) || doneAt >= latestAt) return null;
+    return { runId, verdictKey: id };
+  } catch { return null; }
+}
+
 /** CLI uses argv/body-file, never a shell. Persist only AFTER the sanctioned label writer succeeds.
  * An unreadable ledger refuses send-back; the drain still skips the red PR and logs the retry reason.
  */
@@ -104,10 +128,25 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     temp = mkdtempSync(join(tmpdir(), 'drain-gate-send-back-'));
     const bodyPath = join(temp, 'findings.md');
     writeFileSync(bodyPath, decision.body, { mode: 0o600 });
-    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'],
-      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-    if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha)
+    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid,comments'],
+      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
+    const liveView = live?.status === 0 ? JSON.parse(live.stdout) : null;
+    if (liveView?.headRefOid !== headSha)
       return { sent: false, reason: 'live head changed or unreadable; kept skipped; retry next pass' };
+    const stale = staleMergeGate({ pr, requiredChecks, comments: liveView.comments });
+    if (stale) {
+      // A merge-gate run that finished before the latest review verdict only reflects the lifted hold: ask for a fresh run, once.
+      const rerunMarker = `${ledgerPath}.${headSha.toLowerCase()}.${stale.verdictKey}.rerun`;
+      try { closeSync(openSync(rerunMarker, 'wx', 0o600)); }
+      catch (error) {
+        if (error.code === 'EEXIST') return { sent: false, reason: 'merge-gate run predates the latest review verdict; re-run already requested' };
+        throw error;
+      }
+      const rerun = exec('gh', ['run', 'rerun', stale.runId, `--repo=${repo}`],
+        { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 });
+      if (rerun?.status !== 0) return { sent: false, reason: 'merge-gate run predates the latest review verdict; re-run request failed; kept skipped' };
+      return { sent: false, reason: 'merge-gate run predates the latest review verdict; re-run requested' };
+    }
     // Reserve a durable refusal before the external write, including crash/ledger-failure recovery.
     const marker = openSync(refusalPath, 'wx', 0o600);
     try { writeFileSync(marker, 'send-back may have succeeded; operator must reconcile the ledger before retrying\n'); fsyncSync(marker); }
