@@ -84,10 +84,18 @@ it.each([
     expect(r.calls[carryRecord].join('\n')).toContain(`<!-- reviewed-sha: ${pr.headRefOid} -->`);
     expect(carryRecord).toBeLessThan(r.calls.findIndex(a => a.some(x => x?.includes('enqueuePullRequest')) || (a[0] === 'pr' && a[1] === 'merge')));
   } else {
-    expect(r.calls.some(a => a.includes('--add-label') && a.some(x => x?.includes('review:held-mechanical')))).toBe(true);
     expect(r.calls.some(a => a[0] === 'pr' && a[1] === 'comment'
       && a.some(x => x?.includes('<!-- cleared-from: IC_clearance -->')))).toBe(false);
-    if (commentsTotalCount !== undefined) expect(r.stderr).toContain('complete comments read did not match a valid GraphQL totalCount');
+    if (commentsTotalCount !== undefined) {
+      // The live pre-write guard defers before the label gate when thread completeness is unknown.
+      const reason = `human clearance carry (${'c'.repeat(9)}→${pr.headRefOid.slice(0, 9)}) not recorded: live re-read failed: complete comments read did not match a valid GraphQL totalCount — merge deferred this pass`;
+      expect(r.report.skipped, r.stderr).toEqual(expect.arrayContaining([expect.objectContaining({ num: 42, reason })]));
+      expect(r.report.parked, r.stderr).toEqual([]);
+      expect(r.stderr).toContain(reason);
+      expect(r.calls.filter(a => a.includes('--add-label') || a.includes('--remove-label'))).toEqual([]);
+    } else {
+      expect(r.calls.some(a => a.includes('--add-label') && a.some(x => x?.includes('review:held-mechanical')))).toBe(true);
+    }
   }
 }, { ...setup, ...(sibling ? { siblingCloneSource: resolve(dirname(fileURLToPath(import.meta.url)), '../..') } : {}) }), 120_000);
 it('the CLI passes a non-main base through to the forge guard before any compare read', () => world(async ({ pr, run }) => {
