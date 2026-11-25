@@ -420,7 +420,15 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false } = {}) {
+function noCodeRearmSecurityRefusal(labels) {
+  const names = Array.isArray(labels) && labels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string')
+    ? labels.map(l => typeof l === 'string' ? l : l.name) : null;
+  const hold = names?.find(l => l === 'red-team:blocked' || l === 'red-team:pending');
+  return names === null ? 'no-code re-arm refused: labels unreadable'
+    : hold ? `no-code re-arm refused: ${hold} stands` : null;
+}
+
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null, humanOnlyHold = false, redTeamRulingHold = false, sentBackSameHead = false, acceptanceStillCoversHead = false, humanClearedHead = false, operatorRestamp = false, noCodeRearm = false } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -525,6 +533,10 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // gap (a stale-accepted PR was never re-planned for review); it is not what was standing between a stale
   // acceptance and a bad merge — that gate already held.
   if (to === 'rearm') {
+    if (noCodeRearm) {
+      const security = noCodeRearmSecurityRefusal(currentLabels);
+      if (security) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: security };
+    }
     if (humanClearedHead) return { allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman, reason: 'head carries a human clearance — a rearm never undoes it' };
     const missing = requireLive === 'missing';
     if (missing && (!Array.isArray(currentLabels) || !currentLabels.every(l => typeof (typeof l === 'string' ? l : l?.name) === 'string' && (typeof l === 'string' ? l : l.name).length > 0)
@@ -1096,7 +1108,7 @@ export function redTeamRulingHeld({ repo, pr, headSha, labels, comments, setting
  * capability, never supply a verdict (PR #1056 review, B2).
  * @param {{argv?:string[], fixedTo?:string|null, defaultActor:string, repoOptional?:boolean, usage:string,
  *   allowClearHuman?:boolean,
- *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,
+ *   buildComment:(o:{to:string,actor:string,decision:object,headSha:string,reason:string,comments:object[]|null,
  *     humanClearance?:{actor:string,sha:string,sourceId?:string}|null})=>string,
  *   successResult:(o:{pr:number,to:string,decision:object,labels:string[]})=>object,
  *   refusalResult:(o:{pr:number,decision:object})=>object,
@@ -1276,6 +1288,11 @@ export function runReviewLabelCli({
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
   const pinnedRearm = to === 'rearm' && expectHeadFlag !== undefined;
+  // Head pinning is shared with real-code recovery (including the orphan guard).
+  // Only the no-code executor opts into preserving outstanding red-team labels.
+  const noCodeFlags = argv.filter(a => a.startsWith('--no-code-rearm'));
+  const noCodeRearm = noCodeFlags.length === 1 && noCodeFlags[0] === '--no-code-rearm';
+  if (noCodeFlags.length && (!noCodeRearm || !pinnedRearm)) fail('--no-code-rearm requires a pinned re-arm and must appear once');
   const pinnedPlainRearm = pinnedRearm && onlyIf !== 'missing';
   if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && !pinnedClearHuman && !pinnedRearm && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, re-arm, pinned accept or clear-human');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
@@ -1649,6 +1666,7 @@ export function runReviewLabelCli({
     acceptanceStillCoversHead: parseReviewedSha(prComments.filter(isTrustedMarkerAuthor)) === headSha,
     humanClearedHead: to === 'rearm' && headEverHumanCleared(rearmThread, headSha.trim()),
     operatorRestamp: to === 'restamp' && actorArg.trim().toLowerCase() === 'operator',
+    noCodeRearm,
   });
   if (resumePinnedRearm) {
     decision = { ...decision, allowed: true, addLabel: REVIEW_LABELS.pending, removeLabels: [],
@@ -1961,6 +1979,7 @@ export function runReviewLabelCli({
   }
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
+    comments: rearmThread, // Full, validated rearm thread; render no-code handoffs from the writer's evidence.
   }) + renderReferralCarryRecord(referralCarry) + rearmBinding;
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
@@ -2073,6 +2092,18 @@ export function runReviewLabelCli({
       fresh = provider.readPrState(repo, pr);
       assertPinnedRearmHead(fresh);
     } catch (e) { return readError(e); }
+    // Unreadable rollback evidence is a read error, not a policy refusal. Validate
+    // it before the security guard so the pinned plain re-arm keeps that contract.
+    if (pinnedPlainRearm && (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
+      const name = typeof l === 'string' ? l : l?.name;
+      return typeof name === 'string' && name.length > 0;
+    }))) {
+      return readError(new Error('pre-swap labels unreadable — cannot guarantee re-arm rollback'));
+    }
+    if (noCodeRearm) {
+      const security = noCodeRearmSecurityRefusal(fresh.labels);
+      if (security) return refuse(security);
+    }
     if (!Array.isArray(fresh.comments)) refuse('comments unreadable — cannot prove no human clearance');
     if (typeof fresh.headRefOid !== 'string' || !/^[0-9a-f]{7,40}$/i.test(fresh.headRefOid.trim())) refuse('head unreadable — cannot prove no human clearance');
     const freshComments = fullThread(fresh.comments, fresh.headRefOid, refuse).filter(isTrustedMarkerAuthor);
@@ -2224,12 +2255,6 @@ export function runReviewLabelCli({
     if (to === 'rearm') {
       const { fresh } = recheckRearmClearance();
       if (pinnedPlainRearm) {
-        if (!Array.isArray(fresh.labels) || !fresh.labels.every(l => {
-          const name = typeof l === 'string' ? l : l?.name;
-          return typeof name === 'string' && name.length > 0;
-        })) {
-          fail('pre-swap labels unreadable — cannot guarantee re-arm rollback', 1);
-        }
         preSwapLabels = fresh.labels.map(l => typeof l === 'string' ? l : l.name);
       }
     }

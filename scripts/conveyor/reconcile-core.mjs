@@ -132,7 +132,7 @@ import { collapseRollupToLatestPerName, FAILED_CHECK_CONCLUSIONS } from '../lib/
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { resolveRoundCap } from '../lib/round-cap.mjs';
-import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
+import { countRearmComments, REARM_COMMENT_MARKER, rearmWindow } from './rearm-review.mjs';
 import { isFixRoundRearmComment } from './rearm-round-count.mjs';
 import { NOTE_COMMENT_MARKER } from './reconcile-note-comment.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
@@ -153,7 +153,7 @@ import {
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
-import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
+import { answerDisposition, isCloseSupersededExecuted, isNoCodeRearmAnswer, noCodeRearmState, noCodeRearmGuard, latestOperatorAnswerCommentId } from './stand-down-answer-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { reviewSessionSlug } from './review-session-slug.mjs';
 // Both dispatcher wrappers delegate to the pure session-slug module.
@@ -235,7 +235,7 @@ import { loadExternalCheckApps, isExternalAppCheck } from './external-check-apps
 // `fix`, so until the wiring slice (#4703 slice 5) lands, a rejected card batch keeps its in-place `fix` dispatch
 // instead of stalling on an entry nobody acts on. That slice flips this to true.
 export const CARD_BATCH_EXTRACT_WIRED = false;
-export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'card-batch-extract']);
+export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-timeout-rerun', 'convert-advisory', 'promote-draft', 'restore-review-label', 'close-superseded', 'rearm-no-code', 'card-batch-extract']);
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#REFUSAL_KINDS — every reason this pass declines to dispatch. Frozen and
@@ -303,7 +303,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
-  'fix-join-wait',
+  'fix-join-wait', 'no-code-rearm-held', 'no-code-rearm-spent', 'no-code-rearm-failed',
   'review-ci', 'review-referrals-pending', 'advisory-unreadable',
   'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
@@ -1582,7 +1582,16 @@ function timingFacts(pr, { agents = [], repo, requiredChecks = null, reviewDispa
   // another verdict or written by a juror is never read. (Not the `advisory:changes` label: the label sweeps re-derive it
   // from the first outcome-shaped line, which a juror can forge.)
   const kind = latest ? verdictKind(latest) : null;
-  const findings = kind === 'changes' || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES)
+  const noCode = noCodeRearmState(comments, pr?.headRefOid);
+  const window = noCode.applicable && noCode.executed && isNoCodeRearmAnswer(latestOperatorAnswer(comments))
+    ? rearmWindow(comments) : null;
+  // The unchanged-head handoff retires this review bounce. Its CI failure remains ordinary CI work;
+  // a later verdict/claim or a security hold still contributes findings to the joined-fix policy.
+  const noCodeHandoff = window?.rearmed === true && window.claims?.length === 0
+    && window.honouredAnswerId === latestOperatorAnswerCommentId(comments)
+    && labelNames(pr?.labels).some(l => ['review:pending', 'review:human'].includes(l))
+    && !labelNames(pr?.labels).some(l => ['review:changes', 'red-team:blocked', 'red-team:pending'].includes(l));
+  const findings = (kind === 'changes' && !noCodeHandoff) || (kind === 'advisory' && advisoryOutcomeAtSlot(latest) === ADVISORY_OUTCOMES.CHANGES)
     ? [latest] : [];
   const reviewers = bindAgents(pr, agents, repo).filter(isReviewerBinding);
   const reviewCanFinish = reviewDispatched || Boolean(assessLiveness(reviewers));
@@ -2418,7 +2427,8 @@ export function planReconcile({
         caps: { fix: effectiveRoundCap, conflictFix: conflictFixCapHere, advisoryFix: advisoryFixCapHere },
       } } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
-      ...(operatorAnswer ? { operatorAnswer } : {}),
+      // A no-code disposition is executed mechanically; stale copies must never instruct a later fixer.
+      ...(operatorAnswer && !isNoCodeRearmAnswer(operatorAnswer) ? { operatorAnswer } : {}),
       // The red-main fix PR (published priority record): every fix / ci-heal row of it routes to Claude
       // (`fix-slot-borrow.mjs#claudeOnlyReason`), never a codex-first executor or a borrowed codex slot.
       ...(mainFixPriority ? { mainFix: true } : {}),
@@ -2912,6 +2922,48 @@ export function planReconcile({
             ' should be closed and its backlog card resolved, never dispatched.',
       });
       continue;
+    }
+
+    // ── STANDDOWN-EMPTY-ROUND (D2) — the orchestrator's `rearm-review --no-code-owed` ruling is EXECUTED once by the
+    // conveyor and NEVER handed to a fixer. After every refusal above (live claim, pause, liveness) and before every
+    // round-cap or fix branch. Stale rulings resume ordinary work; spent attempts on review:changes await a fresh answer.
+    // Rearm-review.mjs rechecks head and labels at write time (`--expect-head`, `--no-code-rearm`).
+    const noCodeState = noCodeRearmState(pr?.comments, pr?.headRefOid);
+    if ((pr?.state ?? 'OPEN') === 'OPEN' && isNoCodeRearmAnswer(operatorAnswer) && noCodeState.applicable) {
+      const { held, stale } = noCodeRearmGuard(pr);
+      if (held) {
+        refuse('no-code-rearm-held', { why: held });
+        notes.push({ kind: 'no-code-rearm-held', prNumber,
+          text: `PR #${prNumber}: the no-code rearm ruling cannot run — ${held}; restore readable head, label and thread evidence to retry planning.` });
+        continue;
+      }
+      if (noCodeState.intent && !noCodeState.confirmed && !noCodeState.failed) {
+        notes.push({ kind: 'no-code-rearm-crashed', prNumber,
+          text: `PR #${prNumber}: no-code rearm intent has no confirmation — a person must check the labels before issuing a fresh answer.` });
+      }
+      if (stale) {
+        // Losing review:changes is the expected successful handoff. A confirmed
+        // receipt (or legacy success without an outstanding intent) owes no new ask.
+        // Failed and unconfirmed intents still retain their recovery notes.
+        const completed = noCodeState.executed && !noCodeState.failed
+          && (!noCodeState.intent || noCodeState.confirmed);
+        if (!completed || withPhase.labels.includes('review:changes')) {
+          notes.push({ kind: 'no-code-rearm-stale', prNumber,
+            text: `PR #${prNumber}: the no-code rearm ruling is stale — ${stale}; ordinary planning resumes.` });
+        }
+      } else if (noCodeState.executed) {
+        if (noCodeState.failed) {
+          refuse('no-code-rearm-failed', { why: 'the no-code rearm attempt failed; check labels and issue a fresh operator answer' });
+        }
+        refuse('no-code-rearm-spent', { why: 'the no-code rearm ruling was executed once and the PR still carries review:changes' });
+        notes.push({ kind: 'no-code-rearm-spent', prNumber,
+          text: `PR #${prNumber}: the no-code rearm ruling was executed once and the PR is still review:changes — a fresh operator answer is needed.` });
+        continue;
+      } else {
+        dispatch.push({ ...base, kind: 'rearm-no-code', expectHead: pr.headRefOid, answerId: latestOperatorAnswerCommentId(pr?.comments),
+          why: `the orchestrator ruled no code is owed (@${operatorAnswer.actor} via ${operatorAnswer.channel}) — re-arm review once on the unchanged head, no fix agent` });
+        continue;
+      }
     }
 
     // ── `promote-draft` (draft-first PRs, operator-approved 2026-09-27) — its OWN branch, ahead of `ci-red`
