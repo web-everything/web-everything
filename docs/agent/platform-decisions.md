@@ -6235,7 +6235,7 @@ Every adapter must pass the conformance suite (`we:scripts/lib/__tests__/verdict
 The event schema and the fold stay the standard. The contract changes only by statute PR; its first change is
 `appendIf` (D3, 2026-11-21).
 
-**D3 implementation dependency (PR 2 of 2, card #xctsi6q).** This statute amendment supplies no implementation
+**D3 implementation dependency (PR 2 of 2, card #8629).** This statute amendment supplies no implementation
 or behavioral proof. PR 2 is a hard prerequisite for enabling any production `appendIf` / `merge-intent`
 caller; it must implement the adapter and validator together and pass the cases below. All cases are
 **planned**, not implemented by this amendment. `check:statute` checks document integrity only. PR 2 adds no
@@ -6276,7 +6276,7 @@ documented at the append site and tested by the build that moves the ledger onto
 
 **Lineage:** ratified via the #3007 plan (2026-10-05); F4 resolves #3216. Unifies #3007, #5052, #5053, #5054
 and #4284. Full reasoning: [#3216](/backlog/3216-revisit-the-ledger-write-miss-posture-before-the-authority-m/).
-`appendIf` and the `merge-intent` event added 2026-11-21 by statute PR (ratified D3, `standards.D3`, card #xctsi6q).
+`appendIf` and the `merge-intent` event added 2026-11-21 by statute PR (ratified D3, `standards.D3`, card #8629).
 
 ---
 
