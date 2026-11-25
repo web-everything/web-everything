@@ -21,6 +21,96 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 const cli = fileURLToPath(new NodeURL('../daemon-overlay-audit-check.mjs', import.meta.url));
+
+test('CLI loads relative audit evidence for each clone and reports unaudited adopted edges', () => {
+  const home = mkdtempSync(join(tmpdir(), 'overlay-clone-evidence-'));
+  const dir = join(home, 'states'), bin = join(home, 'bin');
+  const caller = join(home, 'caller'), first = join(home, 'first'), second = join(home, 'second');
+  const sha = 'a'.repeat(40), base = 'b'.repeat(40), edge = 'c'.repeat(40);
+  const pass = head => JSON.stringify({ head, base, verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH,
+    at: '2026-11-10T00:00:00Z', findings: [] }) + '\n';
+  try {
+    [dir, bin, caller, first, second].forEach(path => mkdirSync(path));
+    const git = join(bin, 'git');
+    writeFileSync(git, `#!${process.execPath}\nif (process.argv.includes('rev-parse')) process.stdout.write('${sha}\\n');\n`);
+    chmodSync(git, 0o755);
+    // Redirect only the trusted audit-path setting; the CLI still reads real per-clone ledgers.
+    const preload = join(home, 'relative-settings.mjs');
+    writeFileSync(preload, `import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+const read = fs.readFileSync;
+fs.readFileSync = (path, ...args) => String(path).endsWith('/scripts/settings/prototype-load.json')
+  ? JSON.stringify({ auditRecordPath: 'audits.jsonl' }) : read(path, ...args);
+syncBuiltinESMExports();\n`);
+    writeFileSync(join(caller, 'audits.jsonl'), pass(sha));
+    writeFileSync(join(first, 'audits.jsonl'), pass(sha));
+    writeFileSync(join(second, 'audits.jsonl'), '');
+    const firstState = join(dir, '0123456789abcdef.json'), secondState = join(dir, 'fedcba9876543210.json');
+    writeFileSync(firstState, JSON.stringify({ clone: first, overlays: [{ ref: 'lane/fix' }] }));
+    writeFileSync(secondState, JSON.stringify({ clone: second, overlays: [{ ref: 'lane/fix' }] }));
+    const run = (json = true) => spawnSync(process.execPath, ['--import', preload, cli, ...(json ? ['--json'] : []), `--overlay-dir=${dir}`], {
+      cwd: caller, env: { ...process.env, HOME: home, PATH: bin }, encoding: 'utf8', timeout: 15000, maxBuffer: 65536,
+    });
+    const isolated = run();
+    assert.equal(isolated.status, 1, isolated.stdout);
+    assert.deepEqual(JSON.parse(isolated.stdout).map(row => row.ok), [true, false]);
+    writeFileSync(join(second, 'audits.jsonl'), pass(sha));
+    writeFileSync(firstState, JSON.stringify({ clone: first, overlays: [{ ref: 'lane/fix', edgeResolution: { sha: edge } }] }));
+    const adopted = run();
+    assert.equal(adopted.status, 1, adopted.stdout);
+    const row = JSON.parse(adopted.stdout)[0];
+    assert.equal(row.ok, false);
+    assert.equal(row.edgeSha, edge);
+    assert.equal(row.edgeOk, false);
+    assert.match(run(false).stdout, new RegExp(`edge-sha=${edge}`));
+    writeFileSync(join(first, 'audits.jsonl'), pass(sha) + pass(edge));
+    assert.equal(run().status, 0);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('an audited ref tip never hides missing or malformed edge evidence', () => {
+  const sha = 'a'.repeat(40), edge = 'c'.repeat(40);
+  const audit = head => ({ head, base: 'b'.repeat(40), verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH,
+    at: '2026-11-10T00:00:00Z', findings: [] });
+  const check = (edgeResolution, records = [audit(sha)], resolved = sha) => checkOverlays({
+    states: [{ clone: '/fixture', overlays: [{ ref: 'lane/fix', edgeResolution }] }],
+    evidence: { auditRecords: records }, resolveSha: () => resolved, covers: () => true,
+  })[0];
+  for (const value of [{ sha: edge }, null, {}, [], 'bad', { sha: [sha] }, { sha: sha + '\n' }])
+    assert.equal(check(value).ok, false, JSON.stringify(value));
+  assert.equal(check({ sha: edge }, [audit(sha), audit(edge)]).ok, true);
+  assert.equal(check({ sha: sha.toUpperCase() }).ok, true);
+  assert.equal(check({ sha: edge }, [audit(edge)], null).ok, false, 'gone ref remains unaudited');
+});
+
+test('clone evidence loader failures cannot reuse another clones passing snapshot', () => {
+  const sha = 'a'.repeat(40), calls = [];
+  const rows = checkOverlays({ states: ['/first', '/second'].map(clone => ({ clone, overlays: [{ ref: 'lane/fix' }] })),
+    evidence: clone => {
+      calls.push(clone);
+      if (clone === '/second') throw Error('unreadable');
+      return { auditRecords: [{ head: sha, base: 'b'.repeat(40), verdict: 'NOT WEAKENED', questionHash: QUESTION_HASH,
+        at: '2026-11-10T00:00:00Z', findings: [] }] };
+    }, resolveSha: () => sha, covers: () => true,
+  });
+  assert.deepEqual(calls, ['/first', '/second']);
+  assert.deepEqual(rows.map(row => row.ok), [true, false]);
+});
+
+test('edge waivers bind to the registered ref and exact edge SHA', () => {
+  const sha = 'a'.repeat(40), edge = 'c'.repeat(40);
+  const waiver = { ref: 'lane/fix', sha: edge, ruling: 'R12', findings: ['accepted'], actor: 'operator', quote: 'approved', at: '2026-11-10T00:00:00Z' };
+  const audit = { base: 'b'.repeat(40), questionHash: QUESTION_HASH, at: waiver.at };
+  const check = patch => checkOverlays({ states: [{ clone: '/fixture', overlays: [{ ref: waiver.ref, edgeResolution: { sha: edge } }] }],
+    evidence: { waivers: [{ ...waiver, ...patch }], auditRecords: [
+      { ...audit, head: sha, verdict: 'NOT WEAKENED', findings: [] },
+      { ...audit, head: edge, verdict: 'WEAKENED', findings: waiver.findings },
+    ] }, resolveSha: () => sha, covers: () => true,
+  })[0];
+  assert.equal(check({}).kind, 'waiver');
+  assert.equal(check({ ref: 'lane/other' }).ok, false);
+  assert.equal(check({ sha }).ok, false);
+});
+
 test('CLI treats a missing inventory directory as empty', () => {
   const home = mkdtempSync(join(tmpdir(), 'overlay-missing-'));
   try {
@@ -202,7 +292,9 @@ test('CLI rejects malformed inventory shapes instead of crashing or reporting au
     const file = join(dir, '0123456789abcdef.json');
     for (const state of [null, { clone: 'clone', overlays: {} }, { overlays: [] },
       { clone: 'clone', overlays: [null] }, { clone: 'clone', overlays: [{ ref: 'lane/fix', sha: [] }] },
-      { clone: 'clone', overlays: [{ ref: '--bad' }] }]) {
+      { clone: 'clone', overlays: [{ ref: '--bad' }] },
+      ...[null, {}, [], 'bad', { sha: [] }, { sha: 'a'.repeat(40) + '\n' }]
+        .map(edgeResolution => ({ clone: 'clone', overlays: [{ ref: 'lane/fix', edgeResolution }] }))]) {
       const body = JSON.stringify(state);
       writeFileSync(file, body);
       const result = spawnSync(process.execPath, [cli, '--json', `--overlay-dir=${dir}`], {

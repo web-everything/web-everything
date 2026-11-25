@@ -8,10 +8,16 @@ import { readPlatformPreferences } from './policy-cascade.mjs';
 import { scrubGitRepoEnv } from './lane-git-hardening.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from '../operations/codex-audit-io.mjs';
 import { readStore, storePath, validateEntry, withdrawnRevocations } from '../operations/ruled-weakened-store.mjs';
-import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead } from '../operations/prototype-load.mjs';
+import { jsonLines, canonicalAuditEvidence, mergeRuledWeakened, waiverForHead, safeRegistrationRef } from '../operations/prototype-load.mjs';
 
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
 const prototypeSettingsPath = fileURLToPath(new NodeURL('../settings/prototype-load.json', import.meta.url));
+const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+// Validate before merging: a malformed upper layer must never disappear into a lower-layer waiver.
+const validWaiverSettings = value => isObject(value) && (value.ruledWeakened === undefined
+  || (Array.isArray(value.ruledWeakened) && value.ruledWeakened.every(entry => isObject(entry)
+    && safeRegistrationRef(entry.ref) && fullSha(entry.sha)
+    && waiverForHead([entry], { branch: entry.ref, sha: entry.sha }))));
 // Main's overlay reader derives a file from a clone; an inventory must read each discovered file directly.
 export function overlayDir(env = process.env) {
   const override = env.WE_DAEMON_OVERLAY_DIR;
@@ -21,8 +27,10 @@ export function readInventoryState(file) {
   try {
     const state = JSON.parse(readFileSync(file, 'utf8'));
     if (!state || typeof state.clone !== 'string' || !state.clone.trim() || !Array.isArray(state.overlays)
-      || state.overlays.some(entry => !entry || typeof entry !== 'object'
-        || (entry.sha !== undefined && !fullSha(entry.sha)))) return { corrupt: true };
+      || state.overlays.some(entry => !isObject(entry)
+        || (entry.sha !== undefined && !fullSha(entry.sha))
+        || (Object.hasOwn(entry, 'edgeResolution')
+          && (!isObject(entry.edgeResolution) || !fullSha(entry.edgeResolution.sha))))) return { corrupt: true };
     return state;
   } catch { return { corrupt: true }; }
 }
@@ -78,9 +86,31 @@ export function loadAuditEvidence({ env = process.env, fs = { readFileSync }, cw
       damaged = true;
       console.warn(`${message}; no waiver evidence admitted until the request log is repaired.`);
     } });
-    const platform = readPlatformPreferences({ env, readFile: (path, encoding) => fs.readFileSync(path, encoding) });
+    const platform = readPlatformPreferences({ env, readFile: (path, encoding) => {
+      let body;
+      try { body = fs.readFileSync(path, encoding); }
+      catch (error) {
+        // An explicitly selected missing file is unavailable evidence, not an omitted optional layer.
+        if (path === env.WE_PLATFORM_PREFERENCES_FILE?.trim()) damaged = true;
+        throw error;
+      }
+      const value = JSON.parse(body);
+      if (!isObject(value) || (Object.hasOwn(value, 'prototypeLoad') && !validWaiverSettings(value.prototypeLoad))) {
+        damaged = true;
+        throw new Error('Malformed platform prototypeLoad settings');
+      }
+      return body;
+    } });
+    if (platform.errors.length || damaged) {
+      damaged = true;
+      console.warn('Unreadable or corrupt platform preferences or waiver ledgers; no waiver evidence admitted until repaired.');
+    }
     let tool;
-    try { tool = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'))?.ruledWeakened; }
+    try {
+      const settings = JSON.parse(fs.readFileSync(prototypeSettingsPath, 'utf8'));
+      if (!validWaiverSettings(settings)) throw new Error('Malformed tool waiver settings');
+      tool = settings.ruledWeakened;
+    }
     catch (error) {
       if (error?.code === 'ENOENT') tool = undefined;
       else {

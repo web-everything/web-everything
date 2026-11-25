@@ -3,7 +3,8 @@
  * Usage: node scripts/daemon-overlay-audit-check.mjs [--json] [--overlay-dir=<dir>]
  * Text: UNAUDITED <cloneName> <ref> sha=<sha|unresolved> [moved-from=<sha>] added=<ISO> age=<N>d missing=<evidence>
  *       UNREADABLE <file>, or OK <n> overlays audited. Exit 1 for any incomplete evidence.
- * JSON: array of {clone, ref, sha, addedAt, ageDays, ok, kind}; unreadable files go to stderr.
+ * JSON: array of {clone, ref, sha, addedAt, ageDays, ok, kind}, plus edgeSha/edgeOk/edgeKind when registered.
+ * Both the ref tip and any adopted edge must qualify; unreadable files go to stderr.
  * Never fetches, changes Git refs, or writes state.
  */
 import { readdirSync } from 'node:fs';
@@ -18,21 +19,32 @@ import { isDirectEntry } from './lib/direct-entry-guard.mjs';
 const fullSha = value => typeof value === 'string' && /^[a-f0-9]{40}(?![\s\S])/i.test(value);
 const clean = value => stripVTControlCharacters(String(value)).replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ');
 
-/** Inspect registrations using injected evidence, time and read-only SHA resolution. Pure with supplied resolver and covers. */
+/** Evidence may be a snapshot for tests or a loader called with each clone. Pure with supplied snapshot, resolver and covers. */
 export function checkOverlays({ states, evidence, resolveSha, covers, now = new Date() }) {
-  return states.flatMap(state => state.overlays.map(entry => {
-    let sha;
-    try { sha = resolveSha(state.clone, entry.ref); } catch { sha = null; }
-    if (!fullSha(sha)) sha = null;
-    const movedFrom = entry.sha && (sha === null || entry.sha.toLowerCase() !== sha.toLowerCase()) ? entry.sha : null;
-    const result = auditEvidenceFor(sha, { ...evidence, ref: entry.ref,
-      covers: base => covers ? covers(base, state.clone) : mainCovers(base, { cwd: state.clone }),
+  return states.flatMap(state => {
+    let cloneEvidence;
+    try { cloneEvidence = typeof evidence === 'function' ? evidence(state.clone) : evidence; }
+    catch { cloneEvidence = {}; }
+    return state.overlays.map(entry => {
+      let sha;
+      try { sha = resolveSha(state.clone, entry.ref); } catch { sha = null; }
+      if (!fullSha(sha)) sha = null;
+      const movedFrom = entry.sha && (sha === null || entry.sha.toLowerCase() !== sha.toLowerCase()) ? entry.sha : null;
+      const options = { ...cloneEvidence, ref: entry.ref,
+        covers: base => covers ? covers(base, state.clone) : mainCovers(base, { cwd: state.clone }),
+      };
+      const result = auditEvidenceFor(sha, options);
+      const hasEdge = Object.hasOwn(entry, 'edgeResolution');
+      const edgeSha = fullSha(entry.edgeResolution?.sha) ? entry.edgeResolution.sha : null;
+      const edgeResult = hasEdge ? auditEvidenceFor(edgeSha, options) : null;
+      const ok = result.ok && (!hasEdge || edgeResult.ok);
+      const at = Date.parse(entry.addedAt);
+      return { clone: state.clone, ref: entry.ref, sha, ...(movedFrom ? { movedFrom } : {}), addedAt: Number.isFinite(at) ? new Date(at).toISOString() : null,
+        ageDays: Number.isFinite(at) ? Math.max(0, Math.floor((Number(new Date(now)) - at) / 86400000)) : null,
+        ...(hasEdge ? { edgeSha, edgeOk: edgeResult.ok, edgeKind: edgeResult.kind } : {}),
+        ok, kind: ok ? (result.kind === 'waiver' || edgeResult?.kind === 'waiver' ? 'waiver' : 'audit') : null };
     });
-    const at = Date.parse(entry.addedAt);
-    return { clone: state.clone, ref: entry.ref, sha, ...(movedFrom ? { movedFrom } : {}), addedAt: Number.isFinite(at) ? new Date(at).toISOString() : null,
-      ageDays: Number.isFinite(at) ? Math.max(0, Math.floor((Number(new Date(now)) - at) / 86400000)) : null,
-      ok: result.ok, kind: result.kind };
-  }));
+  });
 }
 
 function localSha(clone, ref, env) {
@@ -66,13 +78,13 @@ export function main(argv = process.argv.slice(2), env = process.env) {
     if (state.corrupt || !state.clone || state.overlays.some(entry => !entry || !safeRegistrationRef(entry.ref))) report(file);
     else states.splice(states.length, 0, state);
   }
-  const results = checkOverlays({ states, evidence: loadAuditEvidence({ env }), resolveSha: (clone, ref) => localSha(clone, ref, env),
+  const results = checkOverlays({ states, evidence: clone => loadAuditEvidence({ env, cwd: clone }), resolveSha: (clone, ref) => localSha(clone, ref, env),
     covers: (base, clone) => mainCovers(base, { cwd: clone, env }),
   });
   if (json) process.stdout.write(`${JSON.stringify(results)}\n`);
   else {
     for (const entry of results.filter(entry => !entry.ok)) {
-      process.stdout.write(`UNAUDITED ${clean(basename(entry.clone))} ${clean(entry.ref)} sha=${entry.sha || 'unresolved'}${entry.movedFrom ? ` moved-from=${clean(entry.movedFrom)}` : ''} added=${entry.addedAt || 'unknown'} age=${entry.ageDays ?? 'unknown'}d missing=audit+waiver\n`);
+      process.stdout.write(`UNAUDITED ${clean(basename(entry.clone))} ${clean(entry.ref)} sha=${entry.sha || 'unresolved'}${entry.movedFrom ? ` moved-from=${clean(entry.movedFrom)}` : ''}${Object.hasOwn(entry, 'edgeSha') ? ` edge-sha=${entry.edgeSha || 'unresolved'} edge-ok=${entry.edgeOk}` : ''} added=${entry.addedAt || 'unknown'} age=${entry.ageDays ?? 'unknown'}d missing=audit+waiver\n`);
     }
     if (!unreadable && results.every(entry => entry.ok)) process.stdout.write(`OK ${results.length} overlays audited\n`);
   }

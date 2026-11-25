@@ -13,6 +13,43 @@ const waiver = { ref, sha: 'a'.repeat(40), ruling: 'R12', findings: ['accepted']
 const sha = 'a'.repeat(40), base = 'b'.repeat(40);
 import { spawnSync } from 'node:child_process';
 
+for (const layer of ['platform', 'tool']) {
+  const shapes = [null, [], true, 7, 'settings', { ruledWeakened: null },
+    { ruledWeakened: {} }, { ruledWeakened: 'waived' }, { ruledWeakened: [null] },
+    { ruledWeakened: [{ ...waiver, findings: [] }] }];
+  const failures = layer === 'platform' ? ['EACCES', 'EISDIR', 'ENOENT', 'invalid JSON', ...shapes] : shapes;
+  for (const failure of failures) test(`${layer} invalid settings ${JSON.stringify(failure)} cannot fall through to stored waivers`, () => {
+    const env = { HOME: '/fixture', WE_PLATFORM_PREFERENCES_FILE: '/fixture/prefs.json' };
+    const weak = { ...valid, head: sha, base, verdict: 'WEAKENED', findings: ['accepted'] };
+    const fs = { readFileSync(path) {
+      const target = layer === 'platform' ? path === env.WE_PLATFORM_PREFERENCES_FILE
+        : path.endsWith('/scripts/settings/prototype-load.json');
+      if (target) {
+        if (['EACCES', 'EISDIR', 'ENOENT'].includes(failure)) throw Object.assign(Error('unavailable'), { code: failure });
+        if (failure === 'invalid JSON') return '{broken';
+        return JSON.stringify(layer === 'platform' ? { prototypeLoad: failure } : failure);
+      }
+      if (path === env.WE_PLATFORM_PREFERENCES_FILE || path.endsWith('/scripts/settings/prototype-load.json')) return '{}';
+      if (path.endsWith('/audits.jsonl')) return JSON.stringify(weak) + '\n';
+      if (path.endsWith('/ruled-weakened.jsonl')) return JSON.stringify(waiver) + '\n';
+      throw Object.assign(Error('absent'), { code: 'ENOENT' });
+    } };
+    const evidence = loadAuditEvidence({ env, fs });
+    assert.deepEqual(evidence.waivers, []);
+    assert.equal(auditEvidenceFor(sha, { ...evidence, ref, covers }).ok, false);
+  });
+}
+
+test('a later valid platform layer cannot hide malformed earlier waiver settings', () => {
+  const fs = { readFileSync(path) {
+    if (path.endsWith('/delivery-priority-settings.json')) return JSON.stringify({ prototypeLoad: { ruledWeakened: {} } });
+    if (path.endsWith('/delivery-platform-preferences.json')) return JSON.stringify({ prototypeLoad: { ruledWeakened: [waiver] } });
+    if (path.endsWith('/ruled-weakened.jsonl')) return JSON.stringify(waiver) + '\n';
+    throw Object.assign(Error('absent'), { code: 'ENOENT' });
+  } };
+  assert.deepEqual(loadAuditEvidence({ env: { HOME: '/fixture' }, fs }).waivers, []);
+});
+
 test('real mainCovers refuses non-ancestor, missing main, invalid base and unknown Git state', () => {
   const cwd = mkdtempSync(join(tmpdir(), 'overlay-ancestry-'));
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
