@@ -150,6 +150,8 @@ import { jitteredDelayMs } from './lib/lane-acquire-backoff.mjs';
 // re-derived (this card's Risk 5 — the two reapers must stay single-sourced).
 import { classifyReap, reapPlan, prStatesFromList, prStatesByPrNumber, prDetailsFromList, itemNumFromSession, prNumFromSession, resolveLeaseItemNum, restPullToPrStateShape } from './conveyor/lease-reaper.mjs';
 import { readField } from './backlog/frontmatter.mjs';
+import { applyReclaimSafety } from './lib/lane-lease-liveness.mjs';
+import { liveCwdRefusal } from './lib/lane-lease-guard.mjs';
 // #3383 — the lane-history ledger (`<lane>/.git/lane-history.jsonl`): one line per acquire/adopt/release/reap,
 // so a lane can be traced back to the session/card/PR that used it AFTER its lease is released (today nothing
 // records that — see `scripts/lane-whois.mjs`, the reader). Lives in its OWN module (another worker owns this
@@ -2111,6 +2113,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
   if (isLeaseStale(existing, nowMs, ttlMs)) {
     // xbdixjc — a stale lease over a lane the hold rule protects is not taken over (its fixer will resume there).
     if (laneHoldRefuses(dir, 'take-over')) return null;
+    if (laneLiveCwdRefuses(dir, 'take-over')) return null; // RS-7179-2
     // #x96v5hl — was `rmSync(file, {force:true})` then a `wx` create: unconditional unlink-then-create, which let
     // TWO concurrent stale-reclaimers both "win". Both see the same stale `existing`, both `rmSync` (always
     // succeeds, no matter what's currently there), then both `wx`-create — but `rmSync` doesn't check WHAT it is
@@ -2261,7 +2264,7 @@ function deadLeasePlan(repo, nowMs, ttlMs) {
     if (holderPresumedGone && itemNumTrustedForOfflineAxis && prState !== 'open' && prState !== 'merged' && prState !== 'closed' && itemResolvedOnMain(itemNum)) prState = 'merged';
     return { prState, pidAlive: null }; // the pid axis is dormant under today's lease schema (see lease-reaper.pidAliveForLease)
   };
-  return reapPlan(candidates, { nowMs, ttlMs, signalsFor });
+  return applyReclaimSafety(reapPlan(candidates, { nowMs, ttlMs, signalsFor })); // RS-7179-2: live cwd process keeps the lane
 }
 
 function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
@@ -2342,6 +2345,14 @@ function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
     ...laneHoldJournalFields(verdict),
   }, { unlessRepeat: true });
   return verdict;
+}
+
+/** RS-7179-2 — refuse to take over / reclaim a lane while a live process has its cwd inside it. */
+function laneLiveCwdRefuses(dir, action) {
+  const refusal = liveCwdRefusal(dir, action);
+  if (!refusal) return null;
+  log(`  lane-${/lane-(\d+)$/.exec(dir)?.[1] ?? '?'}: ${refusal.reason}`);
+  return refusal;
 }
 
 /**
@@ -5516,6 +5527,11 @@ function cmdReclaim(repo) {
   const held = laneHoldRefuses(dir, 'reclaim');
   if (held) {
     if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: held.reason, hold: held.hold }, null, 2)}\n`);
+    return;
+  }
+  const liveCwd = lease ? laneLiveCwdRefuses(dir, 'reclaim') : null; // RS-7179-2
+  if (liveCwd) {
+    if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: liveCwd.reason }, null, 2)}\n`);
     return;
   }
   const proof = laneReclaimPreservationProof(dir, repo.branch, repo);
