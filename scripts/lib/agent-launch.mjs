@@ -2,8 +2,9 @@
  * Closed-grammar process boundary: snapshot plain data, then build argv and directly exec.
  * Child env keeps only explicit transport, locale, terminal, temp and credential keys.
  * HOME comes only from the OS account; caller policy, shell, Git and loader settings are dropped.
+ * The launcher then pins daemon identity, personal-auth refusal and lane Git hardening.
  * Invalid environment serialization is refused even for dropped keys.
- * Every launch requires an absolute guard-shim pathPrefix. Both agents must resolve to the
+ * Every launch requires an existing, searchable absolute guard-shim directory pathPrefix. Both agents must resolve to the
  * same executable on the final absolute-only child PATH as the fixed installation lookup.
  * Config PATH, when supplied, must equal that final child PATH.
  * io.spawn/io.resolveBinary are trusted test seams, never descriptor capabilities.
@@ -13,6 +14,7 @@ import { accessSync, constants, realpathSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { types } from 'node:util';
+import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
 
 const FIXED_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -191,7 +193,16 @@ export function buildAgentInvocation(descriptor, io) {
   const args = argsFrom(d); // Validate the entire snapshot before any IO seam executes.
   const env = envRecord(d.env ?? {});
   absolute(d.pathPrefix, 'pathPrefix (required guard-shim directory)');
+  try {
+    if (!statSync(d.pathPrefix).isDirectory()) throw new Error('not a directory');
+    accessSync(d.pathPrefix, constants.X_OK);
+  } catch {
+    fail('pathPrefix must be an existing searchable directory; restore the guard-shim directory and its search access, then retry');
+  }
   env.HOME = absolute(userInfo().homedir, 'OS account HOME');
+  env.WE_GH_DAEMON_CALLER = 'agent-launch';
+  env.WE_GH_AUTH_PERSONAL_FALLBACK = 'refuse';
+  Object.assign(env, laneGitHardeningEnv(env, { home: env.HOME }));
   const rest = env.PATH === undefined ? [] : env.PATH.split(':').filter(dir => dir !== d.pathPrefix);
   for (const dir of rest) if (!isAbsolute(dir)) fail('relative or empty child PATH entry; use absolute directories and retry');
   env.PATH = [d.pathPrefix, ...rest].join(':');

@@ -4,6 +4,7 @@ import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, realpathSync, readFileSync, symlinkSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 import { launchAgent, buildAgentInvocation, buildAgentArgs, findAgentBinary } from '../lib/agent-launch.mjs';
 const CODEX_SHIM_DIR = new NodeURL('../codex-shims', import.meta.url).pathname;
 
@@ -62,8 +63,9 @@ const LOADER_ORACLE = {
   // Case variants: dropped too, so a case-folding platform can never revive one.
   node_options: '--require=/attacker/x.cjs', Ld_Preload: '/attacker/lib', dyld_insert_libraries: '/attacker/lib',
 };
-const projectedEnv = env => ({ PATH: prefixedPath(env), HOME: userInfo().homedir,
-  ...Object.fromEntries(['TMPDIR', 'TMP', 'TEMP'].filter(key => env[key] !== undefined).map(key => [key, env[key]])) });
+const projectedEnv = env => laneGitHardeningEnv({ WE_GH_DAEMON_CALLER: 'agent-launch',
+  WE_GH_AUTH_PERSONAL_FALLBACK: 'refuse', PATH: prefixedPath(env), HOME: userInfo().homedir,
+  ...Object.fromEntries(['TMPDIR', 'TMP', 'TEMP'].filter(key => env[key] !== undefined).map(key => [key, env[key]])) }, { home: userInfo().homedir });
 const matrix = [
   ...Object.keys(LOADER_ORACLE).map(key => [key, { [key]: 'caller-value' }]),
   ['CUSTOM_OPTIONS', { CUSTOM_OPTIONS: 'caller-value' }],
@@ -421,7 +423,7 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
     for (const field of ['execPath', 'execArgv', 'fork', 'file', 'args', 'argv', 'stdio', 'detached']) refused({ ...base(), [field]: [] }, new RegExp(field));
   });
   it.each(['codex', 'claude'])('11 drops caller runtime loader variables for %s, admission and spawn alike', agent => {
-    const kept = { PATH: prefixedPath({ PATH: bin }), HOME: userInfo().homedir, LANG: 'en_CA.UTF-8' };
+    const kept = { ...projectedEnv({ PATH: bin }), LANG: 'en_CA.UTF-8' };
     const env = { PATH: bin, LANG: kept.LANG, ...LOADER_ORACLE, SAFE: 'dropped', NODE_ENV: 'production' };
     const io = { ...seam(), admit: vi.fn(spec => { expect(spec.options.env).toEqual(kept); return true; }) };
     io.spawn.mockImplementation((_file, _args, options) => {
@@ -508,12 +510,24 @@ describe('closed grammar rejection: the PR #7022 attack classes', () => {
 });
 
 describe('built invocation positive controls', () => {
-  it('preserves direct spawn options and token order', () => {
-    const d = codexDescriptor({ cwd, env: { PATH: bin }, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high' });
+  it('pins literal edit argv including workspace-write sandbox, cwd, model and effort', () => {
+    const d = codexDescriptor({ cwd, env: { PATH: bin }, outputLastMessageFile: '/last', model: 'gpt-5.6-sol', effort: 'high', ephemeral: true });
     const io = seam(); expect(launchAgent(d, io)).toBe('child');
-    expect(io.spawn).toHaveBeenCalledWith(binary, buildAgentArgs(d), {
+    expect(io.spawn).toHaveBeenCalledWith(binary, [
+      'exec', '--json', '-s', 'workspace-write', '--skip-git-repo-check', '-C', cwd,
+      '-o', '/last', '--ephemeral', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=high',
+    ], {
       shell: false, cwd, env: projectedEnv(d.env), stdio: ['pipe', 'pipe', 'pipe'], detached: true,
     });
+  });
+  it('pins literal review argv including read-only sandbox, cwd, model and effort', () => {
+    const d = codexDescriptor({ cwd, env: { PATH: bin }, review: true, ephemeral: true,
+      model: 'gpt-5.6-sol', effort: 'xhigh' });
+    const io = seam(); launchAgent(d, io);
+    expect(io.spawn.mock.calls[0][1]).toEqual([
+      'exec', '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', cwd,
+      '--ephemeral', '-m', 'gpt-5.6-sol', '-c', 'model_reasoning_effort=xhigh',
+    ]);
   });
   it('encodes writable roots and temp strings as data and preserves ephemeral', () => {
     const tempRoot = '/task "quote" \\ $TMP';
@@ -576,7 +590,10 @@ describe('RS-7170-1 round-2 security boundary', () => {
     it.each(Object.entries(forged))(`drops forged %s from spawn env (${role})`, (key, value) => {
       const io = seam();
       launchAgent({ ...descriptor({ PATH: bin, [key]: value }), pathPrefix: root }, io);
-      expect(io.spawn.mock.calls[0][2].env).not.toHaveProperty(key);
+      const childEnv = io.spawn.mock.calls[0][2].env;
+      const pinned = projectedEnv({ PATH: bin });
+      if (Object.hasOwn(pinned, key)) expect(childEnv[key]).toBe(pinned[key]);
+      else expect(childEnv).not.toHaveProperty(key);
     });
     it(`replaces caller HOME with the OS account home (${role})`, () => {
       const io = seam();
@@ -604,7 +621,7 @@ describe('RS-7170-1 round-2 security boundary', () => {
     };
     const env = { PATH: bin, ...allowed, OMIT: undefined };
     const io = seam(); launchAgent({ ...(agent === 'codex' ? base() : claude()), env }, io);
-    expect(io.spawn.mock.calls[0][2].env).toEqual({ PATH: prefixedPath(env), HOME: userInfo().homedir, ...allowed });
+    expect(io.spawn.mock.calls[0][2].env).toEqual({ ...projectedEnv(env), ...allowed });
     expect(io.admit.mock.calls[0][0].options.env).toEqual(io.spawn.mock.calls[0][2].env);
     expect(env).not.toHaveProperty('HOME');
   });
@@ -622,4 +639,55 @@ describe('RS-7170-1 round-2 security boundary', () => {
   it('refuses config PATH that differs from the final prefixed child PATH', () => {
     refused({ ...base(), pathPrefix: root, config: { 'shell_environment_policy.set.PATH': bin } }, /PATH.*match|PATH.*equal/);
   });
+});
+
+
+describe('RS-7170-1 round-3 fail-closed guards', () => {
+  for (const [role, descriptor] of envLaunchPaths) {
+    it.each(['nonexistent', 'plain file', 'non-executable directory'])(
+      `refuses a %s guard prefix before resolution, admission or spawn (${role})`, kind => {
+        const pathPrefix = join(root, 'invalid-guard');
+        if (kind === 'plain file') writeFileSync(pathPrefix, 'not a directory');
+        if (kind === 'non-executable directory') { mkdirSync(pathPrefix); chmodSync(pathPrefix, 0o600); }
+        const io = seam();
+        try {
+          expect(() => launchAgent({ ...descriptor({ PATH: bin }), pathPrefix }, io))
+            .toThrow(/pathPrefix.*existing.*searchable.*restore.*retry/);
+          expect(io.resolveBinary).not.toHaveBeenCalled();
+          expect(io.admit).not.toHaveBeenCalled();
+          expect(io.spawn).not.toHaveBeenCalled();
+        } finally {
+          if (kind === 'non-executable directory') chmodSync(pathPrefix, 0o700);
+        }
+      });
+    it.each([undefined, '', 'forged-daemon'])(
+      `overrides forged or missing daemon identity %j and caller Git hooks with all 16 pins (${role})`, identity => {
+        vi.stubEnv('HOME', '/ambient/forged-home');
+        const caller = { PATH: bin, HOME: '/caller/home', WE_GH_DAEMON_CALLER: identity,
+          WE_GH_AUTH_PERSONAL_FALLBACK: 'allow', WE_OTHER_BYPASS: 'caller-value',
+          GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: '/caller/hooks',
+          GIT_CONFIG_KEY_99: 'credential.helper', GIT_CONFIG_VALUE_99: '/caller/helper',
+          GIT_CONFIG_PARAMETERS: "'core.hooksPath'='/caller/hooks'", GIT_SSH_COMMAND: '/caller/ssh',
+          GIT_ASKPASS: '/caller/askpass', GIT_CONFIG_GLOBAL: '/caller/config' };
+        const io = seam(); launchAgent(descriptor(caller), io);
+        const child = io.spawn.mock.calls[0][2].env;
+        expect(child.WE_GH_DAEMON_CALLER).toBe('agent-launch');
+        expect(child.WE_GH_AUTH_PERSONAL_FALLBACK).toBe('refuse');
+        expect(child.WE_OTHER_BYPASS).toBeUndefined();
+        expect(child.HOME).toBe(userInfo().homedir);
+        const expected = laneGitHardeningEnv({ HOME: userInfo().homedir }, { home: userInfo().homedir });
+        expect(child.GIT_CONFIG_COUNT).toBe('16');
+        expect(Object.keys(child).filter(key => /^GIT_CONFIG_KEY_/.test(key))).toHaveLength(16);
+        for (const [key, value] of Object.entries(expected)) {
+          expect(child[key], key).toBe(value);
+        }
+        for (const [key, value] of Object.entries(child).filter(([key]) => key.startsWith('GIT_'))) {
+          expect(value, key).not.toBe(caller[key]);
+          expect(expected[key], key).toBe(value);
+        }
+        expect(io.admit.mock.calls[0][0].options.env).toEqual(child);
+        expect(caller.GIT_CONFIG_COUNT).toBe('1');
+        expect(caller.WE_GH_AUTH_PERSONAL_FALLBACK).toBe('allow');
+      });
+  }
 });
