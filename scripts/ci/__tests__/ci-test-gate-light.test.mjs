@@ -94,7 +94,8 @@ describe('ci.yml parallel coverage merge and host-path jobs', () => {
 
   it('uses scope-selected soak shards with a fixed eight-shard total', () => {
     const soak = jobs['soak-shard'];
-    expect(soak.needs).toBe('daemon-soak-scope');
+    // Scope selects the matrix; changes supplies the exact-SHA merge-queue reuse decision.
+    expect([...soak.needs].sort()).toEqual(['changes', 'daemon-soak-scope']);
     expect(soak.strategy.matrix.shard).toBe('${{ fromJSON(needs.daemon-soak-scope.outputs.shards) }}');
     expect(jobs['daemon-soak-scope'].outputs.shards).toBe('${{ steps.scope.outputs.shards }}');
     const scope = jobs['daemon-soak-scope'].steps.find(step => step.id === 'scope').run;
