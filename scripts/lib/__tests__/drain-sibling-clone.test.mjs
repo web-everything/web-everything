@@ -5,19 +5,18 @@
  *   hold stays), a tampered diff still holds; only a readable, matching diff yields a scored, clean scan.
  */
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { ensureSiblingClone as ensureRaw, siblingCloneUrl, resetSiblingCloneFailures, describeUnverifiedDiffHold, CLONE_RETRY_COOLDOWN_MS } from '../drain-sibling-clone.mjs';
+import { join } from 'node:path';
+import { ensureSiblingClone as ensureRaw, siblingCloneUrl, slugOfRemote, siblingCloneRejection, createSiblingCloneDir, describeDiffEvidenceHold, resetSiblingCloneFailures, describeUnverifiedDiffHold, CLONE_RETRY_COOLDOWN_MS } from '../drain-sibling-clone.mjs';
 import { computeNetDiffSignals } from '../../merge-ai-prs.mjs';
 import { scanTestTampering } from '../pr-merge-gate.mjs';
 
 // Provisioning is off under vitest unless explicit. Pass it per call: a process.env write would leak into other
 // suites sharing this worker and make them attempt real network clones.
 const ON = { ...process.env, WE_DRAIN_SIBLING_CLONE: 'on' };
-const ensureSiblingClone = (o) => ensureRaw({ env: ON, ...o });
+const ensureSiblingClone = (o) => ensureRaw({ env: ON, isGitDir: () => true, originOf: () => 'git@github.com:o/frontierui.git', ...o });
 
 const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
@@ -67,11 +66,45 @@ describe('ensureSiblingClone fails closed', () => {
     expect(ensureSiblingClone(o)).toBeNull();
     expect(calls).toBe(2);
   });
-  it('no derivable url, or a squatting non-clone directory, never runs git and never clobbers', () => {
+  it('no derivable url never runs git', () => {
     let calls = 0;
     expect(ensureSiblingClone({ ...base, localOrigin: null, exists: poolHas, clone: () => { calls++; } })).toBeNull();
-    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || p === "/x/pool/frontierui", clone: () => { calls++; } })).toBeNull();
     expect(calls).toBe(0);
+  });
+  it('a squatting non-clone directory is never clobbered (fresh cooldown state, so the occupancy guard is what stops it)', () => {
+    let calls = 0; let renames = 0;
+    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || p === '/x/pool/frontierui', clone: () => { calls++; }, rename: () => { renames++; }, now: () => 5 })).toBeNull();
+    expect(calls + renames).toBe(0);
+    // a free directory with the same inputs DOES clone: proves the occupancy check is the only thing that stopped it
+    resetSiblingCloneFailures();
+    expect(ensureSiblingClone({ ...base, exists: (p) => poolHas(p) || (p === '/x/pool/frontierui/.git' && calls > 0), clone: () => { calls++; }, rename: () => {}, now: () => 5 })).toBe('/x/pool/frontierui');
+    expect(calls).toBe(1);
+  });
+  it('an existing clone whose origin is another owner is rejected with a reason (fail closed)', () => {
+    for (const origin of ['git@github.com:evil/frontierui.git', null]) {
+      let calls = 0;
+      expect(ensureSiblingClone({ ...base, exists: () => true, originOf: () => origin, clone: () => { calls++; } })).toBeNull();
+      expect(siblingCloneRejection('o/frontierui')).toMatch(/origin-mismatch/);
+      expect(calls).toBe(0);
+    }
+  });
+  it('an existing clone matching the slug case-insensitively is accepted', () => {
+    expect(ensureSiblingClone({ ...base, exists: () => true, originOf: () => 'https://github.com/O/FrontierUI' })).toBe('/x/pool/frontierui');
+  });
+  it('an existing .git that is not a real git dir is rejected', () => {
+    expect(ensureSiblingClone({ ...base, exists: () => true, isGitDir: () => false })).toBeNull();
+    expect(siblingCloneRejection('o/frontierui')).toBe('not-a-git-dir');
+  });
+  it('a pool sibling with an empty/invalid .git does not make the parent a pool', () => {
+    let calls = 0;
+    expect(ensureSiblingClone({ ...base, exists: poolHas, isGitDir: () => false, clone: () => { calls++; } })).toBeNull();
+    expect(calls).toBe(0);
+  });
+  it('dry-run reports would-provision and never clones', () => {
+    let calls = 0; const logs = [];
+    expect(ensureSiblingClone({ ...base, exists: poolHas, dryRun: true, log: (m) => logs.push(m), clone: () => { calls++; } })).toBeNull();
+    expect(calls).toBe(0);
+    expect(logs.join(' ')).toMatch(/would provision/);
   });
   it('provisioning is off when disabled, and off under a test runner unless explicit', () => {
     let calls = 0;
@@ -146,15 +179,44 @@ describe('describeUnverifiedDiffHold', () => {
   });
 });
 
-describe('drain wiring', () => {
-  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs'), 'utf8');
-  it('siblingCloneDir provisions through ensureSiblingClone instead of returning null for a missing clone', () => {
-    const body = src.slice(src.indexOf('const siblingCloneDir = (repo) =>'));
-    expect(body.slice(0, body.indexOf('};'))).toContain('ensureSiblingClone({ slug: repo');
+describe('slugOfRemote', () => {
+  it.each([['git@github.com:Chalbert/FrontierUI.git', 'chalbert/frontierui'], ['https://github.com/o/n/', 'o/n'], ['junk', null]])('%j', (u, e) => expect(slugOfRemote(u)).toBe(e));
+});
+
+describe('drain wiring (real call path)', () => {
+  const local = (r) => r === 'o/we';
+  const name = (r) => r.split('/')[1];
+  it('createSiblingCloneDir passes dry-run through, skips local repos, and caches a verified clone', () => {
+    const seen = [];
+    const ensure = (o) => { seen.push(o); return '/pool/' + o.name; };
+    const dir = createSiblingCloneDir({ isLocalRepo: local, siblingCloneName: name, readOrigin: () => 'git@github.com:o/we.git', dryRun: true, ensure });
+    expect(dir('o/we')).toBeNull();
+    expect(dir('o/frontierui')).toBe('/pool/frontierui');
+    expect(dir('o/frontierui')).toBe('/pool/frontierui');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({ slug: 'o/frontierui', dryRun: true, localOrigin: 'git@github.com:o/we.git' });
   });
-  it('the unscored hold still parks and carries the reasoned cause and wake event; a clearance never lifts it', () => {
-    expect(src).toContain('describeUnverifiedDiffHold({ repo: v.repo || localSlug');
-    expect(src).not.toContain('unverifiedCleared');
-    expect(src).not.toContain('shouldReparkForUnverifiedDiff');
+  it('an unreadable local origin still resolves (null origin → ensure fails closed itself)', () => {
+    const dir = createSiblingCloneDir({ isLocalRepo: local, siblingCloneName: name, readOrigin: () => { throw new Error('x'); }, ensure: (o) => (o.localOrigin === null ? null : 'bad') });
+    expect(dir('o/frontierui')).toBeNull();
+  });
+  const unscored = { scored: false, reason: 'no-clone' };
+  it('an unscored diff parks with the reasoned cause, whatever else is true; a clean scored diff does not', () => {
+    const hold = describeDiffEvidenceHold({ netDiffText: unscored, gaming: {}, repo: 'o/frontierui' });
+    expect(hold.reasons[0]).toMatch(/Cause:.*no-clone/);
+    expect(hold.reasons[0]).toMatch(/Wake event/);
+    expect(describeDiffEvidenceHold({ netDiffText: { scored: true }, gaming: { evidenceIncomplete: false }, repo: 'o/frontierui' })).toBeNull();
+  });
+  it('a clearance (tamperRepark=false) never lifts an unscored diff', () => {
+    expect(describeDiffEvidenceHold({ netDiffText: unscored, gaming: {}, tamperRepark: false })).not.toBeNull();
+  });
+  it('a rejected clone origin is named in the hold', () => {
+    const hold = describeDiffEvidenceHold({ netDiffText: unscored, gaming: {}, repo: 'o/frontierui', rejection: 'origin-mismatch (evil/frontierui is not o/frontierui)' });
+    expect(hold.reasons[0]).toContain('origin-mismatch');
+  });
+  it('incomplete or tampered scored evidence still parks; a workflow hold does not double-park', () => {
+    expect(describeDiffEvidenceHold({ netDiffText: { scored: true }, gaming: { evidenceIncomplete: true, reasons: ['x'] } }).reasons).toEqual(['x']);
+    expect(describeDiffEvidenceHold({ netDiffText: { scored: true }, gaming: {}, tamperRepark: true })).not.toBeNull();
+    expect(describeDiffEvidenceHold({ netDiffText: unscored, gaming: {}, workflowHoldRepark: true })).toBeNull();
   });
 });

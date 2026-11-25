@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { computeNetDiffPaths, parseNumstat, computeNetDiffChangedFiles, computeNetDiffText, resolveNetDiffBasis, computeNetDiffSignals } from '../merge-ai-prs.mjs';
 import { resolveProducerReviewLabel } from '../pr-land.mjs';
+import { describeDiffEvidenceHold } from '../lib/drain-sibling-clone.mjs';
 import { scoreEscalation, diffHunksFrom, shouldReparkForTestTampering } from '../lib/review-escalation.mjs';
 import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 import { runInProcess, childProcessMock } from './fixtures/merge-ai-prs-cli-harness.mjs';
@@ -1308,12 +1309,9 @@ function producerRubric(sig) {
 }
 
 function tamperingMustHold(netDiffText) {
-  const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
-  const start = source.indexOf('      if (!v.workflowHoldRepark &&');
-  const end = source.indexOf(' {', start);
-  const expression = source.slice(start + '      if ('.length, end - 1);
-  return new Function('netDiffText', 'shouldReparkForTestTampering',
-    'const v = {}, gaming = { tampered: false }, humanClearedSha = "same", tamperHeadSha = "same"; return ' + expression)(netDiffText, shouldReparkForTestTampering);
+  // The REAL decision function the drain calls (not a source slice).
+  return !!describeDiffEvidenceHold({ netDiffText, gaming: { tampered: false }, repo: 'o/r',
+    tamperRepark: shouldReparkForTestTampering({ tampered: false, netDiffScored: netDiffText.scored, humanClearedSha: 'same', headSha: 'same' }) });
 }
 
 function drainScore(sig) {
@@ -1351,6 +1349,6 @@ describe('R1105 pinned test-gaming evidence producer', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
     expect(src).toMatch(/computeNetDiffSignals\(\{ exec, rev: [^\n]*v\.listedHeadSha : null,[^\n]*pinRev: true/);
     expect(src).toMatch(/scanTestTampering\(\{\s*netDiffText, pinnedHeadSha: v\.listedHeadSha \|\| v\.headSha \|\| null/);
-    expect(src).toMatch(/gaming\.evidenceIncomplete \|\| shouldReparkForTestTampering/);
+    expect(src).toMatch(/describeDiffEvidenceHold\(\{ netDiffText, gaming,[^\n]*\n[^\n]*\n\s*tamperRepark: shouldReparkForTestTampering/);
   });
 });

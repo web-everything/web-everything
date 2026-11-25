@@ -42,26 +42,49 @@ export function siblingCloneUrl(localOrigin, slug) {
   return m ? `${m[1]}${slug}.git` : null;
 }
 
+/** `owner/name` (lower-cased) from a git remote URL, or null. Pure. */
+export function slugOfRemote(url) {
+  const m = /[:/]([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(String(url || '').trim());
+  return m ? `${m[1]}/${m[2]}`.toLowerCase() : null;
+}
+
+/** Real checks (injectable): is `dir` a working git dir, and what is its origin URL. */
+const realIsGitDir = (dir) => { try { execRead('git', ['-C', dir, 'rev-parse', '--git-dir'], { stdio: ['ignore', 'pipe', 'ignore'] }); return true; } catch { return false; } };
+const realOriginOf = (dir) => { try { return String(execRead('git', ['-C', dir, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); } catch { return null; } };
+
+const rejections = new Map();
+/** Why the last ensureSiblingClone for `slug` returned null (e.g. `origin-mismatch`), or null. */
+export function siblingCloneRejection(slug) { return rejections.get(slug) || null; }
+
 /**
  * Make sure `<parentDir>/<name>` is a usable git clone of `slug`; returns its path, or `null` (fail closed).
- * @param {{slug:string, name:string, parentDir:string, localOrigin:string|null, exec?:Function, exists?:Function,
- *   rename?:Function, now?:()=>number}} o
+ * An existing clone is trusted only when it is a real git dir whose origin IS `slug` (case-insensitive).
+ * Under `dryRun` nothing is cloned: the would-provision is reported and `null` returned.
  */
-export function ensureSiblingClone({ slug, name, parentDir, localOrigin, clone = blobsFreeClone, exists = existsSync, rename = renameSync, now = Date.now, env = process.env } = {}) {
+export function ensureSiblingClone({ slug, name, parentDir, localOrigin, clone = blobsFreeClone, exists = existsSync, rename = renameSync, now = Date.now, env = process.env,
+  isGitDir = realIsGitDir, originOf = realOriginOf, dryRun = false, log = () => {} } = {}) {
   const dir = resolve(parentDir, name);
-  if (exists(join(dir, '.git'))) return dir;
+  const reject = (why) => { rejections.set(slug, why); return null; };
+  rejections.delete(slug);
+  if (exists(join(dir, '.git'))) {
+    if (!isGitDir(dir)) return reject('not-a-git-dir');
+    const got = slugOfRemote(originOf(dir));
+    if (!got || got !== String(slug).toLowerCase()) return reject(`origin-mismatch (${got || 'no origin'} is not ${slug})`);
+    return dir;
+  }
   // `WE_DRAIN_SIBLING_CLONE=off` disables provisioning; under a test runner it is off unless explicitly `on`
   // (no suite may reach the network by accident).
   const mode = env.WE_DRAIN_SIBLING_CLONE;
   if (mode === 'off' || (env.VITEST && mode !== 'on')) return null;
-  // Only provision into a real lane-pool root: one that already holds ANOTHER constellation sibling clone. A scratch
-  // or temp parent (a test fixture, a one-off checkout) is never a drain pool, and must never trigger a network clone.
-  if (!POOL_SIBLINGS.some((s) => s !== name && exists(join(parentDir, s, '.git')))) return null;
+  // Only provision into a real lane-pool root: one that already holds ANOTHER constellation sibling that is a working
+  // git dir. A scratch or temp parent (a test fixture, an empty `.git`) is never a drain pool.
+  if (!POOL_SIBLINGS.some((s) => s !== name && exists(join(parentDir, s, '.git')) && isGitDir(join(parentDir, s)))) return null;
   const key = `${dir}\0${slug}`;
   const failedAt = failures.get(key);
   if (failedAt !== undefined && now() - failedAt < CLONE_RETRY_COOLDOWN_MS) return null;
   const url = siblingCloneUrl(localOrigin, slug);
   if (!url || exists(dir)) { failures.set(key, now()); return null; } // never clobber a squatting non-clone dir
+  if (dryRun) { log(`would provision ${dir} from ${url}`); return null; }
   const tmp = `${dir}.clone-${process.pid}-${now()}`;
   try {
     clone(url, tmp, { stdio: ['ignore', 'pipe', 'pipe'], timeout: CLONE_TIMEOUT_MS, killSignal: 'SIGKILL',
@@ -76,7 +99,40 @@ export function ensureSiblingClone({ slug, name, parentDir, localOrigin, clone =
 }
 
 /** Test seam: forget remembered clone failures. */
-export function resetSiblingCloneFailures() { failures.clear(); }
+export function resetSiblingCloneFailures() { failures.clear(); rejections.clear(); }
+
+/**
+ * The sibling-clone directory resolver the drain uses (extracted so the real call path is testable). Local repos
+ * need no clone; others resolve `<cwd>/../<name>` through {@link ensureSiblingClone}.
+ */
+export function createSiblingCloneDir({ isLocalRepo, siblingCloneName, cwd = process.cwd(), readOrigin, dryRun = false, log = () => {}, ensure = ensureSiblingClone } = {}) {
+  const verified = new Map(); // a verified clone stays verified for this drain run (no git spawn per call)
+  return (repo) => {
+    if (isLocalRepo(repo)) return null;
+    if (verified.has(repo)) return verified.get(repo);
+    const name = siblingCloneName(repo);
+    if (!name) return null;
+    let localOrigin = null;
+    try { localOrigin = readOrigin(); } catch { /* no origin → no clone */ }
+    const dir = ensure({ slug: repo, name, parentDir: resolve(cwd, '..'), localOrigin, dryRun, log });
+    if (dir) verified.set(repo, dir);
+    return dir;
+  };
+}
+
+/**
+ * The drain's hold decision for diff evidence: unscored, incomplete or tampered evidence parks (fail closed; a
+ * recorded clear-human never lifts an unscored diff). Returns `null` (no hold) or `{ reasons }`.
+ */
+export function describeDiffEvidenceHold({ netDiffText, gaming, workflowHoldRepark = false, tamperRepark = false, repo = null, rejection = null }) {
+  if (workflowHoldRepark) return null;
+  const scored = netDiffText?.scored === true;
+  if (scored && !gaming?.evidenceIncomplete && !tamperRepark) return null;
+  if (scored) return { reasons: gaming?.reasons || [] };
+  const reason = rejection || netDiffText?.reason || 'unscored';
+  return { reasons: [describeUnverifiedDiffHold({ repo, reason,
+    base: `net diff unverified (${reason}); restore diff access and rerun the drain, or obtain human review of the full diff` })] };
+}
 
 /**
  * The reasoned text for an unverified-diff hold: what failed, why, and what wakes it. Stable per (repo, reason) so the

@@ -5,7 +5,7 @@ import { assertCapability } from './lib/repo-profile.mjs';
 import { resolveHandoffSettings } from './lib/handoff-settings.mjs';
 import { writeLabelWithHandoff, signalFixDispatch } from './lib/fix-handoff.mjs';
 import { readCompletePrComments } from './conveyor/pr-comments-complete.mjs';
-import { ensureSiblingClone, describeUnverifiedDiffHold } from './lib/drain-sibling-clone.mjs';
+import { createSiblingCloneDir, describeDiffEvidenceHold, siblingCloneRejection } from './lib/drain-sibling-clone.mjs';
 import { createMqLiveReader, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath, readDrainQueueSafety, redTeamEnqueueHold } from './lib/drain-queue-safety.mjs';
 import { readDrainRedTeamEvidence } from './lib/drain-red-team-evidence.mjs';
 import { readStandingRuling, readOperatorIssues, headIsCardOnly, headBelongsToPr, readUneditedCommentIds, standingRulingScope } from './conveyor/standing-ruling-io.mjs';
@@ -5143,18 +5143,11 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // sibling directory is missing (not provisioned) or isn't a git working copy falls back to the prior skip —
   // nothing here clones on the fly (provisioning is the lane-pool allocator's job — #2303, see
   // skills-src/drain/SKILL.md's Preconditions).
-  const siblingCloneDir = (repo) => {
-    if (isLocalRepo(repo)) return null;
-    const name = siblingCloneName(repo);
-    if (!name) return null;
-    const dir = resolve(process.cwd(), '..', name);
-    try { if (existsSync(join(dir, '.git'))) return dir; } catch { return null; }
-    // CLEAR-HUMAN-NOT-STICKY — the drain daemon's pool had no `frontierui` sibling, so every frontierui PR was
-    // "net diff unverified (no-clone)". Provision it (blobless, fail closed) instead of leaving the diff unread.
-    let localOrigin = null;
-    try { localOrigin = String(readGit(['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim(); } catch { /* no origin → no clone */ }
-    return ensureSiblingClone({ slug: repo, name, parentDir: resolve(process.cwd(), '..'), localOrigin });
-  };
+  // CLEAR-HUMAN-NOT-STICKY — the drain daemon's pool had no `frontierui` sibling, so every frontierui PR was
+  // "net diff unverified (no-clone)". Provision it (blobless, fail closed, origin-verified, never under --dry-run).
+  const siblingCloneDir = createSiblingCloneDir({ isLocalRepo, siblingCloneName, dryRun: DRY_RUN,
+    log: (m) => process.stderr.write(`  · sibling clone: ${m}\n`),
+    readOrigin: () => String(readGit(['remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).trim() });
 
   // #2313 — post (or skip, if already posted) a drain reason comment on a PR. Best-effort: a `gh` miss never
   // fails the sweep. Reads the PR's existing comments once per call (only called for park/skip verdicts, not
@@ -6902,13 +6895,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       }
       // R1105: incomplete/head-mismatched evidence is an additional hold, never
       // clearance evidence. Leave the existing human-clearance decision unchanged.
-      if (!v.workflowHoldRepark && (netDiffText.scored !== true || gaming.evidenceIncomplete || shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }))) {
+      const diffHold = describeDiffEvidenceHold({ netDiffText, gaming, workflowHoldRepark: v.workflowHoldRepark, repo: v.repo || localSlug,
+        rejection: escCwd ? null : siblingCloneRejection(v.repo),
+        tamperRepark: shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha }) });
+      if (diffHold) {
         v.decision = 'skip';
         v.escalated = 'yes';
         v.humanRequired = true;
-        const tamperReasons = netDiffText.scored === true ? gaming.reasons
-          : [describeUnverifiedDiffHold({ repo: v.repo || localSlug, reason: netDiffText.reason || 'unscored',
-            base: `net diff unverified (${netDiffText.reason || 'unscored'}); restore diff access and rerun the drain, or obtain human review of the full diff` })];
+        const tamperReasons = diffHold.reasons;
         v.escalateReasons = tamperReasons;
         // #2766/#2767 — is this PR's own tampering finding (at least partly) INHERITED from an already-
         // escalated stacked base (its own `baseRefName` IS another open PR's `headRef`, and that PR already
