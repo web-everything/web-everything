@@ -11,7 +11,7 @@ it('renders every plist into a real directory with no absolute user path', async
     const lines = [];
     main([`--out=${out}`, '--host-home=/home/studio', '--node=/opt/node/bin/node'], { log: l => lines.push(l) });
     const files = readdirSync(out).filter(f => f.endsWith('.plist'));
-    expect(files.length).toBe(23);
+    expect(files.length).toBe(25);
     for (const f of files) {
       const xml = readFileSync(join(out, f), 'utf8');
       expect(xml).not.toContain('/Users/');
