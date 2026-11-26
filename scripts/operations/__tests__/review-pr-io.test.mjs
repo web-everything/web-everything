@@ -4548,3 +4548,70 @@ describe('strict accept publish wait ignores verdict-dependent required checks',
     expect(f.runNode).not.toHaveBeenCalled();
   });
 });
+
+
+// Complete-reader integration: pages are transport fixtures, not a pre-truncated comment array.
+import { readCompletePrComments as readAppliedComments } from '../../conveyor/pr-comments-complete.mjs';
+import { strandedRecord, appliedComment, attemptMarker, STRANDED_HEAD } from '../__fixtures__/stranded-record.fixture.mjs';
+
+describe('label applied evidence', () => {
+  function appliedFixture({ comments, state = {}, failPage = null, totalCount } = {}) {
+    const run = strandedRecord(), entry = run.effects[0];
+    const rows = comments ?? [appliedComment(run)];
+    const gh = vi.fn(args => {
+      if (args.includes('graphql')) return { data: { repository: { pullRequest: { comments: { totalCount: totalCount ?? rows.length } } } } };
+      const page = Number(/page=(\d+)$/.exec(args[1])?.[1]);
+      if (page === failPage) throw Error('page unavailable');
+      if (!page) throw Error('unexpected comment request');
+      return rows.slice((page - 1) * 100, page * 100).map(c => ({ ...c, node_id: c.id, user: c.author }));
+    });
+    const readComments = vi.fn(() => readAppliedComments(7493, { repo: run.input.repo, gh, maxPages: 102 }));
+    const unexpected = vi.fn(() => { throw Error('applied check must be read only'); });
+    const sinks = createSinks({ runStore: { read: () => run }, runNode: unexpected, postComment: unexpected,
+      labelProvider: {
+        readPrState: () => ({ state: 'OPEN', headRefOid: STRANDED_HEAD,
+          labels: [{ name: 'review:accepted' }], ...state }),
+        readComments, setLabels: unexpected,
+      },
+      // Explicit injection for implementations that consume the shared reader directly.
+      readCompleteComments: readComments,
+    });
+    const check = sinks['review.label-swap'].provablyApplied;
+    return { run, entry, check, gh, readComments, unexpected };
+  }
+  async function check(f) {
+    expect(f.check, 'label sink must expose its read-only applied proof').toBeTypeOf('function');
+    const result = await f.check(f.entry, { runId: f.run.id, key: f.entry.key, attempt: 1 });
+    expect(f.unexpected).not.toHaveBeenCalled();
+    return result;
+  }
+  it('label applied check: one marked trusted comment over complete pages; second match past page 100 or a pagination failure is not applied', async () => {
+    const filler = Array.from({ length: 10_000 }, (_, i) => ({ id: `IC_${i}`, author: { login: 'web-everything' }, body: `discussion ${i}` }));
+    const one = appliedFixture({ comments: [...filler, appliedComment()] });
+    expect(await check(one)).toMatchObject({ applied: true, evidence: expect.any(Object) });
+    expect(one.gh.mock.calls.some(([args]) => String(args[1]).endsWith('page=101'))).toBe(true);
+    const duplicate = appliedFixture({ comments: [appliedComment(), ...filler, appliedComment(undefined, { id: 'IC_second' })] });
+    expect(await check(duplicate)).toMatchObject({ applied: false });
+    const incomplete = appliedFixture({ comments: [appliedComment(), ...filler], failPage: 101 });
+    expect(await check(incomplete)).toMatchObject({ applied: false });
+  });
+  it.each([
+    ['no marker', { comments: [appliedComment(undefined, { body: `✅ review — accepted\n<!-- reviewed-sha:${STRANDED_HEAD} -->` })] }],
+    ['two markers', { comments: [appliedComment(), appliedComment(undefined, { id: 'IC_other' })] }],
+    ['two markers inside one comment', { comments: [appliedComment(undefined, { body: appliedComment().body + '\n' + attemptMarker() })] }],
+    ['wrong head', { state: { headRefOid: 'b'.repeat(40) } }],
+    ['closed PR', { state: { state: 'CLOSED' } }],
+    ['partial labels: missing add', { state: { labels: [] } }],
+    ['partial labels: remove still present', { state: { labels: [{ name: 'review:accepted' }, { name: 'review:pending' }] } }],
+    ['incomplete read', { totalCount: 2 }],
+    ['untrusted author', { comments: [appliedComment(undefined, { author: { login: 'attacker' } })] }],
+    ['same head + same attempt number but another run id', { comments: [appliedComment(strandedRecord({ id: 'another-run' }))] }],
+    ...[
+      ['runId', '/2a0c266d/', '/wrong-run/'], ['effectKey', '/2a0c266d#12#0/', '/2a0c266d#12#1/'],
+      ['attempt', '/1 -->', '/2 -->'], ['repository', 'web-everything/web-everything#', 'other/repo#'],
+      ['PR', '#7493/', '#7494/'], ['reviewed SHA', STRANDED_HEAD, 'b'.repeat(40)],
+    ].map(([name, from, to]) => [`wrong ${name} field`, { comments: [appliedComment(undefined, { body: appliedComment().body.replace(from, to) })] }]),
+  ])('label applied check refuses %s', async (_, options) => {
+    expect(await check(appliedFixture(options))).toMatchObject({ applied: false, reason: expect.any(String) });
+  });
+});

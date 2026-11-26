@@ -769,3 +769,47 @@ it('classifies juror-timeout and writes the named seat to the ended record', () 
   expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
   expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
 });
+
+
+describe('pinned recovery job forwarding', () => {
+  it('--resume-run is passed through to --resume=<id> --resume-only', () => {
+    const spawned = [];
+    const io = createReviewJobIo({ dir, env: {}, spawnNode: (file, argv) => {
+      spawned.push(argv); return { status: 2, stdout: '{"stopped":"refused"}', stderr: '' };
+    } });
+    io.runLoop({ pr: 7493, repo: REPO, lanePath: dir, actorId: 'recovery-agent',
+      resumeRun: '2a0c266d', claimToken: 'handoff-token' });
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual(expect.arrayContaining(['--resume=2a0c266d', '--resume-only', '--claim-token=handoff-token']));
+  });
+
+  it('the job record is written before the loop spawns', () => {
+    const order = [];
+    const { io } = fakeIo({
+      claim: (slug, record) => { order.push('record'); writeJobRecord(record, dir); return { ok: true }; },
+      updateRecord: record => writeJobRecord(record, dir),
+      runLoop: options => {
+        order.push('spawn');
+        const record = readJobRecord('review-7493', dir);
+        expect(record).toMatchObject({ resumeRun: '2a0c266d', claimToken: 'handoff-token' });
+        expect(options).toMatchObject({ resumeRun: '2a0c266d', claimToken: 'handoff-token' });
+        return { status: 2, stdout: '{"stopped":"refused"}', stderr: '' };
+      },
+    });
+    runReviewJob({ pr: 7493, repo: REPO, pid: 99, expectedHead: HEAD,
+      resumeRun: '2a0c266d', claimToken: 'handoff-token' }, io);
+    expect(order).toEqual(['record', 'spawn']);
+  });
+
+  it('the job CLI forwards --resume-run and --claim-token without starting a fresh run', async () => {
+    const { runReviewJobCli } = await import('../review-job.mjs');
+    const runJob = vi.fn(() => ({ status: 'done', outcome: 'refused' }));
+    const previous = process.exitCode;
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      runReviewJobCli(['run', '--pr=7493', `--repo=${REPO}`, `--expected-head=${HEAD}`,
+        '--resume-run=2a0c266d', '--claim-token=handoff-token'], { runJob, rate: () => {} });
+      expect(runJob).toHaveBeenCalledWith(expect.objectContaining({ resumeRun: '2a0c266d', claimToken: 'handoff-token' }));
+    } finally { stdout.mockRestore(); process.exitCode = previous; }
+  });
+});

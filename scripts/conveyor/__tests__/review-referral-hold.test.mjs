@@ -1528,3 +1528,18 @@ describe('a ruling on an unchanged head resumes the parked run (replay of #4361)
     });
   });
 });
+
+
+import { strandedRecord as strandedFixture, STRANDED_REPO, STRANDED_HEAD } from '../../operations/__fixtures__/stranded-record.fixture.mjs';
+
+it('strandedRecordEffect flag honoured only in pinned mode', () => {
+  const r = strandedFixture(), row = reviewRunEvidence(r);
+  expect(row.strandedRecordEffect).toBe(true);
+  const snapshot = pr({ number: 7493, headRefOid: STRANDED_HEAD, labels: [{ name: 'review:accepted' }] });
+  expect(findResumableParkedRun(snapshot, [row], { repo: STRANDED_REPO })).toBeNull();
+  expect(findResumableParkedRun(snapshot, [row], { repo: STRANDED_REPO, pinnedRunId: r.id }))
+    .toEqual({ id: r.id, head: STRANDED_HEAD });
+  expect(findResumableParkedRun(snapshot, [row], { repo: STRANDED_REPO, pinnedRunId: 'another-run' })).toBeNull();
+  expect(findResumableParkedRun({ ...snapshot, headRefOid: 'b'.repeat(40) }, [row],
+    { repo: STRANDED_REPO, pinnedRunId: r.id })).toBeNull();
+});

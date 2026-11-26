@@ -2424,3 +2424,232 @@ describe('runReviewLoopOnce — error-class output (REVIEW-CLI-ERROR-CLASS): a t
     expect(statSync(logPath).mode & 0o077).toBe(0);
   });
 });
+
+
+import { DEAD_OWNER, RECOVERY_OWNER, STRANDED_AT } from '../__fixtures__/stranded-record.fixture.mjs';
+
+describe('pinned stranded record recovery', () => {
+  // Build the parked record through the real operation, retaining its roster and panel findings.
+  async function strandedFixture(answer = CLEAN_ANSWER) {
+    const { declaration, registry } = registryFor({ rev: HEAD_A });
+    const store = createMemoryRunStore(), seen = [];
+    const sinks = recordingSinks(seen);
+    sinks[REVIEW_EFFECTS.LABEL] = async () => { throw Error('loop timeout; orphan outcome unknown'); };
+    const judge = vi.fn(async () => judgeOutcome(answer, {}));
+    const args = { declaration, registry, store, sinks, argv: BASE_ARGV,
+      mintRunId: () => '2a0c266d', makeJudge: () => judge,
+      readResumePr: () => ({ state: 'OPEN', headRefOid: HEAD_A, comments: [], labels: ['review:accepted'] }),
+      readAcceptancePr: () => ({ state: 'OPEN', headRefOid: HEAD_A, comments: [], body: '<!-- authored-by-actor: author -->' }),
+    };
+    await runReviewLoopOnce(args);
+    const saved = store.read('2a0c266d');
+    expect(saved.pending).toMatchObject({ kind: 'effect', step: 'record' });
+    const entry = saved.effects.find(e => e.type === REVIEW_EFFECTS.LABEL);
+    expect(entry).toMatchObject({ status: 'pending', unknownAttempts: 1, attempts: 1 });
+    saved.owner = { ...DEAD_OWNER }; saved.strandedResumeAttempts = 0;
+    entry.lastAttemptAt = STRANDED_AT;
+    store.write(saved); seen.length = 0; judge.mockClear();
+    const label = vi.fn(async () => { throw Error('must never re-send'); });
+    label.provablyApplied = vi.fn(async () => ({ applied: true, evidence: { commentId: 'IC_accept', head: HEAD_A } }));
+    label.provablyNotApplied = vi.fn(() => true);
+    args.sinks = { ...recordingSinks(seen), [REVIEW_EFFECTS.LABEL]: label };
+    let claim = { holder: 'handoff', token: 'claim-secret', sweepOwner: RECOVERY_OWNER, createdAt: STRANDED_AT };
+    // Proposed IO seam: production defaults own file locking; fixtures supply one atomic CAS.
+    args.recoveryIo = {
+      owner: RECOVERY_OWNER, pidIdentity: vi.fn(() => ({ alive: false, reason: 'gone' })),
+      readClaim: () => claim,
+      acquireClaim: vi.fn(({ token }) => {
+        if (claim?.token !== token || claim?.holder !== 'handoff') return { ok: false, reason: 'claim lost or token mismatch' };
+        claim = { ...claim, holder: RECOVERY_OWNER }; return { ok: true, token };
+      }),
+      releaseClaim: vi.fn(() => { claim = null; }),
+    };
+    args.argv = [`--resume=${saved.id}`, '--resume-only', '--claim-token=claim-secret'];
+    return { args, saved, store, judge, seen, label, entry, setClaim: c => { claim = c; } };
+  }
+
+  it('owner stamped before the first step', async () => {
+    const store = createMemoryRunStore(); let observed = 0;
+    const assertOwner = () => {
+      const saved = store.read('owner-before-step');
+      expect(saved?.owner).toMatchObject({ host: expect.any(String), pid: expect.any(Number), procStart: expect.any(String) });
+      expect(Object.hasOwn(saved.owner, 'namespace')).toBe(true);
+    };
+    const declaration = reviewPrOperation({ readPr: input => { assertOwner(); return stubReader({ rev: HEAD_A })(input); } });
+    const registry = createRegistry(); registry.register(declaration);
+    const judge = async () => {
+      const run = store.read('owner-before-step'); observed++;
+      expect(run.owner).toMatchObject({ host: expect.any(String), pid: expect.any(Number), procStart: expect.any(String) });
+      expect(Object.hasOwn(run.owner, 'namespace')).toBe(true);
+      expect(run.owner.namespace === null || typeof run.owner.namespace === 'string').toBe(true);
+      return judgeOutcome(CLEAN_ANSWER, {});
+    };
+    await runReviewLoopOnce({ declaration, registry, store, argv: BASE_ARGV,
+      sinks: recordingSinks([]), makeJudge: () => judge, mintRunId: () => 'owner-before-step' });
+    expect(observed).toBeGreaterThan(0);
+  });
+
+  describe.each([
+    ['claim lost', f => f.setClaim(null), /claim/i],
+    ['token mismatch', f => { f.args.argv[2] = '--claim-token=wrong'; }, /claim|token/i],
+    ['owner changed', f => { f.args.recoveryIo.acquireClaim = () => {
+      f.store.write({ ...f.saved, owner: { ...DEAD_OWNER, pid: 999 } }); return { ok: true, token: 'claim-secret' };
+    }; }, /owner/i],
+    ['operator-wake veto', f => { f.args.readResumePr = () => ({ state: 'OPEN', headRefOid: HEAD_A,
+      comments: [{ id: 'IC_wake', author: { login: 'chalbert' }, createdAt: '2026-11-26T16:00:00Z', body: 'run a fresh review' }] }); }, /operator|wake/i],
+    ['unreadable evidence', f => { f.args.readResumePr = () => { throw Error('evidence unavailable'); }; }, /evidence|unreadable|unavailable/i],
+    ['roster mismatch', f => { f.saved.findings.read.cardOnlyLight = !Boolean(f.args.declaration.cardOnlyLight); }, /roster|seat/i],
+    ['budget spent', f => { f.saved.strandedResumeAttempts = RESUME_MAX_ATTEMPTS; }, /budget|attempt|spent/i],
+    ['head moved', f => { f.args.readResumePr = () => ({ state: 'OPEN', headRefOid: HEAD_B, comments: [] }); }, /head/i],
+    ['PR closed', f => { f.args.readResumePr = () => ({ state: 'CLOSED', headRefOid: HEAD_A, comments: [] }); }, /closed|open/i],
+    ...['reject', 'unknown', 'abstain'].map(v => [`verdict not allowed: ${v}`, f => { f.saved.verdict.verdict = v; }, /verdict/i]),
+    ['verdict not allowed: mismatched to', f => { f.entry.payload.to = 'changes'; }, /verdict|payload|match/i],
+    ['applied check fails', f => { f.label.provablyApplied.mockResolvedValue({ applied: false, reason: 'no marker' }); }, /applied|marker/i],
+    ['applied check throws', f => { f.label.provablyApplied.mockRejectedValue(Error('incomplete read')); }, /applied|incomplete|read/i],
+    ['acceptHold on accept', f => { f.args.acceptPolicy = { value: { unattendedAcceptRequiresCleanReferrals: true } };
+      f.args.readAcceptancePr = () => { throw Error('acceptHold: unavailable standing referrals'); }; }, /accept|held|referral/i],
+  ])('refusal: %s', (_, mutate, reason) => {
+  it('resume-only refuses with zero judge calls', async () => {
+    const f = await strandedFixture(); mutate(f); f.store.write(f.saved);
+    const before = structuredClone(f.saved);
+    const mint = vi.fn(() => 'must-not-start'); f.args.mintRunId = mint;
+    const out = await runReviewLoopOnce(f.args);
+    expect(out).toMatchObject({ code: 2, stopped: 'refused' });
+    expect(out.lines.join('\n')).toMatch(reason);
+    expect(f.judge).not.toHaveBeenCalled(); expect(mint).not.toHaveBeenCalled();
+    expect(f.label).not.toHaveBeenCalled(); expect(f.seen).toEqual([]);
+    const after = f.store.read(before.id);
+    expect(after.effects.find(e => e.key === f.entry.key).status).toBe('pending');
+    expect(after.verdict).toEqual(before.verdict);
+    expect(after.findings).toEqual(before.findings);
+  });
+  });
+
+  it.each([
+    ['live', f => { f.args.recoveryIo.pidIdentity.mockReturnValue({ alive: true }); }],
+    ['unknown', f => { f.args.recoveryIo.pidIdentity.mockReturnValue({ alive: null }); }],
+    ['unstamped', f => { delete f.saved.owner; }],
+    ['foreign host', f => { f.saved.owner.host = 'another-host'; }],
+    ['foreign namespace', f => { f.saved.owner.namespace = 'pid:[999]'; }],
+    ['null namespace on old owner', f => { f.saved.owner.namespace = null; }],
+    ['null namespace on new owner', f => { f.args.recoveryIo.owner = { ...RECOVERY_OWNER, namespace: null }; }],
+    ['identical null namespaces', f => { f.saved.owner.namespace = null; f.args.recoveryIo.owner = { ...RECOVERY_OWNER, namespace: null }; }],
+    ['malformed owner', f => { f.saved.owner = { host: DEAD_OWNER.host, pid: '92472' }; }],
+    ['malformed claim', f => { f.setClaim({ holder: {}, token: 7 }); }],
+  ])('%s owner/claim is never resumed', async (_, mutate) => {
+    const f = await strandedFixture(); mutate(f); f.store.write(f.saved);
+    const out = await runReviewLoopOnce(f.args);
+    expect(out).toMatchObject({ code: 2, stopped: 'refused' });
+    expect(f.label.provablyApplied).not.toHaveBeenCalled(); expect(f.label).not.toHaveBeenCalled();
+    expect(f.judge).not.toHaveBeenCalled(); expect(f.seen).toEqual([]);
+  });
+
+  it.each(['accept', 'changes'])('a resume never changes verdict/panel findings/payload: %s', async verdict => {
+    const f = await strandedFixture(verdict === 'changes' ? BLOCKING_ANSWER : CLEAN_ANSWER);
+    expect(f.saved.verdict.verdict).toBe(verdict);
+    f.entry.payload.to = verdict === 'accept' ? 'accepted' : 'changes';
+    f.store.write(f.saved);
+    const before = structuredClone(f.saved);
+    const out = await runReviewLoopOnce(f.args);
+    expect(out.code).toBe(0);
+    const after = f.store.read(before.id);
+    expect(after.pending).toBeNull(); expect(after.verdict).toEqual(before.verdict);
+    for (const [key, value] of Object.entries(before.findings)) expect(after.findings[key]).toEqual(value);
+    expect(after.effects.find(e => e.key === f.entry.key)).toMatchObject({ payload: f.entry.payload,
+      attempts: 1, unknownAttempts: 1, status: 'applied', result: { reconciled: true } });
+    expect(f.label).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
+  });
+
+  it('attempt cap includes persisted counter exhaustion across restarts', async () => {
+    const f = await strandedFixture();
+    const { createFileRunStore } = await import('../run-store.mjs');
+    const disk = mkdtempSync(join(tmpdir(), 'stranded-restarts-'));
+    onTestFinished(() => rmSync(disk, { recursive: true, force: true }));
+    f.store = createFileRunStore(disk); f.store.write(f.saved); f.args.store = f.store;
+    f.label.provablyApplied.mockResolvedValue({ applied: false, reason: 'orphan not yet posted' });
+    for (let attempt = 0; attempt <= RESUME_MAX_ATTEMPTS; attempt++) {
+      // Reopen the on-disk store as a new process would; only persisted quota survives.
+      f.store = createFileRunStore(disk); f.args.store = f.store;
+      f.saved = f.store.read(f.saved.id);
+      f.saved.owner = { ...DEAD_OWNER }; f.store.write(f.saved);
+      f.setClaim({ holder: 'handoff', token: 'claim-secret', sweepOwner: RECOVERY_OWNER, createdAt: STRANDED_AT });
+      const out = await runReviewLoopOnce({ ...f.args });
+      expect(out).toMatchObject({ code: 2, stopped: 'refused' });
+      expect(f.store.read(f.saved.id).strandedResumeAttempts).toBe(Math.min(attempt + 1, RESUME_MAX_ATTEMPTS));
+    }
+    expect(f.label.provablyApplied).toHaveBeenCalledTimes(RESUME_MAX_ATTEMPTS);
+    expect(f.label).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('--settle-applied records actor and reason only on match and never re-sends (match=%s)', async match => {
+    const f = await strandedFixture();
+    f.args.argv = [`--resume=${f.saved.id}`, '--settle-applied', '--actor=operator', '--reason=verified orphan comment'];
+    f.label.provablyApplied.mockResolvedValue(match ? { applied: true, evidence: { commentId: 'IC_accept' } }
+      : { applied: false, reason: 'not matched' });
+    const out = await runReviewLoopOnce(f.args);
+    expect(out.code).toBe(match ? 0 : 2);
+    const e = f.store.read(f.saved.id).effects.find(e => e.key === f.entry.key);
+    expect(e.status).toBe(match ? 'applied' : 'pending');
+    if (match) expect(e.result).toMatchObject({ reconciled: true, actor: 'operator', reason: 'verified orphan comment' });
+    expect(f.label.provablyApplied).toHaveBeenCalledTimes(1);
+    expect(f.label).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
+  });
+
+  it.each([['--actor=operator'], ['--reason=checked'], []])('--settle-applied refuses without --actor/--reason: %j', async flags => {
+    const f = await strandedFixture();
+    f.args.argv = [`--resume=${f.saved.id}`, '--settle-applied', ...flags];
+    const out = await runReviewLoopOnce(f.args);
+    expect(out).toMatchObject({ code: 2, stopped: 'refused' });
+    expect(out.lines.join('\n')).toMatch(/actor|reason/i);
+    expect(f.label.provablyApplied).not.toHaveBeenCalled(); expect(f.label).not.toHaveBeenCalled();
+    expect(f.judge).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['exactly one at lastAttemptAt', 1, '2026-11-26T14:25:02.000Z', 'web-everything', HEAD_A, true],
+    ['exactly one after lastAttemptAt', 1, '2026-11-26T14:27:57Z', 'web-everything', HEAD_A, true],
+    ['before lastAttemptAt', 1, '2026-11-26T14:25:01Z', 'web-everything', HEAD_A, false],
+    ['missing time', 1, undefined, 'web-everything', HEAD_A, false],
+    ['invalid time', 1, 'invalid', 'web-everything', HEAD_A, false],
+    ['missing comment', 0, '2026-11-26T14:27:57Z', 'web-everything', HEAD_A, false],
+    ['two trusted accepts', 2, '2026-11-26T14:27:57Z', 'web-everything', HEAD_A, false],
+    ['untrusted author', 1, '2026-11-26T14:27:57Z', 'attacker', HEAD_A, false],
+    ['wrong reviewed SHA', 1, '2026-11-26T14:27:57Z', 'web-everything', HEAD_B, false],
+  ])('--settle-applied legacy unstamped run: %s', async (_, count, createdAt, login, head, allowed) => {
+    const f = await strandedFixture(); delete f.saved.owner; f.store.write(f.saved);
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const body = buildVerdictComment({ to: 'accepted', actor: 'review-agent', headSha: head, body: 'persisted findings' });
+    expect(body).not.toContain('review-attempt:');
+    const comments = Array.from({ length: count }, (_, i) => ({ id: `IC_legacy_${i}`, body, createdAt, author: { login } }));
+    const readComments = vi.fn(() => comments);
+    const neverSend = vi.fn(() => { throw Error('operator reconciliation must never send'); });
+    const realLabel = createReviewPrSinks({ runStore: f.store, runNode: neverSend, postComment: neverSend,
+      labelProvider: {
+        readPrState: () => ({ state: 'OPEN', headRefOid: HEAD_A, labels: [{ name: 'review:accepted' }] }),
+        readComments, setLabels: neverSend,
+      }, readCompleteComments: readComments,
+    })[REVIEW_EFFECTS.LABEL];
+    f.args.sinks[REVIEW_EFFECTS.LABEL] = realLabel;
+    f.args.argv = [`--resume=${f.saved.id}`, '--settle-applied', '--actor=operator', '--reason=checked legacy orphan'];
+    const out = await runReviewLoopOnce(f.args);
+    expect(out.code).toBe(allowed ? 0 : 2);
+    const entry = f.store.read(f.saved.id).effects.find(e => e.key === f.entry.key);
+    expect(entry.status).toBe(allowed ? 'applied' : 'pending');
+    if (allowed) expect(entry.result).toMatchObject({ reconciled: true, actor: 'operator', reason: 'checked legacy orphan' });
+    expect(neverSend).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
+  });
+
+
+  it('pid reuse with mismatched start time allows pinned recovery of the old owner', async () => {
+    const f = await strandedFixture();
+    const { pidIdentity } = await import('../../lib/pid-alive.mjs');
+    f.args.recoveryIo.pidIdentity = vi.fn((pid, options) => pidIdentity(pid, { ...options,
+      exec: () => 'S Thu Nov 26 15:00:00 2026 node replacement.mjs' }));
+    const out = await runReviewLoopOnce(f.args);
+    expect(out.code).toBe(0);
+    expect(f.args.recoveryIo.pidIdentity).toHaveBeenCalledWith(DEAD_OWNER.pid,
+      expect.objectContaining({ expectStart: DEAD_OWNER.procStart }));
+    expect(f.label).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
+  });
+
+});

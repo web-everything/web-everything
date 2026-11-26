@@ -1318,3 +1318,75 @@ describe('#4386 real open-pr outcome rendering', () => {
     expect(rendered.lines.join('\n')).toContain(detail);
   });
 });
+
+
+describe('stranded record applied evidence', () => {
+  function pendingRecord() {
+    const run = atEffectStep('stranded-record');
+    run.effects[0] = { ...run.effects[0], status: 'pending', attempts: 1, unknownAttempts: 1,
+      lastAttemptAt: '2026-11-26T14:25:02Z' };
+    const store = createMemoryRunStore(); store.write(run);
+    return { run, store };
+  }
+
+  it('provablyApplied marks applied with evidence, keeps counters, skips sink; throw or false falls through', async () => {
+    for (const answer of ['applied', 'false', 'throw']) {
+      const { run, store } = pendingRecord();
+      const { sinks, calls } = recordingSinks();
+      const entry = run.effects[0], evidence = { commentId: 'IC_accept', head: 'a'.repeat(40) };
+      let checked = 0, notAppliedChecks = 0;
+      sinks[entry.type].provablyApplied = async (saved, ctx) => {
+        checked++;
+        expect(saved.key).toBe(entry.key);
+        expect(ctx).toMatchObject({ runId: run.id, key: entry.key, attempt: 1 });
+        if (answer === 'throw') throw Error('unreadable');
+        return answer === 'applied' ? { applied: true, evidence } : { applied: false, reason: 'no match' };
+      };
+      sinks[entry.type].provablyNotApplied = () => { notAppliedChecks++; return true; };
+      await applyPendingEffects(run, { sinks, store });
+      expect(checked).toBe(1);
+      const saved = store.read(run.id).effects[0];
+      expect(saved.status).toBe('applied');
+      if (answer === 'applied') {
+        expect(saved).toMatchObject({ attempts: 1, unknownAttempts: 1, result: { reconciled: true, evidence } });
+        expect(calls.filter(c => c.key === entry.key)).toEqual([]);
+        expect(notAppliedChecks).toBe(0);
+      } else {
+        expect(calls.filter(c => c.key === entry.key)).toHaveLength(1);
+        expect(saved.attempts).toBe(2);
+      }
+    }
+  });
+
+  it('recovery with a failed applied check never calls the sink', async () => {
+    for (const throws of [false, true]) {
+      const { run, store } = pendingRecord();
+      run.strandedRecordEffect = true; store.write(run);
+      const { sinks, calls } = recordingSinks();
+      let checks = 0, fallbackChecks = 0;
+      sinks[run.effects[0].type].provablyApplied = async () => {
+        checks++;
+        if (throws) throw Error('pagination failed');
+        return { applied: false, reason: 'orphan has not posted yet' };
+      };
+      sinks[run.effects[0].type].provablyNotApplied = () => { fallbackChecks++; return true; };
+      await applyPendingEffects(run, { sinks, store, strandedRecordEffect: true, resumeOnly: true }).catch(() => {});
+      expect(checks).toBe(1);
+      expect(fallbackChecks).toBe(0);
+      expect(calls).toEqual([]);
+      expect(store.read(run.id).effects[0]).toEqual(run.effects[0]);
+    }
+  });
+
+  it('ctx.attempt is the persisted pre-send count, starting at one', async () => {
+    const run = atEffectStep('attempt-context'), store = createMemoryRunStore();
+    store.write(run);
+    const seen = [];
+    const sink = async (_, ctx) => {
+      expect(store.read(ctx.runId).effects.find(e => e.key === ctx.key).attempts).toBe(ctx.attempt);
+      seen.push(ctx.attempt);
+    };
+    await applyPendingEffects(run, { store, sinks: { 'comment.post': sink, 'label.swap': sink } });
+    expect(seen).toEqual([1, 1]);
+  });
+});
