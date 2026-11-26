@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as scope from '../../lib/fast-drain-scope.mjs';
 import { buildEnqueueArgs } from '../merge-queue-enqueue.mjs';
+import { sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { strategyFixture, HEAD, REPO } from './fixtures/fast-drain-strategy.mjs';
 
 test('skipped sweeps never run', () => {
@@ -189,12 +190,65 @@ test('child killed before confirmation leaves no stamp', () => {
 // Execute the production call sites with recording ports: these helpers own executors
 // outside the boundary, so checking the boundary helper alone misses the bypasses.
 const drainSource = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
-function drainSection(start, end) {
-  const from = drainSource.indexOf(start);
-  const to = drainSource.indexOf(end, from);
+const strategySource = readFileSync(resolve(process.cwd(), 'scripts/lib/drain-merge-strategy.mjs'), 'utf8');
+function drainSection(start, end, source = drainSource) {
+  const from = source.indexOf(start);
+  const to = source.indexOf(end, from);
   assert.ok(from >= 0 && to > from, `missing drain section: ${start}`);
-  return drainSource.slice(from, to);
+  return source.slice(from, to);
 }
+
+function productionGuardedHelper(boundary) {
+  const source = drainSection('const guardedHelper =', 'const mergePr =');
+  return Function('drainWriteContext', `${source} return guardedHelper;`)({ getStore: () => ({ boundary }) });
+}
+
+test('enqueue-only defers send-back without calling its private writer; full pass still calls it', () => {
+  const source = drainSection('  if (!DRY_RUN) {\n    try {\n      const sendBacks =', "  __t.add('classifyGateReads'");
+  for (const writeScope of ['enqueue-only', 'full']) {
+    for (const failedChecks of [true, false]) {
+      const calls = [];
+      const boundary = scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 });
+      const ports = { DRY_RUN: false, guardedHelper: productionGuardedHelper(boundary), sendBackBlockedGates,
+        sendBackBlockedGate: () => { calls.push('send-back'); return { sent: true }; },
+        prsByRepo: new Map([[null, [{ number: 7 }]]]),
+        verdicts: failedChecks ? [{ repo: null, num: 7, decision: 'skip', reason: 'required check "test" FAILURE' }] : [],
+        queueRequiredChecksOf: () => ['test'], localSlug: REPO, repoTag: () => '',
+        isLocalRepo: () => true, siblingCloneDir() {}, join: (...parts) => parts.join('/'), dirname: () => 'fixture',
+        refreshedStatePath: () => 'fixture/state.json', process: { stderr: { write() {} } } };
+      Function(...Object.keys(ports), source)(...Object.values(ports));
+      assert.deepEqual(calls, writeScope === 'full' && failedChecks ? ['send-back'] : []);
+      assert.deepEqual(boundary.violations, writeScope === 'enqueue-only' && failedChecks ? ['defer-to-pass:write-boundary:send-back'] : []);
+      for (const kind of boundary.violations) assert.equal(scope.requireFastDrainDeferKind(kind), kind);
+    }
+  }
+});
+
+test('enqueue-only defers collision repair without calling its private writer; full pass still calls it', () => {
+  const source = drainSection('  const mergeStrategy = createDrainMergeStrategy(', '  const prestageCache =');
+  for (const writeScope of ['enqueue-only', 'full']) {
+    const calls = [];
+    const boundary = scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 });
+    const healLaneRefs = () => { calls.push('lane-repair'); return { actions: [] }; };
+    const ports = { guardedHelper: productionGuardedHelper(boundary), healLaneRefs,
+      createDrainMergeStrategy: options => {
+        const source = drainSection('      const poison = guardEnqueue(', '      if (poison)', strategySource);
+        const ports = { c: { num: 7 }, headSha: HEAD, slugOf: () => REPO, exec() {}, cwd: 'fixture', primary: 'primary',
+          heal: options.heal, log: { write() {} }, env: {},
+          guardEnqueue: options => (options.heal ?? healLaneRefs)('fixture', {}) };
+        return Function(...Object.keys(ports), source)(...Object.values(ports));
+      },
+      resolvedMergePolicy: {}, DRY_RUN: false, AS_JSON: false, isLocalRepo: () => true, localSlug: REPO, isMainFix() {},
+      enqueueOnly: writeScope === 'enqueue-only', onlyPr: 7, writeBoundary: boundary,
+      withLandWriteLock() {}, resolvePrimaryPath: () => 'primary', process: { cwd: () => 'fixture' }, flags: {}, env: {} };
+    const run = () => Function(...Object.keys(ports), source)(...Object.values(ports));
+    if (writeScope === 'enqueue-only') assert.throws(run, /defer-to-pass:write-boundary:lane-repair/);
+    else run();
+    assert.deepEqual(calls, writeScope === 'full' ? ['lane-repair'] : []);
+    assert.deepEqual(boundary.violations, writeScope === 'full' ? [] : ['defer-to-pass:write-boundary:lane-repair']);
+    for (const kind of boundary.violations) assert.equal(scope.requireFastDrainDeferKind(kind), kind);
+  }
+});
 
 test('enqueue-only skips hash repair on main even when the queue probe finds hash cards', () => {
   const source = drainSection('  let numbered = { assigned: [], committed: false };', '  if (landedLocal && !DRY_RUN) {');

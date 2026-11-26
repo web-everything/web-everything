@@ -5,7 +5,7 @@ import { hostname } from 'node:os';
 import { readFileSync, statSync } from 'node:fs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
-import { cascadePolicy, readPlatformPreferences } from './policy-cascade.mjs';
+import { cascadePolicy, resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { validDefaultBranch } from './default-branch-cache.mjs';
 import { isPinnedQueueEntryCommand } from './merge-queue-enqueue.mjs';
@@ -16,7 +16,7 @@ export const FAST_DRAIN_DEFER_KINDS = Object.freeze(new Set([
   'index-setting', 'queue-precondition', 'incomplete-context',
 ].map(kind => `defer-to-pass:${kind}`)));
 export const FAST_DRAIN_WRITE_KINDS = Object.freeze(new Set([
-  'merge', 'refresh', 'numbering-push', 'retarget', 'dequeue', 'label-removal', 'other-pr',
+  'merge', 'refresh', 'numbering-push', 'retarget', 'dequeue', 'label-removal', 'other-pr', 'send-back', 'lane-repair',
   'post-conflict-finding', 'workflow-run', 'labels', 'pr-edit', 'comment', 'pr', 'graphql', 'api', 'gh', 'git', 'exec', 'prior-refusal', 'ledger',
 ]));
 export function isFastDrainDeferKind(kind) {
@@ -39,6 +39,7 @@ export function shaCacheRepo(repo, localSlug) {
 export function resolveFastDrainIndexSetting({ env = process.env, tool, platform, readSettings = readDeclaredSettings,
   readPlatform = readPlatformPreferences } = {}) {
   const closed = () => ({ ok: false, kind: 'defer-to-pass:index-setting', line: 'fast-drain: defer-to-pass:index-setting' });
+  let nestedPlatform;
   try {
     if (tool === undefined) {
       const settings = readSettings();
@@ -48,20 +49,23 @@ export function resolveFastDrainIndexSetting({ env = process.env, tool, platform
     if (platform === undefined) {
       const p = readPlatform({ env });
       if (p.errors?.length) return closed();
-      platform = p.prefs?.['mergeQueue.fastDrain.index'] !== undefined
-        ? { index: p.prefs['mergeQueue.fastDrain.index'] } : p.prefs?.['mergeQueue.fastDrain'];
+      platform = p.prefs?.['mergeQueue.fastDrain'];
+      nestedPlatform = p.prefs?.['mergeQueue.fastDrain.index'];
     }
     const validAge = v => Number.isInteger(v) && v >= 1 && v <= 120;
     const validBudget = v => Number.isInteger(v) && v >= 0 && v <= 50;
-    for (const block of [tool, platform]) {
+    for (const block of [tool, platform, ...(nestedPlatform === undefined ? [] : [{ index: nestedPlatform }])]) {
       if (block !== undefined && (block === null || typeof block !== 'object' || Array.isArray(block))) return closed();
       if (block && Object.hasOwn(block, 'index') && (!block.index || typeof block.index !== 'object' || Array.isArray(block.index))) return closed();
       for (const [key, valid] of [['maxAgeMinutes', validAge], ['hydrateBudget', validBudget]]) {
         if (block?.index && Object.hasOwn(block.index, key) && !valid(block.index[key])) return closed();
       }
     }
+    const platformIndex = resolveCascade({ platform: platform?.index, tool: nestedPlatform,
+      valid: { maxAgeMinutes: validAge, hydrateBudget: validBudget } });
+    if (platformIndex.invalid.length) return closed();
     const parseEnv = key => env[key] === undefined ? undefined : /^\d+$/.test(env[key]) ? Number(env[key]) : null;
-    const c = cascadePolicy('mergeQueue.fastDrain.index', tool?.index, { env, platform: platform?.index,
+    const c = cascadePolicy('mergeQueue.fastDrain.index', tool?.index, { env, platform: platformIndex.value ?? {},
       standard: { maxAgeMinutes: 40, hydrateBudget: 10 },
       envValues: { maxAgeMinutes: parseEnv('WE_FAST_DRAIN_INDEX_MAX_AGE_MINUTES'), hydrateBudget: parseEnv('WE_FAST_DRAIN_INDEX_HYDRATE_BUDGET') },
       valid: { maxAgeMinutes: validAge, hydrateBudget: validBudget }, log: () => {} });

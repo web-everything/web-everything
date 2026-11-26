@@ -145,7 +145,7 @@ import {
   collapseRollupToLatestPerName, latestCheckNamed, isFailedCheckRow,
   requiredCheckReadNeeded, requiredCheckRunsEndpoint, mergeRequiredCheckRuns,
 } from './lib/rollup-collapse.mjs';
-import { describeBlockedChecks, sendBackBlockedGates } from './lib/drain-blocked-reason.mjs';
+import { describeBlockedChecks, sendBackBlockedGate, sendBackBlockedGates } from './lib/drain-blocked-reason.mjs';
 import { CODEQL_CHECK_NAME, loadDrainGateSettings } from './lib/codeql-gate.mjs';
 export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingCommit } from './lib/ai-pr-authorship.mjs';
 export { isAiGeneratedPr, hasLabel };
@@ -234,6 +234,7 @@ import { reviewCiGate } from './lib/review-ci-gate.mjs';
 import { resolveRequiredChecks } from './lib/check-state-predicate.mjs';
 import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal, resolveRefreshOnStaleMergeGate, handleStaleMergeGate } from './lib/merge-queue-enqueue.mjs';
 import { recordEnqueueOutcome } from './lib/drain-poison-guard.mjs';
+import { healLaneRefs } from './lib/lane-repair.mjs';
 import { createAsyncShadow } from './lib/drain-async-shadow.mjs';
 import { appendDaemonEvent } from './lib/daemon-events.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
@@ -5278,6 +5279,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
     writeScope: enqueueOnly ? 'enqueue-only' : 'full', targetPr: Number(onlyPr), writeBoundary,
+    heal: guardedHelper('lane-repair', healLaneRefs),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
   function enqueueWithSameHeadGuard(c, sha, options, approvedHeadHold, shadow) {
@@ -6266,6 +6268,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   if (!DRY_RUN) {
     try {
       const sendBacks = sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf: queueRequiredChecksOf, localSlug,
+        sendBack: guardedHelper('send-back', sendBackBlockedGate),
         cwdOf: repo => isLocalRepo(repo) ? undefined : siblingCloneDir(repo),
         ledgerPath: join(dirname(refreshedStatePath()), 'drain-gate-send-backs.json') });
       for (const outcome of sendBacks) process.stderr.write(`  ${repoTag(outcome.repo)}${outcome.num} required-check send-back: ${outcome.sent ? 'review:changes' : 'skipped'}${outcome.reason ? `; ${outcome.reason}` : ''}\n`);

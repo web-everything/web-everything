@@ -141,13 +141,13 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
 }
 
 /** Side effects live in the pass, never in classifyPr's pure BLOCKED arm. */
-export function sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf, localSlug, cwdOf, ledgerPath, exec } = {}) {
+export function sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf, localSlug, cwdOf, ledgerPath, exec, sendBack = sendBackBlockedGate } = {}) {
   const outcomes = [];
   for (const verdict of verdicts) {
     if (verdict.decision !== 'skip' || classifySkipReason(verdict.reason) !== 'checks-failed') continue;
     try {
       const pr = prsByRepo.get(verdict.repo)?.find(pr => pr.number === verdict.num);
-      const outcome = sendBackBlockedGate({ pr, headSha: verdict.listedHeadSha, requiredChecks: requiredChecksOf(verdict.repo),
+      const outcome = sendBack({ pr, headSha: verdict.listedHeadSha, requiredChecks: requiredChecksOf(verdict.repo),
         repo: verdict.repo || localSlug, cwd: cwdOf(verdict.repo), ledgerPath, exec });
       if (outcome.sent || outcome.reason) outcomes.push({ num: verdict.num, repo: verdict.repo, ...outcome });
     } catch { /* Best effort: the failed-check verdict still keeps this PR skipped. */ }

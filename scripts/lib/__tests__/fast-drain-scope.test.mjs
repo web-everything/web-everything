@@ -48,6 +48,22 @@ describe('fast-drain identity index bounds', () => {
     expect(setting({ tool: undefined, readSettings: () => { throw new Error('EACCES'); } })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
     expect(setting({ tool: undefined, readSettings: () => ({ errors: [{ error: 'bad JSON' }], settings: {} }) })).toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
   });
+  it('merges parent platform index bounds with the nested platform policy', () => {
+    const s = setting({ platform: undefined, readPlatform: () => ({ prefs: {
+      'mergeQueue.fastDrain': { index: { maxAgeMinutes: 1, hydrateBudget: 3 } },
+      'mergeQueue.fastDrain.index': { hydrateBudget: 2 },
+    } }) });
+    expect(s).toMatchObject({ ok: true, maxAgeMinutes: 1, hydrateBudget: 2 });
+    expect(s.line).toMatch(/maxAgeMinutes=1 \(platform\).*hydrateBudget=2 \(platform\)/);
+  });
+  it.each([null, [], 1, { index: null }, { index: [] }, { index: { maxAgeMinutes: null } },
+    { index: { maxAgeMinutes: 1.5 } }, { index: { maxAgeMinutes: 121 } }, { index: { hydrateBudget: -1 } }])(
+    'invalid parent platform policy defers even when nested and tool policies override it: %s', parent => {
+      expect(setting({ platform: undefined, tool: { index: { maxAgeMinutes: 20, hydrateBudget: 10 } },
+        readPlatform: () => ({ prefs: { 'mergeQueue.fastDrain': parent,
+          'mergeQueue.fastDrain.index': { maxAgeMinutes: 2, hydrateBudget: 2 } } }) }))
+        .toMatchObject({ ok: false, kind: 'defer-to-pass:index-setting' });
+    });
   it('index settings resolve independently and log provenance', () => {
     const s = setting({ platform: { index: { hydrateBudget: 4 } }, tool: { index: { maxAgeMinutes: 20 } } });
     expect(s).toMatchObject({ ok: true, maxAgeMinutes: 20, hydrateBudget: 4 });
