@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import ts from 'typescript';
 import { assertCapability } from '../lib/repo-profile.mjs';
 import { createDrainMergeStrategy } from '../lib/drain-merge-strategy.mjs';
+import { createFastDrainWriteBoundary } from '../lib/fast-drain-scope.mjs';
 
 const source = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
 const file = ts.createSourceFile('merge-ai-prs.mjs', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -94,6 +95,8 @@ function collect(node) { nodes.push(node); ts.forEachChild(node, collect); }
 collect(file);
 const declaration = name => nodes.find(n => ts.isVariableDeclaration(n) && n.name.getText(file) === name);
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+// Capability inventory exercises the legacy/full-pass path with the real boundary.
+const fullPassPorts = () => ({ enqueueOnly: false, writeBoundary: createFastDrainWriteBoundary({ writeScope: 'full' }) });
 function compile(body, wiring, async = false) {
   const run = new (async ? AsyncFunction : Function)(...Object.keys(wiring), body);
   return () => run(...Object.values(wiring));
@@ -133,7 +136,7 @@ describe('lander write path inventory', () => {
     const push = vi.fn(), rerun = vi.fn();
     const checked = vi.fn(() => { push(); rerun(); });
     const run = compile(`return (${declaration('refreshApprovedHead').initializer.getText(file)})({repo: 'longshore', num: 42}, {});`, {
-      assertCapability, localSlug: 'we', refreshApprovedHeadChecked: checked,
+      ...fullPassPorts(), assertCapability, localSlug: 'we', refreshApprovedHeadChecked: checked,
     });
     expect(run()).toMatchObject({ ok: false, action: 'unsupported-repo' });
     expect(checked).not.toHaveBeenCalled();
@@ -141,10 +144,22 @@ describe('lander write path inventory', () => {
     expect(rerun).not.toHaveBeenCalled();
   });
 
+  it.each(['we', 'longshore'])('enqueue-only refresh for %s refuses before capability admission or effects', repo => {
+    const admission = vi.fn(assertCapability), checked = vi.fn();
+    const writeBoundary = createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo, num: 42 });
+    const run = compile(`return (${declaration('refreshApprovedHead').initializer.getText(file)})({repo, num: 42}, {});`, {
+      repo, enqueueOnly: true, writeBoundary, assertCapability: admission, localSlug: 'we', refreshApprovedHeadChecked: checked,
+    });
+    expect(run).toThrow('defer-to-pass:write-boundary:refresh');
+    expect(admission).not.toHaveBeenCalled();
+    expect(checked).not.toHaveBeenCalled();
+    expect(writeBoundary.violations).toEqual(['defer-to-pass:write-boundary:refresh']);
+  });
+
   it.each([true, false])('merge-queue freshness (couple precheck=%s) reaches admission before refresh push / CI rerun', async precheck => {
     const push = vi.fn(), rerun = vi.fn(), aborts = [];
     const refresh = compile(`return (${declaration('refreshApprovedHead').initializer.getText(file)})({repo: 'longshore', num: 42}, {});`, {
-      assertCapability, localSlug: 'we', refreshApprovedHeadChecked: () => { push(); rerun(); },
+      ...fullPassPorts(), assertCapability, localSlug: 'we', refreshApprovedHeadChecked: () => { push(); rerun(); },
     });
     const run = compile(`return (${declaration('mergeQueueGate').initializer.getText(file)})({repo: 'longshore', num: 42}, 'a', {precheck: ${precheck}});`, {
       mergeQueueHookEnabled: () => true, MERGE_QUEUE: {freshness: {maxAgeMinutes: 60}}, mergeStrategy: {queueOwnsFreshness: () => false},
@@ -165,7 +180,7 @@ describe('lander write path inventory', () => {
     const callback = call.arguments[0].properties.find(n => n.name?.getText(file) === 'refreshStalePr').initializer;
     const push = vi.fn(), rerun = vi.fn();
     const refreshApprovedHead = (v, options) => compile(`return (${declaration('refreshApprovedHead').initializer.getText(file)})(v, options);`, {
-      v, options, assertCapability, localSlug: 'we', refreshApprovedHeadChecked: () => {push(); rerun();},
+      ...fullPassPorts(), v, options, assertCapability, localSlug: 'we', refreshApprovedHeadChecked: () => {push(); rerun();},
     })();
     const result = compile(`return (${callback.getText(file)})({});`, {c: {repo: 'longshore'}, refreshApprovedHead})();
     expect(result).toMatchObject({ok: false, action: 'unsupported-repo'});
@@ -175,10 +190,11 @@ describe('lander write path inventory', () => {
 
   it('renamed-card refresh refuses capability-off before branch refresh / CI restart', async () => {
     const refresh = vi.fn();
-    const node = nodes.find(n => ts.isIfStatement(n) && n.getText(file).includes('await runRenamedPrRefresh('));
+    const node = nodes.find(n => ts.isIfStatement(n) && n.getText(file).includes('await writeBoundary.fullPassDuty(() => runRenamedPrRefresh('));
+    expect(node).toBeTruthy();
     const statements = [...node.parent.statements], at = statements.indexOf(node);
     const run = compile(statements.slice(at - 2, at + 1).map(n => n.getText(file)).join('\n'), {
-      assertCapability, localSlug: 'longshore', log: { write: vi.fn() }, REPOS: [null], isLocalRepo: () => true,
+      ...fullPassPorts(), assertCapability, localSlug: 'longshore', log: { write: vi.fn() }, REPOS: [null], isLocalRepo: () => true,
       runRenamedPrRefresh: refresh,
     }, true);
     await run();
@@ -224,7 +240,7 @@ describe('lander write path inventory', () => {
     const end = declaration('landedLocal').parent.parent;
     const statements = [...start.parent.statements];
     const run = compile(statements.slice(statements.indexOf(start), statements.indexOf(end) + 1).map(n => n.getText(file)).join('\n') + '\nreturn {landedLocal, localWriteRefusal};', {
-      assertCapability, localSlug: 'longshore', AS_JSON: true, DRY_RUN: false,
+      ...fullPassPorts(), assertCapability, localSlug: 'longshore', AS_JSON: true, DRY_RUN: false,
       merged: [{repo: 'longshore'}], isLocalRepo: () => true,
       handOffDrainFollowup: async opts => { if (opts.landed && !opts.dryRun) { launch(); push(); } return { handedOff: false }; },
       __t: {mark: () => 0},
@@ -232,11 +248,12 @@ describe('lander write path inventory', () => {
     expect(await run()).toMatchObject({ landedLocal: false, localWriteRefusal: {kind: 'unsupported-repo'} });
     expect(launch).not.toHaveBeenCalled();
     expect(push).not.toHaveBeenCalled();
-    const repair = nodes.find(n => ts.isIfStatement(n) && n.thenStatement.getText(file).startsWith('numbered = repairHashOnMain('));
-    const repairRun = compile(repair.getText(file), { localWriteRefusal: {}, queuedHashOnMain: true, landedLocal: false, DRY_RUN: false, repairHashOnMain: push });
+    const repair = nodes.find(n => ts.isIfStatement(n) && n.thenStatement.getText(file).startsWith('numbered = writeBoundary.fullPassDuty(() => repairHashOnMain('));
+    expect(repair).toBeTruthy();
+    const repairRun = compile(repair.getText(file), { ...fullPassPorts(), localWriteRefusal: {}, queuedHashOnMain: true, landedLocal: false, DRY_RUN: false, repairHashOnMain: push });
     repairRun();
     const sweep = vi.fn();
-    compile(declaration('strandedSweep').parent.parent.getText(file), { runStrandedSweepStep: opts => { if (!opts.dryRun) sweep(); }, DRY_RUN: false, localWriteRefusal: {}, AS_JSON: true, redMainHeld: false })();
+    compile(declaration('strandedSweep').parent.parent.getText(file), { isDrainShadow: () => false, runStrandedSweepStep: opts => { if (!opts.dryRun) sweep(); }, DRY_RUN: false, localWriteRefusal: {}, AS_JSON: true, redMainHeld: false })();
     expect(push).not.toHaveBeenCalled();
     expect(sweep).not.toHaveBeenCalled();
   });
@@ -253,7 +270,7 @@ describe('lander write path inventory', () => {
     });
     // Exercise the shipped refusal, landedLocal and completion expressions, then the real state writer.
     const wiring = {
-      assertCapability, localSlug, DRY_RUN: false, merged: pending, isLocalRepo: () => true,
+      ...fullPassPorts(), assertCapability, localSlug, DRY_RUN: false, merged: pending, isLocalRepo: () => true,
       followup: { handedOff: false }, localSynced: true, numbered: {},
       resolveOnLandReport: { failed: [] }, derived: { failed: [] }, mergeStrategy, queueFollowUps: pending,
     };

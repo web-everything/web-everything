@@ -491,8 +491,12 @@ describe('T5c: the spawned drain reads with the workflow token on a fresh runner
 
   it('every drain auth call in merge-ai-prs routes through the CI read-only exemption', () => {
     const src = readFileSync(new URL('../merge-ai-prs.mjs', import.meta.url), 'utf8');
-    // The exported entry uses injected inputs; the real CLI supplies process values.
-    expect(src).toMatch(/export async function main\(argv, \{ env = process\.env/);
+    // The index dispatcher forwards injected options to the inner drain entry.
+    expect(src).toMatch(/export async function main\(argv, options = \{\}\)/);
+    expect(src).toContain('const env = options.env ?? process.env;');
+    expect(src).toContain('runIndexMain(argv, options)');
+    expect(src).toContain('runMain(argv, options)');
+    expect(src).toMatch(/async function runMain\(argv, \{ env = process\.env/);
     expect(src).toMatch(/if \(IS_CLI\) main\(process\.argv\.slice\(2\)\)/);
     // Every call, whatever its argument shape (an options variable would bypass an object-literal match).
     const calls = src.split('\n').filter(line => /ensureFreshGithubAppEnv\s*\(/.test(line) && !/^\s*(\/\/|\*)/.test(line));
