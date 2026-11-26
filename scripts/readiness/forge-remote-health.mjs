@@ -3,6 +3,7 @@
 import {readFileSync, writeFileSync, renameSync, rmSync, lstatSync, readdirSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
+import {validRemoteHosts} from './remote-target.mjs';
 import {reserve, readLockEntry, releaseLockDir} from './file-locks.mjs';
 import {parseTelemetry} from './forge-exec-run.mjs';
 import {readForgeTelemetry, pingForge} from './forge-telemetry.mjs';
@@ -91,8 +92,15 @@ async function transaction(root,action,host='forge',onQuarantine=()=>{}) {
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
-export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host=settings.hosts?.[0]?.alias,ping=pingForge}) {
-  if (!host) return {ok:false,status:'no-remote-host',reason:'no remote host configured'};
+export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host=settings?.hosts?.[0]?.alias,ping=pingForge,policyInvalid=[]}) {
+  // Only a successfully read, valid empty roster proves there is no configured host.
+  // Missing or invalid evidence must remain visible instead of suppressing health failures.
+  if (!host) {
+    if (policyInvalid.length || !validRemoteHosts(settings?.hosts) || settings.hosts.length !== 0)
+      return {ok:false,reason:'remote-settings-invalid'};
+    return {ok:false,status:'no-remote-host',reason:'no remote host configured'};
+  }
+  if (!validRemoteHosts([{alias:host,root:'/srv/forge-exec'}])) return {ok:false,reason:'remote-settings-invalid'};
   let quarantineDetail='';
   const finish=result=>{
     if(result.ok)return result;

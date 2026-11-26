@@ -1382,7 +1382,7 @@ export async function runWithRemoteDecision({
   // Local heartbeat workers can be terminated during import. Keep Forge's top-level awaits out of
   // that import graph: terminating an evaluating async module can crash Node with SIGTRAP.
   const { checkRemoteHealth, recordRemoteResult, peekRemoteTelemetry } = await import('./forge-remote-health.mjs');
-  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host});
+  const health = () => checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,policyInvalid:policy.invalid,clock,readTelemetry,host});
   const healthy = await health();
   if (!healthy.ok) return localFallback(healthy.reason, healthy.detail);
   const owner = `remote-${process.pid}-${randomBytes(12).toString('hex')}`;
@@ -1432,7 +1432,7 @@ export async function runWithRemoteDecision({
         markerReapers.set(markerHost,reaper);
       }
       await reaper.step(async()=>{
-        const state = await checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,clock,readTelemetry,host:markerHost});
+        const state = await checkRemoteHealth({root:remoteRoot,settings:policy.settings.remote,policyInvalid:policy.invalid,clock,readTelemetry,host:markerHost});
         return state.ok ? peekRemoteTelemetry({root:remoteRoot,host:markerHost}) : null;
       },nowMs).catch(()=>[]);
     }

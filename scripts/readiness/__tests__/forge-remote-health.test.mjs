@@ -25,6 +25,29 @@ it('no remote host configured → status no-remote-host, no alert', async()=>{
   expect(readdirSync(root)).toEqual([]);
 });
 
+it.each([
+  ['missing host list', {...settings}],
+  ['null settings', null],
+  ['invalid host list', {...settings,hosts:'invalid'}],
+  ['malformed host entry', {...settings,hosts:[{}]}],
+  ['invalid alias', {...settings,hosts:[{alias:'bad host',root:'/srv/forge-exec'}]}],
+])('fails closed on %s instead of quieting as no-remote-host', async (_label, invalidSettings)=>{
+  const root=scratch(), readTelemetry=vi.fn(), ping=vi.fn();
+  expect(await checkRemoteHealth({root,settings:invalidSettings,readTelemetry,ping}))
+    .toEqual({ok:false,reason:'remote-settings-invalid'});
+  expect(readTelemetry).not.toHaveBeenCalled();
+  expect(ping).not.toHaveBeenCalled();
+  expect(readdirSync(root)).toEqual([]);
+});
+it('does not quiet an empty fallback roster after a settings read failure', async()=>{
+  const root=scratch(), readTelemetry=vi.fn(), ping=vi.fn();
+  expect(await checkRemoteHealth({root,settings:{...settings,hosts:[]},policyInvalid:['platform: unreadable preferences'],readTelemetry,ping}))
+    .toEqual({ok:false,reason:'remote-settings-invalid'});
+  expect(readTelemetry).not.toHaveBeenCalled();
+  expect(ping).not.toHaveBeenCalled();
+  expect(readdirSync(root)).toEqual([]);
+});
+
 describe('health state generation isolation',()=>{
   it.each(['forge','other-forge'])('seeds an active legacy breaker for %s without carrying telemetry or touching legacy bytes',async host=>{
     vi.spyOn(Date,'now').mockReturnValue(now);

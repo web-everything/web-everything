@@ -37,11 +37,15 @@ async function receive(producer) {
   expect(await checkRemoteHealth({host:'forge',root: remote, settings, clock: () => now, readTelemetry})).toEqual({ok: true});
   expect(peekRemoteTelemetry({root: remote})).toBeTruthy();
   const health = JSON.parse(await readFile(join(remote, 'health-g2.json'), 'utf8'));
-  const wired = {...smell, evaluate: (probes, ctx) => smell.evaluate(probes, {...ctx, hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: () => health})};
+  const wired = {...smell, evaluate: (probes, ctx) => smell.evaluate(probes, {...ctx,  readForgeHealth: () => health})};
   return runHealthTick(emptyHealthState(), {}, [wired], now);
 }
 
 describe('Forge producer → SSH parser → health cache → notification', () => {
+  it('retains the disk-prune alarm independently of the remote host roster', () => {
+    const results = smell.evaluate({}, {hosts: [], now, readForgeHealth: () => ({telemetry: {sampledAtET: new Date(now).toISOString(), diskUsedPct: 100, prune: {consecutiveRefused: 0}}})});
+    expect(results).toEqual([expect.objectContaining({subject: 'forge-disk-prune', breach: true, escalation: expect.objectContaining({status: 'needs-you'})})]);
+  });
   it.each([['root disk full', 0, {blocks: 100, bfree: 0, bavail: 0}],
     ['three prune refusals', 3, undefined]])('notifies needs-you for %s', async (_label, refused, disk) => {
     for (let i = 0; i < refused; i++) await recordPruneResult(receipts, 'Invalid reserved lock evidence');
@@ -58,7 +62,7 @@ describe('Forge producer → SSH parser → health cache → notification', () =
     expect(tick.state.episodes['forge-disk-prune::forge-disk-prune']).toBeUndefined();
     const telemetry = peekRemoteTelemetry({root: join(root, 'remote')});
     expect(telemetry).toMatchObject({diskUsedPct: 35, prune: {consecutiveRefused: 0, lastRefusal: ''}});
-    expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}],now, readForgeHealth: () => ({telemetry})})).toEqual([{
+    expect(smell.evaluate({}, {now, readForgeHealth: () => ({telemetry})})).toEqual([{
       subject: 'forge-disk-prune', breach: false,
       measure: {diskUsedPct: 35, consecutiveRefused: 0, lastRefusal: ''},
       summary: 'Forge disk 35% used, prune refusals 0 (ok).', recommendation: 'No action.',
@@ -77,14 +81,14 @@ describe('Forge producer → SSH parser → health cache → notification', () =
     const sample = parseTelemetry(JSON.stringify(await runner({blocks: 100, bfree: 0, bavail: 0}).telemetry()));
     expect(sample.diskUsedPct).toBe(100);
     expect(sample).not.toHaveProperty('prune');
-    expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}],now, readForgeHealth: () => ({telemetry: sample})})[0].escalation.status).toBe('needs-you');
+    expect(smell.evaluate({}, {now, readForgeHealth: () => ({telemetry: sample})})[0].escalation.status).toBe('needs-you');
   });
   it('omits unavailable or invalid fields and leaves an observable low note', async () => {
     for (const disk of [new Error('unavailable'), {blocks: 0, bfree: 0, bavail: 0}, {blocks: 10, bfree: 11, bavail: 0}]) {
       const sample = parseTelemetry(JSON.stringify(await runner(disk).telemetry()));
       expect(sample).not.toHaveProperty('diskUsedPct');
       expect(sample).not.toHaveProperty('prune');
-      expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}],now, readForgeHealth: () => ({telemetry: sample})})[0].severity).toBe('low');
+      expect(smell.evaluate({}, {now, readForgeHealth: () => ({telemetry: sample})})[0].severity).toBe('low');
     }
   });
   it('includes reserved blocks in root disk pressure like df and rounds up', async () => {

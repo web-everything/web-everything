@@ -3,7 +3,6 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import smell from '../forge-disk-prune.mjs';
-import { loadAdmissionPolicy, resolveAdmissionPolicy } from '../../../readiness/heavy-admission.mjs';
 import * as forgeDiskPrune from '../forge-disk-prune.mjs';
 import { emptyHealthState, stepEpisodes, planActions } from '../../health-watch-core.mjs';
 import { NOTIFY_EVEN_IN_SHADOW } from '../../health-smells-notify-list.mjs';
@@ -11,72 +10,10 @@ import { validateSmellShape } from '../../health-smells-shape.mjs';
 
 const NOW = Date.parse('2026-11-15T20:00:00-05:00');
 const fresh = '2026-11-15T19:55:00.000-05:00';
-const run = (telemetry) => smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => (telemetry === undefined ? null : { telemetry: telemetry && { sampledAtET: fresh, ...telemetry } }) });
+const run = (telemetry) => smell.evaluate({}, { now: NOW, readForgeHealth: () => (telemetry === undefined ? null : { telemetry: telemetry && { sampledAtET: fresh, ...telemetry } }) });
 const refusal = 'forge-cache-prune: refused: Invalid reserved lock evidence';
 
 describe('forge-disk-prune smell', () => {
-  it('no remote host configured → status no-remote-host, no alert', () => {
-    const readForgeHealth=vi.fn();
-    const results=smell.evaluate({}, {hosts:[],readForgeHealth});
-    expect(results).toEqual([expect.objectContaining({status:'no-remote-host',breach:false})]);
-    expect(readForgeHealth).not.toHaveBeenCalled();
-    const tick=stepEpisodes(emptyHealthState(),[{smell,results}],NOW);
-    expect(planActions(tick.transitions,{[smell.id]:smell})).toEqual([]);
-  });
-  it.each([[], null, 'invalid', [{alias:'bad host',root:'/srv/forge-exec'}]])('preserves needs-you without healthy telemetry for hosts %j', (hosts) => {
-    const breached=stepEpisodes(emptyHealthState(),[{smell,results:run({diskUsedPct:100,prune:{consecutiveRefused:0}})}],NOW);
-    const readForgeHealth=vi.fn();
-    const results=smell.evaluate({}, {hosts,readForgeHealth,episodes:breached.state.episodes});
-    const tick=stepEpisodes(breached.state,[{smell,results}],NOW+1);
-    const again=stepEpisodes(tick.state,[{smell,results}],NOW+2);
-    expect(again.state.episodes['forge-disk-prune::forge-disk-prune']?.escalation?.status).toBe('needs-you');
-    expect(results).toContainEqual(expect.objectContaining({breach:true,escalation:expect.objectContaining({status:'needs-you'})}));
-    expect(readForgeHealth).not.toHaveBeenCalled();
-  });
-  it.each(['invalid host settings', 'cold-start preference read failure', 'throwing preference reader'])('fails closed on %s rather than declaring no remote host', (kind) => {
-    const readForgeHealth=vi.fn();
-    const root=mkdtempSync(join(tmpdir(),'disk-prune-preferences-'));
-    const prefs=join(root,'preferences.json');
-    writeFileSync(prefs,'{malformed');
-    const loadPolicy=() => {
-      if (kind === 'throwing preference reader') throw new Error('preferences unreadable');
-      if (kind === 'invalid host settings') return resolveAdmissionPolicy({platform:{remote:{hosts:'invalid'}}});
-      return loadAdmissionPolicy({env:{WE_PLATFORM_PREFERENCES:prefs},repoRoot:root,home:root});
-    };
-    try {
-      const [result]=smell.evaluate({}, {loadPolicy,readForgeHealth});
-      expect(result).toMatchObject({breach:true,severity:'low'});
-      expect(result.status).not.toBe('no-remote-host');
-      expect(result.summary).toMatch(/unobservable/);
-      expect(readForgeHealth).not.toHaveBeenCalled();
-    } finally { rmSync(root,{recursive:true,force:true}); }
-  });
-  it('checks every host and keeps Forge needs-you independent of healthy Mesa and host order', () => {
-    const hosts=[{alias:'mesa-01',root:'/srv/forge-exec'},{alias:'forge',root:'/srv/forge-exec'}];
-    const readForgeHealth=vi.fn(({host}) => ({telemetry:{sampledAtET:fresh,diskUsedPct:host === 'forge' ? 100 : 20,prune:{consecutiveRefused:0}}}));
-    const results=smell.evaluate({}, {hosts,readForgeHealth,now:NOW});
-    expect(readForgeHealth.mock.calls.map(([arg]) => arg.host)).toEqual(['mesa-01','forge']);
-    expect(results).toHaveLength(2);
-    expect(new Set(results.map(r => r.subject)).size).toBe(2);
-    expect(results.find(r => r.measure.diskUsedPct === 100)).toMatchObject({breach:true,escalation:{status:'needs-you'}});
-    const opened=stepEpisodes(emptyHealthState(),[{smell,results}],NOW);
-    const missing=smell.evaluate({}, {hosts:[...hosts].reverse(),now:NOW,episodes:opened.state.episodes,
-      readForgeHealth:({host}) => host === 'forge' ? null : readForgeHealth({host})});
-    const tick=stepEpisodes(opened.state,[{smell,results:missing}],NOW+1);
-    const again=stepEpisodes(tick.state,[{smell,results:missing}],NOW+2);
-    expect(again.state.episodes['forge-disk-prune::forge-disk-prune']?.escalation?.status).toBe('needs-you');
-    expect(missing.find(r => r.breach)).toMatchObject({escalation:{status:'needs-you'}});
-    // Removing Forge from a valid roster also supplies no healthy Forge evidence.
-    const removed=smell.evaluate({}, {hosts:[hosts[0]],readForgeHealth,now:NOW,episodes:opened.state.episodes});
-    expect(removed.find(r => r.subject === 'forge-disk-prune')).toMatchObject({breach:true,escalation:{status:'needs-you'}});
-    // A Mesa breach has its own sticky identity and clears only after healthy Mesa samples.
-    const both=smell.evaluate({}, {hosts,now:NOW,readForgeHealth:() => ({telemetry:{sampledAtET:fresh,diskUsedPct:100,prune:{consecutiveRefused:0}}})});
-    const bothOpen=stepEpisodes(emptyHealthState(),[{smell,results:both}],NOW);
-    const firstClean=stepEpisodes(bothOpen.state,[{smell,results}],NOW+1);
-    const secondClean=stepEpisodes(firstClean.state,[{smell,results}],NOW+2);
-    expect(Object.values(secondClean.state.episodes)).toHaveLength(1);
-    expect(secondClean.state.episodes['forge-disk-prune::forge-disk-prune'].escalation.status).toBe('needs-you');
-  });
   it('has a valid shape and notifies even in shadow', () => {
     expect(() => validateSmellShape(smell, 'forge-disk-prune.mjs')).not.toThrow();
     expect(NOTIFY_EVEN_IN_SHADOW.has('forge-disk-prune')).toBe(true);
@@ -114,17 +51,17 @@ describe('forge-disk-prune smell', () => {
     }
   });
   it('a throwing reader is a note, not a crash', () => {
-    const out = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: () => { throw new Error('boom\n\x1b\u2028\u202e' + 'x'.repeat(500)); } });
+    const out = smell.evaluate({}, { readForgeHealth: () => { throw new Error('boom\n\x1b\u2028\u202e' + 'x'.repeat(500)); } });
     expect(out[0].summary).toMatch(/unobservable/);
     expect(out[0].summary).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
     expect(out[0].summary).not.toContain('x'.repeat(81));
   });
   it('missing health file -> note on the SAME subject (never closes an open episode); not applicable only under test', () => {
     const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
-    expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: enoent })).toEqual([]);
+    expect(smell.evaluate({}, { readForgeHealth: enoent })).toEqual([]);
     const prev = process.env.VITEST; delete process.env.VITEST;
     try {
-      const out = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: enoent });
+      const out = smell.evaluate({}, { readForgeHealth: enoent });
       expect(out[0]).toMatchObject({ subject: 'forge-disk-prune', breach: true, severity: 'low' });
       expect(out[0].summary).toMatch(/no remote health file/);
     } finally { process.env.VITEST = prev; }
@@ -140,10 +77,10 @@ describe('forge-disk-prune smell', () => {
     expect(g.escalation.status).toBe('needs-you');
   });
   it('a stale or undated healthy sample is an unobservable note, never an all-clear', () => {
-    const old = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => ({ telemetry: { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    const old = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
     expect(old[0].severity).toBe('low');
     expect(old[0].summary).toMatch(/stale/);
-    const undated = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => ({ telemetry: { diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    const undated = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
     expect(undated[0].summary).toMatch(/unobservable/);
   });
   it('default reader sees a real breach at the writer path and rejects oversized health files', () => {
@@ -155,14 +92,14 @@ describe('forge-disk-prune smell', () => {
       const file = join(remote, 'health-g2.json');
       const json = JSON.stringify({ telemetry: { sampledAtET: fresh, diskUsedPct: 100, prune: { consecutiveRefused: 0 } } });
       writeFileSync(file, json);
-      expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW })[0].escalation?.status).toBe('needs-you');
+      expect(smell.evaluate({}, { now: NOW })[0].escalation?.status).toBe('needs-you');
       writeFileSync(file, json.padEnd(64 * 1024, ' '));
-      expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW })[0].escalation?.status).toBe('needs-you');
+      expect(smell.evaluate({}, { now: NOW })[0].escalation?.status).toBe('needs-you');
       writeFileSync(file, json.padEnd(64 * 1024 + 1, ' '));
-      const [oversized] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW });
+      const [oversized] = smell.evaluate({}, { now: NOW });
       expect(oversized.severity).toBe('low');
       expect(oversized.summary).toMatch(/unobservable.*exceeds.*65536/);
-      const [sticky] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, episodes: { [key]: { escalation: { status: 'needs-you' } } } });
+      const [sticky] = smell.evaluate({}, { now: NOW, episodes: { [key]: { escalation: { status: 'needs-you' } } } });
       expect(sticky.escalation?.status).toBe('needs-you');
     } finally {
       vi.unstubAllEnvs();
@@ -206,7 +143,7 @@ describe('forge-disk-prune smell', () => {
     expect(f.measure.lastRefusal).toContain('`"--../');
   });
   it.each(['fresh note', 'persisted high note'])('unobservable episode stays low and later breach notifies once: %s', (kind) => {
-    const tick = (state, telemetry, now) => stepEpisodes(state, [{ smell, results: smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}],
+    const tick = (state, telemetry, now) => stepEpisodes(state, [{ smell, results: smell.evaluate({}, {
       now, episodes: state.episodes, readForgeHealth: () => ({ telemetry: { sampledAtET: fresh, ...telemetry } }),
     }) }], now);
     const note = tick(emptyHealthState(), {}, NOW);
@@ -226,7 +163,7 @@ describe('forge-disk-prune smell', () => {
     expect(tick(clean.state, healthy, NOW + 4).state.episodes[key]).toBeUndefined();
   });
   const key = 'forge-disk-prune::forge-disk-prune';
-  const withEpisode = (telemetry, episodes) => smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, episodes, readForgeHealth: () => ({ telemetry }) });
+  const withEpisode = (telemetry, episodes) => smell.evaluate({}, { now: NOW, episodes, readForgeHealth: () => ({ telemetry }) });
   it('R952 sticky: open needs-you + telemetry missing -> still needs-you "breach open, telemetry now missing"', () => {
     for (const t of [null, { cores: 1 }, { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } }]) {
       const [f] = withEpisode(t, { [key]: { escalation: { status: 'needs-you' } } });
@@ -254,7 +191,7 @@ describe('forge-disk-prune smell', () => {
   });
   it('R952 sticky holds even under test when the health file is missing and an episode is open', () => {
     const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
-    const [f] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], episodes: { [key]: { escalation: { status: 'needs-you' } } }, readForgeHealth: enoent });
+    const [f] = smell.evaluate({}, { episodes: { [key]: { escalation: { status: 'needs-you' } } }, readForgeHealth: enoent });
     expect(f.escalation.status).toBe('needs-you');
   });
 });
