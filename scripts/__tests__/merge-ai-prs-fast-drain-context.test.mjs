@@ -1,7 +1,7 @@
 import { test as nodeTest } from 'node:test';
 const test = process.env.VITEST ? (await import('vitest')).it : nodeTest;
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { readFastDrainContext, relatedFastDrainPrs, fastDrainPrKey, useFastDrainContext,
@@ -114,10 +114,9 @@ test('card-group co-member defers', async () => {
   const h = hardenedContext({ groups: { groups: [{ repo, pr: 7, sources: [{ num: 8 }] }] } });
   await assert.rejects(h.promise, /defer-to-pass:card-group/);
 });
-test('sibling inventory throws: sibling-unreadable', async () => {
-  // The final orchestrator ruling replaces sibling-unreadable with couple-unknown.
+test('unreadable sibling inventory fails with incomplete-context', async () => {
   const h = hardenedContext({ siblingRead: () => { throw new Error('HTTP 500'); } });
-  await assert.rejects(h.promise, /defer-to-pass:couple-unknown/);
+  await assert.rejects(h.promise, /defer-to-pass:incomplete-context/);
 });
 test('manifest-less target with incomplete sibling read defers', async () => {
   const h = hardenedContext({ target: pr(7), siblingRead: () => inventory([], { totalCount: 1 }) });
@@ -559,12 +558,13 @@ test('uncertified flattened lean rows cannot bypass the shared inventory guard',
   assert.equal(calls.fullPages, 1);
 });
 
-test('real CLI defers couple-unknown when lean GraphQL silently omits rows', () => {
+test('real CLI fails incomplete context when lean GraphQL silently omits rows', () => {
   const live = runFastDrainContextCli({ leanIncomplete: true });
-  assert.equal(live.status, 0, live.stderr);
+  assert.notEqual(live.status, 0, live.stderr);
   assert.ok(live.leanListings > 0);
   assert.equal(live.fullListings, 0);
-  assert.equal(JSON.parse(live.stdout).enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
+  assert.equal(JSON.parse(live.stdout).ok, false);
+  assert.match(live.stderr, /fast-drain: incomplete pass context.*retry next pass/);
 });
 
 test('real CLI accepts a complete two-page lean inventory without heavy listing', () => {
@@ -577,23 +577,24 @@ test('real CLI accepts a complete two-page lean inventory without heavy listing'
 
 test('real fast drain does not enqueue when incomplete lean and full inventories omit a row', () => {
   const live = runFastDrainContextCli({ rowCount: 2, leanIncomplete: true, fullIncomplete: true });
-  assert.equal(live.status, 0, live.stderr);
+  assert.notEqual(live.status, 0, live.stderr);
   assert.equal(live.leanListings, 1);
   assert.equal(live.fullListings, 0);
   const result = JSON.parse(live.stdout);
-  assert.equal(result.ok, true);
-  assert.equal(result.enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
+  assert.equal(result.ok, false);
+  assert.match(live.stderr, /fast-drain: incomplete pass context.*retry next pass/);
   assert.deepEqual(result.toMerge, []);
   assert.equal(live.calls.some(a => a[0] === 'pr' && a[1] === 'merge'
     || a.some(v => v.includes('enqueuePullRequest'))), false);
 });
 
-test('real CLI defers couple-unknown when the second lean GraphQL page fails', () => {
+test('real CLI fails incomplete context when the second lean GraphQL page fails', () => {
   const live = runFastDrainContextCli({ rowCount: 101, leanPageError: true });
-  assert.equal(live.status, 0, live.stderr);
+  assert.notEqual(live.status, 0, live.stderr);
   assert.equal(live.leanListings, 2);
   assert.equal(live.fullListings, 0);
-  assert.equal(JSON.parse(live.stdout).enqueueOutcomes[0].kind, 'defer-to-pass:couple-unknown');
+  assert.equal(JSON.parse(live.stdout).ok, false);
+  assert.match(live.stderr, /fast-drain: incomplete pass context.*retry next pass/);
 });
 
 test('revalidateForMerge refuses a green develop PR when default-branch evidence is omitted', () => {
@@ -654,14 +655,21 @@ test('a completely absent target base field fails closed', () => {
 test('real fast drain with a null target base defers after both snapshot and live listing paths', () => {
   for (const killSwitch of [false, true]) {
     const run = runFastDrainContextCli({ targetBaseRefName: null, killSwitch });
-    assert.equal(run.status, 0, run.stderr);
+    assert.equal(run.status === 0, killSwitch, run.stderr);
     const result = JSON.parse(run.stdout);
     assert.deepEqual(result.toMerge, []);
     if (!killSwitch) {
-      assert.equal(result.enqueueOutcomes[0].kind, 'defer-to-pass:incomplete-context');
+      assert.equal(result.ok, false);
+      assert.match(run.stderr, /fast-drain: incomplete pass context/);
     } else {
       assert.deepEqual(result.enqueueOutcomes ?? [], []);
       assert.ok(result.skipped.some(v => v.num === 7 && /PR base branch unreadable.*deferring merge\/enqueue/.test(v.reason)), run.stdout);
     }
   }
+});
+
+test('the fast-drain CLI context call retains the 60-second target observation bound', () => {
+  const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+  const call = source.slice(source.indexOf('readFastDrainContext({ repos: slugs'), source.indexOf('readSnapshot,', source.indexOf('readFastDrainContext({ repos: slugs')));
+  assert.match(call, /targetMaxAgeMs: 60_000/);
 });

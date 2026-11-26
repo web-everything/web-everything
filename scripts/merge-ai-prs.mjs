@@ -4988,6 +4988,22 @@ export async function main(argv, options = {}) {
     catch (error) {
       const boundary = drainWriteContext.getStore()?.boundary;
       const thrownKind = error?.kind || error?.message;
+      if (boundary?.limited && (thrownKind === 'defer-to-pass:incomplete-context'
+        || String(thrownKind).startsWith('fast-drain: incomplete pass context'))) {
+        const detail = String(thrownKind).startsWith('fast-drain: incomplete pass context') ? thrownKind
+          : `fast-drain: incomplete pass context (${thrownKind}) — retry next pass`;
+        const result = { ok: false, considered: 0, toMerge: [], merged: [],
+          failed: [{ num: boundary.num, repo: boundary.repo, detail }], skipped: [] };
+        process.stderr.write(`${detail}\n`);
+        if (parseArgvFlags(argv).json) {
+          const stdout = options.stdout ?? process.stdout;
+          const text = JSON.stringify(result) + '\n';
+          if (stdout === process.stdout) writeAllSync(1, text);
+          else stdout.write(text);
+        }
+        (options.exit ?? process.exit)(1);
+        return result;
+      }
       if (!boundary?.limited || !isFastDrainDeferKind(thrownKind)) throw error;
       const kind = boundary.violations[0] || thrownKind;
       const outcome = { num: boundary.num, repo: boundary.repo, outcome: 'not-enqueued', enqueued: false, deferred: true, kind };
@@ -5121,10 +5137,12 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   const writeBoundary = createFastDrainWriteBoundary({ writeScope: enqueueOnly ? 'enqueue-only' : 'full',
     repo: onlyRepo || localSlug, num: Number(onlyPr), log: line => process.stderr.write(`${line}\n`) });
   drainWriteContext.getStore().boundary = writeBoundary;
+  let fastDrainValidatedBase = null;
   if (onlyPr != null && (flags['from-green-event'] || flags['from-catch-up'])) {
     let defaultBranch;
     try { defaultBranch = execFileSync('gh', ['repo', 'view', onlyRepo || localSlug, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
       { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 }).trim(); } catch { /* missing is a refusal */ }
+    fastDrainValidatedBase = defaultBranch;
     const precondition = validateFastDrainQueuePrecondition({ repo: onlyRepo || localSlug, defaultBranch, exec: execFileSync });
     if (!precondition.ok) {
       const outcome = { num: Number(onlyPr), repo: onlyRepo || localSlug, outcome: 'not-enqueued', enqueued: false, deferred: true, kind: requireFastDrainDeferKind(precondition.kind) };
@@ -5278,7 +5296,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   const isMainFix = (c) => isLocalRepo(c?.repo) && passMainFix.has(Number(c?.num));
   const mainFixFrom = (sig) => new Set(sig?.red ? (sig.fixPrs || []).map(Number).filter(Number.isInteger) : []);
   const mergeStrategy = createDrainMergeStrategy({ resolved: resolvedMergePolicy, dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, isMainFix,
-    writeScope: enqueueOnly ? 'enqueue-only' : 'full', targetPr: Number(onlyPr), writeBoundary,
+    writeScope: enqueueOnly ? 'enqueue-only' : 'full', targetPr: Number(onlyPr), writeBoundary, expectedBase: fastDrainValidatedBase,
     heal: guardedHelper('lane-repair', healLaneRefs),
     withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }), primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: env.WE_PRIMARY }) }); // xtpxusq — logs strategy + source once per pass
   const prestageCache = createPrestageCache();
@@ -5963,7 +5981,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
     // Catch-up shares base facts across children; each reuse revalidates lean membership. Unknown evidence defers.
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!(flags['from-catch-up'] || flags['from-green-event']),
-      indexSetting,
+      indexSetting, targetMaxAgeMs: 60_000,
       readSnapshot,
       listLean,
       readFull: (repo, num) => readFullListingPr(repo, num, true),
@@ -5984,6 +6002,10 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
     })).catch(error => {
       if (flags['from-catch-up'] || flags['from-green-event']) {
         const kind = writeBoundary.violations[0] || (/^defer-to-pass:[a-z-]+(?::[a-z-]+)?/.exec(error.message)?.[0]) || 'defer-to-pass:incomplete-context';
+        if (kind === 'defer-to-pass:incomplete-context') {
+          throw new Error(error.message.startsWith('fast-drain: incomplete pass context') ? error.message
+            : `fast-drain: incomplete pass context (${kind}) — retry next pass`, { cause: error });
+        }
         process.stderr.write(`fast-drain: ${kind}\n`);
         return { deferredKind: kind };
       }
@@ -8429,6 +8451,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
     const testStatusOnly = ['WE_UNDER_TEST', 'WE_TEST_HERMETIC'].find(key => env[key] === '1');
     if (testStatusOnly) process.stderr.write(`sibling clones: status-only (${testStatusOnly}=1, test environment)\n`);
     siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN || Boolean(testStatusOnly),
+      run: execFileSync, beforeWrite: writeBoundary.helper('git', () => {}),
       log: line => process.stderr.write(`${line}\n`) }).failed;
   }
 

@@ -35,12 +35,16 @@ it.each(['precondition', 'F10', 'F10-F12', 'F12', 'F13', 'writeScope'])('REFINE 
   const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
   const entry = cache.get(slug, 42, 30);
   cache.put(slug, 42, { ...entry, body: pr.body, eligible: true });
-  const next = await run(true);
+  const next = await run(true, { expectedStatus: gate === 'F13' ? 1 : 0 });
   expect(next.report.prestaged).not.toBe(true);
-  expect(next.report.enqueueOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
+  if (gate === 'F13') {
+    expect(next.report.ok).toBe(false);
+    expect(next.report.failed).toHaveLength(1);
+    expect(next.stderr).toContain('fast-drain: incomplete pass context');
+  } else expect(next.report.enqueueOutcomes).toEqual(expect.arrayContaining([expect.objectContaining({
     kind: gate === 'precondition' ? 'defer-to-pass:queue-precondition' : gate === 'F10' ? 'defer-to-pass:card-group'
       : gate === 'F10-F12' ? 'defer-to-pass:ordered' : gate === 'F12' ? 'defer-to-pass:couple'
-      : gate === 'F13' ? 'defer-to-pass:incomplete-context' : 'defer-to-pass:write-boundary:comment',
+      : 'defer-to-pass:write-boundary:comment',
   })]));
   expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
 }, { recordedLand: gate !== 'writeScope' }));

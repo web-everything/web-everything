@@ -305,7 +305,7 @@ async function hydrateLiveInventory({ repos, snapshots, indexMeta, now, target, 
   await mapWithConcurrency(repos, 1, async repo => {
     let lean;
     try { lean = validateLeanOpenPrs(await listLean(repo), OPEN_PR_LIST_LIMIT, repo); }
-    catch (cause) { if (failClosed) throw new Error('defer-to-pass:couple-unknown', { cause }); throw cause; }
+    catch (cause) { if (failClosed) throw new Error('defer-to-pass:incomplete-context', { cause }); throw cause; }
     const snap = new Map(snapshots.get(repo).map(p => [p.number, p]));
     const rows = await readFastDrainFacts(lean, concurrency, async p => {
       let row;

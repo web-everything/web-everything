@@ -290,8 +290,9 @@ for (const [name, recording] of [['frozen', fixture], ['recorded', recorded]]) {
       let earlyDefers = 0;
       for (const p of live) {
         // Preserve the full-pass planning parity independently of the new fast refusal.
+        let observedInventory;
         const legacy = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
-          readInventory: () => readFastDrainPassInventory(f.options),
+          readInventory: async () => (observedInventory = await readFastDrainPassInventory(f.options)),
           readFull: async (_repo, n) => live.find(p => p.number === n),
           readManifest: async (_repo, p) => p.manifest ?? p.recordedManifest });
         const fresh = c => live.find(p => p.number === c.num);
@@ -299,7 +300,7 @@ for (const [name, recording] of [['frozen', fixture], ['recorded', recorded]]) {
         after.push(await productionDecision(legacy, targetRepo, p.number, fresh));
         let context;
         try { context = await readFastDrainContext({ repos: [targetRepo], targetRepo, onlyPr: p.number,
-          readInventory: () => readFastDrainPassInventory(f.options), failClosed: true,
+          readInventory: () => observedInventory, failClosed: true,
           readFull: async (_repo, n) => live.find(p => p.number === n),
           readManifest: async (_repo, p) => p.manifest ?? p.recordedManifest }); }
         catch (error) {
@@ -315,7 +316,7 @@ for (const [name, recording] of [['frozen', fixture], ['recorded', recorded]]) {
       expect(before.some(p => p.enqueue.length)).toBe(true);
       expect(before.some(p => p.skipped.length || p.deferred.length)).toBe(true);
       expect(before.length).toBe(18);
-      expect(listings).toBeGreaterThanOrEqual(before.length);
+      expect(listings).toBe(18);
     } finally { f.close(); }
   });
 }
@@ -331,9 +332,10 @@ it('an ordered target defers before the manifest fan-out', async () => {
 
 it('catch-up holds on incomplete context without falling back to full pagination', () => {
   const r = runFastDrainContextCli({ catchUp: true, leanIncomplete: true, rowCount: 18 });
-  expect(r.status, r.stderr).toBe(0);
+  expect(r.status).not.toBe(0);
   expect(r.fullListings + r.heavyListings).toBe(0);
-  expect(JSON.parse(r.stdout).enqueueOutcomes[0].kind).toBe('defer-to-pass:couple-unknown');
+  expect(JSON.parse(r.stdout).ok).toBe(false);
+  expect(r.stderr).toContain('retry next pass');
 });
 
 for (const invalid of ['TTL expired', 'dirty', 'disabled']) {

@@ -1978,10 +1978,10 @@ describe('BLOCKED catch-up back-off', () => {
     for (let i = 0; i < 2; i++) {
       advance(600_000);
       const ran = await handle.catchUp();
-      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true });
+      expect(ran[0]).toMatchObject({ num: 5193, catchUp: true, what: expect.stringMatching(/^backed off:/) });
       expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
       expect(nums(calls).slice(-3)).toEqual([42, 43, 44]);
-      expect(lines.some(line => line.includes('backed off: BLOCKED'))).toBe(true);
+      expect(lines).toContain(`enqueue-on-event: catch-up #5193 — backed off: BLOCKED at head abcdef123 (${2 - i} of 2 catch-up(s) left; retried sooner if its head or checks change)`);
       await handle.tick(); // another tick is not another listing
       expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
     }
@@ -3514,4 +3514,28 @@ describe('catch-up snapshot-first scheduling', () => {
       await round;
     } finally { f.handle.kill(); f.children.forEach(c => c.emit('close', 143)); }
   });
+});
+
+it('O10 incomplete-context child failure stays eligible without suppression or success evidence', async () => {
+  const f = catchUpSetup({ manualFinish: true,
+    readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42)] }) });
+  const finish = async run => {
+    await new Promise(resolve => setImmediate(resolve));
+    const child = f.children.at(-1);
+    child.stdout.emit('data', JSON.stringify({ ok: false, toMerge: [], failed: [{ num: 42 }] }));
+    child.stderr.emit('data', 'fast-drain: incomplete pass context (defer-to-pass:incomplete-context) — retry next pass');
+    child.emit('close', 1);
+    return run;
+  };
+  try {
+    const first = await finish(f.handle.catchUp());
+    expect(first[0]).toMatchObject({ num: 42, code: 1, outcome: 'error' });
+    expect(first[0].what).toContain('class=incomplete-context');
+    expect(f.handle.misses().size).toBe(0);
+    expect(f.handle.blocked().size).toBe(0);
+    expect(f.handle.missBackoff().size).toBe(0);
+    f.advance(600_000);
+    await finish(f.handle.catchUp());
+    expect(f.calls).toHaveLength(2);
+  } finally { f.handle.kill(); }
 });

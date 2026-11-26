@@ -5,7 +5,7 @@ process.env.WE_UNDER_TEST = '1';
 process.env.WE_DRAIN_READS_SOURCE = 'git';
 
 export const HEAD = 'a'.repeat(40), REPO = 'fixture/repo';
-export function strategyFixture({ labels = ['ready-to-merge'], onLive, mutation, membership, evidence,
+export function strategyFixture({ labels = ['ready-to-merge'], onLive, finalBase = 'main', mutation, membership, evidence,
   initial = null, source = 'drain-scan', wait = false, comments, ...extra } = {}) {
   let state = initial, mutated = false, liveReads = 0;
   const calls = [], writes = [], logs = [];
@@ -15,7 +15,7 @@ export function strategyFixture({ labels = ['ready-to-merge'], onLive, mutation,
     if (args.includes('--slurp')) return JSON.stringify([comments ?? [{ author: { login: 'web-everything' }, body: `${redTeamMarker(7, HEAD)}\nRed team not required on this head: card-only diff.` }]]);
     if (args[0] === 'pr' && args[1] === 'view') {
       if (args.at(-1) === 'headRefOid,labels,reviews') return JSON.stringify(onLive?.(++liveReads) ?? { headRefOid: HEAD, labels });
-      return JSON.stringify({ id: 'PR7', headRefOid: HEAD, baseRefName: 'main', labels });
+      return JSON.stringify({ id: 'PR7', headRefOid: HEAD, baseRefName: finalBase, labels });
     }
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (args.some(a => a.includes('isInMergeQueue'))) {
@@ -40,7 +40,7 @@ export function strategyFixture({ labels = ['ready-to-merge'], onLive, mutation,
     labelProvider: { ensureLabel: () => writes.push('ensure-label'), setLabels: (_r, _n, plan) => writes.push(plan),
       readPrState: () => ({ headRefOid: HEAD, labels }), readPrFiles: () => ['scripts/example.mjs'] } };
   const strategy = createDrainMergeStrategy({ localSlug: REPO, isLocalRepo: r => !r || r === REPO, exec,
-    env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: source }, writeScope: 'enqueue-only', targetPr: 7,
+    env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: source }, writeScope: 'enqueue-only', targetPr: 7, expectedBase: 'main',
     statePath: '/fixture/queue.json', readFile: () => {
       if (state == null) throw Object.assign(new Error('absent'), { code: 'ENOENT' });
       return JSON.stringify(state);

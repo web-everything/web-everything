@@ -1,9 +1,10 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import * as scope from '../../lib/fast-drain-scope.mjs';
 import { buildEnqueueArgs } from '../merge-queue-enqueue.mjs';
+import { provisionMissingSiblingClones } from '../sibling-clone-provision.mjs';
 import { sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { strategyFixture, HEAD, REPO } from './fixtures/fast-drain-strategy.mjs';
 
@@ -107,7 +108,7 @@ test('PR edits allow only label membership flags, including equals forms', () =>
     for (const extra of [[flag, 'unsafe'], [`${flag}=unsafe`]]) {
       const calls = [];
       const exec = scope.createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo: REPO, num: 7 }).exec((...a) => calls.push(a));
-      assert.throws(() => exec('gh', ['pr', 'edit', '7', '--add-label', 'review:changes', ...extra]), /write-boundary:(pr-edit|retarget)/);
+      assert.throws(() => exec('gh', ['pr', 'edit', '7', '--repo', REPO, '--add-label', 'review:changes', ...extra]), /write-boundary:(pr-edit|retarget)/);
       assert.deepEqual(calls, []);
     }
   }
@@ -239,7 +240,7 @@ test('enqueue-only defers collision repair without calling its private writer; f
         return Function(...Object.keys(ports), source)(...Object.values(ports));
       },
       resolvedMergePolicy: {}, DRY_RUN: false, AS_JSON: false, isLocalRepo: () => true, localSlug: REPO, isMainFix() {},
-      enqueueOnly: writeScope === 'enqueue-only', onlyPr: 7, writeBoundary: boundary,
+      enqueueOnly: writeScope === 'enqueue-only', onlyPr: 7, writeBoundary: boundary, fastDrainValidatedBase: 'main',
       withLandWriteLock() {}, resolvePrimaryPath: () => 'primary', process: { cwd: () => 'fixture' }, flags: {}, env: {} };
     const run = () => Function(...Object.keys(ports), source)(...Object.values(ports));
     if (writeScope === 'enqueue-only') assert.throws(run, /defer-to-pass:write-boundary:lane-repair/);
@@ -297,4 +298,52 @@ test('a later boundary refusal preserves confirmed enqueues and defers only an u
     Function(...Object.keys(ports), source)(...Object.values(ports));
     assert.deepEqual(ports.result.enqueueOutcomes, expected);
   }
+});
+
+test('implicit PR writes resolve GH_REPO before cwd and refuse unknown repositories', () => {
+  for (const [envRepo, origin, allowed] of [
+    ['fixture/other', REPO, false], [REPO, 'fixture/other', true],
+    [undefined, 'fixture/other', false], [undefined, REPO, true], [undefined, null, false],
+  ]) {
+    const writes = [], reads = [];
+    const exec = scope.createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo: REPO, num: 7 }).exec((file, args, options) => {
+      if (file === 'git') {
+        reads.push(options.cwd);
+        if (!origin) throw new Error('no origin');
+        return 'https://github.com/' + origin + '.git';
+      }
+      writes.push(args);
+    });
+    const run = () => exec('gh', ['pr', 'edit', '7', '--add-label', 'review:changes'],
+      { cwd: '/fixture/checkout', env: { GH_REPO: envRepo } });
+    if (allowed) run();
+    else assert.throws(run, /write-boundary:other-pr/);
+    assert.equal(writes.length, allowed ? 1 : 0);
+    if (!envRepo) assert.deepEqual(reads, ['/fixture/checkout']);
+  }
+});
+
+test('startup sibling provisioning defers through the boundary before reserving or populating a checkout', () => {
+  const source = drainSection('  if (!siblingClonesChecked) {', '  // ── RED-MAIN');
+  const dir = mkdtempSync(resolve(process.env.TMPDIR, 'sibling-boundary-'));
+  try {
+    for (const writeScope of ['enqueue-only', 'full']) {
+      const boundary = scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 });
+      const writes = [];
+      const ports = { siblingClonesChecked: false, siblingProvisionFailures: [],
+        writeBoundary: boundary, guardedHelper: productionGuardedHelper(boundary),
+        DRY_RUN: false, env: {}, process: { cwd: () => resolve(dir, 'web-everything'), stderr: { write() {} } },
+        execFileSync: boundary.exec(() => writes.push('exec')),
+        provisionMissingSiblingClones: options => {
+          if (writeScope === 'full') { writes.push('provision'); return { failed: [] }; }
+          return provisionMissingSiblingClones({ ...options, run: options.run ?? (() => writes.push('populate')), exists: () => false, home: dir });
+        } };
+      Function(...Object.keys(ports), source)(...Object.values(ports));
+      assert.deepEqual(writes, writeScope === 'full' ? ['provision'] : []);
+      assert.equal(existsSync(resolve(dir, 'frontierui')), false);
+      assert.equal(existsSync(resolve(dir, 'plateau-app')), false);
+      assert.ok(writeScope === 'full' || boundary.violations.every(k => k === 'defer-to-pass:write-boundary:git'));
+      assert.equal(boundary.violations.length > 0, writeScope === 'enqueue-only');
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

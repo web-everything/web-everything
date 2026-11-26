@@ -246,7 +246,7 @@ export function createDrainMergeStrategy({
   readGrantScope = standingRulingScope, // PR #5758: the verified standing-ruling scope the red-team gate also reads
   redTeamDeadline, // resolved redTeam.deadlineAction (test seam); read from the cascade when absent
   publishNeedsYou, // operator note publisher; the real needs-you feed outside a test run
-  writeScope = 'full', targetPr = null, writeBoundary,
+  writeScope = 'full', targetPr = null, writeBoundary, expectedBase = null,
 } = {}) {
   const { policy, note } = resolved;
   const boundary = writeBoundary ?? createFastDrainWriteBoundary({ writeScope, repo: localSlug, num: targetPr,
@@ -654,6 +654,9 @@ export function createDrainMergeStrategy({
       }
       const freshHeld = queueLabels(fresh.labels).includes('review:hold') ? 'state is review:hold' : sendBackReason(fresh.labels);
       const freshLabels = queueLabels(fresh.labels);
+      if (boundary.limited && queueLabels(live.labels).includes('review:accepted') && !freshLabels.includes('review:accepted')) {
+        return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: 'review acceptance removed before final admission — retry next pass' };
+      }
       const freshLabelHold = redTeamLabelHoldReason(deadlineOverride
         ? freshLabels.filter(label => label !== 'red-team:pending') : freshLabels);
       if (freshHeld) {
@@ -699,6 +702,7 @@ export function createDrainMergeStrategy({
       }
       boundary.authorizeEnqueue(slugOf(c.repo), c.num, headSha);
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec, sameHeadAdmission,
+        ...(boundary.limited ? { expectedBase } : {}),
         humanOnlyLicense: () => {
           const setting = resolveApprovalLicensesEnqueue({ env, readFile });
           say(`  human-only approvalLicensesEnqueue=${setting.value} (${setting.source})`);
@@ -708,6 +712,7 @@ export function createDrainMergeStrategy({
         },
         ...(preparedAdmission ? { preparedSurface: prepared.preparedSurface } : {}) });
       if (!r.ok) {
+        if (boundary.limited && r.reason === 'base-moved') return { enqueued: false, deferred: true, kind: 'live-state-unreadable', reason: r.error };
         if (r.reason === 'mq-same-head-failed') return { enqueued: false, kind: 'mq-same-head-failed', reason: r.error };
         if (r.humanOnly) {
           void appendDaemonEvent({ kind: 'needs-you', repo: slugOf(c.repo), pr: c.num, daemon: 'drain',

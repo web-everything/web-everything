@@ -12,6 +12,12 @@ import { reserve, releaseLockDirIf, readLockEntry } from '../../readiness/file-l
 import { strategyFixture, HEAD as FAST_HEAD } from './fixtures/fast-drain-strategy.mjs';
 
 describe('fast-drain final head and label validators', () => {
+  it('same-head retarget away from the validated queue branch refuses without enqueue or stamp', () => {
+    const h = strategyFixture({ finalBase: 'develop' });
+    expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ enqueued: false });
+    expect(h.writes).toEqual([]);
+  });
+
   it('late review:hold before the fresh read refuses', () => {
     const h = strategyFixture({ onLive: n => ({ headRefOid: FAST_HEAD, labels: ['ready-to-merge', ...(n === 2 ? ['review:hold'] : [])] }) });
     expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ enqueued: false });

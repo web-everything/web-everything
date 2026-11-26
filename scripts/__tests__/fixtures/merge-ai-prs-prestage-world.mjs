@@ -32,7 +32,7 @@ export function createPrestageWorld(runCommand) {
         commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
         statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
         comments: [{author:{login:'chalbert'},body:REVIEW_RECORD_HEADLINES.restamp+'\n<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-      const run = async (green = false, { rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
+      const run = async (green = false, { expectedStatus = 0, rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
         // The live queue precondition now pins all five producers. Explicit test
         // failures/pending states win; omitted companion checks are successful.
         pr.statusCheckRollup.push(...['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']
@@ -76,7 +76,7 @@ export function createPrestageWorld(runCommand) {
             WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
             WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
             WE_VERDICT_LEDGER_DIR:ledger, WE_VERDICT_LEDGER_STORE:'home' } });
-        expect(r.status, r.stderr + r.stdout).toBe(0);
+        expect(r.status, r.stderr + r.stdout).toBe(expectedStatus);
         return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
       };
       await fn({pr,run,coord,ledger,slug,dir});

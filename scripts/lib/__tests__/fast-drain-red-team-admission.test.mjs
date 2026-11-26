@@ -26,3 +26,11 @@ test('override env: red-team-override defer', () => {
   assert.equal(h.strategy.enqueue({ num: 7 }, HEAD).kind, 'defer-to-pass:red-team-override');
   assert.deepEqual(h.writes, []);
 });
+
+test('acceptance removed between live label reads refuses without enqueue or stamp', () => {
+  const h = strategyFixture({ onLive: n => ({ headRefOid: HEAD,
+    labels: ['ready-to-merge', ...(n === 1 ? ['review:accepted'] : [])] }) });
+  assert.equal(h.strategy.enqueue({ num: 7 }, HEAD).enqueued, false);
+  assert.equal(h.liveReads(), 2);
+  assert.deepEqual(h.writes, []);
+});

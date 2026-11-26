@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { readFileSync, statSync } from 'node:fs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { localRepoSlug } from '../readiness/drain-lock.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
 import { cascadePolicy, resolveCascade, readPlatformPreferences } from './policy-cascade.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
@@ -239,8 +240,11 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
         if (args[0] === 'pr' && !['view', 'list', 'diff', 'checks'].includes(args[1])) {
           const selectors = ghOptions(args.slice(3), ['--repo', '-R', '--add-label', '--remove-label', '--body', '--body-file', '--base', '--title', '-B', '-b', '-F', '-t']);
           if (!selectors) refuse('pr-edit');
-          for (const [flag, r] of selectors.values) if (['--repo', '-R'].includes(flag)) target(r, args[2]);
-          target(repo, args[2]);
+          const repoSelectors = selectors.values.filter(([flag]) => ['--repo', '-R'].includes(flag));
+          let resolvedRepo = (options?.env ?? process.env).GH_REPO;
+          if (!resolvedRepo && !repoSelectors.length) resolvedRepo = localRepoSlug({ cwd: options?.cwd, exec: run });
+          for (const [, r] of repoSelectors) { target(r, args[2]); resolvedRepo = r; }
+          target(resolvedRepo, args[2]);
           if (args[1] === 'merge') refuse('merge');
           if (args[1] === 'update-branch') refuse('refresh');
           if (args[1] === 'edit') {

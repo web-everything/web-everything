@@ -53,7 +53,7 @@ export function siblingCloneStatus({ cwd = process.cwd(), exists = existsSync, r
  * Failed repairs stay unavailable until an operator repairs the path and restarts the drain. home is injectable so tests never use host primary clones.
  */
 export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execFileSync,
-  exists = existsSync, read = readOrigin, shallow = readShallow, log = () => {}, dryRun = false, home = homedir() } = {}) {
+  exists = existsSync, read = readOrigin, shallow = readShallow, beforeWrite = () => {}, log = () => {}, dryRun = false, home = homedir() } = {}) {
   const result = { provisioned: [], failed: [] };
   const report = line => { try { log(diagnostic(line)); } catch { /* logging cannot stop the drain */ } };
   for (const status of siblingCloneStatus({ cwd, exists, read })) {
@@ -77,6 +77,7 @@ export function provisionMissingSiblingClones({ cwd = process.cwd(), run = execF
       const cloneArgs = fullPrimary
         ? ['clone', '--quiet', '-c', 'gc.auto=0', '--reference', primary, url, dir]
         : ['clone', '--quiet', '-c', 'gc.auto=0', url, dir];
+      beforeWrite();
       mkdirSync(dir); // Reserve the absent path exclusively before taking cleanup ownership.
       created = true;
       const bounded = boundedGitCommand(cloneArgs, NETWORK_GIT_TIMEOUT_MS);

@@ -322,7 +322,7 @@ function readBaseTip({ base, cwd, exec }) {
  *   `sameHeadAdmission()` revalidates the drain's timeline admission immediately before a fresh mutation;
  *   already-queued bookkeeping skips it, and unreadable decisions retain the hold.
  */
-export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense, sameHeadAdmission }) {
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, preparedSurface = null, humanOnlyLicense, sameHeadAdmission, expectedBase }) {
   if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
   }
@@ -338,6 +338,10 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync, prepar
   const liveBase = pr?.baseRefName;
   if (typeof liveBase !== 'string' || liveBase === '') {
     return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (the PR base branch is unreadable)' };
+  }
+  if (expectedBase !== undefined && (typeof expectedBase !== 'string' || !expectedBase || liveBase !== expectedBase)) {
+    return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'base-moved', paths: [],
+      error: 'PR base no longer matches the branch whose queue protections were validated — retry next pass' };
   }
   // A prepared list describes `base...head` at one base commit: reuse it only while the head, the base branch AND
   // that branch's tip all still match (a retargeted PR, or a base that moved, can show a workflow edit the prepared
