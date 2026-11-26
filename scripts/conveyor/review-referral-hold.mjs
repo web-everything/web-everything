@@ -26,7 +26,9 @@ import { createActionStore } from '../operations/action-store.mjs';
 import { actionResource } from '../operations/action-record.mjs';
 import { isQuotaError } from '../lib/provider-quota-hold.mjs';
 import { isBodyFileRefusal } from '../operations/review-pr-io.mjs';
-import { parseAdvisories, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { parseAdvisories, latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
+import { reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { reverifyStaleReferrals } from './referral-reverify.mjs';
 
 /** Maximum drives of a saved run before its resume budget is exhausted. Shared with the driver. */
@@ -684,8 +686,8 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
   if (hold.cause) return stay(`the verdict ledger cannot answer for this PR (${hold.cause})`);
   if (!Array.isArray(pr.comments)) return stay('the comment thread is unreadable; read the full thread before resuming');
   if ((pr.comments.length >= GH_LIST_COMMENT_CAP && pr.commentsComplete !== true) || pr.commentsComplete === false) return stay('the comment thread may be truncated; read the full thread before resuming');
-  // Zero findings is proof only when the head's finished review left its advisory: that is the evidence the review ran
-  // and raised nothing. Without it (a lost write-back) the pause stays; onClean is honoured like any clean resume.
+  // A clean advisory releases to its existing owner. One pre-escalation panel with no current advisory or
+  // recorded verdict may instead owe one advisory-only run; a second counted attempt keeps the pause.
   const noFinding = why => {
     if (hold.kind !== 'same-head') return stay(why);
     // The newest advisory comment itself must carry exactly one outcome line, and it must be `accept`: parseAdvisories
@@ -717,7 +719,27 @@ export function decideReferralHoldAutoResolve(pr, hold, { repo,
     const fenced = body.includes('```') || body.includes('~~~');
     const clean = adv && human && !fenced && leads && readable && basisLines === 1 && sameReview && notes[0]?.i === adv.index && advisoryCoversHead(adv, head) && String(adv.head).toLowerCase() === head.toLowerCase()
       && outcomes.length === 1 && outcomes[0] === ADVISORY_OUTCOMES.ACCEPT && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
-    if (!clean) return stay(`${why}, and no clean advisory accept names the full live head`);
+    if (!clean) {
+      // Match the planner's advisoryHeadState predicates exactly: latest parsed coverage uses time/index;
+      // headed vs headless marker notes and reviewed-sha use thread order. A lost pre-escalation verdict
+      // owes one advisory, while any published current advisory or conversion remains with its existing owner.
+      let lastHeaded = -1;
+      let lastHeadless = -1;
+      trusted.forEach((c, i) => {
+        if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
+        if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
+      });
+      const labels = (Array.isArray(pr.labels) ? pr.labels : []).map(l => typeof l === 'string' ? l : l?.name);
+      const owed = human && readable && !labels.includes('review:accepted') && !labels.includes('review:changes')
+        && !advisoryCoversHead(latestAdvisory(trusted), head) && lastHeadless <= lastHeaded
+        && parseReviewedSha(pr.comments) !== head && policy.onClean === 'resume';
+      if (!owed) return stay(`${why}, and no clean advisory accept names the full live head`);
+      if (hold.count !== 1 || hold.attemptsSinceWake !== 1) return stay(`${why}; ${Number.isInteger(hold.attemptsSinceWake)
+        ? `head reviewed ${hold.attemptsSinceWake} time(s) and the PR still carries no advisory for it: the review's write-back fails`
+        : 'the pause does not say how many review attempts ran on this head (ledger hold), so the review is not resumed'}`);
+      return { outcome: 'resume', head, findings: [], counts: {}, advisoryOwed: true,
+        why: `no referral finding and no trusted advisory or reviewed-sha names head ${head.slice(0, 9)}; a review:human head is eligible for one advisory run` };
+    }
     if (policy.onClean !== 'resume') return stay(`no referral finding exists, but referralHoldAutoResolve.onClean=${policy.onClean} (source: ${source('onClean')}) keeps the pause`);
     return { outcome: 'resume', head, findings: [], counts: {},
       why: `no referral finding exists on head ${head.slice(0, 9)}; no ruling is owed` };

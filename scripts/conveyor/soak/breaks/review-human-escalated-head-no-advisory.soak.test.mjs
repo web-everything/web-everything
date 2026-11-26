@@ -1,0 +1,45 @@
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import * as hold from '../../review-referral-hold.mjs';
+import * as core from '../../reconcile-core.mjs';
+import * as review from '../../../operations/review-pr.mjs';
+import * as jury from '../../../lib/jury-core.mjs';
+import b from './review-human-escalated-head-no-advisory.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Runtime policy reads use declared empty configuration in a private fixture, never checkout/host files.
+const policyFixture = vi.hoisted(() => ({ root: null, file: null, unexpected: [] }));
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync(path, ...args) {
+    if (!policyFixture.root) return fs.readFileSync(path, ...args);
+    const name = String(path);
+    if (name.startsWith(policyFixture.root + '/')) return fs.readFileSync(path, ...args);
+    const configuration = name.includes('/scripts/') && name.endsWith('.json')
+      || /\/\.claude\/(?:platform-preferences|operator-overrides)\.json$/.test(name);
+    if (configuration) return fs.readFileSync(policyFixture.file, ...args);
+    policyFixture.unexpected.push(name);
+    throw Error('undeclared fixture read: ' + name);
+  } };
+});
+
+describe('review-human-escalated-head-no-advisory', () => {
+  beforeEach(() => {
+    policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.file = join(policyFixture.root, 'policy.json');
+    policyFixture.unexpected = [];
+    writeFileSync(policyFixture.file, '{}');
+  });
+  afterEach(() => {
+    const { root, unexpected } = policyFixture;
+    policyFixture.root = null;
+    rmSync(root, { recursive: true, force: true });
+    expect(unexpected).toEqual([]);
+  });
+
+  it('always exercises both ticks, partial publication, counted failures and the conversion deferral', async () => {
+    const report = await b.run({ api: { hold, core, review, jury } });
+    expect(b.judge(report)).toEqual([]);
+  });
+});

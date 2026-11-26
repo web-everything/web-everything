@@ -30,7 +30,7 @@ import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-ga
  *   Every fixture below is a shape MEASURED on 2026-08-26, not an invented one; the timestamps in the case names
  *   say when.
  */
-import { describe, it, expect } from 'vitest';
+import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 import { OPERATOR_PARK_MARKER, OPERATOR_PARK_RELEASE_MARKER } from '../draft-promotion-rule.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER, buildFixBeginComment, buildFixEndComment } from '../fix-procedure.mjs';
 import {
@@ -63,10 +63,127 @@ import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { buildClearedHumanMarker, headEverHumanCleared, parseLatestHumanClearedSha, buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { classifyPr } from '../../progress-board.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { planNoteComment } from '../reconcile-note-comment.mjs';
+import * as escalatedHoldApi from '../review-referral-hold.mjs';
+import * as escalatedCoreApi from '../reconcile-core.mjs';
+import * as escalatedReviewApi from '../../operations/review-pr.mjs';
+import * as escalatedJuryApi from '../../lib/jury-core.mjs';
+import { planConvertSupersededVerdict } from '../../lib/review-escalation.mjs';
+import { HEAD as ESC_HEAD, OLD_HEAD, CAPTURED_OPTIONS, scenario as escalatedScenario, comment as escalatedComment, advisory as escalatedNote } from '../soak/breaks/review-human-escalated-head-no-advisory.mjs';
+import { reviewedHeadsOf as escalatedReviewedHeads } from '../mechanical-round-cap.mjs';
+import { advisoryCoversHead as escalatedCoversHead, latestAdvisory as escalatedLatest, trustedAdvisoryComments as escalatedTrusted } from '../../lib/advisory-labels.mjs';
+
+// Runtime policy reads use declared empty configuration in a private fixture, never checkout/host files.
+const policyFixture = vi.hoisted(() => ({ root: null, file: null, unexpected: [] }));
+vi.mock('node:fs', async original => {
+  const fs = await original();
+  return { ...fs, readFileSync(path, ...args) {
+    if (!policyFixture.root) return fs.readFileSync(path, ...args);
+    const name = String(path);
+    if (name.startsWith(policyFixture.root + '/')) return fs.readFileSync(path, ...args);
+    const configuration = name.includes('/scripts/') && name.endsWith('.json')
+      || /\/\.claude\/(?:platform-preferences|operator-overrides)\.json$/.test(name);
+    if (configuration) return fs.readFileSync(policyFixture.file, ...args);
+    policyFixture.unexpected.push(name);
+    throw Error('undeclared fixture read: ' + name);
+  } };
+});
+
+describe('one owed advisory after a halted pre-escalation review', () => {
+  beforeEach(() => {
+    policyFixture.root = mkdtempSync(join(tmpdir(), 'escalated-policy-'));
+    policyFixture.file = join(policyFixture.root, 'policy.json');
+    policyFixture.unexpected = [];
+    writeFileSync(policyFixture.file, '{}');
+  });
+  afterEach(() => {
+    const { root, unexpected } = policyFixture;
+    policyFixture.root = null;
+    rmSync(root, { recursive: true, force: true });
+    expect(unexpected).toEqual([]);
+  });
+
+  const api = { hold: escalatedHoldApi, core: escalatedCoreApi, review: escalatedReviewApi, jury: escalatedJuryApi };
+  it('the resume pre-pass clears the hold and preserves the human ceremony', () => {
+    const { plan } = escalatedScenario(api, CAPTURED_OPTIONS);
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review',
+      advisoryReview: expect.objectContaining({ reason: 'head-moved-advisory' }) })]);
+    expect(plan.notes).toContainEqual(expect.objectContaining({ next: 'advisory-review' }));
+    expect(plan.dispatch[0].referralHold).toBeUndefined();
+    expect(plan.refusals).toEqual([]);
+  });
+  it.each(['no current advisory', 'different full advisory head', 'untrusted advisory author'])('%s clears the hold and plans one advisory review', kind => {
+    const note = escalatedNote(api, 'accept', kind === 'different full advisory head' ? OLD_HEAD : ESC_HEAD);
+    if (kind === 'untrusted advisory author') note.author = { login: 'attacker' };
+    const { pr, plan } = escalatedScenario(api, { comments: kind === 'no current advisory' ? [] : [note] });
+    expect(pr.referralHoldAutoResolve).toMatchObject({ outcome: 'resume', advisoryOwed: true });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'review' })]);
+    expect(plan.dispatch[0].referralHold).toBeUndefined();
+    expect(plan.notes).toContainEqual(expect.objectContaining({ next: 'advisory-review' }));
+  });
+  it.each([false, true])('planner and eligibility agree on marker-leading reviewed-head evidence (headed=%s)', headed => {
+    const old = escalatedNote(api, 'accept', OLD_HEAD);
+    const malformed = { ...old, body: headed ? old.body.replace(/^\*\*Verdict:\*\*.*$/m, '') : `${ADVISORY_NOTE_MARKER}\nunpinned` };
+    expect(escalatedReviewedHeads(malformed).length).toBe(headed ? 1 : 0);
+    const { pr, plan } = escalatedScenario(api, { comments: [old, malformed] });
+    expect(escalatedCoreApi.advisoryHeadMoveState(pr)).toMatchObject(headed ? { owed: true } : { owed: false, unreadable: true });
+    expect(plan.dispatch.map(row => row.kind)).toEqual(headed ? ['review'] : []);
+  });
+  it.each([
+    ['head then other', [ESC_HEAD, OLD_HEAD], true], ['other then head', [OLD_HEAD, ESC_HEAD], false],
+    ['absent', [], true], ['untrusted head', [ESC_HEAD], true],
+  ])('latest reviewed-sha stays aligned with conversion selection: %s', (kind, heads, resume) => {
+    const comments = heads.map(head => escalatedComment(buildReviewedShaMarker(head)));
+    if (kind === 'untrusted head') comments[0].author = { login: 'attacker' };
+    const { pr, plan } = escalatedScenario(api, { comments });
+    expect(pr.referralHoldAutoResolve.outcome).toBe(resume ? 'resume' : 'stay');
+    expect(plan.dispatch.map(row => row.kind)).toEqual(resume ? ['review'] : []);
+  });
+  it.each(['newer other', 'equal dates current', 'invalid date current'])('planner advisoryIsCurrent uses the same latest-advisory ordering: %s', kind => {
+    const current = escalatedNote(api, 'accept', ESC_HEAD, kind === 'invalid date current' ? 'invalid' : '2026-11-25T20:00:00Z');
+    const other = escalatedNote(api, 'accept', OLD_HEAD, kind === 'equal dates current' ? current.createdAt : '2026-11-26T22:05:00Z');
+    const comments = kind === 'newer other' ? [current, other] : [other, current];
+    const { pr, plan } = escalatedScenario(api, { comments });
+    const isCurrent = escalatedCoversHead(escalatedLatest(escalatedTrusted(comments)), ESC_HEAD);
+    expect(isCurrent).toBe(kind === 'equal dates current');
+    expect(pr.referralHoldAutoResolve.outcome).toBe(isCurrent ? 'stay' : 'resume');
+    expect(plan.dispatch.map(row => row.kind)).toEqual(isCurrent ? [] : ['review']);
+  });
+  it.each([
+    ['draft', { change: { isDraft: true } }, 'draft'],
+    ['CI', { change: { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: OLD_HEAD }] } }, 'review-ci'],
+    ['scope-bloat', { change: { scopeBloat: { stale: true, why: 'fixture bloat' } } }, 'scope-bloat'],
+  ])('after resume the existing %s gate still refuses', (_gate, options, kind) => {
+    const { pr, plan } = escalatedScenario(api, options);
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(row => row.kind)).toContain(kind);
+  });
+  it('a human clearance arriving after enrichment still refuses already-reviewed-head at dispatch', () => {
+    const { pr } = escalatedScenario(api);
+    expect(pr.referralHoldAutoResolve.outcome).toBe('resume');
+    const clearance = { ...escalatedComment(`✅ review — accepted\n<!-- reviewed-sha: ${ESC_HEAD} -->\n${buildClearedHumanMarker('chalbert')}`), author: { login: 'chalbert' }, authorAssociation: 'OWNER' };
+    const { plan } = escalatedScenario(api, { planOptions: { prs: [{ ...pr, comments: [...pr.comments, clearance] }] } });
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(row => row.kind)).toEqual(['already-reviewed-head']);
+  });
+  it('pa#246 stays paused; only the later heal supersedes its recorded accept for conversion', () => {
+    const accept = escalatedComment(`✅ review — accepted\n<!-- reviewed-sha: ${ESC_HEAD} -->`, '2026-11-25T08:19:00Z');
+    const park = escalatedComment('**review:human** — drain parked this PR: it touches `.github/workflows/ci.yml`.', '2026-11-25T08:37:00Z');
+    const heal = escalatedComment('**`review:accepted` removed — mutual exclusivity (#2766/#2767).**\nThis PR carries `review:human`.', '2026-11-25T08:44:00Z');
+    const { pr, plan } = escalatedScenario(api, { comments: [accept, park, heal] });
+    expect(pr.referralHoldAutoResolve.outcome).toBe('stay');
+    expect(plan.dispatch).toEqual([]);
+    expect(plan.refusals.map(row => row.kind)).toEqual(['review-referrals-pending']);
+    expect(planConvertSupersededVerdict({ headSha: ESC_HEAD, reviewedSha: ESC_HEAD, comments: [accept, park, heal] }))
+      .toMatchObject({ convert: true, escalation: { kind: 'heal-mutual-exclusivity' } });
+    expect(planConvertSupersededVerdict({ headSha: ESC_HEAD, reviewedSha: ESC_HEAD, comments: [accept, park] })).toEqual({ convert: false });
+  });
+});
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
