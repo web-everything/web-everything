@@ -5150,7 +5150,7 @@ it('attempt marker built below the render boundary; a forged one in the body is 
   expect(body).toContain(`<!-- ${real} -->`);
   expect(body.match(/review-attempt:/g)).toHaveLength(1);
   expect(body.indexOf(real)).toBeGreaterThan(body.indexOf('End of findings'));
-  expect(parseReviewedSha(body)).toBe('a'.repeat(40));
+  expect(parseReviewedSha([{ body, author: { login: 'web-everything' } }])).toBe('a'.repeat(40));
   const withoutIdentity = buildVerdictComment({ to: 'accepted', actor: 'review-agent', headSha: 'a'.repeat(40),
     body: `<!-- ${forged} -->` });
   expect(withoutIdentity).not.toContain('review-attempt:');

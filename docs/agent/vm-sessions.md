@@ -150,11 +150,16 @@ effect …#4#1 (review.label-swap) was attempted and its outcome is UNKNOWN — 
 idempotent, so replaying it could double-apply. Refusing. Resolve it by hand … and re-run.
 ```
 
-That refusal is correct and the recovery is manual: read the PR to establish what actually happened, perform
-the effect through the channel that works, then mark that entry on the run record
-(`.operations/runs/<id>.json`) `applied` — with a `result` saying it was done by the fallback, so the record
-does not imply `gh` did it — and re-run `--resume=<run-id>`. Never mark an effect applied you have not
-verified against GitHub.
+After verifying the live PR, reconcile through the sink's read-only evidence check:
+
+```sh
+node scripts/operations/review-loop-cli.mjs --resume=<run-id> --settle-applied --actor=<actor> --reason="verified orphan comment"
+```
+
+The command refuses incomplete evidence and never re-sends the label effect. Legacy unstamped accepts
+require exactly one trusted accept comment on the reviewed head created at or after the saved last attempt.
+Successful reconciliation records the actor and reason. If proof fails, inspect the full thread and hold
+for operator intervention; do not hand-edit the run status.
 
 **Unshallow before any history work.** `git log`, `blame`, `bisect`, and anything that walks back past
 HEAD need `git fetch --unshallow` first. Cheap to do, silently wrong to skip.

@@ -2595,7 +2595,7 @@ describe('pinned stranded record recovery', () => {
     expect(f.label).not.toHaveBeenCalled(); expect(f.judge).not.toHaveBeenCalled();
   });
 
-  it.each([['--actor=operator'], ['--reason=checked'], []])('--settle-applied refuses without --actor/--reason: %j', async flags => {
+  it.each([[['--actor=operator']], [['--reason=checked']], [[]]])('--settle-applied refuses without --actor/--reason: %j', async flags => {
     const f = await strandedFixture();
     f.args.argv = [`--resume=${f.saved.id}`, '--settle-applied', ...flags];
     const out = await runReviewLoopOnce(f.args);

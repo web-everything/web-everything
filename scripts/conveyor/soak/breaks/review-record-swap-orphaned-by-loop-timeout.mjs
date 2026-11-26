@@ -1,7 +1,7 @@
 /** A killed loop leaves its label grandchild alive; recovery observes it without posting again. */
 import { spawnSync, fork } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, watch, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -78,11 +78,11 @@ export default {
     if (sends !== 0) violations.push('first check re-sent the label effect');
     // The already-running grandchild posts after the failed check, before the next sweep.
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { watcher.close(); reject(Error('surviving grandchild did not publish')); }, 10_000);
-      const watcher = watch(dir, () => {
+      const timer = setTimeout(() => { clearInterval(poll); reject(Error('surviving grandchild did not publish')); }, 10_000);
+      const poll = setInterval(() => {
         if (!existsSync(join(dir, 'comment.json'))) return;
-        clearTimeout(timer); watcher.close(); resolve();
-      });
+        clearTimeout(timer); clearInterval(poll); resolve();
+      }, 20);
       writeFileSync(join(dir, 'publish'), 'post after failed evidence check');
     });
     orphanPosted = true;

@@ -243,7 +243,7 @@ export function supersededHandles(entry) {
  *   populations rather than padding either. A thin dataset is recoverable; a mislabelled one is not.
  * @returns {Promise<{run: object, applied: string[], skipped: string[], halted: (object|null), error: (Error|null)}>}
  */
-export async function applyPendingEffects(run, { sinks, store, stepIndex = null, attemptedBy = 'unknown' } = {}) {
+export async function applyPendingEffects(run, { sinks, store, stepIndex = null, attemptedBy = 'unknown', strandedRecordEffect = false, resumeOnly = false } = {}) {
   assertRunRecord(run, 'run record passed to applyPendingEffects');
   if (!store || typeof store.write !== 'function') {
     throw new TypeError('operations: applyPendingEffects needs a `store` handle — the record must be durable between effects');
@@ -284,6 +284,18 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
     }
     if (entry.status === 'pending' && !entry.idempotent) {
       const sink = lookup(entry.type);
+      let proof;
+      try { proof = await sink.provablyApplied?.(entry, { runId: run.id, key: entry.key,
+        attempt: entry.attempts, readRun: id => store.read(id) }); } catch { proof = null; }
+      if (proof?.applied === true) {
+        run = withEntry(run, entry.key, { status: 'applied', error: null,
+          result: { reconciled: true, evidence: proof.evidence } });
+        store.write(run);
+        continue;
+      }
+      if (strandedRecordEffect || resumeOnly || run.strandedRecordEffect) {
+        throw new Error(`operations: applied evidence unavailable for ${entry.key}; inspect and settle-applied; recovery never re-sends`);
+      }
       if (typeof sink.provablyNotApplied === 'function' && sink.provablyNotApplied(entry) === true) {
         run = withEntry(run, entry.key, { ...entry, status: 'failed' });
         store.write(run);
@@ -391,7 +403,7 @@ export async function applyPendingEffects(run, { sinks, store, stepIndex = null,
 
     try {
       const result = await lookup(live.type)(live.payload, {
-        key: live.key, runId: current.id, type: live.type, stepIndex: live.stepIndex, step: live.step, index: live.index,
+        attempt: attempted.attempts, key: live.key, runId: current.id, type: live.type, stepIndex: live.stepIndex, step: live.step, index: live.index,
         // A read-only handle on THIS executor's store, so a sink that recovers from the run record reads the
         // record this executor writes, never a store it chose on its own (#6661).
         readRun: (id) => store.read(id),

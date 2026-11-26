@@ -1227,6 +1227,12 @@ export function runReviewLabelCli({
   const channelArg = (argv.find((a) => a.startsWith('--channel=')) || '').slice('--channel='.length);
   const pr = argv.find((a) => /^\d+$/.test(a));
   const to = fixedTo || (argv.find((a) => a.startsWith('--to=')) || '').slice('--to='.length);
+  // A supplied attempt must be complete and well formed before any GitHub write.
+  const attemptField = name => argv.find(a => a.startsWith(`--${name}=`))?.slice(name.length + 3);
+  if (argv.some(a => /^--(?:attempt|run-id|effect-key)(?:=|$)/.test(a)) && !buildReviewAttemptMarker({
+    repo, pr: Number(pr), runId: attemptField('run-id'), effectKey: attemptField('effect-key'),
+    attempt: Number(attemptField('attempt')),
+  })) fail('invalid review attempt identity; provide --run-id, --effect-key and --attempt=<positive integer>');
   // #x9krtkb (bug 2) — `restamp`'s ONE caller (`restampAcceptance`, `we:scripts/merge-ai-prs.mjs`) already knows
   // the exact new head: it is the drain's OWN `git push`, computed locally, not a re-read. Before this it threw
   // that value away past `--reason`'s free text and let `runReviewLabelCli` re-derive the head from a fresh
@@ -2549,9 +2555,16 @@ export function runReviewLabelCli({
  *   before this field existed — a restamp of a plain agent accept must never mint a human clearance.
  * @returns {string}
  */
+export function buildReviewAttemptMarker({ repo, pr, runId, effectKey, attempt } = {}) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo ?? '') || !Number.isSafeInteger(Number(pr)) || Number(pr) < 1
+    || !/^[A-Za-z0-9_.-]+$/.test(runId ?? '') || !new RegExp(`^${String(runId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}#[0-9]+#[0-9]+$`).test(effectKey ?? '')
+    || !Number.isSafeInteger(attempt) || attempt < 1) return '';
+  return `<!-- review-attempt: ${repo}#${pr}/${runId}/${effectKey}/${attempt} -->`;
+}
+
 export function buildVerdictComment({
   to, actor, headSha = '', body = '', reason = '', reviewedDiff = '', clearerId = '', independence = null,
-  channel = '', humanClearance = null,
+  channel = '', humanClearance = null, repo, pr, runId, effectKey, attempt,
 } = {}) {
   // #2895 — `clear-human` stamps the marker for the same reason `accepted` does: it IS an acceptance (it adds
   // review:accepted), so the drain must be able to refuse it later if the head advances past the cleared tree.
@@ -2702,7 +2715,8 @@ export function buildVerdictComment({
     ...(to === 'restamp' && reason ? ['', oneLine(reason)] : []),
     ...(text ? ['', text] : []),
   ].join('\n'));
-  return marker ? `${prose}\n\n${marker}` : prose;
+  const attemptMarker = buildReviewAttemptMarker({ repo, pr, runId, effectKey, attempt });
+  return [prose.replace(/review-attempt:/gi, 'review-attempt&#58;'), marker || (attemptMarker && to === 'changes' ? buildReviewedShaMarker(headSha) : ''), attemptMarker].filter(Boolean).join('\n\n');
 }
 
 /**
@@ -2908,6 +2922,10 @@ if (IS_CLI) {
     buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
       to, actor, headSha, reason, reviewedDiff, clearerId, independence, body: verdictBody, channel: verdictChannel,
       humanClearance,
+      repo: (argvRest.find(a => a.startsWith('--repo=')) || '').slice(7), pr: Number(argvRest.find(a => /^\d+$/.test(a))),
+      runId: (argvRest.find(a => a.startsWith('--run-id=')) || '').slice(9),
+      effectKey: (argvRest.find(a => a.startsWith('--effect-key=')) || '').slice(13),
+      attempt: Number((argvRest.find(a => a.startsWith('--attempt=')) || '').slice(10)),
     }),
     successResult: ({ pr, to, labels }) => ({ ok: true, pr, to, labels }),
     // `refused` marks a DECISION (as opposed to a crash / gh failure, which prints `{error}` too); `retryable` marks a

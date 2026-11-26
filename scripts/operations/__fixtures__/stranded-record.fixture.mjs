@@ -18,8 +18,8 @@ export function strandedRecord({ id = '2a0c266d', verdict = 'accept' } = {}) {
       advise: { applied: true, effects: [] }, confirm: verdict,
     },
     stepTimings: [
-      { step: 'read', stepIndex: 0, startedAt: '2026-11-26T13:00:00Z', finishedAt: '2026-11-26T13:01:00Z' },
-      { step: 'advise', stepIndex: 8, startedAt: '2026-11-26T14:00:00Z', finishedAt: '2026-11-26T14:01:00Z' },
+      { step: 'read', stepIndex: 0, startedAt: '2026-11-26T13:00:00Z', finishedAt: '2026-11-26T13:01:00Z', durationMs: 60_000 },
+      { step: 'advise', stepIndex: 8, startedAt: '2026-11-26T14:00:00Z', finishedAt: '2026-11-26T14:01:00Z', durationMs: 60_000 },
     ],
     effects: [{ key: `${id}#12#0`, step: 'record', stepIndex: 12, index: 0, type: 'review.label-swap',
       idempotent: false, status: 'pending', attempts: 1, unknownAttempts: 1,

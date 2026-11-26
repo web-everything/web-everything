@@ -4,8 +4,8 @@ import { fork } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { DEAD_OWNER, RECOVERY_OWNER } from '../__fixtures__/stranded-record.fixture.mjs';
 import { pidIdentity } from '../../lib/pid-alive.mjs';
 
@@ -18,7 +18,7 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 async function api() {
-  const moduleUrl = new URL('../review-recovery-claim.mjs', import.meta.url);
+  const moduleUrl = pathToFileURL(resolve('scripts/operations/review-recovery-claim.mjs'));
   expect(existsSync(moduleUrl), 'recovery must have a shared lock-protected claim home').toBe(true);
   const module = await import(/* @vite-ignore */ moduleUrl.href);
   for (const name of ['createRecoveryHandoff', 'acquireRecoveryClaim', 'releaseRecoveryClaim', 'isProvablyDeadOwner'])
@@ -43,7 +43,7 @@ function message(child) {
   });
 }
 async function child(f, token) {
-  const proc = fork(fileURLToPath(new URL('../__fixtures__/recovery-claim-child.fixture.mjs', import.meta.url)),
+  const proc = fork(resolve('scripts/operations/__fixtures__/recovery-claim-child.fixture.mjs'),
     [f.dir, f.options.runId, token], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'], env: process.env });
   children.push(proc);
   expect(await message(proc)).toMatchObject({ ready: true });
@@ -59,7 +59,7 @@ describe('exclusive review recovery claims', () => {
     const a = await child(f, handoff.token), b = await child(f, handoff.token);
     const results = [message(a), message(b)]; a.send('acquire'); b.send('acquire');
     const answers = await Promise.all(results);
-    expect(answers.filter(r => r.ok)).toHaveLength(1);
+    expect(answers.filter(r => r.ok), JSON.stringify(answers)).toHaveLength(1);
     expect(answers.filter(r => r.ok === false)).toHaveLength(1);
     const winner = answers.find(r => r.ok);
     expect(f.read()).toMatchObject({ token: handoff.token, holder: { pid: winner.owner.pid } });
@@ -135,7 +135,7 @@ describe('exclusive review recovery claims', () => {
   it('child death while daemon survives permits takeover of the child holder', async () => {
     const m = await api(), f = fixture();
     const h = await m.createRecoveryHandoff(f.options), proc = await child(f, h.token);
-    const result = message(proc); proc.send('acquire'); expect((await result).ok).toBe(true);
+    const result = message(proc); proc.send('acquire'); const acquired = await result; expect(acquired.ok, JSON.stringify(acquired)).toBe(true);
     const old = f.read();
     const exited = once(proc, 'exit'); proc.kill('SIGKILL'); await exited;
     expect(process.pid).not.toBe(proc.pid); // the sweep/parent is still executing
@@ -150,7 +150,7 @@ describe('exclusive review recovery claims', () => {
     const identityMessage = message(daemon); daemon.send('identity'); const { owner } = await identityMessage;
     const h = await m.createRecoveryHandoff({ ...f.options, owner });
     const worker = await child(f, h.token), result = message(worker); worker.send('acquire');
-    expect((await result).ok).toBe(true);
+    const acquired = await result; expect(acquired.ok, JSON.stringify(acquired)).toBe(true);
     const original = f.read(), exited = once(daemon, 'exit'); daemon.kill('SIGKILL'); await exited;
     expect((await m.createRecoveryHandoff({ ...f.options, pidIdentity })).ok).toBe(false);
     expect(f.read()).toEqual(original);
@@ -162,7 +162,7 @@ describe('exclusive review recovery claims', () => {
     const a = await child(f, 'unused'), b = await child(f, 'unused');
     const results = [message(a), message(b)]; a.send('handoff'); b.send('handoff');
     const answers = await Promise.all(results);
-    expect(answers.filter(r => r.ok)).toHaveLength(1);
+    expect(answers.filter(r => r.ok), JSON.stringify(answers)).toHaveLength(1);
     expect(answers.filter(r => r.ok === false)).toHaveLength(1);
     expect(f.read().token).toBe(answers.find(r => r.ok).token);
     expect(f.read().token).not.toBe('abandoned');

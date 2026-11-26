@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { recoveryOwner, sameOwner, validRecoveryClaim, isProvablyDeadOwner, readRecoveryClaim, createRecoveryHandoff, acquireRecoveryClaim, releaseRecoveryClaim, withRecoveryClaimLock } from './review-recovery-claim.mjs';
 /**
  * @file scripts/operations/review-loop-cli.mjs
  * @description #3072's REMAINING SLICE, MADE CALLABLE — drives ONE `review-pr` run unattended, using
@@ -544,23 +545,23 @@ export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) 
 
 // A reader belongs to one pass. Acceptance refreshes both head and body after reading the complete thread;
 // neither a contributor push nor an author-stamp edit may reuse the resume snapshot for authorization.
-export function createReviewPassPrReader({ exec = execFileSyncThrottled, readComments = readCompletePrComments } = {}) {
+export function createReviewPassPrReader({ exec = execFileSyncThrottled, readComments = readCompletePrComments, includeState = false } = {}) {
   const views = new Map();
   return ({ repo, pr }, { refreshHead = false } = {}) => {
     const key = JSON.stringify([repo ?? null, String(pr)]);
     const comments = refreshHead ? readComments(pr, { repo }) : null;
     if (refreshHead || !views.has(key)) {
       try {
-        const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,body,createdAt'],
+        const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', includeState ? 'headRefOid,body,createdAt,state' : 'headRefOid,body,createdAt'],
           { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
         views.set(key, { view });
       } catch (error) { views.set(key, { error }); }
     }
     const cached = views.get(key);
     if (cached.error) throw cached.error;
-    const { headRefOid, body, createdAt } = cached.view;
+    const { headRefOid, body, createdAt, state } = cached.view;
     if (refreshHead && !/^[a-f0-9]{40}$/i.test(headRefOid ?? '')) throw new Error('live PR head unavailable');
-    return { headRefOid, body, createdAt, comments: comments ?? readComments(pr, { repo }) };
+    return { headRefOid, body, createdAt, state, comments: comments ?? readComments(pr, { repo }) };
   };
 }
 
@@ -668,14 +669,20 @@ export async function runReviewLoopOnce({
   // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
   // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
   parallelJudges = false, seatLanes = null,
-  readResumePr = createReviewPassPrReader(),
+  readResumePr = null,
   readAcceptancePr = input => readResumePr(input, { refreshHead: true }), cardReadable = referralCardReadable,
   acceptPolicy = unattendedAcceptPolicy(),
   advisorySettings = resolvePostAcceptAdvisorySettings, recordAdvisoryShadow = recordPostAcceptAdvisoryShadow,
   recordAdvisoryLoops = recordPostAcceptAdvisoryLoops, recordAdvisoryRating = recordPostAcceptAdvisoryRating,
-  advisoryLog = line => console.error(line),
+  advisoryLog = line => console.error(line), recoveryIo = null,
 } = {}) {
-  const parsed = parseOperationArgv(declaration, argv);
+  const resumeOnly = argv.includes('--resume-only');
+  const settleApplied = argv.includes('--settle-applied');
+  const recoveryMode = resumeOnly || settleApplied;
+  readResumePr ??= createReviewPassPrReader({ includeState: recoveryMode });
+  const recoveryFlags = new Set(['resume-only', 'claim-token', 'settle-applied', ...(settleApplied ? ['actor', 'reason'] : [])]);
+  const parsed = parseOperationArgv(declaration, argv.filter(a => !recoveryFlags.has(a.replace(/^--/, '').split('=')[0])));
+
   const requiresCleanReferrals = acceptPolicy.value.unattendedAcceptRequiresCleanReferrals;
   // `filed: true` (an accept about to be recorded) admits a round-cards `changes` round only once its card is filed:
   // the run's own filing receipt names this reviewed head and this finding set. A bare `--answer=accept` has none.
@@ -693,6 +700,100 @@ export async function runReviewLoopOnce({
         expectedHead: run.findings?.read?.netBasis?.rev, roundCards, cardReadable });
     } catch (error) { return `live referrals unavailable: ${describeErrorClass('live-referrals', error)}`; }
   };
+  if (recoveryMode) {
+    let run = null, claimed = false;
+    const refuse = reason => ({ code: 2, stopped: 'refused', run,
+      lines: [`error: pinned recovery refused: ${reason}; inspect and use --settle-applied with verified evidence`] });
+    const owner = recoveryIo?.owner ?? recoveryOwner();
+    const runId = parsed.control.resume;
+    const options = { runId, owner, ...(recoveryIo?.pidIdentity ? { pidIdentity: recoveryIo.pidIdentity } : {}) };
+    const io = recoveryIo ?? {
+      owner, readClaim: () => readRecoveryClaim(options),
+      acquireClaim: o => acquireRecoveryClaim({ ...options, ...o }),
+      releaseClaim: o => releaseRecoveryClaim({ ...options, ...o }),
+    };
+    let token = argvFlag(argv, 'claim-token');
+    const actor = argvFlag(argv, 'actor'), reason = argvFlag(argv, 'reason');
+    const locked = fn => recoveryIo ? fn() : withRecoveryClaimLock(options, fn);
+    const ownsClaim = () => {
+      const claim = io.readClaim();
+      return validRecoveryClaim(claim) && claim.token === token && sameOwner(claim.holder, owner);
+    };
+    try {
+      if (!parsed.ok || !runId) return refuse('resume id and valid arguments required');
+      if (settleApplied && (!actor?.trim() || !reason?.trim())) return refuse('actor and reason required');
+      run = store.read(runId);
+      if (!run || run.op !== declaration.name) return refuse('unreadable run evidence');
+      const previousOwner = run.owner;
+      if ((!settleApplied || previousOwner) && !isProvablyDeadOwner(previousOwner, { owner, ...options })) return refuse('owner not provably dead');
+      if (settleApplied && !token) {
+        try { token = io.readClaim()?.token; } catch { /* absent claim may be exclusively created below */ }
+        if (!token && !recoveryIo) {
+          const handoff = createRecoveryHandoff(options);
+          if (!handoff.ok) return refuse(handoff.reason);
+          token = handoff.token;
+        }
+      }
+      const handoff = io.readClaim();
+      if (!validRecoveryClaim(handoff) || handoff.holder !== 'handoff' || !token || handoff.token !== token) return refuse('claim lost or token mismatch');
+      const acquired = await io.acquireClaim({ token });
+      if (!acquired?.ok) return refuse(acquired?.reason ?? 'claim lost');
+      claimed = true;
+      const taken = locked(() => {
+        const fresh = store.read(runId);
+        if (!(previousOwner ? sameOwner(fresh?.owner, previousOwner) : fresh && !fresh.owner)) return 'owner changed';
+        if (!ownsClaim()) return 'claim or owner changed';
+        if ((!settleApplied || previousOwner) && !isProvablyDeadOwner(fresh.owner, { owner, ...options })) return 'owner not dead';
+        const attempts = fresh.strandedResumeAttempts ?? 0;
+        if (!Number.isSafeInteger(attempts) || attempts < 0 || (!settleApplied && attempts >= RESUME_MAX_ATTEMPTS)) return 'attempt budget spent';
+        run = { ...fresh, ...(!settleApplied || previousOwner ? { owner } : {}), strandedRecordEffect: true,
+          ...(!settleApplied ? { strandedResumeAttempts: attempts + 1 } : {}) };
+        store.write(run);
+        return null;
+      });
+      if (taken) return refuse(taken);
+      if (run.pending?.kind !== 'effect' || run.pending.step !== 'record') return refuse('not a stranded record effect');
+      if (securitySeatFromRun(run) !== declaresSecuritySeat(declaration)
+        || Boolean(run.findings?.read?.cardOnlyLight) !== Boolean(declaration.cardOnlyLight)) return refuse('roster mismatch');
+      const label = run.effects.find(e => e.stepIndex === run.pending.stepIndex && e.type === REVIEW_EFFECTS.LABEL && e.status === 'pending' && !e.idempotent);
+      const verdict = run.verdict?.verdict;
+      if (!label || !['accept', 'changes'].includes(verdict) || label.payload.to !== (verdict === 'accept' ? 'accepted' : 'changes')) return refuse('verdict/payload mismatch');
+      const live = await readResumePr(run.input);
+      if (live?.state !== 'OPEN') return refuse('PR closed or open state unavailable');
+      if (live.headRefOid !== run.findings?.read?.netBasis?.rev || live.headRefOid !== label.payload.reviewedHead) return refuse('head moved');
+      if (!Array.isArray(live.comments)) return refuse('unreadable operator wake evidence');
+      if (!findResumableParkedRun({ ...live, number: run.input.pr }, [reviewRunEvidence(run)], { repo: run.input.repo, pinnedRunId: run.id })) return refuse('operator wake veto or unreadable evidence');
+      const hold = verdict === 'accept' ? acceptHold(run, { filed: true }) : null;
+      if (hold) return refuse(`accept held: ${hold}`);
+      let proof;
+      try { proof = await sinks[REVIEW_EFFECTS.LABEL]?.provablyApplied?.(label, { runId, key: label.key,
+        attempt: label.attempts, readRun: id => {
+          const saved = store.read(id);
+          // Legacy evidence is determined from the pre-takeover stamp, never from the new owner.
+          return !previousOwner && settleApplied ? { ...saved, owner: undefined } : saved;
+        }, settleApplied }); } catch { return refuse('applied evidence unreadable'); }
+      if (proof?.applied !== true) return refuse(`applied check failed: ${proof?.reason ?? 'missing proof'}`);
+      const settled = locked(() => {
+        const fresh = store.read(runId);
+        if (!ownsClaim() || (!settleApplied || previousOwner ? !sameOwner(fresh?.owner, owner) : !fresh || Boolean(fresh.owner))) return false;
+        const current = fresh.effects.find(e => e.key === label.key);
+        if (JSON.stringify(current) !== JSON.stringify(label)) return false;
+        run = { ...fresh, owner, effects: fresh.effects.map(e => e.key === label.key ? { ...e, status: 'applied', error: null,
+          result: { reconciled: true, evidence: proof.evidence, ...(settleApplied ? { actor, reason } : {}) } } : e) };
+        store.write(run); return true;
+      });
+      if (!settled) return refuse('claim or owner changed before settlement');
+      // Every remaining record sink checks that this process still owns both claim and run.
+      const guardedSinks = Object.fromEntries(Object.entries(sinks).map(([type, sink]) => [type, Object.assign(async (...args) => {
+        if (!ownsClaim() || !sameOwner(store.read(runId)?.owner, owner)) throw Error('recovery claim lost');
+        return sink(...args);
+      }, sink)]));
+      const out = await driveRun({ run, registry, store, sinks: guardedSinks,
+        judge: () => { throw Error('pinned recovery cannot call a panel'); }, autoConfirm: () => null, attemptedBy: 'auto' });
+      return { ...renderOutcome({ outcome: out, json: parsed.control.json, declaration }), run: out.run, stopped: out.stopped };
+    } catch { return refuse('unreadable evidence or claim'); }
+    finally { if (claimed) await io.releaseClaim({ token }); }
+  }
   const drive = (o) => {
     const guardedConfirm = (pending, current) => {
       const answer = o.autoConfirm?.(pending, current);
@@ -780,6 +881,7 @@ export async function runReviewLoopOnce({
   if (parsed.control.resume) {
     run = store.read(parsed.control.resume);
     if (!run) return { code: 2, lines: [`error: no run record for ${JSON.stringify(parsed.control.resume)}`], run: null, stopped: 'refused' };
+    if (run.strandedRecordEffect || reviewRunEvidence(run)?.strandedRecordEffect) throw new Error('UNKNOWN stranded record outcome requires pinned --resume-only with a claim, or --settle-applied');
     if (run.op !== declaration.name) {
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
@@ -906,6 +1008,10 @@ export async function runReviewLoopOnce({
       store.write(run);
     }
   }
+
+  // Every normal driver, including a referral rewind, owns its future record effects.
+  run = { ...run, owner: recoveryOwner() };
+  store.write(run);
 
   let resume = null;
   if (parsed.control.answer != null) {

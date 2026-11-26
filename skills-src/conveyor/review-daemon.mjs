@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { sweepStrandedRecordEffects } from '../../scripts/operations/review-recovery-claim.mjs';
+export { sweepStrandedRecordEffects } from '../../scripts/operations/review-recovery-claim.mjs';
+import { tryReadCompletion } from '../../scripts/operations/completion-store.mjs';
 /**
  * @file skills-src/conveyor/review-daemon.mjs
  * @description #3876 (epic #3383) — the standalone Review daemon: reconcile-pass.mjs (discovery) +
@@ -94,7 +97,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
 import { reviewDispatchContext } from '../../scripts/lib/review-dispatch-context.mjs';
-import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
+import { dispatchReviewJob, dispatchReviewByMode, laneCooloffActive } from '../../scripts/operations/review-job.mjs';
 import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
 import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
 import { hostLoadAdmission } from '../../scripts/lib/host-load.mjs';
@@ -2101,6 +2104,17 @@ export function runReviewDispatchPass({ owner, lockRoot = RUNNER_LOCK_ROOT, log 
     return dispatch({ ...args, ...(Array.isArray(lanes) ? { preferLane: lanes.includes(args.preferLane) ? args.preferLane : lanes[0] } : {}), leaseHeld: currentLeaseHeld });
   }, { lockRoot, owner, log: line => log.error(line) });
   const options = reviewTickOpts({ log, factCache, leaseHeld, dispatchWithLease });
+  // Run discovery is independent of accepted-label filtering. Dispatch rechecks CI, cooldown and lease.
+  const holdReconcile = options.holdReconcile ?? sweepReviewHolds;
+  options.holdReconcile = input => {
+    sweepStrandedRecordEffects({ repo: input.repo, leaseHeld,
+      readPr: ({ repo, pr }) => readLiveRedTeamPr({ repo, pr }),
+      ciAllowed: run => readReviewCiGateFactsFirst(run.input)?.allowed === true,
+      cooldownActive: run => laneCooloffActive(tryReadCompletion(`review-${run.input.pr}`), Date.now()),
+      dispatch: args => dispatchWithLease(dispatchReviewJob, args, { recovery: true }),
+      log: line => log.error(line) });
+    return holdReconcile(input);
+  };
   const dispatch = options.dispatch ?? dispatchReviewByMode;
   options.dispatch = args => dispatchWithLease(dispatch, args);
   return runReviewTickAllRepos({ tick, ...options, ...opts, dispatch: options.dispatch, leaseHeld });

@@ -1,3 +1,5 @@
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { buildReviewAttemptMarker } from '../review-set-label.mjs';
 import { redTeamCheckRunIsEvidence, redTeamCheckRunPayload, postRedTeamCheckRun as defaultPostRedTeamCheckRun } from '../lib/red-team-check-run.mjs';
 import { redTeamForHead } from '../lib/red-team-gate.mjs';
 import { assertReviewSessionPin } from '../lib/review-session-pin.mjs';
@@ -1145,6 +1147,7 @@ export function createReviewPrSinks({
   // The forge port the ADVISORY_LABEL sink reads live PR state and writes labels through — injectable so the sink
   // is testable with no `gh`, exactly like `postComment` above. Defaults to the same real provider.
   labelProvider = createReferralGhProvider(),
+  readCompleteComments = (repo, pr) => readCompletePrComments(pr, { repo }),
   // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own two primitives (see the header note above).
   readLabels = createGhProvider().readLabels,
   setLabels = createGhProvider().setLabels,
@@ -1815,6 +1818,8 @@ export function createReviewPrSinks({
         // and the single home's own default for an absent one is the NEUTRAL sentence, never a wrong channel.
         ...(payload.channel ? [`--channel=${payload.channel}`] : []),
         `--body-file=${bodyPath}`,
+        ...(Number.isSafeInteger(ctx?.attempt) && ctx.attempt > 0
+          ? [`--run-id=${ctx.runId}`, `--effect-key=${ctx.key}`, `--attempt=${ctx.attempt}`] : []),
       ];
       let stdout = '';
       try {
@@ -2083,6 +2088,41 @@ export function createReviewPrSinks({
     },
   };
   // Only historical body-file argument refusals prove a pending label attempt never wrote.
+  sinks[REVIEW_EFFECTS.LABEL].provablyApplied = async (entry, ctx) => {
+    const refuse = reason => ({ applied: false, reason });
+    try {
+      const run = (ctx.readRun ?? (id => runStore.read(id)))(ctx.runId);
+      const p = entry.payload;
+      if (!run || run.id !== ctx.runId || !run.effects?.some(e => e.key === entry.key && e.attempts === ctx.attempt)
+        || p.repo !== run.input?.repo || Number(p.pr) !== Number(run.input?.pr)
+        || !/^[a-f0-9]{40}$/.test(p.reviewedHead ?? '') || p.reviewedHead !== run.findings?.read?.netBasis?.rev
+        || !['accepted', 'changes'].includes(p.to) || p.addLabel !== `review:${p.to}` || !Array.isArray(p.removeLabels)) return refuse('invalid applied identity');
+      const state = await labelProvider.readPrState(p.repo, p.pr);
+      const labels = Array.isArray(state?.labels) ? state.labels.map(l => typeof l === 'string' ? l : l?.name) : null;
+      if (state?.state !== 'OPEN' || state.headRefOid !== p.reviewedHead || !labels
+        || !labels.includes(p.addLabel) || p.removeLabels.some(l => labels.includes(l))) return refuse('applied end state does not match');
+      const comments = await readCompleteComments(p.repo, p.pr);
+      if (!Array.isArray(comments)) return refuse('incomplete comments');
+      const marker = buildReviewAttemptMarker({ repo: p.repo, pr: p.pr, runId: run.id, effectKey: entry.key, attempt: ctx.attempt });
+      const legacy = ctx.settleApplied === true && !run.owner && p.to === 'accepted';
+      if (!legacy && !marker) return refuse('missing attempt identity');
+      const matches = comments.filter(c => {
+        if (!isTrustedMarkerAuthor(c) || typeof c.body !== 'string') return false;
+        const shas = [...c.body.matchAll(/<!--\s*reviewed-sha:\s*([a-f0-9]{40})\s*-->/g)];
+        if (shas.length !== 1 || shas[0][1] !== p.reviewedHead) return false;
+        if (legacy) return c.body.trimStart().split('\n')[0] === '✅ review — accepted' && Number.isFinite(Date.parse(entry.lastAttemptAt))
+          && Number.isFinite(Date.parse(c.createdAt)) && Date.parse(c.createdAt) >= Date.parse(entry.lastAttemptAt);
+        return c.body.includes(marker) && (c.body.match(/review-attempt:/g) ?? []).length === 1;
+      });
+      if (matches.length !== 1) return refuse('applied marker not unique or unavailable');
+      // Re-read live state after the complete thread read, refusing a head/label race.
+      const fresh = await labelProvider.readPrState(p.repo, p.pr);
+      const names = fresh?.labels?.map(l => typeof l === 'string' ? l : l?.name);
+      if (fresh?.state !== 'OPEN' || fresh.headRefOid !== p.reviewedHead || !names?.includes(p.addLabel)
+        || p.removeLabels.some(l => names.includes(l))) return refuse('applied state changed');
+      return { applied: true, evidence: { commentId: matches[0].id, head: p.reviewedHead, attempt: ctx.attempt } };
+    } catch { return refuse('unreadable applied evidence; operator must inspect full thread'); }
+  };
   sinks[REVIEW_EFFECTS.LABEL].provablyNotApplied = entry => isBodyFileRefusal(entry.error);
   return sinks;
 }

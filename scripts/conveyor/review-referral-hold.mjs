@@ -59,6 +59,8 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   if (run?.op !== 'review-pr') return null;
   const read = run.findings?.read;
   const suspendedReferralEffect = !run.resumeOf && run.pending?.kind === 'effect' && run.pending.step === 'mandatoryReferrals';
+  const strandedRecordEffect = run.pending?.kind === 'effect' && run.pending.step === 'record'
+    && Array.isArray(run.effects) && run.effects.some(e => e?.type === 'review.label-swap' && e.status === 'pending' && !e.idempotent && e.attempts > 0) === true;
   let retryableRecordEffect = false;
   let ciHeldRecordRetry;
   try {
@@ -128,6 +130,7 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
     return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt: null,
       ...(requireVerdict ? { misnamed: true } : {}),
       ...(suspendedReferralEffect ? { suspendedReferralEffect: true } : {}),
+      ...(strandedRecordEffect ? { strandedRecordEffect: true } : {}),
       ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
       ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
       incomplete: true, quotaOnly, parked: false, attempted: false, persistenceFailed: false, count: 0,
@@ -146,7 +149,8 @@ export function reviewRunEvidence(run, { requireVerdict = false } = {}) {
   } catch { /* unreadable effects cannot establish a CI-held publish */ }
   return { id: run.id, repo: read.repo, pr: Number(read.pr), head, startedAt, completedAt,
     quotaOnly,
-    ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
+    ...(strandedRecordEffect ? { strandedRecordEffect: true } : {}),
+      ...(retryableRecordEffect ? { retryableRecordEffect: true } : {}),
     ...(ciHeldRecordRetry ? { ciHeldRecordRetry } : {}),
     // A throwing stage has no pending confirm left. Keep this durable shape wakeable without caching live rulings.
     ...(pending.length && !run.pending && run.stepTimings?.some(t => t?.step === 'stageVerdict'
@@ -373,9 +377,14 @@ function latestReviewAttempt(history) {
  * (unless the operator in person asked for a fresh look): the retry budget picks the time, and the retry re-runs the persist step only. Pure.
  * @returns {{id: string, head: string}|null}
  */
-export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0 } = {}) {
+export function findResumableParkedRun(pr, runs, { repo, cardReadable, ciHeldRecordRetryMax = 0, pinnedRunId = null } = {}) {
   const history = runs.filter(r => !r.misnamed && r.repo === repo && r.pr === Number(pr.number));
   const last = latestReviewAttempt(history);
+  if (pinnedRunId) {
+    if (last?.id !== pinnedRunId || !last.strandedRecordEffect || last.head !== pr.headRefOid
+      || operatorWakeTime(pr, last) > last.startedAt) return null;
+    return { id: last.id, head: last.head };
+  }
   const ciHeldRetry = ciHeldRecordRetryMax > 0 && ciHeldRecordRetryCountersValid(last?.ciHeldRecordRetry)
     && last.ciHeldRecordRetry.attempts <= ciHeldRecordRetryMax
     && last.ciHeldRecordRetry.resumeAttempts < RESUME_MAX_ATTEMPTS;

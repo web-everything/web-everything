@@ -637,10 +637,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null, resumeRun = null, claimToken = null }) => {
       const r = node([
-        'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
+        'scripts/operations/review-loop-cli.mjs', ...(resumeRun ? [] : [`--pr=${pr}`, `--repo=${repo}`]), `--cwd=${lanePath}`,
         '--provider=claude', '--json',
+        ...(resumeRun ? [`--resume=${resumeRun}`, '--resume-only', `--claim-token=${claimToken ?? ''}`] : []),
         ...(reviewModel ? [`--model=${reviewModel}`] : []),
       ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
@@ -1077,6 +1078,7 @@ export function commentReasonSuffix(value, text = (v, fb) => { try { return Stri
 }
 
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
+  if (opts.resumeRun) return runReviewArc(opts, io, {});
   const jobStartedAt = io.now();
   const seatsBox = {};
   if (!opts.redTeamOnly && typeof io.concurrentSeatsSetting === 'function') {
@@ -1308,7 +1310,7 @@ function finalHeadSeatsGate(input, io) {
 export const NO_EXPECTED_HEAD_OUTCOME = 'refused-no-expected-head';
 
 function runReviewArc({
-  pr, repo, expectedHead, reviewModel = null, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
+  pr, repo, expectedHead, resumeRun = null, claimToken = null, reviewModel = null, redTeamOnly = false, redTeamMode = 'fresh', preferLane = null, laneWaitMs = REVIEW_JOB_LANE_WAIT_MS, loopTimeoutMs = resolveLoopTimeoutMs(), pid = process.pid, onSessionSlug,
 } = {}, io, seatsBox = {}) {
   const planned = planReviewDispatch({ pr, repo });
   const slug = planned.sessionSlug;
@@ -1320,11 +1322,28 @@ function runReviewArc({
     label: null, ...fields, timings: { ...timings, totalMs: io.now() - t0 },
   });
 
-  const record = { slug, pr: planned.pr, repo: planned.repo, pid, startedAt: new Date(t0).toISOString(), cwd: io.root };
+  const record = { slug, pr: planned.pr, repo: planned.repo, ...(resumeRun ? { resumeRun, claimToken } : {}), pid, startedAt: new Date(t0).toISOString(), cwd: io.root };
   const claim = io.claim(slug, record);
   if (!claim.ok) {
     io.log(`review-job ${slug}: refused — a live job (pid ${claim.heldBy}) already holds this PR's slot`);
     return result({ outcome: 'refused-live-job', refused: true });
+  }
+
+  if (resumeRun) {
+    // Recovery has no panel or speculative seats. Its own job record already owns the PR slot.
+    let lane;
+    try {
+      if (!claimToken) return result({ outcome: 'refused', refused: true, reason: 'missing recovery claim token' });
+      const actorId = io.newActorId();
+      lane = io.acquireLane({ laneRepo: planned.laneRepo, slug, actorId, waitMs: laneWaitMs });
+      if (!lane?.lanePath) return result({ outcome: 'refused', refused: true, reason: 'recovery lane unavailable' });
+      const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath: lane.lanePath,
+        actorId, timeoutMs: loopTimeoutMs, resumeRun, claimToken });
+      const parsed = parseReviewLoopStdout(loop.stdout);
+      return result({ ...classifyReviewLoopOutcome(parsed), runId: resumeRun,
+        ...(loop.status !== 0 ? { outcome: 'refused', refused: true } : {}) });
+    } catch { return result({ outcome: 'refused', refused: true, reason: 'recovery evidence unavailable' }); }
+    finally { if (lane?.lanePath) io.releaseLane(slug); io.unclaim(slug, pid); }
   }
 
   let tel = null;
@@ -1633,7 +1652,7 @@ function runReviewArc({
  *   logPath:string, skipped?:string}}
  */
 export function dispatchReviewJob({
-  careLevel = 'none', scopePaths = [], escalationReason = [],
+  careLevel = 'none', scopePaths = [], escalationReason = [], resumeRun = null, claimToken = null,
   leaseHeld = () => true,
   ciGate = readReviewCiGate, advisoryCiWaiver = null, redTeamOnly = false, redTeamMode = 'fresh',
   pr, repo, preferLane = null, root = REPO_ROOT, env = process.env, now = Date.now(), checkStaleness,
@@ -1685,6 +1704,7 @@ export function dispatchReviewJob({
   if (leaseHeld() !== true) throw Error('dispatch lease lost');
   const jobPid = spawnJob({
     argv: [THIS_FILE, 'run', `--pr=${planned.pr}`, `--repo=${planned.repo}`,
+      ...(resumeRun ? [`--resume-run=${resumeRun}`, `--claim-token=${claimToken ?? ''}`] : []),
       ...(tier === 'opus' ? ['--review-model=opus'] : []),
       ...(redTeamOnly ? [`--red-team-only=${redTeamMode}`] : []),
       ...(expectedHead === undefined ? [] : [`--expected-head=${expectedHead}`]),
@@ -1693,7 +1713,7 @@ export function dispatchReviewJob({
   // Claim the slot for the child NOW, so the very next reader (a tick 120s later, or a status tag this same
   // tick) sees it — the child's own claim then finds its own pid already recorded and proceeds.
   if (Number.isInteger(jobPid)) {
-    writeJobRecord({ slug, pr: planned.pr, repo: planned.repo, pid: jobPid, startedAt: new Date(now).toISOString(), cwd: root }, dir);
+    writeJobRecord({ slug, pr: planned.pr, repo: planned.repo, ...(resumeRun ? { resumeRun, claimToken } : {}), pid: jobPid, startedAt: new Date(now).toISOString(), cwd: root }, dir);
   }
   return { ...base, jobPid: Number.isInteger(jobPid) ? jobPid : null };
 }
@@ -1869,10 +1889,11 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       if (flag('expected-head') === undefined) {
         const noHead = { refused: true, outcome: 'refused-no-expected-head', reason: 'no expected head: the reviewed head is unknown' };
         writeAllSync(1, `${JSON.stringify(noHead)}\n`);
-        process.exitCode = 75;
+        process.exitCode = flag('resume-run') ? 2 : 75;
         return;
       }
-      const out = runJob({ pr: flag('pr'), repo: flag('repo'), redTeamOnly, redTeamMode, onSessionSlug,
+      const out = runJob({ pr: flag('pr'), repo: flag('repo'),
+        ...(flag('resume-run') ? { resumeRun: flag('resume-run'), claimToken: flag('claim-token') } : {}), redTeamOnly, redTeamMode, onSessionSlug,
         ...(reviewModel ? { reviewModel } : {}),
         ...(flag('expected-head') === undefined ? {} : { expectedHead: flag('expected-head') }),
         preferLane: Number.isInteger(lane) && lane > 0 ? lane : null });
@@ -1884,7 +1905,7 @@ export function runReviewJobCli(argv = process.argv.slice(2), { runJob = runRevi
       // a rating failure must never affect this CLI's own exit code. A refused job ran no review — nothing to
       // rate (`rateReviewJobLog` also skips any summary with no loop timing, the same guard at the pure layer).
       if (!redTeamOnly && out.sessionSlug && !out.refused) { try { rate(jobLogPath(out.sessionSlug)); } catch { /* best-effort */ } }
-      process.exitCode = out.refused ? 75 : 0;
+      process.exitCode = out.refused ? (flag('resume-run') ? 2 : 75) : 0;
     } catch (e) {
       writeLineSync(2, `review-job: error: ${String(e?.message ?? e)}`);
       process.exitCode = 1;
