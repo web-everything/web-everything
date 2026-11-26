@@ -39,6 +39,7 @@ export function loadFixerLadder({
   override, // injectable: skip the file
   capacity, now, // injectable observations and clock; production reads live capacity
   providerCapacity, // legacy injectable capacity settings; pinned routes bypass capacity scoring
+  previousProvider, previousOutcome, // failed agy turns advance to the wired Codex repair port
   aiRouting, operatorKeys, // optional resolver input (fix coordinator slice); absent = unchanged
 } = {}) {
   if (aiRouting !== undefined && !Array.isArray(operatorKeys)) throw new TypeError('aiRouting requires operatorKeys from the policy snapshot');
@@ -50,7 +51,19 @@ export function loadFixerLadder({
   const routeErrors = [];
   for (const rung of policy.rungs) {
     if (rung.action !== 'dispatch') continue;
-    if (!rung.taskType) { routes[rung.id] = null; continue; }
+    if (!rung.taskType) {
+      routes[rung.id] = null;
+      if (previousProvider === 'antigravity' && previousOutcome === 'failed') {
+        // Use the existing policy's cross-provider model. Never resend to agy;
+        // if Codex cannot be launched, the ordinary stronger/human rungs remain.
+        try {
+          const next = resolveOperationRoute({ operation: 'fix', taskType: 'ruling-escalation-cross-provider',
+            available: providers, gateClosed: false, policy: routingPolicy, providerCapacity, capacity, now });
+          if (externalFixProviders.has('codex') && next?.provider === 'codex') routes[rung.id] = next;
+        } catch { /* no usable next provider */ }
+      }
+      continue;
+    }
     try {
       const base = { operation: 'fix', taskType: rung.taskType, available: providers, gateClosed, policy: routingPolicy, providerCapacity, capacity, now };
       routes[rung.id] = resolveOperationRoute(base);
@@ -68,6 +81,6 @@ export function loadFixerLadder({
     }
   }
   const available = (rung) => rung.action !== 'dispatch' || (!rung.taskType
-    ? true : routes[rung.id] != null && routes[rung.id].provider === rung.provider);
+    ? !(previousProvider === 'antigravity' && previousOutcome === 'failed') || routes[rung.id]?.provider === 'codex' : routes[rung.id] != null && routes[rung.id].provider === rung.provider);
   return { policy, error: [error, fromFile.error, ...routeErrors].filter(Boolean).join('; ') || null, routes, available, humanAt: humanAtMisses(policy, { available }) };
 }

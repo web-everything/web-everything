@@ -57,6 +57,7 @@ const CONFINEMENT_MODULES = Object.freeze([
   'scripts/lib/antigravity-run-evidence.mjs',
   'scripts/lib/judge-spawn.mjs',
   'scripts/lib/policy-cascade.mjs',
+  'scripts/lib/settings-files.mjs',
   'scripts/lib/mandate-fence.mjs',
   'scripts/lib/critical-work.mjs',
   'scripts/lib/provider-quota-hold.mjs',

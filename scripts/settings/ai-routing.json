@@ -1,4 +1,11 @@
 {
   "$comment": "AI role routing. Empty preserves existing resolvers; inherit leaves each current choice unchanged. PR1 adds inspection only; callers migrate separately.",
-  "aiRouting": {}
+  "aiRouting": {},
+  "agyFix": {
+    "allowedKinds": [
+      "doc-fix",
+      "fix"
+    ],
+    "share": 0.1
+  }
 }

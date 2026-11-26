@@ -1533,3 +1533,15 @@ describe('the critical-work gate opens per taskType for non-critical work only (
     }
   });
 });
+
+it('a normal-sized fix is routed to agy at the configured share', () => {
+  const settings = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../settings/ai-routing.json'), 'utf8'));
+  const context = { kind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'],
+    filesTouched: ['blocks/selection/Selection.ts'], agyFixSettings: settings.agyFix,
+    availability: { antigravity: false }, sample: 0 };
+  const routes = Array.from({ length: 100 }, (_, i) => selectProvider({ taskType: 'fix' }, { ...context, sample: i / 100 }));
+  expect(routes.filter(route => route.recommendation === 'gemini')).toHaveLength(10);
+  expect(selectProvider({ taskType: 'fix' }, { ...context, availability: { antigravity: 'signed out' } }).recommendation).toBe('codex');
+  expect(selectProvider({ taskType: 'fix' }, { ...context, scope: ['scripts/operations/fix-run.mjs'] }).recommendation).toBe('codex');
+  expect(selectProvider({ taskType: 'fix' }, { ...context, size: 4 }).recommendation).toBe('codex');
+});

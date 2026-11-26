@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { deriveAgyFixAdmission } from '../lib/agy-fix-admission.mjs';
+import { deriveAgyFixAdmission, isAdmissibleTargetPath } from '../lib/agy-fix-admission.mjs';
 import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-prompt-command-rules.mjs';
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
@@ -213,7 +213,7 @@ export function unstagedPaths(porcelain) {
 }
 
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
-export function changedPaths(porcelain) {
+export function changedPaths(porcelain, { includeArtifacts = false } = {}) {
   const records = String(porcelain ?? '').split('\0');
   const paths = [];
   for (let i = 0; i < records.length; i++) {
@@ -221,10 +221,10 @@ export function changedPaths(porcelain) {
     if (!row) continue;
     const code = row.slice(0, 2);
     const path = row.slice(3);
-    if (isStageable(path, code[1] === 'D' || code === 'D ')) paths.push(path);
+    if (includeArtifacts || isStageable(path, code[1] === 'D' || code === 'D ')) paths.push(path);
     if (/[RC]/.test(code)) {
       const source = records[++i];
-      if (isStageable(source, code.includes('R'))) paths.push(source);
+      if (includeArtifacts || isStageable(source, code.includes('R'))) paths.push(source);
     }
   }
   return [...new Set(paths)];
@@ -1074,6 +1074,7 @@ export async function runFixCli(argv = [], {
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
     let spawned;
+    let agyAdmission = null;
     if (repeatPlan.action === 'reset') {
       if (target) throw new LauncherError('repeated finding: resolve base conflict before scope reset');
       const scope = String(launch.scope ?? '').split(',').map(p => p.trim().replace(/^[a-z][\w-]*:/i, '')).filter(Boolean);
@@ -1103,6 +1104,8 @@ export async function runFixCli(argv = [], {
           let item;
           try { item = launch.item ? await loadFixItem(launch.item) : {}; } catch { item = null; }
           admission = item && deriveAgyFixAdmission(item, { ...launch, repo: launch.claimRepo ?? 'we' });
+          agyAdmission = admission;
+          if (!admission) throw new LauncherError('agy repair admission unavailable; use the next fix provider');
         }
         spawned = await provider.spawn({
           ...admission,
@@ -1135,6 +1138,18 @@ export async function runFixCli(argv = [], {
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new LauncherError('lane git config changed while the agent ran; refusing to push');
     const statusAfterAgent = git('status', '--porcelain=v1', '-z', '--untracked-files=all');
     const paths = changedPaths(statusAfterAgent);
+    if (launch.provider === 'antigravity') {
+      const outputPaths = [...new Set([
+        ...changedPaths(statusAfterAgent, { includeArtifacts: true }),
+        ...git('diff', '--name-only', '-z', '--no-renames', `${before}..HEAD`).split('\0').filter(Boolean),
+      ])];
+      const refused = outputPaths.filter(path => !agyAdmission
+        || !agyAdmission.scope.some(root => path === root || path.startsWith(`${root}/`))
+        || !isAdmissibleTargetPath(path)
+        || !deriveAgyFixAdmission({ ...agyAdmission, taskKind: agyAdmission.kind, scope: [path] },
+          { scope: agyAdmission.scope, taskKind: agyAdmission.kind, size: agyAdmission.size }));
+      if (refused.length) throw new LauncherError('agy output scope/admission refused; use the next fix provider or request operator review');
+    }
     if (inMerge()) {
       // Every conflicted path is a text UU/AA conflict (checked above), so it must still exist as a regular file in the
       // lane with no conflict markers; a missing, symlinked, hardlinked or escaping path counts as unresolved.

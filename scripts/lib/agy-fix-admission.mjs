@@ -1,6 +1,8 @@
 import { statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cascadePolicy } from './policy-cascade.mjs';
+import { readSettingsChecked } from './settings-files.mjs';
 import { criticalWorkVerdict } from './critical-work.mjs';
 
 // Node paths avoid Vite treating a dynamic new URL as an eager checkout-wide asset glob.
@@ -32,7 +34,8 @@ const isTestScope = p => hasAllowedTestSubject(p)
   && (isTest(p) || /(^|\/)(__tests__|tests)(\/|$)/.test(p) && !/\.[^/]+$/.test(p));
 // Runtime repairs use the same ordinary block subjects, excluding tests and their support trees.
 const isRuntime = p => hasAllowedTestSubject(p) && /\.(mjs|js|ts|cjs)$/.test(p)
-  && !isTest(p) && !/(^|\/)(__tests__|tests)(\/|$)/.test(p);
+  && !/\.(test|spec)\.[^/]+$/.test(p)
+  && !/(^|\/)(__tests__|tests|setup(?:Tests)?|conformance|a11y|e2e)(\/|[.-]|$)/i.test(p);
 /** Applied files must be prose, ordinary runtime code or code tests; directory prefixes are scope-only. */
 export const isAdmissibleTargetPath = p => admissible(p, false);
 export const isAdmissibleTargetScope = p => admissible(p, true);
@@ -64,8 +67,25 @@ function admissible(p, scope) {
   } catch { return false; } // Unknown criticality uses the next provider/operator.
 }
 
+/** Repair policy is separate from agy-build's doc-only policy; confinement still gates execution. */
+export function readAgyFixSettings({ env = process.env, platform, read = readSettingsChecked, log } = {}) {
+  let tool;
+  try {
+    const result = read({ namespace: 'agyFix' });
+    if (result.taint.length) return null;
+    tool = result.value;
+  } catch { return null; }
+  return cascadePolicy('agyFix', tool, {
+    standard: { allowedKinds: ['doc-fix'], share: 0 }, platform, env, log,
+    valid: {
+      allowedKinds: value => Array.isArray(value) && value.every(kind => ['doc-fix', 'fix'].includes(kind)),
+      share: value => Number.isFinite(value) && value >= 0 && value <= 1,
+    },
+  }).value;
+}
+
 /** Repair admission is narrower than general build admission. Unknown evidence uses the next provider. */
-export function deriveAgyFixAdmission(item = {}, launch = {}) {
+export function deriveAgyFixAdmission(item = {}, launch = {}, policy = readAgyFixSettings()) {
   const repo = launch.claimRepo ?? launch.repo ?? 'we';
   const parseScope = declared => {
     const entries = Array.isArray(declared) ? declared : typeof declared === 'string' ? declared.split(',') : [];
@@ -94,6 +114,7 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;
   const kind = taskKind === 'fix' && scope.every(isDocScope) ? 'doc-fix'
     : taskKind === 'fix' && scope.every(isTestScope) ? 'test-fix' : taskKind;
+  if (!policy || !Array.isArray(policy.allowedKinds) || !policy.allowedKinds.includes(kind)) return null;
   if (kind === 'fix' && scope.every(isRuntime)) return { kind, size, scope };
   // #8606: no agy-authored test may execute on the host before review, regardless of settings.
   if (kind !== 'doc-fix' || size !== 1 || !scope.every(isDocScope)) return null;

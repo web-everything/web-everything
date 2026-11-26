@@ -130,3 +130,10 @@ describe('what the dispatch does with a rung', () => {
     expect(withRulingNotAddressed('BRIEF', ruling(2))).not.toMatch(/failing test/);
   });
 });
+
+it('a failed agy fix escalates to codex, not to a repeat agy run', () => {
+  const ladder = loadFixerLadder({ override: null, previousProvider: 'antigravity', previousOutcome: 'failed',
+    externalFixProviders: new Set(['codex']) });
+  expect(ladder.routes.resend).toMatchObject({ provider: 'codex' });
+  expect(plan(2, ladder).dispatch[0].rulingNotAddressed.route).toMatchObject({ provider: 'codex' });
+});

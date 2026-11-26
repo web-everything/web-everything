@@ -218,3 +218,17 @@ it('exports a frozen directory allowlist for documentation admission', () => {
 it.each(refusedTargets)('refuses forbidden file %s as a scope too', path => {
   expect(isAdmissibleTargetScope(path)).toBe(false);
 });
+
+// GEMINI-FIX-PATH audit regressions.
+it.each(['setup.test.ts', 'conformance.test.ts', 'a11y.spec.ts', 'e2e.spec.ts',
+  'setup.ts', 'conformance/helper.ts', 'a11y/helper.ts', 'e2e/helper.ts'])(
+  'never reclassifies excluded test/support file %s as runtime', name => {
+    const path = `blocks/selection/${name}`;
+    expect(isAdmissibleTargetPath(path)).toBe(false);
+    expect(admit({ taskKind: 'fix', size: 3, scope: [path] })).toBeNull();
+  });
+it('executable repair admission agrees with the shipped fix policy', () => {
+  const settings = JSON.parse(readFileSync(new URL('../../settings/ai-routing.json', import.meta.url), 'utf8'));
+  expect(settings.agyFix?.allowedKinds).toContain('fix');
+  expect(admit({ taskKind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] })).not.toBeNull();
+});

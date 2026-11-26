@@ -66,6 +66,7 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
+import { deriveAgyFixAdmission } from './agy-fix-admission.mjs';
 import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
@@ -744,6 +745,22 @@ function evaluateProviderFitness(providerNames, taskType, filesTouched, estimate
  */
 // @test-only-export-ok: Shared library exported for interactive Claude sessions and conveyor runners
 export function selectProvider(task, context) {
+  // Repair share is caller-loaded; absent availability/sample/policy evidence fails
+  // closed to the next provider. The launcher separately enforces confinement.
+  if (task?.taskType === 'fix' && context?.kind === 'fix') {
+    const settings = context.agyFixSettings;
+    const admission = deriveAgyFixAdmission({ ...task, size: context.size, scope: context.scope },
+      { ...context, taskKind: 'fix', scope: context.scope }, settings ?? null);
+    const share = admission && context.availability?.antigravity === false
+      && Number.isFinite(settings?.share) && settings.share >= 0 && settings.share <= 1
+      && context.previousProvider !== 'antigravity' ? settings.share : 0;
+    const sampled = Number.isFinite(context.sample) && context.sample >= 0 && context.sample < share;
+    return { recommendation: sampled ? RECOMMENDATIONS.GEMINI : RECOMMENDATIONS.CODEX,
+      claudeTier: null, auditTrail: [{ criterion: 'agy-fix-share', result: sampled ? 'agy' : 'codex',
+        dataConsulted: `effective share=${share}`, reasoning: 'Bounded repair admission and provider availability' }],
+      reasoning: sampled ? 'Configured agy fix share' : 'Use the next fix provider',
+      ...(sampled ? { agyAdmission: admission } : {}) };
+  }
   const taskType = task?.taskType || 'bugfix';
   const description = typeof task?.description === 'string' ? task.description : '';
   const filesTouched = Array.isArray(context?.filesTouched) ? context.filesTouched : [];
