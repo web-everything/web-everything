@@ -560,3 +560,16 @@ test('list metadata rejects non-arrays, unreadable evidence and duplicate legacy
   f.write(META, { instantGaps: [] });
   assert.throws(() => readMetadata({ root: f.root }), /duplicate metadata key: instantGaps/);
 });
+
+
+test('prerelease preset leaves are registered with reviewed inactive defaults', () => {
+  const registry = buildRegistry({ root: ROOT });
+  const metadata = readMetadata({ root: ROOT });
+  for (const [key, value] of Object.entries({ prereleasePresetActive: false, prereleasePresetExpiresAt: null })) {
+    const row = registry.rows.find(row => row.key === key && row.owners.includes('scripts/settings/delivery-tiers.json'));
+    assert.ok(row, `missing preset leaf: ${key}`);
+    assert.equal(row.value, value);
+    assert.equal(metadata.settings[key].changeVia, 'pr');
+    assert.equal(metadata.settings[key].instant, false);
+  }
+});

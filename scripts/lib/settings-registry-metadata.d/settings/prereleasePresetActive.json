@@ -1,0 +1,6 @@
+{
+  "description": "Observe-only prerelease preset opt-in; off until S13 activation. True requires a valid future UTC expiry; no gate consumes it in S2.",
+  "owner": "scripts/settings/delivery-tiers.json",
+  "changeVia": "pr",
+  "instant": false
+}

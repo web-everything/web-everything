@@ -1,0 +1,6 @@
+{
+  "description": "UTC ISO expiry, null until activation; activation stamps seven elapsed days. Expired or malformed evidence disables the preset; repair by reviewed PR.",
+  "owner": "scripts/settings/delivery-tiers.json",
+  "changeVia": "pr",
+  "instant": false
+}

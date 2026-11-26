@@ -2,6 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR } from './protected-path-floor.mjs';
 
 // TRUST_CHAIN basenames from gate-config.mjs, deliberately listed here rather than
@@ -168,4 +169,47 @@ export function classifyTier(paths, opts = {}) {
   const tier = perFile.some(file => file.tier === 'HIGH') ? 'HIGH'
     : perFile.some(file => file.tier === 'MEDIUM') ? 'MEDIUM' : 'LOW';
   return { tier, perFile };
+}
+
+
+const PRESET_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const presetOff = () => ({ active: false, expiresAt: null });
+const validPresetClock = now => Number.isSafeInteger(now) && Math.abs(now) < 8.64e15;
+function validPresetExpiry(value) {
+  return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
+}
+
+/** PURE: prepare settings for S13's activation op; no write or gate enrollment.
+ * Seven elapsed UTC days, independent of local timezone and DST. Invalid clocks refuse activation.
+ */
+export function activatePrereleasePreset(settings, now = Date.now()) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw Error('Expected settings object');
+  if (!validPresetClock(now) || !validPresetClock(now + PRESET_WINDOW_MS)) throw Error('Invalid activation clock');
+  return { ...settings, prereleasePresetActive: true,
+    prereleasePresetExpiresAt: new Date(now + PRESET_WINDOW_MS).toISOString() };
+}
+
+/** Observe-only settings reader. Unknown evidence disables the preset; restore valid
+ * settings through a reviewed PR. An active bit alone can never enable the preset.
+ * Expiry remains null until activation; expiry at or before now is inactive.
+ */
+export function readPrereleasePreset(opts = {}) {
+  try {
+    const settings = Object.hasOwn(opts, 'settings') ? opts.settings
+      : parseSettings((opts.readSettings ?? readFileSync)(SETTINGS_PATH, 'utf8'));
+    const now = Object.hasOwn(opts, 'now') ? opts.now : Date.now();
+    if (!validPresetClock(now) || !settings || typeof settings !== 'object' || Array.isArray(settings)
+      || typeof settings.prereleasePresetActive !== 'boolean'
+      || !(settings.prereleasePresetExpiresAt === null || validPresetExpiry(settings.prereleasePresetExpiresAt))) return presetOff();
+    const resolveLeaf = (key, standard, valid) => cascadePolicy(key, settings[key], {
+      standard, valid, platform: opts.platform?.[key], env: opts.env, log: opts.log,
+    }).value;
+    const active = resolveLeaf('prereleasePresetActive', false, value => typeof value === 'boolean');
+    const expiresAt = resolveLeaf('prereleasePresetExpiresAt', null, value => value === null || validPresetExpiry(value));
+    if (active && expiresAt === null) return presetOff();
+    return { active: active && Date.parse(expiresAt) > now, expiresAt };
+  } catch {
+    return presetOff();
+  }
 }
