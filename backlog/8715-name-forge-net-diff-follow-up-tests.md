@@ -1,9 +1,10 @@
 ---
+bornAs: xq7478t
 kind: story
 size: 1
 status: open
 dateOpened: "2026-11-25"
-scope: ["we:backlog/xkoxrzn-prove-safe-pure-test-renames-in-forge-net-diffs.md", "we:skills-src/drain/SKILL.md", "we:scripts/lib/__tests__/drain-api-reads.test.mjs", "we:scripts/__tests__/merge-ai-prs-forge-net-diff.test.mjs"]
+scope: ["we:backlog/8713-prove-safe-pure-test-renames-in-forge-net-diffs.md", "we:skills-src/drain/SKILL.md", "we:scripts/lib/__tests__/drain-api-reads.test.mjs", "we:scripts/__tests__/merge-ai-prs-forge-net-diff.test.mjs"]
 tags: []
 ---
 
