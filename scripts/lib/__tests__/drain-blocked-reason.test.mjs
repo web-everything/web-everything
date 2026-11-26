@@ -25,7 +25,7 @@ function fixture(fn) {
   const pr = { number: 7483, headRefOid: head, rowsHead: head, rowsComplete: true, labels: ['ready-to-merge'],
     statusCheckRollup: [row('test'), row('merge-gate', 'FAILURE', { completedAt: at(5), detailsUrl: `https://github.com/${repo}/actions/runs/45635463327/job/1` })] };
   const run = { id: 45635463327, repository: { full_name: repo }, name: 'Merge gate', path: '.github/workflows/merge-gate.yml',
-    event: 'pull_request_target', head_sha: head, run_attempt: 1, status: 'completed', conclusion: 'failure', updated_at: at(5) };
+    event: 'pull_request_target', pull_requests: [{ number: pr.number }], head_sha: head, run_attempt: 1, status: 'completed', conclusion: 'failure', updated_at: at(5) };
   const statePath = (r = repo, n = pr.number, id = run.id) => `${ledgerPath}.${r.replace('/', '~')}.${n}.${head}.${id}.rerun.json`;
   const writes = [], posts = [], bindings = [];
   let post = () => ({ status: 0 });
@@ -141,6 +141,20 @@ describe('retained diagnostics and ledger regressions', () => {
     held(f, { exec }, /head changed/); expect(existsSync(f.statePath())).toBe(false);
   }));
 });
+it.each([undefined, {}, [], [{ number: 7484 }], [{ number: '7483' }]])('run PR binding %j holds without POST', pull_requests => fixture(f => {
+  f.run.pull_requests = pull_requests; held(f, {}, /binding/);
+}));
+it('head moving after reservation prevents the rerun POST', () => fixture(f => {
+  const exec = (c, a, o) => a[0] === 'pr' && existsSync(f.statePath())
+    ? { status: 0, stdout: JSON.stringify({ headRefOid: 'b'.repeat(40) }) } : f.exec(c, a, o);
+  held(f, { exec }, /live head changed/); expect(f.state()).toMatchObject({ count: 1, confirmed: false });
+}));
+it('head moving before the changes write prevents the writer', () => fixture(f => {
+  f.run.updated_at = at(8);
+  const exec = (c, a, o) => a[0] === 'pr' && existsSync(`${f.ledgerPath}.${head}.refused`)
+    ? { status: 0, stdout: JSON.stringify({ headRefOid: 'b'.repeat(40) }) } : f.exec(c, a, o);
+  held(f, { exec }, /live head changed/); expect(existsSync(`${f.ledgerPath}.${head}.refused`)).toBe(false);
+}));
 describe('Required-gate send-back R1–R3', () => {
   it('T1 #7483 replay: gate older than main settle is re-run once via REST, never sent back', () => fixture(f => {
     f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = '2026-11-25T14:35:06Z';
@@ -149,7 +163,7 @@ describe('Required-gate send-back R1–R3', () => {
     expect(f.writes).toHaveLength(0); f.go(); expect(f.posts).toHaveLength(1);
   }));
   it('T2 #7452 replay: ledgered head, rendered clear-human, stale then in-progress then green', () => fixture(f => {
-    f.pr.number = 7452; writeFileSync(f.ledgerPath, JSON.stringify({ [`${repo}#7452`]: { [head]: true } }));
+    f.pr.number = 7452; f.run.pull_requests = [{ number: 7452 }]; writeFileSync(f.ledgerPath, JSON.stringify({ [`${repo}#7452`]: { [head]: true } }));
     const readComments = () => [comment(at(9), buildVerdictComment({ to: 'clear-human', actor: 'nicolas', headSha: head }))];
     expect(f.go({ readComments }).reason).toContain('requested'); f.run.run_attempt++; f.run.status = 'in_progress';
     expect(f.go({ readComments }).reason).toContain('in progress'); f.run.status = 'completed'; f.run.conclusion = 'success';
@@ -234,6 +248,7 @@ describe('Required-gate send-back R1–R3', () => {
     const verdicts = [null, null, 'other/repo'].map((r, i) => ({ num: 7483 + i, repo: r, listedHeadSha: head, decision: 'skip', reason: 'merge state BLOCKED; required check "merge-gate" FAILURE' }));
     const prsByRepo = new Map([[null, [f.pr, { ...f.pr, number: 7484 }]], ['other/repo', [{ ...f.pr, number: 7485 }]]]);
 
+    f.run.pull_requests.push({ number: 7484 });
     const result = sendBackBlockedGates({ ...f.options, prsByRepo, verdicts, requiredChecksOf: () => requiredChecks, localSlug: repo, cwdOf, defaultBranchOf, readMain, readFreeze });
     expect(readMain).toHaveBeenCalledTimes(2); expect(readMain).toHaveBeenCalledWith(expect.objectContaining({ repo, defaultBranch: 'main', cwd: '/repo-a' }));
     expect(readMain).toHaveBeenCalledWith(expect.objectContaining({ repo: 'other/repo', defaultBranch: 'trunk', cwd: '/repo-b' }));
@@ -335,7 +350,7 @@ describe('restored HEAD coverage', () => {
     expect(f.go({ readComments: undefined }).reason).toContain('requested'); expect(readCompletePrComments).toHaveBeenCalledWith(f.pr.number, { repo }); expect(f.writes).toHaveLength(0);
   }));
   it('#7472 stale merge-gate replay requests run 45545719563 via REST', () => fixture(f => {
-    f.pr.number = 7472; f.run.id = 45545719563; f.pr.statusCheckRollup[1].detailsUrl = `https://github.com/${repo}/actions/runs/45545719563/job/138974726864`;
+    f.pr.number = 7472; f.run.pull_requests = [{ number: 7472 }]; f.run.id = 45545719563; f.pr.statusCheckRollup[1].detailsUrl = `https://github.com/${repo}/actions/runs/45545719563/job/138974726864`;
     f.run.updated_at = f.pr.statusCheckRollup[1].completedAt = '2026-11-25T04:18:05Z';
     expect(f.go({ readComments: () => [comment('2026-11-25T03:43:10Z', '🔁 review — changes requested'), comment('2026-11-25T07:19:09Z')], readMain: () => ({ ...green(), settledAt: '2026-11-25T03:00:00Z' }), readFreeze: () => ({ frozen: false, publishedAt: '2026-11-25T03:00:00Z' }) }).reason).toContain('requested');
     expect(f.posts).toEqual([['api', '-X', 'POST', `repos/${repo}/actions/runs/45545719563/rerun`]]); expect(f.writes).toHaveLength(0);

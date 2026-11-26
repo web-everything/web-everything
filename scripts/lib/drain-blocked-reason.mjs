@@ -68,6 +68,13 @@ const BOUNCE_HEADING = /^🔁\s+(?:human\s+)?review\b/u;
 const CLEARING_HEADING = /^✅\s+(?:(?:human\s+)?review\s+[—-]\s+accepted|review\s+[—-]\s+`review:human` cleared)/u;
 const time = value => typeof value === 'string' && value.trim() ? Date.parse(value) : NaN;
 const hold = reason => ({ sent: false, reason: `merge-gate ${reason}; kept skipped` });
+function liveHeadMatches(pr, repo, headSha, exec, cwd) {
+  try {
+    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'],
+      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+    return live?.status === 0 && JSON.parse(live.stdout).headRefOid === headSha;
+  } catch { return false; }
+}
 
 /** Required-gate send-back: drain MUST NOT record a verdict from a required merge-gate red whose completion
  * predates the latest clearing verdict, main settle, or freeze lift, or while main/freeze is unreadable. */
@@ -96,6 +103,7 @@ function gateDisposition({ pr, requiredChecks, repo, headSha, ledgerPath, ledger
   const A = run?.run_attempt;
   if (run?.id !== Number(runId[2]) || run?.repository?.full_name !== repo || run?.name !== 'Merge gate'
     || !/^\.github\/workflows\/merge-gate\.yml(?:@.+)?$/.test(run?.path ?? '') || run?.event !== 'pull_request_target'
+    || !Array.isArray(run?.pull_requests) || !run.pull_requests.some(p => p?.number === pr.number)
     || String(run?.head_sha).toLowerCase() !== headSha.toLowerCase() || !Number.isSafeInteger(A) || A < 1) return hold('run binding mismatch');
   if (['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(run.status)) return hold('re-run in progress');
   if (run.status !== 'completed') return hold('run status unreadable');
@@ -132,12 +140,19 @@ function gateDisposition({ pr, requiredChecks, repo, headSha, ledgerPath, ledger
   if (state?.count >= 3) return hold('re-run budget exhausted; operator must hand re-run or make a ruling');
   const persist = value => {
     const pending = `${path}.pending`;
-    writeFileSync(pending, JSON.stringify(value) + '\n', { mode: 0o600 }); renameSync(pending, path);
+    const fd = openSync(pending, 'w', 0o600);
+    try { writeFileSync(fd, JSON.stringify(value) + '\n'); fsyncSync(fd); }
+    finally { closeSync(fd); }
+    renameSync(pending, path);
+    let dirFd;
+    try { dirFd = openSync(dirname(path), 'r'); fsyncSync(dirFd); }
+    catch { /* Directory fsync is best effort on filesystems that do not support it. */ }
+    finally { if (dirFd !== undefined) closeSync(dirFd); }
   };
-  const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'], { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-  if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha) return hold('live head changed or unreadable');
+  if (!liveHeadMatches(pr, repo, headSha, exec, cwd)) return hold('live head changed or unreadable');
   state = { count: (state?.count ?? 0) + 1, attempt: A, at: new Date(Date.now()).toISOString(), confirmed: false };
   persist(state); // Under the ledger lock: spend the budget BEFORE the external write, including crashes.
+  if (!liveHeadMatches(pr, repo, headSha, exec, cwd)) return hold('live head changed or unreadable');
   const rerun = exec('gh', ['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId[2]}/rerun`],
     { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024, env: { ...process.env, WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1' } });
   if (rerun?.status !== 0) return hold('re-run refused; operator must check actions: write or hand re-run');
@@ -197,9 +212,7 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     temp = mkdtempSync(join(tmpdir(), 'drain-gate-send-back-'));
     const bodyPath = join(temp, 'findings.md');
     writeFileSync(bodyPath, decision.body, { mode: 0o600 });
-    const live = exec('gh', ['pr', 'view', String(pr.number), `--repo=${repo}`, '--json=headRefOid'],
-      { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
-    if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha)
+    if (!liveHeadMatches(pr, repo, headSha, exec, cwd))
       return { sent: false, reason: 'live head changed or unreadable; kept skipped; retry next pass' };
     const disposition = gateDisposition({ pr, requiredChecks, repo, headSha, ledgerPath, ledgered: ledger[key]?.[headSha.toLowerCase()], readComments, readMain, readFreeze, defaultBranch, exec, cwd });
     if (disposition) return disposition;
@@ -208,6 +221,10 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     const marker = openSync(refusalPath, 'wx', 0o600);
     try { writeFileSync(marker, 'send-back may have succeeded; operator must reconcile the ledger before retrying\n'); fsyncSync(marker); }
     finally { closeSync(marker); }
+    if (!liveHeadMatches(pr, repo, headSha, exec, cwd)) {
+      rmSync(refusalPath); // No writer ran; this reservation can be released.
+      return hold('live head changed or unreadable');
+    }
     const result = exec(process.execPath, [new URL('../review-set-label.mjs', import.meta.url).pathname,
       String(pr.number), `--repo=${repo}`, '--to=changes', `--body-file=${bodyPath}`],
     { cwd, encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024 });

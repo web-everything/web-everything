@@ -6,15 +6,12 @@ const PROBE = `
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-const { sendBackBlockedGate, decideGateSendBack } = await import(process.argv[1]);
+const { sendBackBlockedGate } = await import(process.argv[1]);
 const head = 'a'.repeat(40), repo = 'acme/widgets';
 const early = '2026-11-25T14:35:06Z', late = '2026-11-25T15:07:20Z';
 const pr = { number: 7483, headRefOid: head, rowsHead: head, rowsComplete: true, labels: ['ready-to-merge'],
   statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure', completedAt: early,
     detailsUrl: 'https://github.com/' + repo + '/actions/runs/45635463327' }] };
-if (process.argv[2] === 'signal') {
-  console.log(JSON.stringify(decideGateSendBack({ pr, headSha: head, requiredChecks: ['merge-gate'], ledger: { [head]: true } }).send));
-} else {
   const violations = [];
   for (const shape of ['#7483', '#7452', 'freeze-lift']) {
     const dir = mkdtempSync(join(tmpdir(), 'soak-gate-clear-')), ledgerPath = join(dir, 'ledger');
@@ -30,7 +27,7 @@ if (process.argv[2] === 'signal') {
           return { status: 0 };
         }
         return { status: 0, stdout: JSON.stringify({ id: 45635463327, repository: { full_name: repo }, name: 'Merge gate',
-          path: '.github/workflows/merge-gate.yml', event: 'pull_request_target', head_sha: head, run_attempt: 1,
+          path: '.github/workflows/merge-gate.yml', event: 'pull_request_target', head_sha: head, pull_requests: [{ number: pr.number }], run_attempt: 1,
           status: 'completed', conclusion: 'failure', updated_at: early }) };
       };
       const o = { pr, headSha: head, repo, ledgerPath, exec, requiredChecks: ['merge-gate'],
@@ -43,18 +40,20 @@ if (process.argv[2] === 'signal') {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
   console.log(JSON.stringify(violations));
-}
 `;
-function probe(root, mode = 'scenario') {
+function probe(root) {
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', PROBE,
-    pathToFileURL(join(root, 'scripts/lib/drain-blocked-reason.mjs')).href, mode],
+    pathToFileURL(join(root, 'scripts/lib/drain-blocked-reason.mjs')).href],
   { encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 });
-  try { return r.status === 0 ? JSON.parse(r.stdout.trim().split('\n').pop()) : null; } catch { return null; }
+  if (r.error || r.status !== 0) throw Error('stale gate probe failed: ' + (r.error?.message || r.stderr));
+  const violations = JSON.parse(r.stdout.trim().split('\n').pop());
+  if (!Array.isArray(violations)) throw Error('stale gate probe unreadable');
+  return violations;
 }
 export default {
   id: 'merge-gate-stale-after-clear', title: 'Clearing main, review or freeze refreshes a stale gate without bouncing',
   card: 'MERGE-GATE-RERUN-ON-CLEAR', fixedBy: { sha: 'pending', where: 'merge-gate rerun on clear', paths: ['scripts/lib/drain-blocked-reason.mjs'] },
-  fixPresent: root => probe(root, 'signal') === true,
-  async run() { return { violations: probe(process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname) ?? ['stale gate probe unreadable'] }; },
+  fixPresent: root => probe(root).length === 0,
+  async run() { return { violations: probe(process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname) }; },
   judge: report => report.violations,
 };
