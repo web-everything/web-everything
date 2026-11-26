@@ -33,7 +33,7 @@ export default {
         planned.push(...result.dispatch.map(d => d.kind));
         return result;
       };
-      const answer = () => runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=Inspected; no code owed',
+      const answer = () => runStandDownAnswer(['42', '--repo=no-code-rearm-fixture/example', '--reason=Inspected; no code owed',
         '--actor=chalbert', '--channel=chat', '--disposition=rearm-review', '--no-code-owed'], {
         gh: args => {
           if (args[1] === 'view') return JSON.stringify({ comments, headRefOid: head, labels: labels.map(name => ({ name })) });
