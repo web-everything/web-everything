@@ -1,5 +1,7 @@
 /** Required-check diagnostics and a strictly changes-only, head-deduplicated send-back. */
 import { latestCheckNamed, isFailedCheckRow } from './rollup-collapse.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { classifySkipReason } from './drain-skip-reasons.mjs';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, openSync, closeSync, statSync, accessSync, constants, fsyncSync } from 'node:fs';
@@ -11,6 +13,10 @@ const record = value => !!value && typeof value === 'object' && !Array.isArray(v
 const clean = value => value.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '').trim();
 const firstLine = row => [row.summary, row.output?.summary, row.title, row.output?.title, row.description]
   .filter(value => typeof value === 'string').flatMap(value => value.split(/\r?\n/).map(clean)).find(Boolean) || '';
+// Paged rows expose databaseId as checkRunId; the shared selector reads id.
+const withRunIds = rows => rows.map(row => ({ ...row,
+  ...(!(Number.isSafeInteger(Number(row.id)) && Number(row.id) > 0) && Number.isInteger(row.checkRunId)
+    ? { id: row.checkRunId } : {}) }));
 
 /** Pure; unknown evidence retains the caller's original BLOCKED reason. Missing rows wait. */
 export function describeBlockedChecks(pr, requiredChecks) {
@@ -19,10 +25,7 @@ export function describeBlockedChecks(pr, requiredChecks) {
       || pr.statusCheckRollup.some(row => !record(row) || typeof (row.name || row.context) !== 'string')
       || !Array.isArray(requiredChecks) || !requiredChecks.length
       || requiredChecks.some(name => typeof name !== 'string' || !name.trim())) return null;
-    // Paged rows expose databaseId as checkRunId; the shared selector reads id.
-    const rollup = pr.statusCheckRollup.map(row => ({ ...row,
-      ...(!(Number.isSafeInteger(Number(row.id)) && Number(row.id) > 0) && Number.isInteger(row.checkRunId)
-        ? { id: row.checkRunId } : {}) }));
+    const rollup = withRunIds(pr.statusCheckRollup);
     const failed = [], waiting = [];
     for (const name of new Set(requiredChecks)) {
       // Keep the shared run-ID/rollup ordering: queued replacements have no timestamps yet.
@@ -57,10 +60,43 @@ export function decideGateSendBack({ pr, headSha, requiredChecks, ledger } = {})
   } catch { return { send: false }; }
 }
 
+// Verdict headings review-set-label.mjs and the human ceremony write. Bounce is broad (any `🔁 … review`), clearing is exact.
+const BOUNCE_HEADING = /^🔁\s+(?:human\s+)?review\b/u;
+const CLEARING_HEADING = /^✅\s+(?:(?:human\s+)?review\s+[—-]\s+accepted|review\s+[—-]\s+`review:human` cleared)/u;
+// An empty re-run marker older than this belongs to a writer that died before it heard back.
+const RERUN_UNCONFIRMED_MS = 5 * 60_000;
+
+/** Pure. Non-null only when merge-gate is the ONLY failed required check, its run completed BEFORE the latest trusted
+ * review verdict, and both times and the run id are readable. Anything else returns null (today's send-back). */
+export function staleMergeGate({ pr, requiredChecks, repo, readComments } = {}) {
+  try {
+    const failed = describeBlockedChecks(pr, requiredChecks)?.failed ?? [];
+    if (failed.length !== 1 || !failed[0].startsWith('required check "merge-gate"')) return null;
+    const gate = latestCheckNamed(withRunIds(pr.statusCheckRollup), 'merge-gate');
+    const doneAt = Date.parse(gate?.completedAt ?? gate?.completed_at ?? '');
+    const runId = new RegExp(`^https://github\\.com/${repo}/actions/runs/(\\d+)(?:/|$)`).exec(String(gate?.detailsUrl ?? gate?.details_url ?? ''))?.[1];
+    if (!runId || !Number.isFinite(doneAt)) return null;
+    const comments = readComments();
+    if (!Array.isArray(comments)) return null;
+    let latest = null, latestAt = -Infinity;
+    for (const c of comments) {
+      const heading = String(c?.body ?? '').trimStart();
+      if (!isTrustedMarkerAuthor(c) || !(BOUNCE_HEADING.test(heading) || CLEARING_HEADING.test(heading))) continue;
+      const at = Date.parse(c?.createdAt ?? c?.created_at ?? '');
+      if (!Number.isFinite(at)) return null; // an unorderable trusted verdict: no suppression
+      if (at >= latestAt) { latest = c; latestAt = at; }
+    }
+    if (!CLEARING_HEADING.test(String(latest?.body ?? '').trimStart())) return null; // newest verdict must clear the PR
+    const id = String(latest?.id ?? latest?.node_id ?? '').replace(/[^A-Za-z0-9_-]/g, '');
+    if (!latest || !id || !runId || !Number.isFinite(doneAt) || doneAt >= latestAt) return null;
+    return { runId, verdictKey: id };
+  } catch { return null; }
+}
+
 /** CLI uses argv/body-file, never a shell. Persist only AFTER the sanctioned label writer succeeds.
  * An unreadable ledger refuses send-back; the drain still skips the red PR and logs the retry reason.
  */
-export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, exec = (command, args, options) => command === 'gh'
+export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, repo, cwd, statLock = statSync, readComments = readCompletePrComments, exec = (command, args, options) => command === 'gh'
     ? spawnSync(process.execPath, [new URL('./gh-throttle.mjs', import.meta.url).pathname, ...args], options)
     : spawnSync(command, args, options) } = {}) {
   let temp, lockPath, lockFd, refusalPath;
@@ -108,6 +144,29 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
       { cwd, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
     if (live?.status !== 0 || JSON.parse(live.stdout).headRefOid !== headSha)
       return { sent: false, reason: 'live head changed or unreadable; kept skipped; retry next pass' };
+    const stale = staleMergeGate({ pr, requiredChecks, repo, readComments: () => readComments(pr.number, { repo }) });
+    let note = '';
+    if (stale) {
+      // A merge-gate run that finished before the latest review verdict only reflects the lifted hold: ask for a fresh run, once.
+      // The marker is empty while the request is in flight and non-empty once GitHub accepted it. The ledger lock is held here.
+      const rerunMarker = `${ledgerPath}.${headSha.toLowerCase()}.${stale.verdictKey}.rerun`;
+      let held;
+      try { held = statSync(rerunMarker); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (held?.size > 0) return { sent: false, reason: 'merge-gate run predates the latest review verdict; re-run already requested' };
+      if (held && Date.now() - held.mtimeMs <= RERUN_UNCONFIRMED_MS)
+        return { sent: false, reason: 'merge-gate re-run request unconfirmed; kept skipped; retried after five minutes' };
+      if (held) rmSync(rerunMarker);
+      closeSync(openSync(rerunMarker, 'wx', 0o600));
+      const rerun = exec('gh', ['run', 'rerun', stale.runId, `--repo=${repo}`],
+        { cwd, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024 });
+      if (rerun?.status === 0) {
+        writeFileSync(rerunMarker, 'requested\n');
+        return { sent: false, reason: 'merge-gate run predates the latest review verdict; re-run requested' };
+      }
+      // The re-run was refused (for example a read-only token): drop the marker and fall back to today's send-back.
+      rmSync(rerunMarker, { force: true });
+      note = `merge-gate re-run refused for run ${stale.runId} (check the drain identity has actions: write); `;
+    }
     // Reserve a durable refusal before the external write, including crash/ledger-failure recovery.
     const marker = openSync(refusalPath, 'wx', 0o600);
     try { writeFileSync(marker, 'send-back may have succeeded; operator must reconcile the ledger before retrying\n'); fsyncSync(marker); }
@@ -117,7 +176,7 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
     { cwd, encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024 });
     if (result?.status !== 0) {
       // A failed process may already have mutated the PR; keep the reservation.
-      return { sent: false, reason: 'review-set-label outcome uncertain; refusal marker retained; operator must reconcile the ledger before retrying' };
+      return { sent: false, reason: `${note}review-set-label outcome uncertain; refusal marker retained; operator must reconcile the ledger before retrying` };
     }
     ledger[key] = { ...(ledger[key] || {}), [headSha.toLowerCase()]: true };
     const pending = `${ledgerPath}.${process.pid}.pending`;
@@ -125,10 +184,10 @@ export function sendBackBlockedGate({ pr, headSha, requiredChecks, ledgerPath, r
       writeFileSync(pending, JSON.stringify(ledger) + '\n', { mode: 0o600 });
       renameSync(pending, ledgerPath);
     } catch {
-      return { sent: true, recorded: false, reason: 'send-back succeeded but ledger write failed; operator must repair the ledger before retrying' };
+      return { sent: true, recorded: false, reason: `${note}send-back succeeded but ledger write failed; operator must repair the ledger before retrying` };
     } finally { try { rmSync(pending, { force: true }); } catch { /* Refusal marker survives cleanup failure. */ } }
     rmSync(refusalPath);
-    return { sent: true, recorded: true };
+    return { sent: true, recorded: true, ...(note && { reason: `${note}sent back instead` }) };
   } catch {
     return { sent: false, reason: 'send-back evidence, ledger, or CLI unreadable; kept skipped; repair/retry next pass' };
   } finally {

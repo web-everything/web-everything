@@ -732,10 +732,11 @@ describe('portable feed IO and settings', () => {
     const spawnJob = vi.fn(() => ({ pid: 4242 })), seen = [], outcomes = [];
     // The job-side live head moved after the precheck; nothing here can launch a real job.
     const jobOpts = { io: { liveHead: () => 'b'.repeat(40) }, spawnJob, checkoutExists: () => false,
-      stackCheck: () => ({ base: null }), readCompletion: () => null };
+      readCompletion: () => null };
     const record = result => { outcomes.push(result); return result; };
     const loadReviewJob = async () => ({ ...reviewJob,
-      dispatchReviewByMode: opts => { seen.push(opts); return record(reviewJob.dispatchReviewByMode({ ...opts, ...jobOpts })); },
+      dispatchReviewByMode: opts => { seen.push(opts); return record(reviewJob.dispatchReviewByMode({ ...opts, ...jobOpts,
+        stackCheck: () => ({ base: null }) })); },
       dispatchReviewJob: opts => { seen.push(opts); return record(reviewJob.dispatchReviewJob({ ...opts, ...jobOpts })); } });
     const { io } = await localIo({ loadReviewJob, readGhText: commentGh(), readAgents: () => [],
       // Keep the stub loader even if production passes none, so this test never reaches a real launcher.

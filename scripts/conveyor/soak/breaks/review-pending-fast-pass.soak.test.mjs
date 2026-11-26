@@ -1,0 +1,27 @@
+import { expect, it } from 'vitest';
+import { fileURLToPath } from 'node:url';
+import scenario from './review-pending-fast-pass.mjs';
+import { defineBreakTest } from '../define-break-test.mjs';
+import { exerciseFastCli } from '../../../lib/__tests__/fixtures/review-fast-cli-integration.mjs';
+defineBreakTest(scenario);
+it('logs ten pending PR dispatches within 180s of labelling and median under 3min with the ordinary daemon live', async () => {
+  expect(await exerciseFastCli(['cadence'])).toEqual({ violations: [] });
+});
+it('ordinary and fast dispatch cannot both spend the last live seat', async () => {
+  expect(await exerciseFastCli(['race'])).toEqual({ violations: [] });
+});
+it('maintains ordinary holds while a fast dispatch owns the mutex', async () => {
+  expect(await exerciseFastCli(['maintenance'])).toEqual({ violations: [] });
+});
+it('models 45s of ordinary maintenance and slow evidence reads over ten pending PRs', async () => {
+  expect(await exerciseFastCli(['cadence-load'])).toEqual({ violations: [] });
+});
+it('defers while an ordinary dispatch holds the mutex for 45s and retries at the next cadence', async () => {
+  expect(await exerciseFastCli(['contention'])).toEqual({ violations: [] });
+});
+it('detects the fix by behavior in this tree', () => {
+  expect(scenario.fixPresent(fileURLToPath(new URL('../../../../', import.meta.url)))).toBe(true);
+});
+it('fails closed for a missing implementation', () => {
+  expect(scenario.fixPresent(fileURLToPath(new URL('./missing-fixture/', import.meta.url)))).toBe(false);
+});

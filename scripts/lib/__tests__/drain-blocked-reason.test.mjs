@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync, chmodSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync, chmodSync, statSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describeBlockedChecks, decideGateSendBack, sendBackBlockedGate, sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { classifyPr, unlandableStateReason } from '../../merge-ai-prs.mjs';
 import { classifySkipReason } from '../drain-skip-reasons.mjs';
@@ -9,6 +9,14 @@ import { deriveWaitingOn } from '../../operations/pr-sweep-core.mjs';
 import { classifyStall } from '../../conveyor/pr-stall-classify.mjs';
 import soakBreak from '../../conveyor/soak/breaks/drain-blocked-reason-names-failed-check.mjs';
 import { FAILED_CHECK_CONCLUSIONS } from '../rollup-collapse.mjs';
+import { VERDICT_HEADINGS } from '../review-log-claims.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+
+// Pass-through spy: every call reaches the real reader unless one test overrides it.
+vi.mock('../../conveyor/pr-comments-complete.mjs', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, readCompletePrComments: vi.fn(actual.readCompletePrComments) };
+});
 
 const head = 'a'.repeat(40);
 const requiredChecks = ['test', 'merge-gate'];
@@ -353,4 +361,164 @@ describe('audit safeguards', () => {
     expect(classifyStall({ row: { ...row, liveJob: 'ci' }, head })).toBeNull();
     expect(classifyStall({ row: { ...row, actor: 'operator' }, head }).reason).toContain('does not fit');
   });
+});
+
+describe('stale merge-gate run vs later review verdict', () => {
+  const runUrl = 'https://github.com/o/r/actions/runs/45545719563/job/1';
+  const rerunMarkers = ledgerPath => readdirSync(dirname(ledgerPath)).filter(name => name.endsWith('.rerun'));
+  it('a refused re-run falls back to the send-back and leaves no marker', () => withDir(ledgerPath => {
+    const ex = vi.fn((command, argv) => command === 'gh' && argv[0] === 'run' ? { status: 1 }
+      : command === 'gh' ? { status: 0, stdout: JSON.stringify({ headRefOid: head }) } : { status: 0 });
+    const result = go(ledgerPath, Object.assign(ex, { comments: [verdictAt('2026-11-25T07:30:00Z')] }), prWith());
+    expect(result).toMatchObject({ sent: true, recorded: true, reason: expect.stringContaining('re-run refused') });
+    expect(ex.mock.calls.filter(([command, argv]) => command === 'gh' && argv[0] === 'run')).toHaveLength(1);
+    expect(rerunMarkers(ledgerPath)).toEqual([]);
+  }));
+  it('merge-gate listed first beside another failed required check still sends back', () => withDir(ledgerPath => {
+    const writes = [];
+    const pr = fixture({ statusCheckRollup: [row('test', 'FAILURE'), gate()] });
+    const result = sendBackBlockedGate({ pr, headSha: head, requiredChecks: ['merge-gate', 'test'], repo: 'o/r', ledgerPath,
+      exec: exec(null, writes), readComments: () => [verdictAt('2026-11-25T07:30:00Z')] });
+    expect(result.sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('a run completing at the same instant as the verdict is not stale', () => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T04:18:00Z')], writes), prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  const clearing = VERDICT_HEADINGS.filter(h => h.kind === 'accepted' || h.kind === 'clear-human').map(h => h.prefix);
+  it.each([...clearing, '✅ human review — accepted'])('counts the clearing heading %s', heading => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z', heading)], writes), prWith()).reason).toContain('re-run requested');
+    expect(sends(writes)).toEqual([]);
+  }));
+  it.each(['🔁 review — changes requested', '🔁 human review — changes requested', '🔁 human review - changes requested'])(
+    'a later %s overrides an acceptance', heading => withDir(ledgerPath => {
+      const writes = [];
+      const comments = [verdictAt('2026-11-25T06:00:00Z'), { ...verdictAt('2026-11-25T07:00:00Z', heading), id: 'C_2' }];
+      expect(go(ledgerPath, exec(comments, writes), prWith()).sent).toBe(true);
+      expect(reruns(writes)).toEqual([]);
+    }));
+  it('retries an unconfirmed marker left by a dead writer only once it is old; a confirmed one holds', () => withDir(ledgerPath => {
+    const writes = [];
+    const crash = exec([verdictAt('2026-11-25T07:30:00Z')]);
+    const dying = Object.assign(vi.fn((command, argv) => {
+      if (command === 'gh' && argv[0] === 'run') throw Error('killed');
+      return crash(command, argv);
+    }), { comments: crash.comments });
+    expect(go(ledgerPath, dying, prWith()).sent).toBe(false);
+    const [name] = rerunMarkers(ledgerPath);
+    const marker = join(dirname(ledgerPath), name);
+    const ex = exec(crash.comments, writes);
+    expect(go(ledgerPath, ex, prWith()).reason).toContain('unconfirmed');
+    expect(reruns(writes)).toEqual([]);
+    utimesSync(marker, new Date(0), new Date(0));
+    expect(go(ledgerPath, ex, prWith()).reason).toContain('re-run requested');
+    utimesSync(marker, new Date(0), new Date(0));
+    expect(go(ledgerPath, ex, prWith()).reason).toContain('already requested');
+    expect(reruns(writes)).toHaveLength(1);
+    expect(sends(writes)).toEqual([]);
+  }));
+  it('by default reads verdicts through the complete comment reader for this PR and repo, and orders paged rows by checkRunId', () => withDir(ledgerPath => {
+    const writes = [];
+    // REST issue-comment shape as the paginated reader returns it: author.login, createdAt, node id.
+    vi.mocked(readCompletePrComments).mockClear();
+    vi.mocked(readCompletePrComments).mockImplementationOnce(() => [{ id: 'IC_1', body: '✅ review — accepted',
+      createdAt: '2026-11-25T07:30:00Z', author: { login: 'web-everything' } }]);
+    // The newer run (101) finished before the verdict; timestamps alone would pick the older id.
+    const paged = (checkRunId, completedAt) => row('merge-gate', 'FAILURE', { checkRunId, completedAt, startedAt: completedAt, detailsUrl: runUrl });
+    const pr = fixture({ statusCheckRollup: [row('test'), paged(101, '2026-11-25T04:18:00Z'), paged(100, '2026-11-25T08:00:00Z')] });
+    const result = sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: exec(null, writes) });
+    expect(result.reason).toContain('re-run requested');
+    expect(readCompletePrComments).toHaveBeenCalledWith(7196, { repo: 'o/r' });
+    expect(sends(writes)).toEqual([]);
+  }));
+  it('#7472 stale merge-gate replay: requests run 45545719563 and sends nothing back', () => withDir(ledgerPath => {
+    // Captured live: job 138974726864 and the thread as it stood before the 07:33Z send-back.
+    const live = '50cdbd2c73036272f775cbef41be1b517e1241ae';
+    const slug = 'web-everything/web-everything';
+    const verdict = (id, createdAt, body) => ({ id, createdAt, body, author: { login: 'web-everything' } });
+    const pr = fixture({ number: 7472, headRefOid: live, rowsHead: live, statusCheckRollup: [row('test'),
+      row('merge-gate', 'FAILURE', { checkRunId: 138974726864, startedAt: '2026-11-25T04:17:00Z', completedAt: '2026-11-25T04:18:05Z',
+        detailsUrl: `https://github.com/${slug}/actions/runs/45545719563/job/138974726864` })] });
+    const writes = [];
+    const ex = vi.fn((command, argv) => {
+      if (command === 'gh' && argv[0] === 'pr') return { status: 0, stdout: JSON.stringify({ headRefOid: live }) };
+      writes.push(argv); return { status: 0 };
+    });
+    const result = sendBackBlockedGate({ pr, headSha: live, requiredChecks, repo: slug, ledgerPath, exec: ex, readComments: () => [
+      verdict('IC_kwDORBt1-c8AAAABqk2UkA', '2026-11-25T03:43:10Z', '🔁 review — changes requested'),
+      verdict('IC_kwDORBt1-c8AAAABqoPAcQ', '2026-11-25T07:19:09Z', '✅ review — accepted')] });
+    expect(result).toMatchObject({ sent: false, reason: expect.stringContaining('re-run requested') });
+    expect(writes).toEqual([['run', 'rerun', '45545719563', `--repo=${slug}`]]);
+  }));
+  it.each([
+    ['newest verdict is changes-requested', [{ id: 'A', body: '✅ review — accepted', createdAt: '2026-11-25T06:00:00Z' }, { id: 'B', body: '🔁 review — changes requested', createdAt: '2026-11-25T07:00:00Z' }]],
+    ['a trusted verdict has an unreadable time', [{ id: 'A', body: '✅ review — accepted', createdAt: '2026-11-25T06:00:00Z' }, { id: 'B', body: '🔁 review — changes requested', createdAt: 'x' }]],
+  ])('no suppression: %s', (_n, list) => withDir(ledgerPath => {
+    const writes = [];
+    const ex = exec(list.map(c => ({ ...c, viewerDidAuthor: true })), writes);
+    expect(go(ledgerPath, ex, prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('a run URL from another repo sends back as today', () => withDir(ledgerPath => {
+    const writes = [];
+    const pr = prWith(gate({ detailsUrl: 'https://github.com/evil/x/actions/runs/1/job/2' }));
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), pr).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  const gate = (extra = {}) => restRow('merge-gate', 'failure', { detailsUrl: runUrl, completedAt: '2026-11-25T04:18:00Z', ...extra });
+  const prWith = (g = gate(), more = []) => fixture({ statusCheckRollup: [row('test'), g, ...more] });
+  const verdictAt = (createdAt, body = '✅ review — accepted') => ({ id: 'C_1', body, createdAt, viewerDidAuthor: true });
+  const withDir = fn => {
+    const directory = mkdtempSync(join(tmpdir(), 'drain-stale-'));
+    try { fn(join(directory, 'ledger.json')); } finally { rmSync(directory, { recursive: true, force: true }); }
+  };
+  const exec = (comments, writes = []) => Object.assign(vi.fn((command, argv) => {
+    if (command === 'gh' && argv[0] === 'run') { writes.push(argv); return { status: 0 }; }
+    if (command === 'gh') return { status: 0, stdout: JSON.stringify({ headRefOid: head }) };
+    writes.push(argv); return { status: 0 };
+  }), { comments });
+  const go = (ledgerPath, ex, pr) => sendBackBlockedGate({ pr, headSha: head, requiredChecks, repo: 'o/r', ledgerPath, exec: ex,
+    readComments: () => { if (!ex.comments) throw Error('unreadable'); return ex.comments; } });
+  const reruns = writes => writes.filter(a => a[0] === 'run');
+  const sends = writes => writes.filter(a => a[0] !== 'run');
+
+  it('run older than the verdict: no send-back, one re-run request, none on the second pass', () => withDir(ledgerPath => {
+    const writes = [];
+    const ex = exec([verdictAt('2026-11-25T07:30:00Z')], writes);
+    expect(go(ledgerPath, ex, prWith())).toMatchObject({ sent: false, reason: expect.stringContaining('re-run requested') });
+    expect(reruns(writes)).toEqual([['run', 'rerun', '45545719563', '--repo=o/r']]);
+    expect(sends(writes)).toEqual([]);
+    expect(go(ledgerPath, ex, prWith())).toMatchObject({ sent: false });
+    expect(reruns(writes)).toHaveLength(1);
+    expect(sends(writes)).toEqual([]);
+  }));
+  it('run newer than the verdict still sends back', () => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T03:00:00Z')], writes), prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it.each([
+    ['no comments read', undefined],
+    ['verdict time unreadable', [verdictAt('not-a-date')]],
+    ['no verdict comment', [{ id: 'C', body: 'hello', createdAt: '2026-11-25T07:30:00Z', viewerDidAuthor: true }]],
+    ['verdict from an untrusted author', [{ ...verdictAt('2026-11-25T07:30:00Z'), viewerDidAuthor: false, author: { login: 'rando' } }]],
+  ])('unreadable evidence sends back as today: %s', (_name, comments) => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec(comments, writes), prWith()).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('run completion time unreadable sends back as today', () => withDir(ledgerPath => {
+    const writes = [];
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), prWith(gate({ completedAt: undefined }))).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
+  it('another failed check besides merge-gate sends back', () => withDir(ledgerPath => {
+    const writes = [];
+    const pr = fixture({ statusCheckRollup: [row('test', 'FAILURE'), gate()] });
+    expect(go(ledgerPath, exec([verdictAt('2026-11-25T07:30:00Z')], writes), pr).sent).toBe(true);
+    expect(reruns(writes)).toEqual([]);
+  }));
 });

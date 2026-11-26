@@ -183,7 +183,8 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { writeLineSync } from '../lib/write-all-sync.mjs';
 // Capacity deferrals use bounded markers and a separate elapsed-time host capacity alert.
 import { defaultReadPrComments } from './ci-red-recovery-watch.mjs';
-import { postNoteComment } from './reconcile-note-comment.mjs';
+import { planNoteComment, postNoteComment } from './reconcile-note-comment.mjs';
+import { createLandingHolderBlockedState } from './landing-holder-blocked-state.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
 import {
   QUEUE_CAP_REFUSAL_CAP, buildQueueCapRefusalComment, summarizeCapacityDeferral,
@@ -2005,6 +2006,10 @@ export function runReconcileFixDispatch({
   readPrComments = defaultReadPrComments,
   postQueueCapComment = postNoteComment,
   notifyQueueCapOperator = notifyDesktopChecked,
+  landingBlockedState = undefined,
+  notesDryRun = landingNotesDryRun(),
+  postLandingHolderComment = postNoteComment,
+  notifyLandingHolderOperator = notifyDesktopChecked,
   // #4295 — live in-flight claims the scope-overlap filter reads; injectable so tests never touch the real sidecar.
   listBuildClaims = () => listBuildDispatchClaims(),
   listFixClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }),
@@ -2329,12 +2334,24 @@ export function runReconcileFixDispatch({
       if (Array.isArray(scope) && scope.length) landingHolders.push({ pr, scope, headRefOid: holderStateReader.stateFor(pr)?.headRefOid });
     }
   }
+  const landingState = landingBlockedState ?? (isUnderTestEnv() ? null
+    : createLandingHolderBlockedState({ repo: ghRepoSlug(repoKey) }));
+  const landingBlockedSince = landingState?.read() ?? new Map();
   const scopeFilter = fixStep('scope-filter', () => filterFixesByInFlightScope(
     stackOrder.planned, listBuildClaims(), claims, {
       urgentPrs, stackAbove: stackOrder.stackAbove, policy: scopePolicy, regionOverlap, priorityPrs, holderEntries,
       holderState: holderStateReader ? pr => holderStateReader.stateFor(pr) : null, landingHolders,
+      now, landingBlockedSince,
     },
   ));
+  if (!dryRun) {
+    try { landingState?.write(scopeFilter.landingHolds); }
+    catch (error) { console.error(`reconcile-fix-dispatch: landing holder clock write failed: ${String(error.message).split('\n')[0]}`); }
+    for (const escalation of scopeFilter.landingEscalations) {
+      recordLandingHolderEscalation({ escalation, repo: ghRepoSlug(repoKey), readPrComments,
+        postComment: postLandingHolderComment, notify: notifyLandingHolderOperator, notesDryRun });
+    }
+  }
   for (const d of scopeFilter.scopeDecisions ?? []) {
     console.error(`reconcile-fix-dispatch: fix-scope PR #${d.pr} ${d.decision === 'admitted' ? 'admitted past' : 'blocked by'} #${d.holder} — ${d.rule}: ${d.why} [${d.setting}]`);
   }
@@ -2600,6 +2617,33 @@ export function planQueueCapRefusal({
   return {
     attempts: 0, deferredForCapacity, firstAt, capExhausted: false, postMarker, postBaseline, starvation,
   };
+}
+
+/** Advisory IO after the scope refusal is decided. Unknown history never posts a duplicate. */
+// Same switch the notes daemon honours: an explicit WE_CONVEYOR_POST_NOTE_COMMENTS=0 is the diagnostic dry-run.
+export function landingNotesDryRun(env = process.env) {
+  return env?.WE_CONVEYOR_POST_NOTE_COMMENTS === '0';
+}
+export function recordLandingHolderEscalation({
+  escalation, repo, readPrComments = defaultReadPrComments,
+  postComment = postNoteComment, notify = notifyDesktopChecked, notesDryRun = landingNotesDryRun(),
+} = {}) {
+  if (notesDryRun) return { dryRun: true };
+  try {
+    // Without an observed head there is no safe per-head episode identity; retry next pass.
+    if (!escalation?.holderHead) return { headUnknown: true };
+    const comments = readPrComments(escalation.holder, { repo });
+    if (!Array.isArray(comments)) return { historyUnknown: true };
+    const note = { kind: 'landing-holder-stuck', prNumber: escalation.holder,
+      holderHead: escalation.holderHead,
+      text: `Conflicting fixes ${escalation.waiters.map(pr => `#${pr}`).join(', ')} have waited ${escalation.waitedMinutes} minutes behind this landing PR (aging bound: ${escalation.maxWaitMinutes} minutes). Check the drain, run /finish, or remove review:accepted.${escalation.failedClosed ? ' Holder state could not be read; the hold remains fail closed.' : ''}` };
+    const plan = planNoteComment(note, comments);
+    if (plan.alreadyPosted) return { alreadyPosted: true };
+    const posted = postComment({ repo, pr: escalation.holder, body: plan.body });
+    if (posted?.ok === true) notify({ title: '🔔 conveyor — landing holder stuck',
+      body: `PR #${escalation.holder}: conflicting fixes have waited ${escalation.waitedMinutes} minutes; check the drain or /finish` });
+    return { posted: posted?.ok === true };
+  } catch { return { historyUnknown: true }; } // Never mask the already-decided refusal.
 }
 
 /**
@@ -2928,13 +2972,14 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   rebaseExempt = defaultRebaseExempt,
   stackAbove = new Map(),
   policy = null, regionOverlap = null, priorityPrs = new Set(), holderEntries = new Map(),
-  holderState = null, landingHolders = [],
+  holderState = null, landingHolders = [], landingBlockedSince = new Map(),
 } = {}) {
   const accepted = [];
   const refusals = [];
   const picked = [];
   const released = [];
   const scopeDecisions = [];
+  const landingHolds = [];
   const settings = policy?.value;
   const wait = settings?.waitForLandingHolder;
   const priority = e => settings?.priorityBypass && (priorityPrs.has(Number(e.pr)) || e.mainFix === true
@@ -3003,6 +3048,8 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         if (overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) decide(entry, c, 'holdMode', false, 'refused waiter has no running fixer session');
       }
     }
+    const protectedIds = new Set();
+    const protectedHolds = new Map();
     let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => {
       if (!overlapsInFlight(scopeFor(entry), [overlapClaim(c)])) return false;
       if (!settings) return true; // Public API compatibility: historical policy when omitted.
@@ -3022,16 +3069,26 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
             results.push(result);
           }
         }
-        observation = results.find(r => r.overlap) ?? results[0] ?? { overlap: true, why: 'unknown scope', failedClosed: true };
+        // A confirmed conflict on any shared file takes precedence over binary/directory fallbacks
+        // and ordinary region intersections, so scope order cannot bypass landing-holder protection.
+        observation = results.find(r => r.overlap && r.conflict === true)
+          ?? results.find(r => r.overlap) ?? results[0] ?? { overlap: true, why: 'unknown scope', failedClosed: true };
         if (!observation.overlap) {
           decide(entry, c, 'overlapGranularity', false, observation.why); return false;
         }
         if (c.landing && observation.conflict !== true) return false;
         if (observation.conflict && wait?.enabled) {
-          const d = landingHolderDecision({ state: holderState ? holderState(c.pr) : null, setting: wait });
+          const state = holderState ? holderState(c.pr) : null;
+          const d = landingHolderDecision({ state, setting: wait });
           if (!d.hold) {
             decide(entry, c, 'waitForLandingHolder', false, d.why); return false;
           }
+          protectedIds.add(c.id);
+          const previous = landingBlockedSince.get(`${entry.pr}:${c.pr}`);
+          protectedHolds.set(c.id, { pr: entry.pr, holder: c.pr,
+            holderHead: state?.headRefOid || c.headRefOid || c.headSha || observation.holderHead || null,
+            since: Number.isFinite(Date.parse(previous)) && Date.parse(previous) <= now ? previous : new Date(now).toISOString(),
+            failedClosed: Boolean(d.failedClosed) });
           observation = { overlap: true, why: d.why, failedClosed: d.failedClosed, rule: 'waitForLandingHolder' };
         }
       }
@@ -3043,17 +3100,23 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         acceptedIds.has(c.id) ? 'overlapping fix already accepted this pass' : observation.why, observation.failedClosed);
       return true;
     });
-    // #3881 — aging override: past the bound, only a fix ACCEPTED earlier in this same pass still blocks.
+    // Record only actual protected blockers; explicit priority/urgent bypass semantics stay unchanged.
+    for (const id of new Set(blockers.map(c => c.id))) {
+      if (protectedHolds.has(id)) landingHolds.push(protectedHolds.get(id));
+    }
+    // #3881 — ordinary holds age out; accepted fixes and landing conflicts retain serialization.
     const waitedMinutes = Math.floor((now - waitingTime(entry)) / 60_000);
     const agedOut = maxWaitMinutes != null && blockers.length > 0 && waitedMinutes >= maxWaitMinutes;
-    const bypassed = agedOut ? blockers.filter((c) => !acceptedIds.has(c.id)).map((c) => c.id) : [];
+    const bypassed = agedOut ? blockers.filter((c) => !acceptedIds.has(c.id) && !protectedIds.has(c.id)).map((c) => c.id) : [];
     if (agedOut) {
       if (settings) for (const d of scopeDecisions.filter(d => d.pr === entry.pr && d.decision === 'blocked')) {
-        if (blockers.some(c => (c.pr ?? c.num) === d.holder && !acceptedIds.has(c.id))) {
+        if (blockers.some(c => (c.pr ?? c.num) === d.holder && protectedIds.has(c.id))) {
+          d.why += '; aging bound reached: escalated, not released';
+        } else if (blockers.some(c => (c.pr ?? c.num) === d.holder && !acceptedIds.has(c.id))) {
           d.decision = 'admitted'; d.why += '; existing aging override releases this hold';
         }
       }
-      blockers = blockers.filter((c) => acceptedIds.has(c.id));
+      blockers = blockers.filter((c) => acceptedIds.has(c.id) || protectedIds.has(c.id));
     }
     const hit = overlapsInFlight(scopeFor(entry), blockers.map(overlapClaim));
     // Only pr-lifetime retains refused waiters. Accepted fixes hold in either mode.
@@ -3081,5 +3144,22 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     }
     accepted.push(entry);
   }
-  return { planned: accepted, refusals, ranks: orderedRanks, ...(policy ? { scopeDecisions } : {}), ...(agedAdmits.length ? { agedAdmits } : {}) };
+  const byHolder = new Map();
+  for (const hold of landingHolds) {
+    let group = byHolder.get(hold.holder);
+    if (!group) {
+      group = { holder: hold.holder, holderHead: hold.holderHead, waiters: [], since: hold.since,
+        waitedMinutes: 0, maxWaitMinutes, failedClosed: false };
+      byHolder.set(hold.holder, group);
+    }
+    if (!group.waiters.includes(hold.pr)) group.waiters.push(hold.pr);
+    if (Date.parse(hold.since) < Date.parse(group.since)) group.since = hold.since;
+    group.failedClosed ||= hold.failedClosed;
+  }
+  const landingEscalations = [...byHolder.values()].filter(group => {
+    const elapsed = now - Date.parse(group.since);
+    group.waitedMinutes = Math.floor(elapsed / 60000);
+    return maxWaitMinutes != null && elapsed >= maxWaitMinutes * 60000;
+  });
+  return { planned: accepted, refusals, ranks: orderedRanks, landingHolds, landingEscalations, ...(policy ? { scopeDecisions } : {}), ...(agedAdmits.length ? { agedAdmits } : {}) };
 }
