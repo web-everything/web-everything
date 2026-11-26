@@ -34,7 +34,7 @@ const { mkdirSync, writeFileSync } = fs;
 import { execFileSync } from 'node:child_process';
 import { readPoolSource, readPoolJson, readPoolHeavyHeld, poolPidAlive, poolSourcePaths,
   SOURCES, RED_TEAM_HARD_LEASE_CEILING_MS, loadPoolSettings, readPoolSettingsChecked, readPoolOverrides } from '../resource-pool-io.mjs';
-import { POOL_DEFAULTS, grantDecision } from '../resource-pool.mjs';
+import { POOL_DEFAULTS, grantDecision, summarize } from '../resource-pool.mjs';
 import { readPoolLaneStatus } from '../resource-pool-lanes.mjs';
 import { lockDirFor } from '../../readiness/file-locks.mjs';
 let coord, paths, env, laneDir;
@@ -54,7 +54,7 @@ beforeEach(() => {
   guard.checkout = join(coord, 'web-everything'); guard.writes = []; guard.children = [];
 });
 afterEach(() => { guard.active = false; fs.rmSync(coord, { recursive: true, force: true }); });
-const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, namespace: 'local', host: 'studio',
+const read = (source, options = {}) => readPoolSource(source, { paths, env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), namespace: 'local', host: 'studio',
   listCommands: () => `${process.pid} 1 node resource-pool.mjs`, roundBudget: () => ({ live: 2 }),
   laneStatus: () => ({ lanes: [] }), heavyStatus: () => ({ held: [] }), slotAlive: () => true, ...options });
 const settingsArgs = () => ({ env: {}, read: () => ({ value: structuredClone(POOL_DEFAULTS), taint: [] }),
@@ -186,7 +186,7 @@ it('workers and lane inventory perform zero fs writes and never launch the lane-
   for (const file of sentinels) fs.writeFileSync(file, 'preserve');
   guard.active = true;
   expect(read('workers', { laneStatus: undefined })).toMatchObject({ ok: true, holders: [{ jobId: 'fix-1' }] });
-  expect(readPoolLaneStatus({ env, nowMs, run: execFileSync, readJson: path => readPoolJson(path).data }).lanes)
+  expect(readPoolLaneStatus({ env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), run: execFileSync, readJson: path => readPoolJson(path).data }).lanes)
     .toMatchObject([{ leased: true }]);
   expect(guard.writes).toEqual([]);
   expect(guard.children).toHaveLength(4);
@@ -205,7 +205,7 @@ it.each(['acquiredAt', 'renewedAt'])('malformed, future and non-ISO %s remain un
   }
 });
 it('a non-ENOENT lease read error stays unknown', () => {
-  const laneStatus = () => readPoolLaneStatus({ env, nowMs, run: () => guard.checkout,
+  const laneStatus = () => readPoolLaneStatus({ env, nowMs, cwd: coord, readRegistry: () => ({ repos: [{ name: 'web-everything' }] }), run: () => guard.checkout,
     readJson: () => { throw Object.assign(Error('permission denied'), { code: 'EACCES' }); } });
   expect(read('workers', { laneStatus })).toMatchObject({ ok: false, error: expect.stringContaining('permission denied') });
 });
@@ -369,4 +369,46 @@ it('valid red-team identity delegates to the real probe for live, replaced and d
     .toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }] });
   for (const options of [{ processAlive: () => false }, { processAlive: () => true, readStart: () => 'replacement' }])
     expect(read('redTeam', { slotAlive: undefined, ...options })).toMatchObject({ ok: true, holders: [] });
+});
+
+it('an over-24h live red-team holder is counted and a foreign-host holder makes inventory unknown', () => {
+  const clock = 200000000, file = join(paths.redTeam, filename);
+  const put = patch => {
+    fs.writeFileSync(file, JSON.stringify({ ...status(), ...patch }));
+    fs.utimesSync(file, new Date(0), new Date(0));
+  };
+  put({ host: 'studio', pidNamespace: 'local' });
+  const probe = { nowMs: clock, slotAlive: undefined, processAlive: () => true, readStart: () => 'owner-start' };
+  expect(read('redTeam', probe)).toMatchObject({ ok: true, holders: [{ kind: 'redTeam' }], expiredRedTeamRows: 0 });
+  put({ host: 'foreign' });
+  expect(read('redTeam', probe)).toMatchObject({ ok: false, error: expect.stringContaining('unknown red-team liveness') });
+});
+it('old red-team rows require proven death; unreadable liveness refuses and pid reuse never counts the replacement', () => {
+  const file = join(paths.redTeam, filename); fs.writeFileSync(file, JSON.stringify(status()));
+  fs.utimesSync(file, new Date(0), new Date(0));
+  const probe = { nowMs: 200000000, slotAlive: undefined, processAlive: () => true };
+  for (const readStart of [() => null, () => { throw Error('unreadable process'); }])
+    expect(read('redTeam', { ...probe, readStart })).toMatchObject({ ok: false, error: expect.stringContaining('inspect') });
+  for (const patch of [{ processAlive: () => false }, { readStart: () => 'replacement' }])
+    expect(read('redTeam', { ...probe, ...patch })).toMatchObject({ ok: true, holders: [], expiredRedTeamRows: 1 });
+});
+it('escaped duplicate key rejects in source JSON before last-wins parsing can erase evidence', () => {
+  for (const text of ['{"cpu":{},"c\\u0070u":{}}', '{"outer":{"pid":123,"p\\u0069d":456}}']) {
+    fs.writeFileSync(paths.snapshot, text);
+    expect(() => readPoolJson(paths.snapshot)).toThrow(/duplicate/);
+  }
+  fs.writeFileSync(paths.snapshot, '{"left":{"pid":1},"right":{"pid":2},"text":"{\\\"pid\\\":3}"}');
+  expect(readPoolJson(paths.snapshot).data).toMatchObject({ left: { pid: 1 }, right: { pid: 2 } });
+});
+it('per-source dedupe retains independent fix-claim and worker evidence for the same job', () => {
+  const dir = join(paths.fix, 'b'.repeat(16)); fs.mkdirSync(dir);
+  const claim = { owner: 'fixer', heartbeatAt: new Date(nowMs).toISOString(), meta: { repo: 'we', pr: 12, kind: 'fix' } };
+  fs.writeFileSync(join(dir, 'lock.json'), JSON.stringify(claim));
+  const fix = read('fix'); const session = fix.holders[0].jobId;
+  const row = { owner: `${laneDir}#1`, meta: { dispatchKind: 'fix', session } };
+  const workers = read('workers', { heavyStatus: () => ({ held: [row, row] }) });
+  expect(workers.holders).toHaveLength(1);
+  expect(fix.holders).toHaveLength(1);
+  expect(workers.holders[0].jobId).toBe(session);
+  expect(summarize([...fix.holders, ...workers.holders])['studio.units'].held).toBe(4);
 });
