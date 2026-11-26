@@ -26,7 +26,7 @@ export function storePath(env = process.env) {
   return join(env.HOME, 'workspace/.operations/coordination/ruled-weakened.jsonl');
 }
 const nonblank = (v) => typeof v === 'string' && v.trim().length > 0;
-const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim();
+const bareRef = ref => String(ref ?? '').replace(/\s*\(.*\)\s*$/, '').trim().replace(/^refs\/heads\//, '');
 const revocationKey = e => JSON.stringify([bareRef(e.ref), String(e.sha ?? '').toLowerCase()]);
 const isoTime = at => typeof at === 'string'
   && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(at) ? Date.parse(at) : NaN;
@@ -51,14 +51,19 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   const damaged = (i, count, request) => {
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
     let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
-    // Unparseable text: it may only block when it could be a revocation or names the scoped ref (fail closed); else it is unrelated.
+    // Unparseable text blocks when it could be a revocation, names the scoped ref, or ends partway through its ref value.
     // Opt-in only (rewaive-plan, a read-only planner): every other caller keeps the fail-closed default.
     if (relaxUnattributed && scopeRef !== undefined && !named) {
       const raw = lines.slice(i, i + count).join('\n').toLowerCase()
-        .replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase().replaceAll('\\', '');
+        .replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase()
+        .trimEnd().replace(/\\(?:u[0-9a-f]{0,3})?$/, '').replaceAll('\\', '');
       // Could be a revocation: names revok/withdrawn, or is cut off inside "withdrawn" (e.g. a truncated "WITH").
       const hint = /revok|withdraw/.test(raw) || /(?:^|[^a-z])w(?:i(?:t(?:h(?:d(?:r(?:a(?:w(?:n)?)?)?)?)?)?)?)?["'\s]*$/.test(raw);
-      other = !hint && !raw.includes(String(scopeRef).toLowerCase());
+      const ref = bareRef(scopeRef).toLowerCase();
+      const tail = /["']ref["']\s*:\s*["']([^"'\r\n]*)$/.exec(raw.trimEnd())?.[1];
+      // Check both spellings before stripping refs/heads/: a cut inside that prefix is uncertain too.
+      const truncatedRef = !!tail && [ref, `refs/heads/${ref}`].some(name => name.startsWith(tail));
+      other = !hint && !truncatedRef && !raw.includes(ref);
     }
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);
