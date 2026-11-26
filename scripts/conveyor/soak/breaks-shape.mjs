@@ -14,9 +14,21 @@
  * behaviour under test. `fixPresent` is exactly { marker: 'repo/relative/module.mjs#exportName' } or
  * { fixCommit: '<hex sha>' }. Marker modules are parsed, never executed; a missing marker is an error,
  * not permission to invert the behavioural assertion. Commit ancestry allows patch-id equivalence.
- * Discovery temporarily warns about legacy functions until S1.2 migrates them; the harness refuses
- * to execute them. Declared sources are always validated strictly.
+ * Only names pinned in legacy-fixpresent.json may temporarily retain function probes until S1.2
+ * migrates them. Unlisted functions are refused in discovery and execution.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const legacyNames = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'legacy-fixpresent.json'), 'utf8'));
+if (!Array.isArray(legacyNames) || legacyNames.some(name => typeof name !== 'string' || !name.trim())
+  || new Set(legacyNames).size !== legacyNames.length) {
+  throw new Error('soak: invalid legacy-fixpresent.json; restore the explicit grandfather list');
+}
+const legacyBreaks = new Set(legacyNames);
+export const isLegacyFixPresent = id => legacyBreaks.has(id);
+
 const REQUIRED_BREAK_FIELDS = Object.freeze(['id', 'title', 'card', 'fixedBy', 'fixPresent', 'run', 'judge']);
 
 export function validateFixPresent(source) {
@@ -48,7 +60,7 @@ export function validateBreakShape(mod, file, { legacy = 'warn' } = {}) {
   if (!mod.fixedBy || typeof mod.fixedBy !== 'object' || typeof mod.fixedBy.sha !== 'string' || typeof mod.fixedBy.where !== 'string') {
     throw new Error(`soak/breaks/${file}: "fixedBy" must be an object with string "sha" and "where"`);
   }
-  if (typeof mod.fixPresent === 'function' && legacy === 'warn') {
+  if (typeof mod.fixPresent === 'function' && legacy === 'warn' && isLegacyFixPresent(mod.id)) {
     console.warn(`soak/breaks/${file}: fixPresent is a legacy function; migrate to a declared marker or fixCommit (S1.2)`);
   } else {
     try { validateFixPresent(mod.fixPresent); }

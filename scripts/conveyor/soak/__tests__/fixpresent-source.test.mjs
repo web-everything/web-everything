@@ -24,6 +24,16 @@ afterEach(() => { registered.length = 0; for (const root of roots.splice(0)) rmS
 const strict = b => validateBreakShape(b, 'fixture.mjs', { legacy: 'reject' });
 
 describe('declared fix presence', () => {
+  test.each([true, false])('allows an explicitly grandfathered behavioural probe returning %s', async present => {
+    const root = tempRoot();
+    const b = { ...markerBreak(root), id: 'accepted-pr-stale-accept-row-never-executed', fixPresent: vi.fn(() => present),
+      run: async () => present ? 'fixed' : 'broken' };
+    harness.defineBreakTest(b, { root });
+    expect(b.fixPresent).toHaveBeenCalledWith(root);
+    expect(registered).toHaveLength(1);
+    await registered[0].run();
+  });
+
   test.each([true, false])('refuses a legacy behavioural probe returning %s without executing it', present => {
     const root = tempRoot(), b = markerBreak(root);
     b.fixPresent = vi.fn(() => present);

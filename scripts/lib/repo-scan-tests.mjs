@@ -68,6 +68,8 @@ export const REPO_SCAN_TESTS = Object.freeze([
     matches: (f) => f.startsWith('scripts/conveyor/soak/breaks/') && f.endsWith('.mjs'),
     inputs: ['scripts/conveyor/registry-discovery.mjs', 'scripts/conveyor/soak/breaks-shape.mjs',
       'scripts/conveyor/soak/define-break-test.mjs', 'scripts/conveyor/soak/fixtures/fixpresent-registration.mjs',
+      'scripts/conveyor/soak/legacy-fixpresent.json',
+      'scripts/conveyor/soak/fixtures/fixpresent-original-legacy.json',
       'scripts/push-gate-allowlist.json', 'scripts/lib/push-gate-lint.mjs',
       'scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs'],
   },

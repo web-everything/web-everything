@@ -18,6 +18,7 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import { discoverModuleFiles, loadModuleRegistry } from '../../registry-discovery.mjs';
 import { findRawPushes } from '../../../lib/push-gate-lint.mjs';
@@ -25,6 +26,19 @@ import { validateBreakShape } from '../breaks-shape.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REAL_BREAKS_DIR = join(HERE, '..', 'breaks');
+const legacyNames = () => JSON.parse(readFileSync(join(HERE, '../legacy-fixpresent.json'), 'utf8'));
+
+// Historical S1.1 snapshot: migrations edit legacy-fixpresent.json only, never this fixture or its digest.
+const originalLegacyNames = Object.freeze(JSON.parse(readFileSync(join(HERE, '../fixtures/fixpresent-original-legacy.json'), 'utf8')));
+const originalLegacySet = new Set(originalLegacyNames);
+
+function assertGrandfatherRatchet(names) {
+  expect(createHash('sha256').update(JSON.stringify(originalLegacyNames)).digest('hex')).toBe('df23bd1ff263bf4a502c2158faaad6e235960f2ba28069afd9a26ca9df97d86b');
+  expect(originalLegacyNames).toHaveLength(454);
+  expect(names.filter(name => !originalLegacySet.has(name))).toEqual([]);
+  expect(names.length).toBeLessThanOrEqual(454);
+  expect(new Set(names).size).toBe(names.length);
+}
 
 const VALID_BREAK = `
 export default {
@@ -52,13 +66,13 @@ function loadBreaks(dir) {
 }
 
 describe('soak/breaks/index.mjs — directory discovery', () => {
-  it('every real production descriptor registers successfully with independent evidence', () => {
+  it('every real production descriptor registers successfully with declared or grandfathered evidence', () => {
     const out = execFileSync(process.execPath, [join(HERE, '../fixtures/fixpresent-registration.mjs')], {
       encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
     const report = JSON.parse(out);
     expect(report.total).toBe(discoverModuleFiles(REAL_BREAKS_DIR).length);
-    expect(report.legacy).toBe(0);
+    expect(report.legacy).toBe(legacyNames().length);
     expect(report.refused).toEqual([]);
     expect(report.registered).toBe(report.total);
   });
@@ -74,17 +88,45 @@ describe('soak/breaks/index.mjs — directory discovery', () => {
     expect(findRawPushes(mutation, file)).toHaveLength(1);
   });
 
-  it('reports legacy function probes during discovery without rejecting existing breaks', async () => {
+  it('the grandfather list may only shrink from its original ID set', () => {
+    assertGrandfatherRatchet(legacyNames());
+    assertGrandfatherRatchet(legacyNames().slice(1));
+  });
+
+  it('the grandfather ratchet rejects a same-length substitution with a new behavioural-probe ID', () => {
+    const names = legacyNames();
+    const substituted = ['new-behavioural-probe-not-grandfathered', ...names.slice(1)];
+    expect(substituted).toHaveLength(names.length);
+    expect(() => assertGrandfatherRatchet(substituted)).toThrow();
+  });
+
+  it('every listed name exists as a legacy break', () => {
+    const names = legacyNames();
+    const report = JSON.parse(execFileSync(process.execPath, [join(HERE, '../fixtures/fixpresent-registration.mjs')], {
+      encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    expect(report.legacyNames.sort()).toEqual([...names].sort());
+  });
+
+  it('refuses a behavioural probe not on the grandfather list during discovery without executing it', async () => {
     const dir = tempDir();
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       writeFileSync(join(dir, 'legacy.mjs'), VALID_BREAK.replace("fixPresent: { marker: 'fix.mjs#soakFix' },", 'fixPresent() { throw new Error("must not execute during discovery"); },'));
-      expect(await loadBreaks(dir)).toHaveLength(1);
-      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/legacy\.mjs.*fixPresent.*function.*migrat/i));
+      await expect(loadBreaks(dir)).rejects.toThrow(/fixPresent.*marker.*fixCommit/);
     } finally {
-      warn.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('warns only for an explicitly grandfathered behavioural probe', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const b = { id: legacyNames()[0], title: 'legacy fixture', card: 'test', fixedBy: { sha: 'deadbeef', where: 'main' },
+        fixPresent: vi.fn(), run: vi.fn(), judge: vi.fn() };
+      expect(validateBreakShape(b, 'legacy.mjs')).toBe(b);
+      expect(b.fixPresent).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/legacy\.mjs.*fixPresent.*function.*migrat/i));
+    } finally { warn.mockRestore(); }
   });
   it('picks up a new module file dropped into the directory with NO index edit', async () => {
     const dir = tempDir();

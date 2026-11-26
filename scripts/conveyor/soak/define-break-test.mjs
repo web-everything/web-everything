@@ -5,7 +5,7 @@
  * GREEN. When it does not (the fix lives on another branch still in review), the test is EXPECTED-FAIL — titled
  * with the missing fix and its card, and a completed, nonempty judge verdict REQUIRES the break
  * to reproduce; setup/import/judge exceptions remain failures; it flips to a required pass by itself the moment the fix lands on this tree.
- * Discovery warns about legacy descriptors, but execution refuses them until they declare independent evidence.
+ * Only explicitly grandfathered legacy descriptors may retain behavioural probes during migration.
  */
 
 import { resolve } from 'node:path';
@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { readGit } from '../../lib/proc-read.mjs';
 import { parse } from 'acorn';
 import { describe, expect, it } from 'vitest';
-import { validateFixPresent } from './breaks-shape.mjs';
+import { validateFixPresent, isLegacyFixPresent } from './breaks-shape.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..', '..');
 
@@ -56,10 +56,11 @@ export function resolveFixPresent(source, root) {
 }
 
 export function defineBreakTest(b, { root = REPO_ROOT } = {}) {
-  if (typeof b.fixPresent === 'function') {
+  const legacy = typeof b.fixPresent === 'function';
+  if (legacy && !isLegacyFixPresent(b.id)) {
     throw new Error(`soak: break ${b.id}: fixPresent functions are refused; declare a marker or fixCommit before running this break`);
   }
-  const present = resolveFixPresent(b.fixPresent, root);
+  const present = legacy ? b.fixPresent(root) : resolveFixPresent(b.fixPresent, root);
   const title = present
     ? `${b.title} — stays fixed (fix ${b.fixedBy.sha})`
     : `[EXPECTED-FAIL: fix ${b.fixedBy.sha} (${b.fixedBy.where}) is not in this tree — ${b.card}] ${b.title}`;

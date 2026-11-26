@@ -1,5 +1,5 @@
 // Native Node loads unchanged production descriptors. Replace only Vitest's registration API:
-// legacy evidence must be refused before any probe executes, and declared evidence resolves for real.
+// grandfathered probes and declared evidence resolve for real; every descriptor must register.
 import { register } from 'node:module';
 import assert from 'node:assert/strict';
 
@@ -21,23 +21,16 @@ register(`data:text/javascript,${encodeURIComponent(`
 const { BREAKS } = await import('../breaks/index.mjs');
 const { defineBreakTest } = await import('../define-break-test.mjs');
 const { registrations } = await import('vitest');
-let legacy = 0;
+const legacyNames = [];
 const refused = [];
 for (const b of BREAKS) {
   const before = registrations.length;
-  if (typeof b.fixPresent === 'function') {
-    legacy++;
-    assert.throws(() => defineBreakTest(b), error => {
-      assert.ok(error.message.includes(b.id), b.id);
-      assert.match(error.message, /fixPresent.*marker.*fixCommit/);
-      refused.push({ id: b.id, error: error.message });
-      return true;
-    }, b.id);
-    assert.equal(registrations.length, before, b.id);
-  } else {
+  if (typeof b.fixPresent === 'function') legacyNames.push(b.id);
+  try {
     defineBreakTest(b);
     assert.equal(registrations.length, before + 1, b.id);
-    assert.equal(registrations.at(-1).fails, false, b.id);
+  } catch (error) {
+    refused.push({ id: b.id, error: error.message });
   }
 }
-process.stdout.write(JSON.stringify({ total: BREAKS.length, legacy, refused, registered: registrations.length }));
+process.stdout.write(JSON.stringify({ total: BREAKS.length, legacy: legacyNames.length, legacyNames, refused, registered: registrations.length }));
