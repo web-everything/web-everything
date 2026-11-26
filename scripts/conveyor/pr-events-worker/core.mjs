@@ -69,6 +69,8 @@ export const DEFAULT_MAX_RUNTIME_EVENTS = 5000;
 /** Idempotency-key tombstones outlive event rows (60 days, 20000 keys, oldest evicted first). */
 export const DEFAULT_RUNTIME_KEY_RETENTION_MS = 60 * 24 * 3600 * 1000;
 export const DEFAULT_MAX_RUNTIME_KEYS = 20_000;
+export const DEFAULT_RECEIPT_RETENTION_MS = 14 * 24 * 3600 * 1000;
+export const DEFAULT_MAX_RECEIPTS = 250_000;
 export const DEFAULT_RUNTIME_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export const DEFAULT_PAGE_LIMIT = 200;
 export const MAX_PAGE_LIMIT = 500;
@@ -104,6 +106,29 @@ export async function verifySignature(secret, body, header) {
 
 const prNumbers = (list) => (Array.isArray(list) ? list.map((p) => p?.number).filter(Number.isInteger) : []);
 
+const nativeType = { check_run: 'check_run', pull_request_review: 'review', issue_comment: 'comment', pull_request: 'pull_request' };
+const nativeId = (id) => Number.isSafeInteger(id) && id > 0 ? id : null;
+const isLevel = (type, action) => type === 'check_suite' || type === 'merge_group' ||
+  (type === 'pull_request' && ['labeled', 'unlabeled', 'closed', 'reopened', 'ready_for_review', 'converted_to_draft'].includes(action));
+
+/** Shared webhook / REST identity. A REST object uses the kind's default action; a review dismissal or
+ * synchronize needs an explicit action and, for synchronize, the actual before/after evidence.
+ * A poll head/state observation must never be passed off as a synchronize occurrence. */
+export function occurrenceId(eventName, objectOrPayload) {
+  const p = objectOrPayload || {};
+  const type = nativeType[eventName];
+  if (!type) return null;
+  const object = p[type] || p;
+  const id = nativeId(object.id);
+  const action = p.action || ({ check_run: 'completed', pull_request_review: 'submitted', issue_comment: 'created', pull_request: 'opened' })[eventName];
+  if (!id || !ACCEPTED_EVENTS[eventName]?.has(action) || isLevel(eventName, action)) return null;
+  if (eventName === 'pull_request' && action === 'synchronize') {
+    return typeof p.before === 'string' && p.before && typeof p.after === 'string' && p.after
+      ? `gh/pr/${id}/sync/${p.before}..${p.after}` : null;
+  }
+  return `gh/${eventName === 'pull_request' ? 'pr' : type}/${id}/${action}`;
+}
+
 /**
  * Turn one GitHub delivery into the compact stored record, or `null` when the event/action is not one we keep.
  * Only identifiers and states — no titles, bodies, comments or logins.
@@ -116,6 +141,12 @@ export function parseGithubEvent(eventName, payload, { deliveryId = null, receiv
   const repo = payload.repository?.full_name;
   if (typeof repo !== 'string' || !repo) return null;
   const base = { id: deliveryId, at: new Date(receivedAt).toISOString(), type: eventName, action, repo };
+  // Preserve the legacy parser shape for level observations. Their delivery-based shadow annotation is
+  // added by the log; edge identity must be captured here before the payload is discarded.
+  if (!isLevel(eventName, action)) {
+    base.occ = occurrenceId(eventName, payload);
+    base.native = { id: nativeId(payload[nativeType[eventName]]?.id), type: nativeType[eventName] };
+  }
 
   if (eventName === 'pull_request') {
     const pr = payload.pull_request || {};
@@ -278,12 +309,16 @@ export function validateRuntimeEvent(raw) {
  * Shared log over memory / Durable Object SQLite storage.
  * storage: { getMeta(k), setMeta(k,v), hasDelivery(id), insert(seq,id,at,json,keep), range(after,limit),
  *   minSeq(), prune(maxEvents,olderThanMs,maxRuntimeEvents,runtimeOlderThanMs), transaction(fn),
- *   getProjection(bucket,key), putProjection(bucket,key,value), listProjection(bucket) }
+ *   getProjection(bucket,key), putProjection(bucket,key,value), listProjection(bucket),
+ *   hasReceipt(k), putReceipt(k,at,seq), pruneReceipts(olderThan,max) }
  * prune returns the highest deleted seq (0 if none); callers persist it atomically with the append.
  */
 export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retentionMs = DEFAULT_RETENTION_MS,
   maxRuntimeEvents = DEFAULT_MAX_RUNTIME_EVENTS, runtimeRetentionMs = DEFAULT_RUNTIME_RETENTION_MS,
-  runtimeKeyRetentionMs = DEFAULT_RUNTIME_KEY_RETENTION_MS, maxRuntimeKeys = DEFAULT_MAX_RUNTIME_KEYS } = {}) {
+  runtimeKeyRetentionMs = DEFAULT_RUNTIME_KEY_RETENTION_MS, maxRuntimeKeys = DEFAULT_MAX_RUNTIME_KEYS,
+  occDedupe = 'shadow', receiptRetentionMs = DEFAULT_RECEIPT_RETENTION_MS, maxReceipts = DEFAULT_MAX_RECEIPTS } = {}) {
+  if (!['off', 'shadow'].includes(occDedupe) || !Number.isSafeInteger(maxReceipts) || maxReceipts < 1 ||
+      !Number.isFinite(receiptRetentionMs) || receiptRetentionMs < 0) throw new Error('invalid occurrence receipt configuration');
   if (!Number.isSafeInteger(maxRuntimeEvents) || maxRuntimeEvents < 0 ||
       !Number.isFinite(runtimeRetentionMs) || runtimeRetentionMs < 0 ||
       !Number.isFinite(runtimeKeyRetentionMs) || runtimeKeyRetentionMs < 0 || !Number.isSafeInteger(maxRuntimeKeys) || maxRuntimeKeys < 1) throw new Error('invalid runtime retention bounds');
@@ -306,7 +341,27 @@ export function createEventLog(storage, { maxEvents = DEFAULT_MAX_EVENTS, retent
       if (!keep) storage.setMeta('lastDeliveryAt', String(now));
       if (record.id && storage.hasDelivery(record.id)) return { seq: null, duplicate: true };
       const seq = head() + 1;
-      const stored = { ...record, seq };
+      const { occ, native, level, occMissing, occDuplicate, ...visible } = record;
+      const stored = { ...visible, seq };
+      if (!keep && occDedupe === 'shadow') {
+        const increment = (key, amount = 1) => storage.setMeta(key, String(Number(storage.getMeta(key) || 0) + amount));
+        // Prune BEFORE lookup too, so replay-only traffic cannot keep expired evidence alive.
+        const evicted = storage.pruneReceipts(now - receiptRetentionMs, maxReceipts);
+        if (evicted) increment('occReceiptEvictions', evicted);
+        const level = isLevel(record.type, record.action);
+        const key = level ? (record.id ? `gh/delivery/${record.id}` : null) : occ;
+        stored.occ = level ? null : occ ?? null;
+        stored.level = level;
+        if (native) stored.native = native;
+        stored.occMissing = !key;
+        stored.occDuplicate = key ? storage.hasReceipt(key) : false;
+        if (!key) increment('occMissing');
+        if (stored.occDuplicate) increment('occDuplicates');
+        // Keep the first receipt's sequence: repeats cannot displace older unique evidence.
+        if (key && !stored.occDuplicate) storage.putReceipt(key, now, seq);
+        const overflow = storage.pruneReceipts(now - receiptRetentionMs, maxReceipts);
+        if (overflow) increment('occReceiptEvictions', overflow);
+      }
       storage.insert(seq, record.id || null, now, JSON.stringify(stored), keep);
       storage.setMeta('head', String(seq));
       if (!keep) storage.setMeta('lastEventAt', String(now));
@@ -426,11 +481,12 @@ const numOrNull = (v) => (v == null || v === '' || !Number.isFinite(Number(v)) ?
 export function createMemoryStorage() {
   let meta = new Map();
   let projection = new Map();
+  let receipts = new Map();
   let rows = []; // { seq, id, at, json } ascending
   return {
     transaction(fn) {
-      const saved = [new Map(meta), structuredClone(rows), structuredClone(projection)];
-      try { return fn(); } catch (error) { [meta, rows, projection] = saved; throw error; }
+      const saved = [new Map(meta), structuredClone(rows), structuredClone(projection), structuredClone(receipts)];
+      try { return fn(); } catch (error) { [meta, rows, projection, receipts] = saved; throw error; }
     },
     getProjection: (bucket, key) => structuredClone(projection.get(JSON.stringify([bucket, key])) ?? null),
     putProjection: (bucket, key, value) => { projection.set(JSON.stringify([bucket, key]), structuredClone(value)); },
@@ -438,6 +494,15 @@ export function createMemoryStorage() {
     getMeta: (k) => (meta.has(k) ? meta.get(k) : null),
     setMeta: (k, v) => { meta.set(k, v); },
     hasDelivery: (id) => rows.some((r) => r.id === id),
+    hasReceipt: (key) => receipts.has(key),
+    putReceipt: (key, at, seq) => { receipts.set(key, { at, seq }); },
+    pruneReceipts: (olderThan, max) => {
+      const before = receipts.size;
+      for (const [key, receipt] of receipts) if (receipt.at < olderThan) receipts.delete(key);
+      const oldest = [...receipts].sort((a, b) => a[1].seq - b[1].seq).slice(0, Math.max(0, receipts.size - max));
+      for (const [key] of oldest) receipts.delete(key);
+      return before - receipts.size;
+    },
     insert: (seq, id, at, json, keep = false) => { rows.push({ seq, id, at, json, keep }); },
     range: (after, limit) => rows.filter((r) => r.seq > after).slice(0, limit).map((r) => r.json),
     minSeq: () => (rows.length ? rows[0].seq : null),
@@ -489,8 +554,12 @@ export async function handleRequest(request, env, { getLog, now = () => Date.now
       await log.touch(t);
       return json(200, { stored: false, reason: eventName === 'ping' ? 'ping' : 'ignored event/action' });
     }
-    const res = await log.append(record, t);
-    return json(202, { stored: !res.duplicate, seq: res.seq, duplicate: res.duplicate });
+    try {
+      const res = await log.append(record, t);
+      return json(202, { stored: !res.duplicate, seq: res.seq, duplicate: res.duplicate });
+    } catch {
+      return json(503, { error: 'event storage unavailable; retry delivery' });
+    }
   }
 
   if (url.pathname === '/runtime-events') {
