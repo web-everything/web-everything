@@ -16,13 +16,11 @@ import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
  *   nothing invokes is the #3095 defect arriving by a different door, and prose is exactly where that rot is
  *   invisible.
  */
-// @repo-scanning-test scope=files
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { scanRoot, scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
 import {
   standDownHead, standDownLapse, annotateLapsedStandDowns, resolveStandDownLapseOnNewHead,
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
@@ -395,6 +393,7 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
       const claims = await import(${JSON.stringify(resolve(HERE, '../fix-dispatch-claim.mjs'))});
       claims.acquireFixDispatchClaim({ repo: 'we', pr: 3311, owner: 'daemon:1' });
       child.execFileSync = (_cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ headRefOid: 'a'.repeat(40) });
         if (args[0] === 'pr' && args[1] === 'comment') {
           assert.ok(claims.readFixDispatchClaim({ repo: 'we', pr: 3311 }));
           if (${postFails}) throw new Error('post failed');
@@ -710,50 +709,21 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
 });
 
 
-it('every production stand-down poster includes the head trailer', () => {
-  const root = scanRoot(resolve(HERE, '../../..'));
-  const files = [];
-  function collect(dir) {
-    for (const entry of readdirSync(resolve(root, dir), { withFileTypes: true })) {
-      const path = `${dir}/${entry.name}`;
-      if (['__tests__', '__fixtures__', 'soak', 'fixtures', 'node_modules'].includes(entry.name)) continue;
-      if (entry.isDirectory()) collect(path);
-      else if (/\.(?:[cm]?[jt]s|md)$/.test(path)) files.push(path);
-    }
+it('accepts an absent head and validates exactly 40 hex when supplied', () => {
+  expect(standDownHead(buildStandDownComment())).toBe(null);
+  expect(standDownHead(buildStandDownComment({ head: null }))).toBe(null);
+  for (const head of ['', 'abc1234', 'z'.repeat(40), 'a'.repeat(40) + '\n']) {
+    expect(() => buildStandDownComment({ head })).toThrow(/head/i);
   }
-  collect('scripts');
-  collect('skills-src');
-  const inspect = paths => paths.map(path => inspectStandDownPosters(path, readFileSync(resolve(root, path), 'utf8')));
-  let results = inspect(scopedScanFiles(files));
-  // A scoped edit may name a non-poster. Prove the inventory is alive against the full
-  // tree in that case, rather than succeeding with zero recognized callers.
-  if (!results.some(r => r.callers)) results = inspect(files);
-  expect(requireStandDownPosters(results)).toEqual([]);
-  const head = 'a'.repeat(40);
-  expect(standDownHead(buildLoadFlakeHoldComment({ head, detail: 'No saved alternate' }))).toBe(head);
+  expect(standDownHead(buildStandDownComment({ head: 'A'.repeat(40) }))).toBe('A'.repeat(40));
 });
-
-it('refuses missing or unsafe stand-down heads outside tests', () => {
-  vi.stubEnv('VITEST', '');
-  vi.stubEnv('WE_UNDER_TEST', '');
-  try {
-    expect(() => buildStandDownComment()).toThrow(/head.*required/i);
-    for (const head of [null, '', 'not-a-sha', 'a'.repeat(40) + '\n']) {
-      expect(() => buildStandDownComment({ head })).toThrow(/head.*required/i);
-    }
-    const head = 'a'.repeat(40);
-    expect(buildStandDownComment({ head }).split('\n').at(-1)).toContain(` head=${head}`);
-  } finally { vi.unstubAllEnvs(); }
-});
-
 
 // Each audit finding has its own regression, before fixing the production path.
-import { inspectStandDownPosters, requireStandDownPosters } from '../../lib/stand-down-posters.mjs';
 import { REPO_SCAN_TESTS } from '../../lib/repo-scan-tests.mjs';
 import { defaultPostConflictStandDown } from '../parked-pr-conflict-watch.mjs';
 
 describe('head trailer audit regressions', () => {
-  it('brief needs-judgment, conflict and gate-red exits carry executable full heads', async () => {
+  it('brief exits delegate the head lookup to the CLI', async () => {
     const brief = readFileSync(BRIEF, 'utf8');
     const { spawnSync } = await import('node:child_process');
     const head = 'b'.repeat(40);
@@ -761,7 +731,11 @@ describe('head trailer audit regressions', () => {
       import child from 'node:child_process';
       import { syncBuiltinESMExports } from 'node:module';
       import assert from 'node:assert/strict';
-      child.execFileSync = (_cmd, args) => {
+      child.execFileSync = (_cmd, args, options) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          assert.equal(options.timeout, 20000);
+          return JSON.stringify({ headRefOid: '${head}' });
+        }
         if (args[0] === 'pr' && args[1] === 'comment') {
           assert.match(args[args.indexOf('--body') + 1], /<!-- stand-down reason=[a-z-]+ head=${head}(?: findings=[A-Za-z0-9_-]+)? -->$/);
           process.stdout.write('POSTED\\n');
@@ -782,12 +756,12 @@ describe('head trailer audit regressions', () => {
     try {
     for (const reason of ['needs-judgment', 'conflict', 'gate-red']) {
       const command = brief.replace(/\\\n/g, ' ').split('\n').find(line => line.startsWith('node ') && line.includes(`--reason=${reason}`));
-      expect(command).toMatch(/--head=/);
+      expect(command).not.toContain('$(gh');
+      expect(command).not.toMatch(/--head=/);
       const runnable = command.replaceAll('{{WE_ROOT}}', resolve(HERE, '../../..'))
         .replaceAll('{{PR_NUM}}', '42').replaceAll('{{REPO}}', 'we').replaceAll('{{SESSION_SLUG}}', 'audit');
-      // Run the brief's shell command, including its head lookup, against hermetic IO.
-      const shell = `gh() { printf '%s' '${head}'; }
-node() { "$NODE_EXE" "$HARNESS_PATH" "$@"; }
+      // Execute the actual brief command with hermetic child IO.
+      const shell = `node() { "$NODE_EXE" "$HARNESS_PATH" "$@"; }
 ${runnable}`;
       const result = spawnSync('bash', ['-c', shell], { encoding: 'utf8', timeout: 30000,
         env: { ...process.env, NODE_EXE: process.execPath, HARNESS_PATH: harnessPath, FINDING_REFS_FILE: refs, WE_COORDINATION_ROOT: root } });
@@ -805,41 +779,70 @@ ${runnable}`;
   it.each(['VITEST', 'WE_UNDER_TEST'])('environment %s cannot disable head validation, including 0', name => {
     for (const value of ['0', '1', 'true']) {
       vi.stubEnv(name, value);
-      try { expect(() => buildStandDownComment()).toThrow(/head.*required/i); }
+      try {
+        expect(standDownHead(buildStandDownComment())).toBe(null);
+        expect(() => buildStandDownComment({ head: 'invalid' })).toThrow(/head/i);
+      }
       finally { vi.unstubAllEnvs(); }
     }
   });
-  it('inventory resolves imported aliases, local aliases and namespace calls and refuses zero callers', () => {
-    for (const text of [
-      "import { buildStandDownComment as post } from './stand-down.mjs'; post({});",
-      "import * as holds from './stand-down.mjs'; holds.buildStandDownComment({});",
-      "const post = buildStandDownComment; post({});",
-    ]) {
-      const result = inspectStandDownPosters('scripts/poster.mjs', text);
-      expect(result.callers).toBe(1);
-      expect(result.missing).toHaveLength(1);
-    }
-    expect(() => requireStandDownPosters([{ callers: 0, missing: [] }])).toThrow(/no.*caller/i);
+  it('removes the static poster inventory registration', () => {
+    expect(REPO_SCAN_TESTS.some(r => r.test.endsWith('/stand-down.test.mjs'))).toBe(false);
   });
-  it('invalid heads and subsequent overwrites fail inventory and runtime validation', () => {
-    for (const expression of ['undefined', 'null', "''", "'abc1234'", "'z'.repeat(40)"]) {
-      expect(inspectStandDownPosters('scripts/poster.mjs', `buildStandDownComment({head: ${expression}})`).missing).toHaveLength(1);
-    }
-    expect(inspectStandDownPosters('scripts/poster.mjs', 'buildStandDownComment({head, ...options})').missing).toHaveLength(1);
-    for (const head of [undefined, null, '', 'abc1234', 'z'.repeat(40)]) {
-      expect(() => buildStandDownComment({head: 'a'.repeat(40), ...{ head }})).toThrow(/head.*required/i);
-    }
+});
+
+describe('stand-down CLI current head', () => {
+  async function run({ supplied, read = 'ok' } = {}) {
+    const { spawnSync } = await import('node:child_process');
+    const head = 'b'.repeat(40);
+    const root = mkdtempSync(resolve(tmpdir(), 'stand-down-cli-'));
+    const harness = resolve(root, 'harness.mjs');
+    writeFileSync(harness, `
+      import child from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import assert from 'node:assert/strict';
+      child.execFileSync = (_cmd, args, options) => {
+        if (args[0] === 'pr' && args[1] === 'view') {
+          assert.equal(options.timeout, 20000);
+          assert.ok(options.maxBuffer > 0);
+          assert.ok(args.includes('--repo=we'));
+          if (${JSON.stringify(read)} === 'error') throw new Error('head unavailable');
+          return ${JSON.stringify(read)} === 'malformed' ? '{}' : JSON.stringify({ headRefOid: '${head}' });
+        }
+        if (args[0] === 'pr' && args[1] === 'comment') process.stdout.write(JSON.stringify({ body: args[args.indexOf('--body') + 1] }) + '\\n');
+        return '';
+      };
+      syncBuiltinESMExports();
+      const cli = process.argv[2];
+      await import(cli);
+      process.argv.splice(1, 1);
+      await import(cli + '?cli-test');
+    `);
+    try {
+      return spawnSync(process.execPath, [harness, resolve(HERE, '../stand-down.mjs'), '42', '--repo=we', '--reason=needs-judgment',
+        ...(supplied === undefined ? [] : ['--head=' + supplied])], { encoding: 'utf8', timeout: 30000 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }
+  it('resolves a missing --head with a bounded PR read', async () => {
+    const result = await run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(standDownHead(JSON.parse(result.stdout.split('\n')[0]).body)).toBe('b'.repeat(40));
   });
-  it('inventory reaches operations, CLI invocations and briefs', () => {
-    const manifest = REPO_SCAN_TESTS.find(r => r.test.endsWith('/stand-down.test.mjs'));
-    for (const path of ['scripts/operations/fix-run.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs', 'skills-src/conveyor/fix-agent-brief.md']) expect(manifest.matches(path), path).toBe(true);
-    for (const [path, text] of [
-      ['skills-src/conveyor/brief.md', 'node scripts/conveyor/stand-down.mjs 42 --reason=conflict'],
-      ['scripts/poster.mjs', "exec('node', ['scripts/conveyor/stand-down.mjs', '42', '--reason=conflict'])"],
-    ]) {
-      const result = inspectStandDownPosters(path, text);
-      expect(result.callers).toBe(1);
-      expect(result.missing).toHaveLength(1);
-    }
+  it('refuses a stale --head before posting', async () => {
+    const result = await run({ supplied: 'a'.repeat(40) });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/head.*(mismatch|current|match)/i);
+    expect(result.stdout).not.toContain('body');
+  });
+  it('accepts a supplied current head', async () => {
+    const result = await run({ supplied: 'b'.repeat(40) });
+    expect(result.status, result.stderr).toBe(0);
+    expect(standDownHead(JSON.parse(result.stdout.split('\n')[0]).body)).toBe('b'.repeat(40));
+  });
+  it.each(['error', 'malformed'])('posts unheaded when the head read is %s', async read => {
+    const result = await run({ read });
+    expect(result.status, result.stderr).toBe(0);
+    expect(standDownHead(JSON.parse(result.stdout.split('\n')[0]).body)).toBe(null);
+    expect(result.stderr).toMatch(/unheaded/i);
   });
 });

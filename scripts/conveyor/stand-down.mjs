@@ -40,6 +40,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
+import { runGhSync } from '../lib/gh-throttle.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readBotLogins } from '../lib/github-app-identity.mjs';
@@ -748,13 +749,13 @@ export function standDownReason(body) {
  * The body states the ASYMMETRY explicitly — terminal for the reconciler, cleared by a person — because that is
  * the difference between a marker and a burial. A reader who finds this comment must be able to see, without
  * reading any code, that the automation has deliberately stopped and that they are the intended next step.
- * Head is always required. Historical comments belong in explicit reader fixtures.
- * @param {{ actor?:string, reason?:string, detail?:string, head:string }} o
+ * Head is optional for durable legacy posts when the PR head cannot be read.
+ * @param {{ actor?:string, reason?:string, detail?:string, head?:string }} o
  * @returns {string}
  */
 export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null, findingRefs } = {}) {
-  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head.length !== 40) {
-    throw new TypeError('stand-down: a valid head is required; pass the PR head SHA');
+  if (head != null && (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head.length !== 40)) {
+    throw new TypeError('stand-down: head must be a 40-hex PR head SHA when supplied');
   }
   if (findingRefs !== undefined && (reason !== 'needs-judgment' || !validFindingRefs(findingRefs))) {
     throw new Error('findingRefs requires needs-judgment and a non-empty list of {runId, key} subjects');
@@ -774,8 +775,8 @@ export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '
     '**A human is the intended next step.** The automatic fix loop will NOT try this PR again while this comment ' +
       'stands — re-running it would only re-ask the same question. Take it over with `/finish`, or delete this ' +
       'comment once the blocker is resolved to hand the PR back to the loop.',
-    ...(isSafeGitSha(head) ? ['This hold is for this head only and lapses automatically on a new push.'] : []),
-    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'}${isSafeGitSha(head) ? ` head=${head}` : ''}${encodedRefs ? ` findings=${encodedRefs}` : ''} -->`,
+    ...(head ? ['This hold is for this head only and lapses automatically on a new push.'] : []),
+    `<!-- stand-down reason=${Object.hasOwn(STAND_DOWN_REASONS, reason) ? reason : 'unknown'}${head ? ` head=${head}` : ''}${encodedRefs ? ` findings=${encodedRefs}` : ''} -->`,
   ].join('\n');
 }
 
@@ -800,6 +801,23 @@ if (IS_CLI) {
   if (!Number.isInteger(pr) || pr <= 0) {
     fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>] [--superseded-by=<n> --merged-at=<iso>]  (pr must be a positive integer)`);
   }
+  const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : [];
+  if (flags.head !== undefined && (typeof flags.head !== 'string' || flags.head.length !== 40 || !/^[0-9a-f]{40}$/i.test(flags.head))) {
+    fail('--head must be a 40-hex PR head SHA');
+  }
+  let currentHead;
+  try {
+    const snapshot = JSON.parse(runGhSync(['pr', 'view', String(pr), ...repoArgs, '--json', 'headRefOid'], {
+      encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024, stdio: ['ignore', 'pipe', 'ignore'], killSignal: 'SIGKILL',
+      throttle: { noMemo: true, maxAttempts: 1, acquireTimeoutMs: 20_000 },
+    }));
+    if (typeof snapshot?.headRefOid === 'string' && snapshot.headRefOid.length === 40 && /^[0-9a-f]{40}$/i.test(snapshot.headRefOid)) currentHead = snapshot.headRefOid;
+  } catch { /* Durability first: an unreadable head must never prevent the stand-down. */ }
+  if (currentHead && flags.head !== undefined && flags.head.toLowerCase() !== currentHead.toLowerCase()) {
+    fail(`--head mismatch: supplied ${flags.head} does not match PR #${pr}'s current head ${currentHead}; no stand-down posted`);
+  }
+  if (!currentHead) process.stderr.write('⚠ stand-down: could not resolve the current PR head; posting an unheaded stand-down\n');
+  flags.head = currentHead;
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
   let detail = typeof flags.detail === 'string' ? flags.detail : undefined;
   let findingRefs;
@@ -845,7 +863,6 @@ if (IS_CLI) {
       altSha: typeof flags['alt-sha'] === 'string' ? flags['alt-sha'] : (parseAltBranch(detail)?.sha ?? null),
     })
     : buildStandDownComment({ actor, head: isSafeGitSha(flags.head) ? flags.head : undefined, reason: flags.reason === 'load-flake' ? 'gate-red' : typeof flags.reason === 'string' ? flags.reason : undefined, detail, findingRefs });
-  const repoArgs = typeof flags.repo === 'string' ? [`--repo=${flags.repo}`] : []; // a missing --repo derives from cwd.
   const gh = (args) => execFileSync('gh', args, { /* #74c write-only call: stdout is never read, so it is not captured (nothing to overflow or truncate) */ stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
   try {
     // #x5n4zn3 — was bare (no timeout).
