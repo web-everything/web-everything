@@ -174,6 +174,7 @@ export const REPO_SCAN_TESTS = Object.freeze([
  * @type {Readonly<Record<string, string>>}
  */
 export const DEFERRED_SCAN_TESTS = Object.freeze({
+  'scripts/operations/__tests__/daemon-host-gate-dryrun.test.mjs': 'false positive: its recursive snapshot walks only mkdtemp HOME and repo fixtures to prove read-only behavior and detect unintended writes, never the live repo; imports daemon-host-gate-dryrun.mjs so vitest related selects it when the operation changes',
   'scripts/operations/__tests__/direct-exec-tripwire.test.mjs': 'static tripwire: reads three named dispatch modules and walks scripts/ once for launch call sites; small and hermetic; CI runs it on every PR and verify runs it when the test file itself changes',
   'scripts/lib/__tests__/file-class-policy.test.mjs': 'one record-only check walks scripts/ to assert no other script imports the file-class engine; it loads the engine so vitest related selects it when the engine changes, and CI runs it on every PR',
   'scripts/lib/__tests__/settings-registry.test.mjs': 'false positive: git ls-files checks only the named generated settings-registry.md path is untracked; it does not enumerate the repo for a rule scan, and imports settings-registry.mjs so vitest related selects it when the generator changes',
