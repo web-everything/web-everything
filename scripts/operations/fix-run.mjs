@@ -1141,7 +1141,7 @@ export async function runFixCli(argv = [], {
     if (launch.provider === 'antigravity') {
       const outputPaths = [...new Set([
         ...changedPaths(statusAfterAgent, { includeArtifacts: true }),
-        ...git('diff', '--name-only', '-z', '--no-renames', `${before}..HEAD`).split('\0').filter(Boolean),
+        ...git('diff', '--name-only', '-z', '--no-renames', before, 'HEAD').split('\0').filter(Boolean),
       ])];
       const refused = outputPaths.filter(path => !agyAdmission
         || !agyAdmission.scope.some(root => path === root || path.startsWith(`${root}/`))
