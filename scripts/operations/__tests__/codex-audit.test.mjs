@@ -11,10 +11,16 @@ import * as auditSettings from '../../lib/audit-settings.mjs';
 import { createAuditDeps } from '../codex-audit-io.mjs';
 
 // Lets one test swap the text codex-audit.mjs reads for its settings file; every other read passes through.
-const settingsOverride = vi.hoisted(() => ({ text: null }));
+const settingsOverride = vi.hoisted(() => ({ text: null, error: null }));
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal();
-  const readFileSync = (path, ...rest) => settingsOverride.text !== null && String(path).endsWith('settings/codex-audit.json') ? settingsOverride.text : actual.readFileSync(path, ...rest);
+  const readFileSync = (path, ...rest) => {
+    if (String(path).endsWith('settings/codex-audit.json')) {
+      if (settingsOverride.error) throw settingsOverride.error;
+      if (settingsOverride.text !== null) return settingsOverride.text;
+    }
+    return actual.readFileSync(path, ...rest);
+  };
   return { ...actual, readFileSync, default: { ...actual.default, readFileSync } };
 });
 
@@ -61,6 +67,22 @@ describe('canonical audit', () => {
       expect(await main(ARGS, f.deps)).toBe(0);
       expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff --unified=1 ${BASE}...${HEAD} --`);
     } finally { settingsOverride.text = null; }
+  });
+
+  it.each(['invalid', 'unreadable'])('uses safe default context and records a degraded blocking verdict for %s policy', async kind => {
+    if (kind === 'invalid') settingsOverride.text = JSON.stringify({ audit: { hunkContextLines: -1 } });
+    else settingsOverride.error = new Error('policy read denied');
+    try {
+      const f = fixture('NOT WEAKENED');
+      expect(await main([...ARGS, '--json'], f.deps)).toBe(1);
+      expect(f.deps.runCodex.mock.calls[0][1].hunkContextLines).toBe(3);
+      const result = JSON.parse(f.output.join(''));
+      expect(result).toMatchObject({ verdict: 'WEAKENED', degraded: true });
+      expect(result.policyErrors).toEqual([expect.stringMatching(/hunk.context policy/i)]);
+      expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', degraded: true, policyErrors: result.policyErrors });
+      expect(f.errors.join('')).toMatch(/retry|human review/);
+      expect(findAudit(f.records, { base: BASE, head: HEAD, questionHash: QUESTION_HASH, priorQuestionHashes: [] }).verdict).toBe('WEAKENED');
+    } finally { settingsOverride.text = null; settingsOverride.error = null; }
   });
 
   it.each(['--note=x', '--question=x', '--prompt=x', '--help', '--json=true', 'extra', '--', '--base=other'])('rejects extra argument %s before any work', async arg => {
@@ -753,7 +775,19 @@ describe('debounce and delta audits', () => {
   });
   it.each(['bad JSON', JSON.stringify({ audit: { delta: { maxFiles: -1 } } }), JSON.stringify({ audit: { delta: { maxFiles: '5' } } })])('unreadable or invalid delta setting disables delta: %s', async text => {
     settingsOverride.text = text;
-    try { await full(delta()); } finally { settingsOverride.text = null; }
+    try {
+      const f = delta();
+      if (text === 'bad JSON') {
+        // The full-file fallback still runs, but unreadable shared policy cannot certify a pass.
+        expect(await main(ARGS, f.deps)).toBe(1);
+        expect(f.deps.runCodex).toHaveBeenCalledOnce();
+        expect(f.deps.runCodex.mock.calls[0][0]).toContain(`git diff ${BASE}...${HEAD}`);
+        expect(f.deps.runCodex.mock.calls[0][1].hunkContextLines).toBe(3);
+        expect(f.records[0]).not.toHaveProperty('basis');
+        expect(f.records[0]).toMatchObject({ verdict: 'WEAKENED', degraded: true,
+          policyErrors: [expect.stringMatching(/hunk.context policy/i)] });
+      } else await full(f);
+    } finally { settingsOverride.text = null; }
   });
 });
 
@@ -865,21 +899,37 @@ describe('changed-hunk policy transition', () => {
     expect(resolve({}, { log })).toBe(3);
     expect(log).toHaveBeenCalledWith(expect.stringContaining('hunkContextLines=3 (standard)'));
   });
-  it('cascades platform then tool and only allows env to tighten', () => {
+  it('cascades platform then tool and only allows env to raise context', () => {
     expect(resolve({}, { platform: { hunkContextLines: 2 } })).toBe(2);
     expect(resolve({ hunkContextLines: 3 }, { platform: { hunkContextLines: 2 } })).toBe(3);
-    expect(resolve({ hunkContextLines: 2 }, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: '1' } })).toBe(1);
-    expect(resolve({ hunkContextLines: 1 }, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: '3' } })).toBe(1);
+    expect(resolve({ hunkContextLines: 2 }, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: '1' } })).toBe(2);
+    expect(resolve({ hunkContextLines: 1 }, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: '3' } })).toBe(3);
   });
-  it.each([null, {}, [], '2', -1, 1.5, 4, 1000000])('fails closed to zero on invalid or oversized context %j', hunkContextLines => {
+  it.each([null, {}, [], '2', -1, 1.5, 4, 1000000])('fails closed to safe default with a policy error on invalid or oversized context %j', hunkContextLines => {
     const log = vi.fn();
-    expect(resolve({ hunkContextLines }, { log })).toBe(0);
-    expect(resolve({}, { platform: { hunkContextLines } })).toBe(0);
+    const onPolicyError = vi.fn();
+    expect(resolve({ hunkContextLines }, { log, onPolicyError })).toBe(3);
+    expect(resolve({}, { platform: { hunkContextLines }, onPolicyError })).toBe(3);
+    expect(onPolicyError).toHaveBeenCalledWith(expect.stringMatching(/hunk.context policy/i));
     expect(log).toHaveBeenCalledWith(expect.stringContaining('fallback; retry settings or request human review'));
   });
-  it('fails closed on unreadable settings and invalid environment values', () => {
-    expect(resolve({}, { readFile: () => { throw new Error('unreadable'); } })).toBe(0);
-    expect(resolve({}, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: 'invalid' } })).toBe(0);
+  it('preserves configured context and reports unreadable platform policy', () => {
+    const onPolicyError = vi.fn();
+    expect(resolve({ hunkContextLines: 2 }, { platform: undefined,
+      platformRead: () => { throw new Error('denied'); }, onPolicyError })).toBe(2);
+    expect(onPolicyError).toHaveBeenCalled();
+  });
+  it('uses safe default context on unreadable settings', () => {
+    const onPolicyError = vi.fn();
+    expect(resolve({}, { readFile: () => { throw new Error('unreadable'); }, onPolicyError })).toBe(3);
+    expect(onPolicyError).toHaveBeenCalled();
+  });
+  it.each(['0', '1', 'invalid', '-1', '1.5', '4', '1000000', ''])('ignores lower or invalid env context %j with a warning', raw => {
+    const log = vi.fn(), onPolicyError = vi.fn();
+    expect(resolve({ hunkContextLines: 2 }, { env: { WE_AUDIT_HUNK_CONTEXT_LINES: raw }, log, onPolicyError })).toBe(2);
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/WE_AUDIT_HUNK_CONTEXT_LINES.*ignored/));
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('hunkContextLines=2 (tool)'));
+    expect(onPolicyError).not.toHaveBeenCalled();
   });
   it('a prior-hash NOT WEAKENED record still passes inside its window after the question change', () => {
     const prior = 'c911fc8450ac5a4864dd1ef78284b88321e32671cc66880a8d84a9b2f4a6c284';

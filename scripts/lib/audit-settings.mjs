@@ -352,19 +352,24 @@ function resolveUnguarded({ path = AUDIT_SETTINGS_PATH, fileRead = readFileSync,
 }
 
 
-/** Changed-hunk context is deliberately small (0–3 lines). Environment may only reduce it.
- * Invalid/unreadable evidence uses zero context; operators can repair settings or request human review.
+/** Changed-hunk context is deliberately small (0–3 lines). Environment may only raise it.
+ * Invalid/unreadable policy preserves safe configured context (or the three-line default).
+ * The caller must record onPolicyError as degraded evidence requiring retry or human review.
  */
 export function resolveHunkContextSettings({ readFile = readFileSync, platformRead = readFileSync,
-  env = process.env, platform, log = console.error } = {}) {
+  env = process.env, platform, log = console.error, onPolicyError = () => {} } = {}) {
   const valid = v => Number.isInteger(v) && v >= 0 && v <= 3;
-  const fallback = () => {
-    log('audit scope: hunkContextLines=0 (fallback; retry settings or request human review)');
-    return 0;
+  let safeContext = 3;
+  const fallback = (reason = 'invalid policy') => {
+    const error = `Hunk-context policy error: ${reason}`;
+    onPolicyError(error);
+    log(`audit scope: hunkContextLines=${safeContext} (fallback; retry settings or request human review); ${error}`);
+    return safeContext;
   };
   try {
     const data = JSON.parse(readFile(AUDIT_SETTINGS_PATH, 'utf8'));
     if (!isObj(data) || !isObj(data.audit)) return fallback();
+    if (valid(data.audit.hunkContextLines) && data.audit.hunkContextLines > 0) safeContext = data.audit.hunkContextLines;
     let plat = platform;
     if (plat === undefined) {
       const resolved = readPlatformPreferences({ env, readFile: platformRead });
@@ -386,13 +391,15 @@ export function resolveHunkContextSettings({ readFile = readFileSync, platformRe
     let source = resolved.sources.hunkContextLines;
     const raw = env.WE_AUDIT_HUNK_CONTEXT_LINES;
     if (raw !== undefined) {
-      if (!/^[0-3]$/.test(raw)) return fallback();
-      const tightened = Math.min(value, Number(raw));
-      if (tightened < value) source = 'env';
-      value = tightened;
+      if (!/^[0-3]$/.test(raw) || Number(raw) < value) {
+        log('env WE_AUDIT_HUNK_CONTEXT_LINES ignored (invalid or below configured context; may only raise context within 0–3)');
+      } else if (Number(raw) > value) {
+        value = Number(raw);
+        source = 'env';
+      }
     }
     if (!valid(value)) return fallback();
     log(`audit scope: hunkContextLines=${value} (${source})`);
     return value;
-  } catch { return fallback(); }
+  } catch { return fallback('unreadable policy'); }
 }
