@@ -1343,6 +1343,35 @@ describe('CI-heal salvage before agent dispatch', () => {
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: variant.endsWith('unreadable') ? 'fix-loop-unreadable' : 'fix-cause-unknown' }));
   });
+  it.each(['answered', 'interrupted', 'new-failure', 'budget-park', 'raw-ceiling'])('CI-heal honors an unknown-cause answer while preserving %s evidence', async variant => {
+    const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
+    const { buildOperatorAnswer, latestOperatorAnswer } = await import('../../conveyor/stand-down-answer-core.mjs');
+    const now = Date.now(), head = entry.headRefOid;
+    const comments = [
+      { id: 'SD1', author: { login: 'web-everything' }, createdAt: new Date(now - 2000).toISOString(),
+        body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) },
+      { author: { login: 'chalbert' }, createdAt: new Date(now - 1000).toISOString(), body: buildOperatorAnswer({
+        standDownId: 'SD1', actor: 'chalbert', channel: 'chat', reason: 'Retry the repair' }) },
+    ];
+    const park = { ...rows()[0], kind: 'park', reason: 'fix-cause-unknown', at: comments[0].createdAt };
+    const evidence = variant === 'interrupted' ? [] : [park];
+    if (variant === 'budget-park') evidence.push({ ...park, reason: 'raw per-head repair session ceiling reached' });
+    if (variant === 'raw-ceiling') evidence.push(...[...rows(), ...rows()].slice(0, 5));
+    const ledger = loop({ readRows: () => evidence, readRouted: () => ({ 'we#3895': [{ head,
+      at: variant === 'new-failure' ? now - 500 : now - 3000, outcome: 'failed', cause: 'unknown' }] }) });
+    const { result, dispatch } = await exercise(() => null, { now,
+      reconcile: () => ({ dispatch: [{ ...entry, operatorAnswer: latestOperatorAnswer(comments) }], refusals: [] }),
+      readPrComments: () => comments, fixLoop: ledger,
+      fixConfig: { hold: true, maxSessions: 3, windowHours: 6 }, postParkComment: vi.fn() });
+    if (['answered', 'interrupted'].includes(variant)) {
+      expect(result.dispatched, JSON.stringify(result)).toHaveLength(1);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } else {
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({
+        kind: variant === 'new-failure' ? 'fix-cause-unknown' : 'fix-loop-parked' }));
+    }
+  });
   it('raw ceiling does not promote the current or persisted launcher-only rearm', async () => {
     const evidence = [...rows(), rows()[0]];
     const ledger = loop({ readRows: () => evidence, readSessionLog: () =>

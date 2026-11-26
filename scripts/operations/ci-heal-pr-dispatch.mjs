@@ -66,7 +66,8 @@ import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { assertCapability, repoProfile, briefTokensForRepo } from '../lib/repo-profile.mjs';
 import { resolvePrWorkUnit } from '../conveyor/pr-work-unit.mjs';
-import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
+import { freeLaneNumbers, fetchPrDiffPaths, queueBudgetFrom, queueCapWhy, fixerTableFor, releaseAnsweredUnknownCause } from '../conveyor/reconcile-fix-dispatch.mjs'; // queueBudgetFrom/queueCapWhy: card xkyw1x4
+import { defaultReadPrComments } from '../conveyor/ci-red-recovery-watch.mjs';
 import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
@@ -453,6 +454,7 @@ export async function runReconcileCiHealDispatch({
   fixConfig = fixLoopConfig(),
   currentBuild = () => currentCheckoutBuild(root),
   postParkComment = postFixLoopParkComment,
+  readPrComments = defaultReadPrComments,
   now = Date.now,
   deadlineAt, cursor, shouldYield,
   gateSliceMs,
@@ -547,7 +549,7 @@ export async function runReconcileCiHealDispatch({
   };
   let build = null;
   try { build = await (fixLoop.currentBuild ?? currentBuild)(); } catch { /* Build lookup is best effort. */ }
-  let handled = 0;
+  let handled = 0, answerReads = 0;
   let deferred = [];
   console.error(`ci-heal-pr-dispatch: timing pre-loop ms=${clock() - startedAt}`);
   // Phase A: finish admission and assign lanes before any expensive launch.
@@ -641,12 +643,17 @@ export async function runReconcileCiHealDispatch({
         refusals.push({ pr: entry.prNumber, kind: 'fix-loop-unreadable', why: 'Operator must restore routed outcome evidence before another launch' });
         continue;
       }
-      if (fixConfig.hold && unparkedUnknownOnHead(routed, routedId, loopRows)) {
+      const released = releaseAnsweredUnknownCause({ entry, rows: loopRows, routed, repo: repoKey, now: entryNow,
+        readComments: () => {
+          if (++answerReads > 4) throw Error('operator-answer read budget exhausted; retry next pass');
+          return readPrComments(entry.prNumber, { repo: CONSTELLATION_REPOS[repoKey].slug, root });
+        } });
+      if (fixConfig.hold && unparkedUnknownOnHead(released.routed, routedId, released.rows)) {
         refusals.push({ pr: entry.prNumber, kind: 'fix-cause-unknown', why: 'Unknown repair cause has no durable park; operator must complete the stand-down' });
         continue;
       }
       const modelCount = consecutiveUnproductiveOnHead(routed, routedId);
-      const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build, modelCount });
+      const disposition = fixLoopDisposition({ ...identity, rows: released.rows, infraFailures, infraRows, build, modelCount });
       const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
       const counts = `${loop.count} ci-heal/fix sessions (${loop.rawCount} raw, ${loop.infraFailures} infrastructure discount) on head ${shortHead}`;
       if (disposition.action === 'park' || disposition.action === 'parked') {

@@ -84,7 +84,7 @@ import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
 import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopDisposition } from './fix-loop-ledger.mjs';
 import { standDownComments, standDownHead, standDownTrailerReason } from './stand-down.mjs';
-import { withOperatorAnswer } from './stand-down-answer-core.mjs';
+import { withOperatorAnswer, buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -196,7 +196,7 @@ import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOver
 import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
-import { BORROW_REASON, readRoutedOutcomes, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, routedOutcomeCause, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -1883,6 +1883,39 @@ export function classifyEnvFaultRefusals(refusals) {
     ? { ...r, kind: 'dispatch-env-fault' } : r));
 }
 
+/** Discount an answered unknown-cause episode for one admission without rewriting durable evidence. */
+export function releaseAnsweredUnknownCause({ entry, rows, routed, repo, now, readComments }) {
+  const unchanged = { rows, routed };
+  if (!entry.operatorAnswer) return unchanged;
+  const key = `${repo}#${entry.prNumber}`;
+  const matches = row => row.repo === repo && row.pr === entry.prNumber && row.head === entry.headRefOid;
+  const isUnknown = row => row.head === entry.headRefOid && Object.hasOwn(row, 'cause') && routedOutcomeCause(row) === 'unknown';
+  if (!rows.some(row => matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown')
+      && !(routed?.[key] ?? []).some(isUnknown)) return unchanged;
+  try {
+    const comments = readComments();
+    if (!Array.isArray(comments)) return unchanged;
+    // Revalidate the carried answer against its trusted thread record. A stale answer is not a blanket bypass.
+    const body = buildOperatorAnswer(entry.operatorAnswer);
+    const answerIndex = comments.findLastIndex(c => c.body === body && parseOperatorAnswer(c));
+    if (answerIndex < 0) return unchanged;
+    const at = Date.parse(comments[answerIndex].createdAt);
+    if (!Number.isFinite(at) || at > now) return unchanged;
+    const throughAnswer = comments.slice(0, answerIndex + 1);
+    const questions = comments.flatMap((c, index) => standDownComments([c]).some(question =>
+      standDownTrailerReason(question.body) === 'fix-cause-unknown' && standDownHead(question.body) === entry.headRefOid) ? [index] : []);
+    if (!questions.length || questions.some(index => !isOperatorAnswerStandDownSuperseded(throughAnswer, index))) return unchanged;
+    // Thread order binds exact timestamp ties. Later or unreadable evidence stays held;
+    // if local subsecond time cannot be ordered against GitHub time, a fresh later answer is required.
+    return {
+      rows: rows.filter(row => !(matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown'
+        && Date.parse(row.at) <= at)),
+      routed: { ...routed, [key]: (routed?.[key] ?? []).filter(row => !(isUnknown(row)
+        && Number.isFinite(row.at) && row.at <= at)) },
+    };
+  } catch { return unchanged; }
+}
+
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#runReconcileFixDispatch — the WHOLE pass: read
  * `reconcile-pass.mjs`'s plan (reused, not re-run by hand), narrow it to dispatchable fixes
@@ -2161,8 +2194,10 @@ export function runReconcileFixDispatch({
       try {
         const comments = readPrComments(refusal.prNumber, { repo: CONSTELLATION_REPOS[repoKey].slug, root });
         if (!Array.isArray(comments)) throw new Error('unreadable stand-down comments');
-        for (const comment of standDownComments(comments)) {
+        for (const [index, comment] of comments.entries()) {
+          if (!standDownComments([comment]).length) continue;
           if (standDownTrailerReason(comment.body) !== 'fix-cause-unknown') continue;
+          if (isOperatorAnswerStandDownSuperseded(comments, index)) continue;
           const head = standDownHead(comment.body);
           if (!/^[a-f0-9]{40}$/i.test(head ?? '')) continue;
           if (rows.some(r => r.kind === 'park' && r.repo === repoKey && r.pr === refusal.prNumber && r.head === head)) continue;
@@ -2174,15 +2209,23 @@ export function runReconcileFixDispatch({
     }
     const config = fixConfig ?? fixLoopConfig();
     const held = [], dispatch = [];
+    let answerReads = 0;
     for (const entry of reconciled.dispatch) {
-      const parks = rows.filter(row => row.kind === 'park' && row.reason === 'fix-cause-unknown');
+      let unknown = false, effectiveRows = rows;
+      try {
+        const released = releaseAnsweredUnknownCause({ entry, rows, repo: repoKey, now,
+          routed: (fixLoop.readRouted ?? readRoutedOutcomes)({ repo: repoKey, pr: entry.prNumber, strict: true }),
+          readComments: () => {
+            if (++answerReads > 4) throw Error('operator-answer read budget exhausted; retry next pass');
+            return readPrComments(entry.prNumber, { repo: CONSTELLATION_REPOS[repoKey].slug, root });
+          } });
+        effectiveRows = released.rows;
+        unknown = config.hold && unparkedUnknownOnHead(released.routed,
+          { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid }, effectiveRows);
+      } catch { unknown = true; }
+      const parks = effectiveRows.filter(row => row.kind === 'park' && row.reason === 'fix-cause-unknown');
       const disposition = fixLoopDisposition({ rows: parks, repo: repoKey, pr: entry.prNumber,
         head: entry.headRefOid, now, config });
-      let unknown = false;
-      try {
-        unknown = config.hold && unparkedUnknownOnHead((fixLoop.readRouted ?? readRoutedOutcomes)({ repo: repoKey, pr: entry.prNumber, strict: true }),
-          { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid }, rows);
-      } catch { unknown = true; }
       if (disposition.action === 'parked' || unknown) held.push({ ...entry, kind: 'fix-loop-parked', why: 'fix-cause-unknown: operator decision required' });
       else dispatch.push(entry);
     }

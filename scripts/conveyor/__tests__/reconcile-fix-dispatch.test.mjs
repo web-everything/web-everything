@@ -3329,6 +3329,30 @@ describe('unknown-cause park recovery', () => {
       expect(out.reconcileRefusalDetails).toContainEqual(expect.objectContaining({ kind: 'fix-loop-parked' }));
     } finally { vi.unstubAllEnvs(); }
   });
+  it.each(['persisted', 'interrupted'])('an operator answer releases its %s unknown-cause park through the real planner', async variant => {
+    const { planReconcile } = await import('../reconcile-core.mjs');
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const { buildOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+    const comments = [
+      { author: { login: 'web-everything' }, body: '🔁 human review — changes requested\n\nRepair the admitted finding.' },
+      { id: 'SD1', author: { login: 'web-everything' }, createdAt: new Date(now - 2000).toISOString(),
+        body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) },
+      { id: 'ANS1', author: { login: 'chalbert' }, createdAt: new Date(now - 1000).toISOString(),
+        body: buildOperatorAnswer({ standDownId: 'SD1', actor: 'chalbert', channel: 'chat', reason: 'Retry the repair' }) },
+    ];
+    const pr = { number: entry.prNumber, headRefName: entry.headRefName, headRefOid: head,
+      state: 'OPEN', isDraft: false, baseRefName: 'main', mergeStateStatus: 'CLEAN',
+      labels: ['review:changes'], comments, commits: [], statusCheckRollup: [] };
+    const park = { v: 1, kind: 'park', repo: 'we', pr: entry.prNumber, head,
+      reason: 'fix-cause-unknown', at: comments[1].createdAt };
+    const dispatch = vi.fn(() => ({ agentId: 'test' }));
+    const result = run({ dispatch, readPrComments: () => comments,
+      reconcile: () => planReconcile({ prs: [pr], agents: [], durableCounts: {}, now }),
+      fixLoop: { readRows: () => variant === 'persisted' ? [park] : [], append: vi.fn(),
+        readRouted: () => ({ 'we#1764': [{ head, at: now - 3000, outcome: 'failed', cause: 'unknown' }] }) } });
+    expect(result.dispatched, JSON.stringify(result)).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
   it('comment without park row is completed to a park on the next pass', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
@@ -3344,6 +3368,39 @@ describe('unknown-cause park recovery', () => {
       expect(append).toHaveBeenCalledTimes(1);
       expect(readFixLoopRows({ env })).toEqual([expect.objectContaining({ kind: 'park', head, repo: 'we', pr: 1764, reason: 'fix-cause-unknown' })]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('does not recreate an answered unknown park while recovering a later unanswered question', async () => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const { buildOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+    const comments = [
+      { id: 'SD1', author: { login: 'web-everything' }, body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) },
+      { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'SD1',
+        actor: 'chalbert', channel: 'chat', reason: 'Retry the repair' }) },
+      { id: 'SD2', author: { login: 'web-everything' }, body: buildStandDownComment({ reason: 'needs-judgment', head }) },
+    ];
+    const append = vi.fn(), dispatch = vi.fn();
+    run({ dispatch, reconcile: () => ({ dispatch: [], refusals: [{ kind: 'stood-down', prNumber: 1764 }] }),
+      readPrComments: () => comments, fixLoop: { readRows: () => [], append, readRouted: () => ({}) } });
+    expect(append).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+  it('bounds answer-thread reads to four per pass and holds the remaining park for retry', async () => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const { buildOperatorAnswer, latestOperatorAnswer } = await import('../stand-down-answer-core.mjs');
+    const comments = [
+      { id: 'SD1', author: { login: 'web-everything' }, body: buildStandDownComment({ reason: 'fix-cause-unknown', head }) },
+      { author: { login: 'chalbert' }, createdAt: new Date(now - 1000).toISOString(),
+        body: buildOperatorAnswer({ standDownId: 'SD1', actor: 'chalbert', channel: 'chat', reason: 'Retry' }) },
+    ];
+    const entries = Array.from({ length: 5 }, (_, i) => ({ ...entry, prNumber: entry.prNumber + i,
+      operatorAnswer: latestOperatorAnswer(comments) }));
+    const readPrComments = vi.fn(() => comments);
+    const result = run({ readPrComments, reconcile: () => ({ dispatch: entries, refusals: [] }),
+      fixLoop: { readRows: () => entries.map(e => ({ v: 1, kind: 'park', repo: 'we', pr: e.prNumber, head,
+        reason: 'fix-cause-unknown', at: new Date(now - 2000).toISOString() })), append: vi.fn(), readRouted: () => ({}) } });
+    expect(readPrComments).toHaveBeenCalledTimes(4);
+    expect(result.reconcileRefusalDetails).toContainEqual(expect.objectContaining({
+      prNumber: entries[4].prNumber, kind: 'fix-loop-parked' }));
   });
   it.each(['untrusted', 'quoted', 'missing-head'])('does not recover a %s unknown-cause marker', async variant => {
     const { buildStandDownComment } = await import('../stand-down.mjs');
