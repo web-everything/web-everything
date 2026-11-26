@@ -1,3 +1,4 @@
+import { prepVerdict } from '../../lib/prep-block.mjs';
 /**
  * @file land-prevention-card.test.mjs — #4317. `landPreventionCard` is the detached job
  * `we:scripts/review-set-label.mjs#fileApprovalPreventionCard` spawns instead of shelling `file-item` inline:
@@ -110,6 +111,7 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
     const result = await landPreventionCard(INPUT, {
       exec, write: () => {}, mkTmp: () => '/tmp/land-prevention-card-x', rmTmp: () => {}, writeFile: (p, c) => written.push({ p, c }),
     });
+    expect(prepVerdict(written.find(({ p }) => p.endsWith('pr-body.md')).c)).toMatchObject({ ok: true, waived: true, reason: 'card-only mechanical filing' });
     expect(written.find(({ p }) => p.endsWith('commit-msg.txt')).c.split('\n')[0]).toBe('WE #9001: prevention — Reject malformed flags (from #42 review)');
     expect(result).toEqual({ ok: true, step: 'done', num: 9001, rel: 'backlog/9001-file-the-prevention.md', pr: 5555, url: 'https://github.com/web-everything/web-everything/pull/5555', reason: null });
 

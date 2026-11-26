@@ -1,4 +1,4 @@
-/** Canonical codex-audit admission shared by every PR producer. No docs-only exemption. */
+/** Canonical codex-audit admission shared by every PR producer. Narrow added-card admission precedes audit evidence. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -8,6 +8,35 @@ import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
+import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
+
+/** Unknown or incomplete Git evidence always falls back to canonical audit admission. */
+export function cardOnlyAdmission(options = {}) {
+  try {
+    const { git, fullSha, fetchMain } = options ?? {};
+    if (!validSha(fullSha)) return { ok: false };
+    fetchMain();
+    const main = String(git('rev-parse', '--verify', 'origin/main^{commit}')).trim().toLowerCase();
+    const fetched = String(git('rev-parse', '--verify', 'FETCH_HEAD^{commit}')).trim().toLowerCase();
+    if (!validSha(main) || main !== fetched) return { ok: false };
+    const bases = String(git('merge-base', '--all', 'origin/main', fullSha)).trim().split(/\s+/);
+    if (bases.length !== 1 || !validSha(bases[0])) return { ok: false };
+    const raw = git('diff', '--raw', '-z', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', bases[0], fullSha);
+    if (typeof raw !== 'string' || !raw || !raw.endsWith('\0')) return { ok: false };
+    const fields = raw.slice(0, -1).split('\0'), rows = [];
+    if (fields.length % 2) return { ok: false };
+    for (let i = 0; i < fields.length; i += 2) {
+      // Git raw diffs abbreviate object IDs (core.abbrev); do not parse human/quoted paths.
+      const row = /^:([0-7]{6}) ([0-7]{6}) ([a-f0-9]{4,64}) ([a-f0-9]{4,64}) ([A-Z])$/.exec(fields[i]);
+      const path = fields[i + 1];
+      if (!row || !path || /[\x00-\x1f\x7f]/.test(path)) return { ok: false };
+      const [, oldMode, mode, oldId, newId, status] = row;
+      if (status === 'A' && (oldMode !== '000000' || !/^0+$/.test(oldId) || /^0+$/.test(newId))) return { ok: false };
+      rows.push({ status, mode, path });
+    }
+    return cardOnlyEligibility(rows).ok ? { ok: true } : { ok: false };
+  } catch { return { ok: false }; }
+}
 
 // The shared evaluator skips unusable records. At admission, corrupt evidence must
 // refuse before that skip can expose an older pass (including a carried pass).
@@ -28,9 +57,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
-  const git = (...args) => String(exec('git', ['-C', repo, ...args], {
-    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-  })).trim();
+  const git = (...args) => {
+    const output = String(exec('git', ['-C', repo, ...args], {
+      env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+    }));
+    return args.includes('--raw') ? output : output.trim();
+  };
   let fullSha;
   try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }
   if (!validSha(fullSha)) return { ok: false, reason: 'canonical-audit-missing', record: null,
@@ -46,6 +78,8 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     }
     if (!fetched) throw new Error(`main not refreshed: ${fetchError || 'origin/main fetch unavailable; retry when main can be read'}`);
   };
+  if (cardOnlyAdmission({ git, fullSha, fetchMain }).ok)
+    return { ok: true, reason: null, message: '', exemption: 'card-only', record: null, sha: fullSha };
   // A preflight may read refs but must never admit evidence against an unrefreshed main.
   if (refreshMain) {
     try { fetchMain(); }

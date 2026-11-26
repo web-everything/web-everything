@@ -791,7 +791,7 @@ describe('fileCard: synchronous card filing before an optional operator ruling (
         const exec = vi.fn(() => { throw new Error('duplicate filing attempted'); });
         const landing = vi.fn(exec);
         h.landRulingCard.mockImplementation((input, context) => land(input, {
-          ...context, dedupe, landPreventionCard: landing, exec,
+          ...context, dedupe, lookupRulingCard: () => ({ ok: true, card: null }), landPreventionCard: landing, exec,
         }));
         const verdict = await h.run();
         expect(dedupe).toHaveBeenCalledTimes(1);
@@ -891,7 +891,7 @@ describe('fileCard fails closed on missing dedupe evidence and unclassified degr
   it('files when dedupe ran and found no match', async () => {
     const { landRulingCard } = await import('../record-referral-ruling-io.mjs');
     const landPreventionCard = vi.fn(async () => ({ ok: true, step: 'done', rel: 'backlog/x1.md', pr: 9 }));
-    expect(await landRulingCard({ title: 't' }, { dedupe: () => ({ action: 'file', matches: [] }), landPreventionCard }))
+    expect(await landRulingCard({ title: 't', rulingKey: `referral-run:${'a'.repeat(64)}` }, { dedupe: () => ({ action: 'file', matches: [] }), lookupRulingCard: () => ({ ok: true, card: null }), landPreventionCard }))
       .toMatchObject({ ok: true, ref: 'we:backlog/x1.md@pr9' });
   });
 });

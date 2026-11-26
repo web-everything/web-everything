@@ -107,6 +107,7 @@ import {
   loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, filingSource,
   remainingAfter, parseFilingItems,
 } from '../lib/card-dedupe.mjs';
+import { landRulingInLane, lookupRulingCard as lookupRulingBranch } from './ruling-card-branch.mjs';
 import { rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
@@ -491,6 +492,9 @@ export async function landPreventionCard(input, {
   sleep: wait = sleep,
   removeCards = removeFiledCards,
   salvageCards = salvageLaneCards,
+  rulingSourceRoot,
+  lookupRulingCard = (key, { lane }) => lookupRulingBranch({ root: lane, rulingKey: key,
+    git: (...args) => exec('git', ['-C', lane, ...args], { timeout: 30000 }) }),
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -513,6 +517,7 @@ export async function landPreventionCard(input, {
   };
   const handedOn = new Map(); // card path → the exact text admitted to the batch or spooled
   let durable = false;
+  let keepRulingLane = false;
   const fail = (step, reason, extra = {}) => {
     write(`land-prevention-card: FAILED at ${step} — ${reason}\n`);
     return { ok: false, step, num: extra.num ?? null, rel: extra.rel ?? null, pr: extra.pr ?? null, url: extra.url ?? null, reason };
@@ -567,6 +572,14 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
+    if (input.rulingKey) {
+      keepRulingLane = true; // Any throw/failure preserves the filing; release may otherwise salvage/remove it.
+      const result = await landRulingInLane(input, { lane, laneRunMjs, exec, lookup: lookupRulingCard,
+        parse: parseRunJsonTail, submit: extractSubmitResult, scratchFile, writeFile, sourceRoot: rulingSourceRoot,
+        timeouts: { file: FILE_ITEM_TIMEOUT_MS, verify: VERIFY_TIMEOUT_MS, open: OPEN_PR_TIMEOUT_MS } });
+      keepRulingLane = !result.ok;
+      return result;
+    }
     await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
     if (input.foldOpenSingles) {
       const summary = await foldOpenSingles({ lane }, { exec, batch, write });
@@ -733,7 +746,7 @@ export async function landPreventionCard(input, {
       ? `\n\nDedupe before filing: ${mentioned.length} existing open card(s) got independent raised-by files instead of a new card: `
         + `${mentioned.map((m) => `\`${m.card.rel}\``).join(', ')}.\n`
       : '';
-    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}\n`, 'utf8');
+    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}\n\nprep: waived — card-only mechanical filing\n`, 'utf8');
     const ref = preventionCardRef({ num, rel, session: input.session });
     let opened;
     try {
@@ -761,7 +774,7 @@ export async function landPreventionCard(input, {
   } catch (e) {
     return fail('unexpected', String(e?.message || e));
   } finally {
-    if (laneDir) {
+    if (laneDir && !input.rulingKey) {
       try {
         const removed = durable ? removeCards({ dir: laneDir, expected: handedOn, isLeaseCurrent }) : [];
         if (removed.length) write(`land-prevention-card: removed ${removed.length} filed card copy(ies) from the lane — ${removed.join(', ')}\n`);
@@ -772,7 +785,9 @@ export async function landPreventionCard(input, {
         else if (saved.status === 'mixed') write(`land-prevention-card: lane holds non-card changes too; card files left for release to judge — ${saved.other.join(', ')}\n`);
       } catch (e) { write(`land-prevention-card: lane cleanup failed (non-fatal; lane-pool release retries it) — ${errorReason(e)}\n`); }
     }
-    if (laneNum != null && laneHolder) {
+    if (keepRulingLane) {
+      write(`land-prevention-card: ruling lane retained at ${laneDir}; resume the ruling or inspect its keyed branch before release\n`);
+    } else if (laneNum != null && laneHolder) {
       try {
         // Assert only this acquisition's holder; the ambient ownerSession fallback cannot prove it.
         exec('node', [LANE_POOL_CLI, 'release', `--lane=${laneNum}`, `--session=${laneHolder}`], {
