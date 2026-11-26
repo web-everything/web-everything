@@ -477,7 +477,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     const state = readRebuildState(cloneDir, env);
     expect(state.held?.reason).toBe('smoke-rejected');
     expect(state.rejected?.harnessBroken).not.toBe(true);
-    expect(readOverlays(cloneDir, env).some(overlay => overlay.ref === 'lane/refused-control')).toBe(true);
+    expect(readOverlays(cloneDir, { env }).some(overlay => overlay.ref === 'lane/refused-control')).toBe(true);
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
@@ -727,19 +727,21 @@ describe('failsSameChecks', () => {
     expect(failed[0].entries).toEqual(expect.arrayContaining([
       expect.objectContaining({ ok: false, kind: 'import failed', errorClass: 'TypeError: broken smoke harness' }),
     ]));
-    expect(failsSameChecks([{ ok: false, name: 'daemon-entries-boot' }], failed)).toBe(true);
+    expect(failsSameChecks(failed, failed)).toBe(true);
+    expect(failsSameChecks([{ ok: false, name: 'daemon-entries-boot', entries: [{ entry: 'other-entry', ok: false }] }], failed)).toBe(false);
   });
 
   it('an evidence-less control row never establishes harness-broken', () => {
     const candidate = [{ ok: false, name: 'tree-stays-clean', detail: 'smoke introduced tracked dirt' }];
-    const control = [{ ok: false, name: 'tree-stays-clean', detail: 'same name without gate evidence' }];
+    const control = [{ ok: false, name: 'tree-stays-clean' }];
     expect(failsSameChecks(candidate, control)).toBe(false);
   });
 
-  it('true when the control fails every check the candidate failed', () => {
+  // S2a ruling: a name-only match is the fail-open bug (the old expectation here was true); it is false now.
+  it('false when the control matches by name only, without executed-check evidence', () => {
     const candidate = [{ name: 'a' }, { name: 'b' }];
     const control = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
-    expect(failsSameChecks(candidate, control)).toBe(true);
+    expect(failsSameChecks(candidate, control)).toBe(false);
   });
 
   it('false when the control is missing one of the candidate\'s failed checks', () => {

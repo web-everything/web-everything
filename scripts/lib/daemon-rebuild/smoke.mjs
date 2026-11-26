@@ -25,7 +25,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript, isEnvTimeoutRow } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -193,8 +193,32 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const c = new Set((controlFailed || []).map((r) => r.name));
-  return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+  if (!Array.isArray(candidateFailed) || candidateFailed.length === 0 || !Array.isArray(controlFailed)) return false;
+  // S2a: only a control row that failed AFFIRMATIVELY with executed-check evidence can vouch for a candidate failure.
+  // Budget refusals, skips, timeout-only boots and evidence-less (name-only) rows never do. Boot is compared per entry.
+  const evidenced = controlFailed.filter(controlRowHasFailureEvidence);
+  return candidateFailed.every((row) => {
+    const control = evidenced.find((r) => r.name === row.name);
+    if (!control) return false;
+    if (!Array.isArray(control.entries)) return true;
+    const failedEntries = (Array.isArray(row.entries) ? row.entries : []).filter((e) => e && !e.ok);
+    if (failedEntries.length === 0) return false;
+    const controlEntries = new Set(control.entries.filter(bootEntryHasFailureEvidence).map((e) => e.entry));
+    return failedEntries.every((e) => controlEntries.has(e.entry));
+  });
+}
+
+function bootEntryHasFailureEvidence(entry) {
+  return !!entry && entry.ok === false && typeof entry.entry === 'string' && typeof entry.errorClass === 'string'
+    && entry.errorClass.length > 0 && !/skipped|timed out|output exceeded/.test(String(entry.kind ?? ''));
+}
+
+function controlRowHasFailureEvidence(row) {
+  if (!row || row.ok !== false || row.budgetInterrupted || row.budgetSkipped) return false;
+  if (/^skipped\b/.test(String(row.detail ?? ''))) return false;
+  if (Array.isArray(row.entries)) return row.entries.some(bootEntryHasFailureEvidence);
+  // Typed evidence exists only for boot entries today (S1 adds the ledger): other rows need a real, non-timeout detail.
+  return typeof row.detail === 'string' && row.detail.trim().length > 0 && !isEnvTimeoutRow(row);
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
