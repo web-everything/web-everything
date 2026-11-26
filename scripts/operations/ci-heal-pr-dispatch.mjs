@@ -636,7 +636,7 @@ export async function runReconcileCiHealDispatch({
       const loop = fixLoopState({ ...identity, infraFailures });
       let routed;
       const routedId = { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid };
-      try { routed = (fixLoop.readRouted ?? (isUnderTest() ? () => ({}) : readRoutedOutcomes))({ ...routedId, strict: true }); }
+      try { routed = (fixLoop.readRouted ?? readRoutedOutcomes)({ ...routedId, strict: true }); }
       catch {
         refusals.push({ pr: entry.prNumber, kind: 'fix-loop-unreadable', why: 'Operator must restore routed outcome evidence before another launch' });
         continue;

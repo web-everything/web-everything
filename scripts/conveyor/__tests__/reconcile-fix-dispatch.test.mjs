@@ -2088,7 +2088,7 @@ describe('actual PR ownership and unblock ranking (2026-10-01)', () => {
     const claim3834 = { meta: { repo: 'web-everything/web-everything', pr: 3834, scope: [`we:${agents}`] } };
     const e3787 = { kind: 'fix', prNumber: 3787, headRefName: 'lane/3787-x', files: [agents, 'docs/agent/platform-decisions.md'] };
     const run = (refusals, claims) => runReconcileFixDispatch({
-      root: '/repo', repo: 'we', checkStaleness: FRESH,
+      root: '/repo', repo: 'we', checkStaleness: FRESH, fixLoop: null,
       reconcile: () => ({ dispatch: [e3787], refusals, openPrFiles: [{ pr: 3834, files: [agents] }, { pr: 3787, files: e3787.files }] }),
       findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1],
       listBuildClaims: () => [], listFixClaims: () => claims,
@@ -3313,6 +3313,21 @@ describe('unknown-cause park recovery', () => {
     const fresh = run({ fixLoop, dispatch, reconcile: () => ({ dispatch: [{ ...entry, headRefOid: 'b'.repeat(40) }], refusals: [] }) });
     expect(fresh.dispatched, JSON.stringify(fresh)).toHaveLength(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('VITEST=1 and WE_UNDER_TEST=1 do not disable the guard: the default ledger park still stops dispatch', async () => {
+    const { mkdtempSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { appendFixLoopRow } = await import('../fix-loop-ledger.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'no-env-bypass-'));
+    const env = { WE_FIX_LOOP_LEDGER: join(dir, 'ledger.jsonl') };
+    appendFixLoopRow({ v: 1, kind: 'park', repo: 'we', pr: 1764, head, reason: 'fix-cause-unknown', at: new Date(now - 8 * 3600000).toISOString() }, { env, now });
+    vi.stubEnv('VITEST', '1'); vi.stubEnv('WE_UNDER_TEST', '1'); vi.stubEnv('WE_FIX_LOOP_LEDGER', env.WE_FIX_LOOP_LEDGER);
+    try {
+      const dispatch = vi.fn(() => ({ agentId: 'test' }));
+      const out = run({ dispatch });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(out.reconcileRefusalDetails).toContainEqual(expect.objectContaining({ kind: 'fix-loop-parked' }));
+    } finally { vi.unstubAllEnvs(); }
   });
   it('comment without park row is completed to a park on the next pass', async () => {
     const { mkdtempSync, rmSync } = await import('node:fs');

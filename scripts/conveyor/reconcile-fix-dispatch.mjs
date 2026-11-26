@@ -2029,7 +2029,8 @@ export function runReconcileFixDispatch({
   // seam above (never touching a real `gh`/`osascript` process unless the caller wants that).
   queueCapRefusalCap = QUEUE_CAP_REFUSAL_CAP,
   readPrComments = defaultReadPrComments,
-  fixLoop = isUnderTestEnv() ? null : { readRows: readFixLoopRows, append: appendFixLoopRow },
+  // Never environment-gated: a test turns the guard off only by passing `fixLoop: null` explicitly.
+  fixLoop = { readRows: readFixLoopRows, append: appendFixLoopRow },
   fixConfig = null,
   postQueueCapComment = postNoteComment,
   notifyQueueCapOperator = notifyDesktopChecked,
