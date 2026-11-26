@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 const { sendBackBlockedGate, decideGateSendBack } = await import(process.argv[1]);
-const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+const head = 'a'.repeat(40), repo = 'acme/widgets';
 const early = '2026-11-25T14:35:06Z', late = '2026-11-25T15:07:20Z';
 const pr = { number: 7483, headRefOid: head, rowsHead: head, rowsComplete: true, labels: ['ready-to-merge'],
   statusCheckRollup: [{ name: 'merge-gate', status: 'completed', conclusion: 'failure', completedAt: early,
