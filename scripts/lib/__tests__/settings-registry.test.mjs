@@ -45,6 +45,15 @@ test('missing top-level setting metadata blocks generation', t => {
   const r = f.build(); assert.ok(r.problems.includes('missing setting metadata: beta'));
   assert.throws(() => renderMarkdown(r), /missing setting metadata: beta/);
 });
+test('standalone delivery strategy documents do not become registry keys or block docs generation', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/delivery-strategy.json', JSON.parse(readFileSync(join(ROOT, 'scripts/settings/delivery-strategy.json'), 'utf8')));
+  f.write('scripts/settings/delivery-strategy-table.json', JSON.parse(readFileSync(join(ROOT, 'scripts/settings/delivery-strategy-table.json'), 'utf8')));
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.deepEqual([...new Set(registry.rows.map(row => row.key))].sort(), ['alpha', 'beta', 'empty']);
+  assert.equal(ensureRegistryDoc({ root: f.root }), renderMarkdown(registry));
+});
 test('missing platform-only setting metadata blocks generation', t => {
   const f = fixture(t); f.write('scripts/lib/delivery-priority-settings.json', { newPlatform: true });
   assert.ok(f.build().problems.includes('missing setting metadata: newPlatform'));
@@ -480,6 +489,17 @@ test('standalone timeout policy does not claim conveyor setting metadata', t => 
   const r = f.build();
   assert.deepEqual(r.problems, []);
   assert.ok(!r.rows.some(row => row.owners.includes('scripts/settings/test-timeout-policy.json')));
+});
+
+test('standalone selector documents do not claim metadata or collide with declared conveyor leaves', t => {
+  const f = fixture(t);
+  f.write('scripts/settings/delivery-strategy-table.json', { version: 'draft', description: 'Table', inputs: [], rules: [] });
+  f.write('scripts/settings/delivery-strategy.json', { revision: 'draft', values: { 'overlay-cap': 3 } });
+  const registry = f.build();
+  assert.deepEqual(registry.problems, []);
+  assert.ok(!registry.rows.some(row => row.owners.some(owner => /\/delivery-strategy(?:-table)?\.json$/.test(owner))));
+  assert.ok(!registry.rows.some(row => ['version', 'description', 'inputs', 'rules', 'revision', 'values'].includes(row.key)));
+  assert.doesNotThrow(() => renderMarkdown(registry));
 });
 
 function authoredFixture(t) {
