@@ -104,24 +104,36 @@ describe('lane-pool acquire reclaim log', () => {
     expect(git(['rev-parse', 'HEAD'], lane(1))).toBe(head);
   }, 120_000);
 
-  it('delivers the whole stderr, ✗ reason included, to a reader that only drains after exit', async () => {
-    // One fail() write far larger than a pipe buffer, then process.exit(1): with an async pipe the tail is lost.
-    // Many short unknown flags (one huge argv string hits E2BIG): fail() lists them all in ONE ~200KB line.
-    const flags = Array.from({ length: 2000 }, (_, i) => `--unknown-${String(i).padStart(4, '0')}-${'x'.repeat(90)}`);
+  async function expectPausedStderr({ count, resumeAfterExit }) {
+    // The 2000-flag case makes one fail() write larger than a pipe buffer, then process.exit(1): an async pipe loses the tail.
+    // Many short unknown flags avoid E2BIG for a single huge argv string; fail() lists them in one ~200KB line.
+    const flags = Array.from({ length: count }, (_, i) => `--unknown-${String(i).padStart(4, '0')}-${'x'.repeat(90)}`);
     const child = spawn(process.execPath, [SCRIPT, 'status', ...flags], { stdio: ['ignore', 'ignore', 'pipe'],
       env: { PATH: process.env.PATH, HOME: process.env.HOME, LANE_POOL_ROOT: pool } }); // small env: argv+env stay under ARG_MAX
     // 'close' (not 'exit'): fires only after the child exited AND its stderr pipe is fully drained, so a child that
     // is merely slow to start under a loaded CI shard (main 661a07fbc: err === '') is waited for, never mistaken for
     // a lost tail. The old async-pipe bug still fails: the child exits, the pipe closes, and the tail is missing.
     const exited = new Promise((done) => child.on('close', done));
-    child.stderr.pause();
-    await new Promise((done) => setTimeout(done, 1_500)); // a stalled reader: the pipe fills meanwhile
+    // Register BEFORE pausing: Node resumes unread stdio when the child exits. A fast child can otherwise
+    // have all its output discarded before the delayed listener attaches, even when the writer flushed it.
     let err = '';
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (d) => { err += d; });
-    child.stderr.resume();
+    child.stderr.pause();
     // Bounded well inside the 60s test timeout: a hung child fails the exit-code assertion, it never stalls the suite.
-    const code = await Promise.race([exited, new Promise((done) => setTimeout(() => { child.kill('SIGKILL'); done('timeout'); }, 40_000).unref())]);
+    let timeout;
+    const finished = Promise.race([exited, new Promise((done) => {
+      timeout = setTimeout(() => { child.kill('SIGTERM'); done('timeout'); }, 40_000).unref();
+    })]);
+    let code;
+    try {
+      if (resumeAfterExit) await finished; // deterministically exercise Node's automatic exit-time drain
+      else await new Promise((done) => setTimeout(done, 1_500)); // a stalled reader: the pipe fills meanwhile
+      child.stderr.resume();
+      code = await finished;
+    } finally {
+      clearTimeout(timeout);
+    }
     expect(code).toBe(1);
     expect(err).toContain('unrecognized flag(s)');
     expect(err).toContain('full flag list');
@@ -129,5 +141,13 @@ describe('lane-pool acquire reclaim log', () => {
     expect(err).toContain(flags[flags.length - 1]);
     expect(err.endsWith('is exactly the footgun this check exists to close.\n')).toBe(true);
     expect(existsSync(pool)).toBe(false);
+  }
+
+  it('delivers the whole stderr, ✗ reason included, to an initially paused reader that resumes after child exit', async () => {
+    await expectPausedStderr({ count: 2, resumeAfterExit: true });
+  }, 60_000);
+
+  it('delivers the whole stderr, ✗ reason included, to an initially paused reader that resumes after a delay', async () => {
+    await expectPausedStderr({ count: 2000, resumeAfterExit: false });
   }, 60_000);
 });
