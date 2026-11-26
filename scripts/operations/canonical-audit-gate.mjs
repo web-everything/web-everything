@@ -27,12 +27,12 @@ export function cardOnlyAdmission(options = {}) {
     if (fields.length % 2) return { ok: false };
     for (let i = 0; i < fields.length; i += 2) {
       // Git raw diffs abbreviate object IDs (core.abbrev); do not parse human/quoted paths.
-      const row = /^:([0-7]{6}) ([0-7]{6}) ([a-f0-9]{4,64}) ([a-f0-9]{4,64}) ([A-Z])$/.exec(fields[i]);
+      const row = fields[i].match(/^:([0-7]{6}) ([0-7]{6}) ([a-f0-9]{4,64}) ([a-f0-9]{4,64}) ([A-Z])$/);
       const path = fields[i + 1];
       if (!row || !path || /[\x00-\x1f\x7f]/.test(path)) return { ok: false };
       const [, oldMode, mode, oldId, newId, status] = row;
       if (status === 'A' && (oldMode !== '000000' || !/^0+$/.test(oldId) || /^0+$/.test(newId))) return { ok: false };
-      rows.push({ status, mode, path });
+      rows[i / 2] = { status, mode, path };
     }
     return cardOnlyEligibility(rows).ok ? { ok: true } : { ok: false };
   } catch { return { ok: false }; }
@@ -57,12 +57,10 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
-  const git = (...args) => {
-    const output = String(exec('git', ['-C', repo, ...args], {
-      env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-    }));
-    return args.includes('--raw') ? output : output.trim();
-  };
+  // trim() never strips NUL, so the -z raw diff keeps its terminating NUL.
+  const git = (...args) => String(exec('git', ['-C', repo, ...args], {
+    env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+  })).trim();
   let fullSha;
   try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }
   if (!validSha(fullSha)) return { ok: false, reason: 'canonical-audit-missing', record: null,

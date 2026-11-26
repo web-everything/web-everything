@@ -173,7 +173,7 @@ export function createCardBranchSink({ root = REPO_ROOT,
 
 /** Ruling-only publication: no shared batch sink, one immutable card, local preservation before push. */
 export function createRulingCardBranchSink({ root = REPO_ROOT,
-  git = (args, options) => execFileSync('git', args, options) } = {}) {
+  git = (args, options) => execFileSync('git', args, { maxBuffer: 8 * 1024 * 1024, ...options }) } = {}) {
   return async ({ rel, content, rulingKey }) => {
     const branch = rulingBranch(rulingKey), ref = `refs/heads/${branch}`;
     if (!cardOnlyEligibility([{ status: 'A', mode: '100644', path: rel }]).ok

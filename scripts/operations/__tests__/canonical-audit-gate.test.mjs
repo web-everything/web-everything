@@ -338,6 +338,25 @@ describe('card-only admission with real git evidence', () => {
       expect(admission.cardOnlyAdmission({ git, fullSha, fetchMain: r.fetchMain })).toEqual({ ok: false });
     } finally { r.close(); }
   });
+  it('cardOnlyAdmission issues only read-only git subcommands (merge-base --all, diff --raw -z --no-renames)', () => {
+    const r = cardRepo();
+    try {
+      r.put('backlog/101-new.md'); const fullSha = r.commit();
+      const seen = [];
+      const git = (...args) => { seen.push(args); return r.git(...args); };
+      expect(admission.cardOnlyAdmission({ git, fullSha, fetchMain: r.fetchMain })).toEqual({ ok: true });
+      const readOnly = new Set(['rev-parse', 'merge-base', 'diff']);
+      expect(seen.length).toBeGreaterThan(0);
+      for (const args of seen) expect(readOnly.has(args[0]), args.join(' ')).toBe(true);
+      const mb = seen.filter(a => a[0] === 'merge-base');
+      expect(mb).toHaveLength(1);
+      expect(mb[0]).toContain('--all');
+      const diff = seen.filter(a => a[0] === 'diff');
+      expect(diff).toHaveLength(1);
+      for (const flag of ['--raw', '-z', '--no-renames']) expect(diff[0]).toContain(flag);
+      expect(diff[0].some(a => /^--(output|stat|patch|binary)/.test(a))).toBe(false);
+    } finally { r.close(); }
+  });
   it('audit-on-ready reports an exempt head as not owed', () => {
     const check = () => probe(r => { r.put('backlog/101-new.md'); r.commit(); }).result;
     expect(planAuditOwed({ repo: 'o/r', rawPrs: [{ number: 1, headRefOid: sha,
