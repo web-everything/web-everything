@@ -42,7 +42,7 @@ const fs = require('node:fs');
 const a = process.argv.slice(2), s = JSON.parse(fs.readFileSync(process.env.SOAK_STATE, 'utf8'));
 fs.appendFileSync(process.env.SOAK_CALLS, JSON.stringify(a) + '\\n');
 if (a[0] === 'pr' && a[1] === 'view') console.log(JSON.stringify(s));
-else if (a[0] === 'api' && a[1] === 'repos/o/r/issues/7452/comments' && a.includes('--slurp')) {
+else if (a[0] === 'api' && a[1] === 'repos/o/r/issues/7452/comments' && a.includes('--paginate') && a.includes('--slurp')) {
   console.log(JSON.stringify([s.comments.map(({ author, id, ...c }, i) => ({ ...c, user: author, id: i + 1, node_id: id }))]));
 } else if (a[0] === 'pr' && a[1] === 'edit') {
   const remove = a.filter((v, i) => a[i - 1] === '--remove-label');
