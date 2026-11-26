@@ -3384,7 +3384,7 @@ describe('unknown-cause park recovery', () => {
     expect(append).not.toHaveBeenCalled();
     expect(dispatch).not.toHaveBeenCalled();
   });
-  it('bounds answer-thread reads to four per pass and holds the remaining park for retry', async () => {
+  it.each(['fix', 'ci-heal'])('bounds answer-thread reads to four per pass and holds the remaining park for retry (%s)', async mode => {
     const { buildStandDownComment } = await import('../stand-down.mjs');
     const { buildOperatorAnswer, latestOperatorAnswer } = await import('../stand-down-answer-core.mjs');
     const comments = [
@@ -3392,15 +3392,22 @@ describe('unknown-cause park recovery', () => {
       { author: { login: 'chalbert' }, createdAt: new Date(now - 1000).toISOString(),
         body: buildOperatorAnswer({ standDownId: 'SD1', actor: 'chalbert', channel: 'chat', reason: 'Retry' }) },
     ];
-    const entries = Array.from({ length: 5 }, (_, i) => ({ ...entry, prNumber: entry.prNumber + i,
+    const entries = Array.from({ length: 5 }, (_, i) => ({ ...entry, kind: mode, prNumber: entry.prNumber + i,
       operatorAnswer: latestOperatorAnswer(comments) }));
     const readPrComments = vi.fn(() => comments);
-    const result = run({ readPrComments, reconcile: () => ({ dispatch: entries, refusals: [] }),
-      fixLoop: { readRows: () => entries.map(e => ({ v: 1, kind: 'park', repo: 'we', pr: e.prNumber, head,
-        reason: 'fix-cause-unknown', at: new Date(now - 2000).toISOString() })), append: vi.fn(), readRouted: () => ({}) } });
+    const options = { readPrComments, reconcile: () => ({ dispatch: entries, refusals: [] }),
+      fixLoop: { killed: () => false, currentBuild: () => null, readSessionLog: () => '',
+        readRows: () => entries.map(e => ({ v: 1, kind: 'park', repo: 'we', pr: e.prNumber, head,
+        reason: 'fix-cause-unknown', at: new Date(now - 2000).toISOString() })), append: vi.fn(), readRouted: () => ({}) } };
+    const { runReconcileCiHealDispatch } = await import('../../operations/ci-heal-pr-dispatch.mjs');
+    const result = mode === 'fix' ? run(options) : await runReconcileCiHealDispatch({ ...options,
+      root: '/repo', now, checkStaleness: FRESH, fixConfig: config,
+      flushOwed: () => ({}), pollAttempts: () => [], flushTimeouts: () => [], timeoutHold: () => null,
+      salvage: () => null, resolveWorkUnit: () => ({ itemNum: null, scope: [] }), pickFreeLanes: () => [1, 2, 3, 4, 5],
+      dispatch: () => ({ agentId: 'test' }) });
     expect(readPrComments).toHaveBeenCalledTimes(4);
-    expect(result.reconcileRefusalDetails).toContainEqual(expect.objectContaining({
-      prNumber: entries[4].prNumber, kind: 'fix-loop-parked' }));
+    expect([...result.reconcileRefusalDetails, ...result.refusals]).toContainEqual(expect.objectContaining({
+      [mode === 'fix' ? 'prNumber' : 'pr']: entries[4].prNumber, kind: 'fix-loop-parked' }));
   });
   it.each(['untrusted', 'quoted', 'missing-head'])('does not recover a %s unknown-cause marker', async variant => {
     const { buildStandDownComment } = await import('../stand-down.mjs');
@@ -3420,8 +3427,11 @@ describe('unknown-cause park recovery', () => {
     } });
     expect(dispatch).not.toHaveBeenCalled();
     expect([...result.refusals, ...result.reconcileRefusalDetails]).toContainEqual(expect.objectContaining({
-      kind: variant === 'unreadable-ledger' ? 'fix-loop-unreadable' : 'fix-loop-parked',
+      kind: variant === 'unreadable-ledger' ? 'fix-loop-unreadable'
+        : variant === 'unreadable-outcomes' ? 'routed-outcomes-unreadable' : 'fix-loop-parked',
     }));
+    if (variant === 'unreadable-outcomes') expect(result.reconcileRefusalDetails[0].why)
+      .toMatch(/restore.*routed.*operator answer cannot/i);
   });
   it('a failed park write retains the stand-down and retries on the next pass', async () => {
     const { buildStandDownComment } = await import('../stand-down.mjs');

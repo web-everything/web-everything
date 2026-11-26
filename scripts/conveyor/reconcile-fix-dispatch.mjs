@@ -84,7 +84,7 @@ import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
 import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopDisposition } from './fix-loop-ledger.mjs';
 import { standDownComments, standDownHead, standDownTrailerReason } from './stand-down.mjs';
-import { withOperatorAnswer, buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
+import { withOperatorAnswer, isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS, ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -196,9 +196,10 @@ import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOver
 import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
-import { BORROW_REASON, readRoutedOutcomes, routedOutcomeCause, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
-import { removePromptFile } from '../operations/fix-run.mjs';
+import { removePromptFile, releaseAnsweredUnknownCause } from '../operations/fix-run.mjs';
+export { releaseAnsweredUnknownCause };
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
 import { runReconcilePass, resolveLaneHead, PR_LIST_JSON_FIELDS } from './reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from './unsupported-repo.mjs';
@@ -1883,39 +1884,6 @@ export function classifyEnvFaultRefusals(refusals) {
     ? { ...r, kind: 'dispatch-env-fault' } : r));
 }
 
-/** Discount an answered unknown-cause episode for one admission without rewriting durable evidence. */
-export function releaseAnsweredUnknownCause({ entry, rows, routed, repo, now, readComments }) {
-  const unchanged = { rows, routed };
-  if (!entry.operatorAnswer) return unchanged;
-  const key = `${repo}#${entry.prNumber}`;
-  const matches = row => row.repo === repo && row.pr === entry.prNumber && row.head === entry.headRefOid;
-  const isUnknown = row => row.head === entry.headRefOid && Object.hasOwn(row, 'cause') && routedOutcomeCause(row) === 'unknown';
-  if (!rows.some(row => matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown')
-      && !(routed?.[key] ?? []).some(isUnknown)) return unchanged;
-  try {
-    const comments = readComments();
-    if (!Array.isArray(comments)) return unchanged;
-    // Revalidate the carried answer against its trusted thread record. A stale answer is not a blanket bypass.
-    const body = buildOperatorAnswer(entry.operatorAnswer);
-    const answerIndex = comments.findLastIndex(c => c.body === body && parseOperatorAnswer(c));
-    if (answerIndex < 0) return unchanged;
-    const at = Date.parse(comments[answerIndex].createdAt);
-    if (!Number.isFinite(at) || at > now) return unchanged;
-    const throughAnswer = comments.slice(0, answerIndex + 1);
-    const questions = comments.flatMap((c, index) => standDownComments([c]).some(question =>
-      standDownTrailerReason(question.body) === 'fix-cause-unknown' && standDownHead(question.body) === entry.headRefOid) ? [index] : []);
-    if (!questions.length || questions.some(index => !isOperatorAnswerStandDownSuperseded(throughAnswer, index))) return unchanged;
-    // Thread order binds exact timestamp ties. Later or unreadable evidence stays held;
-    // if local subsecond time cannot be ordered against GitHub time, a fresh later answer is required.
-    return {
-      rows: rows.filter(row => !(matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown'
-        && Date.parse(row.at) <= at)),
-      routed: { ...routed, [key]: (routed?.[key] ?? []).filter(row => !(isUnknown(row)
-        && Number.isFinite(row.at) && row.at <= at)) },
-    };
-  } catch { return unchanged; }
-}
-
 /**
  * we:scripts/conveyor/reconcile-fix-dispatch.mjs#runReconcileFixDispatch — the WHOLE pass: read
  * `reconcile-pass.mjs`'s plan (reused, not re-run by hand), narrow it to dispatchable fixes
@@ -2211,10 +2179,16 @@ export function runReconcileFixDispatch({
     const held = [], dispatch = [];
     let answerReads = 0;
     for (const entry of reconciled.dispatch) {
-      let unknown = false, effectiveRows = rows;
+      let unknown = false, effectiveRows = rows, routed;
+      try { routed = (fixLoop.readRouted ?? readRoutedOutcomes)({ repo: repoKey, pr: entry.prNumber, strict: true }); }
+      catch {
+        held.push({ ...entry, kind: 'routed-outcomes-unreadable',
+          why: 'Operator must restore the per-PR routed outcome file from valid evidence before another launch; an operator answer cannot repair this file' });
+        continue;
+      }
       try {
         const released = releaseAnsweredUnknownCause({ entry, rows, repo: repoKey, now,
-          routed: (fixLoop.readRouted ?? readRoutedOutcomes)({ repo: repoKey, pr: entry.prNumber, strict: true }),
+          routed,
           readComments: () => {
             if (++answerReads > 4) throw Error('operator-answer read budget exhausted; retry next pass');
             return readPrComments(entry.prNumber, { repo: CONSTELLATION_REPOS[repoKey].slug, root });

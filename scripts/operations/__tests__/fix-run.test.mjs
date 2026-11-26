@@ -162,9 +162,11 @@ describe('runFixCli', () => {
             text: 'x'.repeat(variant === 'fetch-cut' ? 17000 : variant === 'renderer-cut' ? 2100 : 1) };
         } });
       expect([...inputs.gaps, ...ciHealContextGaps(inputs)].length).toBeGreaterThan(0);
-      const io = capture(m, { readCiHeal: () => inputs });
+      const appendLoopRow = vi.fn();
+      const io = capture(m, { readCiHeal: () => inputs, appendLoopRow });
       await runFixCli([...argv, '--repair-kind=ci-heal'], io);
       expect(io.recordRouted).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'no-change', cause: 'input' }));
+      expect(appendLoopRow).toHaveBeenCalledWith(expect.objectContaining({ kind: 'outcome', cause: 'input' }));
     }
   });
   it('an agent-written fake truncation marker with complete inputs records model', async () => {
@@ -235,6 +237,66 @@ describe('runFixCli', () => {
     expect(writeErr.mock.calls.flat().join('')).toContain('unknown-cause park incomplete; operator intervention required');
     expect(rows.some(row => row.kind === 'park')).toBe(false);
     expect(order).toEqual(failure === 'read' ? [] : failure === 'comment' ? ['comment'] : ['comment', 'park']);
+  });
+  it.each(['codex', 'claude'])('a second unknown failure after an answered retry creates a fresh stand-down (%s)', async provider => {
+    const { runReconcileFixDispatch } = await import('../../conveyor/reconcile-fix-dispatch.mjs');
+    const { recordUnknownCausePark } = await import('../fix-run.mjs');
+    const { planReconcile } = await import('../../conveyor/reconcile-core.mjs');
+    const { buildOperatorAnswer } = await import('../../conveyor/stand-down-answer-core.mjs');
+    const head = 'a'.repeat(40), store = ledger(), rows = [];
+    let now = Date.parse('2026-11-26T12:00:00Z');
+    const comments = [{ author: { login: 'web-everything' }, body: '🔁 human review — changes requested\n\nRepair the finding.' }];
+    const admission = () => runReconcileFixDispatch({ root: '/repo', now, dryRun: false,
+      checkStaleness: () => ({ fresh: true }), netScope: null, prStack: null, priorityShadow: null,
+      landingBlockedState: { read: () => new Map(), write: () => {} },
+      reconcile: () => planReconcile({ prs: [{ number: 7, state: 'OPEN', isDraft: false,
+        headRefName: 'lane/7-x', headRefOid: head, baseRefName: 'main', mergeStateStatus: 'CLEAN',
+        labels: ['review:changes'], comments, commits: [], statusCheckRollup: [] }],
+        agents: [], durableCounts: {}, now, requiredChecks: [], shadowDeps: { mode: 'off' } }),
+      readPrComments: () => comments, fixConfig: { hold: true, maxSessions: 3, windowHours: 6 },
+      fixLoop: { readRows: () => rows, readRouted: () => store.read(), append: () => {} },
+      findItemFn: () => null, loadItems: () => [], fetchItemlessDiffPaths: () => ['scripts/operations/fix-run.mjs'],
+      pickFreeLanes: () => [1], tryResume: () => ({ resumed: false }), tryResumeRound: null,
+      readPushHold: () => null, listBuildClaims: () => [], listFixClaims: () => [], dispatch: () => ({ agentId: 'test' }) });
+    const fail = async () => {
+      // Native Claude has no fix-run launcher. Exercise the shared park settlement
+      // without routed outcomes, then use the same real planner/admission cycle.
+      if (provider === 'claude') {
+        await recordUnknownCausePark({ repo: 'we', pr: 7, head, now,
+          readLoopRows: () => rows, readComments: () => comments,
+          appendLoopRow: row => rows.push({ ...row, v: 1, at: new Date(now).toISOString() }),
+          postComment: body => comments.push({ id: `SD${comments.length}`, author: { login: 'web-everything' },
+            createdAt: new Date(now).toISOString(), body }) });
+        expect(store.read()).toEqual({});
+        return;
+      }
+      const m = mk([head]); m.spawn.mockRejectedValue(new Error('unclassified worker error'));
+      const io = capture(m, { clock: () => now, readComments: async () => comments,
+        readLoopRows: () => rows, appendLoopRow: row => rows.push({ ...row, v: 1, at: new Date(now).toISOString() }),
+        recordRouted: row => recordRoutedOutcome({ ...row, now, store, readClaim: () => null }),
+        run: (cmd, args, opts) => {
+          if (args.includes('comment')) { comments.push({ id: `SD${comments.length}`, author: { login: 'web-everything' },
+            createdAt: new Date(now).toISOString(), body: readFileSync(args.at(-1), 'utf8') }); return ''; }
+          return m.run(cmd, args, opts);
+        } });
+      expect((await runFixCli(argv.map(arg => arg === '--provider=codex' ? `--provider=${provider}` : arg), io)).code).toBe(1);
+    };
+    const answer = () => {
+      const question = comments.at(-1); now += 2000;
+      comments.push({ author: { login: 'chalbert' }, createdAt: new Date(now).toISOString(),
+        body: buildOperatorAnswer({ standDownId: question.id, actor: 'chalbert', channel: 'chat', reason: 'Retry the repair' }) });
+    };
+    await fail();
+    expect(admission().dispatched).toHaveLength(0);
+    answer();
+    expect(admission().dispatched).toHaveLength(1);
+    now += 2000;
+    await fail();
+    expect(rows.filter(row => row.kind === 'park')).toHaveLength(2);
+    expect(comments.filter(comment => comment.id?.startsWith('SD'))).toHaveLength(2);
+    expect(admission().dispatched).toHaveLength(0);
+    answer();
+    expect(admission().dispatched).toHaveLength(1);
   });
   it('unknown parks once per head and survives restart without re-posting', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'unknown-park-'));

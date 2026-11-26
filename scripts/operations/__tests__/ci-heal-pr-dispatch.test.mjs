@@ -1341,7 +1341,9 @@ describe('CI-heal salvage before agent dispatch', () => {
         return { 'we#3895': [{ head: entry.headRefOid, outcome: 'failed', cause: variant }] }; } });
     const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
     expect(dispatch).not.toHaveBeenCalled();
-    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: variant.endsWith('unreadable') ? 'fix-loop-unreadable' : 'fix-cause-unknown' }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: variant === 'outcomes-unreadable'
+      ? 'routed-outcomes-unreadable' : variant === 'ledger-unreadable' ? 'fix-loop-unreadable' : 'fix-cause-unknown' }));
+    if (variant === 'outcomes-unreadable') expect(result.refusals[0].why).toMatch(/restore.*routed.*operator answer cannot/i);
   });
   it.each(['answered', 'interrupted', 'new-failure', 'budget-park', 'raw-ceiling'])('CI-heal honors an unknown-cause answer while preserving %s evidence', async variant => {
     const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
@@ -1383,6 +1385,24 @@ describe('CI-heal salvage before agent dispatch', () => {
     const next = await exercise(() => null, { fixLoop: ledger });
     expect(next.dispatch.mock.calls[0][0].strongerModel).toBeUndefined();
   });
+  it.each(['input', 'launcher', 'infra', 'model'].flatMap(cause =>
+    ['build-change', 'window', 'raw-ceiling', 'persisted-build-change', 'persisted-window', 'persisted-raw-ceiling']
+      .map(path => [cause, path])))('only model sessions promote on %s / %s rearm', async (cause, path) => {
+    const now = Date.now(), persisted = path.startsWith('persisted-');
+    const evidence = rows().map((row, i) => ({ ...row, session: `s${i}`,
+      at: new Date(now - 4 * 3600000).toISOString(),
+      build: path.endsWith('build-change') ? 'old-build' : 'b'.repeat(40) }));
+    if (path === 'raw-ceiling') evidence.push({ ...evidence[0], session: 's3' });
+    if (persisted) evidence.push({ ...evidence[0], kind: 'rearm', at: new Date(now - 3 * 3600000).toISOString(),
+      reason: path.endsWith('build-change') ? 'fixer build-change' : path.endsWith('window') ? 're-arm window elapsed'
+        : 'final attempt before raw per-head session ceiling' });
+    const routed = { 'we#3895': evidence.filter(row => row.kind === 'ci-heal')
+      .map(row => ({ head: row.head, at: Date.parse(row.at), outcome: 'no-change', cause })) };
+    const { result, dispatch } = await exercise(() => null, { now,
+      fixLoop: loop({ readRows: () => evidence, readRouted: () => routed }) });
+    expect(result.dispatched, JSON.stringify(result)).toHaveLength(1);
+    expect(dispatch.mock.calls[0][0].strongerModel).toBe(cause === 'model' ? true : undefined);
+  });
   it.each(['truncated', 'older-head', 'older-window', 'extra-terminal'])('leaves %s terminal evidence unassigned', async variant => {
     const evidence = rows();
     const terminal = 'fix-run: PR #3895 failed (no-finding: none); claim released';
@@ -1416,7 +1436,8 @@ describe('CI-heal salvage before agent dispatch', () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
   it('records a legacy-build re-arm and dispatches on Claude', async () => {
-    const ledger = loop({ readRows: () => rows().map(({ build, ...r }) => r) });
+    const ledger = loop({ readRows: () => rows().map(({ build, ...r }) => r),
+      readRouted: () => ({ 'we#3895': Array(2).fill({ head: entry.headRefOid, outcome: 'no-change' }) }) });
     const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
     expect(result.dispatched).toHaveLength(1);
     expect(dispatch.mock.calls[0][0].strongerModel).toBe(true);
@@ -1463,7 +1484,7 @@ describe('CI-heal salvage before agent dispatch', () => {
     const { result } = await exercise(() => null, { fixLoop: ledger,
       fixConfig: { maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 60, rearmAfterMinutesSource: 'repo' } });
     expect(result.refusals[0].why).toContain('0 infrastructure discount');
-    expect(result.refusals[0].why).toContain('re-arms on the stronger-model rung at');
+    expect(result.refusals[0].why).toContain('re-arms on the current fixer rung at');
     expect(result.refusals[0].why).toContain('rearmAfterMinutes=60 (source repo)');
   });
   it('build and log read failures do not prevent an otherwise eligible dispatch', async () => {

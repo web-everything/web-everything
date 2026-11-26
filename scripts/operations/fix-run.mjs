@@ -4,7 +4,8 @@ import { renderNoPromptCommandRules, assertBriefTaskContent } from '../lib/no-pr
 import { readCiJobLog } from '../lib/gh-ci-log.mjs';
 import { stripVTControlCharacters } from 'node:util';
 import { boundedCiLogTail } from '../lib/ci-log-evidence.mjs';
-import { buildStandDownComment } from '../conveyor/stand-down.mjs';
+import { buildStandDownComment, standDownComments, standDownHead, standDownTrailerReason } from '../conveyor/stand-down.mjs';
+import { latestOperatorAnswer, buildOperatorAnswer, parseOperatorAnswer, isOperatorAnswerStandDownSuperseded } from '../conveyor/stand-down-answer-core.mjs';
 import { repeatedFindingPlan, applyScopeReset, resolveFixSafety } from '../conveyor/repeated-finding-reset.mjs';
 /**
  * @file scripts/operations/fix-run.mjs
@@ -656,6 +657,55 @@ export async function resolveFixProvider(name) {
   return resolveDeliveryAgentProvider(name);
 }
 
+/** Release only the unknown-cause episode covered by a trusted, current answer. */
+export function releaseAnsweredUnknownCause({ entry, rows, routed, repo, now, readComments }) {
+  const unchanged = { rows, routed };
+  if (!entry.operatorAnswer) return unchanged;
+  const key = `${repo}#${entry.prNumber}`;
+  const matches = row => row.repo === repo && row.pr === entry.prNumber && row.head === entry.headRefOid;
+  const isUnknown = row => row.head === entry.headRefOid && Object.hasOwn(row, 'cause') && routedOutcomeCause(row) === 'unknown';
+  if (!rows.some(row => matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown')
+      && !(routed?.[key] ?? []).some(isUnknown)) return unchanged;
+  try {
+    const comments = readComments();
+    if (!Array.isArray(comments)) return unchanged;
+    // Revalidate the carried answer against its trusted thread record. A stale answer is not a blanket bypass.
+    const body = buildOperatorAnswer(entry.operatorAnswer);
+    const answerIndex = comments.findLastIndex(c => c.body === body && parseOperatorAnswer(c));
+    if (answerIndex < 0) return unchanged;
+    const at = Date.parse(comments[answerIndex].createdAt);
+    if (!Number.isFinite(at) || at > now) return unchanged;
+    const throughAnswer = comments.slice(0, answerIndex + 1);
+    const questions = comments.flatMap((c, index) => standDownComments([c]).some(question =>
+      standDownTrailerReason(question.body) === 'fix-cause-unknown' && standDownHead(question.body) === entry.headRefOid) ? [index] : []);
+    if (!questions.length || questions.some(index => !isOperatorAnswerStandDownSuperseded(throughAnswer, index))) return unchanged;
+    // Thread order binds exact timestamp ties. Later or unreadable evidence stays held;
+    // if local subsecond time cannot be ordered against GitHub time, a fresh later answer is required.
+    return {
+      rows: rows.filter(row => !(matches(row) && row.kind === 'park' && row.reason === 'fix-cause-unknown'
+        && Date.parse(row.at) <= at)),
+      routed: { ...routed, [key]: (routed?.[key] ?? []).filter(row => !(isUnknown(row)
+        && Number.isFinite(row.at) && row.at <= at)) },
+    };
+  } catch { return unchanged; }
+}
+
+/** Revalidate answered parks before deduplicating a new unknown-cause episode. */
+export async function recordUnknownCausePark({ repo, pr, head, readLoopRows, readComments, appendLoopRow, postComment, now = Date.now() }) {
+  let rows = readLoopRows();
+  const matches = row => row.kind === 'park' && row.reason === 'fix-cause-unknown'
+    && row.repo === repo && row.pr === pr && row.head === head;
+  if (rows.some(matches)) {
+    const comments = await readComments();
+    rows = releaseAnsweredUnknownCause({ entry: { prNumber: pr, headRefOid: head,
+      operatorAnswer: latestOperatorAnswer(comments) }, rows, routed: {}, repo, now,
+      readComments: () => comments }).rows;
+  }
+  if (rows.some(matches)) return;
+  await postComment(buildStandDownComment({ reason: 'fix-cause-unknown', head }));
+  await appendLoopRow({ kind: 'park', repo, pr, head, reason: 'fix-cause-unknown' });
+}
+
 /**
  * THE CLI AS A FUNCTION. Exit 1 only when the launch itself threw; "agent made no change" is exit 0.
  * Card 5947 (live #5045, 2026-10-13): CI evidence and pre-lane outcomes are launcher-owned.
@@ -738,14 +788,10 @@ export async function runFixCli(argv = [], {
     }
     if (head && cause === 'unknown') {
       try {
-        const parked = readLoopRows().some(row => row.kind === 'park' && row.repo === repo
-          && row.pr === Number(launch.pr) && row.head === head);
-        if (!parked) {
-          const body = buildStandDownComment({ reason: 'fix-cause-unknown', head });
-          withMessageFile(body, file => run('gh', ['pr', 'comment', launch.pr,
-            ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
-          await appendLoopRow({ kind: 'park', repo, pr: Number(launch.pr), head, reason: 'fix-cause-unknown' });
-        }
+        await recordUnknownCausePark({ repo, pr: Number(launch.pr), head, readLoopRows, appendLoopRow, now: clock(),
+          readComments: () => readComments(launch.pr, { repo: launch.repo }),
+          postComment: body => withMessageFile(body, file => run('gh', ['pr', 'comment', launch.pr,
+            ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot })) });
       } catch (e) { writeErr(`fix-run: unknown-cause park incomplete; operator intervention required: ${singleLine(e?.message ?? e)}\n`); }
     }
     if (head) {
@@ -753,7 +799,7 @@ export async function runFixCli(argv = [], {
         await appendLoopRow({ kind: 'outcome', repo, pr: Number(launch.pr), head, session: launch.sessionSlug,
           // The fix-loop ledger represents a lease loss as a failed infrastructure row.
           outcome: outcome === FIX_RUN_OUTCOME.LEASE_LOST ? FIX_RUN_OUTCOME.FAILED : outcome,
-          infra: cause === 'infra' || isInfraFixRunOutcome(outcome, reason), reason });
+          cause, infra: cause === 'infra' || isInfraFixRunOutcome(outcome, reason), reason });
       } catch (e) { writeErr(`fix-run: could not record fix-loop outcome: ${String(e?.message ?? e)}\n`); }
     }
     try {

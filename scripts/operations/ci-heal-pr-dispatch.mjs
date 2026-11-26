@@ -640,7 +640,8 @@ export async function runReconcileCiHealDispatch({
       const routedId = { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid };
       try { routed = (fixLoop.readRouted ?? readRoutedOutcomes)({ ...routedId, strict: true }); }
       catch {
-        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-unreadable', why: 'Operator must restore routed outcome evidence before another launch' });
+        refusals.push({ pr: entry.prNumber, kind: 'routed-outcomes-unreadable',
+          why: 'Operator must restore the per-PR routed outcome file from valid evidence before another launch; an operator answer cannot repair this file' });
         continue;
       }
       const released = releaseAnsweredUnknownCause({ entry, rows: loopRows, routed, repo: repoKey, now: entryNow,
@@ -671,12 +672,12 @@ export async function runReconcileCiHealDispatch({
       }
       if (disposition.action === 'hold') {
         refusals.push({ pr: entry.prNumber, kind: 'fix-loop-hold',
-          why: `${counts}; re-arms on the stronger-model rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
+          why: `${counts}; re-arms on the ${modelCount >= 2 ? 'stronger-model' : 'current fixer'} rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
         continue;
       }
-      const strongerModel = (disposition.action === 'rearm' && disposition.strongerModel !== false)
+      const strongerModel = modelCount >= 2 && ((disposition.action === 'rearm' && disposition.strongerModel !== false)
         || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid
-          && (row.reason !== 'final attempt before raw per-head session ceiling' || modelCount >= 2));
+          && Date.parse(row.at) <= entryNow));
       let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
       if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
       if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }

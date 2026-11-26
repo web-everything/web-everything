@@ -369,3 +369,23 @@ it('raw ceiling reached by launcher rows alone does not set strongerModel', () =
   expect(decide(1).strongerModel).toBe(false);
   expect(decide(2).strongerModel).toBe(true);
 });
+it.each(['input', 'launcher', 'infra'])('%s outcomes with infra:false discount sessions but retain the raw ceiling', cause => {
+  const sessions = Array.from({ length: 5 }, (_, i) => row({ session: `s${i}` }));
+  const evidence = sessions.flatMap(session => [session,
+    { ...session, kind: 'outcome', outcome: 'no-change', cause, infra: false }]);
+  const env = { WE_FIX_LOOP_LEDGER: join(temp(), 'ledger.jsonl') };
+  evidence.forEach(entry => appendFixLoopRow(entry, { env, now }));
+  const persisted = readFixLoopRows({ env });
+  expect(state(persisted)).toMatchObject({ count: 0, rawCount: 5, infraFailures: 5, held: false });
+  expect(fixLoopDisposition({ rows: persisted, repo: 'we', pr: 3990, head, now, config, modelCount: 0 }))
+    .toMatchObject({ action: 'park', reason: 'raw per-head repair session ceiling reached' });
+});
+it.each(['build', 'window'])('a %s rearm explicitly requires model evidence for promotion', path => {
+  const sessions = Array.from({ length: 3 }, () => row({ build: path === 'build' ? 'old' : 'current',
+    at: new Date(now - 3 * 3600000).toISOString() }));
+  const decide = modelCount => fixLoopDisposition({ rows: sessions, repo: 'we', pr: 3990, head, now,
+    config, build: 'current', modelCount });
+  expect(decide(0)).toMatchObject({ action: 'rearm', strongerModel: false });
+  expect(decide(1).strongerModel).toBe(false);
+  expect(decide(2).strongerModel).toBe(true);
+});

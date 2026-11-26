@@ -97,7 +97,9 @@ export function ledgerInfraRows({ rows, repo, pr, head }) {
     const next = sessions.slice(i + 1).find(row => row.session === session.session);
     const outcome = matches.find(row => row.kind === 'outcome' && row.session === session.session
       && Date.parse(row.at) >= Date.parse(session.at) && (!next || Date.parse(row.at) < Date.parse(next.at)));
-    return outcome?.infra === true;
+    // The legacy discount flag remains supported; explicit non-model causes also
+    // exclude incomplete inputs and launcher refusals from the productive budget.
+    return outcome?.infra === true || ['input', 'launcher', 'infra'].includes(outcome?.cause);
   });
 }
 export function fixLoopState({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0 }) {
@@ -174,8 +176,8 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
     if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling', strongerModel: modelCount >= 2 };
     return { action: 'dispatch' };
   }
-  if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change' };
-  if (new Date(now).getTime() >= Date.parse(until)) return { action: 'rearm', reason: 're-arm window elapsed' };
+  if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change', strongerModel: modelCount >= 2 };
+  if (new Date(now).getTime() >= Date.parse(until)) return { action: 'rearm', reason: 're-arm window elapsed', strongerModel: modelCount >= 2 };
   return { action: 'hold', until };
 }
 /** A red-main park may lapse only after recovery and a fresh budget evaluation. Pure. */
