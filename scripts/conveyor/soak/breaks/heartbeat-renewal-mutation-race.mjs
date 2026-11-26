@@ -23,13 +23,13 @@ export function heartbeatMutationRace(action) {
         concurrent = pool.run(action, ...args);
         renameSync(from, to);
       } };
-    const renewed = renewLaneLeaseOnce({ cwd: pool.dir, now: () => now, fs });
+    const renewed = renewLaneLeaseOnce({ cwd: pool.dir, owner: `a||${lease.acquiredAt}`, caller: { session: 'a' }, now: () => now, fs });
     const afterRenewal = JSON.parse(readFileSync(pool.marker, 'utf8'));
     const retry = pool.run(action, ...args);
     const read = () => existsSync(pool.marker) ? JSON.parse(readFileSync(pool.marker, 'utf8')) : null;
     const afterRetry = read();
     const nextRenewed = renewLaneLeaseOnce({ cwd: pool.dir,
-      owner: `a||${lease.acquiredAt}`, now: () => now });
+      owner: `a||${lease.acquiredAt}`, caller: { session: 'a' }, now: () => now });
     return { action, lease, renewed, concurrentCode: concurrent?.status,
       retryCode: retry.status, afterRenewal, afterRetry, nextRenewed, final: read(),
       expectedRenewal: { ...lease, renewedAt: now.toISOString() } };
@@ -44,7 +44,7 @@ export function judgeMutationRace(r) {
   if (r.action === 'release') return !r.nextRenewed && r.final === null ? [] : ['released lease was resurrected'];
   if (r.action === 'acquire') return !r.nextRenewed && r.final?.holder &&
     JSON.stringify(r.final) === JSON.stringify(r.afterRetry) ? [] : ['reacquired lease was overwritten'];
-  if (r.action === 'adopt') return r.nextRenewed && r.final?.workerSession === 'adopting-worker' &&
+  if (r.action === 'adopt') return !r.nextRenewed && r.final?.workerSession === 'adopting-worker' &&
     JSON.stringify(r.final) === JSON.stringify(r.afterRetry) ? [] : ['adopted worker was overwritten'];
   return ['unknown mutation'];
 }

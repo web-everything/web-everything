@@ -718,6 +718,8 @@ export function detachedGateExecFn(bin, args, opts = {}) {
     const { timeout = DEFAULT_TIMEOUT_MS, maxBuffer = 50 * 1024 * 1024, closeGraceMs = GATE_CLOSE_GRACE_MS,
       ...spawnOpts } = opts;
     const child = nodeSpawn(bin, args, { ...spawnOpts, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    process.emit('lane-lease-worker-started', child.pid);
+    child.once('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
     const output = { stdout: [], stderr: [] };
     const sizes = { stdout: 0, stderr: 0 };
     let failure;
@@ -1084,6 +1086,8 @@ export async function runCodexDirectExec({
       reject(new Error(`codex-direct-task: could not start \`${cli}\`: ${e.message}`));
       return;
     }
+    process.emit('lane-lease-worker-started', child.pid);
+    child.once('exit', () => process.emit('lane-lease-worker-stopped', child.pid));
     let out = '';
     let err = '';
     let timer = null;
@@ -1774,8 +1778,10 @@ export async function withLaneLeaseHeartbeat(cwds, fn, start) {
   let stop = () => {};
   // Loaded lazily: a static import widens this module's import graph for every transitive importer
   // (merge-ai-prs in-process CLI harness runs hang on the second main call when it is static).
-  try { stop = (start ?? (await import('./lib/lane-lease-heartbeat.mjs')).startLaneLeaseHeartbeat)({ cwds }) || stop; } catch (e) { console.error(`codex-direct-task: lane lease heartbeat did not start (${e?.message}); the run continues without lease renewal`); }
-  try { return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
+  stop = await (start ?? (await import('./lib/lane-lease-heartbeat.mjs')).startLaneLeaseHeartbeat)({
+    cwds, onLost: () => process.kill(process.pid, 'SIGTERM'),
+  }) || stop;
+  try { await stop.ready; return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
 }
 
 async function main() {

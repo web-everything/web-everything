@@ -21,36 +21,36 @@ const at = new Date('2026-11-25T03:00:00.000Z');
 describe('renewLaneLeaseOnce', () => {
   it('never creates a lease where none exists', () => {
     const d = gitDir();
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
     expect(existsSync(join(d, '.lane-lease'))).toBe(false);
   });
   it('writes nothing for a torn or non-object lease', () => {
     const d = gitDir();
     put(d, '{"session":');
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
     expect(readFileSync(join(d, '.lane-lease'), 'utf8')).toBe('{"session":');
     put(d, '[1]');
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
   });
   it('never extends a lease now held by another owner', () => {
     const d = gitDir();
     put(d, { ...lease, session: 'b' });
-    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', caller: { session: 'a' }, owner: 'a||2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(false);
     expect(read(d).renewedAt).toBeUndefined();
   });
   it('leaves a reserved lease unchanged', () => {
     const d = gitDir();
     put(d, { ...lease, reserved: true });
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
   });
   it('refuses an identityless record, a changed holder and an expired lease', () => {
     const d = gitDir();
     put(d, { foo: 1 });
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
     put(d, { ...lease, holder: 'h2' });
-    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a|h1|2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', caller: { session: 'a' }, owner: 'a|h1|2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(false);
     put(d, { ...lease, ttlMinutes: 10 });
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
     expect(read(d).renewedAt).toBeUndefined();
   });
   it('does not overwrite a lease replaced during the write', () => {
@@ -60,13 +60,13 @@ describe('renewLaneLeaseOnce', () => {
       existsSync, readFileSync, rmSync: (p, o) => rmSync(p, o), renameSync: () => { throw new Error('must not rename'); },
       writeFileSync: (p, data, o) => { writeFileSync(p, data, o); put(d, { ...lease, session: 'other' }); },
     };
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at, fs })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at, fs })).toBe(false);
     expect(read(d).session).toBe('other');
   });
   it('renews an owned lease atomically', () => {
     const d = gitDir();
     put(d, lease);
-    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(true);
+    expect(renewLaneLeaseOnce({ cwd: 'x', caller: { session: 'a' }, owner: 'a||2026-11-25T00:00:00.000Z', leaseDirFn: () => d, now: () => at })).toBe(true);
     expect(read(d).renewedAt).toBe(at.toISOString());
     expect(readdirSync(d)).toEqual(['.lane-lease']);
   });
@@ -78,11 +78,11 @@ describe('renewLaneLeaseOnce', () => {
     put(d, lease);
     const fs = { existsSync, readFileSync, writeFileSync, rmSync,
       renameSync: () => { throw new Error('publication failed'); } };
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at, fs })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at, fs })).toBe(false);
     expect(read(d)).toEqual(lease);
     expect(readdirSync(d)).toEqual(['.lane-lease']);
     expect(existsSync(laneLeaseLockPath(join(d, '.lane-lease')))).toBe(false);
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(true);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(true);
   });
 });
 
@@ -109,11 +109,11 @@ describe('lease mutation coordination', () => {
     const lock = laneLeaseLockPath(file);
     utimesSync(lock, new Date(0), new Date(0));
     expect(() => withLaneLeaseMutation(file, () => {})).toThrow(/confirm no writer remains/);
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(false);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(false);
     expect(read(d)).toEqual(lease);
     // This fixture's writer is known to have exited; recovery is explicit.
     rmdirSync(lock);
-    expect(renewLaneLeaseOnce({ cwd: 'x', leaseDirFn: () => d, now: () => at })).toBe(true);
+    expect(renewLaneLeaseOnce({ cwd: 'x', owner: 'a||2026-11-25T00:00:00.000Z', caller: { session: 'a' }, leaseDirFn: () => d, now: () => at })).toBe(true);
   });
   it('uses the same mutex through symlink aliases and releases it on throw', () => {
     const d = gitDir(), alias = `${d}-alias`, file = join(d, '.lane-lease');
@@ -191,7 +191,7 @@ describe('startLaneLeaseHeartbeat', () => {
   it('does not claim ownership when the caller has no identity', () => {
     const d = gitDir();
     put(d, lease);
-    startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: null, callerHolder: null, leaseDirFn: () => d, now: () => at });
+    expect(() => startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: null, callerHolder: null, leaseDirFn: () => d, now: () => at })).toThrow(/ownership/);
     expect(read(d)).toEqual(lease);
   });
   it.each(['foreign session', 'same-session reacquire', 'new worker'])('preserves a %s lease between beats and reports loss through default stderr', (change) => {
@@ -205,23 +205,21 @@ describe('startLaneLeaseHeartbeat', () => {
     put(d, replacement);
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
-      tick(); tick();
+      tick(); tick(); tick();
       expect(read(d)).toEqual(replacement);
       expect(stderr).toHaveBeenCalledTimes(1);
-      expect(stderr.mock.calls[0][0]).toMatch(/lane-lease-heartbeat: could not renew.*lane.*run continues unprotected/);
+      expect(stderr.mock.calls[0][0]).toMatch(/lane-lease-heartbeat: could not renew.*stopping worker/);
     } finally { stop(); stderr.mockRestore(); }
   });
   it('does not capture or write a lease owned by another caller session', () => {
     const d = gitDir();
     put(d, { ...lease, ownerSession: 'someone-else', workerSession: 'someone-else' });
     const before = readFileSync(join(d, '.lane-lease'), 'utf8');
-    let scheduled = false;
-    const stop = startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: 'me',
-      leaseDirFn: () => d, now: () => at,
-      setIntervalFn: () => { scheduled = true; return {}; } });
-    stop();
+    const schedule = vi.fn();
+    expect(() => startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: 'me',
+      leaseDirFn: () => d, now: () => at, setIntervalFn: schedule })).toThrow(/ownership/);
     expect(readFileSync(join(d, '.lane-lease'), 'utf8')).toBe(before);
-    expect(scheduled).toBe(false);
+    expect(schedule).not.toHaveBeenCalled();
   });
   it('uses the production session environment to refuse a foreign lease', () => {
     const d = gitDir();
@@ -229,8 +227,7 @@ describe('startLaneLeaseHeartbeat', () => {
     vi.stubEnv('CLAUDE_CODE_SESSION_ID', 'me');
     vi.stubEnv('LANE_SESSION', '');
     try {
-      const stop = startLaneLeaseHeartbeat({ cwds: ['lane'], leaseDirFn: () => d, now: () => at });
-      stop();
+      expect(() => startLaneLeaseHeartbeat({ cwds: ['lane'], leaseDirFn: () => d, now: () => at })).toThrow(/ownership/);
       expect(read(d)).toEqual({ ...lease, ownerSession: 'someone-else' });
     } finally { vi.unstubAllEnvs(); }
   });
@@ -238,7 +235,7 @@ describe('startLaneLeaseHeartbeat', () => {
     const d = gitDir();
     put(d, { ...lease, reserved: true });
     const warn = vi.fn(), setIntervalFn = vi.fn();
-    startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: 'a', leaseDirFn: () => d, warn, setIntervalFn });
+    expect(() => startLaneLeaseHeartbeat({ cwds: ['lane'], callerSession: 'a', leaseDirFn: () => d, warn, setIntervalFn })).toThrow(/ownership/);
     expect(warn).not.toHaveBeenCalled();
     expect(setIntervalFn).not.toHaveBeenCalled();
     expect(read(d)).toEqual({ ...lease, reserved: true });
@@ -266,7 +263,7 @@ describe('startLaneLeaseHeartbeat', () => {
     const warns = []; let period;
     startLaneLeaseHeartbeat({
       cwds: ['lane'], callerSession: 'a', leaseDirFn: () => d, now: () => new Date('2026-11-25T00:00:30.000Z'), warn: (l) => warns.push(l),
-      setIntervalFn: (fn, ms) => { period = ms; rmSync(join(d, '.lane-lease')); fn(); fn(); return {}; }, clearIntervalFn: () => {},
+      setIntervalFn: (fn, ms) => { period = ms; rmSync(join(d, '.lane-lease')); fn(); fn(); fn(); return {}; }, clearIntervalFn: () => {},
     });
     expect(period).toBe(60_000);
     expect(warns).toHaveLength(1);

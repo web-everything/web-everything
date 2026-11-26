@@ -7,13 +7,15 @@
  *   - no lease file, an unreadable or torn lease, or a non-object: NOTHING is written (never create a lease);
  *   - capture requires the caller's session or holder; the captured lease fixes the owner
  *     (`session` + `holder` + `acquiredAt`); a lease now held by someone else is never extended;
- *   - writes are atomic temp+rename; any error is swallowed (best-effort, never fails the job).
+ *   - writes are atomic temp+rename; startup failure refuses the job and renewal loss stops it.
  * IO is injected (`fs`, `now`, `leaseDirFn`) so tests need no real lane.
  */
-import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
-import { LEASE_FILENAME, renewedLease, isLeaseStale } from './lane-lease.mjs';
+import { LEASE_FILENAME, renewedLease, isLeaseStale, isConfirmedOwnLease } from './lane-lease.mjs';
 import { withLaneLeaseMutation } from './lane-lease-lock.mjs';
 
 export const DEFAULT_LEASE_HEARTBEAT_MS = 10 * 60_000;
@@ -24,24 +26,45 @@ const defaultLeaseDir = (cwd) => {
     let dir = resolve(cwd);
     for (let i = 0; i < 64; i += 1) {
       const dot = join(dir, '.git');
-      if (existsSync(dot)) {
-        if (statSync(dot).isDirectory()) return dot;
+      let stat;
+      try { stat = statSync(dot); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (stat) {
+        if (stat.isDirectory()) return dot;
         const m = /^gitdir:\s*(.+)$/m.exec(readFileSync(dot, 'utf8'));
-        return m ? resolve(dir, m[1].trim()) : null;
+        if (!m) throw new Error('invalid gitdir pointer');
+        return resolve(dir, m[1].trim());
       }
       const up = dirname(dir);
       if (up === dir) return null;
       dir = up;
     }
     return null;
-  } catch { return null; }
+  } catch (error) { throw new Error('cannot inspect lane lease ownership', { cause: error }); }
 };
 
 const ownerKey = (lease) => `${lease?.session ?? ''}|${lease?.holder ?? ''}|${lease?.acquiredAt ?? ''}`;
 
-const belongsToCaller = (lease, { session, holder }) =>
-  (!!holder && (lease.holder === holder || lease.session === holder)) ||
-  (!!session && (lease.workerSession || lease.ownerSession || lease.session) === session);
+// ownerSession is only evidence after checking every live sibling in the pool.
+function belongsToCaller(lease, { session, holder }, gitDir) {
+  if (lease.workerSession) return lease.workerSession === session;
+  if (holder && (lease.holder === holder || lease.session === holder)) return true;
+  if (!session) return false;
+  if (lease.session === session) return true;
+  if (lease.ownerSession !== session) return false;
+  const checkout = basename(gitDir) === '.git' ? dirname(gitDir) : gitDir;
+  const siblings = [];
+  for (const entry of readdirSync(dirname(checkout), { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^lane-\d+$/.test(entry.name)) continue;
+    const siblingDir = defaultLeaseDir(join(dirname(checkout), entry.name));
+    if (!siblingDir || resolve(siblingDir) === resolve(gitDir)) continue;
+    const file = join(siblingDir, LEASE_FILENAME);
+    if (!existsSync(file)) continue;
+    const sibling = readLease(file, { readFileSync });
+    if (!sibling) throw new Error('unreadable sibling lease ownership');
+    if (!isLeaseStale(sibling, Date.now())) siblings.push(sibling);
+  }
+  return isConfirmedOwnLease({ lease, mySessionId: session, siblingLeases: siblings });
+}
 
 /** A lease with credentials: a session, an acquire time, and (when present) a numeric ttl. Anything else is no lease. */
 function readLease(file, fs) {
@@ -51,16 +74,18 @@ function readLease(file, fs) {
     if (typeof lease.session !== 'string' || !lease.session || Number.isNaN(Date.parse(lease.acquiredAt))) return null;
     if (lease.ttlMinutes !== undefined && !Number.isFinite(lease.ttlMinutes)) return null;
     return lease;
-  } catch { return null; }
+  } catch (error) { return error.code === 'ENOENT' ? undefined : null; }
 }
 
 /**
- * Renew one lane lease once. Returns true only when a lease owned by `owner` (or, with no owner, the lease
- * as read) was rewritten with a fresh `renewedAt`.
+ * Renew one lane lease once. Explicit owner and caller evidence are required. Returns true only when
+ * the captured lease was rewritten with a fresh `renewedAt`.
  */
-export function renewLaneLeaseOnce({ cwd, owner = null, caller = null, now = () => new Date(), leaseDirFn = defaultLeaseDir,
+export function renewLaneLeaseOnce({ cwd, owner, caller, now = () => new Date(), leaseDirFn = defaultLeaseDir,
   fs = { existsSync, readFileSync, writeFileSync, renameSync, rmSync } } = {}) {
   try {
+    if (typeof owner !== 'string' || !owner || !caller ||
+        ![caller.session, caller.holder].some(v => typeof v === 'string' && v)) return false;
     const gitDir = leaseDirFn(cwd);
     if (!gitDir) return false;
     const file = join(gitDir, LEASE_FILENAME);
@@ -68,8 +93,8 @@ export function renewLaneLeaseOnce({ cwd, owner = null, caller = null, now = () 
       if (!fs.existsSync(file)) return false;
       const lease = readLease(file, fs);
       if (!lease) return false;
-      if (owner && ownerKey(lease) !== owner) return false;
-      if (caller && !belongsToCaller(lease, caller)) return false;
+      if (ownerKey(lease) !== owner) return false;
+      if (!belongsToCaller(lease, caller, gitDir)) return false;
       // An expired lease returns only through the allocator, never a renewal.
       if (isLeaseStale(lease, now().getTime())) return false;
       const next = renewedLease(lease, now().toISOString());
@@ -90,32 +115,92 @@ export function renewLaneLeaseOnce({ cwd, owner = null, caller = null, now = () 
   } catch { return false; }
 }
 
-/**
- * Start renewing the lease of each checkout in `cwds` every `everyMs`. The owner of each lease is captured
- * now; a checkout with no readable lease is skipped for good. Returns `stop()`.
- */
+/** Capture and renew only proven ownership. Production ticks run in a separate process. */
 export function startLaneLeaseHeartbeat({ cwds, everyMs = DEFAULT_LEASE_HEARTBEAT_MS, now, leaseDirFn = defaultLeaseDir,
   callerSession = process.env.CLAUDE_CODE_SESSION_ID || null, callerHolder = process.env.LANE_SESSION || null,
   fs = { existsSync, readFileSync, writeFileSync, renameSync, rmSync }, setIntervalFn = setInterval, clearIntervalFn = clearInterval,
-  warn = (line) => process.stderr.write(`${line}\n`) } = {}) {
+  onLost = () => {}, warn = (line) => process.stderr.write(`${line}\n`) } = {}) {
   const caller = { session: callerSession, holder: callerHolder };
   const targets = [...new Set((cwds ?? []).filter(Boolean))].flatMap((cwd) => {
     const dir = leaseDirFn(cwd);
-    const lease = dir ? readLease(join(dir, LEASE_FILENAME), fs) : null;
-    return lease && !lease.reserved && belongsToCaller(lease, caller)
-      ? [{ cwd, owner: ownerKey(lease), ttlMs: Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : Infinity, lost: false }] : [];
+    if (!dir) return [];
+    const lease = readLease(join(dir, LEASE_FILENAME), fs);
+    // Only ENOENT proves absence; existsSync also returns false for denied reads.
+    if (lease === undefined) return [];
+    if (!lease || lease.reserved || !belongsToCaller(lease, caller, dir)) {
+      throw new Error(`lane lease ownership could not be confirmed for ${cwd}; acquire/adopt your own lane before retrying`);
+    }
+    return [{ cwd, dir, owner: ownerKey(lease), ttlMs: Number.isFinite(lease.ttlMinutes) ? lease.ttlMinutes * 60_000 : Infinity }];
   });
   if (!targets.length) return () => {};
-  // The interval never exceeds a third of the shortest lease ttl, so a short lease cannot lapse between beats.
-  const period = Math.min(everyMs, ...targets.map((t) => t.ttlMs / 3));
-  const tick = () => {
-    for (const t of targets) {
-      if (renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, caller, now, leaseDirFn, fs })) { t.lost = false; continue; }
-      if (!t.lost) { t.lost = true; try { warn(`lane-lease-heartbeat: could not renew the lease for ${t.cwd} (lost, replaced, expired, unreadable or mutation busy); the run continues unprotected. If a .lane-lease-lock persists, confirm no writer remains before removing it.`); } catch { /* best-effort */ } }
+  const period = Math.min(everyMs, ...targets.map(t => t.ttlMs / 3));
+  if (!Number.isFinite(period) || period <= 0) throw new Error('invalid lane lease heartbeat period');
+  // Prove startup synchronously before allowing any task code to run.
+  for (const t of targets) {
+    if (!renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, caller, now, leaseDirFn, fs })) {
+      throw new Error(`lane lease heartbeat startup renewal failed for ${t.cwd}`);
     }
+  }
+  let lost = false;
+  const lose = () => {
+    if (lost) return;
+    lost = true;
+    warn('lane-lease-heartbeat: could not renew lane ownership; stopping worker. Reacquire/adopt a lane before retrying. For an abandoned mutation lock, confirm no writer remains before removing it.');
+    onLost();
   };
-  tick();
-  const timer = setIntervalFn(tick, period);
-  timer?.unref?.();
-  return () => clearIntervalFn(timer);
+  // Injectable in-process clock for deterministic unit tests only.
+  if (setIntervalFn !== setInterval) {
+    let failures = 0;
+    const timer = setIntervalFn(() => {
+      const ok = targets.every(t => renewLaneLeaseOnce({ cwd: t.cwd, owner: t.owner, caller, now, leaseDirFn, fs }));
+      failures = ok ? 0 : failures + 1;
+      if (failures >= 3) lose();
+    }, period);
+    timer?.unref?.();
+    return () => clearIntervalFn(timer);
+  }
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./lane-lease-heartbeat-child.mjs', import.meta.url)),
+    JSON.stringify({ targets, caller, period: Math.min(period, 1000), parentPid: process.pid })],
+  { stdio: ['ignore', 'ignore', 'inherit', 'ipc'], env: { ...process.env, NODE_OPTIONS: '' } });
+  let stopped = false;
+  let ready = false;
+  let resolveReady, rejectReady;
+  const readyPromise = new Promise((yes, no) => { resolveReady = yes; rejectReady = no; });
+  // Consumers using the synchronous stop API may not await readiness.
+  readyPromise.catch(() => {});
+  const fail = () => {
+    if (stopped) return;
+    if (!ready) rejectReady(new Error('lane lease heartbeat child failed to start'));
+    else lose();
+  };
+  const startupTimer = setTimeout(() => { fail(); child.kill('SIGTERM'); }, 5000);
+  startupTimer.unref();
+  child.on('message', message => {
+    if (message === 'ready') { ready = true; clearTimeout(startupTimer); child.unref(); child.channel?.unref(); resolveReady(); }
+    if (message === 'lost') lose();
+  });
+  child.on('error', fail);
+  child.on('exit', fail);
+  const workers = new Set();
+  const started = pid => {
+    if (!Number.isInteger(pid) || pid <= 0) return;
+    workers.add(pid);
+    if (child.connected) child.send({ workers: [...workers] });
+  };
+  const ended = pid => {
+    workers.delete(pid);
+    if (child.connected) child.send({ workers: [...workers] });
+  };
+  process.on('lane-lease-worker-started', started);
+  process.on('lane-lease-worker-stopped', ended);
+  const stop = () => {
+    stopped = true;
+    clearTimeout(startupTimer);
+    process.removeListener('lane-lease-worker-started', started);
+    process.removeListener('lane-lease-worker-stopped', ended);
+    child.kill('SIGTERM');
+    if (child.connected) child.disconnect();
+  };
+  stop.ready = readyPromise;
+  return stop;
 }

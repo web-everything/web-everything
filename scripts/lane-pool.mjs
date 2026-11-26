@@ -2110,11 +2110,17 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing))); } catch (e) {
+    try {
+      return withLaneLeaseMutation(file, () => {
+        const current = readLease(dir);
+        if (!current || JSON.stringify(current) !== JSON.stringify(existing) || !leaseOwnedBy(current, session)) return null;
+        writeLeaseAtomicUnlocked(file, bodyFor(holder, adopted || laneWorkerSession(current)));
+        return holder;
+      });
+    } catch (e) {
       if (e.code === 'ELEASEBUSY') return null;
       throw e;
     }
-    return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
     // xbdixjc — a stale lease over a lane the hold rule protects is not taken over (its fixer will resume there).

@@ -21,7 +21,9 @@ describe('codex-direct-task CLI lease renewal', () => {
       import { EventEmitter } from 'node:events';
       import { readFileSync, writeFileSync } from 'node:fs';
       cp.execFileSync = (_bin, args) => args.includes('--absolute-git-dir') ? ${JSON.stringify(join(dir, '.git'))} : args.includes('rev-parse') ? 'sha' : '';
-      cp.spawn = () => {
+      const realSpawn = cp.spawn;
+      cp.spawn = (bin, args, options) => {
+        if (bin === process.execPath) return realSpawn(bin, args, options);
         const renewed = ${JSON.stringify([cwd, dir])}.map(p => JSON.parse(readFileSync(p + '/.git/.lane-lease', 'utf8')).renewedAt || null);
         writeFileSync(${JSON.stringify(join(base, 'observed.json'))}, JSON.stringify(renewed));
         const child = new EventEmitter();
@@ -61,7 +63,18 @@ describe('withLaneLeaseHeartbeat', () => {
     await expect(withLaneLeaseHeartbeat(['a'], async () => { throw new Error('boom'); }, () => () => log.push('stop'))).rejects.toThrow('boom');
     expect(log).toEqual(['stop']);
   });
-  it('still runs the task when the heartbeat cannot start', async () => {
-    expect(await withLaneLeaseHeartbeat(['a'], async () => 1, () => { throw new Error('x'); })).toBe(1);
+  it('refuses to run the task when the heartbeat cannot start', async () => {
+    let ran = false;
+    await expect(withLaneLeaseHeartbeat(['a'], async () => { ran = true; }, () => { throw new Error('x'); })).rejects.toThrow('x');
+    expect(ran).toBe(false);
   });
+});
+
+it('does not enter task code when the heartbeat child readiness fails', async () => {
+  let ran = false, stopped = false;
+  const stop = () => { stopped = true; };
+  stop.ready = Promise.reject(new Error('child startup failed'));
+  await expect(withLaneLeaseHeartbeat(['lane'], () => { ran = true; }, () => stop)).rejects.toThrow('child startup failed');
+  expect(ran).toBe(false);
+  expect(stopped).toBe(true);
 });
