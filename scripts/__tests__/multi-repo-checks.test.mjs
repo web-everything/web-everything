@@ -143,6 +143,19 @@ it('the no-code-owed soak uses a repository-neutral fixture and still refuses ex
   expect(scenario.judge(await scenario.run())).toEqual([]);
 }, 30_000);
 
+it('the no-code rearm recovery soak uses a repository-neutral fixture and preserves replacement recovery', async () => {
+  const file = 'scripts/conveyor/soak/breaks/no-code-rearm-recovery.mjs';
+  expect(scanMultiRepo(read(file))).toEqual([]);
+  const { default: scenario } = await import('../conveyor/soak/breaks/no-code-rearm-recovery.mjs');
+  const report = await scenario.run();
+  expect(scenario.judge(report)).toEqual([]);
+  expect(report.cases.map(({ length }) => length)).toEqual([40, 9]);
+  for (const result of report.cases) {
+    expect(result).toMatchObject({ answers: 2, receipts: 2, writes: 2, confirms: 1 });
+    expect(result.planned).not.toContain('fix');
+  }
+}, 30_000);
+
 it('the orphan pagination soak resolves its repository and preserves incomplete-listing recovery', async () => {
   const file = 'scripts/conveyor/soak/breaks/orphan-guard-lists-past-200.mjs';
   expect(scanMultiRepo(read(file))).toEqual([]);

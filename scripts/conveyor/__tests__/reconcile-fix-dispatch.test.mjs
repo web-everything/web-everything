@@ -11,9 +11,12 @@ import { NO_PROMPT_COMMAND_RULES } from '../../lib/no-prompt-command-rules.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { FIX_OVERLAP_PROSE_GLOBS, stripProseScope } from '../fix-scope-policy.mjs';
 import { spawnSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { probeHeldLandAdvanceBatch } from '../soak/breaks/fix-push-hold-repair-starvation.mjs';
 import * as ghThrottle from '../../lib/gh-throttle.mjs';
 import {
-  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
+  createFixPassPrReader, fetchPrFilesPaginated, replayFixLaunch, withStaleBase, withPlannedContext, dispatchFix, readLivePushHold, isSmokeDryRunPr, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
   findResumeCandidate, buildResumePrompt, tryResumeFix, tryResumeRoundFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
@@ -2804,5 +2807,485 @@ describe('bounced no-findings fresh evidence', () => {
     expect(reader).toHaveBeenCalledTimes(1);
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.reconcileRefusalDetails.some(r => r.kind === 'cap-exhausted')).toBe(true);
+  });
+});
+
+describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer spawn', () => {
+  const entry = { kind: 'fix', prNumber: 1764, headRefName: 'lane/3438-wire-reconcile-pass', headRefOid: 'a'.repeat(40) };
+  const run = (extra, entries = [entry]) => runReconcileFixDispatch({
+    root: '/repo', reconcile: () => ({ dispatch: entries, refusals: [], notes: [], prs: entries.length, agents: 0 }),
+    findItemFn: findItemStub, loadItems: () => [], pickFreeLanes: () => [4], checkStaleness: FRESH,
+    fetchItemlessDiffPaths: () => [], ...extra,
+  });
+  const ok = (pr) => ({ sessionId: `s-${pr}`, pr });
+
+  it('spawns when the live read shows no hold (happy path)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(() => null);
+    const result = run({ dispatch, readPushHold, dryRun: false });
+    expect(readPushHold).toHaveBeenCalledWith(expect.objectContaining({ pr: 1764 }), undefined);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(result.dispatched).toHaveLength(1);
+  });
+
+  it.each(['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical'])(
+    'a hold (%s) seen at the spawn site is not spawned, even when the plan was made before it', (label) => {
+      const dispatch = vi.fn(p => ok(p.pr));
+      const result = run({ dispatch, readPushHold: () => ({ code: 'hold-label', reason: label }), dryRun: false });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.dispatched).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    });
+
+  it('an unreadable hold read fails closed: nothing is spawned', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const result = run({ dispatch, readPushHold: () => { throw new Error('gh timeout'); }, dryRun: false });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('a misbound mq-failure hint plus a live hold is not spawned (:2099)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const bad = { ...entry, mqFailureRecovery: { repo: 'web-everything/web-everything', pr: 9999, head: 'b'.repeat(40), evidence: { complete: true } } };
+    const result = run({ dispatch, readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }), dryRun: false }, [bad]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+  });
+
+  it('a hold added after lane selection returns the lane and spawns nothing (:2152)', () => {
+    let reads = 0;
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(({ pr }) => (pr === 1764 && ++reads === 2 ? { code: 'hold-label', reason: 'review:human' } : null));
+    const pickFreeLanes = () => [4];
+    const second = { kind: 'fix', prNumber: 1765, headRefName: 'lane/3439-other-thing' };
+    const result = run({ dispatch, readPushHold, pickFreeLanes, dryRun: false }, [entry, second]);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    // The held PR's lane went back to the pool, so the next PR still got lane 4.
+    expect(dispatch.mock.calls[0][0]).toEqual(expect.objectContaining({ pr: 1765, lane: 4 }));
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    expect(reads).toBe(2);
+  });
+
+  it.each([{ isConflict: true }, { attempts: 1 }])('a held eligible resume is refused, with a clear positive control (%j)', shape => {
+    const tryResume = vi.fn(() => ({ resumed: true, result: { pr: 1764 } }));
+    const tryResumeRound = vi.fn(() => ({ resumed: true, result: { pr: 1764 } }));
+    const dispatch = vi.fn(p => ok(p.pr));
+    const options = { dispatch, tryResume, tryResumeRound, dryRun: false };
+    const readPushHold = vi.fn().mockReturnValueOnce(null).mockReturnValue({ code: 'hold-label', reason: 'review:human' });
+    const result = run({ ...options, readPushHold }, [{ ...entry, ...shape }]);
+    expect(readPushHold).toHaveBeenCalledTimes(2);
+    expect(tryResume).not.toHaveBeenCalled();
+    expect(tryResumeRound).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ pr: 1764, kind: 'push-hold' }));
+    run({ ...options, readPushHold: () => null }, [{ ...entry, ...shape }]);
+    expect(shape.isConflict ? tryResume : tryResumeRound).toHaveBeenCalledTimes(1);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('a held first entry consumes no fix-cap, queue demand or pass allowance', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const tryAdmit = vi.fn(() => ({ admit: tryAdmit.mock.calls.length <= 1, kind: 'fix-cap' }));
+    const queue = vi.fn(() => ({ admit: queue.mock.calls.length <= 1 }));
+    const result = run({ dispatch, dispatchThrottle: { tryAdmit }, queueAdmission: { tryAdmit: queue },
+      readPushHold: ({ pr }) => pr === 1764 ? { code: 'hold-label', reason: 'review:human' } : null,
+    }, [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(dispatch.mock.calls.map(([p]) => p.pr)).toEqual([1765]);
+    expect(tryAdmit).toHaveBeenCalledTimes(1);
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(result.handled).toBe(1);
+  });
+
+  it('a correctly bound MQ refresh on a held PR never reaches the push port', () => {
+    const refreshMqFailure = vi.fn(() => ({ action: 'refreshed' }));
+    const dispatch = vi.fn();
+    const held = { ...entry, mqFailureRecovery: { repo: 'web-everything/web-everything', pr: entry.prNumber,
+      head: entry.headRefOid, evidence: { complete: true, testFiles: ['tests/failure.test.mjs'], assertions: ['break'] } } };
+    const options = { dispatch, refreshMqFailure, mqFailureLedger: { readFixFallback: () => false },
+      mqFailureIo: { readHead: () => entry.headRefOid }, fetchItemlessDiffPaths: () => ['src/unrelated.mjs'] };
+    const result = run({ ...options, readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }) }, [held]);
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    run({ ...options, readPushHold: () => null }, [held]);
+    expect(refreshMqFailure).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ isConflict: true }, { takeover: {} }, { labels: ['review:human', 'review:changes'] }])('MQ refresh never receives repair exemptions (%j)', repair => {
+    const refreshMqFailure = vi.fn(() => ({ action: 'refreshed' }));
+    const held = { ...entry, labels: ['review:human'], ...repair,
+      mqFailureRecovery: { repo: 'web-everything/web-everything', pr: entry.prNumber,
+        head: entry.headRefOid, evidence: { complete: true, testFiles: ['tests/failure.test.mjs'], assertions: ['break'] } } };
+    const contexts = [];
+    const result = run({ refreshMqFailure, mqFailureLedger: { readFixFallback: () => false },
+      mqFailureIo: { readHead: () => entry.headRefOid }, fetchItemlessDiffPaths: () => ['src/unrelated.mjs'],
+      readPushHold: context => { contexts.push(context); return readLivePushHold(context, { hermetic: false,
+        run: () => JSON.stringify({ state: 'OPEN', labels: held.labels.map(name => ({ name })) }) }); },
+    }, [held]);
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]).not.toHaveProperty('repair');
+    expect(refreshMqFailure).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+  });
+
+  it('held reads still obey the pass deadline without spending dispatch allowance', () => {
+    let time = 0;
+    const readPushHold = vi.fn(() => { time = 2; return { code: 'hold-label', reason: 'review:human' }; });
+    const result = run({ now: 0, clock: () => time, deadlineAt: 1, readPushHold },
+      [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(readPushHold).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ handled: 0, deferred: [1765] });
+  });
+
+  it.each([
+    [undefined, ['review:human', 'review:changes'], {}],
+    [undefined, ['review:human', 'review:changes', 'red-team:blocked'], {}],
+    [undefined, ['review:human', 'review:changes', 'red-team:pending'], {}, false],
+    [undefined, ['review:human', 'review:changes', 'review:held-mechanical'], {}],
+    ['advisory-fix', ['review:human', 'advisory:changes'], {}],
+    ['operator-send-back', ['review:human'], { operatorSendBack: { body: 'repair' } }],
+    ['ruling-not-addressed', ['review:human'], { rulingNotAddressed: { matches: [] } }],
+    ['block-ruled-referral', ['review:human'], { blockRuledReferrals: [{}] }],
+    ['takeover', ['review:human'], { takeover: {} }],
+    ['scope-bloat-rebase', ['review:human'], { scopeBloat: {} }],
+    ['stale-base-rebase', ['review:human'], { staleBase: {} }],
+    ['stale-base-rebase', ['red-team:pending'], { staleBase: {} }],
+    [undefined, ['review:changes', 'review:held-mechanical'], {}],
+    ['stacked-rebase', ['review:accepted'], { isConflict: true }],
+    [undefined, ['review:human', CONFLICT_LABEL], { isConflict: true }],
+    [undefined, ['review:changes', 'red-team:blocked'], {}],
+    [undefined, ['review:changes'], {}],
+    [undefined, ['review:pending', CONFLICT_LABEL], { isConflict: true }],
+    ['mq-failure-recovery', ['review:changes'], {}],
+    [undefined, ['review:changes', 'red-team:pending'], {}, false],
+    ['advisory-fix', ['review:human', 'advisory:changes', 'review:held-mechanical'], {}, false],
+  ])('planner repair shape %s with %j obeys the live reader', (mode, labels, fields, allowed = true) => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = context => readLivePushHold(context, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) });
+    const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, mode, labels, ...fields }]);
+    if (allowed) {
+      expect(result.refusals).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } else {
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    }
+  });
+
+  it('both default reader wirings reach gh with hermetic off', () => {
+    const gh = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }));
+    const readPushHoldOptions = { run: gh, hermetic: false };
+    const dispatch = vi.fn();
+    run({ dispatch, readPushHoldOptions });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(1);
+    const spawnAgent = vi.fn();
+    expect(dispatchFix({ itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, readPushHoldOptions, grantConflictHelper: vi.fn() }))
+      .toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'hold-label', reason: 'review:human' } });
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(gh).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    [['red-team:pending'], { staleBase: {} }, null],
+    [['red-team:pending'], {}, { code: 'hold-label', reason: 'red-team:pending' }],
+    [['red-team:pending'], { mode: 'stale-base-rebase' }, { code: 'hold-label', reason: 'red-team:pending' }],
+    [['review:held-mechanical', 'review:changes'], { labels: ['review:held-mechanical', 'review:changes'] }, null],
+    [['review:held-mechanical'], { labels: ['review:held-mechanical', 'review:changes'] },
+      { code: 'hold-label', reason: 'review:held-mechanical' }],
+    [['review:held-mechanical', 'review:changes'], undefined, { code: 'hold-label', reason: 'review:held-mechanical' }],
+  ])('live hold repair authorization (%j, %j)', (labels, repair, expected) => {
+    expect(readLivePushHold({ repo: 'we', pr: 1764, repair }, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) })).toEqual(expected);
+  });
+
+  describe('SHIP-WM-296 red-team:pending blocks merge, not an eligible fix push', () => {
+    const view = (labels, extra = {}) => JSON.stringify({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: labels.map(name => ({ name })), ...extra });
+    const read = (repair, labels, extra) => readLivePushHold({ repo: 'we', pr: 1764, repair },
+      { hermetic: false, run: () => view(labels, extra) });
+    const HELD = { code: 'hold-label', reason: 'red-team:pending' };
+    const H = 'a'.repeat(40);
+    const E1 = { mode: 'advisory-fix', labels: ['review:human'], headRefOid: H };
+    const E2 = { isConflict: true, labels: ['review:changes'], headRefOid: H };
+    const E2L = ['review:changes', 'red-team:pending'];
+    const CONF = { mergeable: 'CONFLICTING', baseRefName: 'main' };
+
+    it('E1 advisory-fix launches through pending, at admission and at the launch re-read', () => {
+      const labels = ['review:human', 'advisory:changes', 'red-team:pending'];
+      expect(read(E1, labels)).toBeNull();
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      const readPushHold = context => readLivePushHold(context, { hermetic: false, run: () => view(labels) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E1 }]);
+      expect(result.refusals).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+    it('E2 conflict bounce on the default base launches through pending', () => {
+      expect(read(E2, E2L, CONF)).toBeNull();
+    });
+    it.each([
+      ['takeover row with advisory:changes stays held', { takeover: {}, mode: 'takeover', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['takeover flag without mode stays held', { takeover: {}, mode: 'advisory-fix', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['stacked-rebase stays held', { mode: 'stacked-rebase', isConflict: true, labels: ['review:changes'] }, E2L, CONF],
+      ['restack repair stays held', { ...E1, restack: {} }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E1 with no planned head stays held', { mode: 'advisory-fix', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E2 with null planned head stays held', { ...E2, headRefOid: null }, E2L, CONF],
+      ['E1 with no live head read stays held', E1, ['review:human', 'advisory:changes', 'red-team:pending'], { headRefOid: undefined }],
+      ['repair planned for an older head stays held', { ...E1, headRefOid: 'b'.repeat(40) }, ['review:human', 'advisory:changes', 'red-team:pending'], { headRefOid: 'a'.repeat(40) }],
+      ['joinedInputs stays held', { ...E1, joinedInputs: [{}] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E1 with no live advisory:changes is held', E1, ['review:human', 'red-team:pending']],
+      ['E1 with no live review:human is held', E1, ['advisory:changes', 'red-team:pending']],
+      ['E2 with live mergeable UNKNOWN is held', E2, E2L, { mergeable: 'UNKNOWN', baseRefName: 'main' }],
+      ['E2 with no mergeable read is held', E2, E2L, { baseRefName: 'main' }],
+      ['E2 base retargeted off the default branch is held', E2, E2L, { mergeable: 'CONFLICTING', baseRefName: 'lane/other' }],
+      ['E2 with no live review:changes is held', E2, ['red-team:pending'], CONF],
+      ['plain review:changes bounce (not conflict) is held', { labels: ['review:changes'] }, E2L, CONF],
+      ['red-team:blocked still holds (E1)', { ...E1, labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked']],
+    ])('%s', (_name, repair, labels, extra) => {
+      expect(read(repair, labels, extra)).not.toBeNull();
+    });
+    it('the launch re-read holds when the base is retargeted between admission and launch', () => {
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      let reads = 0;
+      const readPushHold = context => readLivePushHold(context, { hermetic: false,
+        run: () => view(E2L, { mergeable: 'CONFLICTING', baseRefName: ++reads === 1 ? 'main' : 'lane/x' }) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E2 }]);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    });
+    it('pending stays a hold for E1 when the pending label is the only exemption absent (no repair)', () => {
+      expect(read(undefined, ['red-team:pending'])).toEqual(HELD);
+    });
+  });
+
+  it.each([
+    [['red-team:pending', 'review:human'], { staleBase: {}, labels: ['red-team:pending'] }],
+    [['red-team:pending', 'review:held-mechanical'], { staleBase: {}, labels: ['red-team:pending'] }],
+    [['review:held-mechanical', 'review:changes'], { labels: ['review:changes'] }],
+    [['review:held-mechanical', 'review:changes', 'red-team:pending'], { labels: ['review:held-mechanical', 'review:changes'] }],
+    [['review:human', 'review:changes'], { labels: ['review:changes'] }],
+    [['review:human'], { labels: ['review:human', 'review:changes'] }],
+    [['review:human'], { mode: 'advisory-fix', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes'], { mode: 'advisory-fix', labels: [] }],
+    [['red-team:blocked', 'review:changes'], { labels: ['review:changes'] }],
+    [['red-team:blocked'], { labels: ['red-team:blocked', 'review:changes'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending'], { takeover: {}, mode: 'takeover', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending'], { mode: 'stacked-rebase', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked'], { mode: 'advisory-fix', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'review:held-mechanical'], { mode: 'advisory-fix', labels: ['review:human'] }],
+  ])('repair context cannot bypass a new, unrelated or superseded hold (%j)', (labels, repair) => {
+    const dispatch = vi.fn();
+    const result = run({ dispatch, readPushHoldOptions: { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) } }, [{ ...entry, ...repair }]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+  });
+
+  it.each([true, false].flatMap(itemBacked => [
+    { itemBacked, labels: ['review:human', 'review:changes'] },
+    { itemBacked, mode: 'advisory-fix', labels: ['review:human', 'advisory:changes'] },
+    { itemBacked, mode: 'operator-send-back', labels: ['review:human'], operatorSendBack: { body: 'repair' } },
+    { itemBacked, labels: ['review:changes', 'red-team:blocked'] },
+  ]))('direct callers retain hold repair context ($mode, item-backed=$itemBacked)', ({ itemBacked, ...context }) => {
+    const row = { ...entry, ...(itemBacked ? {} : { headRefName: 'topic' }), ...context };
+    const { planned } = planFixesFromReconcile([row], findItemStub, () => [], () => [], 'we', () => ['src/a.mjs']);
+    expect(planned[0]).toMatchObject(context);
+    expect(readLivePushHold({ repo: 'we', pr: 1764, repair: planned[0] }, { hermetic: false,
+      run: () => JSON.stringify({ state: 'OPEN', labels: row.labels.map(name => ({ name })) }) })).toBeNull();
+  });
+
+  it.each([true, false])('real planner ordinary bounced repair launches with its existing human hold (item-backed=%s)', itemBacked => {
+    const labels = ['review:changes', 'review:human'];
+    const pr = { number: entry.prNumber, state: 'OPEN', isDraft: false,
+      headRefName: itemBacked ? entry.headRefName : 'topic', headRefOid: entry.headRefOid,
+      baseRefName: 'main', labels: labels.map(name => ({ name })), mergeStateStatus: 'CLEAN',
+      rowsComplete: true, rowsHead: entry.headRefOid,
+      statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      comments: [{ body: '🔁 human review — changes requested\n\nRepair the admitted finding.' }] };
+    const plan = planFreshBounce({ prs: [pr], agents: [], now: Date.parse('2026-11-25T00:00:00Z') });
+    expect(plan.dispatch).toHaveLength(1);
+    expect(plan.dispatch[0]).toMatchObject({ kind: 'fix', phase: 'bounced', findings: 1, labels });
+    expect(plan.dispatch[0].mode).toBeUndefined();
+    expect(plan.dispatch[0].operatorSendBack).toBeUndefined();
+    const dispatch = vi.fn(p => ok(p.pr));
+    const liveRead = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: pr.labels }));
+    const result = run({ dispatch, tryResume: () => ({ resumed: false }),
+      fetchItemlessDiffPaths: () => ['src/a.mjs'],
+      readPushHoldOptions: { hermetic: false, run: liveRead } }, plan.dispatch);
+    expect(result.refusals).toEqual([]);
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(liveRead).toHaveBeenCalledTimes(2);
+    // Repair admission is read-only: human review remains owed before landing.
+    expect(pr.labels.map(label => label.name)).toEqual(labels);
+  });
+
+  it('dispatchFix re-reads the hold after the slow prep and spawns nothing; the claim is released', () => {
+    const spawnAgent = vi.fn(() => '');
+    const releaseClaim = vi.fn();
+    expect(dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: 'lane/3438-wire-reconcile-pass', scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, releaseClaim, grantConflictHelper: vi.fn(),
+        readPushHold: () => ({ code: 'hold-label', reason: 'review:human' }) },
+    )).toMatchObject({ refused: true, outcome: 'push-hold', hold: { code: 'hold-label', reason: 'review:human' } });
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['red-team:pending', 'review:held-mechanical', 'unreadable'])(
+    'land-advance defers a held first fix (%s), dispatches the second and queues item 7', async hold => {
+      const { result, calls, spawned, released, ledger, queued } = await probeHeldLandAdvanceBatch({ hold });
+      expect(result.errors).toEqual([]);
+      expect(result.deferred).toEqual([{ target: 'we#1', reason: 'push-hold' }]);
+      expect(result.dispatched).toHaveLength(1);
+      expect(calls).toEqual([1, 2]);
+      expect(spawned).toEqual([2]);
+      expect(released).toEqual([1]);
+      expect(ledger).toEqual(['we#2']);
+      expect(queued).toEqual(['7']);
+    });
+
+  it('dispatchFix fails closed on a throwing final hold read and releases its claim', () => {
+    const spawnAgent = vi.fn();
+    const releaseClaim = vi.fn();
+    const events = [];
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9 },
+      { root: '/repo', readBrief: () => { events.push('brief'); return REAL_TEMPLATE_STUB; },
+        spawnAgent, releaseClaim, grantConflictHelper: vi.fn(),
+        readPushHold: () => { events.push('hold'); throw Error('gh timeout after slow prep'); } });
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold', pr: 1764, hold: { code: 'unreadable' } });
+    expect(events).toEqual(['brief', 'hold']);
+    expect(spawnAgent).not.toHaveBeenCalled();
+    expect(releaseClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it('a final hold refusal voids an unlaunched takeover before releasing its claim', () => {
+    const events = [];
+    const spawnAgent = vi.fn();
+    const result = dispatchFix(
+      { itemNum: '3438', pr: 1764, laneRef: entry.headRefName, scope: ['we:x'], lane: 9,
+        takeover: { n: 1, budget: 1, attempts: 5, cap: 5 } },
+      { root: '/repo', readBrief: () => REAL_TEMPLATE_STUB, spawnAgent, grantConflictHelper: vi.fn(),
+        postTakeover: () => events.push('mark'), postTakeoverVoidMark: () => events.push('void'),
+        releaseClaim: () => events.push('release'), readPushHold: () => ({ code: 'hold-label', reason: 'red-team:pending' }) });
+    expect(result).toMatchObject({ refused: true, outcome: 'push-hold' });
+    expect(events).toEqual(['mark', 'void', 'release']);
+    expect(spawnAgent).not.toHaveBeenCalled();
+  });
+
+  it('a final dispatch refusal returns the lane for the next reconcile entry', () => {
+    const dispatch = vi.fn(p => p.pr === 1764 ? { refused: true, outcome: 'push-hold', reason: 'late hold' } : ok(p.pr));
+    const result = run({ dispatch, readPushHold: () => null },
+      [entry, { ...entry, prNumber: 1765, headRefName: 'lane/3439-other-thing' }]);
+    expect(dispatch.mock.calls.map(([p]) => [p.pr, p.lane])).toEqual([[1764, 4], [1765, 4]]);
+    expect(result.dispatched).toEqual([ok(1765)]);
+    expect(result.refusals).toContainEqual({ pr: 1764, kind: 'push-hold', why: 'late hold' });
+  });
+
+  it('default reader refuses held PRs outside the test environment through both dispatcher entry points', () => {
+    const moduleUrl = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../reconcile-fix-dispatch.mjs')).href;
+    const env = { ...process.env, WE_FIX_SCOPE_OVERLAP_GRANULARITY: 'file' };
+    delete env.VITEST;
+    delete env.WE_UNDER_TEST;
+    const child = `
+      import { readLivePushHold, dispatchFix, runReconcileFixDispatch } from ${JSON.stringify(moduleUrl)};
+      let reads = 0, spawned = 0, released = 0;
+      const run = () => { reads++; return JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }); };
+      const hold = readLivePushHold({ repo: 'we', pr: 7 }, { run });
+      const planned = { pr: 7, itemNum: '3438', laneRef: 'topic', scope: ['we:src/a.mjs'], lane: 4 };
+      const direct = dispatchFix(planned, {
+        root: '/repo', readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}}',
+        readFixClaim: () => null, readHistoryInputs: () => null, acquireClaim: () => ({ ok: true }),
+        releaseClaim: () => { released++; }, stampExecutor: () => {}, postNotice: () => {}, wrapFix: false,
+        sessionCwdFor: () => '/scratch/fix', ensureSessionCwd: p => p, isolateSession: () => ({}),
+        advisorFor: () => ({ enabled: false }), recordAdvisor: () => {}, resolveSettingsEnv: () => null,
+        grantConflictHelper: () => {}, readPushHoldOptions: { run }, spawnAgent: () => { spawned++; },
+      });
+      const pass = runReconcileFixDispatch({
+        root: '/repo', repo: 'we', dryRun: false, priorityShadow: null, tryResumeRound: null,
+        reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 7, headRefName: 'topic' }], refusals: [] }),
+        readPushHoldOptions: { run }, checkStaleness: () => ({ fresh: true, behind: 0 }),
+        listBuildClaims: () => [], listFixClaims: () => [], loadItems: () => [], findItemFn: () => null,
+        fetchItemlessDiffPaths: () => ['src/a.mjs'], pickFreeLanes: () => [4], stepLog: () => {},
+        dispatch: () => { spawned++; return { pr: 7 }; },
+      });
+      process.stdout.write(JSON.stringify({ reads, spawned, released, hold, direct, pass }));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e', child], {
+      cwd: process.cwd(), env, encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const report = JSON.parse(result.stdout);
+    expect(report).toMatchObject({ reads: 3, spawned: 0, released: 1,
+      hold: { code: 'hold-label', reason: 'review:human' },
+      direct: { refused: true, outcome: 'push-hold' }, pass: { dispatched: [] } });
+    expect(report.pass.refusals).toContainEqual(expect.objectContaining({ pr: 7, kind: 'push-hold' }));
+  });
+
+  describe('readLivePushHold parses live evidence (no env bypass when hermetic is off)', () => {
+    const view = (v) => vi.fn(() => JSON.stringify(v));
+    const read = (run) => readLivePushHold({ repo: 'we', pr: 7 }, { run, hermetic: false });
+    it('clear when open with no hold label, and reads without the memo', () => {
+      const run = view({ state: 'OPEN', labels: [{ name: 'review:pending' }] });
+      expect(read(run)).toBeNull();
+      expect(run.mock.calls[0][1].throttle).toEqual({ noMemo: true });
+    });
+    it.each(['review:human', 'red-team:blocked', 'red-team:pending', 'review:held-mechanical'])('refuses %s', (name) => {
+      expect(read(view({ state: 'OPEN', labels: [{ name }] }))).toEqual({ code: 'hold-label', reason: name });
+    });
+    it.each(['CLOSED', 'MERGED'])('refuses a %s PR', (state) => {
+      expect(read(view({ state, labels: [] }))?.code).toBe('pr-not-open');
+    });
+    it.each([{ state: 'OPEN', labels: 'x' }, { state: 'OPEN', labels: [{}] }, { state: 'WEIRD', labels: [] }, null])(
+      'refuses malformed evidence %j', (v) => { expect(read(view(v))?.code).toBe('unreadable'); });
+    it('a throw or bad JSON propagates so the caller fails closed', () => {
+      expect(() => read(vi.fn(() => { throw new Error('timeout'); }))).toThrow();
+      expect(() => read(vi.fn(() => 'not json'))).toThrow();
+    });
+  });
+
+  it('dryRun never calls the dispatcher or the hold gate (:2114)', () => {
+    const dispatch = vi.fn(p => ok(p.pr));
+    const readPushHold = vi.fn(() => null);
+    const result = run({ dispatch, readPushHold, dryRun: true });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(readPushHold).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+  });
+});
+
+
+describe('candidate-side old smoke read isolation', () => {
+  it.each(['', 'reconcile-fix-pass'])('sentinel PR + smoke marker %j skips the live hold read, gh never called', marker => {
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', marker);
+    const run = vi.fn(() => { throw Error('must not call gh'); });
+    try {
+      expect(isSmokeDryRunPr(900002)).toBe(true);
+      expect(readLivePushHold({ repo: 'we', pr: 900002 }, { run, hermetic: false })).toBeNull();
+      expect(run).not.toHaveBeenCalled();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('sentinel PR without the marker still reads live and refuses unreadable evidence', () => {
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', '');
+    delete process.env.WE_SMOKE_DRYRUN_ONLY;
+    const run = vi.fn(() => JSON.stringify({}));
+    try {
+      expect(isSmokeDryRunPr(900002)).toBe(false);
+      expect(readLivePushHold({ repo: 'we', pr: 900002 }, { run, hermetic: false }))
+        .toMatchObject({ code: 'unreadable' });
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('a smoke marker never exempts a non-sentinel PR or a near-match', () => {
+    for (const pr of [1764, 90000, 9000000, '900002x']) expect(isSmokeDryRunPr(pr, { WE_SMOKE_DRYRUN_ONLY: '' })).toBe(false);
+    vi.stubEnv('WE_SMOKE_DRYRUN_ONLY', '');
+    const run = vi.fn(() => JSON.stringify({ state: 'OPEN', labels: [{ name: 'review:human' }] }));
+    try {
+      expect(readLivePushHold({ repo: 'we', pr: 1764 }, { run, hermetic: false }))
+        .toEqual({ code: 'hold-label', reason: 'review:human' });
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllEnvs(); }
   });
 });

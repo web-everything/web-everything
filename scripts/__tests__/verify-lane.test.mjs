@@ -1592,7 +1592,7 @@ if (args[0] === 'vitest' && args.includes('--reporter=json') && args.includes('-
   }
   process.exit(${retryExit});
 }
-if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit') || (args[0] === 'vitest' && args[1] === 'run' && args.length === 2)) {
+if ((args[0] === 'vitest' && args[1] === 'run' && args.includes('--passWithNoTests')) || (args[0] === 'run' && args[1] === 'test:unit') || (args[0] === 'vitest' && args[1] === 'run' && args.slice(2).every(a => a.startsWith('--')))) {
   writeAllSync(1, 'passed file\\n'.repeat(${outputLines}));
   writeAllSync(2, ${JSON.stringify(stderr)});
   writeAllSync(1, ${JSON.stringify(stdout)});
@@ -1710,7 +1710,8 @@ process.exit(${standardsExit});
     const r = f.invoke([], { WE_VERIFY_RETRY_FAILED: '1', WE_BUILD_FINAL_GATE: 'full' });
     expect(r.code, r.stderr).toBe(0);
     expect(r.json).toMatchObject({ status: 'green', isolatedRetry: 'flaky-retried-green' });
-    expect(f.calls()[0].args).toEqual(['run', 'test:unit']);
+    expect(f.calls()[0].args).toEqual(['run', 'test:unit', '--', '--reporter=default', '--reporter=json',
+      expect.stringMatching(/^--outputFile\.json=.+\/verify-test-count-[^/]+\/results\.json$/)]);
     expect(f.calls().at(-1).args).toEqual(['run', 'check:standards']);
   });
 
@@ -1745,7 +1746,7 @@ export async function load(url, context, nextLoad) {
     const f = fixture({ guard: true, guardExcluded: true });
     const npx = join(dir, 'bin/npx');
     writeFileSync(npx, readFileSync(npx, 'utf8').replace(
-      "(args[0] === 'vitest' && args[1] === 'run' && args.length === 2)", 'false'));
+      "(args[0] === 'vitest' && args[1] === 'run' && args.slice(2).every(a => a.startsWith('--')))", 'false'));
     const r = f.invoke([], idleFallbackEnv());
     expect(r.json.status, r.stderr).toBe('red');
     expect(r.json.phases.alwaysRun).toMatchObject({ executed: true, ran: ['guard.test.mjs'],
@@ -1795,7 +1796,8 @@ export async function load(url, context, nextLoad) {
       WE_VERIFY_ALWAYS_RUN_TESTS: '' });
     expect(r.code, r.stderr).toBe(2);
     expect(f.calls().map(call => call.args)).toEqual([
-      ['vitest', 'run'], ['direct-standards'],
+      ['vitest', 'run', '--reporter=default', '--reporter=json',
+        expect.stringMatching(/^--outputFile\.json=.+\/verify-test-count-[^/]+\/results\.json$/)], ['direct-standards'],
     ]);
     expect(f.calls()[0].held).toHaveLength(1);
     expect(r.json.phases.outcomes).toMatchObject({ vitest: { result: 'fail' },
@@ -2303,7 +2305,7 @@ describe('verify phase telemetry (#5141)', () => {
     if (previousPoolRoot === undefined) delete process.env.LANE_POOL_ROOT;
     else process.env.LANE_POOL_ROOT = previousPoolRoot;
   });
-  const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number),
+  const explicitPhases = { admissionWaitMs: expect.any(Number), gateMs: expect.any(Number), executedTests: null,
     vitestMs: null, scanMs: null, standardsMs: null, targetFileCount: null, changedFileCount: null,
     importGraphTargetCount: null, literalReferenceTargetCount: null, relatedMode: null, testTimeoutFactor: null, standardsPolicy: null, settingsSource: null, admissionMode: 'gate', admissionPhases: null, selection: null,
     outcomes: { vitest: { result: 'skipped' }, scan: { result: 'skipped' }, standards: { result: 'skipped' } } };

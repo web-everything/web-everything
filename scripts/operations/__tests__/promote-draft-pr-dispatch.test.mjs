@@ -4,8 +4,14 @@
  *   `reconcile-core.mjs` planned `kind:'promote-draft'` for. No process is started and no real `gh` is
  *   shelled — `reconcile` and `provider` are injected, mirroring `ci-heal-pr-dispatch.test.mjs`'s own shape.
  */
-import { describe, it, expect, vi } from 'vitest';
-import { runReconcilePromoteDraftDispatch, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, chmodSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { fixDispatchClaimRoot, fixDispatchResource } from '../../conveyor/fix-claim-store.mjs';
+import { lockDirFor } from '../../readiness/file-locks.mjs';
+import { runReconcilePromoteDraftDispatch, defaultNoCodeRearm, acquireNoCodeRearmLock, defaultReadHeadCheckState, defaultReadPrLabels, isPromoteCodePath, promoteCodeClosure } from '../promote-draft-pr-dispatch.mjs';
 
 const FRESH = () => ({ fresh: true, behind: 0 });
 // Every pre-existing test in this file promotes cleanly, so it pins a fresh re-read that always says green —
@@ -676,5 +682,392 @@ describe('fresh review-status:draft-withdrawn label guard', () => {
     const result = run(() => { if (labels instanceof Error) throw labels; return labels; }, ready);
     expect(result.refusals).toEqual([expect.objectContaining({ kind: 'draft-state-unreadable' })]);
     expect(ready).not.toHaveBeenCalled();
+  });
+});
+
+import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.mjs';
+// D2: the real mechanical executor, with hermetic IO and writer stdout.
+import { buildOperatorAnswer, NO_CODE_REARM_RECEIPT } from '../../conveyor/stand-down-answer-core.mjs';
+import { buildStandDownComment } from '../../conveyor/stand-down.mjs';
+import { planReconcile } from '../../conveyor/reconcile-core.mjs';
+import { readCompletePrComments } from '../../conveyor/pr-comments-complete.mjs';
+import { runReviewLabelCli } from '../../review-set-label.mjs';
+import { formatPromoteActionLine, runPromoteDraftDispatchAllRepos } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
+
+describe('operator no-code rearm executor', () => {
+  let lockRoot;
+  beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'no-code-executor-')); });
+  afterEach(() => rmSync(lockRoot, { recursive: true, force: true }));
+  const head = 'a'.repeat(40);
+  const c = (id, body) => ({ id, body, author: { login: 'chalbert' } });
+  const begin = c('begin', `🔒 conveyor fix-begin — fix claim held
+
+**Branch:** \`lane/x\` at \`${head}\``);
+  const verdict = c('verdict', `🔁 review — changes requested
+
+Fix defect`);
+  const stop = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head }));
+  const answer = c('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }));
+  const thread = () => [verdict, begin, stop, answer];
+  const entry = { kind: 'rearm-no-code', prNumber: 42, expectHead: head, answerId: 'answer' };
+  const json = labels => JSON.stringify({ ok: true, labelsObserved: true, labels });
+  function setup(over = {}) {
+    const posted = [];
+    const postComment = vi.fn(({ comment }) => posted.push(c('receipt', comment))), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm,
+      acquireRearmLock: args => acquireNoCodeRearmLock({ ...args, root: lockRoot }, {
+        stamp: () => ({ runnerStart: 'test-process-birth' }), identity: () => ({ alive: true }),
+      }), ...over };
+    return { options, postComment, rearm, run: () => runReconcilePromoteDraftDispatch(options) };
+  }
+  it('overlapping executors consume one answer only once', () => {
+    const posted = [];
+    let overlap, contender;
+    const postComment = vi.fn(({ comment }) => posted.push(c(`receipt-${posted.length}`, comment)));
+    const rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    const first = setup({ readThread: () => [...thread(), ...posted], postComment, rearm,
+      readClaim: () => { overlap = contender.run(); return null; } });
+    contender = setup({ ...first.options, readClaim: () => null });
+    const result = first.run();
+    expect(result.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(overlap.dispatched).toEqual([]);
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(rearm).toHaveBeenCalledTimes(1);
+  });
+  it('rechecks admission inside exclusion and releases the lock on a stale plan', () => {
+    const comments = thread();
+    const s = setup({ readThread: () => comments });
+    const acquire = s.options.acquireRearmLock;
+    s.options.acquireRearmLock = args => {
+      const release = acquire(args);
+      comments.push(c('receipt-by-predecessor', NO_CODE_REARM_RECEIPT('answer', head)));
+      return release;
+    };
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+    const release = acquire({ repoSlug: 'web-everything/web-everything', prNumber: 42 });
+    release();
+  });
+  it('unreadable lock ownership refuses before reading evidence or writing', () => {
+    const s = setup({ acquireRearmLock: () => { throw Error('operator must inspect lock ownership'); }, readThread: vi.fn() });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-lock-unavailable' }));
+    expect(s.options.readThread).not.toHaveBeenCalled();
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['thread-read', 'claim-read', 'receipt-post', 'writer'])('releases exclusion after %s fails', stage => {
+    const fail = () => { throw Error('fixture failure'); };
+    const s = setup({ ...(stage === 'thread-read' ? { readThread: fail } : {}),
+      ...(stage === 'claim-read' ? { readClaim: fail } : {}),
+      ...(stage === 'receipt-post' ? { postComment: fail } : {}),
+      ...(stage === 'writer' ? { rearm: fail } : {}) });
+    expect(s.run().dispatched).toEqual([]);
+    const release = s.options.acquireRearmLock({ repoSlug: 'web-everything/web-everything', prNumber: 42 });
+    release();
+  });
+  function actualWriterFixture(comments = thread()) {
+    const stateFile = join(lockRoot, 'state.json');
+    const ghPath = join(lockRoot, 'gh');
+    writeFileSync(stateFile, JSON.stringify({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments, writes: [] }));
+    writeFileSync(ghPath, [
+      `#!${process.execPath}`,
+      "const fs = require('node:fs');",
+      "const a = process.argv.slice(2), p = process.env.REARM_TEST_STATE, s = JSON.parse(fs.readFileSync(p, 'utf8'));",
+      "const save = () => fs.writeFileSync(p, JSON.stringify(s));",
+      "if (a[0] === 'pr' && a[1] === 'view') console.log(JSON.stringify(s));",
+      "else if (a[0] === 'api' && a[1].includes('/comments')) console.log(JSON.stringify([s.comments]));",
+      "else if (a[0] === 'pr' && a[1] === 'edit') { s.labels = s.labels.filter(l => !a.some((v,i) => v === '--remove-label' && a[i+1] === l)); const i = a.indexOf('--add-label'); if (i >= 0) s.labels.push(a[i+1]); s.writes.push('labels'); save(); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { const file = a[a.indexOf('--body-file')+1]; const body = fs.readFileSync(file === '-' ? 0 : file, 'utf8'); s.comments.push({ id: 'writer-comment', body, author: { login: 'web-everything' } }); s.writes.push('comment'); save(); }",
+      "else { console.error('unexpected hermetic gh call', a); process.exit(1); }",
+    ].join('\n'));
+    chmodSync(ghPath, 0o755);
+    const read = () => JSON.parse(readFileSync(stateFile, 'utf8'));
+    const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
+    const writer = vi.fn(args => defaultNoCodeRearm({ ...args, spawn: (exe, argv, opts) => spawnSync(exe, argv, { ...opts,
+      env: { ...cleanEnv, PATH: `${lockRoot}:${process.env.PATH}`, HOME: lockRoot, WE_COORDINATION_ROOT: lockRoot,
+        WE_GH_THROTTLE_LOCK_ROOT: join(lockRoot, 'throttle'), REARM_TEST_STATE: stateFile },
+    }) }));
+    const postComment = vi.fn(({ comment }) => { const s = read(); s.comments.push(c('receipt', comment)); s.writes.push('receipt'); writeFileSync(stateFile, JSON.stringify(s)); });
+    return { read, writer, postComment, write: state => writeFileSync(stateFile, JSON.stringify(state)) };
+  }
+  it('actual rearm-review writer transitions labels once across two executor ticks', () => {
+    const { read, writer, postComment } = actualWriterFixture();
+    const planned = [];
+    const reconcile = () => {
+      const result = planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ ...read(), number: 42,
+        headRefName: 'lane/test', mergeStateStatus: 'CLEAN',
+        statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+      }] });
+      planned.push(...result.dispatch.map(row => row.kind));
+      return result;
+    };
+    const s = setup({ reconcile, readThread: () => read().comments, readPrLabels: () => read().labels, postComment, rearm: writer });
+    const first = s.run();
+    expect(first.refusals).toEqual([]);
+    expect(first.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(read().labels).toEqual(['review:pending']);
+    const after = read();
+    expect(s.run().dispatched).toEqual([]);
+    expect(read()).toEqual(after);
+    expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
+    expect(planned.filter(kind => kind === 'fix')).toEqual([]);
+    expect(planned.filter(kind => kind === 'rearm-no-code')).toEqual(['rearm-no-code']);
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+  }, 120000);
+  it.each([false, true])('receipted replacement preserves consumed writer budgets: noCodeOwed=%s', noCodeOwed => {
+    const ordinary = (id, standDownId) => c(id, buildOperatorAnswer({ standDownId, actor: 'chalbert',
+      reason: 'Allow one retry', channel: 'chat', disposition: 'rearm-review' }));
+    const exhausted = [verdict, begin, { ...stop, id: 'waiver-stop-1' }, ordinary('waiver-1', 'waiver-stop-1'),
+      { ...begin, id: 'begin-2' }, { ...stop, id: 'waiver-stop-2' }, ordinary('waiver-2', 'waiver-stop-2'),
+      { ...begin, id: 'begin-3' }, stop, answer, c('original-receipt', NO_CODE_REARM_RECEIPT('answer', head))];
+    const replacement = c('replacement', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert',
+      reason: 'Inspected failed handoff', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true, supersedes: 'answer' }));
+    const { read, write, writer, postComment } = actualWriterFixture([...exhausted, replacement]);
+    const s = setup({ reconcile: () => ({ dispatch: [{ ...entry, answerId: 'replacement' }], refusals: [] }),
+      readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
+      postComment: args => {
+        postComment(args);
+        // A new empty round arrives after admission. The replacement must not reset either
+        // of the two spent waivers or the single spent no-code cap override in the writer.
+        const state = read();
+        state.comments.push({ ...begin, id: 'begin-4' }, { ...stop, id: 'stop-4' },
+          c('over-budget', buildOperatorAnswer({ standDownId: 'stop-4', actor: 'chalbert',
+            reason: 'Retry again', channel: 'chat', disposition: 'rearm-review', noCodeOwed })));
+        write(state);
+      },
+    });
+    const first = s.run();
+    expect(first.dispatched).toEqual([]);
+    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(writer.mock.results[0].value.status).toBe(1);
+    expect(writer.mock.results[0].value.stdout).toContain('no change made');
+    expect(read().labels).toEqual(['review:changes']);
+    expect(read().writes.filter(kind => kind === 'labels')).toEqual([]);
+    const after = read();
+    expect(s.run().dispatched).toEqual([]);
+    expect(read()).toEqual(after);
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+  }, 120000);
+  it.each(['red-team:blocked', 'red-team:pending', 'changes verdict', 'stand-down'])(
+    'post-receipt %s permits exactly one extra review through the actual writer', lateEvidence => {
+      const { read, write, writer, postComment } = actualWriterFixture();
+      const s = setup({ readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
+        postComment: args => {
+          postComment(args);
+          const state = read();
+          if (lateEvidence.startsWith('red-team:')) state.labels.push(lateEvidence);
+          else state.comments.push({ ...(lateEvidence === 'changes verdict' ? verdict : stop), id: 'late-evidence' });
+          write(state);
+        },
+      });
+      // Pin the disclosed admission-to-writer window; the receipt still bounds the attempt.
+      expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+      expect(read().labels).toContain('review:pending');
+      expect(read().labels).not.toContain('review:changes');
+      expect(read().labels).not.toContain('review:accepted');
+      const after = read();
+      expect(s.run().dispatched).toEqual([]);
+      expect(read()).toEqual(after);
+      expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
+      expect(writer).toHaveBeenCalledTimes(1);
+      expect(postComment).toHaveBeenCalledTimes(1);
+    }, 120000);
+  it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {
+    const readClaim = vi.fn(() => { if (mode === 'unreadable') throw Error('store unreadable'); return { meta: { who: 'fixer' } }; });
+    const s = setup({ readClaim });
+    const result = s.run();
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: mode === 'live' ? 'rearm-no-code-claimed' : 'rearm-no-code-unreadable' }));
+    expect(readClaim).toHaveBeenCalledWith({ repo: 'we', pr: 42 });
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['fix', 'ci-heal'])('a dispatched %s claim refuses with zero writes', kind => {
+    if (!process.env.TMPDIR) throw Error('This fixture requires the task TMPDIR');
+    const root = mkdtempSync(join(process.env.TMPDIR, 'rearm-claims-'));
+    const previousRoot = process.env.WE_COORDINATION_ROOT;
+    process.env.WE_COORDINATION_ROOT = root;
+    try {
+      const dir = lockDirFor(fixDispatchClaimRoot(), fixDispatchResource({ repo: 'we', pr: 42, kind }));
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'lock.json'), JSON.stringify({
+        owner: 'dispatched-session', heartbeatAt: new Date().toISOString(),
+        meta: { repo: 'we', pr: 42, kind },
+      }));
+      const s = setup({ readClaim: undefined });
+      const result = s.run();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-claimed' }));
+      expect(result.dispatched).toEqual([]);
+      expect(s.postComment).not.toHaveBeenCalled();
+      expect(s.rearm).not.toHaveBeenCalled();
+    } finally {
+      if (previousRoot === undefined) delete process.env.WE_COORDINATION_ROOT;
+      else process.env.WE_COORDINATION_ROOT = previousRoot;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it.each(['outsider', 'unknown', 'unreadable', 'missing'])('receipt author %s refuses without spawning or spending the ruling', mode => {
+    const posted = [];
+    const s = setup({
+      postComment: vi.fn(({ comment }) => posted.push({ id: 'new-receipt', body: comment, ...(mode === 'unknown' ? {} : { author: { login: 'outsider' } }) })),
+      readThread: vi.fn(() => {
+        if (posted.length && mode === 'unreadable') throw Error('readback failed');
+        return [...thread(), ...(mode === 'missing' ? [] : posted)];
+      }),
+    });
+    const result = s.run();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-receipt-failed' }));
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['deadline', 'adoption'])('rearm loop defers remaining entries on %s and counts handled entries', mode => {
+    let time = 0, yieldNow = false;
+    const s = setup({ now: () => time, deadlineAt: 10, shouldYield: () => yieldNow,
+      reconcile: () => ({ dispatch: [entry, { ...entry, prNumber: 43 }], refusals: [] }),
+      rearm: vi.fn(() => { time = 11; yieldNow = mode === 'adoption'; return { status: 0, stdout: json(['review:pending']) }; }),
+    });
+    const result = s.run();
+    expect(result).toMatchObject({ handled: 1, deferred: [43] });
+    if (mode === 'adoption') expect(result.yieldedForAdoption).toBe(true);
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+  });
+  it('rearm loop defers every entry when planning exhausts the deadline', () => {
+    let time = 0;
+    const s = setup({ now: () => time, deadlineAt: 10, reconcile: () => { time = 11; return { dispatch: [entry], refusals: [] }; } });
+    expect(s.run()).toMatchObject({ handled: 0, deferred: [42] });
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['review:pending', 'review:human'])('confirms exactly once from observed %s and pins the head', label => {
+    const s = setup({ rearm: vi.fn(() => ({ status: 0, stdout: `diagnostic\n${json([label])}\n` })) });
+    expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(s.postComment).toHaveBeenCalledTimes(1);
+    expect(s.postComment).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 42, comment: NO_CODE_REARM_RECEIPT('answer', head) }));
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+    expect(s.options.rearm).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 42, expectHead: head, answerId: 'answer' }));
+  });
+  it.each([
+    ['empty stdout', { status: 0, stdout: '' }],
+    ['malformed JSON', { status: 0, stdout: 'not json' }],
+    ['ok only without labelsObserved', { status: 0, stdout: JSON.stringify({ ok: true }) }],
+    ['missing labelsObserved', { status: 0, stdout: JSON.stringify({ ok: true, labels: ['review:pending'] }) }],
+    ['labels null', { status: 0, stdout: JSON.stringify({ ok: true, labelsObserved: true, labels: null }) }],
+    ['changes still present', { status: 0, stdout: json(['review:pending', 'review:changes']) }],
+    ['exit 1', { status: 1, stdout: json(['review:pending']) }],
+    ['ok false', { status: 0, stdout: JSON.stringify({ ok: false, labelsObserved: true, labels: ['review:pending'] }) }],
+    ['non-string labels', { status: 0, stdout: json(['review:pending', {}]) }],
+    ['no pending or human', { status: 0, stdout: json([]) }],
+  ])('zero confirms for %s', (_, child) => {
+    const s = setup({ rearm: () => child });
+    const result = s.run();
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(s.postComment).toHaveBeenCalledTimes(1);
+  });
+  it.each(['throw', 'over 10 pages', 'count mismatch', 'bad labels'])('unreadable %s gives zero writes', mode => {
+    const readThread = (number, opts) => {
+      expect(opts).toMatchObject({ maxPages: 10 });
+      if (mode === 'throw') throw Error('thread unavailable');
+      if (mode === 'bad labels') return thread();
+      return readCompletePrComments(number, { ...opts, gh: args => {
+        if (args[1] === 'graphql') return { data: { repository: { pullRequest: { comments: { totalCount: 999 } } } } };
+        return mode === 'over 10 pages' ? Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: 'chalbert' }, body: 'filler' })) : thread();
+      } });
+    };
+    const s = setup({ readThread, ...(mode === 'bad labels' ? { readPrLabels: () => null } : {}) });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unreadable' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it.each(['over 10 pages', 'count mismatch'])('default full-thread reader refuses %s with zero writes', async mode => {
+    const ghThrottle = await import('../../lib/gh-throttle.mjs');
+    const gh = vi.spyOn(ghThrottle, 'runGhSync').mockImplementation(args => JSON.stringify(args[1] === 'graphql'
+      ? { data: { repository: { pullRequest: { comments: { totalCount: 999 } } } } }
+      : mode === 'over 10 pages' ? Array.from({ length: 100 }, (_, i) => c(`f${i}`, 'filler')) : thread()));
+    try {
+      const s = setup({ readThread: undefined });
+      const result = s.run();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unreadable', why: expect.stringContaining('operator must inspect') }));
+      expect(gh).toHaveBeenCalledTimes(mode === 'over 10 pages' ? 10 : 2);
+      expect(gh.mock.calls.every(([args]) => !args.includes('--paginate'))).toBe(true);
+      expect(s.postComment).not.toHaveBeenCalled();
+      expect(s.rearm).not.toHaveBeenCalled();
+    } finally { gh.mockRestore(); }
+  });
+  it.each(['changed answer', 'red-team hold', 'fix-begin raced', 'invalid answer id'])('fresh %s refuses before receipt', mode => {
+    const s = setup({ readThread: () => mode === 'changed answer' ? thread().slice(0, -1) : mode === 'fix-begin raced' ? [...thread(), begin] : mode === 'invalid answer id' ? [...thread().slice(0, -1), { ...answer, id: 'answer\nattack' }] : thread(), readPrLabels: () => mode === 'red-team hold' ? ['review:changes', 'red-team:pending'] : ['review:changes'] });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('receipt failure never spawns rearm; child throw leaves ruling spent', () => {
+    const s = setup({ postComment: () => { throw Error('post failed'); } });
+    expect(s.run().dispatched).toEqual([]);
+    expect(s.rearm).not.toHaveBeenCalled();
+    const crashed = setup({ rearm: () => { throw Error('child crashed'); } });
+    expect(crashed.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(crashed.postComment).toHaveBeenCalledTimes(1);
+  });
+  it('101st-comment answer executes once over two ticks; tick 3 resumes ordinary review', () => {
+    const comments = [...Array.from({ length: 97 }, (_, i) => c(`f${i}`, 'filler')), ...thread()];
+    let labels = ['review:changes'];
+    const plan = () => planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ number: 42, state: 'OPEN', headRefName: 'lane/test', headRefOid: head, rowsHead: head, rowsComplete: true, labels, comments, commentsComplete: true, mergeStateStatus: 'CLEAN', statusCheckRollup: ['gate', 'standards', 'test-shard (1)'].map(name => ({ name, status: 'completed', conclusion: 'success' })) }] });
+    const s = setup({ reconcile: plan, readThread: (number, opts) => readCompletePrComments(number, { ...opts, gh: args => {
+        if (args[1] === 'graphql') return { data: { repository: { pullRequest: { comments: { totalCount: comments.length } } } } };
+        const page = Number(/page=(\d+)$/.exec(args[1])[1]);
+        return comments.slice((page - 1) * 100, page * 100);
+      } }), readPrLabels: () => labels,
+      postComment: vi.fn(({ comment }) => { comments.push(c('receipt', comment)); }),
+      rearm: vi.fn(() => { labels = ['review:pending']; comments.push(c('rearmed', '🔧 conveyor fix — re-armed for re-review')); return { status: 0, stdout: json(labels) }; }),
+    });
+    const first = s.run(), second = s.run(), third = plan();
+    expect([...first.dispatched, ...second.dispatched].map(d => d.kind)).toEqual(['rearm-no-code']);
+    expect(s.options.postComment).toHaveBeenCalledTimes(1);
+    expect(s.options.rearm).toHaveBeenCalledTimes(1);
+    expect(third.dispatch.length).toBeGreaterThan(0);
+    expect(third.dispatch.every(d => d.kind === 'review')).toBe(true);
+  });
+  it('head-of-list promote failure still runs restore-review-label and rearm-no-code', () => {
+    const addLabel = vi.fn();
+    const s = setup({ reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 1, headRefOid: head }, { kind: 'restore-review-label', prNumber: 2 }, entry] }), readHeadCheckState: () => { throw Error('failed promote'); }, readPrLabels: ({ prNumber }) => prNumber === 42 ? ['review:changes'] : [], addLabel });
+    expect(s.run().dispatched.map(d => d.kind)).toEqual(['restore-review-label', 'rearm-no-code']);
+    expect(addLabel).toHaveBeenCalledTimes(1);
+  });
+  it('daemon logs mechanical rearm without launching an agent', async () => {
+    const s = setup();
+    const launchAgent = vi.fn();
+    const fixes = runReconcileFixDispatch({ root: '/repo', checkStaleness: FRESH, reconcile: s.options.reconcile,
+      dispatch: launchAgent, pickFreeLanes: () => [], findItemFn: () => null, loadItems: () => [], priorityShadow: null });
+    expect(fixes.dispatched).toEqual([]);
+    expect(launchAgent).not.toHaveBeenCalled();
+    const result = await runPromoteDraftDispatchAllRepos({ repos: ['we'], tick: () => s.run() });
+    expect(result.dispatched).toHaveLength(1);
+    expect(s.rearm).toHaveBeenCalledTimes(1);
+    expect(formatPromoteActionLine({ ...result.dispatched[0], repo: 'we' })).toMatch(/rearm-no-code.*no fix agent/);
+  });
+  it('default rearm spawns only the head-pinned writer with inert argv and bounded output', () => {
+    const spawn = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
+    expect(setup({ rearm: args => defaultNoCodeRearm({ ...args, spawn }) }).run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      const [file, args, options] = spawn.mock.calls[0];
+      expect(file).toBe(process.execPath);
+      expect(args[0].endsWith('/scripts/conveyor/rearm-review.mjs')).toBe(true);
+      expect(args.slice(1)).toEqual(['42', '--repo=web-everything/web-everything', `--expect-head=${head}`, '--actor=conveyor (operator no-code ruling answer)']);
+      expect(options).toMatchObject({ encoding: 'utf8', timeout: 120000, maxBuffer: 4 * 1024 * 1024 });
+    expect(options.shell).not.toBe(true);
+  });
+  it('real writer fallback stdout lacks labelsObserved and cannot confirm', () => {
+    const chunks = [];
+    const exit = vi.spyOn(process, 'exit').mockImplementation(code => { throw Object.assign(Error('exit'), { exitCode: code }); });
+    try {
+      try { runReviewLabelCli({ argv: ['42', '--repo=o/n'], fixedTo: 'rearm', defaultActor: 'test', usage: 'test', buildComment: () => 'rearm', successResult: o => ({ ok: true, ...o }), refusalResult: ({ decision }) => ({ error: decision.reason }), emit: line => chunks.push(line), provider: { readPrState: () => ({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments: [] }), setLabels: () => {}, postComment: () => {}, readLabels: () => { throw Error('readback unavailable'); } } }); } catch (e) { expect(e.exitCode).toBe(0); }
+    } finally { exit.mockRestore(); }
+    const stdout = chunks.join('');
+    expect(JSON.parse(stdout)).toMatchObject({ ok: true, labels: ['review:pending'] });
+    expect(JSON.parse(stdout)).not.toHaveProperty('labelsObserved');
+    expect(setup({ rearm: () => ({ status: 0, stdout }) }).run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
   });
 });

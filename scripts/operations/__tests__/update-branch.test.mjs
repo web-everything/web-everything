@@ -3,6 +3,8 @@ import { createUpdateBranchSinks } from '../update-branch-io.mjs';
 import { updateBranchOperation, UPDATE_BRANCH_OP, finishUpdateBranch } from '../update-branch.mjs';
 import { parseOperationArgv, runOperationCli } from '../cli-adapter.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
+// Collect the operation registry before the per-test deadline, like the other CLI wiring suites.
+import { resolveOperation } from '../run.mjs';
 import { withRealRepo } from './helpers/real-repo.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -127,6 +129,78 @@ describe('update-branch', () => {
     expect(await f.run()).toMatchObject({ ok: false, refused: true, detail: expect.stringMatching(/inspect the PR before retrying/) });
     expect(writes(f)).toHaveLength(1);
     expect(f.sleep).not.toHaveBeenCalled();
+  });
+
+  it('refuses head-moved with no PUT when the head differs', async () => {
+    const f = fixture([pull]);
+    const result = await f.run({ ...input, 'expected-head': 'd'.repeat(40) });
+    expect(result).toMatchObject({ ok: false, refused: true, status: 'head-moved', beforeHead: head, afterHead: head });
+    expect(writes(f)).toHaveLength(0);
+    expect(f.gh).toHaveBeenCalledTimes(1);
+    expect(f.append).toHaveBeenCalledTimes(1);
+  });
+
+  it('PUT carries expected_head_sha equal to the given head', async () => {
+    const f = fixture([pull, { behind_by: 2 }, accepted, next, { behind_by: 0 }]);
+    expect(await f.run({ ...input, 'expected-head': head })).toMatchObject({ ok: true, status: 'updated' });
+    expect(writes(f)[0][0]).toContain(`expected_head_sha=${head}`);
+  });
+
+  it('omitted flag keeps today\'s behaviour', async () => {
+    const f = fixture([pull, { behind_by: 2 }, accepted, next, { behind_by: 0 }]);
+    expect(await f.run()).toMatchObject({ ok: true, status: 'updated' });
+    expect(writes(f)[0][0]).toContain(`expected_head_sha=${head}`);
+  });
+
+  it.each(['abc', 'A'.repeat(40), 42])('rejects a malformed expected head before any IO (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '   ', [], [''], ['  '], undefined, [undefined], [, ], new Array(1)])('empty --expected-head refuses, no PUT (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+    expect(writes(f)).toHaveLength(0);
+  });
+
+  it('CLI: the head lock reaches the op (head-moved, no PUT), empty and repeated flags refuse, absent keeps behaviour', async () => {
+    const { declaration, registry } = resolveOperation(UPDATE_BRANCH_OP);
+    const cli = async (extra, replies) => {
+      const f = fixture(replies);
+      const outcome = await runOperationCli({ declaration, registry, sinks: f.sinks, argv: ['--pr=42', '--reason=sync', ...extra], store: createMemoryRunStore(), newRunId: () => 'cli-lock' });
+      return { f, finished: finishUpdateBranch(outcome), outcome };
+    };
+    const moved = await cli([`--expected-head=${'d'.repeat(40)}`], [pull]);
+    expect(JSON.parse(moved.finished.lines[0])).toMatchObject({ status: 'head-moved', refused: true });
+    expect(writes(moved.f)).toHaveLength(0);
+    for (const extra of [['--expected-head='], ['--expected-head=   '], [`--expected-head=${head}`, `--expected-head=${head}`]]) {
+      const bad = await cli(extra, [pull]);
+      expect(bad.f.gh).not.toHaveBeenCalled();
+      expect(JSON.stringify(bad.outcome)).toMatch(/expected-head/);
+    }
+    const ok = await cli([], [pull, { behind_by: 0 }]);
+    expect(JSON.parse(ok.finished.lines[0])).toMatchObject({ status: 'already-up-to-date' });
+    const match = await cli([`--expected-head=${head}`], [pull, { behind_by: 0 }]);
+    expect(JSON.parse(match.finished.lines[0])).toMatchObject({ status: 'already-up-to-date' });
+  });
+
+  it.each([null, [head, 'd'.repeat(40)], [head, head]])('refuses an explicit null or repeated expected head before any IO (%j)', async value => {
+    const f = fixture([]);
+    await expect(f.run({ ...input, 'expected-head': value })).rejects.toThrow(/expected-head/);
+    expect(f.gh).not.toHaveBeenCalled();
+  });
+
+  it('accepts a single-element array from the repeatable CLI flag and runs the head lock', async () => {
+    const f = fixture([pull]);
+    expect(await f.run({ ...input, 'expected-head': ['d'.repeat(40)] })).toMatchObject({ status: 'head-moved' });
+    expect(writes(f)).toHaveLength(0);
+  });
+
+  it('declares --expected-head in the CLI usage', async () => {
+    const { declaration } = resolveOperation(UPDATE_BRANCH_OP);
+    expect(parseOperationArgv(declaration, ['--pr=42', '--reason=x', `--expected-head=${head}`]).ok).toBe(true);
   });
 
   it.each([undefined, '', '   '])('refuses a missing/empty reason before any IO (%j)', async reason => {

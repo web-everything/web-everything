@@ -16,6 +16,7 @@
     "scripts/conveyor/soak/breaks/drain-restamp-stale-code-clone.mjs": {"status":"pending-migration","reason":"S6: advance fixture main to exercise stale drain clone restamping.","sites":14},
     "scripts/conveyor/soak/breaks/fix-dispatch-stalls-on-unrelated-clone-lag.mjs": {"status":"pending-migration","reason":"S6: seed and advance fixture main past the fix dispatcher clone.","sites":18},
     "scripts/conveyor/soak/breaks/fresh-stamp-commit-graph-repair.mjs": {"status":"pending-migration","reason":"S6: seed and advance fixture main before corrupting the commit graph.","sites":18},
+    "scripts/conveyor/soak/breaks/hotpatch-registration-default-tip.mjs": {"status":"pending-migration","reason":"S6: seed local fixture repositories and move hotpatch refs for admission probes; no pushes.","sites":14},
     "scripts/conveyor/soak/breaks/lane-acquire-default-wait.mjs": {"status":"pending-migration","reason":"S6: seed local main for the default lane-acquire wait probe.","sites":6},
     "scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs": {"status":"pending-migration","reason":"S6: seed local main for partial provisioning waiter recovery.","sites":6},
     "scripts/conveyor/soak/breaks/lane-pool-recovery-origin-isolation.mjs": {"status":"pending-migration","reason":"S6: seed primary origin before creating a separate caller-origin fixture.","sites":25},
@@ -47,7 +48,7 @@
     "scripts/operations/migrate-raised-by.mjs": {"status":"pending-migration","reason":"S6: lease-publish raised-by migrations and roll back when approval cannot carry.","sites":12},
     "scripts/operations/record-verdict-io.mjs": {"status":"pending-migration","reason":"S5: synchronize the fetched source ref onto the verdict transport branch.","sites":2},
     "scripts/operations/review-prep-io.mjs": {"status":"pending-migration","reason":"S5: publish prepared review evidence and report an owed push on failure.","sites":4},
-    "scripts/pr-land.mjs": {"status":"pending-migration","reason":"S3: publish source lane commits and authorized main landings.","sites":23},
+    "scripts/pr-land.mjs": {"status":"pending-migration","reason":"S3: publish source lane commits and authorized main landings. Sites 24–25 are the read-only runGit remote get-url and merge-base calls in readFinishGuardMarker, flagged because the remote, head and base arguments are dynamic.","sites":25},
     "scripts/push-if-green.mjs": {"status":"pending-migration","reason":"S3: publish the selected source only after green verification.","sites":7},
     "scripts/session-replay.mjs": {"status":"pending-migration","reason":"S6: publish seeded replay fixtures to ephemeral main.","sites":2},
     "scripts/audit-backlog-health.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
@@ -264,7 +265,7 @@
     "scripts/lib/validate-rules-anchors.cjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/verdict-ledger-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/verify-base-rerun.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/lib/verify-lane-gate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":14},
+    "scripts/lib/verify-lane-gate.mjs": {"status":"pending-migration","reason":"S2: existing unresolved git reads plus the bounded hardened policyGit port and six injected Git reads for startup identity and sibling alias evidence.","sites":21},
     "scripts/lib/verify-revert-red.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/we-scan-cache.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
     "scripts/lint-locus-prefix.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
@@ -316,7 +317,7 @@
     "scripts/operations/resolve-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/operations/review-extra-seats.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
     "scripts/operations/review-job.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
-    "scripts/operations/review-pr-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
+    "scripts/operations/review-pr-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},
     "scripts/operations/review-round-replay.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/round-judge-replay.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/ruled-weakened-prune.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
@@ -345,6 +346,6 @@
     "scripts/run-fresh.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-commands-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/sync-skills-deploy.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
-    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2}
+    "scripts/verify-lane.mjs": {"status":"pending-migration","reason":"S2: existing unresolved calls; sharedGit is a bounded hardened read port. The added HEAD:.gitattributes show uses an enumerated tracked path, never a transport or write.","sites":4}
   }
 }

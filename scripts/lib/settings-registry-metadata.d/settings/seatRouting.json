@@ -1,0 +1,6 @@
+{
+  "description": "Review seat vendor routing: seatRouting.correctness A keeps claude, B sends the correctness seat to the vendor that did not build the PR.",
+  "owner": "scripts/settings/review.json",
+  "changeVia": "pr",
+  "instant": false
+}
