@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { planFileItem } from '../../operations/file-item.mjs';
 import * as sizeAdmission from '../pr-size-admission.mjs';
+import { findRawPushes } from '../push-gate-lint.mjs';
 import { BUILT_IN_PR_SIZE_SETTINGS } from '../pr-size-defaults.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
@@ -27,6 +28,10 @@ vi.mock('node:child_process', async (importOriginal) => {
 // fileItem accepts the declared operation's title/kind/size/digest/scope fields and returns
 // the CLI's outcomePayload envelope with a top-level verdict.
 afterEach(() => vi.restoreAllMocks());
+
+it('sibling history inspection exposes literal non-push Git subcommands to the push gate', () => {
+  expect(findRawPushes(sizeAdmission.checkSiblingBase.toString())).toEqual([]);
+});
 
 describe('planSizeAdmission — size dials capacity, never permission', () => {
   it.each([0, 299, 300])('exactly %i non-test lines need no action', (lines) => {
