@@ -24,6 +24,7 @@ import { recordRedTeamStatus, readRedTeamPublicationHold, redTeamStatusDir } fro
 import { publishStoredRedTeamResult } from '../red-team-withheld-publish.mjs';
 import { redTeamMarker } from '../red-team-gate.mjs';
 import { evaluateRedTeamCheckFact } from '../red-team-check-run.mjs';
+import { redTeamClearProof } from '../drain-queue-safety.mjs';
 
 // The real operator feed is never written from this file: every test either injects a publisher or relies on the
 // test-run guard, and the guard's own tests assert against this stand-in.
@@ -113,6 +114,28 @@ const MERGED = { state: 'MERGED', mergedAt: '2026-10-09T22:00:00Z', mergeCommit:
 const stampedBy = (login) => [{ author: { login }, body: buildClearanceComment(HEAD) }];
 
 describe('enqueue delegates red-team verdicts to merge-gate', () => {
+  it.each([true, false])('E4 send-back fix pushes a new head with an old-head red-team success and no run on the new head, so admission is deferred red-team-pending, not merged (pending label=%s)', withLabel => {
+    const root = mkdtempSync(join(tmpdir(), 'e4-drain-'));
+    try {
+      writeFileSync(join(root, 'preferences.json'), '{}');
+      const OLD = 'd'.repeat(40), gateApp = 4242, pr = 7490;
+      const comments = [policyClear(pr, OLD)];
+      expect(redTeamClearProof({ comments, pr, head: OLD })).toMatchObject({ ok: true });
+      expect(redTeamClearProof({ comments, pr, head: HEAD })).toMatchObject({ ok: false });
+      const checkRuns = [{ id: 1, name: 'red-team', head_sha: OLD, external_id: `${LOCAL}#${pr}`,
+        app: { id: gateApp }, status: 'completed', conclusion: 'success' }];
+      const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr, headSha: HEAD, appId: gateApp, checkRuns }));
+      const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+        now: () => Date.parse('2026-11-26T22:17:00Z'), liveComments: comments,
+        env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run', WE_PLATFORM_PREFERENCES_FILE: join(root, 'preferences.json') },
+        strategyExtra: { cwd: root, primary: null, cardGroupHold: () => null, readGrantScope: () => null,
+          readRedTeamEvidence: () => ({ scheduled: false, inFlight: false }), readRedTeamCheck },
+        onView: { readLive: () => ({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted', ...(withLabel ? ['red-team:pending'] : [])] }) } });
+      expect(h.s.enqueue({ num: pr }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending' });
+      expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it.each([true, false])('check-run refuses a newer pending round after initial success (fresh pending label=%s)', withLabel => {
     const appId = 5037855;
     const runs = [{ id: 1, name: 'red-team', head_sha: HEAD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'completed', conclusion: 'success' }];
