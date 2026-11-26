@@ -9,7 +9,7 @@ export {
   restoreStrayClaimStamps,
 } from './local-state.mjs';
 export {
-  HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV, SLOW_SMOKE_ALERT_MS, failsSameChecks, isExternalOnlyFailure,
+  resolveAdoptNotWorse, SLOW_SMOKE_ALERT_MS, failsSameChecks, isExternalOnlyFailure,
   rejectRetryDelayMs,
 } from './smoke.mjs';
 export {
