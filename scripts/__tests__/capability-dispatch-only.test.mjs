@@ -169,6 +169,7 @@ const remainingUnguardedWrites = [
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Repark human review surfaces","call":"sweepHumanSurfaceRepark"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Reconcile hold labels","call":"sweepReviewHoldLabels"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Run hold/stamp reconciliation","call":"holdReconcile"},
+  {"file":"skills-src/conveyor/review-daemon.mjs","description":"Stranded-record recovery wrapper: runs sweepStrandedRecordEffects (claim-guarded, resume-only dispatch of a dead-owner run) then delegates unchanged to the existing hold reconciliation","call":"holdReconcile"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Same-pass draft promotion via promoteDraftsGuarded -> runDraftPromotionStep -> ready without review capability admission","call":"promoteDraftsThenReplan"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Refresh review/status labels","call":"tagStatus"},
   {"file":"skills-src/conveyor/review-daemon.mjs","description":"Publish referral pause notice","call":"notifyReferral"},
