@@ -3001,6 +3001,64 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
       run: () => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })) }) })).toEqual(expected);
   });
 
+  describe('SHIP-WM-296 red-team:pending blocks merge, not an eligible fix push', () => {
+    const view = (labels, extra = {}) => JSON.stringify({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: labels.map(name => ({ name })), ...extra });
+    const read = (repair, labels, extra) => readLivePushHold({ repo: 'we', pr: 1764, repair },
+      { hermetic: false, run: () => view(labels, extra) });
+    const HELD = { code: 'hold-label', reason: 'red-team:pending' };
+    const H = 'a'.repeat(40);
+    const E1 = { mode: 'advisory-fix', labels: ['review:human'], headRefOid: H };
+    const E2 = { isConflict: true, labels: ['review:changes'], headRefOid: H };
+    const E2L = ['review:changes', 'red-team:pending'];
+    const CONF = { mergeable: 'CONFLICTING', baseRefName: 'main' };
+
+    it('E1 advisory-fix launches through pending, at admission and at the launch re-read', () => {
+      const labels = ['review:human', 'advisory:changes', 'red-team:pending'];
+      expect(read(E1, labels)).toBeNull();
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      const readPushHold = context => readLivePushHold(context, { hermetic: false, run: () => view(labels) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E1 }]);
+      expect(result.refusals).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+    it('E2 conflict bounce on the default base launches through pending', () => {
+      expect(read(E2, E2L, CONF)).toBeNull();
+    });
+    it.each([
+      ['takeover row with advisory:changes stays held', { takeover: {}, mode: 'takeover', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['takeover flag without mode stays held', { takeover: {}, mode: 'advisory-fix', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['stacked-rebase stays held', { mode: 'stacked-rebase', isConflict: true, labels: ['review:changes'] }, E2L, CONF],
+      ['restack repair stays held', { ...E1, restack: {} }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E1 with no planned head stays held', { mode: 'advisory-fix', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E2 with null planned head stays held', { ...E2, headRefOid: null }, E2L, CONF],
+      ['E1 with no live head read stays held', E1, ['review:human', 'advisory:changes', 'red-team:pending'], { headRefOid: undefined }],
+      ['repair planned for an older head stays held', { ...E1, headRefOid: 'b'.repeat(40) }, ['review:human', 'advisory:changes', 'red-team:pending'], { headRefOid: 'a'.repeat(40) }],
+      ['joinedInputs stays held', { ...E1, joinedInputs: [{}] }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['E1 with no live advisory:changes is held', E1, ['review:human', 'red-team:pending']],
+      ['E1 with no live review:human is held', E1, ['advisory:changes', 'red-team:pending']],
+      ['E2 with live mergeable UNKNOWN is held', E2, E2L, { mergeable: 'UNKNOWN', baseRefName: 'main' }],
+      ['E2 with no mergeable read is held', E2, E2L, { baseRefName: 'main' }],
+      ['E2 base retargeted off the default branch is held', E2, E2L, { mergeable: 'CONFLICTING', baseRefName: 'lane/other' }],
+      ['E2 with no live review:changes is held', E2, ['red-team:pending'], CONF],
+      ['plain review:changes bounce (not conflict) is held', { labels: ['review:changes'] }, E2L, CONF],
+      ['red-team:blocked still holds (E1)', { ...E1, labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked']],
+    ])('%s', (_name, repair, labels, extra) => {
+      expect(read(repair, labels, extra)).not.toBeNull();
+    });
+    it('the launch re-read holds when the base is retargeted between admission and launch', () => {
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      let reads = 0;
+      const readPushHold = context => readLivePushHold(context, { hermetic: false,
+        run: () => view(E2L, { mergeable: 'CONFLICTING', baseRefName: ++reads === 1 ? 'main' : 'lane/x' }) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E2 }]);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    });
+    it('pending stays a hold for E1 when the pending label is the only exemption absent (no repair)', () => {
+      expect(read(undefined, ['red-team:pending'])).toEqual(HELD);
+    });
+  });
+
   it.each([
     [['red-team:pending', 'review:human'], { staleBase: {}, labels: ['red-team:pending'] }],
     [['red-team:pending', 'review:held-mechanical'], { staleBase: {}, labels: ['red-team:pending'] }],
@@ -3012,7 +3070,9 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
     [['review:human', 'advisory:changes'], { mode: 'advisory-fix', labels: [] }],
     [['red-team:blocked', 'review:changes'], { labels: ['review:changes'] }],
     [['red-team:blocked'], { labels: ['red-team:blocked', 'review:changes'] }],
-    [['review:human', 'advisory:changes', 'red-team:pending'], { mode: 'advisory-fix', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending'], { takeover: {}, mode: 'takeover', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending'], { mode: 'stacked-rebase', labels: ['review:human'] }],
+    [['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked'], { mode: 'advisory-fix', labels: ['review:human'] }],
     [['review:human', 'advisory:changes', 'review:held-mechanical'], { mode: 'advisory-fix', labels: ['review:human'] }],
   ])('repair context cannot bypass a new, unrelated or superseded hold (%j)', (labels, repair) => {
     const dispatch = vi.fn();
