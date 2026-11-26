@@ -30,6 +30,28 @@ vi.mock('node:child_process', async (importOriginal) => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('ruled data exemptions', () => {
+  it('refuses wider directory globs in every settings layer with provenance', () => {
+    for (const dataPaths of [['src/**/*.json'], ['protocols/**/*.json']]) {
+      for (const layer of ['platform', 'tool', 'env']) {
+        const options = { platform: {}, env: {}, [layer]: layer === 'env'
+          ? { WE_PR_SIZE_DATA_PATHS: JSON.stringify(dataPaths) } : { dataPaths } };
+        expect(() => resolvePrSizeSettings(options)).toThrow(`Invalid prSize ${layer}.dataPaths`);
+      }
+    }
+  });
+
+  it('counts renamed schemas before exact-path, fixture and directory exemptions', () => {
+    const settings = { ...BUILT_IN_PR_SIZE_SETTINGS,
+      dataPaths: ['src/**/__fixtures__/*.json', 'protocols/**/fixtures/*.json', 'fixtures/schema.json'],
+      dataDirs: ['data', 'fixtures'] };
+    for (const path of ['data/nested/schema.json', 'src/x/__fixtures__/schema.json',
+      'protocols/p/fixtures/schema.json', 'fixtures/schema.json']) {
+      const diff = `301\t0\t\0data/ordinary.json\0${path}\0` + '25\t0\tdata/ordinary.json\0';
+      expect(sizeAdmission.measureNonTestLines(diff, settings))
+        .toEqual({ lines: 301, dataLines: 25, exempt: false });
+    }
+  });
+
   it('schema files and wider environment globs never receive data exemptions', () => {
     expect(() => resolvePrSizeSettings({ platform: {}, env: {
       WE_PR_SIZE_DATA_PATHS: '["src/**/*.json"]',

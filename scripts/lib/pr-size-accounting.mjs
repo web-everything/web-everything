@@ -55,6 +55,7 @@ function isDataPath(path, settings) {
   const segments = path.split('/');
   if (segments.some(segment => !segment || segment === '.' || segment === '..')) return false;
   const filename = segments.pop();
+  if (filename === 'schema.json') return false;
   const dot = filename.lastIndexOf('.');
   if (dot === -1 || !BUILT_IN_PR_SIZE_SETTINGS.dataExtensions.includes(filename.slice(dot))) return false;
   if (settings.dataPaths.some(glob => matchesDataPath(glob, path))) return true;
