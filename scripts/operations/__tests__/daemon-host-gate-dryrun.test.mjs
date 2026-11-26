@@ -34,7 +34,7 @@ vi.mock('node:fs', async importOriginal => {
 });
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal();
-  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
+  return { ...actual, execFileSync: vi.fn(() => { throw new Error('unconfigured native command'); }) };
 });
 
 const SELF = '11111111-1111-4111-8111-111111111111';
@@ -84,10 +84,16 @@ function fixture(options = {}) {
   for (const path of [agents, join(home, '.claude'), join(cwd, '.git'), bin]) fs.mkdirSync(path, { recursive: true });
   const hostPath = join(home, '.claude', 'host-id');
   if (options.identity !== 'absent') fs.writeFileSync(hostPath, `${options.identity ?? SELF}\n`, { mode: 0o600 });
-  const scutil = join(bin, 'scutil');
-  fs.writeFileSync(scutil, `#!${process.execPath}\nprocess.stdout.write(${JSON.stringify(options.hostName ?? 'studio')}); process.exit(${options.scutilExit ?? 0});\n`, { mode: 0o755 });
-  vi.stubEnv('PATH', `${bin}${delimiter}${process.env.PATH}`);
-  const env = { HOME: home, PATH: process.env.PATH, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh') };
+  // The real main guard does its candidate-aware lookup, but its OS boundary is
+  // injected too. No reader fixture starts a process or falls back to host PATH.
+  execFileSync.mockImplementation((command, argv) => {
+    if (command !== 'scutil' || JSON.stringify(argv) !== JSON.stringify(['--get', 'HostName'])) {
+      throw new Error(`unconfigured native command: ${command}`);
+    }
+    if (options.scutilExit) throw failure(options.scutilExit);
+    return options.hostName ?? 'studio';
+  });
+  const env = { HOME: home, PATH: bin, WE_GH_THROTTLE_LOCK_ROOT: join(root, 'gh') };
   const ledger = ghThrottleLogPath(ghThrottleLockRoot(undefined, env));
   fs.mkdirSync(env.WE_GH_THROTTLE_LOCK_ROOT, { recursive: true });
   fs.writeFileSync(ledger, '');
@@ -192,9 +198,9 @@ function expectIncomplete(report, kind, label = null) {
   expect(finish(report).code).toBe(2);
 }
 
-// Exercise the real runner with PATH tools, not a second implementation of its
-// freshness/store policy. Every tool records outside the snapshotted fixture.
-// An unexpected tool/argv fails locally; none delegates to a host binary.
+// Exercise the real runner with preloaded IO, including the named builtin imports
+// used by its guards. Only the native timeout probe starts a fixture child.
+// Observations live outside the byte-for-byte snapshot; unexpected IO is fatal.
 function productionFixture(options = {}) {
   const h = fixture();
   const observer = fs.mkdtempSync(join(tmpdir(), 'host-gate-dryrun-observer-'));
@@ -203,18 +209,69 @@ function productionFixture(options = {}) {
   fs.writeFileSync(callsPath, '');
   const configPath = join(h.root, 'tools.json');
   fs.writeFileSync(configPath, JSON.stringify({ root: h.root, home: h.home, cwd: h.cwd, callsPath,
+    sourceRoot: fileURLToPath(new URL('../../../', import.meta.url)), now: NOW,
     sha: SHA, body: { type: 'file', encoding: 'base64', content: b64('studio\n'), sha: SHA }, ...options }));
-  const toolSource = `#!${process.execPath}
-const fs = require('node:fs'), path = require('node:path');
+  const preload = join(h.root, 'io.cjs');
+  const blockedGh = join(h.root, 'blocked-gh.cjs');
+  fs.writeFileSync(blockedGh, keepAliveScript({ maxLifetimeMs: 30000 }));
+  fs.writeFileSync(preload, `
+const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process'), os = require('node:os');
+const { syncBuiltinESMExports } = require('node:module');
 const config = JSON.parse(fs.readFileSync(${JSON.stringify(configPath)}, 'utf8'));
-const command = path.basename(process.argv[1]), argv = process.argv.slice(2);
-fs.appendFileSync(config.callsPath, JSON.stringify({command, argv, env: {
-  GH_CALLER: process.env.GH_CALLER, GH_HOST: process.env.GH_HOST,
-  WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: process.env.WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS,
-  WE_GH_JSON_RETRIES: process.env.WE_GH_JSON_RETRIES,
-}}) + '\\n');
-function out(text) { process.stdout.write(String(text)); }
-function refuse(reason, code = 2) { process.stderr.write(reason); process.exit(code); }
+const native = { ...fs }, nativeExec = cp.execFileSync;
+const observerFd = native.openSync(config.callsPath, 'a');
+const record = row => native.writeSync(observerFd, JSON.stringify(row) + '\\n');
+process.on('exit', () => native.closeSync(observerFd));
+const inside = (root, target) => target === path.resolve(root) || target.startsWith(path.resolve(root) + path.sep);
+os.homedir = () => config.home;
+os.userInfo = () => ({ homedir: config.home, username: 'fixture', shell: '/fixture/shell',
+  uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? 20 });
+os.hostname = () => 'fixture-host';
+// Permit the fixture and versioned module/config reads. Live checkout metadata,
+// sibling checkouts, host HOME and every write outside the fixture are refused.
+const wrapFs = (name, implementation) => (...args) => {
+    const writing = /^(write|append|mkdir|rm|unlink|chmod|rename|link|symlink)/.test(name)
+      || name === 'openSync' && (typeof args[1] === 'string' ? /[wa+]/.test(args[1])
+        : Boolean(args[1] & (fs.constants.O_WRONLY | fs.constants.O_RDWR | fs.constants.O_CREAT)));
+    const targets = /^(rename|link|symlink)/.test(name) ? args.slice(0, 2) : args.slice(0, 1);
+    for (const value of targets) {
+      if (typeof value === 'number') continue;
+      const target = path.resolve(value instanceof URL ? require('node:url').fileURLToPath(value) : String(value));
+      // judge-spawn discovers an optional Node-sibling CLI during runner import.
+      // Model its absence explicitly; never inspect the installed host toolchain.
+      if (name === 'existsSync' && target === path.join(path.dirname(process.execPath), 'claude')) return false;
+      if (inside(config.root, target)) continue;
+      // TypeScript flips the case of its own module path during import. Model a
+      // case-sensitive filesystem consistently on macOS and Linux.
+      if (!writing && !inside(config.sourceRoot, target)
+        && inside(config.sourceRoot.toLowerCase(), target.toLowerCase())) {
+        throw Object.assign(new Error('fixture-case-sensitive: ' + target), {code: 'ENOENT'});
+      }
+      const relative = path.relative(config.sourceRoot, target);
+      if (!writing && inside(config.sourceRoot, target)
+        && !relative.split(path.sep).some(part => ['.git', '.operations', '.claude'].includes(part))) continue;
+      record({ command: 'fixture-fs-refused', name, target });
+      throw new Error('fixture-fs-refused: ' + name + ' ' + target);
+    }
+    return implementation(...args);
+};
+for (const name of ['accessSync', 'existsSync', 'lstatSync', 'statSync', 'realpathSync',
+  'readFileSync', 'readdirSync', 'readlinkSync', 'openSync', 'writeFileSync', 'appendFileSync',
+  'mkdirSync', 'rmSync', 'unlinkSync', 'chmodSync', 'renameSync', 'linkSync', 'symlinkSync']) {
+  fs[name] = wrapFs(name, native[name]);
+}
+fs.realpathSync.native = wrapFs('realpathSync.native', native.realpathSync.native);
+Date.now = () => config.now;
+cp.execFileSync = (command, argv, settings = {}) => {
+const callEnv = settings.env ?? process.env;
+record({command, argv, timeout: settings.timeout, env: {
+  GH_CALLER: callEnv.GH_CALLER, GH_HOST: callEnv.GH_HOST,
+  WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: callEnv.WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS,
+  WE_GH_JSON_RETRIES: callEnv.WE_GH_JSON_RETRIES,
+}});
+let output = '';
+function out(text) { output = String(text); }
+function refuse(reason, status = 2) { throw Object.assign(new Error(reason), {status, stdout: '', stderr: reason}); }
 if (command === 'git') {
   if (config.gitFailure) refuse('fixture git read failed', 128);
   if (argv.includes('fetch')) refuse('unexpected fetch: diagnostic must be zeroWrites');
@@ -231,8 +288,7 @@ if (command === 'git') {
   if (config.ghStatus) refuse('HTTP ' + config.ghStatus, 1);
   if (config.ghExecFailure) refuse('fixture gh execution failed', 127);
   if (config.ghTimeout) {
-    ${keepAliveScript({ maxLifetimeMs: 30000 })}
-    return;
+    return nativeExec(process.execPath, [${JSON.stringify(blockedGh)}], settings);
   }
   out(config.ghOutput ?? JSON.stringify(config.body));
 } else if (command === 'scutil') out('studio');
@@ -246,10 +302,13 @@ else if (command === 'plutil') {
 else if (command === 'ps') out('4100 1 ${START}\\n');
 else if (command === 'pgrep') out('5100\\n');
 else refuse('unexpected external tool: ' + command);
-`;
-  for (const command of ['git', 'gh', 'scutil', 'plutil', 'launchctl', 'ps', 'pgrep']) {
-    fs.writeFileSync(join(h.root, 'bin', command), toolSource, { mode: 0o755 });
-  }
+return output;
+};
+for (const name of ['execSync', 'exec', 'execFile', 'spawn', 'spawnSync', 'fork']) {
+  cp[name] = () => { record({command: 'fixture-process-refused', name}); throw new Error('unexpected process API: ' + name); };
+}
+syncBuiltinESMExports();
+`);
   for (const file of fs.readdirSync(h.agents)) fs.unlinkSync(join(h.agents, file));
   fs.writeFileSync(join(h.agents, 'different-name.plist'), JSON.stringify({ Label: 'com.we.fixture',
     ProgramArguments: ['node', '/fixture/daemon-host-gate.mjs', '--', 'daemon'] }));
@@ -271,20 +330,71 @@ export function decideHostRole({ thisHost, owner, atStart }) {
 }
 `);
   for (const folder of ['runs', 'calls', 'coordination']) fs.mkdirSync(join(h.root, folder));
-  const env = { ...process.env, ...h.deps.env, OPERATION_RUNS_DIR: join(h.root, 'runs'),
+  const env = { ...h.deps.env, TMPDIR: tmpdir(), WE_TELEMETRY: '0',
+    DEVELOPER_DIR: join(h.root, 'developer-tools'),
+    WE_PLATFORM_PREFERENCES_FILE: join(h.root, 'absent-preferences.json'),
+    OPERATION_RUNS_DIR: join(h.root, 'runs'),
     WE_SHARED_RUNS_DIR: join(h.root, 'runs'), OPERATION_CALLS_DIR: join(h.root, 'calls'),
     WE_COORDINATION_ROOT: join(h.root, 'coordination'), WE_DAEMON_MANAGED_CLONE: '',
     WE_OPERATION_ALLOW_STALE: '', LANE_POOL_ROOT: join(h.root, 'unused-pool') };
-  const run = () => {
+  const calls = () => fs.readFileSync(callsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const execute = argv => {
     const before = snapshot(h.root);
-    const result = spawnSync(process.execPath, [fileURLToPath(new URL('../run.mjs', import.meta.url)),
-      'daemon-host-gate-dryrun', '--json'], { cwd: h.cwd, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1048576 });
+    const result = spawnSync(process.execPath, ['--require', preload, ...argv], {
+      cwd: h.cwd, env, encoding: 'utf8', timeout: 20000, maxBuffer: 1048576 });
     expect(result.error).toBeUndefined();
     expect(snapshot(h.root)).toEqual(before);
-    return { ...result, calls: fs.readFileSync(callsPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
+    expect(calls().filter(row => row.command.startsWith('fixture-'))).toEqual([]);
+    return { ...result, calls: calls() };
   };
-  return { ...h, run };
+  const run = (argv = ['--json']) => execute([fileURLToPath(new URL('../run.mjs', import.meta.url)),
+    'daemon-host-gate-dryrun', ...argv]);
+  const probe = (command, argv) => execute(['-e', `process.stdout.write(require('node:child_process').execFileSync(${JSON.stringify(command)}, ${JSON.stringify(argv)}, {encoding: 'utf8'}))`]);
+  const evaluate = source => execute(['-e', source]);
+  return { ...h, env, run, probe, evaluate };
 }
+
+describe('hermetic fixture boundaries', () => {
+  it('production fixture pins every OS home lookup to its throwaway HOME', () => {
+    const h = productionFixture();
+    const result = h.evaluate(`const os = require('node:os'); process.stdout.write(JSON.stringify([os.homedir(), os.userInfo().homedir]));`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([h.home, h.home]);
+  });
+
+  it('production fixture models the TypeScript casing probe as a missing file without inspecting the host filesystem', () => {
+    const h = productionFixture();
+    const source = fileURLToPath(new URL('../../../node_modules/typescript/lib/typescript.js', import.meta.url));
+    const swapped = source.replace(/[a-zA-Z]/g, c => c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase());
+    const result = h.evaluate(`try { require('node:fs').statSync(${JSON.stringify(swapped)}); process.exit(2); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; process.stdout.write('fixture-case-sensitive'); }`);
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe('fixture-case-sensitive');
+  });
+
+  it('reader fixtures inject scutil and reject every unconfigured native command', () => {
+    const h = fixture({ hostName: 'fixture-host' });
+    expect(execFileSync('scutil', ['--get', 'HostName'], {})).toBe('fixture-host');
+    expect(() => execFileSync('pgrep', ['-P', '4100'], {})).toThrow('unconfigured native command');
+    expect(h.deps.env.PATH.split(delimiter)).toEqual([join(h.root, 'bin')]);
+  });
+
+  it.each([
+    ['gh', ['api', '--hostname', 'github.com', `repos/${CONSTELLATION_REPOS.we.slug}/contents/host?ref=daemon-host-owner`], JSON.stringify({ type: 'file', encoding: 'base64', content: b64('studio\n'), sha: SHA })],
+    ['pgrep', ['-P', '4100'], '5100\n'],
+    ['launchctl', ['print', 'gui/501/com.we.fixture'], 'state = running\npid = 4100\n'],
+    ['ps', ['-o', 'pid=,ppid=,lstart=', '-p', '4100'], `4100 1 ${START}\n`],
+  ])('production fixture injects %s without host PATH, HOME, cwd or clock dependencies', (command, argv, output) => {
+    const h = productionFixture();
+    expect(h.env.PATH.split(delimiter)).toEqual([join(h.root, 'bin')]);
+    const before = snapshot(h.root);
+    const result = h.probe(command, argv);
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toBe(output);
+    expect(snapshot(h.root)).toEqual(before);
+  });
+});
 
 describe('HGD-1 main predictions and conservative pinned comparison', () => {
   it('with the live bare studio record and a valid host-id, main code reports revoke-possible for a gate with children and standby for a gate without, and names the fix', async () => {
@@ -601,8 +711,9 @@ describe('raw gh evidence and completeness', () => {
     const h = fixture();
     const child = join(h.root, 'blocked-gh.mjs');
     fs.writeFileSync(child, keepAliveScript({ maxLifetimeMs: 10000 }));
+    const native = await vi.importActual('node:child_process');
     const exec = (command, argv, settings) => command === 'gh'
-      ? execFileSync(process.execPath, [child], settings) : h.exec(command, argv, settings);
+      ? native.execFileSync(process.execPath, [child], settings) : h.exec(command, argv, settings);
     const kill = vi.spyOn(process, 'kill').mockImplementation(() => { throw new Error('op must initiate no signal'); });
     const report = await createDaemonHostGateDryrunReader({ ...h.deps, exec, timeoutMs: 200 })({});
     expectIncomplete(report, 'gh-timeout');
@@ -739,16 +850,13 @@ describe('declared operation and output', () => {
   });
 
   it('the production entrypoint recognises the op and exposes only the candidate selector, without executing tools for --help', () => {
-    const h = fixture();
-    const runner = fileURLToPath(new URL('../run.mjs', import.meta.url));
-    const result = spawnSync(process.execPath, [runner, 'daemon-host-gate-dryrun', '--help'], {
-      cwd: h.cwd, env: { ...process.env, HOME: h.home, OPERATION_RUNS_DIR: join(h.root, 'runs'),
-        OPERATION_CALLS_DIR: join(h.root, 'calls') }, encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024,
-    });
+    const h = productionFixture();
+    const result = h.run(['--help']);
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr + result.stdout).toBe(0);
     expect(result.stdout).toContain('--candidates');
     expect(result.stdout).not.toContain('--timeout');
+    expect(result.calls).toEqual([]);
   });
 
   it('production entrypoint with an expired freshness cache does no fetch, writes no cache/runs/calls/host-id, and prints the exact report with exit 0', () => {
