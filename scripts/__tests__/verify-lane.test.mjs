@@ -92,6 +92,24 @@ function runVerify(gate) {
 }
 
 describe('verify-lane writer — overlapping-runs race (#2833 finding 1)', () => {
+  it.each(['running', 'green', 'red'])('run A finishing cannot settle or overwrite run B at the same HEAD (B=%s)', status => {
+    const gateScript = join(dir, 'gate.mjs');
+    const replacement = join(dir, '.git', 'replacement-marker');
+    writeFileSync(gateScript, `import { readFileSync, writeFileSync } from 'node:fs';
+const path = ${JSON.stringify(marker())};
+const own = JSON.parse(readFileSync(path, 'utf8'));
+if (!own.runId || own.status !== 'running') throw new Error('run A did not publish its identity');
+const bytes = JSON.stringify({ ...own, runId: 'run-B', status: ${JSON.stringify(status)}, exitCode: ${status === 'running' ? 'null' : status === 'green' ? '0' : '1'} }) + '\\n';
+writeFileSync(path, bytes);
+writeFileSync(${JSON.stringify(replacement)}, bytes);
+`);
+    const { code, json } = runVerify(`node ${gateScript}`);
+    expect(code).toBe(3);
+    expect(json).toMatchObject({ status: 'superseded', reason: 'superseded', exitCode: 0 });
+    expect(readFileSync(marker())).toEqual(readFileSync(replacement));
+    expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ runId: 'run-B', sha: headSha(), status });
+  });
+
   it('a slow GREEN run at X refuses to stamp green over a RED record for Y (no false-green)', () => {
     // Gate = a mid-run "overlapping run B" that claims the marker with red-Y, then exits 0 (this run's suites pass).
     const redY = JSON.stringify({ sha: OTHER_SHA, status: 'red', startedAt: '2026-08-02T00:00:00.000Z', finishedAt: '2026-08-02T00:01:00.000Z', suites: 'gate', exitCode: 2 });

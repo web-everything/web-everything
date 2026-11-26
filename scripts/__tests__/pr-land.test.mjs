@@ -1274,3 +1274,27 @@ describe('accepted-head carry — a fresh hold verdict must not re-hold a PR alr
     expect(decideHoldReadyStrip(REVIEW_LABELS.pending, [REVIEW_LABELS.accepted, REVIEW_LABELS.human], { acceptedAtHead: true }).held).toBe(true);
   });
 });
+
+describe('S1 label-time evidence freshness', () => {
+  const snapshot = { source: 'local', bytesDigest: 'digest-A', record: { runId: 'A' } };
+  const decision = { ok: true, status: 'green', reason: 'verified' };
+  const inputs = { headSha: 'a'.repeat(40), policyKey: 'b'.repeat(64), gatePlan: { command: 'gate' }, treeHash: 'c'.repeat(64), cleanTree: true };
+  it('L-receipt-snapshot: receipt captures the validated snapshot, never a second read', () => {
+    const receipt = prLand.makeVerifyReceipt({ snapshot, verdict: decision, inputs, refSha: inputs.headSha });
+    snapshot.record = { runId: 'B' };
+    expect(receipt).toMatchObject({ source: 'local', bytesDigest: 'digest-A', runId: 'A' });
+    expect(prLand.revalidateVerifyReceipt(receipt, { snapshot: { ...snapshot, bytesDigest: 'digest-B' }, inputs, verdict: decision }).ok).toBe(false);
+  });
+  it.each(['headSha', 'policyKey', 'gatePlan', 'treeHash', 'cleanTree'])('fresh inputs before every label: %s', field => {
+    const receipt = prLand.makeVerifyReceipt({ snapshot, verdict: decision, inputs, refSha: inputs.headSha });
+    const changed = { ...inputs, [field]: field === 'cleanTree' ? false : 'changed' };
+    expect(prLand.revalidateVerifyReceipt(receipt, { snapshot, inputs: changed, verdict: decision }).ok).toBe(false);
+  });
+  it('unchanged evidence passes; deletion, unreadable and changed CI IDs refuse', () => {
+    const receipt = prLand.makeVerifyReceipt({ snapshot, verdict: decision, inputs, refSha: inputs.headSha });
+    expect(prLand.revalidateVerifyReceipt(receipt, { snapshot, inputs, verdict: decision }).ok).toBe(true);
+    expect(prLand.revalidateVerifyReceipt(receipt, { snapshot: null, inputs, verdict: decision }).ok).toBe(false);
+    const ci = prLand.makeVerifyReceipt({ snapshot: null, verdict: { ok: true, reason: 'ci-verified', ciSources: [{ runId: 1 }] }, inputs, refSha: inputs.headSha });
+    expect(prLand.revalidateVerifyReceipt(ci, { inputs, verdict: { ok: true, reason: 'ci-verified', ciSources: [{ runId: 2 }] } }).ok).toBe(false);
+  });
+});

@@ -79,6 +79,7 @@ import { VERIFY_DAEMON_LEASE_KEY } from '../skills-src/conveyor/verify-daemon.mj
 import { signalVerifyRequest } from './lib/fix-handoff.mjs';
 import { readLockEntry } from './readiness/file-locks.mjs';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createFailureCollector, mergeFailureDetails } from './lib/verify-failures.mjs';
 import { createOutputTail } from './lib/output-tail.mjs';
 import { isolatedRetryArgv, isolatedRetryFailures, describeIsolatedRetry, isolatedRetryAudit, FLAKY_OUTSIDE_DIFF, STILL_RED_IN_ISOLATION, MAX_TIMEOUT_LOG_BYTES, retryFailedPhase, appendTestFlake, scanFailureDiagnostic, FLAKY_RETRIED_GREEN } from './lib/gate-timeout-retry.mjs';
@@ -722,7 +723,8 @@ if (MODE === 'request') {
   }
 }
 
-if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, ...gateAudit, runId: typeof flags['run-id'] === 'string' ? flags['run-id'] : undefined }), ...(FORCE_LOCAL ? { local: true } : {}) });
+const ownRunId = typeof flags['run-id'] === 'string' ? flags['run-id'] : randomUUID();
+if (MODE !== 'run') writeMarker({ ...verifyStartBody({ sha: headSha, suites: GATE, startedAt: new Date().toISOString(), treeHash: currentTreeHash, ...gateAudit, runId: ownRunId }), ...(FORCE_LOCAL ? { local: true } : {}) });
 
 // #3105 — `request` stops HERE: the marker is stamped, nothing has run yet, and this call already returns
 // (`emit` calls `process.exit`). The actual suite run is picked up by `scripts/conveyor/verify-dispatch.mjs`
@@ -1430,18 +1432,19 @@ if (MODE === 'run') {
 //    (a) stamp OUR sha (`headSha`, captured at start) — NOT re-read the on-disk marker's sha, or a slow run
 //        finishing at X copies a newer run's sha Y onto its green and publishes a false green for Y; and
 //    (b) refuse to overwrite a marker whose sha is not ours — an older/overlapping run must never clobber a
-//        newer run's record (compare-and-set on the sha). A slow GREEN run at X must NOT stamp green over a
+//        newer run's record (compare-and-set on the sha and runId). A slow GREEN run at X must NOT stamp green over a
 //        RED record for Y.
 const onDisk = readMarker();
 // A dispatched run may finish before the next supersession sweep. Its verdict cannot answer
 // a replacement request with a different execution policy, even at the very same HEAD/tree.
 const policySuperseded = DISPATCHED_RUN && onDisk && !onDisk.corrupt
   && (onDisk.local === true) !== FORCE_LOCAL;
-if (onDisk && !onDisk.corrupt && onDisk.sha && (onDisk.sha !== headSha || policySuperseded)) {
+const runSuperseded = onDisk && !onDisk.corrupt && onDisk.runId !== ownRunId;
+if (onDisk && !onDisk.corrupt && onDisk.sha && (onDisk.sha !== headSha || policySuperseded || runSuperseded)) {
   emit(
     {
       sha: headSha, status: 'superseded', reason: 'superseded', exitCode, ...redCauseFields,
-      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)}${policySuperseded ? ' with a different local policy' : ''} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
+      detail: `suites finished (exit ${exitCode}) for ${headSha.slice(0, 8)}, but the on-disk marker now belongs to ${String(onDisk.sha).slice(0, 8)}${policySuperseded ? ' with a different local policy' : ''}${runSuperseded ? ' with a different run identity' : ''} (an overlapping verify-lane run) — refusing to overwrite it; no marker written for this run.`,
     },
     3,
   );

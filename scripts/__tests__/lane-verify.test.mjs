@@ -1304,3 +1304,11 @@ it('markerNonceSuffix formats a hex nonce and fails closed to empty on anything 
     expect(markerNonceSuffix(bad)).toBe('');
   }
 });
+
+describe('S1 own-run authority fields', () => {
+  it('finish explicit null never inherits a concurrent run identity', () => {
+    const prev = { sha: SHA, runId: 'B', policyKey: 'b'.repeat(64), policyInputs: { v: 2 }, gatePlan: { command: 'B' }, treeHash: 'c'.repeat(64) };
+    const result = verifyFinishBody(prev, { sha: SHA, runId: 'A', policyKey: null, policyInputs: null, gatePlan: null, treeHash: null, exitCode: 1 });
+    expect(result).toMatchObject({ v: 2, writer: 'verify-lane', runId: 'A', policyKey: null, policyInputs: null, gatePlan: null, treeHash: null });
+  });
+});

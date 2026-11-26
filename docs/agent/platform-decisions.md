@@ -2538,6 +2538,25 @@ central gate), so this is a clean file-local-fast vs global-authoritative split,
 best-effort; report `we:reports/2026-06-28-gate-location-lane-central.md`). Under parent #1933 (the parallel-batch
 pipeline); lane fast-fail build = follow-up #1939. Reuses the #1159 gate-partition (`we:scripts/check-standards.mjs:1385-1410`).
 
+### Local marker landing evidence
+
+Local marker evidence may certify committed landing only when its internally consistent result and explicit own-run identity match the exact committed HEAD, current effective verification policy, executed gate and clean tree, with the same evidence freshly revalidated before labeling; preparation evidence alone cannot certify landing.
+
+Local v2 records carry explicit writer, runId, policyKey, versioned policyInputs, gatePlan and treeHash.
+Consistency errors precede version/schema errors; invalid or corrupt records refuse even with CI or opt-out
+(break-glass remains explicit). Legacy and missing proof are unverified. Green and red-preexisting authority
+both require current policy, executed plan, exact HEAD and clean matching tree, in that order. Shared
+projections cannot grant local authority. A bounded local snapshot supplies both parsed evidence and its digest;
+label-time revalidation must preserve that receipt and refresh all decision inputs before each add attempt.
+Unknown, unreadable or oversized evidence asks the operator to rerun verification or inspect/quarantine the
+marker. The payload limit is 1 MiB with one overflow sentinel byte, including short-read retries.
+
+Producers publish only their own captured identity, explicitly null on unavailable or changed inputs, and
+compare runId before settlement. A green ledger entry can narrow selection only for a validated non-null
+policy key and default executed plan after successful clean, non-skipped marker publication. Dirty unchanged
+preparation/cache evidence may resume work; it grants no committed landing authority. Existing required CI
+remains authoritative; sampling is neither continuous integrity nor atomic remote labeling.
+
 ### Merge-risk = optimistic-by-default, lock only the irreducible shared set, derived static ∪ dynamic {#merge-risk-optimistic-with-targeted-lock}
 
 In the same lane-to-central pipeline, a lane must **reserve (pre-lock) a file before editing it iff** the file is on a **static denylist OR ≥2 active lanes' probed touch-sets both name it** (static ∪ dynamic double-declaration); everything else relies on optimistic git-merge, with a merge conflict as the last-resort backstop (replay that lane serially). Optimism is the floor — pessimism is added *only* where a wrong guess is expensive — because the DB literature ("combine optimistic + pessimistic"), the merge-queue/monorepo "serialize only the shared scope" critique, and WE's already-disjoint **per-entry registries** ([#1145/#1146/#1157](backlog-workflow.md)) all converge there. The static set is **derived by category, not a fixed file list** (the list is operational and drifts): a candidate shared file is (①) a **splittable collection** → split to per-entry, leaves the lock-set; (②) **purely-derived** (a deterministic generator reproduces it from source) → regenerate-on-merge, leaves the lock-set; or (③) an **irreducible residual** (structured registration doc / hand-curated *sweep input* / hand-authored prose) → **locked**. **③ excludes flat config (#1952/#2149 Fork 1):** a **flat, developer-unique-keyed config** (`tsconfig.json`, `vite.config.mts`, `vitest.config.ts`) merges optimistically — distinct-line edits are trustworthy and a genuine clash is a real git conflict — so it is **not** ③. A **keyed manifest** (`package.json`) is likewise optimistic, *not* locked: its only clean-but-wrong class is two lanes adding the **same key** (order is irrelevant to npm; distinct-key adds merge clean and correct), which is fully enumerable and machine-checkable — so it rides the floor behind a **deterministic duplicate-key merge-gate lint** (`validateNoDuplicateManifestKeys`, run by check:standards on the merged tree), per the hookable-vs-judgment rule (a script-decidable class gets a hook, not a lock). What **stays ③** is a **registration monolith** (`.eleventy.js`: same-name / ordering-sensitive `addFilter`/`addShortcode`/… registrations clean-merge into a silent last-wins and are **not** deterministically lintable) — locked until a proven fragment split moves it to ① (order-insensitivity established, per #2149 Fork 2). The discriminator for ②-vs-③ is *purity*: a `lastSwept`/`selectionCriteria`-style **curated** artifact is **not** purely-derived (no generator reproduces a human's curation) and stays locked; a hand-authored doc with an embedded auto-generated block is **locked prose + a regenerated sub-block**, never a wholesale regenerate. The dynamic layer extends coverage to the unenumerable long tail (ordinary `*.ts`/`*.njk`/shared-test overlaps the static list can't name); a static-only interim re-exposes optimism on that *common* surface, so dynamic-B ships **promptly**, not deferred.

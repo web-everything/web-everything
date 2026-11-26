@@ -196,15 +196,15 @@ describe('verify-lane --local', () => {
     expect(end).toBeGreaterThan(start);
     const emit = vi.fn(() => { throw new Error('superseded exit'); });
     const context = {
-      DISPATCHED_RUN: true, FORCE_LOCAL: local, headSha: 'head', exitCode: 0, redCauseFields: {}, emit,
-      readMarker: () => ({ status: 'running', sha: 'head', ...(!local ? { local: true } : {}) }),
+      DISPATCHED_RUN: true, FORCE_LOCAL: local, ownRunId: 'policy-run', headSha: 'head', exitCode: 0, redCauseFields: {}, emit,
+      readMarker: () => ({ status: 'running', sha: 'head', runId: 'policy-run', ...(!local ? { local: true } : {}) }),
     };
     expect(() => runInNewContext(source.slice(start, end), context)).toThrow('superseded exit');
     expect(emit).toHaveBeenCalledWith(expect.objectContaining({ status: 'superseded' }), 3);
     emit.mockClear();
     for (const policy of local ? [true] : [false, undefined]) {
       runInNewContext(source.slice(start, end), { ...context,
-        readMarker: () => ({ status: 'running', sha: 'head', local: policy }),
+        readMarker: () => ({ status: 'running', sha: 'head', runId: 'policy-run', local: policy }),
       });
     }
     expect(emit).not.toHaveBeenCalled();
@@ -213,7 +213,7 @@ describe('verify-lane --local', () => {
   it.each([false, true])('request marker preserves parsed --local through daemon dispatch to the executing CLI (local=%s)', async local => {
     const startLine = source.split('\n').find(line => line.startsWith("if (MODE !== 'run') writeMarker("));
     const context = {
-      MODE: 'request', process: { env: {} }, verifyStartBody: value => value,
+      MODE: 'request', ownRunId: 'request-run', process: { env: {} }, verifyStartBody: value => value,
       headSha: 'head', GATE: selectedTests, currentTreeHash: 'tree', writeMarker: vi.fn(), gateAudit: {},
     };
     parseCli(context, local);
@@ -278,7 +278,7 @@ describe('verify-lane --local', () => {
     expect(finishLine).toBeTypeOf('string');
     const writeMarker = vi.fn();
     const context = {
-      MODE: 'verify', writeMarker, process: { env: {} },
+      MODE: 'verify', ownRunId: 'verify-run', writeMarker, process: { env: {} },
       verifyStartBody: value => value, headSha: 'head', GATE: 'gate', currentTreeHash: 'tree', flags: {}, gateAudit: {},
       finished: { status: 'green' }, overallRunLocation: () => ({ location: 'local' }), ranOnPhases: {},
       resolvedGate: null, redCauseFields: {}, phases: {}, revertRed: null,

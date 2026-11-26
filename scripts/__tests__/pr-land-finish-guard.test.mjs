@@ -329,3 +329,34 @@ describe('finish-guard shared readMarker wiring', () => {
     expect(finishArgs).toMatch(/headSha: refSha, remote: REMOTE, base: BASE/);
   });
 });
+
+// S1 landing authority is distinct from the historical WIP/carry-forward fixtures above.
+describe('S1 atomic local landing', () => {
+  const sha = 'a'.repeat(40), policyKey = 'b'.repeat(64), treeHash = 'c'.repeat(64);
+  const gatePlan = { command: 'gate', mode: 'selected', selectionMode: 'pr', deltaBase: null };
+  const record = () => ({ v: 2, writer: 'verify-lane', runId: 'A', sha, status: 'green', exitCode: 0,
+    policyKey, policyInputs: null, gatePlan, treeHash });
+  const landing = { policyKey, gatePlan, treeHash, cleanTree: true };
+  const decide = (rec = record(), extra = {}) => resolveFinishGuardVerdict({ headSha: sha,
+    readMarker: () => rec, landingContext: landing, ...extra });
+  it('atomic-v1-no-shadow-bypass: complete non-null v2 passes and null-key refuses', () => {
+    expect(decide()).toMatchObject({ ok: true, reason: 'verified' });
+    expect(decide({ ...record(), policyKey: null })).toMatchObject({ ok: false, reason: 'stale:producer-key-null' });
+  });
+  it.each([{ requireVerified: false }, { ciOnly: { ok: true } }, { ciCheckRuns: [] }])('invalid-never-substitutes %j', extra => {
+    expect(decide({ ...record(), exitCode: 1 }, extra)).toMatchObject({ ok: false, reason: 'invalid:exit-status' });
+  });
+  it('break-glass is the first explicit override', () => {
+    expect(decide({ corrupt: true }, { breakGlass: true }).reason).toBe('break-glass');
+  });
+  it('L-head pins key/plan before varying head; explicit mismatch follows key checks', () => {
+    expect(decide({ ...record(), sha: 'd'.repeat(40) }).reason).toBe('stale:other-head');
+    expect(decide(record(), { landingContext: { ...landing, cleanTree: false } }).reason).toBe('stale:tree-mismatch');
+    const rec = { ...record(), gateExplicit: true, gatePlan: { ...gatePlan, command: 'other' } };
+    expect(decide(rec).reason).toBe('stale:gate-explicit');
+    expect(decide({ ...rec, policyKey: null }).reason).toBe('stale:producer-key-null');
+  });
+  it('L-input-failure: thrown identity reads are unavailable proof', () => {
+    expect(decide(record(), { landingContext: () => { throw new Error('unreadable'); } })).toMatchObject({ ok: false, reason: 'stale:consumer-key-unavailable' });
+  });
+});
