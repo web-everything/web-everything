@@ -179,7 +179,7 @@ export function buildCandidates(prs, {
  * `we:scripts/lib/rebase-drop-manifest.mjs#rebaseDropManifest` — never a second rebase implementation. Reports
  * `rebaseDropManifest`'s own `action` verbatim (`'rebased'` / `'current'` / `'skip'` / `'error'`) so a reader can
  * tell "refreshed" apart from "was already current" apart from "hit a real conflict, left for a human".
- * The sink guard: when the caller names the PR (`prNumber`), it must be provably same-repo
+ * The sink guard: the caller must name the PR, repo and head; the PR must be provably same-repo
  * ({@link sameRepoRefusal}) before anything is rebased or pushed — a fork PR, or one whose head name merely
  * shadows a same-repo lane, would otherwise have `origin/<laneRef>` (someone else's branch) force-pushed.
  * @param {string} laneRef
@@ -190,10 +190,12 @@ export function refreshOntoMain(laneRef, {
   root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest,
   prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository,
 } = {}) {
-  if (prNumber !== null) {
-    const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
-    if (refused) return refused;
-  }
+  const defer = error => ({ ok: false, action: 'refresh', deferred: true, error: `${error}; retry next tick after restoring the missing fact` });
+  if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return defer('missing or invalid prNumber');
+  if (typeof repo !== 'string' || repoKeyForSlug(repo) === null) return defer('missing or unknown repo');
+  if (typeof laneRef !== 'string' || !laneRef.trim()) return defer('missing or unreadable head ref');
+  const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
+  if (refused) return refused;
   const result = rebase({ laneRef, base, cwd: root });
   if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
@@ -263,6 +265,7 @@ export function sweepCiRedRecovery({
   // least-recently-attempted. null = no memory (the plan's own order); the CLI wires the file-backed one.
   applyLedger = null,
 } = {}) {
+  let ledgerError = null;
   const tickStartedAt = now();
   const retrySettings = exhaustedRetrySettings ?? resolveExhaustedRetry();
   const prs = readOpenPrs({ repo, extraFields: ['labels'] });
@@ -304,7 +307,7 @@ export function sweepCiRedRecovery({
   // tick skipped first (the apply stamps alone would miss claim-held or refused PRs and starve those behind them).
   const discoveryKey = (c) => `d:${c.prNumber}`;
   let discoverySeen = {};
-  try { if (apply && applyLedger) discoverySeen = normalizeApplyLedger(applyLedger.read()).at; } catch { /* fairness only */ }
+  try { if (apply && applyLedger) discoverySeen = readApplyLedgerState(applyLedger).at; } catch (e) { ledgerError = `discovery: ${e?.message ?? e}`; }
   const discoveryOrder = rawCandidates.map((c, i) => ({ c, i, seen: discoverySeen[discoveryKey(c)] ?? 0 }))
     .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.c);
   let discoveryReads = 0;
@@ -352,12 +355,12 @@ export function sweepCiRedRecovery({
   // Only stamp when discovery actually deferred someone (the only case where fairness across ticks matters).
   if (apply && applyLedger && readPrs.size && discoveryDeferred.length) {
     try {
-      let ledger = normalizeApplyLedger(applyLedger.read());
+      let ledger = readApplyLedgerState(applyLedger);
       ledger = pruneApplyLedger(ledger, now());
       ledger.seq += 1;
       for (const pr of readPrs) { ledger.at[`d:${pr}`] = ledger.seq; ledger.ts[`d:${pr}`] = now(); }
       applyLedger.write(ledger);
-    } catch { /* fairness only */ }
+    } catch (e) { ledgerError = `discovery: ${e?.message ?? e}`; }
   }
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
@@ -386,7 +389,6 @@ export function sweepCiRedRecovery({
   const repoRoot = resolveLanePoolRepoPath(repo) ?? REPO_ROOT;
 
   const applied = [];
-  let ledgerError = null;
   if (apply) {
     // `started` counts refreshes that did work (they spend the progress floor and the per-tick cap). A deferral writes
     // nothing, so it is never counted; but its network reads cost TIME, and the time check below runs for every PR, so
@@ -400,7 +402,7 @@ export function sweepCiRedRecovery({
     // attempted, ties in the plan's own order. A PR the budget deferred without trying stays unmarked, so it leads
     // the next tick; a PR that was tried (even a slow free deferral) goes behind everything not yet tried.
     // Attempts are recorded BEFORE the refresh runs and written at once, so a sweep killed at the pass deadline
-    // mid-refresh has still moved that PR to the back. Ledger trouble only costs fairness — it never stops the sweep.
+    // mid-refresh has still moved that PR to the back. Unreadable or unwritable state defers writes until repaired.
     // The key is the PR number alone (the file is per repo): a head that moves between ticks (author push, our own
     // rebase) must not reset a PR's place. An entry also survives the PR dropping out of the plan for a tick (a
     // transient comment-read failure) — it expires only after APPLY_LEDGER_TTL_MS, and the file is capped.
@@ -422,21 +424,36 @@ export function sweepCiRedRecovery({
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
+      if (ledgerError) {
+        applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true,
+          error: `apply ledger unavailable (${ledgerError}); restore ledger access or repair its contents before retrying` });
+        continue;
+      }
       const held = checkClaim({ repo, branch: d.headRefName });
       if (!held && applyLedger) {
         // Re-read and merge (max per key) just before writing: a sweep that overlapped this one (a manual run, or a
         // slow predecessor) must not lose its stamps to this tick's older snapshot.
         const fresh = readLedger();
-        if (fresh) ledger = mergeApplyLedgers(ledger, fresh);
+        if (!fresh) {
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true,
+            error: `apply ledger unavailable (${ledgerError}); restore ledger access or repair its contents before retrying` });
+          continue;
+        }
+        ledger = mergeApplyLedgers(ledger, fresh);
         ledger = pruneApplyLedger(ledger, now());
         ledger.seq += 1;
         ledger.at[applyKey(d)] = ledger.seq;
         ledger.ts[applyKey(d)] = now();
-        try { applyLedger.write(ledger); } catch (e) { ledgerError = `write: ${e?.message ?? e}`; }
+        try { applyLedger.write(ledger); } catch (e) {
+          ledgerError = `write: ${e?.message ?? e}`;
+          applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true,
+            error: `apply ledger unavailable (${ledgerError}); restore ledger write access before retrying` });
+          continue;
+        }
       }
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
-        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
+        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo: repoSlug(repo), readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
       // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
       if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {
@@ -636,7 +653,7 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     try {
       const claimed = checkClaim({ repo, branch: c.headRefName });
       result = claimed ? { ok: false, deferred: true, error: claimed.message }
-        : decision.mode === 'rebase' ? refresh(c.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
+        : decision.mode === 'rebase' ? refresh(c.headRefName, { repo: repoSlug(repo), root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
         : trigger(c, { repo: repoSlug(repo), defaultBranch });
     } catch (e) { result = { ok: false, error: describeExecError(e) }; }
     if (!result.ok && checkClaim({ repo, branch: c.headRefName })) result = { ...result, deferred: true };
@@ -1550,7 +1567,7 @@ export function restackStackedPr(d, {
         const fetched = fetchRef(pr.baseRefName, { root });
         if (!fetched.ok) return failed(fetched.error);
       }
-      const result = refresh(pr.headRefName, { base: `origin/${pr.baseRefName}`, root });
+      const result = refresh(pr.headRefName, { base: `origin/${pr.baseRefName}`, root, prNumber: pr.prNumber ?? pr.number, repo: repoSlug(repo), readIsCrossRepository });
       if (!result.ok) return failed(result.error);
       steps.push({ prNumber: pr.prNumber ?? pr.number, headRefName: pr.headRefName, action: result.action, newCommit: result.newCommit });
     } catch (e) { return failed(describeExecError(e)); }
@@ -2099,16 +2116,30 @@ function applyLedgerPath(repo = null, home = handoffHome()) {
   return join(home, `ci-red-recovery-apply-ledger.${encodeURIComponent(repoSlug(repo))}.json`);
 }
 
+/** Missing files are first-run state; malformed persisted evidence must never be normalized into permission to push. */
+function readApplyLedgerState(ledger) {
+  const raw = ledger.read();
+  if (raw !== null && (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || !Number.isSafeInteger(raw.seq) || raw.seq < 0
+    || !raw.at || typeof raw.at !== 'object' || Array.isArray(raw.at)
+    || Object.entries(raw.at).some(([key, stamp]) => key === '__proto__' || !Number.isSafeInteger(stamp) || stamp <= 0)
+    || (raw.ts !== undefined && (!raw.ts || typeof raw.ts !== 'object' || Array.isArray(raw.ts)
+      || Object.values(raw.ts).some(time => !Number.isFinite(time)))))) {
+    throw new Error('malformed apply ledger');
+  }
+  return normalizeApplyLedger(raw);
+}
+
 /** File-backed fairness ledger for the apply loop (`{ read, write }`). Hermetic inside a test run unless a `path` is
  *  given: never the live record. A missing file reads as empty; any other read error propagates to the sweep, which
- *  reports it as `applyLedgerError` and carries on. */
+ *  reports it as `applyLedgerError` and defers refreshes until the operator restores readable state. */
 export function createFileApplyLedger({ repo = null, path, env = process.env } = {}) {
   if (path === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) return { read: () => ({ seq: 0, at: {} }), write: () => {} };
   const file = path ?? applyLedgerPath(repo);
   return {
     read() {
       try { return JSON.parse(readFileSync(file, 'utf8')); }
-      catch (e) { if (e.code === 'ENOENT' || e instanceof SyntaxError) return null; throw e; }
+      catch (e) { if (e.code === 'ENOENT') return null; throw e; }
     },
     write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: { ...state.at }, ts: { ...state.ts } }); },
   };

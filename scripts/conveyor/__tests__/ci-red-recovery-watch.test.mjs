@@ -19,7 +19,7 @@ import {
   resolveApplyBudgetMs, resolveMaxApplyPerTick, createFileApplyLedger, normalizeApplyLedger, main,
   sweepExhaustedRetry, mergeApplyLedgers, pruneApplyLedger, APPLY_LEDGER_TTL_MS, APPLY_LEDGER_MAX_ENTRIES, APPLY_LEDGER_SEQ_REBASE,
 } from '../ci-red-recovery-watch.mjs';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
@@ -523,14 +523,15 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
   it.each([
     ['read', { read: () => { throw new Error('EACCES'); }, write: vi.fn() }],
     ['write', { read: () => null, write: () => { throw new Error('ENOSPC'); } }],
-  ])('a failing ledger %s never stops the sweep; it is reported as applyLedgerError', (kind, ledger) => {
+  ])('an unreadable ledger %s refuses refresh and reports the missing fact', (kind, ledger) => {
     const prs = [{ ...PR_2635, number: 2635, headRefName: 'lane/e1' }];
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
     const result = sweepCiRedRecovery({
       readOpenPrs: () => prs, readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33, readComments: () => [],
       refresh, postComment: vi.fn(), apply: true, applyLedger: ledger,
     });
-    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(result.applied[0]).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/ledger/) });
     expect(result.applyLedgerError).toMatch(new RegExp(`^${kind}:`));
   });
 
@@ -592,7 +593,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
       expect(Object.keys(p.at).sort()).toEqual(['2', '3']);
     });
 
-    it('round-trips through a file; a missing or corrupt file reads as nothing', () => {
+    it('round-trips through a file; missing is empty but corrupt is unreadable', () => {
       const dir = mkdtempSync(join(tmpdir(), 'apply-ledger-'));
       try {
         const path = join(dir, 'ledger.json');
@@ -601,7 +602,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
         ledger.write({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         writeFileSync(path, '{not json');
-        expect(ledger.read()).toBeNull();
+        expect(() => ledger.read()).toThrow();
       } finally { rmSync(dir, { recursive: true, force: true }); }
     });
 
@@ -760,22 +761,23 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
 });
 
 describe('ci-red-recovery-watch — refreshOntoMain', () => {
+  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false };
   it('delegates to rebaseDropManifest and reports its action verbatim on success', () => {
     const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'abc123' }));
     // #2811 — `newCommit` now threaded through verbatim (the apply loop's own re-verify/re-arm step needs it).
-    expect(refreshOntoMain('lane/xdzl6mb', { root: '/repo', base: 'origin/main', rebase })).toEqual({ ok: true, action: 'rebased', newCommit: 'abc123' });
+    expect(refreshOntoMain('lane/xdzl6mb', { ...verified, root: '/repo', base: 'origin/main', rebase })).toEqual({ ok: true, action: 'rebased', newCommit: 'abc123' });
     expect(rebase).toHaveBeenCalledWith({ laneRef: 'lane/xdzl6mb', base: 'origin/main', cwd: '/repo' });
   });
 
   it('reports action:"current" as ok — rebaseDropManifest\'s own idempotency short-circuit, not a failure', () => {
     const rebase = vi.fn(() => ({ action: 'current', newCommit: 'abc123' }));
-    expect(refreshOntoMain('lane/x', { rebase })).toEqual({ ok: true, action: 'current', newCommit: 'abc123' });
+    expect(refreshOntoMain('lane/x', { ...verified, rebase })).toEqual({ ok: true, action: 'current', newCommit: 'abc123' });
   });
 
   it('surfaces a real conflict (action:"skip") and a hard failure (action:"error") as not-ok, never force-resolved', () => {
-    expect(refreshOntoMain('lane/x', { rebase: () => ({ action: 'skip', reason: 'real conflict beyond .lane-manifest.json' }) }))
+    expect(refreshOntoMain('lane/x', { ...verified, rebase: () => ({ action: 'skip', reason: 'real conflict beyond .lane-manifest.json' }) }))
       .toEqual({ ok: false, action: 'skip', error: 'real conflict beyond .lane-manifest.json' });
-    expect(refreshOntoMain('lane/x', { rebase: () => ({ action: 'error', reason: 'push failed' }) }))
+    expect(refreshOntoMain('lane/x', { ...verified, rebase: () => ({ action: 'error', reason: 'push failed' }) }))
       .toEqual({ ok: false, action: 'error', error: 'push failed' });
   });
 });
@@ -2665,12 +2667,12 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
       expect(watch.defaultReadIsCrossRepository(4825, { repo: 'we', exec })).toBe(false);
       expect(exec.mock.calls[1][1]).toContain('web-everything/web-everything');
     });
-    it('recovers a same-repository PR when repo is omitted', () => {
+    it('refuses a refresh when repo is omitted', () => {
       const exec = vi.fn(() => 'false\n');
       const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'abc' }));
       const result = watch.refreshOntoMain('lane/x', { prNumber: 4825, rebase, readIsCrossRepository: (n, o) => watch.defaultReadIsCrossRepository(n, { ...o, exec }) });
-      expect(rebase).toHaveBeenCalledTimes(1);
-      expect(result).toMatchObject({ ok: true, action: 'rebased' });
+      expect(rebase).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/repo/) });
     });
   });
   it.each(['current', 'fetch-error', 'refresh-error', 'race', 'quoted', 'cycle', 'depth'])('bounds restack failure: %s', kind => {
@@ -2754,7 +2756,7 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
         const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'n' }));
         const postComment = vi.fn();
         const result = sweepCiRedRecovery({ apply: true, readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33,
-          readComments: () => [], checkClaim: () => null,
+          readComments: () => [], checkClaim: () => null, repo,
           readIsCrossRepository: reader, refresh: (ref, o) => refreshOntoMain(ref, { ...o, rebase }), postComment });
         expect(result.dispatch).toHaveLength(1);
         expect(rebase).not.toHaveBeenCalled();
@@ -2858,5 +2860,60 @@ describe('ci-red-recovery-watch — fixture credential hygiene', () => {
     expect(m.credentialBufferFinding(content)).toBeNull();
     expect(m.credentialContentFinding(Buffer.from(rel), content)).toBeNull();
     expect(() => m.manifestEntry(Buffer.from(rel), content, false, true)).not.toThrow();
+  });
+});
+
+
+describe('CI-RED-RECOVERY-REBASE-FAILOPEN', () => {
+  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false };
+  it('refresh with no prNumber or an unreadable isCrossRepository refuses and never rebases', () => {
+    for (const options of [
+      { ...verified, prNumber: null }, { ...verified, prNumber: undefined },
+      { ...verified, prNumber: 0 }, { ...verified, readIsCrossRepository: () => null },
+      { ...verified, readIsCrossRepository: () => { throw new Error('unreadable'); } },
+    ]) {
+      const rebase = vi.fn(() => ({ action: 'rebased' }));
+      expect(refreshOntoMain('lane/x', { ...options, rebase })).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/prNumber|verified/) });
+      expect(rebase).not.toHaveBeenCalled();
+    }
+  });
+  it.each([null, '', 'unknown'])('missing or unknown repo %s refuses before reading or rebasing', repo => {
+    const rebase = vi.fn();
+    const readIsCrossRepository = vi.fn(() => false);
+    expect(refreshOntoMain('lane/x', { ...verified, repo, rebase, readIsCrossRepository })).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/repo/) });
+    expect(readIsCrossRepository).not.toHaveBeenCalled();
+    expect(rebase).not.toHaveBeenCalled();
+  });
+  it.each([null, undefined, '', '   '])('unreadable head %s refuses and never rebases', head => {
+    const rebase = vi.fn();
+    expect(refreshOntoMain(head, { ...verified, rebase })).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/head/) });
+    expect(rebase).not.toHaveBeenCalled();
+  });
+  it.each(['initial read', 'reread', 'malformed'])('unreadable ledger at %s refuses without refresh or comment', failure => {
+    let reads = 0;
+    const applyLedger = { read: () => {
+      reads += 1;
+      if (failure === 'malformed') return { at: [] };
+      if (failure === 'initial read' || reads > 1) throw new Error('EACCES');
+      return { seq: 0, at: {} };
+    }, write: vi.fn() };
+    const refresh = vi.fn();
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({ repo: verified.repo, apply: true, applyLedger,
+      readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33,
+      readComments: () => [], checkClaim: () => null, refresh, postComment });
+    expect(result.applied[0]).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/ledger/) });
+    expect(formatReport(result)).toMatch(/ledger/);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(postComment).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['we', 'web-everything/web-everything'], ['frontierui', 'frontier-ui/frontierui'], ['plateau-app', 'plateauapp/plateau-app'],
+  ])('the %s plist selects a pass that supplies its own --repo', async (key, slug) => {
+    const { DAEMON_MANIFEST } = await import('../../../skills-src/conveyor/daemon-manifest.mjs');
+    const xml = readFileSync(join(REPO_ROOT, `skills-src/conveyor/launchd/com.we.conveyor-pass-daemon.ci-red-recovery-watch-${key}.plist.example`), 'utf8');
+    const pass = xml.match(/<string>--pass=([^<]+)<\/string>/)?.[1];
+    expect(pass).toBe(`ci-red-recovery-watch-${key}`);
+    expect(DAEMON_MANIFEST[pass].args).toContain(`--repo=${slug}`);
   });
 });
