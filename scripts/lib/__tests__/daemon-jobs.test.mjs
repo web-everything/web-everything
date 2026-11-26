@@ -313,6 +313,57 @@ function watchFixture() {
 }
 
 describe('weekly tool version advisory', () => {
+  it('missing inventory with positive outdated evidence stays unknown and keeps an active episode', async () => {
+    const { io, inventory, state } = watchFixture();
+    const job = createToolVersionWatch(io);
+    await job.tick({ now: T0 });
+    inventory.casks.shift();
+    const result = await job.tick({ now: T0 + WEEK });
+    expect(result.tools[0]).toMatchObject({ status: 'unknown', diagnostic: expect.stringMatching(/inspect.*Homebrew/i) });
+    expect(state().episodes['antigravity-cli']).toBeTruthy();
+    expect(io.alert).toHaveBeenCalledTimes(2);
+  });
+
+  it('a string-valued formula installed field is unknown and alerts', async () => {
+    const { io, inventory } = watchFixture();
+    inventory.formulae[0].installed = '2.80.0';
+    const result = await createToolVersionWatch(io).tick({ now: T0 });
+    expect(result.tools[2]).toMatchObject({ status: 'unknown', diagnostic: expect.stringMatching(/inspect.*Homebrew/i) });
+    expect(io.alert.mock.calls.some(([event]) => event.tool === 'gh')).toBe(true);
+  });
+
+  it.each(['formula', 'cask'])('outdated evidence under the other type refuses a current %s', async type => {
+    const { io, outdated } = watchFixture();
+    const tool = type === 'formula' ? 'gh' : 'codex';
+    outdated[type === 'formula' ? 'casks' : 'formulae'].push({
+      name: `vendor/tap/${tool}`, installed_versions: ['old'], current_version: 'new',
+    });
+    const result = await createToolVersionWatch(io).tick({ now: T0 });
+    expect(result.tools.find(item => item.tool === tool)).toMatchObject({ status: 'unknown', diagnostic: expect.stringMatching(/inspect.*Homebrew/i) });
+    expect(io.alert.mock.calls.some(([event]) => event.tool === tool)).toBe(true);
+  });
+
+  it.each(['outdated', 'unknown'])('identical %s after recovery publishes a distinct episode across restarts', async status => {
+    const { io, inventory, outdated, state } = watchFixture();
+    const published = new Set();
+    io.alert.mockImplementation(async event => { published.add(event.episode); });
+    if (status === 'unknown') inventory.casks[0].installed = null;
+    await createToolVersionWatch(io).tick({ now: T0 });
+    const original = state().episodes['antigravity-cli'];
+    await createToolVersionWatch(io).tick({ now: T0 + WEEK });
+    expect(published.size).toBe(1);
+    inventory.casks[0].installed = '1.5.16';
+    outdated.casks = [];
+    await createToolVersionWatch(io).tick({ now: T0 + 2 * WEEK });
+    inventory.casks[0].installed = status === 'unknown' ? null : '1.5.11';
+    outdated.casks = [{ name: 'antigravity-cli', installed_versions: ['1.5.11'], current_version: '1.5.16' }];
+    await createToolVersionWatch(io).tick({ now: T0 + 3 * WEEK });
+    expect(state().episodes['antigravity-cli']).not.toBe(original);
+    expect(published.size).toBe(2);
+    await createToolVersionWatch(io).tick({ now: T0 + 4 * WEEK });
+    expect(io.alert).toHaveBeenCalledTimes(2);
+  });
+
   it('weekly CLI watch reports outdated and unknown without self-updating', async () => {
     const { io } = watchFixture();
     const job = createToolVersionWatch(io);

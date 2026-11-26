@@ -409,7 +409,9 @@ export function createToolVersionWatch({ exec, withLock, readState, writeState, 
           state = await readState();
           if (state !== null && (!Number.isSafeInteger(state?.nextDueAt) || state.nextDueAt < 0 ||
             !state.episodes || typeof state.episodes !== 'object' || Array.isArray(state.episodes) ||
-            Object.entries(state.episodes).some(([tool, id]) => !Object.hasOwn(WATCHED_TOOLS, tool) || !/^[a-f0-9]{64}$/.test(id))))
+            Object.entries(state.episodes).some(([tool, id]) => !Object.hasOwn(WATCHED_TOOLS, tool) || !/^[a-f0-9]{64}$/.test(id)) ||
+            (state.recoveries !== undefined && (!state.recoveries || typeof state.recoveries !== 'object' || Array.isArray(state.recoveries) ||
+              Object.entries(state.recoveries).some(([tool, id]) => !Object.hasOwn(WATCHED_TOOLS, tool) || !/^[a-f0-9]{64}$/.test(id))))))
             throw new Error('invalid state');
         } catch {
           throw new Error('Inspect tool-version-watch state; unreadable or invalid evidence requires operator repair before retry.');
@@ -423,28 +425,33 @@ export function createToolVersionWatch({ exec, withLock, readState, writeState, 
           const base = { tool, provenance: 'homebrew', installed: [], latest: null, package: null, type: null };
           const unknown = diagnostic => ({ ...base, status: 'unknown', diagnostic });
           if (!inventory.data || !outdated.data) return unknown(inventory.diagnostic ?? outdated.diagnostic);
+          const matchesTool = row => [row.name, row.token, row.full_name, row.full_token,
+            ...(Array.isArray(row.aliases) ? row.aliases : [])]
+            .some(name => typeof name === 'string' && aliases.includes(name.split('/').at(-1)));
+          const stale = [];
+          for (const [type, rows] of [['formula', outdated.data.formulae], ['cask', outdated.data.casks]]) {
+            for (const row of rows) if (matchesTool(row)) stale.push({ type, row });
+          }
           const matches = [];
           for (const [type, rows] of [['formula', inventory.data.formulae], ['cask', inventory.data.casks]]) {
             for (const row of rows) {
-              const names = [row.name, row.token, row.full_name, row.full_token, ...(Array.isArray(row.aliases) ? row.aliases : [])];
-              if (names.some(name => typeof name === 'string' && aliases.includes(name.split('/').at(-1)))) matches.push({ type, row });
+              if (matchesTool(row)) matches.push({ type, row });
             }
           }
+          if (matches.length === 0 && stale.length) return unknown('Inspect Homebrew inventory and outdated output; package presence conflicts.');
           if (matches.length === 0) return { ...base, status: 'not-installed', diagnostic: 'Not installed through Homebrew; other installation managers are outside this inventory.' };
           if (matches.length !== 1) return unknown('Inspect Homebrew inventory; multiple packages match this tool.');
           const { type, row } = matches[0];
           base.type = type;
           base.package = type === 'formula' ? row.full_name ?? row.name : row.full_token ?? row.token;
-          base.installed = type === 'formula' && Array.isArray(row.installed) ? row.installed.map(item => item?.version) : [row.installed];
+          base.installed = type === 'formula' ? (Array.isArray(row.installed) ? row.installed.map(item => item?.version) : []) : [row.installed];
           base.latest = type === 'formula' ? row.versions?.stable : row.version;
           const validVersion = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
           if (!base.installed.length || !base.installed.every(validVersion) || !validVersion(base.latest))
             return unknown('Inspect Homebrew inventory; installed or latest version is incomplete.');
-          const stale = (type === 'formula' ? outdated.data.formulae : outdated.data.casks).filter(item =>
-            [item.name, item.token, item.full_name, item.full_token].some(name => typeof name === 'string' && [base.package, row.name, row.token].includes(name)));
-          if (stale.length > 1 || (stale.length === 1 && (stale[0].current_version !== base.latest ||
-            !Array.isArray(stale[0].installed_versions) ||
-            JSON.stringify([...stale[0].installed_versions].sort()) !== JSON.stringify([...base.installed].sort()))))
+          if (stale.length > 1 || (stale.length === 1 && (stale[0].type !== type || stale[0].row.current_version !== base.latest ||
+            !Array.isArray(stale[0].row.installed_versions) ||
+            JSON.stringify([...stale[0].row.installed_versions].sort()) !== JSON.stringify([...base.installed].sort()))))
             return unknown('Inspect Homebrew inventory and outdated output; version evidence conflicts.');
           if (!stale.length && base.installed.some(version => version !== base.latest))
             return unknown('Inspect Homebrew inventory and outdated output; freshness is unconfirmed.');
@@ -452,7 +459,9 @@ export function createToolVersionWatch({ exec, withLock, readState, writeState, 
         });
         for (const tool of tools) {
           if (tool.status === 'outdated' || tool.status === 'unknown') {
-            const episode = createHash('sha256').update(JSON.stringify(tool)).digest('hex');
+            // Legacy records have no recovery marker and keep their original episode IDs.
+            // Chaining the last recovered ID distinguishes recurrence while keeping retries stable.
+            const episode = createHash('sha256').update(JSON.stringify(tool)).update(state.recoveries?.[tool.tool] ?? '').digest('hex');
             if (state.episodes[tool.tool] !== episode) {
               await alert({ ...tool, episode, advisory: true,
                 diagnostic: tool.diagnostic ?? `Inspect Homebrew package ${tool.package}: installed ${tool.installed.join(', ')}, latest ${tool.latest}. Upgrade manually if appropriate.` });
@@ -460,6 +469,8 @@ export function createToolVersionWatch({ exec, withLock, readState, writeState, 
               await writeState(state);
             }
           } else if (Object.hasOwn(state.episodes, tool.tool)) {
+            state.recoveries ??= {};
+            state.recoveries[tool.tool] = state.episodes[tool.tool];
             delete state.episodes[tool.tool];
             await writeState(state);
           }
