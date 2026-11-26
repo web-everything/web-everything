@@ -1,6 +1,7 @@
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import * as scope from '../../lib/fast-drain-scope.mjs';
 import { buildEnqueueArgs } from '../merge-queue-enqueue.mjs';
 import { strategyFixture, HEAD, REPO } from './fixtures/fast-drain-strategy.mjs';
@@ -187,7 +188,7 @@ test('child killed before confirmation leaves no stamp', () => {
 
 // Execute the production call sites with recording ports: these helpers own executors
 // outside the boundary, so checking the boundary helper alone misses the bypasses.
-const drainSource = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
+const drainSource = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
 function drainSection(start, end) {
   const from = drainSource.indexOf(start);
   const to = drainSource.indexOf(end, from);
