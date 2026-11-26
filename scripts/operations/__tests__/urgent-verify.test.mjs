@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 import { ciUnitPlan, ciGatePlan, urgentMarker, urgentLedger, urgentSignature, urgentKeyPath, normalizeUrgentRepo, urgentFuiRepo } from '../urgent-verify-marker.mjs';
+import * as verification from '../urgent-verify.mjs';
+import { EventEmitter } from 'node:events';
 import { createUrgentDeps, urgentVerify } from '../urgent-verify.mjs';
 import { admissionLockRoot, poolRootOf, runUnderAdmission } from '../../readiness/heavy-admission.mjs';
 import { resolveOperation } from '../run.mjs';
@@ -1215,5 +1217,81 @@ describe('urgent-verify real process-tree expiry', () => {
     const spawnSync = vi.fn(() => ({ status: 0, stdout: '' }));
     createUrgentDeps({ cwd: '/repo', env: { PATH: '/bin', HOME: '/h' }, spawnSync, maxMinutes: 10000 }).standards();
     expect(spawnSync.mock.calls[0][2].timeout).toBeLessThanOrEqual(240 * 60_000);
+  });
+});
+
+
+describe('urgent-verify graceful supervisor', () => {
+  function fixture(graceMs = 100) {
+    const child = new EventEmitter(); child.pid = 101;
+    const caller = new EventEmitter();
+    let time = 0, rows = [
+      { pid: 101, ppid: 10, pgid: 101, birth: 'child' },
+      { pid: 102, ppid: 101, pgid: 102, birth: 'grandchild' },
+      { pid: 999, ppid: 1, pgid: 999, birth: 'unrelated' },
+    ];
+    const tasks = new Map(); let sequence = 0;
+    const signals = [], records = [];
+    const io = {
+      spawn: () => child, events: caller, parent: () => 10, now: () => time,
+      inventory: () => rows.map(r => ({ ...r })),
+      signal: (group, signal) => signals.push([group, signal, time]),
+      finish: result => records.push(result),
+      schedule: (fn, delay) => { tasks.set(++sequence, { fn, at: time + delay }); return sequence; },
+      clear: id => tasks.delete(id),
+    };
+    verification.superviseCommand({ cmd: 'fixture', args: [], expires: 1000, parent: 10, graceMs, pollMs: 10 }, io);
+    const advance = ms => {
+      const end = time + ms;
+      for (;;) {
+        const next = [...tasks].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        time = next[1].at; tasks.delete(next[0]); next[1].fn();
+      }
+      time = end;
+    };
+    return { child, caller, signals, records, advance, io, rows: value => { rows = value; } };
+  }
+  it('caller cancellation sends TERM before KILL to detached verification groups', () => {
+    const f = fixture(); f.caller.emit('SIGTERM');
+    expect(f.signals).toEqual([[101, 'SIGTERM', 0], [102, 'SIGTERM', 0]]);
+    f.advance(100);
+    expect(f.signals.slice(2)).toEqual([[101, 'SIGKILL', 100], [102, 'SIGKILL', 100]]);
+    expect(f.records).toEqual([]);
+    f.rows([]); f.advance(10);
+    expect(f.records).toEqual([expect.objectContaining({ signal: 'SIGTERM', cleanupComplete: true })]);
+  });
+  it.each(['SIGTERM', 'SIGINT', 'timeout'])('TERM INT and timeout cancel all owned detached groups: %s', trigger => {
+    const f = fixture();
+    if (trigger === 'timeout') f.advance(1000); else f.caller.emit(trigger);
+    f.caller.emit('SIGTERM'); f.caller.emit('SIGINT');
+    expect(f.signals.map(s => s.slice(0, 2))).toEqual([[101, 'SIGTERM'], [102, 'SIGTERM']]);
+    // Cooperative remote-cancel acknowledgement removes the wrapper; stubborn writer remains.
+    f.rows([{ pid: 102, ppid: 1, pgid: 102, birth: 'grandchild' }]);
+    f.advance(100);
+    expect(f.signals.filter(s => s[1] === 'SIGKILL').map(s => s[0])).toEqual([102]);
+    f.rows([]); f.advance(10); f.advance(1000);
+    expect(f.records).toHaveLength(1);
+  });
+  it('grace expires at the configured deadline', () => {
+    const f = fixture(75); f.caller.emit('SIGINT'); f.advance(74);
+    expect(f.signals.every(s => s[1] === 'SIGTERM')).toBe(true);
+    f.rows([{ pid: 102, ppid: 1, pgid: 102, birth: 'grandchild' }]); f.advance(1);
+    expect(f.signals.at(-1)).toEqual([102, 'SIGKILL', 75]);
+  });
+  it('cleanup precedes cancellation records; cleanup failure stays incomplete with an operator diagnostic', () => {
+    const f = fixture(); f.caller.emit('SIGTERM'); f.advance(1099);
+    expect(f.records).toEqual([]);
+    f.advance(1);
+    expect(f.records).toEqual([expect.objectContaining({ cleanupComplete: false, error: expect.objectContaining({ message: expect.stringMatching(/operator|inspect/) }) })]);
+  });
+  it.each(['reuse', 'unreadable', 'unrelated member'])('reused and unrelated groups are never signalled: %s', kind => {
+    const f = fixture();
+    if (kind === 'unreadable') f.io.inventory = () => { throw new Error('unreadable'); };
+    else f.rows(kind === 'reuse' ? [{ pid: 101, ppid: 1, pgid: 101, birth: 'reused' }]
+      : [{ pid: 101, ppid: 10, pgid: 101, birth: 'child' }, { pid: 666, ppid: 1, pgid: 101, birth: 'stranger' }]);
+    f.caller.emit('SIGTERM'); f.advance(1100);
+    expect(f.signals).toEqual([]);
+    expect(f.records[0]).toMatchObject({ cleanupComplete: false });
   });
 });
