@@ -39,6 +39,39 @@ function fixture() {
 }
 
 describe('open-pr sibling base', () => {
+  it('admits a clean branch with 300 unrelated remote lane refs', () => {
+    const f = fixture();
+    f.git(['checkout', '-qb', 'lane/unrelated', 'main']);
+    f.commit('unrelated', 'unrelated work');
+    const tip = f.git(['rev-parse', 'HEAD']).trim();
+    f.git(['update-ref', '--stdin'], { input: Array.from({ length: 300 }, (_, n) =>
+      `update refs/remotes/origin/lane/unrelated-${n} ${tip}\n`).join('') });
+    f.git(['checkout', 'lane/own']);
+    f.git(['reset', '--hard', 'main']);
+    f.commit('clean', 'clean own change');
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('excludes this PR own branch and its -vN renames from sibling candidates', () => {
+    const f = fixture();
+    f.git(['reset', '--hard', 'main']);
+    f.commit('first', 'first own change');
+    f.git(['branch', 'lane/own-v2']);
+    f.commit('second', 'second own change');
+    expect(f.run()).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('fails closed when candidate ref reads fail', () => {
+    const f = fixture();
+    const result = f.run('main', { git: (args, opts) => {
+      if (args[0] === 'for-each-ref') throw new Error('cannot read lane refs');
+      return f.git(args, opts);
+    } });
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'sibling-base-unknown' });
+    expect(result.detail).toContain('cannot read lane refs');
+    expect(f.calls[0]).toContain('--check');
+  });
+
   it('refuses a branch whose history holds commits that belong to another open lane', () => {
     const f = fixture();
     expect(f.run()).toMatchObject({ outcome: 'refused', reason: 'sibling-base' });

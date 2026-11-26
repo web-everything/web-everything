@@ -102,16 +102,25 @@ export function checkSiblingBase({ git, ref, sha, base = 'main' }) {
     }
     const parent = parentRef ? resolveCommit(parentRef) : main;
     if (parentRef && read(['merge-base', head, parent]).trim() !== parent) throw new Error('declared parent is not contained in this head');
-    const carried = new Set(commits(head, `^${main}`, `^${parent}`));
-    const rows = list(read(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/lane/', 'refs/remotes/origin/lane/']));
-    if (rows.length > 256) throw new Error('sibling evidence exceeds 256 lane refs');
+    const ownCommits = commits(head, `^${main}`);
+    const carried = new Set(parentRef ? commits(head, `^${main}`, `^${parent}`) : ownCommits);
+    // Ask Git for ancestry-related refs before inspecting ownership. Unrelated
+    // lanes must not consume an evidence-count budget or require reflog reads.
+    const laneRefs = filters => list(read(['for-each-ref', '--format=%(refname) %(objectname)',
+      ...filters, 'refs/heads/lane/', 'refs/remotes/origin/lane/']));
+    const rows = new Set(laneRefs([`--merged=${head}`, `--no-merged=${main}`]));
+    for (const commit of ownCommits) {
+      for (const row of laneRefs([`--contains=${commit}`])) rows.add(row);
+    }
+    const laneName = name => name.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
+    const ownLane = laneName(headRef).replace(/-v\d+$/, '');
     const candidates = [];
     for (const row of rows) {
       const match = /^(refs\/(?:heads|remotes\/origin)\/lane\/\S+) ([a-f0-9]{40})$/.exec(row);
       if (!match) throw new Error('unreadable lane ref');
       const [, name, tip] = match;
-      const lane = name.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
-      if (lane === headRef.replace(/^refs\/heads\//, '') || tip === head) continue;
+      const lane = laneName(name);
+      if (lane.replace(/-v\d+$/, '') === ownLane || tip === head) continue;
       // A lane may have advanced since this branch forked. Inspect the shared ancestry,
       // and judge only the inherited portion for squash equivalence below.
       const shared = list(read(['merge-base', '--all', head, tip])).map(commitSha);
