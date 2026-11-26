@@ -45,7 +45,8 @@ export default {
   // Decided by behaviour: the two eligible routes launch through pending.
   fixPresent(root) {
     const out = probe(root);
-    return !!out && out[0]?.[1] === null && out[1]?.[1] === null;
+    // Either route launching marks the fix as present; run() then demands both, so a one-route regression fails loudly.
+    return !!out && (out[0]?.[1] === null || out[1]?.[1] === null);
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const out = probe(sourceRoot);

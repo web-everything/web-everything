@@ -111,7 +111,9 @@ function pendingExemptRoute(repair, labels, view) {
   if (!repair || labels.includes('red-team:blocked')) return false;
   if (PENDING_EXCLUDED_MODES.includes(repair.mode) || repair.takeover || repair.staleBase || repair.scopeBloat
     || repair.operatorSendBack || repair.rulingNotAddressed || repair.joinedInputs
-    || repair.blockRuledReferrals?.length) return false;
+    || repair.restack || repair.blockRuledReferrals?.length) return false;
+  // Bind to the planned head: a repair planned for an older head cannot waive pending on a replacement head.
+  if (repair.headRefOid && repair.headRefOid !== view.headRefOid) return false;
   if (repair.mode === 'advisory-fix') return labels.includes('advisory:changes') && labels.includes('review:human');
   return repair.isConflict === true && !repair.mode && view.mergeable === 'CONFLICTING'
     && typeof view.baseRefName === 'string' && view.baseRefName === 'main'
@@ -126,7 +128,7 @@ function pendingExemptRoute(repair, labels, view) {
  */
 export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
   if (hermetic || isSmokeDryRunPr(pr)) return null;
-  const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state,mergeable,baseRefName'],
+  const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state,mergeable,baseRefName,headRefOid'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
     || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };

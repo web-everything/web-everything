@@ -3002,7 +3002,7 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
   });
 
   describe('SHIP-WM-296 red-team:pending blocks merge, not an eligible fix push', () => {
-    const view = (labels, extra = {}) => JSON.stringify({ state: 'OPEN', labels: labels.map(name => ({ name })), ...extra });
+    const view = (labels, extra = {}) => JSON.stringify({ state: 'OPEN', headRefOid: 'a'.repeat(40), labels: labels.map(name => ({ name })), ...extra });
     const read = (repair, labels, extra) => readLivePushHold({ repo: 'we', pr: 1764, repair },
       { hermetic: false, run: () => view(labels, extra) });
     const HELD = { code: 'hold-label', reason: 'red-team:pending' };
@@ -3027,6 +3027,8 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
       ['takeover row with advisory:changes stays held', { takeover: {}, mode: 'takeover', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
       ['takeover flag without mode stays held', { takeover: {}, mode: 'advisory-fix', labels: ['review:human'] }, ['review:human', 'advisory:changes', 'red-team:pending']],
       ['stacked-rebase stays held', { mode: 'stacked-rebase', isConflict: true, labels: ['review:changes'] }, E2L, CONF],
+      ['restack repair stays held', { ...E1, restack: {} }, ['review:human', 'advisory:changes', 'red-team:pending']],
+      ['repair planned for an older head stays held', { ...E1, headRefOid: 'b'.repeat(40) }, ['review:human', 'advisory:changes', 'red-team:pending'], { headRefOid: 'a'.repeat(40) }],
       ['joinedInputs stays held', { ...E1, joinedInputs: [{}] }, ['review:human', 'advisory:changes', 'red-team:pending']],
       ['E1 with no live advisory:changes is held', E1, ['review:human', 'red-team:pending']],
       ['E1 with no live review:human is held', E1, ['advisory:changes', 'red-team:pending']],
