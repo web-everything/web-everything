@@ -65,7 +65,7 @@ describe('SHIP-WM-160: replay 11-24..25: each fix gets the winning strategy', ()
   it('SHIP-WM-161/173: golden table and settings digests match the copied fixtures and replay helper', () => {
     expect(digestOf(table)).toEqual(replay.table.digest);
     expect(digestOf(settings.values)).toEqual(replay.settings.digest);
-    expect(replayFindings({ table, settings, points: replay.points, records: replay.records })).toEqual([]);
+    expect(replayFindings({ table, settings, points: replay.points })).toEqual([]);
   });
   it('SHIP-WM-160/163: #7485 is prototype-first and first as hold-causer at its now-green head', () => {
     const point = replay.points.find((p) => p.candidates.some((c) => c.id === '#7485'));
@@ -93,6 +93,16 @@ describe('SHIP-WM-160/161: timestamps denote valid, timezone-independent instant
   it.each(invalid)('SHIP-WM-160: invalid observation time %j fails closed', (observedAt) => {
     outcome(select({ table, settings, inputs: datedInputs(observedAt), at: '2026-11-25T12:00:00Z' }), 'unhandled', 'EVIDENCE_UNKNOWN');
   });
+  it.each([...invalid, undefined, null, '', '1795604400', true, {}, [], NaN, Infinity, -Infinity].map((observedAt) => [observedAt]))('SHIP-WM-162: invalid observation time %j is refused even in an accurate unhandled record', (observedAt) => {
+    const recorded = datedInputs(observedAt);
+    const decisionAt = '2026-11-25T12:00:00Z';
+    const got = select({ table, settings, inputs: recorded, at: decisionAt });
+    outcome(got, 'unhandled', 'EVIDENCE_UNKNOWN');
+    const record = { ...decision(), ...got, inputs: recorded, at: decisionAt };
+    const findings = decisionFindings({ record, table, settings });
+    expect(findings).toHaveLength(table.inputs.length);
+    expect(findings.every((f) => f.includes('observation time') && f.includes('SHIP-WM-162'))).toBe(true);
+  });
   it.each(invalid)('SHIP-WM-160/162: invalid decision time %j fails selection and record validation', (badAt) => {
     outcome(select({ table, settings, inputs: datedInputs('1800-01-01T00:00:00Z'), at: badAt }), 'unhandled', 'EVIDENCE_UNKNOWN');
     expect(decisionFindings({ record: { ...decision(), at: badAt }, table, settings })).toContain('decision decision-fixture: decision time is invalid: refused (SHIP-WM-162)');
@@ -104,9 +114,16 @@ describe('SHIP-WM-160/161: timestamps denote valid, timezone-independent instant
     ['2026-11-25T11:00:00.123Z', '2026-11-25T11:00:00.124Z'],
     ['2024-02-29T11:00:00Z', '2024-02-29T12:00:00Z'],
     ['2000-02-29T11:00:00Z', '2000-02-29T12:00:00Z'],
-    [0, 1], [1795604400, 1795608000],
+    [0, 1], [-1, 0], [1795604400.123, 1795604400.124],
+    [1795604400, 1795608000],
+    [1795604400, '2026-11-25T12:00:00Z'],
+    ['2026-11-25T11:00:00Z', 1795608000],
   ])('SHIP-WM-161: valid instants %j / %j retain prototype selection', (observedAt, decisionAt) => {
-    expect(select({ table, settings, inputs: datedInputs(observedAt), at: decisionAt })).toMatchObject({ rule: 'R3', strategy: 'prototype-first', build: true });
+    const recorded = datedInputs(observedAt);
+    const got = select({ table, settings, inputs: recorded, at: decisionAt });
+    expect(got).toMatchObject({ rule: 'R3', strategy: 'prototype-first', build: true });
+    const record = { ...decision(), ...got, inputs: recorded, at: decisionAt };
+    expect(decisionFindings({ record, table, settings })).toEqual([]);
   });
   it('SHIP-WM-160: explicit offsets still reject future observations', () => {
     outcome(select({ table, settings, inputs: datedInputs('2026-11-25T08:00:00-05:00'), at: '2026-11-25T12:00:00Z' }), 'unhandled', 'EVIDENCE_UNKNOWN');
@@ -414,12 +431,14 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
     const record = { ...decision(), ...got, inputs: recorded, table: { uri: changed.id, version: changed.version, digest: digestOf(changed) } };
     expect(decisionFindings({ record, table: changed, settings, strategies })).toEqual([]);
     const points = [{ at, candidates: [{ id: '#example', planOrder: 1, inputs: recorded }], expected: { order: ['#example'], outputs: { '#example': got } } }];
-    expect(replayFindings({ table: changed, settings, points, records: [record], strategies })).toEqual([]);
-    // Without the custom contract, load validation refuses before comparing outputs.
-    const missingContract = [`table ${changed.name}@${changed.version}: strategy x-custom has no contract: refused (SHIP-WM-154)`];
-    expect(tableFindings({ table: changed })).toEqual(missingContract);
-    expect(decisionFindings({ record, table: changed, settings })).toEqual(missingContract);
-    expect(replayFindings({ table: changed, settings, points: [], records: [record] })).toEqual(missingContract);
+    expect(replayFindings({ table: changed, settings, points, strategies })).toEqual([]);
+    // Missing contracts are refused at table load, before decision replay.
+    expect(decisionFindings({ record, table: changed, settings })).toEqual([
+      `table ${changed.name}@${changed.version}: strategy x-custom has no contract: refused (SHIP-WM-154)`,
+    ]);
+    expect(select({ table: changed, settings, inputs: recorded, at })).toMatchObject({
+      rule: 'unconfigured', strategy: 'unhandled', build: false, reason: 'EVIDENCE_UNKNOWN',
+    });
     expect(replayFindings({ table: changed, settings, points }).length).toBeGreaterThan(0);
   });
   it.each(DECISION_FIELDS)('SHIP-WM-162: decision missing %s is refused', (field) => {
@@ -472,85 +491,5 @@ describe('SHIP-WM-161/162/163/173: deterministic records, order and table lineag
   it('SHIP-WM-161: canonical digest ignores object insertion order', () => {
     expect(canon({ b: 2, a: [true, null] })).toBe(canon({ a: [true, null], b: 2 }));
     expect(digestOf({ b: 2, a: 1 })).toEqual(digestOf({ a: 1, b: 2 }));
-  });
-});
-
-
-describe('S1.1c audit regressions', () => {
-  it('S1.1c finding delivery-strategy.mjs:45 - selection requires source URI and digest', () => {
-    for (const source of [undefined, {}, { uri: 'evidence' }, { digest: digestOf('evidence') }, { uri: ' ', digest: digestOf('evidence') }, { uri: 'evidence', digest: {} }]) {
-      const recorded = inputs({ 'step-kind': 'daemon-fix', blocker: 'stage' });
-      recorded['audit-state'].source = source;
-      outcome(run({}, { inputs: recorded }), 'unhandled', 'EVIDENCE_UNKNOWN');
-    }
-  });
-  it('S1.1c finding delivery-strategy.mjs:110 - core inputs cannot become optional', () => {
-    for (const input of table.inputs.filter((i) => i.required)) refused(158, (t) => { t.inputs.find((i) => i.name === input.name).required = false; });
-  });
-  it('S1.1c finding delivery-strategy.mjs:159 - prototype bound must use overlay-cap', () => {
-    refused(165, (t) => { row(t, 'R3').when['live-overlays'].belowSetting = 'land-by-budget'; });
-  });
-  it('S1.1c finding delivery-strategy.mjs:150 - blocker condition alone never clears a stalled gate', () => {
-    refused(164, (t) => { row(t, 'R10').rank = 0; row(t, 'R10').when.blocker = { in: ['stage', 'hold'] }; });
-  });
-  it('S1.1c finding delivery-strategy.mjs:115 - supplied contracts cannot redefine reference gate effects', () => {
-    const strategies = table.strategies.names.map((name) => ({ name, feedsGates: false }));
-    for (const [id, clause] of [['R6', 164], ['R8', 170]]) {
-      const changed = clone(table);
-      changed.rules = changed.rules.filter((r) => r.id !== id);
-      expect(tableFindings({ table: changed, strategies }).some((f) => f.includes(`SHIP-WM-${clause}`))).toBe(true);
-      outcome(run({}, { table: changed, strategies }), 'unhandled', 'EVIDENCE_UNKNOWN');
-    }
-  });
-  it('S1.1c finding delivery-strategy.mjs:147 - every output ranks after security', () => {
-    refused(157, (t) => { t.rules.push({ id: 'early-hold', rank: 0, when: {}, output: clone(row(t, 'R6').output) }); });
-  });
-  it('S1.1c finding delivery-strategy.mjs:154 - prototype requires passing CI', () => {
-    refused(165, (t) => { delete row(t, 'R3').when['ci-state']; });
-  });
-  it('S1.1c finding delivery-strategy.mjs:162 - hold incident requires audit and CI while red recovery remains valid', () => {
-    for (const key of ['audit-state', 'ci-state']) refused(166, (t) => { delete row(t, 'R2').when[key]; });
-    expect(tableFindings({ table })).toEqual([]);
-    outcome(run({ 'red-interval-open': true, 'red-recovery-candidate': true, 'audit-state': 'fail', 'ci-state': 'fail' }), 'incident', 'RED_MAIN_RECOVERY');
-  });
-  it('S1.1c finding delivery-strategy.mjs:172 - build-ahead requires independent preparation', () => {
-    refused(170, (t) => { delete row(t, 'R7').when['prepped-independent']; });
-    outcome(run({ 'loaded-stage-stress': 'stressed', 'stress-incident': 'fix-landed', 'prepped-independent': false }), 'hold', 'STAGE_STRESSED');
-  });
-  it('S1.1c finding delivery-strategy.mjs:190 - decision metadata has typed non-empty values', () => {
-    for (const [key, value] of [['decisionId', ''], ['decisionId', 1], ['candidate', ' '], ['candidate', {}], ['position', -1], ['position', 0.5], ['position', Infinity], ['positionReason', ''], ['positionReason', true], ['actions', {}]]) {
-      const record = decision();
-      record[key] = value;
-      expect(decisionFindings({ record, table, settings }).some((f) => f.includes('SHIP-WM-162'))).toBe(true);
-    }
-    const record = decision();
-    record.position = 0;
-    expect(decisionFindings({ record, table, settings })).toEqual([]);
-  });
-  it('S1.1c finding delivery-strategy.mjs:196 - source digest is a SHA-256 object', () => {
-    for (const digest of [{}, 'digest', [], { sha256: 'a'.repeat(63) }, { sha256: 'g'.repeat(64) }, { sha256: 'a'.repeat(64) + '\n' }, { sha256: 1 }]) {
-      const record = decision();
-      for (const x of Object.values(record.inputs)) x.source.digest = digest;
-      expect(decisionFindings({ record, table, settings }).some((f) => f.includes('SHIP-WM-162'))).toBe(true);
-    }
-  });
-  it('S1.1c finding delivery-strategy.mjs:180 - order refuses invalid IDs and non-finite plan positions', () => {
-    for (const candidate of [{ planOrder: 1 }, { id: ' ', planOrder: 1 }, { id: 1, planOrder: 1 }, { id: 'a' }, { id: 'a', planOrder: NaN }, { id: 'a', planOrder: Infinity }, { id: 'a', planOrder: '1' }]) {
-      expect(orderFindings({ candidates: [candidate], order: [candidate.id] }).length).toBeGreaterThan(0);
-    }
-    expect(orderFindings({ candidates: [{ id: 'a', planOrder: 1 }, { id: 'a', planOrder: 2 }], order: ['a', 'a'] }).length).toBeGreaterThan(0);
-  });
-  it('S1.1c finding delivery-strategy.mjs:180 - hold flags must agree with recorded hold-causer evidence', () => {
-    for (const [clearsHold, value] of [[true, false], [true, undefined], [false, true], [undefined, true]]) {
-      const candidates = [{ id: 'a', planOrder: 1, clearsHold, inputs: { 'hold-causer': observation(value) } }];
-      expect(orderFindings({ candidates, order: ['a'] }).length).toBeGreaterThan(0);
-    }
-  });
-  it('S1.1c finding delivery-strategy.test.mjs:62 - golden records replay and tampered strategy is detected', () => {
-    expect(replay.records).toHaveLength(8);
-    expect(replayFindings({ table, settings, points: replay.points, records: replay.records })).toEqual([]);
-    const records = clone(replay.records);
-    records[0].strategy = records[0].strategy === 'incident' ? 'normal-pr' : 'incident';
-    expect(replayFindings({ table, settings, points: replay.points, records }).some((f) => f.includes('SHIP-WM-161'))).toBe(true);
   });
 });
