@@ -256,6 +256,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
+  'scripts/lib/review-fast-pass-cli.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
