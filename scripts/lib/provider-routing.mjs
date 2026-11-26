@@ -66,7 +66,6 @@
  * dispatches work, not a coded gate on `taskType`; re-derive once real build-new-feature trial data exists.
  */
 
-import { deriveAgyFixAdmission } from './agy-fix-admission.mjs';
 import { readBuildArgonSettings, resolveBuildArgonModel } from './build-argon-settings.mjs';
 const BUILD_ARGON_SETTINGS = readBuildArgonSettings();
 
@@ -745,12 +744,14 @@ function evaluateProviderFitness(providerNames, taskType, filesTouched, estimate
  */
 // @test-only-export-ok: Shared library exported for interactive Claude sessions and conveyor runners
 export function selectProvider(task, context) {
-  // Repair share is caller-loaded; absent availability/sample/policy evidence fails
+  // Repair admission and share are caller-loaded; absent admission/availability/sample/policy evidence fails
   // closed to the next provider. The launcher separately enforces confinement.
   if (task?.taskType === 'fix' && context?.kind === 'fix') {
     const settings = context.agyFixSettings;
-    const admission = deriveAgyFixAdmission({ ...task, size: context.size, scope: context.scope },
-      { ...context, taskKind: 'fix', scope: context.scope }, settings ?? null);
+    const admission = typeof context.deriveAgyFixAdmission === 'function'
+      ? context.deriveAgyFixAdmission({ ...task, size: context.size, scope: context.scope },
+        { ...context, taskKind: 'fix', scope: context.scope }, settings ?? null)
+      : null;
     const share = admission && context.availability?.antigravity === false
       && Number.isFinite(settings?.share) && settings.share >= 0 && settings.share <= 1
       && context.previousProvider !== 'antigravity' ? settings.share : 0;

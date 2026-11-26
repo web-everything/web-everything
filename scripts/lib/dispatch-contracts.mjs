@@ -17,6 +17,7 @@ import { taskTypeFor } from './dispatch-task-type.mjs';
 // #4034 — the critical-work verdict and the critical-miss veto list the provider cascade's CRITICAL_WORK_GATE reads.
 // A safe import cycle: critical-work.mjs reads deriveRisk/deriveComplexity from here, never at module top level.
 import { criticalWorkVerdict, criticalMissesFor } from './critical-work.mjs';
+import { deriveAgyFixAdmission } from './agy-fix-admission.mjs';
 
 /** Closed task vocabulary, sourced from the router's proven envelopes. */
 // @test-only-export-ok: contract for the G2 dispatcher wiring (no runtime caller in slice G1)
@@ -477,6 +478,7 @@ export function routeDispatch(profile, options = {}) {
       const criticalWork = criticalWorkVerdict({ taskType: profile.taskType, filesTouched: profile.filesTouched, estimatedLoc: profile.estimatedLoc, acceptanceTestable: profile.acceptanceTestable, risk: options.criticalRisk ?? profile.risk, tags });
       const criticalMisses = criticalMissesFor(scorecards, profile.taskType);
       const context = { risk: profile.risk, filesTouched: [...profile.filesTouched], estimatedSize: profile.estimatedLoc, acceptanceTestable: profile.acceptanceTestable, scorecards: records, kind, tags, criticalWork, criticalMisses, simple: simple === true, availability: options.availability, ...(criticalWorkGate ? { criticalWorkGate } : {}) };
+      if (kind === 'fix') context.deriveAgyFixAdmission = deriveAgyFixAdmission;
       const selected = selectProvider(task, context);
       routerAudit.push(...selected.auditTrail);
       out.provider = selected.recommendation;

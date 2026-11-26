@@ -1,0 +1,6 @@
+{
+  "description": "Antigravity (agy) repair admission: which fix kinds agy may take and the share of eligible fixes routed to it.",
+  "owner": "scripts/settings/ai-routing.json",
+  "changeVia": "pr",
+  "instant": false
+}
