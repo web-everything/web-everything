@@ -45,6 +45,15 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs',
+    scope: 'full',
+    why: 'directory completeness and production-registry collection require every break; selection is limited to the soak registry and its registration inputs',
+    matches: (f) => f.startsWith('scripts/conveyor/soak/breaks/') && f.endsWith('.mjs'),
+    inputs: ['scripts/conveyor/registry-discovery.mjs', 'scripts/conveyor/soak/breaks-shape.mjs',
+      'scripts/conveyor/soak/define-break-test.mjs', 'scripts/conveyor/soak/fixtures/fixpresent-registration.mjs',
+      'scripts/conveyor/soak/__tests__/breaks-index-discovery.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/push-gate-boundary.test.mjs',
     scope: 'files',
     why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',

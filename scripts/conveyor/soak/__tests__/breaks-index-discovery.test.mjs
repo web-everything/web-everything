@@ -1,4 +1,5 @@
 /**
+ * @repo-scanning-test
  * @file breaks-index-discovery.test.mjs — proves `breaks/index.mjs` builds its registry from the DIRECTORY,
  * not a hand-maintained import list (the #3729-style conflict this refactor removes): a new module file is
  * picked up with zero index edits, non-module entries (index.mjs itself, tests, fixtures) are excluded,
@@ -12,7 +13,7 @@
  * under the wrong pool. The one check that needs the real, on-disk registry shells a plain `node` subprocess
  * instead (see the last test below), sidestepping that pool difference entirely.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +31,7 @@ export default {
   title: 'a temp break for the discovery test',
   card: 'test-only',
   fixedBy: { sha: 'deadbeef', where: 'main' },
-  fixPresent() { return true; },
+  fixPresent: { marker: 'fix.mjs#soakFix' },
   async run() { return { violations: [] }; },
   judge() { return []; },
 };
@@ -50,6 +51,28 @@ function loadBreaks(dir) {
 }
 
 describe('soak/breaks/index.mjs — directory discovery', () => {
+  it('the real registry registers successfully during S1.1 with legacy probes in both assertion modes', () => {
+    const out = execFileSync(process.execPath, [join(HERE, '../fixtures/fixpresent-registration.mjs')], {
+      encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const report = JSON.parse(out);
+    expect(report.total).toBe(discoverModuleFiles(REAL_BREAKS_DIR).length);
+    expect(report.legacy).toBeGreaterThan(0);
+    expect(report.registered).toBe(report.total + report.legacy);
+  });
+
+  it('reports legacy function probes during discovery without rejecting existing breaks', async () => {
+    const dir = tempDir();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      writeFileSync(join(dir, 'legacy.mjs'), VALID_BREAK.replace("fixPresent: { marker: 'fix.mjs#soakFix' },", 'fixPresent() { throw new Error("must not execute during discovery"); },'));
+      expect(await loadBreaks(dir)).toHaveLength(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringMatching(/legacy\.mjs.*fixPresent.*function.*migrat/i));
+    } finally {
+      warn.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
   it('picks up a new module file dropped into the directory with NO index edit', async () => {
     const dir = tempDir();
     try {
@@ -116,7 +139,7 @@ describe('soak/breaks/index.mjs — directory discovery', () => {
     const out = execFileSync(
       process.execPath,
       ['-e', "import('./index.mjs').then((m) => process.stdout.write(JSON.stringify(m.BREAKS.map(b => b.id))))"],
-      { cwd: REAL_BREAKS_DIR, encoding: 'utf8' },
+      { cwd: REAL_BREAKS_DIR, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
     );
     const ids = JSON.parse(out);
     expect(ids).toHaveLength(files.length);
