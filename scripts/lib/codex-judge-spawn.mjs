@@ -278,14 +278,18 @@ export function stripNulls(value) {
 /** CORE-VRD-067/068: missing findings are a seat error, never a clean review. */
 export class CodexInvalidFindingsError extends Error {
   constructor() {
-    super('codex-judge-spawn: findings must be an array; the seat output is incomplete. Re-run the review.');
+    super('judge seat: findings must be an array of objects with non-empty string summaries; the seat output is incomplete. Re-run the review.');
     this.name = 'CodexInvalidFindingsError';
   }
 }
 
 /** Only findings-bearing schemas require a list; synthesis and other judge shapes remain valid. */
 export function assertCodexFindings(value, shape) {
-  if (Object.hasOwn(shape?.properties ?? {}, 'findings') && !Array.isArray(value?.findings)) {
+  if (!Object.hasOwn(shape?.properties ?? {}, 'findings')) return;
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !Array.isArray(value.findings)
+    || value.findings.some((finding) => !finding || typeof finding !== 'object' || Array.isArray(finding)
+      || typeof finding.summary !== 'string' || !finding.summary.trim())) {
     throw new CodexInvalidFindingsError();
   }
 }

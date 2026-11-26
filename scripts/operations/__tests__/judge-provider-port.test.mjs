@@ -197,19 +197,15 @@ describe('card x5s8b47 — `gracefulOnUnavailable`: an advisory seat degrades, i
     expect(value).toEqual({ summary: 'antigravity judged it', findings: [] });
   });
 
-  it('Codex usable, but the spawn itself throws → recorded as a skipped seat, never a crash, with the real error logged', async () => {
+  it('Codex unexpected EOF is a seat error, never a skipped clean answer', async () => {
     const logged = [];
     const judgeFn = createDefaultJudge({
       resolveProvider: () => async () => { throw new Error('codex exec: unexpected EOF on stdout'); },
       checkProviderHold: async () => null,
       logGracefulOutcome: (line) => logged.push(line),
     });
-    const returned = await judgeFn(REQUEST);
-    const { value } = unwrapJudgeOutcome(returned);
-    expect(value.skipped).toMatchObject({ provider: 'codex', crashed: true });
-    expect(value.skipped.reason).toMatch(/codex exec: unexpected EOF on stdout/);
-    expect(value.findings).toEqual([]);
-    expect(logged.some((l) => l.includes('codex exec: unexpected EOF on stdout'))).toBe(true);
+    await expect(judgeFn(REQUEST)).rejects.toThrow(/codex exec: unexpected EOF on stdout/);
+    expect(logged).toEqual([]);
   });
 
   it('every provider unavailable (no fallback configured) → skips with a reason naming that', async () => {
@@ -249,6 +245,50 @@ describe('CODEX-SEAT-NULL-FINDINGS through createDefaultJudge', () => {
   it('malformed findings remains a seat error even for a graceful Codex seat', async () => {
     await expect(judgeFor({ summary: 'reviewed', findings: null })({ ...request, gracefulOnUnavailable: true }))
       .rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+  });
+
+  it.each(['not JSON', 'null', '[]', '42', ''])('malformed-output probe %j fails closed for a graceful Codex seat', async (lastMessage) => {
+    const judge = createDefaultJudge({
+      checkProviderHold: async () => null,
+      resolveProvider: () => async () => parseCodexJudgeOutcome({
+        stdout: JSON.stringify({ type: 'turn.completed', usage: {} }), lastMessage, shape,
+      }),
+    });
+    await expect(judge({ ...request, gracefulOnUnavailable: true })).rejects.toThrow();
+  });
+
+  it.each([null, undefined])('quota-held Codex fallback probe rejects Antigravity findings %j as a seat error', async (findings) => {
+    const calls = [];
+    const judge = createDefaultJudge({
+      checkProviderHold: async (name) => name === 'codex' ? 'quota exhausted' : null,
+      resolveProvider: (name) => async () => {
+        calls.push(name);
+        return { value: { summary: 'reviewed', findings } };
+      },
+    });
+    await expect(judge({ ...request, gracefulOnUnavailable: true })).rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+    expect(calls).toEqual(['antigravity']);
+  });
+
+  it.each(['claude', 'codex', 'antigravity'])('validates findings entries for %s seats', async (providerName) => {
+    const judge = createDefaultJudge({
+      resolveProvider: () => makeFakeProvider({ findings: [{ summary: '' }, {}] }).provider,
+    });
+    await expect(judge({ ...request, providerName })).rejects.toThrow(/findings/);
+  });
+
+  it.each([{ findings: null }, {}, { findings: [{ summary: '' }, {}] }])('quota-held Codex fallback probe rejects malformed Antigravity answer %j', async (answer) => {
+    const calls = [];
+    const judge = createDefaultJudge({
+      checkProviderHold: async (name) => name === 'codex' ? 'quota exhausted' : null,
+      resolveProvider: (name) => async () => { calls.push(name); return { value: answer }; },
+    });
+    await expect(judge({ ...request, gracefulOnUnavailable: true })).rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+    expect(calls).toEqual(['antigravity']);
+  });
+
+  it.each(['claude', 'antigravity'])('validates findings for a direct %s seat', async (providerName) => {
+    await expect(judgeFor({ findings: null })({ ...request, providerName })).rejects.toThrow(/findings.*array/);
   });
 
   it.each([

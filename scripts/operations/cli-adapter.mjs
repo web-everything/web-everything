@@ -871,7 +871,7 @@ export function createDefaultJudge({
     // closes, both measured live against PRs #2865/#2867/#2873/#2874/#2875 (card x5s8b47): (a) Codex
     // quota-exhausted — the spawn was never even attempted before this fix, so it failed every time and
     // crashed the whole `review-loop-cli` process; and (b) the spawn throwing for any OTHER reason, mid-call.
-    // Codex failures become a recorded, zero-finding answer; Antigravity requires explicit skip evidence.
+    // Every provider requires explicit unavailability evidence before a failure can become a skip.
     // Eligible failures become a recorded, zero-finding,
     // non-blocking judge answer instead. `reduce`'s own silent-juror refusal (`review-pr.mjs`) requires a
     // non-empty `summary`, which the skip answer below always carries, so a skip reads to every downstream
@@ -916,14 +916,14 @@ export function createDefaultJudge({
       try {
         const actual = configured && spawnProviderName !== effectiveProviderName ? { ...effective, ...configured.fallback.find(route => route.provider === spawnProviderName), providerName: spawnProviderName } : effective;
         const outcome = await spawnProvider(buildProviderRequest(actual, cwd, spawnProviderName));
-        if (spawnProviderName === 'codex') assertCodexFindings(outcome.value, actual.shape);
+        assertCodexFindings(outcome.value, actual.shape);
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
       } catch (e) {
         if (e instanceof CodexInvalidFindingsError) throw e;
-        // Antigravity may skip only with explicit provider-unavailability evidence.
+        // Every provider may skip only with explicit provider-unavailability evidence.
         // Missing/malformed output, schema failures and tool denials remain seat failures.
-        if (spawnProviderName === 'antigravity' && ![
+        if (![
           'skip-provider-unresponsive', 'skip-quota-exhausted', 'skip-quota-hold',
           'skip-backend-mismatch', 'skip-model-mismatch', 'skip-binary-dead',
         ].includes(e?.telemetry?.fallbackDecision)) throw e;
@@ -946,7 +946,7 @@ export function createDefaultJudge({
     // #3383 mechanical-dispatcher Gap 2 root cause fix — see `buildProviderRequest`'s own comment for the full
     // account of why `model`/`cwd` are conditionally spread rather than always present.
     const outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName));
-    if (effectiveProviderName === 'codex') assertCodexFindings(outcome.value, effective.shape);
+    assertCodexFindings(outcome.value, effective.shape);
     // NOT a spread of `outcome`: it also carries `argv` (which embeds the whole mandate) and the answer itself.
     // The record keeps the meter, never the material. `normalizeJudgeTelemetry` whitelists again on arrival.
     return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, effective));

@@ -474,6 +474,13 @@ describe('codexJudgeSpawn — exercised over an injected spawn (real temp files,
     ['null', { summary: 'reviewed', findings: null }],
     ['missing', { summary: 'reviewed' }],
     ['string', { summary: 'reviewed', findings: 'none' }],
+    ['malformed-entry probe', { summary: 'reviewed', findings: [{ summary: '' }, {}] }],
+    ['mixed entries', { findings: [{ summary: 'valid' }, {}] }],
+    ['null entry', { findings: [null] }],
+    ['scalar entry', { findings: ['broken'] }],
+    ['array entry', { findings: [[]] }],
+    ['whitespace summary', { findings: [{ summary: '   ' }] }],
+    ['non-string summary', { findings: [{ summary: 1 }] }],
   ])('rejects %s findings as a seat error before null stripping', async (_label, answer) => {
     const { fn } = fakeSpawn({ stdout: okJsonl, writeLastMessage: JSON.stringify(answer) });
     await expect(codexJudgeSpawn({
