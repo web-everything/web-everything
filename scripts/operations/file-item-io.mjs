@@ -39,6 +39,7 @@ import { execFileSync } from 'node:child_process';
 import { searchCapabilities } from '../capability-search.mjs';
 import { rulingBranch, cardRulingKey, lookupRulingCard } from './ruling-card-branch.mjs';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
+import { validateCardPublicationHistory } from '../lib/card-publication-history.mjs';
 import { localDateString } from '../lib/local-date.mjs';
 
 export { REPO_ROOT };
@@ -123,16 +124,7 @@ export function createCardBranchSink({ root = REPO_ROOT,
           // Validate every batch commit: a tip-only diff hides reverted private content.
           // Card publication creates a linear chain; refuse merges rather than overlooking
           // side-parent history. --all plus sha() refuses missing or ambiguous ancestors.
-          const batchBaseline = sha(run(['merge-base', '--all', remoteMain, base]));
-          const range = `${batchBaseline}..${base}`;
-          if (run(['rev-list', '--min-parents=2', '--max-count=1', range])) {
-            throw new Error('remote batch contains merge commits');
-          }
-          const paths = run(['log', '--format=', '--name-only', '--no-renames', '-z', range], undefined, true)
-            .split('\0').filter(Boolean);
-          if (paths.some(path => !/^backlog\/[^/\\\x00-\x1f]+\.md$/.test(path))) {
-            throw new Error('remote batch contains non-card changes');
-          }
+          validateCardPublicationHistory({ run, main: remoteMain, head: base });
         }
         stage = 'building card-only commit';
         run(['read-tree', base]);

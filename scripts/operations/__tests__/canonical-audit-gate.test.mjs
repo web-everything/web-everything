@@ -259,9 +259,21 @@ describe('card-only admission with real git evidence', () => {
       change(r);
       const fullSha = r.git('rev-parse', 'HEAD').trim();
       const reads = [];
-      const result = checkCanonicalAuditForOpen({ repo: r.root, sha: fullSha, fetchMain: options.fetchMain ?? r.fetchMain,
-        exec: (_cmd, args) => r.git(...args.slice(2)),
-        readFile: path => { reads.push(path); throw new Error('audit must be required for ineligible changes'); } });
+      const result = checkCanonicalAuditForOpen({ repo: r.root, ref, sha: fullSha, fetchMain: options.fetchMain ?? r.fetchMain,
+        liveFingerprint: options.liveFingerprint,
+        env: { HOME: '/fixture-home', WE_PLATFORM_PREFERENCES_FILE: '/fixture-prefs' },
+        exec: (_cmd, args) => {
+          const raw = r.git(...args.slice(2));
+          return args.includes('--raw') && options.trailing ? raw + options.trailing : raw;
+        },
+        readFile: path => {
+          reads.push(path);
+          if (path === WRITER_SETTINGS) return JSON.stringify({ auditRecordPath: '~/audit.jsonl', ...options.tool?.(fullSha) });
+          if (path === '/fixture-prefs') return '{}';
+          if (path === '/fixture-home/audit.jsonl' && options.auditError) throw options.auditError;
+          if (path === '/fixture-home/audit.jsonl' && options.auditText) return options.auditText(fullSha, r.baseline);
+          throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        } });
       return { result, reads, fullSha };
     } finally { r.close(); }
   }
@@ -269,13 +281,57 @@ describe('card-only admission with real git evidence', () => {
     expect(admission.cardOnlyAdmission(null)).toEqual({ ok: false });
     expect(admission.cardOnlyAdmission({ get git() { throw new Error('unreadable'); } })).toEqual({ ok: false });
   });
-  it.each(['missing', 'malformed', 'WEAKENED'])('eligible cards bypass %s records before any settings or record read', _kind => {
+  it('eligible cards with absent records retain card-only admission', () => {
     const { result, reads, fullSha } = probe(r => { r.put('backlog/101-new.md'); r.commit(); });
     expect(result).toEqual({ ok: true, reason: null, message: '', exemption: 'card-only', record: null, sha: fullSha });
-    expect(reads).toEqual([]);
+    expect(reads).toContain('/fixture-home/audit.jsonl');
+  });
+  it('finding 1: eligible cards refuse malformed and WEAKENED audit records', () => {
+    for (const kind of ['WEAKENED', 'malformed']) {
+      const { result } = probe(r => { r.put('backlog/101-new.md'); r.commit(); }, {
+        auditText: (head, base) => kind === 'malformed' ? '{truncated' : JSON.stringify({ ...weak, head, base }),
+      });
+      expect(result, kind).toMatchObject({ ok: false, reason: kind === 'malformed' ? 'canonical-audit-missing' : 'canonical-audit-weakened' });
+    }
+  });
+  it.each(['unreadable file', 'malformed record', 'covering WEAKENED', 'unknown fingerprint', 'exact record without main coverage'])(
+    'eligible cards retain the audit refusal for %s', kind => {
+      const fingerprint = 'd'.repeat(64);
+      const { result } = probe(r => { r.put('backlog/101-new.md'); r.commit(); }, {
+        auditError: kind === 'unreadable file' ? Object.assign(new Error('denied'), { code: 'EACCES' }) : undefined,
+        liveFingerprint: () => kind === 'unknown fingerprint' ? null : fingerprint,
+        auditText: (head, base) => JSON.stringify({ ...weak, head, base,
+          ...(kind === 'malformed record' ? { at: 'invalid' } : {}),
+          ...(['covering WEAKENED', 'unknown fingerprint'].includes(kind) ? { head: other, fingerprint } : {}),
+          ...(kind === 'exact record without main coverage' ? { ...green, head, base: other } : {}),
+        }),
+      });
+      expect(result).toMatchObject({ ok: false });
+      expect(result.message).toContain('codex-audit --base=origin/main --head=');
+    });
+  it('eligible cards use an existing green record or exact-head waiver through normal admission', () => {
+    for (const waived of [false, true]) {
+      const { result } = probe(r => { r.put('backlog/101-new.md'); r.commit(); }, {
+        auditText: (head, base) => JSON.stringify({ ...(waived ? weak : green), head, base }),
+        tool: head => waived ? { ruledWeakened: [{ ...waiver, sha: head }] } : {},
+      });
+      expect(result).toMatchObject({ ok: true, record: { verdict: waived ? 'WEAKENED' : 'NOT WEAKENED' } });
+      expect(result).not.toHaveProperty('exemption');
+    }
+  });
+  it('unrelated audit records do not prevent absent-head card-only admission', () => {
+    const { result } = probe(r => { r.put('backlog/101-new.md'); r.commit(); }, {
+      auditText: (_head, base) => JSON.stringify({ ...weak, head: other, base, fingerprint: 'd'.repeat(64) }),
+      liveFingerprint: () => 'e'.repeat(64),
+    });
+    expect(result).toMatchObject({ ok: true, exemption: 'card-only', record: null });
   });
   it('admits a card plus a raised-by file', () => {
     expect(probe(r => { r.put('backlog/101-new.md'); r.put(`backlog/raised-by/100/1-${'a'.repeat(24)}.md`); r.commit(); }).result.ok).toBe(true);
+  });
+  it('finding 2: production wrapper refuses a raw diff with trailing newline', () => {
+    expect(probe(r => { r.put('backlog/101-new.md'); r.commit(); }, { trailing: '\n' }).result)
+      .toMatchObject({ ok: false, reason: 'canonical-audit-missing' });
   });
   it('admits a merge-from-main head by its net diff', () => {
     expect(probe(r => {

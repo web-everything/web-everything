@@ -1,4 +1,4 @@
-/** Canonical codex-audit admission shared by every PR producer. Narrow added-card admission precedes audit evidence. */
+/** Canonical codex-audit admission shared by every PR producer. Added cards admit only absent audit evidence. */
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -6,7 +6,7 @@ import { canonicalAuditEvidence, validSha } from './prototype-load.mjs';
 import { loadRuledWeakened } from './prototype-load-io.mjs';
 import { readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readAuditSettings, resolveAuditRecordPath } from './codex-audit-io.mjs';
-import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
+import { netDiffFingerprint, carriesAcross } from '../lib/net-diff-fingerprint.mjs';
 import { findAudit, QUESTION_HASH } from './codex-audit.mjs';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
 
@@ -19,6 +19,14 @@ export function cardOnlyAdmission(options = {}) {
     const main = String(git('rev-parse', '--verify', 'origin/main^{commit}')).trim().toLowerCase();
     const fetched = String(git('rev-parse', '--verify', 'FETCH_HEAD^{commit}')).trim().toLowerCase();
     if (!validSha(main) || main !== fetched) return { ok: false };
+    return cardOnlyCommittedDiff({ git, fullSha });
+  } catch { return { ok: false }; }
+}
+
+/** Shared committed-diff proof; callers decide whether main must first be refreshed. */
+export function cardOnlyCommittedDiff({ git, fullSha } = {}) {
+  try {
+    if (!validSha(fullSha)) return { ok: false };
     const bases = String(git('merge-base', '--all', 'origin/main', fullSha)).trim().split(/\s+/);
     if (bases.length !== 1 || !validSha(bases[0])) return { ok: false };
     const raw = git('diff', '--raw', '-z', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', bases[0], fullSha);
@@ -57,12 +65,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   readFile = readFileSync, exec = execFileSync, fetchMain: fetchMainOpt, refreshMain = false, ancestor: ancestorOpt,
   liveFingerprint: liveFingerprintOpt, warn = message => console.warn(message),
 } = {}) {
-  // trim() never strips NUL, so the -z raw diff keeps its terminating NUL.
+  // Preserve raw evidence byte-for-byte; only scalar consumers may trim their output.
   const git = (...args) => String(exec('git', ['-C', repo, ...args], {
     env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-  })).trim();
+  }));
   let fullSha;
-  try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).toLowerCase(); } catch { /* refuse below */ }
+  try { fullSha = git('rev-parse', '--verify', '--end-of-options', `${sha || 'HEAD'}^{commit}`).trim().toLowerCase(); } catch { /* refuse below */ }
   if (!validSha(fullSha)) return { ok: false, reason: 'canonical-audit-missing', record: null,
     message: 'cannot resolve the PR source to a full 40-hex sha; resolve it with git rev-parse, then run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>' };
   const refuse = (reason, detail) => ({ ok: false, reason, record: null, sha: fullSha,
@@ -76,8 +84,7 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     }
     if (!fetched) throw new Error(`main not refreshed: ${fetchError || 'origin/main fetch unavailable; retry when main can be read'}`);
   };
-  if (cardOnlyAdmission({ git, fullSha, fetchMain }).ok)
-    return { ok: true, reason: null, message: '', exemption: 'card-only', record: null, sha: fullSha };
+  const cardOnly = cardOnlyAdmission({ git, fullSha, fetchMain }).ok;
   // A preflight may read refs but must never admit evidence against an unrefreshed main.
   if (refreshMain) {
     try { fetchMain(); }
@@ -97,7 +104,12 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
     const home = typeof env.HOME === 'string' && env.HOME.trim() ? env.HOME : homedir();
     config = { ruledWeakened: loadRuledWeakened({ platform: platform.prefs.prototypeLoad?.ruledWeakened,
       tool: tool.ruledWeakened, fs: { readFileSync: readFile }, env: { ...env, HOME: home }, warn }) };
-    const contents = readFile(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8');
+    let contents;
+    try { contents = readFile(resolveAuditRecordPath(tool, { home, cwd: repo }), 'utf8'); }
+    catch (error) {
+      if (!cardOnly || error.code !== 'ENOENT') throw error;
+      contents = '';
+    }
     try {
       records = String(contents).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
     } catch {
@@ -137,6 +149,9 @@ export function checkCanonicalAuditForOpen({ repo = process.cwd(), ref, sha, env
   let evidence;
   try {
     const fp = liveFingerprint(records);
+    if (cardOnly && !records.some(record => record.head.toLowerCase() === fullSha
+      || (record.fingerprint && (!fp || carriesAcross(record.fingerprint, fp)))))
+      return { ok: true, reason: null, message: '', exemption: 'card-only', record: null, sha: fullSha };
     evidence = canonicalAuditEvidence(records, fullSha, covers, fp);
     if (!evidence.ok && evidence.reason === 'weakened') {
       for (const entry of config.ruledWeakened) {

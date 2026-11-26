@@ -4,22 +4,51 @@ import { lstatSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import yaml from 'js-yaml';
 import { cardOnlyEligibility } from '../lib/card-batch-policy.mjs';
+import { cardOnlyCommittedDiff } from './canonical-audit-gate.mjs';
+import { validateCardPublicationHistory } from '../lib/card-publication-history.mjs';
+import { parseFilingItems, parseCardItems } from '../lib/card-dedupe.mjs';
 
 const SHA = /^[a-f0-9]{40}$/;
 const MAX_LOOKUP_REFS = 1024;
 export { rulingBranch } from '../lib/ruling-card-key.mjs';
 import { rulingBranch } from '../lib/ruling-card-key.mjs';
 
-export function cardRulingKey(content) {
+/** A PREP waiver describes the committed head, never a planned path or the staged index. */
+export function committedCardPrep({ lane, sha = 'HEAD', exec }) {
+  try {
+    const git = (...args) => String(exec('git', ['-C', lane, ...args], {
+      encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    }));
+    const fullSha = git('rev-parse', '--verify', `${sha}^{commit}`).trim();
+    if (cardOnlyCommittedDiff({ git, fullSha }).ok) return '\n\nprep: waived — card-only mechanical filing\n';
+  } catch { /* Unknown evidence cannot grant a waiver; ordinary PREP admission remains required. */ }
+  return '\n\nPREP waiver omitted: committed card-only evidence unavailable; supply PREP evidence before opening.\n';
+}
+
+function parseRulingCard(content) {
   const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
   if (!frontmatter) throw new Error('unreadable card frontmatter');
   const data = yaml.load(frontmatter[1]);
   if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('unreadable card frontmatter');
   if (data.rulingKey !== undefined) rulingBranch(data.rulingKey);
-  return data.rulingKey;
+  return { data, body: content.slice(frontmatter[0].length) };
 }
 
-export function lookupRulingCard({ root, rulingKey, git = (...args) => execFileSync('git', ['-C', root, ...args], {
+export function cardRulingKey(content) {
+  return parseRulingCard(content).data.rulingKey;
+}
+
+export function rulingCardCoversInput(text, input) {
+  try {
+    const { data, body } = parseRulingCard(text);
+    if (data.status !== 'open' || data.rulingKey !== input.rulingKey) return false;
+    const expected = parseFilingItems(input.digest), actual = parseCardItems(body);
+    return expected.length > 0 && expected.every(item => actual.some(found =>
+      found.file === item.file && found.line === item.line && found.claim === item.claim));
+  } catch { return false; }
+}
+
+export function lookupRulingCard({ root, rulingKey, digest, git = (...args) => execFileSync('git', ['-C', root, ...args], {
   encoding: 'utf8', timeout: 30000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
 }) } = {}) {
   try {
@@ -37,32 +66,31 @@ export function lookupRulingCard({ root, rulingKey, git = (...args) => execFileS
         if (mode !== '100644' || type !== 'blob') throw new Error('unreadable regular card');
         blobs.set(path, blob);
       }
-      // Search immutable objects in one process; do not spawn a child for every unrelated backlog card.
-      let keyed;
-      try { keyed = String(git('grep', '-l', '-z', '--fixed-strings', 'rulingKey', sha, '--', ':(top,glob)backlog/*.md')); }
-      catch (error) {
-        if (error.status !== 1 || String(error.stdout ?? '') || String(error.stderr ?? '')) throw error;
-        keyed = '';
-      }
-      if (keyed && !keyed.endsWith('\0')) throw new Error('truncated ruling-key search');
       const matches = [];
-      for (const hit of keyed ? keyed.slice(0, -1).split('\0') : []) {
-        const prefix = `${sha}:`;
-        if (!hit.startsWith(prefix) || !blobs.has(hit.slice(prefix.length))) throw new Error('invalid ruling-key search path');
-        const path = hit.slice(prefix.length);
-        if (cardRulingKey(String(git('cat-file', 'blob', blobs.get(path)))) === rulingKey) matches.push(path);
+      for (const [path, blob] of blobs) {
+        // YAML may quote or escape property names. A literal prefilter cannot prove absence.
+        const text = String(git('cat-file', 'blob', blob));
+        const { data } = parseRulingCard(text);
+        if (data.rulingKey === rulingKey) matches.push({ rel: path, text, status: data.status });
       }
       if (matches.length > 1) throw new Error('duplicate ruling keys; use the existing consolidate path');
       return matches[0] ?? null;
     };
     const ownCard = sha => {
-      const rel = readCards(sha);
-      if (!rel) throw new Error('per-ruling branch exists without its keyed card');
-      const base = String(git('merge-base', '--all', 'origin/main', sha)).trim();
-      if (!SHA.test(base)) throw new Error('ambiguous ruling branch baseline');
+      const card = readCards(sha);
+      if (!card) throw new Error('per-ruling branch exists without its keyed card');
+      const { rel, text, status } = card;
+      if (status !== 'open') throw new Error('keyed ruling card is not open; inspect before retrying');
+      if (digest !== undefined && !rulingCardCoversInput(text, { rulingKey, digest }))
+        throw new Error('keyed ruling card does not cover every finding; inspect before retrying');
+      const base = validateCardPublicationHistory({ main: 'origin/main', head: sha,
+        run: (args, _input, raw = false) => {
+          const output = String(git(...args));
+          return raw ? output : output.trim();
+        } });
       if (String(git('diff', '--name-status', '-z', '--no-renames', '--ignore-submodules=none', '--no-ext-diff', base, sha)) !== `A\0${rel}\0`)
         throw new Error('per-ruling branch is not a single added card');
-      return { ok: true, card: { rel, branch, sha } };
+      return { ok: true, card: { rel, branch, sha, text } };
     };
     const local = String(git('for-each-ref', '--format=%(objectname) %(refname)', ref,
       'refs/heads/lane/card-batch-*', 'refs/remotes/origin/lane/card-batch-*')).trim();
@@ -132,7 +160,7 @@ export async function landRulingInLane(input, { lane, laneRunMjs, exec, lookup, 
   timeouts = { file: 120000, verify: 4200000, open: 2700000 } }) {
   const fail = (step, reason, rel = null) => ({ ok: false, step, reason, rel });
   let found;
-  try { found = await lookup(input.rulingKey, { lane }); }
+  try { found = await lookup(input.rulingKey, { lane, digest: input.digest }); }
   catch (error) { return fail('ruling-lookup', `unreadable ruling key: ${error.message}; nothing filed`); }
   if (found?.ok !== true) return fail('ruling-lookup', found?.reason ?? 'ruling-key lookup unavailable; nothing filed');
   const branch = rulingBranch(input.rulingKey);
@@ -148,7 +176,7 @@ export async function landRulingInLane(input, { lane, laneRunMjs, exec, lookup, 
     rel = filed?.verdict?.rel;
     if (!rel) return fail('file-item', 'file-item produced no card path');
     // Never trust only the operation verdict: prove the keyed branch actually survived publication.
-    try { found = await lookup(input.rulingKey, { lane }); }
+    try { found = await lookup(input.rulingKey, { lane, digest: input.digest }); }
     catch (error) { return fail('ruling-lookup', error.message, rel); }
     if (found?.ok !== true || found.card?.rel !== rel) return fail('ruling-lookup', found?.reason ?? 'filed card branch unavailable; preserve the lane and retry', rel);
   }
@@ -169,7 +197,7 @@ export async function landRulingInLane(input, { lane, laneRunMjs, exec, lookup, 
     if (!verified?.verdict?.ok) return fail('verify', 'gate not green', rel);
   } catch (error) { return fail('verify', String(error.message).split('\n')[0], rel); }
   const body = scratchFile('pr-body.md');
-  writeFile(body, `Mechanically filed ruling card.\n\n${input.digest}\n\nprep: waived — card-only mechanical filing\n`, 'utf8');
+  writeFile(body, `Mechanically filed ruling card.\n\n${input.digest}${committedCardPrep({ lane, sha: found.card.sha, exec })}`, 'utf8');
   try {
     const opened = parse(exec('node', [laneRunMjs, 'open-pr', `--ref=${branch}`, `--sha=${found.card.sha}`,
       '--base=main', `--bodyFile=${body}`, '--mode=label-on-green', '--requireVerified=true', '--json'], { cwd: lane, timeout: timeouts.open }));

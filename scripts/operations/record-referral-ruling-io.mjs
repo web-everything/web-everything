@@ -1,11 +1,11 @@
-import { lookupRulingCard as lookupRulingBranch, rulingBranch } from './ruling-card-branch.mjs';
+import { lookupRulingCard as lookupRulingBranch, rulingBranch, rulingCardCoversInput } from './ruling-card-branch.mjs';
 import { assertJudgeReason } from './record-referral-ruling.mjs';
 import { assertRulingIdentity } from '../lib/operator-identity.mjs';
 import { JUDGE_ACTOR, JUDGE_ATTRIBUTION, readJudgeActorPolicy, readJudgeWriterPolicy, assertJudgeAuthority } from '../lib/marker-authorship.mjs';
 import { cascadePolicy, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 import { readFindingClassPolicy } from '../lib/finding-class-policy.mjs';
 import { landPreventionCard as defaultLandPreventionCard, runCardDedupe } from './land-prevention-card.mjs';
-import { loadCardDedupePolicy, readOpenCards, readPrHostedCards } from '../lib/card-dedupe.mjs';
+import { loadCardDedupePolicy, readOpenCards, readPrHostedCards, parseFilingItems } from '../lib/card-dedupe.mjs';
 /**
  * @file scripts/operations/record-referral-ruling-io.mjs
  * @description The io binding of `record-referral-ruling` (#4979): reads the PR thread through `gh`, resolves the
@@ -322,17 +322,28 @@ const rulingDedupe = (input, options) => runCardDedupe(input, { ...options, read
 
 export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
   landPreventionCard = defaultLandPreventionCard,
-  lookupRulingCard = (key, { lane = REPO_ROOT } = {}) => lookupRulingBranch({ root: lane, rulingKey: key }), ...landingOptions } = {}) {
+  lookupRulingCard = (key, { lane = REPO_ROOT, digest } = {}) => lookupRulingBranch({ root: lane, rulingKey: key, digest }), ...landingOptions } = {}) {
   let existing;
   if (input.rulingKey) {
-    try { rulingBranch(input.rulingKey); existing = await lookupRulingCard(input.rulingKey, { lane: REPO_ROOT }); }
+    try { rulingBranch(input.rulingKey); existing = await lookupRulingCard(input.rulingKey, { lane: REPO_ROOT, digest: input.digest }); }
     catch (error) { return { ok: false, step: 'ruling-lookup', reason: `${error.message}; nothing filed` }; }
     if (existing?.ok !== true) return { ok: false, step: 'ruling-lookup', reason: existing?.reason ?? 'ruling-key lookup unavailable; nothing filed' };
   }
   let plan;
-  try { plan = existing?.card ? { action: 'file', matches: [] } : await dedupe(input, { lane: REPO_ROOT }); }
+  try { plan = await dedupe(input, { lane: REPO_ROOT }); }
   catch (error) { return { ok: false, step: 'dedupe', reason: `duplicate-card check failed: ${String(error?.message ?? error).split('\n')[0]}; nothing filed` }; }
-  if (plan?.action === 'mention' && plan.matches?.length) {
+  if (!plan || !['file', 'mention'].includes(plan.action) || !Array.isArray(plan.matches)
+    || (plan.action === 'mention' && !plan.matches.length))
+    return { ok: false, step: 'dedupe', reason: 'duplicate-card check unavailable or partial; inspect evidence before retrying; nothing filed' };
+  if (existing?.card) {
+    if (!rulingCardCoversInput(existing.card.text, input))
+      return { ok: false, step: 'ruling-lookup', reason: 'keyed card is not open or does not cover every finding; inspect before retrying; nothing filed' };
+    if (plan.matches.length && (plan.action !== 'mention' || plan.remaining !== null
+      || plan.matches.length !== parseFilingItems(input.digest).length
+      || !plan.matches.every(({ card }) => card?.rel === existing.card.rel && rulingCardCoversInput(card.text, input))))
+      return { ok: false, step: 'dedupe', reason: 'keyed branch conflicts with duplicate-card evidence; inspect or consolidate before retrying; nothing filed' };
+  }
+  if (!existing?.card && plan.action === 'mention' && plan.matches.length) {
     const refs = plan.matches.map(({ card }) => {
       if (!card?.rel || (card.host !== 'main' && !card.host?.pr)) return null;
       return `we:${card.rel}${card.host === 'main' ? '' : `@pr${card.host.pr}`}`;
@@ -340,12 +351,8 @@ export async function landRulingCard(input, { repo, pr, dedupe = rulingDedupe,
     if (refs.every(Boolean) && new Set(refs).size === 1)
       return { ok: true, reused: true, ref: refs[0], pr: plan.matches[0].card.host?.pr ?? null };
   }
-  // Fail closed: unreadable dedupe evidence never proceeds to filing.
-  if (!plan || plan.action === 'off') {
-    return { ok: false, step: 'dedupe', reason: 'duplicate-card check unavailable; nothing filed' };
-  }
   // Fail closed: any other match (several cards, or only some findings matched) would file a duplicate.
-  if (plan?.matches?.length) {
+  if (!existing?.card && plan.matches.length) {
     return { ok: false, step: 'dedupe', reason: 'findings already match existing open card(s) but not as one card; cite the right one with --card instead of filing a duplicate' };
   }
   if (!input.rulingKey) return { ok: false, step: 'ruling-lookup',

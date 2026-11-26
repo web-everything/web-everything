@@ -1,4 +1,6 @@
 import { prepVerdict } from '../../lib/prep-block.mjs';
+import { cardRepo } from './helpers/card-ruling-repo.mjs';
+import { landRulingInLane, rulingBranch } from '../ruling-card-branch.mjs';
 /**
  * @file land-prevention-card.test.mjs — #4317. `landPreventionCard` is the detached job
  * `we:scripts/review-set-label.mjs#fileApprovalPreventionCard` spawns instead of shelling `file-item` inline:
@@ -50,8 +52,14 @@ const INPUT = {
  *  string to return, or a function `(cmd, args, opts) => string` for a call needing to inspect its own args. */
 function scriptedExec(steps) {
   let i = 0;
-  const calls = [];
+  const calls = [], proofCalls = [];
   const exec = (cmd, args, opts) => {
+    if (cmd === 'git' && (args.includes('HEAD^{commit}') || args.includes('--all') || args.includes('--raw'))) {
+      proofCalls.push({ cmd, args, opts });
+      if (args.includes('HEAD^{commit}')) return 'a'.repeat(40) + '\n';
+      if (args.includes('--all')) return 'b'.repeat(40) + '\n';
+      return `:000000 100644 ${'0'.repeat(40)} ${'c'.repeat(40)} A\0backlog/9001-file-the-prevention.md\0`;
+    }
     calls.push({ cmd, args, opts });
     const step = steps[i];
     i += 1;
@@ -60,7 +68,7 @@ function scriptedExec(steps) {
     if (step instanceof Error) throw step;
     return step;
   };
-  return { exec, calls };
+  return { exec, calls, proofCalls };
 }
 
 const ACQUIRE_OK = JSON.stringify({ lane: 7, path: '/workspace/.lanes/web-everything/lane-7', session: 'prevention-card-test', holder: 'h' });
@@ -69,6 +77,43 @@ const VERIFY_GREEN = JSON.stringify({ verdict: { ok: true, passed: 2, failed: 0,
 const OPEN_PR_OPENED = JSON.stringify({
   runId: 'r1', op: 'open-pr', stopped: 'complete', applied: [], inFlight: [], pending: null,
   findings: { submit: { effects: [{ result: { outcome: 'opened', pr: 5555, url: 'https://github.com/web-everything/web-everything/pull/5555' } }] } },
+});
+
+it('finding 3: filing commits only card paths and omits waivers for mixed committed diffs', async () => {
+  const r = cardRepo(), bodies = [];
+  const rel = 'backlog/101-new.md', key = `referral-test:${'a'.repeat(64)}`;
+  try {
+    r.put('scripts/inherited.mjs'); r.commit();
+    const exec = (cmd, args) => {
+      if (cmd === 'git') return r.git(...args.slice(2));
+      if (cmd === 'gh' || args.includes('release')) return '';
+      if (args.includes('acquire')) return JSON.stringify({ lane: 7, path: r.root, holder: 'test' });
+      if (args.includes('file-item')) {
+        r.put(rel, '---\nstatus: open\n---\nCard\n');
+        r.put('scripts/staged.mjs'); r.git('add', 'scripts/staged.mjs');
+        return JSON.stringify({ verdict: { num: 101, rel } });
+      }
+      if (args.includes('verify')) return VERIFY_GREEN;
+      if (args.includes('open-pr')) return OPEN_PR_OPENED;
+      throw new Error('unexpected child');
+    };
+    const result = await landPreventionCard(INPUT, { exec, dedupe: () => null, write: () => {},
+      pendingDir: join(r.root, 'pending'), writeFile: (path, bytes) => {
+        if (path.endsWith('pr-body.md')) bodies.push(bytes);
+        writeFileSync(path, bytes);
+      } });
+    expect(result).toMatchObject({ ok: true });
+    expect(r.git('diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD').trim()).toBe(rel);
+    expect(r.git('diff', '--cached', '--name-only').trim()).toBe('scripts/staged.mjs');
+    expect(bodies[0]).not.toContain('prep: waived');
+    const sha = r.git('rev-parse', 'HEAD').trim();
+    const ruled = await landRulingInLane({ ...INPUT, rulingKey: key }, { lane: r.root, laneRunMjs: 'run.mjs', exec,
+      lookup: () => ({ ok: true, card: { rel, sha, branch: rulingBranch(key) } }), parse: JSON.parse,
+      submit: () => ({ outcome: 'opened', pr: 5555 }), scratchFile: () => join(r.root, 'ruling-body.md'),
+      writeFile: (_path, body) => bodies.push(body) });
+    expect(ruled).toMatchObject({ ok: true });
+    expect(bodies[1]).not.toContain('prep: waived');
+  } finally { r.close(); }
 });
 
 describe('landPreventionCard — the real acquire → file-item → commit → verify → open-pr → release sequence', () => {

@@ -107,7 +107,7 @@ import {
   loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, filingSource,
   remainingAfter, parseFilingItems,
 } from '../lib/card-dedupe.mjs';
-import { landRulingInLane, lookupRulingCard as lookupRulingBranch } from './ruling-card-branch.mjs';
+import { landRulingInLane, lookupRulingCard as lookupRulingBranch, committedCardPrep } from './ruling-card-branch.mjs';
 import { rulingCardTitle } from '../lib/locus-prefix-text.mjs';
 
 import { raisedByFile, readRaisedBy, parseRaisedBy, raisedByKey } from '../lib/raised-by.mjs';
@@ -493,8 +493,8 @@ export async function landPreventionCard(input, {
   removeCards = removeFiledCards,
   salvageCards = salvageLaneCards,
   rulingSourceRoot,
-  lookupRulingCard = (key, { lane }) => lookupRulingBranch({ root: lane, rulingKey: key,
-    git: (...args) => exec('git', ['-C', lane, ...args], { timeout: 30000 }) }),
+  lookupRulingCard = (key, { lane, digest }) => lookupRulingBranch({ root: lane, rulingKey: key, digest,
+    git: (...args) => exec('git', ['-C', lane, ...args], { timeout: 30000, maxBuffer: 16 * 1024 * 1024 }) }),
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -572,12 +572,18 @@ export async function landPreventionCard(input, {
     // one hop further out. A real delivery agent avoids this by `cd $LANE` + a RELATIVE `scripts/...` path; this
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
+    const labelReviewPending = pr => {
+      try {
+        exec('gh', ['pr', 'edit', String(pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
+      } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
+    };
     if (input.rulingKey) {
       keepRulingLane = true; // Any throw/failure preserves the filing; release may otherwise salvage/remove it.
       const result = await landRulingInLane(input, { lane, laneRunMjs, exec, lookup: lookupRulingCard,
         parse: parseRunJsonTail, submit: extractSubmitResult, scratchFile, writeFile, sourceRoot: rulingSourceRoot,
         timeouts: { file: FILE_ITEM_TIMEOUT_MS, verify: VERIFY_TIMEOUT_MS, open: OPEN_PR_TIMEOUT_MS } });
       keepRulingLane = !result.ok;
+      if (result.ok) labelReviewPending(result.pr);
       return result;
     }
     await drainPendingPrevention({ lane }, { pendingDir, exec, batch, write });
@@ -724,7 +730,7 @@ export async function landPreventionCard(input, {
         : machinePrTitle({ item, kind: 'prevention', card: { title: mentionTitle(input, mentioned[0].items[0]) } });
       writeFile(msgPath, `${subject}\n\n`
         + 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n', 'utf8');
-      exec('git', ['-C', lane, 'commit', '-F', msgPath], {});
+      exec('git', ['-C', lane, 'commit', '-F', msgPath, '--', ...filingPaths], {});
     } catch (e) {
       return fail('commit', String(e?.message || e).split('\n')[0], { num, rel });
     }
@@ -746,7 +752,7 @@ export async function landPreventionCard(input, {
       ? `\n\nDedupe before filing: ${mentioned.length} existing open card(s) got independent raised-by files instead of a new card: `
         + `${mentioned.map((m) => `\`${m.card.rel}\``).join(', ')}.\n`
       : '';
-    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}\n\nprep: waived — card-only mechanical filing\n`, 'utf8');
+    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}${committedCardPrep({ lane, exec })}`, 'utf8');
     const ref = preventionCardRef({ num, rel, session: input.session });
     let opened;
     try {
@@ -762,9 +768,7 @@ export async function landPreventionCard(input, {
     if (submit?.outcome !== 'opened') {
       return fail('open-pr', submit?.reason ?? 'PR was not opened', { num, rel, pr: submit?.pr, url: submit?.url });
     }
-    try {
-      exec('gh', ['pr', 'edit', String(submit.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--add-label', 'review:pending'], { cwd: lane });
-    } catch (error) { write(`land-prevention-card: review:pending label failed (non-fatal) — ${errorReason(error)}\n`); }
+    labelReviewPending(submit.pr);
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
     durable = true;
     return {

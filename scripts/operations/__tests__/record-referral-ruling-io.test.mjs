@@ -10,11 +10,14 @@ import { readFileSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs';
 import { SCAFFOLD_EFFECT } from '../scaffold.mjs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import { prepVerdict } from '../../lib/prep-block.mjs';
+import { planDedupe, cardFromText } from '../../lib/card-dedupe.mjs';
 
 const key = 'referral-run-123:' + 'a'.repeat(64);
 const rel = 'backlog/101-ruling.md';
-const content = `---\nstatus: open\nrulingKey: "${key}"\n---\n# Ruling\n`;
-const input = { title: 'Ruling', kind: 'story', size: '2', digest: 'Finding', scope: 'we:scripts/a.mjs',
+const digest = '1. `we:scripts/a.mjs:7` — Finding';
+const content = `---\nstatus: open\nrulingKey: "${key}"\n---\n# Ruling\n\n${digest}\n`;
+const input = { title: 'Ruling', kind: 'story', size: '2', digest, scope: 'we:scripts/a.mjs',
   queue: 'true', session: 'card-ruling-test', rulingKey: key };
 const clean = () => ({ action: 'file', matches: [] });
 const noDelete = () => { throw new Error('filed cards must never be deleted or salvaged'); };
@@ -54,6 +57,49 @@ function io(r) {
 }
 
 describe('per-ruling branch ownership and crash recovery', () => {
+  it('finding 7: keyed branches still require strict dedupe, full finding coverage and open status', async () => {
+    const r = cardRepo();
+    try {
+      r.put(rel, content); let sha = r.commit();
+      const ref = `refs/heads/${ruling.rulingBranch(key)}`;
+      r.git('update-ref', ref, sha);
+      for (const plan of ['unreadable', null, { action: 'off', matches: [] }, { action: 'partial', matches: [] },
+        { action: 'mention', matches: [{ card: { rel: 'backlog/999-other.md', host: 'main' } }] }]) {
+        const dedupe = vi.fn(() => { if (plan === 'unreadable') throw new Error('lookup failed'); return plan; });
+        const land = vi.fn();
+        const result = await landRulingCard(input, { dedupe, lookupRulingCard: io(r).lookup, landPreventionCard: land });
+        expect(result, JSON.stringify(plan)).toMatchObject({ ok: false, step: 'dedupe' });
+        expect(dedupe).toHaveBeenCalledOnce(); expect(land).not.toHaveBeenCalled();
+      }
+      const own = cardFromText({ rel, text: content, host: 'main' });
+      const dedupe = vi.fn(() => planDedupe({ input, cards: [own], policy: { dedupe: true, similarity: 0.3 } }));
+      const land = vi.fn(async () => ({ ok: true, step: 'done', rel, pr: 77, reused: true }));
+      expect(await landRulingCard(input, { dedupe, lookupRulingCard: io(r).lookup, landPreventionCard: land }))
+        .toMatchObject({ ok: true, reused: true, ref: `we:${rel}@pr77` });
+      expect(dedupe).toHaveBeenCalledOnce(); expect(land).toHaveBeenCalledOnce();
+      for (const bytes of [content.replace('status: open', 'status: closed'), content.replace(' — Finding', ' — Different finding')]) {
+        r.put(rel, bytes); sha = r.commit(); r.git('update-ref', ref, sha);
+        const land = vi.fn();
+        const result = await landRulingCard(input, { dedupe: clean, lookupRulingCard: io(r).lookup, landPreventionCard: land });
+        expect(result).toMatchObject({ ok: false }); expect(land).not.toHaveBeenCalled();
+        expect(ruling.lookupRulingCard({ root: r.root, rulingKey: key, digest: input.digest, git: (...args) => r.git(...args) }))
+          .toMatchObject({ ok: false });
+      }
+    } finally { r.close(); }
+  });
+  it('finding 4: ruling PRs receive review:pending before lane release', async () => {
+    const r = cardRepo();
+    try {
+      const h = io(r);
+      expect(await landRulingCard(input, { dedupe: clean, lookupRulingCard: h.lookup, exec: h.exec,
+        write: () => {}, removeCards: noDelete, salvageCards: noDelete })).toMatchObject({ ok: true });
+      const label = h.calls.findIndex(([cmd, args]) => cmd === 'gh' && args.includes('review:pending'));
+      const release = h.calls.findIndex(([, args]) => args.includes('release'));
+      expect(label).toBeGreaterThan(-1);
+      expect(h.calls[label][1]).toEqual(['pr', 'edit', '77', '--repo', 'web-everything/web-everything', '--add-label', 'review:pending']);
+      expect(release).toBeGreaterThan(label);
+    } finally { r.close(); }
+  });
   it('unreadable ruling-key lookup fails closed and files nothing', async () => {
     const land = vi.fn();
     const result = await landRulingCard(input, { dedupe: clean, lookupRulingCard: () => { throw new Error('unreadable'); }, landPreventionCard: land });
@@ -154,6 +200,52 @@ describe('per-ruling branch ownership and crash recovery', () => {
 
 
 describe('ruling lookup closed paths and durable publication', () => {
+  it('finding 6: lookup parses escaped YAML ruling keys and blocks unparseable unrelated cards', () => {
+    const r = cardRepo();
+    try {
+      r.put(rel, content.replace('rulingKey:', '"ruling\\u004bey":'));
+      let sha = r.commit();
+      r.git('update-ref', `refs/heads/${ruling.rulingBranch(key)}`, sha);
+      expect(io(r).lookup(key)).toMatchObject({ ok: true, card: { rel, sha } });
+      r.put('backlog/102-bad.md', '---\nbad: [\n---\n'); sha = r.commit();
+      r.git('update-ref', `refs/heads/${ruling.rulingBranch(key)}`, sha);
+      const result = io(r).lookup(key);
+      expect(result).toMatchObject({ ok: false });
+      expect(result.reason).toContain('nothing filed');
+    } finally { r.close(); }
+  });
+  it('finding 5: reused ruling branches reject reverted code and merged side-parent history', () => {
+    for (const kind of ['reverted code', 'merge']) {
+      const r = cardRepo();
+      try {
+        r.put('scripts/hidden.mjs'); const side = r.commit();
+        if (kind === 'reverted code') { r.git('rm', 'scripts/hidden.mjs'); r.commit(); }
+        else r.git('reset', '--hard', r.baseline);
+        r.put(rel, content); let sha = r.commit();
+        if (kind === 'merge') sha = r.git('commit-tree', r.git('rev-parse', `${sha}^{tree}`).trim(), '-p', sha, '-p', side, '-m', 'merge side history').trim();
+        r.git('update-ref', `refs/heads/${ruling.rulingBranch(key)}`, sha);
+        expect(r.git('diff', '--name-status', r.baseline, sha)).toBe(`A\t${rel}\n`);
+        const result = io(r).lookup(key);
+        expect(result, kind).toMatchObject({ ok: false });
+        expect(result.reason).toContain('nothing filed');
+      } finally { r.close(); }
+    }
+  });
+  it.each(['unreadable', 'truncated'])('ruling history lookup refuses %s per-commit evidence', kind => {
+    const r = cardRepo();
+    try {
+      r.put(rel, content); const sha = r.commit();
+      r.git('update-ref', `refs/heads/${ruling.rulingBranch(key)}`, sha);
+      const result = ruling.lookupRulingCard({ root: r.root, rulingKey: key, git: (...args) => {
+        if (args[0] === 'log') {
+          if (kind === 'unreadable') throw new Error('history unavailable');
+          return rel;
+        }
+        return r.git(...args);
+      } });
+      expect(result).toMatchObject({ ok: false }); expect(result.reason).toContain('nothing filed');
+    } finally { r.close(); }
+  });
   it.each(['local read error', 'origin read error', 'malformed origin listing', 'truncated tree', 'malformed frontmatter', 'duplicate keyed cards', 'wrong branch content'])('fails closed: %s', kind => {
     const r = cardRepo();
     try {
@@ -271,6 +363,7 @@ describe('published ruling card checkout with the actual scaffold and publicatio
       try { h.r.git('checkout', '--detach', h.published.sha); } catch (error) { checkoutError = error; }
       expect(String(checkoutError?.stderr)).toContain('untracked working tree files would be overwritten by checkout');
       expect(await h.run()).toMatchObject({ ok: true, pr: 77 });
+      expect(prepVerdict(readFileSync(join(h.r.root, 'pr-body.md'), 'utf8'))).toMatchObject({ ok: true, waived: true });
       expect(h.verify).toHaveBeenCalledOnce();
       expect(h.calls.some(([, args]) => args.includes('checkout') && args.includes('--detach'))).toBe(true);
       expect(h.r.git('show', `${h.published.sha}:${rel}`)).toBe(content);

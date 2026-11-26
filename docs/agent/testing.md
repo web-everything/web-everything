@@ -4625,18 +4625,30 @@ to an older pass, plus carried and waived paths; malformed records require repai
 
 ## Canonical audit before opening PRs
 
-A head whose net diff from the single merge-base with freshly fetched origin/main consists only of ADDED top-level `backlog/<id>-*.md` card files or raised-by files (status A, mode 100644) is admitted without a canonical audit; an edited or deleted card, any other path, a rename, a symlink, an empty diff, more than one merge-base, or any git or fetch error requires the audit as before.
+A head whose net diff from the single merge-base with freshly fetched origin/main consists only of ADDED top-level `backlog/<id>-*.md` card files or raised-by files (status A, mode 100644) can admit without a canonical audit only when records for that head or covering it are absent; an edited or deleted card, any other path, a rename, a symlink, an empty diff, more than one merge-base, or any git or fetch error requires the audit as before.
 
-Eligible cards bypass missing, malformed and WEAKENED records before settings or records are read.
-Ineligible changes keep the existing veto and exact-head waiver behavior. The raw NUL-delimited diff
+Eligible cards admit only when no audit record exists for the head or covers its live fingerprint.
+Malformed or unreadable records refuse; an absent record file (ENOENT) is absence. Existing records
+keep the normal veto and exact-head waiver behavior, including WEAKENED records. The raw NUL-delimited diff
 must be complete, and the fetched commit must equal origin/main. Unknown evidence falls through to
 the audit path; its refusal names the canonical audit command for the resolved head.
+Exercise the production wrapper with a raw diff plus trailing newline: trimming scalar Git reads
+must never trim raw diff evidence. PREP waivers use the same committed raw-diff proof against
+origin/main for both ordinary and ruling filings. Unknown or mixed evidence omits the waiver and
+names the need for PREP evidence in the body; it never silently stops the filing. Commit only the
+filed card and raised-by paths, leaving unrelated staged changes intact.
 
 Ruling filings carry a stable `rulingKey` (referral run ID plus finding fingerprint) in frontmatter
 and use `lane/card-ruling-<key>` exclusively. The `file-item` rulingKey input opts out of shared batch
 publication and preserves only that card on its own branch before returning. Resume reads that branch
 locally, then origin, reusing its immutable card and PR; no filed card is deleted. A legacy keyed card
 found only on a shared batch branch stops with a report; unreadable lookup stops without filing.
+Parse every backlog card's YAML frontmatter, including escaped key names; parse failures block.
+Reused branches share the publication sink's full-history validator: no merges or side-parent history,
+and every intervening commit must contain only card paths, including changes later reverted.
+Require an open keyed card covering every requested finding, and always run strict duplicate lookup;
+unavailable, partial or conflicting evidence blocks with an inspection/consolidation report. A ruling
+PR gets the same `review:pending` label as an ordinary filing before lane release.
 Lookup refuses more than 1,024 local or origin ruling/batch refs; inspect or consolidate legacy
 branches before retrying. Persisted filings without a ruling key require re-preparation from the referral identity, never a
 new guessed key. Exercise the crash between filing and opening with real Git objects and injected
