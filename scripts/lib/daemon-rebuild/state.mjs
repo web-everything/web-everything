@@ -263,7 +263,8 @@ export function assertReadyCandidatePins(root, r, env = process.env, read = read
       if (typeof auditedTip === 'function' && auditedTip(pin.ref, pin.sha) !== true) throw new StaleReadyPinError('Unaudited ready pin');
       const registration = registry.overlays?.find(o => o.ref === pin.ref);
       // A pin means pin: the build applies pin.sha, so a branch that only fast-forwarded past the held tip
-      // keeps the proof. Ancestry is re-derived from git (never from labels); a rewritten branch or any git error stays stale.
+      // keeps the proof. Descending from pin.sha alone is insufficient: a rewrite can retain the applied
+      // SHA while losing pinnedFrom. Re-derive both ancestry checks; a rewrite or any git error stays stale.
       const tip = verifyRev(git, `refs/remotes/origin/${pin.ref}^{commit}`);
       const ancestor = (a, b) => {
         try { return git(['merge-base', '--is-ancestor', a, b]).status === 0; } catch { return false; }
