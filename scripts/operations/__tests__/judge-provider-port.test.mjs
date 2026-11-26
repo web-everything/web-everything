@@ -14,6 +14,8 @@
 
 import { describe, it, expect } from 'vitest';
 
+import { parseCodexJudgeOutcome } from '../../lib/codex-judge-spawn.mjs';
+import { deriveVerdict } from '../../lib/jury-core.mjs';
 import { createDefaultJudge, unwrapJudgeOutcome } from '../cli-adapter.mjs';
 
 /** A hand-written `JudgeProvider` — no argv, no stdout, no child process. Records what it was handed. */
@@ -219,5 +221,42 @@ describe('card x5s8b47 — `gracefulOnUnavailable`: an advisory seat degrades, i
     const { value } = unwrapJudgeOutcome(returned);
     expect(value.skipped.provider).toBe('antigravity');
     expect(value.skipped.reason).toMatch(/no fallback provider configured/);
+  });
+});
+
+
+describe('CODEX-SEAT-NULL-FINDINGS through createDefaultJudge', () => {
+  const shape = { type: 'object', properties: { summary: { type: 'string' }, findings: { type: 'array', items: { type: 'object' } } } };
+  const request = { mandate: 'review', input: 'diff', shape, providerName: 'codex' };
+  function judgeFor(answer) {
+    return createDefaultJudge({
+      checkProviderHold: async () => null,
+      resolveProvider: () => async () => parseCodexJudgeOutcome({
+        stdout: JSON.stringify({ type: 'turn.completed', usage: {} }),
+        lastMessage: JSON.stringify(answer),
+      }),
+    });
+  }
+
+  it('a Codex seat answer with findings:null fails closed as a seat error through createDefaultJudge', async () => {
+    await expect(judgeFor({ summary: 'reviewed', findings: null })(request)).rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+  });
+
+  it('missing findings fails closed as a seat error', async () => {
+    await expect(judgeFor({ summary: 'reviewed' })(request)).rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+  });
+
+  it('malformed findings remains a seat error even for a graceful Codex seat', async () => {
+    await expect(judgeFor({ summary: 'reviewed', findings: null })({ ...request, gracefulOnUnavailable: true }))
+      .rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+  });
+
+  it.each([
+    [[], 'accept'],
+    [[{ summary: 'broken', impactIfUnfixed: 5 }], 'changes'],
+  ])('preserves a findings array %j and derives %s', async (findings, verdict) => {
+    const { value } = unwrapJudgeOutcome(await judgeFor({ summary: 'reviewed', findings })(request));
+    expect(value.findings).toEqual(findings);
+    expect(deriveVerdict({ findings: value.findings })).toBe(verdict);
   });
 });

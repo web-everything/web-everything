@@ -64,7 +64,7 @@ import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-s
 // `requireAllProperties` from `jury-core.mjs` here and broke all three of those tests with
 // `ERR_MODULE_NOT_FOUND: markdown-it` — a real, live-caught regression, not a hypothetical one; see
 // `codex-judge-spawn.mjs`'s own header for the full account. Do not re-introduce that edge.
-import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute } from '../lib/codex-judge-spawn.mjs';
+import { codexJudgeSpawn, requireAllProperties, resolveRaiseOnlyJudgeRoute, assertCodexFindings, CodexInvalidFindingsError } from '../lib/codex-judge-spawn.mjs';
 // #3383 probation — the ratified Codex model pin (`#x8wbivt`), a leaf constant with no jury/markdown-it edge
 // (same safety property `codex-judge-spawn.mjs`'s own header discusses for this file). Needed so the
 // advisory judge seat's `{provider, model}` identity is a STAMPABLE fact rather than whatever `codex exec`
@@ -916,9 +916,11 @@ export function createDefaultJudge({
       try {
         const actual = configured && spawnProviderName !== effectiveProviderName ? { ...effective, ...configured.fallback.find(route => route.provider === spawnProviderName), providerName: spawnProviderName } : effective;
         const outcome = await spawnProvider(buildProviderRequest(actual, cwd, spawnProviderName));
+        if (spawnProviderName === 'codex') assertCodexFindings(outcome.value, actual.shape);
         // NOT a spread of `outcome` — see the ordinary path's own note just below.
         return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, actual));
       } catch (e) {
+        if (e instanceof CodexInvalidFindingsError) throw e;
         // Antigravity may skip only with explicit provider-unavailability evidence.
         // Missing/malformed output, schema failures and tool denials remain seat failures.
         if (spawnProviderName === 'antigravity' && ![
@@ -944,6 +946,7 @@ export function createDefaultJudge({
     // #3383 mechanical-dispatcher Gap 2 root cause fix — see `buildProviderRequest`'s own comment for the full
     // account of why `model`/`cwd` are conditionally spread rather than always present.
     const outcome = await resolvedProvider(buildProviderRequest(effective, cwd, effectiveProviderName));
+    if (effectiveProviderName === 'codex') assertCodexFindings(outcome.value, effective.shape);
     // NOT a spread of `outcome`: it also carries `argv` (which embeds the whole mandate) and the answer itself.
     // The record keeps the meter, never the material. `normalizeJudgeTelemetry` whitelists again on arrival.
     return judgeOutcome(outcome.value, judgeTelemetryFrom(outcome, effective));

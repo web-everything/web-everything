@@ -470,6 +470,29 @@ describe('codexJudgeSpawn — exercised over an injected spawn (real temp files,
     JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }),
   ].join('\n');
 
+  it.each([
+    ['null', { summary: 'reviewed', findings: null }],
+    ['missing', { summary: 'reviewed' }],
+    ['string', { summary: 'reviewed', findings: 'none' }],
+  ])('rejects %s findings as a seat error before null stripping', async (_label, answer) => {
+    const { fn } = fakeSpawn({ stdout: okJsonl, writeLastMessage: JSON.stringify(answer) });
+    await expect(codexJudgeSpawn({
+      mandate: 'review', input: 'diff',
+      shape: { type: 'object', properties: { findings: { type: 'array' } } },
+      spawnFn: fn, persistTranscript: () => null,
+    })).rejects.toThrow(/findings.*array.*[Rr]e-?run/);
+  });
+
+  it.each([{ findings: [] }, { findings: [{ summary: 'broken', file: null }] }])('preserves valid findings $findings while stripping optional nulls', async ({ findings }) => {
+    const { fn } = fakeSpawn({ stdout: okJsonl, writeLastMessage: JSON.stringify({ summary: 'reviewed', findings }) });
+    const outcome = await codexJudgeSpawn({
+      mandate: 'review', input: 'diff',
+      shape: { type: 'object', properties: { findings: { type: 'array' } } },
+      spawnFn: fn, persistTranscript: () => null,
+    });
+    expect(outcome.value.findings).toEqual(stripNulls(findings));
+  });
+
   it('writes the (already-transformed) shape to a real temp schema file the argv points at', async () => {
     let schemaFileSeenDuringSpawn = null;
     const fn = (cli, argv) => {

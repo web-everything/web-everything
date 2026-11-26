@@ -275,6 +275,21 @@ export function stripNulls(value) {
   return out;
 }
 
+/** CORE-VRD-067/068: missing findings are a seat error, never a clean review. */
+export class CodexInvalidFindingsError extends Error {
+  constructor() {
+    super('codex-judge-spawn: findings must be an array; the seat output is incomplete. Re-run the review.');
+    this.name = 'CodexInvalidFindingsError';
+  }
+}
+
+/** Only findings-bearing schemas require a list; synthesis and other judge shapes remain valid. */
+export function assertCodexFindings(value, shape) {
+  if (Object.hasOwn(shape?.properties ?? {}, 'findings') && !Array.isArray(value?.findings)) {
+    throw new CodexInvalidFindingsError();
+  }
+}
+
 /** The CLI this provider runs as. Named once, exactly like `judge-spawn.mjs`'s `JUDGE_CLI`. */
 export const CODEX_CLI = 'codex';
 
@@ -493,13 +508,14 @@ function parseInvalidSchemaError(message) {
  *   never reaches stdout at all).
  * @param {string|null} [o.lastMessage] - the `--output-last-message` file's content, or `null` if it was
  *   never written (a kill before the file was created, probe 6).
+ * @param {object} [o.shape] - requested schema; findings-bearing answers require an actual array.
  * @returns {{value: object, sessionId: string, costUsd: number, numTurns: number, stopReason: string,
  *            usage: object}}
  * @throws {CodexInvalidSchemaError} on OpenAI's strict-schema 400.
  * @throws {Error} on any other terminal failure, or on no terminal event at all (the timeout caller handles
  *   that case separately — see `codexJudgeSpawn`).
  */
-export function parseCodexJudgeOutcome({ stdout, stderr = '', lastMessage = null } = {}) {
+export function parseCodexJudgeOutcome({ stdout, stderr = '', lastMessage = null, shape } = {}) {
   const lines = String(stdout).split('\n').map(parseJsonlLine).filter(Boolean);
 
   // THE TERMINAL EVENT IS THE LAST ONE, NEVER THE FIRST (probe 5). Scan from the end for the two events that
@@ -565,6 +581,8 @@ export function parseCodexJudgeOutcome({ stdout, stderr = '', lastMessage = null
   if (!parsedAnswer || typeof parsedAnswer !== 'object' || Array.isArray(parsedAnswer)) {
     throw new Error(`codex-judge-spawn: the juror's final answer was not a JSON object: ${answerText.slice(0, 200)}`);
   }
+
+  assertCodexFindings(parsedAnswer, shape);
 
   return {
     // #3371 probe 4 — strip `null`s before ANY downstream consumer (e.g. `normalizeFinding`) sees this value.
@@ -829,7 +847,10 @@ export async function codexJudgeSpawn({
 
   if (result.timedOut) {
     let outcome = null;
-    try { outcome = parseCodexJudgeOutcome({ stdout: result.stdout, stderr: result.stderr, lastMessage }); } catch { outcome = null; }
+    try { outcome = parseCodexJudgeOutcome({ stdout: result.stdout, stderr: result.stderr, lastMessage, shape }); } catch (e) {
+      if (e instanceof CodexInvalidFindingsError) throw e;
+      outcome = null;
+    }
     if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout: result.stdout, stderr: result.stderr });
     return {
       ...outcome, durationMs: wallMs, wallMs, timedOut: true,
@@ -840,6 +861,7 @@ export async function codexJudgeSpawn({
     stdout: result.stdout,
     stderr: result.stderr || (result.code === 0 ? '' : `exit code ${result.code}`),
     lastMessage,
+    shape,
   });
   return {
     ...outcome, durationMs: wallMs, wallMs, timedOut: false,
