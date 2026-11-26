@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url';
 import { planFileItem } from '../../operations/file-item.mjs';
 import * as sizeAdmission from '../pr-size-admission.mjs';
 import { BUILT_IN_PR_SIZE_SETTINGS } from '../pr-size-defaults.mjs';
+import { resolvePrSizeSettings } from '../pr-size-settings.mjs';
 import { outcomePayload } from '../../operations/cli-adapter.mjs';
 import { fileIntoBatch } from '../../operations/card-batch-file.mjs';
 
@@ -27,6 +28,27 @@ vi.mock('node:child_process', async (importOriginal) => {
 // fileItem accepts the declared operation's title/kind/size/digest/scope fields and returns
 // the CLI's outcomePayload envelope with a top-level verdict.
 afterEach(() => vi.restoreAllMocks());
+
+describe('ruled data exemptions', () => {
+  it('schema files and wider environment globs never receive data exemptions', () => {
+    expect(() => resolvePrSizeSettings({ platform: {}, env: {
+      WE_PR_SIZE_DATA_PATHS: '["src/**/*.json"]',
+    } })).toThrow(/env\.dataPaths/);
+    expect(sizeAdmission.measureNonTestLines('301\t0\tdata/nested/schema.json\0'))
+      .toEqual({ lines: 301, dataLines: 0, exempt: false });
+  });
+
+  it('schema exclusion precedes every data exemption', () => {
+    const paths = ['data/nested/schema.json', 'fixtures/schema.json',
+      'src/x/__fixtures__/schema.json', 'protocols/p/fixtures/schema.json'];
+    const settings = { ...BUILT_IN_PR_SIZE_SETTINGS, dataDirs: ['data', 'fixtures'],
+      dataPaths: ['src/**/*.json', 'protocols/**/*.json', ...paths] };
+    for (const path of paths) {
+      expect(sizeAdmission.measureNonTestLines(`301\t0\t${path}\0`, settings))
+        .toEqual({ lines: 301, dataLines: 0, exempt: false });
+    }
+  });
+});
 
 describe('planSizeAdmission — size dials capacity, never permission', () => {
   it.each([0, 299, 300])('exactly %i non-test lines need no action', (lines) => {
