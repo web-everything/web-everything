@@ -239,7 +239,7 @@
     "scripts/lib/output-mix.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/overlay-adoption.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/pr-limit.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
-    "scripts/lib/pr-size-admission.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":6},
+    "scripts/lib/pr-size-admission.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.; +1 read-only timeout wrapper (OPEN-PR-SIBLING-BASE, reviewed by the orchestrator 2026-11-25 22:19 ET: rev-parse/diff/ls-tree reads only, no push)","sites":7},
     "scripts/lib/pre-pr-review.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":16},
     "scripts/lib/priority-order.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/rebase-verdict-carry.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
