@@ -19,6 +19,9 @@ The prioritisation table retains its loader (including the pending promise) on
 the table across script reinitialization. Sort and filter handlers bind once.
 `backlog-table-sort.test.ts` covers pending and completed loads, single sort and
 filter actions after reinitialization, and retry after a failed load.
+Happy DOM 12 does not implement `HTMLTableCellElement.cellIndex`; the table
+fixture supplies a getter on its headers. Keep numeric and text columns with
+different orders so sorting the wrong column or comparing empty values fails.
 
 After `build:docs`, the required CI smoke job runs the unchanged 24 MiB
 deployment guard, then `node --test tests/build/site-asset-size.test.mjs`.

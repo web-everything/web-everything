@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 const script = readFileSync('src/assets/js/backlog-table-sort.js', 'utf8');
-const row = (id: number) => `<tr data-kind="task" data-readiness="batchable" data-search="${id} title"><td data-sort-val="${id}">${id}</td></tr>`;
+const row = (id: number) => `<tr data-kind="task" data-readiness="batchable" data-search="${id} title"><td data-sort-val="${id}">${id}</td><td data-sort-val="${['', 'Beta', 'Gamma', 'Alpha'][id]}">Title</td></tr>`;
 let fetcher: any;
 let listeners: any[];
 function mount(saved = false) {
@@ -9,11 +9,18 @@ function mount(saved = false) {
   document.body.innerHTML = `<input data-ptable-search><button data-pkind="task" aria-pressed="true">Task</button>
     <button data-pkind="decision" aria-pressed="true">Decision</button>
     <span data-pcount-full="3" data-pcount-nofiller="2">3</span><strong data-ptable-count>3</strong>
-    <table class="sortable" data-prio-chunks="/one /two"><thead><tr><th data-sort-key="id" data-sort-type="num">ID</th></tr></thead><tbody>${row(1)}</tbody></table>
+    <table class="sortable" data-prio-chunks="/one /two"><thead><tr><th data-sort-key="id" data-sort-type="num">ID</th><th data-sort-key="title" data-sort-type="text">Title</th></tr></thead><tbody>${row(1)}</tbody></table>
     <button data-prio-load>Show all 3 rows</button><span data-prio-status role="status"></span>`;
+  // Happy DOM 12 lacks HTMLTableCellElement.cellIndex. Supply the browser getter
+  // on fixture headers so the real sorter reads the selected column's values.
+  document.querySelectorAll('th').forEach(header => {
+    Object.defineProperty(header, 'cellIndex', {
+      get: () => Array.from(header.parentElement!.children).indexOf(header),
+    });
+  });
   new Function(script)();
 }
-const ids = () => Array.from(document.querySelectorAll('tbody tr:not(.ptable-empty)')).map(row => row.textContent);
+const ids = () => Array.from(document.querySelectorAll('tbody tr:not(.ptable-empty)')).map(row => row.firstElementChild!.textContent);
 async function loaded() { await vi.waitFor(() => expect(ids()).toHaveLength(3)); }
 beforeEach(() => {
   localStorage.clear();
@@ -50,6 +57,23 @@ describe('prioritisation lazy loading', () => {
     header.click(); header.click();
     await loaded();
     expect(ids()).toEqual(['1', '2', '3']); // descending first, ascending second
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('sorts numeric and text columns in both directions with click and keyboard', async () => {
+    mount();
+    const numeric = document.querySelector('[data-sort-key="id"]') as HTMLElement;
+    const title = document.querySelector('[data-sort-key="title"]') as HTMLElement;
+    numeric.click();
+    await loaded();
+    expect(ids()).toEqual(['3', '2', '1']);
+    numeric.click();
+    expect(ids()).toEqual(['1', '2', '3']);
+    title.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    expect(ids()).toEqual(['3', '1', '2']);
+    title.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+    expect(ids()).toEqual(['2', '1', '3']);
+    expect(numeric.hasAttribute('data-sort-dir')).toBe(false);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
