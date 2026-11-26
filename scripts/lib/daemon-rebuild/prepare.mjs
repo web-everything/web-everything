@@ -33,6 +33,7 @@ import {
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { askPinMoved } from './orchestrator-ask.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
 import { makeAuditedTipGate, tipInMain } from './audited-tip.mjs';
@@ -433,6 +434,7 @@ export async function prepareRebuild({
   // A refusal can stop before visiting other pins. Keep their notices and persist any new ones
   // already emitted, even though this plan will not be adopted.
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
+  let askAlerted = false;
   for (const event of plan.alerts || []) {
     // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
     // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
@@ -441,6 +443,11 @@ export async function prepareRebuild({
       const { ref, pr, newTip, files } = event.detail;
       const noticeKey = event.kind === 'overlay-pinned' ? newTip : `unaudited-tip:${newTip}`;
       pinnedNow[ref] = noticeKey;
+      if (event.kind === 'overlay-unaudited-tip' && event.detail.adopted && !strictState) {
+        // Advisory and deduped by key in the asks file; never blocks adoption.
+        const asked = askPinMoved({ ref, pr, adopted: event.detail.adopted, newTip, env });
+        if (!asked.ok && !askAlerted) { askAlerted = true; alert('orchestrator-ask-unwritable', { ref, error: asked.error }); }
+      }
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (!strictState && event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;

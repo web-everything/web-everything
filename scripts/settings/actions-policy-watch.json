@@ -1,0 +1,10 @@
+{
+  "actionsPolicyWatch": {
+    "policyId": 17152,
+    "policyEndpoint": "orgs/{org}/actions/policies/{policyId}",
+    "event": "pull_request_target",
+    "expectedWorkflowPath": ".github/workflows/merge-gate.yml",
+    "changelogFeed": "https://github.blog/changelog/label/actions/feed/",
+    "keywords": ["allow-policy", "allow policy", "pull_request_target"]
+  }
+}

@@ -64,6 +64,11 @@ import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { resolveCoordinationRoot } from './coordination-root.mjs';
+import { acquireLiveOwnerWatchLock } from '../conveyor/pr-live-owner-lock.mjs';
+import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
@@ -77,7 +82,8 @@ import { checksArgv, parseJsonLines } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
-import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
+import { readLiveDrainClaim } from '../conveyor/fix-procedure.mjs';
+import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT, parseNoCodeRearmReceipt } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -170,6 +176,22 @@ export { CLOSE_SUPERSEDED_MARKER };
 export function closeSupersededComment(answer = {}) {
   const quote = String(answer.reason ?? '').replace(/<!--/g, '&lt;!--').split('\n').map((l) => `> ${l}`).join('\n');
   return `${CLOSE_SUPERSEDED_MARKER}\n## Closed as superseded — operator disposition\n\nRuled by @${answer.actor ?? 'operator'} via ${answer.channel ?? 'unknown'} (\`close-superseded\`), executed mechanically by the conveyor. No files were changed and no fix agent was dispatched.\n\n${quote}`;
+}
+
+/** Mechanical rearm only: the existing writer owns the label transition and head pin. */
+export function defaultNoCodeRearm({ repoSlug, prNumber, expectHead, answerId, spawn = spawnSync }) {
+  // Validate before forming even argv: the actor is also rendered in a durable comment.
+  NO_CODE_REARM_RECEIPT(answerId, expectHead);
+  return spawn(process.execPath, [resolve(THIS_CODE_ROOT, 'scripts/conveyor/rearm-review.mjs'), String(prNumber),
+    `--repo=${repoSlug}`, `--expect-head=${expectHead}`, `--actor=conveyor (operator no-code ruling ${answerId})`],
+  { encoding: 'utf8', timeout: 120_000, maxBuffer: 4 * 1024 * 1024 });
+}
+
+/** Cross-checkout exclusion through admission, receipt and child readback. No TTL takeover:
+ * a living or unreadable holder stays exclusive, including a slow writer. */
+export function acquireNoCodeRearmLock({ repoSlug, prNumber, root = resolveCoordinationRoot() }, lockOptions) {
+  const key = createHash('sha256').update(`${repoSlug}#${prNumber}`).digest('hex');
+  return acquireLiveOwnerWatchLock(resolve(root, 'no-code-rearm', key), lockOptions);
 }
 
 /** `gh pr view --json files` returns at most this many entries, silently. */
@@ -273,6 +295,15 @@ export function runReconcilePromoteDraftDispatch({
   readHeadCheckState = defaultReadHeadCheckState,
   readPrLabels = defaultReadPrLabels,
   readComments = readCompletePrComments,
+  // The shared reader enforces maxPages on its parsed-JSON seam; the legacy exec path paginates itself.
+  readThread = (pr, options) => readCompletePrComments(pr, { ...options, gh: args => JSON.parse(runGhSync(args, {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    throttle: { op: 'pr-comments', repo: options.repo },
+  })) }),
+  postComment = ({ repoSlug, prNumber, comment }) => createGhProvider().postComment(repoSlug, prNumber, comment),
+  rearm = defaultNoCodeRearm,
+  acquireRearmLock = acquireNoCodeRearmLock,
+  readClaim = readLiveDrainClaim,
   // #3902 — strips `ready-to-merge` when the STUCK restore variant applies its review hold.
   removeLabel = defaultRemoveLabel,
   // #2811/#2821 follow-up — clear the now-stale `review-status:awaiting-ci` / `review-status:awaiting-base` label the INSTANT a draft promotes,
@@ -467,6 +498,85 @@ export function runReconcilePromoteDraftDispatch({
       dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
     } catch (e) {
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
+    }
+  }
+  // Finish each entry atomically; defer the remaining entries when the tick must yield.
+  const rearmEntries = (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code');
+  for (const [index, entry] of rearmEntries.entries()) {
+    yieldedForAdoption ||= safeAdoptYield(shouldYield);
+    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
+      deferred.push(...rearmEntries.slice(index).map(row => row.prNumber));
+      break;
+    }
+    handled += 1;
+    const prNumber = entry.prNumber;
+    let release;
+    try {
+      release = acquireRearmLock({ repoSlug, prNumber });
+    } catch (e) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-unavailable', why: String(e?.message ?? e).split('\n')[0] });
+      continue;
+    }
+    try {
+      // Admission is deliberately inside exclusion: a contender must see its predecessor's receipt.
+      let comments, labels;
+      try {
+        comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+        labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
+        if (!Array.isArray(comments)) throw Error('comments unreadable');
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
+        continue;
+      }
+      const plan = noCodeRearmPlan({ comments, labels, headRefOid: entry.expectHead });
+      if (plan.state !== 'ready' || plan.answerId !== entry.answerId) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: plan.why });
+        continue;
+      }
+      try {
+        const claim = readClaim({ repo: repoKey, pr: prNumber });
+        if (claim?.uncertain) {
+          throw Error('fix claim store unreadable; operator must inspect the claim store');
+        }
+        if (claim) {
+          refusals.push({ pr: prNumber, kind: 'rearm-no-code-claimed', why: 'a live fix claim appeared; wait for its owner to finish' });
+          continue;
+        }
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
+        continue;
+      }
+      try {
+        const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
+        const priorIds = new Set(comments.map(c => c.id));
+        postComment({ repoSlug, prNumber, comment: receipt });
+        const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+        if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
+          && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
+          throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
+        }
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
+        continue;
+      }
+      let child, observed;
+      try {
+        child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: plan.answerId });
+        observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
+        if (child.status !== 0 || observed?.ok !== true || observed.labelsObserved !== true
+          || !Array.isArray(observed.labels) || !observed.labels.every(l => typeof l === 'string')
+          || observed.labels.includes('review:changes')
+          || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
+          throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
+        }
+        dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
+      } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
+      }
+    } finally {
+      try { release(); } catch (e) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-release-failed', why: String(e?.message ?? e).split('\n')[0] });
+      }
     }
   }
   // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.

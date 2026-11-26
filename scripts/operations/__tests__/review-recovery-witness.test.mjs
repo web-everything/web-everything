@@ -274,16 +274,27 @@ it('CAS refuses a changed raw digest without changing either file', () => {
   expect(() => evidence.recordRedTeamStatus({ repo, pr, loopPayload: payload(), status: 'queued' }, { env: f.env, expectedSha256: w.rawWriter.sha256 })).toThrow();
   expect(readFileSync(f.path, 'utf8')).toBe(before);
 });
-it('A1 / matrix 11: --pr --repo --prefer-lane --red-team-only round-trip; removed --red-team-plan refuses', () => {
+it.each(['none', 'high'])('A1 / matrix 11: --pr --repo --prefer-lane --red-team-only --review-model round-trip (care=%s); removed --red-team-plan refuses', careLevel => {
   const f = fixture(), spawnJob = vi.fn(() => 123);
-  dispatchReviewJob({ expectedHead: head, io: { liveHead: () => head }, pr, repo, root: f.dir, dir: join(f.dir, 'jobs'), redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7,
+  dispatchReviewJob({ expectedHead: head, io: { liveHead: () => head }, pr, repo, root: f.dir, dir: join(f.dir, 'jobs'), redTeamOnly: true, redTeamMode: 'fresh', preferLane: 7, careLevel,
     spawnJob, checkStaleness: () => ({ stale: false }), readCompletion: () => null, resolveSettingsEnv: () => ({}), checkoutExists: () => true });
   const argv = spawnJob.mock.calls[0][0].argv.slice(1), runJob = vi.fn(() => ({}));
+  expect(argv.includes('--review-model=opus')).toBe(careLevel === 'high');
   expect(argv.some(a => a.startsWith('--red-team-plan'))).toBe(false);
   runReviewJobCli(argv, { runJob });
-  expect(runJob).toHaveBeenCalledWith({ pr: String(pr), repo, preferLane: 7, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head });
+  expect(runJob).toHaveBeenCalledWith({ pr: String(pr), repo, preferLane: 7, redTeamOnly: true, redTeamMode: 'fresh', expectedHead: head,
+    ...(careLevel === 'high' ? { reviewModel: 'opus' } : {}) });
   runJob.mockClear(); runReviewJobCli([...argv, '--red-team-plan={}'], { runJob });
   expect(runJob).not.toHaveBeenCalled(); process.exitCode = 0;
+});
+it('A1b: --review-model refuses unsupported models before running the job', () => {
+  const runJob = vi.fn();
+  const previousExit = process.exitCode;
+  try {
+    runReviewJobCli(['run', `--pr=${pr}`, `--repo=${repo}`, `--expected-head=${head}`, '--review-model=unknown'], { runJob });
+    expect(process.exitCode).toBe(1);
+    expect(runJob).not.toHaveBeenCalled();
+  } finally { process.exitCode = previousExit; }
 });
 // Drive daemon -> job -> queued CAS -> runner -> finished status across two ticks.
 it.each([1, 2, 3, 4, 5, 6, 7, 8, 9])('A3 / matrix %s: persisted dead job settles by tick two', row => {

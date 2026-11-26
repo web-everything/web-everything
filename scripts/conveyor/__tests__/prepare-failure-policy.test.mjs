@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -585,5 +585,38 @@ describe('prepare publication failures', () => {
     expect(readFailureState(path).failures.a).toMatchObject({ cause, held: false, retry: true });
     expect(readFailureState(path).failures.a.holdReason).toBeUndefined();
     expect(releaseDuePrepareRetries({ path, prLimitClear: () => true })).toEqual([]);
+  });
+});
+
+describe('cliPrepareFailureEvidence for a pid: handle', () => {
+  let cliPrepareFailureEvidence;
+  // Cold daemon-graph transforms must not consume the assertions' five-second deadline.
+  beforeAll(async () => {
+    ({ cliPrepareFailureEvidence } = await import('../../../skills-src/conveyor/build-dispatch-daemon.mjs'));
+  }, 60_000);
+
+  it('reads the last JSON line of the dispatch log into evidence.error, not the bare label', () => {
+    const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-'));
+    try {
+      const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
+      execFileSync('mkdir', ['-p', logs]);
+      writeFileSync(join(logs, 'prepare-item-5086.log'), 'noise\n{"outcome":"escalated-needs-human","executor":"none","pr":null,"detail":"prepare batch requires positive external concurrency"}\n');
+      const evidence = cliPrepareFailureEvidence({ handle: 'pid:31324', payload: { num: '5086' } }, { logRoot });
+      expect(evidence.error).toBe('prepare batch requires positive external concurrency');
+      expect(cliPrepareFailureEvidence({ handle: 'pid:1', payload: { num: '9999' } }, { logRoot }).error).toBeNull();
+    } finally { rmSync(logRoot, { recursive: true, force: true }); }
+  });
+  it('ignores a stale log from before the attempt and JSON that is not the terminal shape', () => {
+    const logRoot = mkdtempSync(join(tmpdir(), 'prepare-evidence-guard-'));
+    try {
+      const logs = join(logRoot, '.operations', 'delivery-dispatch-logs');
+      execFileSync('mkdir', ['-p', logs]);
+      const file = join(logs, 'prepare-item-7001.log');
+      writeFileSync(file, '{"outcome":"escalated-needs-human","detail":"old transient error"}\n');
+      const entry = { handle: 'pid:1', payload: { num: '7001' }, startedAt: new Date(Date.now() + 3_600_000).toISOString() };
+      expect(cliPrepareFailureEvidence(entry, { logRoot }).error).toBeNull();
+      writeFileSync(file, '{"detail":"diagnostic only"}\n{"note":"x","error":"not terminal"}\n');
+      expect(cliPrepareFailureEvidence({ handle: 'pid:1', payload: { num: '7001' } }, { logRoot }).error).toBeNull();
+    } finally { rmSync(logRoot, { recursive: true, force: true }); }
   });
 });

@@ -388,7 +388,7 @@ describe('merge-gate refresh after restamp', () => {
     const source = fs.readFileSync('scripts/review-set-label.mjs', 'utf8');
     expect(source).toContain("import { refreshMergeGateAfterRestamp } from './lib/merge-gate-refresh.mjs'");
     expect(source).toMatch(/for \(const step of order\) \{ steps\[step\]\(\); \}\s*const refreshFn = refreshGate \?\? \(liveGhProviders\.has\(provider\) \? refreshMergeGateAfterRestamp : null\);\s*const gateRefresh = to === 'restamp' && refreshFn\s*\? refreshFn\(\{ repo, pr, head: headSha, restampedAtMs: restampedAt \}\)/);
-    expect(source).toMatch(/\.\.\.successResult\(\{ pr: Number\(pr\), to, decision, labels: newLabels \}\),\s*\.\.\.\(gateRefresh \? \{ gateRefresh \} : \{\}\)/);
+    expect(source).toMatch(/\.\.\.successResult\(\{ pr: Number\(pr\), to, decision, labels: newLabels \}\),\s*\.\.\.\(labelsObserved \? \{ labelsObserved: true \} : \{\}\),\s*\.\.\.\(gateRefresh \? \{ gateRefresh \} : \{\}\)/);
   });
   it('the workflow label-event filter lets gate:refresh through (else the toggle never re-runs the gate)', () => {
     const yml = readFileSync(join(process.cwd(), '.github/workflows/merge-gate.yml'), 'utf8');

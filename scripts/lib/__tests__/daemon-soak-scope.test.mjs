@@ -70,14 +70,26 @@ const scopeJob = yaml.load(readFileSync(CI_YML, 'utf8')).jobs['daemon-soak-scope
 const scopeStep = scopeJob.steps.find((step) => step.id === 'scope');
 const baseSha = 'a'.repeat(40);
 const headSha = 'b'.repeat(40);
+const mqBaseSha = 'c'.repeat(40);
+const mqHeadSha = 'd'.repeat(40);
+const ALL_SHARDS = 'run=true\nshards=[1,2,3,4,5,6,7,8]';
+const BASELINE_ONLY = 'run=false\nshards=[1]';
+
+function diffArgs(event) {
+  const range = event === 'merge_group' ? `${mqBaseSha}...${mqHeadSha}` : `${baseSha}...${headSha}`;
+  return ['-c', 'core.quotePath=false', 'diff', '--name-only', '--no-renames', range, '--'];
+}
 
 function runScope({ event = 'pull_request', files = 'backlog/new-card.md', endpointFiles = 'scripts/conveyor/main-only.mjs', renamed = false, gitFails = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'we-daemon-scope-'));
   const output = join(root, 'output');
+  const gitCalls = join(root, 'git-calls');
   const values = {
     'github.event_name': event,
-    'github.event.pull_request.base.sha': baseSha,
-    'github.event.pull_request.head.sha': headSha,
+    'github.event.pull_request.base.sha': event === 'pull_request' ? baseSha : '',
+    'github.event.pull_request.head.sha': event === 'pull_request' ? headSha : '',
+    'github.event.merge_group.base_sha': event === 'merge_group' ? mqBaseSha : '',
+    'github.event.merge_group.head_sha': event === 'merge_group' ? mqHeadSha : '',
   };
   const substitute = (value) => String(value).replace(/\$\{\{\s*([^}]+?)\s*\}\}/g, (_, key) => {
     if (!(key in values)) throw new Error(`unmodelled workflow expression: ${key}`);
@@ -85,6 +97,7 @@ function runScope({ event = 'pull_request', files = 'backlog/new-card.md', endpo
   });
   const script = `
     git() {
+      printf '%s\\n' "$@" >> "$SCOPE_GIT_CALLS"
       if [ "$SCOPE_GIT_FAILS" = true ]; then return 128; fi
       case " $* " in
         *" $SCOPE_RANGE "*)
@@ -98,53 +111,67 @@ function runScope({ event = 'pull_request', files = 'backlog/new-card.md', endpo
     ${substitute(scopeStep.run)}
   `;
   try {
-    const result = spawnSync('bash', ['-e', '-c', script], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], {
+      cwd: join(HERE, '..', '..', '..'),
       encoding: 'utf8',
+      timeout: 25_000,
+      maxBuffer: 1024 * 1024,
       env: {
         ...process.env,
         ...Object.fromEntries(Object.entries(scopeStep.env ?? {}).map(([key, value]) => [key, substitute(value)])),
         GITHUB_OUTPUT: output,
-        SCOPE_RANGE: `${baseSha}...${headSha}`,
+        SCOPE_GIT_CALLS: gitCalls,
+        SCOPE_RANGE: diffArgs(event)[5],
         SCOPE_FILES: files,
         SCOPE_RENAME_FILES: renamed ? 'backlog/moved-code.md' : files,
         SCOPE_ENDPOINT_FILES: endpointFiles,
         SCOPE_GIT_FAILS: String(gitFails),
       },
     });
-    return { ...result, output: result.status === 0 ? readFileSync(output, 'utf8').trim() : '' };
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    // These events must bypass Git entirely, even when resolving a diff would fail.
+    if (event === 'push' || event === 'workflow_dispatch') {
+      expect(() => readFileSync(gitCalls)).toThrow(/ENOENT/);
+    } else {
+      expect(readFileSync(gitCalls, 'utf8')).toBe(`${diffArgs(event).join('\n')}\n`);
+    }
+    return { ...result, output: readFileSync(output, 'utf8').trim() };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-describe('daemon-soak scope workflow uses the PR contribution', () => {
+describe.each(['pull_request', 'merge_group'])('daemon-soak scope workflow uses the %s contribution', (event) => {
   it('skips a card-only PR despite daemon changes on its divergent base', () => {
-    const result = runScope();
+    const result = runScope({ event });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.output).toBe('run=false');
+    expect(result.output).toBe(BASELINE_ONLY);
   });
 
   it('runs for daemon edits at the PR head even if the synthetic merge has no endpoint change', () => {
-    const result = runScope({ files: 'scripts/conveyor/pr-edit.mjs', endpointFiles: '' });
+    const result = runScope({ event, files: 'scripts/conveyor/pr-edit.mjs', endpointFiles: '' });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.output).toBe('run=true');
+    expect(result.output).toBe(ALL_SHARDS);
   });
 
   it('runs when daemon code is moved outside daemon scope', () => {
-    const result = runScope({ files: 'scripts/conveyor/moved.mjs\nbacklog/moved-code.md', endpointFiles: '', renamed: true });
+    const result = runScope({ event, files: 'scripts/conveyor/moved.mjs\nbacklog/moved-code.md', endpointFiles: '', renamed: true });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.output).toBe('run=true');
+    expect(result.output).toBe(ALL_SHARDS);
   });
 
-  it('fails closed when the PR diff cannot be resolved', () => {
-    const result = runScope({ gitFails: true });
-    expect(result.status).not.toBe(0);
-    expect(result.output).toBe('');
-  });
-
-  it.each(['push', 'merge_group', 'workflow_dispatch'])('always runs on %s without resolving a PR diff', (event) => {
+  it('requires all eight shards when the contribution diff cannot be resolved', () => {
     const result = runScope({ event, gitFails: true });
     expect(result.status, result.stderr).toBe(0);
-    expect(result.output).toBe('run=true');
+    expect(result.output).toBe(ALL_SHARDS);
+  });
+});
+
+describe('daemon-soak scope workflow outside scoped events', () => {
+  it.each(['push', 'workflow_dispatch'])('always runs on %s without resolving a diff', (event) => {
+    const result = runScope({ event, gitFails: true });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toBe(ALL_SHARDS);
   });
 });

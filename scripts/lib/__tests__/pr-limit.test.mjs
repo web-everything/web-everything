@@ -41,10 +41,21 @@ describe('resolvePrLimit', () => {
     expect(PR_LIMIT_DEFAULTS).toEqual({ we: 15, frontierui: 5, 'plateau-app': 5 });
   });
 
-  it('the checked-in tool settings give every repo the same 15 cap', () => {
+  it('tool settings give every repo the same limit', () => {
     const tool = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../settings/pr-limit.json'), 'utf8')).prLimit;
+    // Pin the platform we cap from the prep without depending on host-owned preferences.
+    const platform = cap(25);
+    expect(tool.limits).toEqual({ we: 25, frontierui: 25, 'plateau-app': 25 });
     for (const key of ['we', 'frontierui', 'plateau-app']) {
-      expect(readPrLimit(key, {}, { platform: {}, tool }).limit).toBe(15);
+      expect(readPrLimit(key, {}, { platform: {}, tool })).toEqual({ limit: platform.limits.we, source: 'tool' });
+      expect(readPrLimit(key, {}, { platform, tool }).limit).toBe(platform.limits.we);
+    }
+  });
+
+  it('env overrides the checked-in tool settings for every repo', () => {
+    const tool = JSON.parse(readFileSync(resolve(import.meta.dirname, '../../settings/pr-limit.json'), 'utf8')).prLimit;
+    for (const [key, envKey] of Object.entries(PR_LIMIT_ENV)) {
+      expect(readPrLimit(key, { [envKey]: '30' }, { platform: {}, tool })).toEqual({ limit: 30, source: 'env' });
     }
   });
 
@@ -297,7 +308,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], focus: 0, focusPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 25, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], focus: 0, focusPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -1232,7 +1243,7 @@ describe('excludeFocus — operator R384: focus PRs are exempt from the cap (exp
     expect(r).toMatchObject({ count: 2, focus: 0, focusPrNumbers: [] });
   });
 
-  it('excludeFocus off counts them all again (the 15 cap holds for everything else)', () => {
+  it('excludeFocus off counts them all again (the 25 cap holds for everything else)', () => {
     const rows = [row(1), row(3, { labels: [{ name: 'focus' }] })];
     const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: scope({ excludeFocus: false, focusRefs: ['lane/p1'] }) });
     expect(r).toMatchObject({ count: 2, focus: 0 });
