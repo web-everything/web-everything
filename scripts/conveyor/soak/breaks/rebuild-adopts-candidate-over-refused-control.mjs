@@ -11,13 +11,20 @@ import { pathToFileURL } from 'node:url';
 
 const PROBE = `
 const { failsSameChecks } = await import(process.argv[1]);
-const cand = [{ ok: false, name: 'tree-stays-clean', detail: 'smoke introduced tracked dirt' }];
+const raw = 'TypeError: smoke harness broke at 12';
+const entry = (over = {}) => ({ entry: 'e.mjs', ok: false, kind: 'import failed', errorClass: raw, rawError: raw, ...over });
+const boot = (over = {}, row = {}) => ({ ok: false, name: 'daemon-entries-boot', entries: [entry(over)], ...row });
+// The candidate is ALWAYS a valid typed failure, so only the CONTROL's evidence validation can make a probe false.
+const cand = [boot()];
 const out = {
-  budgetRefused: failsSameChecks(cand, [{ ok: false, name: 'tree-stays-clean', budgetInterrupted: true, detail: 'skipped: rebuild smoke budget exhausted (0ms left)' }]),
-  nameOnly: failsSameChecks(cand, [{ ok: false, name: 'tree-stays-clean' }]),
-  bootTimeoutOnly: failsSameChecks(
-    [{ ok: false, name: 'daemon-entries-boot', entries: [{ entry: 'e.mjs', ok: false, errorClass: 'SyntaxError: x' }] }],
-    [{ ok: false, name: 'daemon-entries-boot', entries: [{ entry: 'e.mjs', ok: false, kind: 'child failed: timed out after 45000ms (process group killed)', errorClass: null, signal: 'SIGKILL' }] }]),
+  validControl: failsSameChecks(cand, [boot()]),
+  budgetRefused: failsSameChecks(cand, [boot({}, { budgetInterrupted: true })]),
+  timeoutOnly: failsSameChecks(cand, [boot({ kind: 'child failed: timed out after 45000ms (process group killed)', signal: 'SIGKILL' })]),
+  unparsable: failsSameChecks(cand, [boot({ kind: 'unparsable child output' })]),
+  infraError: failsSameChecks([boot({ errorClass: 'Error: spawn git ENOENT', rawError: 'Error: spawn git ENOENT' })], [boot({ errorClass: 'Error: spawn git ENOENT', rawError: 'Error: spawn git ENOENT' })]),
+  textualOnly: failsSameChecks(cand, [{ ok: false, name: 'daemon-entries-boot', detail: raw }]),
+  differentRaw: failsSameChecks(cand, [boot({ rawError: raw.replace('12', '13') })]),
+  nameOnly: failsSameChecks([{ ok: false, name: 'tree-stays-clean', detail: 'dirt' }], [{ ok: false, name: 'tree-stays-clean', detail: 'dirt' }]),
 };
 console.log(JSON.stringify(out));
 `;
@@ -43,6 +50,8 @@ export default {
   judge(report) {
     const p = report.probe;
     if (!p) return ['the failsSameChecks probe did not run'];
-    return Object.entries(p).filter(([, v]) => v !== false).map(([k]) => `${k}: a non-affirmative control matched the candidate failure`);
+    const problems = Object.entries(p).filter(([k, v]) => k !== 'validControl' && v !== false).map(([k]) => `${k}: a non-affirmative control matched the candidate failure`);
+    if (p.validControl !== true) problems.push('validControl: an exact, typed, executed-check control no longer matches (the probe cannot discriminate)');
+    return problems;
   },
 };

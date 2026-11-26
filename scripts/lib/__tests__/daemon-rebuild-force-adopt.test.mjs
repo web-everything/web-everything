@@ -135,7 +135,7 @@ afterEach(() => {
 
 const RULINGS = '## R508 — x\nOperator "Yes": adopt the build even though smoke failed for infra.\n';
 const QUOTE = 'adopt the build even though smoke failed for infra';
-const TYPED_BOOT_FAILURE = { ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false, entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: boom' }] };
+const TYPED_BOOT_FAILURE = { ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false, entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: boom', rawError: 'TypeError: boom' }] };
 const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
 const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });

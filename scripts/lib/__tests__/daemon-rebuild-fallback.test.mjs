@@ -489,7 +489,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
 
     let t = 1_000_000;
     const runSmoke = vi.fn(async () => ({
-      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: harness broke' }] }] },
+      verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: harness broke', rawError: 'TypeError: harness broke' }] }] },
     }));
 
     const first = await rebuildClone({
@@ -538,7 +538,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
     const runSmoke = vi.fn(async () => ({
       verdict: 'code', attempts: 1,
-      smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'cross-org auth', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'Error: cross-org auth' }] }] },
+      smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'cross-org auth', entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'Error: cross-org auth', rawError: 'Error: cross-org auth' }] }] },
     }));
 
     const result = await rebuildClone({
@@ -710,7 +710,7 @@ describe('failsSameChecks', () => {
     expect(child).toHaveBeenCalled();
     expect(failed).toEqual([expect.objectContaining({ name: 'daemon-entries-boot' })]);
     expect(failed[0].entries.every(entry => entry.errorClass === null && entry.signal === 'SIGKILL')).toBe(true);
-    const candidate = [{ ok: false, name: 'daemon-entries-boot', entries: [{ entry: failed[0].entries[0].entry, ok: false, kind: 'import failed', errorClass: 'SyntaxError: real regression' }] }];
+    const candidate = [{ ok: false, name: 'daemon-entries-boot', entries: [{ entry: failed[0].entries[0].entry, ok: false, kind: 'import failed', errorClass: 'SyntaxError: real regression', rawError: 'SyntaxError: real regression' }] }];
     expect(failsSameChecks(candidate, failed)).toBe(false);
   });
 
@@ -745,10 +745,22 @@ describe('failsSameChecks', () => {
     expect(failsSameChecks(candidate, control)).toBe(false);
   });
 
-  const bootRow = (...entries) => ({ ok: false, name: 'daemon-entries-boot', entries: entries.map(([entry, errorClass, kind = 'import failed']) => ({ entry, ok: false, kind, errorClass })) });
+  const bootRow = (...entries) => ({ ok: false, name: 'daemon-entries-boot', entries: entries.map(([entry, rawError, kind = 'import failed']) => ({ entry, ok: false, kind, errorClass: rawError, rawError })) });
 
-  it('true only for the same boot entry with the same normalised error signature', () => {
-    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 12'])], [bootRow(['a.mjs', 'TypeError: x at 99'], ['b.mjs', 'Error: y'])])).toBe(true);
+  it('true only for the same boot entry with a byte-identical raw error', () => {
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 12'])], [bootRow(['a.mjs', 'TypeError: x at 12'], ['b.mjs', 'Error: y'])])).toBe(true);
+  });
+
+  it('false when the raw errors differ only by case, digits or whitespace (no normalisation)', () => {
+    const control = [bootRow(['a.mjs', 'TypeError: x at 12'])];
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError: x at 13'])], control)).toBe(false);
+    expect(failsSameChecks([bootRow(['a.mjs', 'typeerror: x at 12'])], control)).toBe(false);
+    expect(failsSameChecks([bootRow(['a.mjs', 'TypeError:  x at 12'])], control)).toBe(false);
+  });
+
+  it('false when only the lossy errorClass is equal but the raw errors differ', () => {
+    const row = (rawError) => ({ ok: false, name: 'daemon-entries-boot', entries: [{ entry: 'a.mjs', ok: false, kind: 'import failed', errorClass: 'ReferenceError: Cannot access <…> before initialization', rawError }] });
+    expect(failsSameChecks([row("ReferenceError: Cannot access 'a' before initialization")], [row("ReferenceError: Cannot access 'b' before initialization")])).toBe(false);
   });
 
   it('false when the control is missing one of the candidate\'s failed boot entries', () => {
@@ -765,8 +777,12 @@ describe('failsSameChecks', () => {
 
   it('infrastructure errors, short-cap timeouts and textual-only rows are never evidence', () => {
     const candidate = [bootRow(['a.mjs', 'Error: x'])];
-    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: spawn git ENOENT'])])).toBe(false);
+    // Identical raw errors on both sides, so only the control-evidence check can reject.
+    expect(failsSameChecks([bootRow(['a.mjs', 'Error: spawn git ENOENT'])], [bootRow(['a.mjs', 'Error: spawn git ENOENT'])])).toBe(false);
     expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x', 'child failed: timed out after 1ms (process group killed)'])])).toBe(false);
+    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x', 'unparsable child output'])])).toBe(false);
+    expect(failsSameChecks(candidate, [{ ...bootRow(['a.mjs', 'Error: x']), budgetInterrupted: true }])).toBe(false);
+    expect(failsSameChecks(candidate, [bootRow(['a.mjs', 'Error: x'])])).toBe(true); // control: the same fixture is accepted when valid
     expect(failsSameChecks(candidate, [{ ok: false, name: 'daemon-entries-boot', detail: 'threw: unable to initialize smoke check' }])).toBe(false);
     expect(failsSameChecks([{ ok: false, name: 'tree-stays-clean', detail: 'dirt' }], [{ ok: false, name: 'tree-stays-clean', detail: 'git status --porcelain failed: spawn git ENOENT' }])).toBe(false);
   });

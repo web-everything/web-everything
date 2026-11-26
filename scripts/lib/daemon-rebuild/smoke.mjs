@@ -211,13 +211,14 @@ export function failsSameChecks(candidateFailed, controlFailed) {
 /** SHIP-WM-321: a boot entry failure with executed-check evidence: an import that ran and failed with a typed error class. */
 function typedBootFailure(entry) {
   return !!entry && entry.ok === false && typeof entry.entry === 'string' && entry.kind === 'import failed'
-    && typeof entry.errorClass === 'string' && entry.errorClass.length > 0
-    && !/ENOENT|EACCES|EMFILE|ENOMEM|EAGAIN|spawn|timed out|timeout|budget|skipped/i.test(entry.errorClass);
+    && typeof entry.rawError === 'string' && entry.rawError.length > 0
+    && !/ENOENT|EACCES|EMFILE|ENOMEM|EAGAIN|spawn|timed out|timeout|budget|skipped/i.test(entry.rawError);
 }
 
+/** Exact raw equality only (no normalisation, lowercasing, number masking or errorClass): S1's lossless typed
+ *  signature may relax this later. */
 function bootFailureIdentity(entry) {
-  const signature = entry.errorClass.toLowerCase().replace(/0x[0-9a-f]+|\d+/g, '#').replace(/\s+/g, ' ').trim();
-  return `${entry.entry}\u0000${signature}`;
+  return `${entry.entry}\u0000${entry.rawError}`;
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
