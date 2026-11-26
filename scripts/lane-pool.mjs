@@ -124,6 +124,7 @@ import {
   laneAuthoredSince,
 } from './lib/lane-lease.mjs';
 import { retryTransientGit } from './lib/git-fetch-retry.mjs';
+import { withLaneLeaseMutation } from './lib/lane-lease-lock.mjs';
 import { healLaneRefs, diagnoseLane, quarantineLane, looksLikeCorruption, looksLikeCommitGraphError, healSharedCommitGraph } from './lib/lane-repair.mjs';
 // #4122 — the free-lane list `acquire`'s auto-pick reads as a fast pre-filter before paying for its own scan
 // (see that module's own header for the full incident/design writeup).
@@ -968,6 +969,10 @@ function laneFingerprint(dir, branch) {
  *   exists); default mirrors a plain overwrite.
  */
 function writeLeaseAtomic(file, body, { exclusive = false } = {}) {
+  return withLaneLeaseMutation(file, () => writeLeaseAtomicUnlocked(file, body, { exclusive }));
+}
+
+function writeLeaseAtomicUnlocked(file, body, { exclusive = false } = {}) {
   const tmp = `${file}.tmp-${process.pid}-${randomBytes(4).toString('hex')}`;
   writeFileSync(tmp, body, { flag: 'wx' }); // the temp name is always fresh — no clobber risk here
   try {
@@ -1171,7 +1176,7 @@ function recloneLane(repo, n, reason) {
   try { lease = readFileSync(LEASE_MARKER(dir), 'utf8'); } catch { /* no lease to carry */ }
   quarantineLane(dir, join(repo.poolDir, '.quarantine'), { log, reason });
   cloneLane(repo, n);
-  if (lease) writeFileSync(LEASE_MARKER(dir), lease);
+  if (lease) writeLeaseAtomic(LEASE_MARKER(dir), lease);
   journalLaneEvent(dir, { action: 'quarantine-reclone', before: null, headAfter: laneHead(dir), reason: `corrupt clone quarantined + re-provisioned: ${reason}`, loud: true });
 }
 
@@ -2086,7 +2091,7 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     // return null so the caller's existing retry loop (`excluded.add(pick)` then pick the next candidate) moves
     // on, instead of an uncaught throw crashing the whole acquire. Live-caught: wev-review-daemon session
     // review-2549 crashed here writing into a lane `trim` had just removed.
-    if (e.code === 'ENOENT') return null;
+    if (e.code === 'ENOENT' || e.code === 'ELEASEBUSY') return null;
     if (e.code !== 'EEXIST') throw e;
   }
   const existing = readLease(dir);
@@ -2105,7 +2110,10 @@ function tryClaimLane(dir, session, nowMs, ttlMs, { allowReacquire = false } = {
     const holder = laneHolderSlug(existing) || mintedHolder;
     // …and it KEEPS the declared occupant for the same reason: dropping it would silently un-protect a lane an
     // agent is working in. `--adopt` on the re-acquire is the deliberate way to (re-)claim it.
-    writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing)));
+    try { writeLeaseAtomic(file, bodyFor(holder, adopted || laneWorkerSession(existing))); } catch (e) {
+      if (e.code === 'ELEASEBUSY') return null;
+      throw e;
+    }
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
@@ -2352,7 +2360,7 @@ function restoreLeaseAfterRefusedClaim(dir, preExisting) {
   try {
     if (preExisting && !isLeaseStale(preExisting, Date.now(), ttlMsFromFlags())) writeLeaseAtomic(LEASE_MARKER(dir), JSON.stringify(preExisting, null, 2) + '\n');
     // journal-exempt: drops only the claim THIS refused acquire just wrote — the lane never changed hands.
-    else rmSync(LEASE_MARKER(dir), { force: true });
+    else withLaneLeaseMutation(LEASE_MARKER(dir), () => rmSync(LEASE_MARKER(dir), { force: true }));
   } catch { /* the refusal still stands; a stale lease ages out on its own */ }
 }
 
@@ -3875,8 +3883,10 @@ async function cmdReleaseAllPools(repo) {
       const refusedReset = resetPinnedLaneForRelease(salvageRepo, dir, lease);
       if (refusedReset) { kept.push({ pool: name, lane: n, ...refusedReset }); process.exitCode = 1; continue; }
       // owner-operation: explicit release, including the holder's own renewals.
-      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n)) {
-        log(`  ${name}/lane-${n}: lease changed during salvage; kept`);
+      if (!takeMarkerIf(dir, moved => sameLease(moved, lease), n, { onBusy: () => {
+        kept.push({ pool: name, lane: n, reason: 'lease mutation busy' }); process.exitCode = 1;
+      } })) {
+        log(`  ${name}/lane-${n}: lease unavailable during salvage (changed or mutation busy); kept`);
         continue;
       }
       journalLaneEvent(dir, {
@@ -4095,8 +4105,10 @@ async function cmdRelease(repo) {
     const refusedReset = resetPinnedLaneForRelease(repo, dir, lease);
     if (refusedReset) { kept.push({ lane: n, ...refusedReset }); process.exitCode = 1; continue; }
     // owner-operation: explicit release, including the holder's own renewals.
-    if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n)) {
-      log(`  lane-${n}: lease changed since it was read (a new acquire/release raced this one) — not releasing; re-run if lane-${n} still looks wrong`);
+    if (!takeMarkerIf(dir, (moved) => sameLease(moved, lease), n, { onBusy: () => {
+      kept.push({ lane: n, reason: 'lease mutation busy' }); process.exitCode = 1;
+    } })) {
+      log(`  lane-${n}: lease unavailable (changed or mutation busy) — not releasing; re-run if lane-${n} still looks wrong`);
       continue;
     }
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
@@ -5152,7 +5164,16 @@ const TRIM_REACQUIRED = { kind: 'leased', reason: 're-leased after trim evaluate
 /** Move lane `dir`'s lease marker aside atomically (only one renamer wins) and keep it gone ONLY if `isMine`
  *  accepts what was moved; otherwise put it back without clobbering a marker written meanwhile (`link` fails if
  *  the name exists). Returns true iff the marker was taken. */
-function takeMarkerIf(dir, isMine, n) {
+function takeMarkerIf(dir, isMine, n, { onBusy = () => {} } = {}) {
+  try { return withLaneLeaseMutation(LEASE_MARKER(dir), () => takeMarkerIfUnlocked(dir, isMine, n)); } catch (error) {
+    if (error.code !== 'ELEASEBUSY') throw error;
+    log(`  lane-${n}: ${error.message} — kept`);
+    onBusy();
+    return false;
+  }
+}
+
+function takeMarkerIfUnlocked(dir, isMine, n) {
   const file = LEASE_MARKER(dir);
   const aside = `${file}.trim-${process.pid}`;
   try { renameSync(file, aside); } catch { return false; } // gone or replaced since — don't guess
@@ -5195,7 +5216,7 @@ function claimLaneForRemoval(repo, n, evaluatedLease, remoteShasBox) {
     host: hostname(), pid: process.pid, ownerSession: process.env.CLAUDE_CODE_SESSION_ID || null,
   }), null, 2) + '\n';
   try {
-    writeFileSync(file, body, { flag: 'wx' });
+    writeLeaseAtomic(file, body, { exclusive: true });
   } catch {
     return { keep: TRIM_REACQUIRED };
   }
@@ -5588,7 +5609,7 @@ function cmdReclaim(repo) {
   }
   if (lease) journalLaneEvent(dir, { action: 'lease-expire', leaseSession: lease.session, reason: 'stale lease claimed by reclaim' });
   try {
-    writeFileSync(file, body, { flag: 'wx' });
+    writeLeaseAtomic(file, body, { exclusive: true });
   } catch {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
@@ -5664,7 +5685,7 @@ function cmdReclaim(repo) {
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
-  rmSync(file, { force: true }); // back to the free-pool state — the same end state a normal `release` leaves
+  withLaneLeaseMutation(file, () => rmSync(file, { force: true })); // back to the free-pool state
   journalLaneEvent(dir, {
     action: 'reclaim-reset', before, headAfter: laneHead(dir),
     leaseSession: lease?.session,
@@ -5714,7 +5735,7 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
     fail(`lane-${n}: its lease changed between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
   if (lease) journalLaneEvent(dir, { action: 'lease-expire', leaseSession: lease.session, reason: 'stale lease claimed by salvage' });
-  try { writeFileSync(file, body, { flag: 'wx' }); } catch {
+  try { writeLeaseAtomic(file, body, { exclusive: true }); } catch {
     fail(`lane-${n}: a lease appeared between the read above and the claim attempt — not reclaimed, safe to retry`);
   }
   // owner-operation: release only this salvage's temporary hold on any later refusal.
@@ -5761,7 +5782,7 @@ function cmdReclaimSalvage(repo, { n, dir, dryRun, lease, proof }) {
   scrubClaimedLaneConfig(dir, 'before reclaim reset');
   execFileSync('git', ['reset', '--hard', `origin/${repo.branch}`], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
   execFileSync('git', ['clean', '-fd'], { cwd: dir, stdio: 'ignore', ...defaultGitTimeoutOpt(), env: laneGitHardeningEnv(LANE_GIT_ENV) });
-  rmSync(file, { force: true });
+  withLaneLeaseMutation(file, () => rmSync(file, { force: true }));
   // #4370 — unpushed content here was SAVED first (a verified bundle), and the owner was proven gone (g2).
   journalLaneEvent(dir, {
     action: 'salvage-reset', before, headAfter: laneHead(dir),
@@ -5830,19 +5851,34 @@ function cmdAdopt(repo) {
   const me = process.env.CLAUDE_CODE_SESSION_ID || null;
   if (!me) fail('adopt needs a durable session id (CLAUDE_CODE_SESSION_ID) to stamp — without one there is nothing to declare, and the Edit/Write guard stays fail-open for this lane');
   const dir = laneDir(repo, n);
+  let adopted;
+  try { adopted = withLaneLeaseMutation(LEASE_MARKER(dir), () => adoptLaneLease(n, dir, me)); } catch (error) {
+    fail(error.message);
+  }
+  // History and git snapshots need no mutation lock; a slow observer must not
+  // exclude heartbeat, release or acquire after the hand-off has been published.
+  recordLaneAdoption(repo, n, dir, me, adopted);
+}
+
+function adoptLaneLease(n, dir, me) {
   const lease = readLease(dir);
-  if (!lease) fail(`lane-${n} holds no lease to adopt — acquire it first (\`acquire --lane=${n} --purpose=<why> --adopt\`)`);
+  // Throw inside the transaction so the mutex is released before CLI exit.
+  if (!lease) throw new Error(`lane-${n} holds no lease to adopt — acquire it first (\`acquire --lane=${n} --purpose=<why> --adopt\`)`);
   if (isLeaseStale(lease, Date.now(), ttlMsFromFlags())) {
-    fail(`lane-${n}'s lease is STALE (${describeLease(lease)}) — a stale lease reads as no lease; re-acquire the lane rather than adopting a dead hold`);
+    throw new Error(`lane-${n}'s lease is STALE (${describeLease(lease)}) — a stale lease reads as no lease; re-acquire the lane rather than adopting a dead hold`);
   }
   const current = laneWorkerSession(lease);
   if (current && current !== me && !flags.force) {
-    fail(
+    throw new Error(
       `lane-${n} is already declared as occupied by session ${current} (${describeLease(lease)}) — adopting it would take it out from under a working agent.\n` +
       `    If that agent is gone, pass --force to take it over deliberately; otherwise acquire your own lane (\`acquire --purpose=<why> --adopt\`).`,
     );
   }
-  writeFileSync(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
+  writeLeaseAtomicUnlocked(LEASE_MARKER(dir), JSON.stringify({ ...lease, workerSession: me }, null, 2) + '\n');
+  return { lease, current };
+}
+
+function recordLaneAdoption(repo, n, dir, me, { lease, current }) {
   // #3383 — record the occupancy hand-off in the lane-history ledger (best-effort).
   appendLaneHistory(dir, laneHistoryEntry({ event: 'adopt', ownerSession: me, workerSession: me, session: lease.session }));
   journalLaneEvent(dir, {
@@ -6076,4 +6112,9 @@ if (flags.lane !== undefined && (
   fail('--lane requires a lane number');
 }
 
-await COMMANDS[cmd](resolveRepo());
+try { await COMMANDS[cmd](resolveRepo()); } catch (error) {
+  // Batch release and auto-pick handle busy lanes locally so they can continue.
+  // Other mutation callers still owe a clean refusal when a writer wins the lock.
+  if (error.code === 'ELEASEBUSY') fail(error.message);
+  throw error;
+}

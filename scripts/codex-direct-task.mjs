@@ -1769,6 +1769,15 @@ function repoRootFromCwd() {
   return execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: GIT_STEP_TIMEOUT_MS }).trim();
 }
 
+/** RS-7179-1: keep the caller's lane lease(s) renewed for the whole run, stopped in `finally`. */
+export async function withLaneLeaseHeartbeat(cwds, fn, start) {
+  let stop = () => {};
+  // Loaded lazily: a static import widens this module's import graph for every transitive importer
+  // (merge-ai-prs in-process CLI harness runs hang on the second main call when it is static).
+  try { stop = (start ?? (await import('./lib/lane-lease-heartbeat.mjs')).startLaneLeaseHeartbeat)({ cwds }) || stop; } catch (e) { console.error(`codex-direct-task: lane lease heartbeat did not start (${e?.message}); the run continues without lease renewal`); }
+  try { return await fn(); } finally { try { stop(); } catch { /* best-effort */ } }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const flags = parseFlags(args);
@@ -1853,7 +1862,7 @@ async function main() {
 
   let report;
   try {
-    report = await codexDirectTask({
+    report = await withLaneLeaseHeartbeat([process.cwd(), dir], () => codexDirectTask({
       task,
       taskFile,
       dir,
@@ -1882,7 +1891,7 @@ async function main() {
       review: Boolean(flags.review),
       resumeThreadId,
       ...(flags['no-self-review'] ? { selfReview: false } : {}),
-    });
+    }));
   } catch (e) {
     console.error(`codex-direct-task: ${e.message}`);
     process.exitCode = 1;
