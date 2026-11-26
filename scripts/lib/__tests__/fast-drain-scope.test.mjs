@@ -190,7 +190,16 @@ describe('legacy manifest revision identity', () => {
 describe('fast drain listing', () => {
   const resolve = (options = {}) => resolveFastDrainListingSetting({ env: {}, tool: {}, platform: {}, ...options });
   it('defaults to snapshot from the standard', () => {
-    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', context: 'snapshot', contextSource: 'standard', line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard), context=snapshot (standard)' });
+    expect(resolve()).toEqual({ listing: 'snapshot', source: 'standard', context: 'snapshot', contextSource: 'standard', selfRefresh: false, line: 'fast-drain: mergeQueue.fastDrain.listing=snapshot (standard), context=snapshot (standard)' });
+  });
+  it('selfRefresh is OFF by default, on only for tool/env "on", and ignores invalid values', () => {
+    expect(resolve().selfRefresh).toBe(false);
+    expect(resolve({ tool: { selfRefresh: 'on' } }).selfRefresh).toBe(true);
+    for (const v of ['1', 'on', 'true']) {
+      expect(resolve({ env: { WE_FAST_DRAIN_SELF_REFRESH: v } }).selfRefresh, `env WE_FAST_DRAIN_SELF_REFRESH=${v} has no effect; behaviour stays OFF`).toBe(false);
+    }
+    expect(resolve({ tool: { selfRefresh: 'yes' } }).selfRefresh).toBe(false);
+    expect(resolve({ tool: { selfRefresh: true } }).selfRefresh).toBe(false);
   });
   it('resolves platform, tool and env in cascade order', () => {
     expect(resolve({ platform: { listing: 'live' } })).toMatchObject({ listing: 'live', source: 'platform' });

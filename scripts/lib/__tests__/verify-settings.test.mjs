@@ -9,7 +9,7 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
   verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases } from '../verify-lane-gate.mjs';
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
-const custom = { shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
+const custom = { sharedGreenReuse: false, shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
   matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', retryFailed: 0, relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
   revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10, selection: 'pr', phaseTimeoutMs: 600_000, slotHeartbeatMs: 120_000 };
 const roots = [];
@@ -30,7 +30,7 @@ describe('verify settings', () => {
     for (const f of shippedAlwaysRun) expect(existsSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..', f)), f).toBe(true);
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true, revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 40, selection: 'since-last-green' }, sources: { ...allSources('file'), shardMinTests: 'default', shardSize: 'default', shardParallel: 'default' } });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true, revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 40, selection: 'since-last-green' }, sources: { ...allSources('file'), shardMinTests: 'default', shardSize: 'default', shardParallel: 'default', sharedGreenReuse: 'default' } });
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
@@ -52,12 +52,12 @@ describe('verify settings', () => {
   });
 
   it('lets valid environment values override every key independently', () => {
-    const env = { WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3', WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
+    const env = { WE_VERIFY_SHARED_GREEN_REUSE: '1', WE_VERIFY_SHARD_MIN_TESTS: '24', WE_VERIFY_SHARD_SIZE: '12', WE_VERIFY_SHARD_PARALLEL: '3', WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
       WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RETRY_FAILED: '2', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
       WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7', WE_VERIFY_SELECTION: 'since-last-green', WE_VERIFY_PHASE_TIMEOUT_MS: '90000', WE_VERIFY_SLOT_HEARTBEAT_MS: '60000' };
-    const values = { shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
+    const values = { sharedGreenReuse: true, shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
       matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', retryFailed: 2, relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
       revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7, selection: 'since-last-green', phaseTimeoutMs: 90_000, slotHeartbeatMs: 60_000 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
@@ -250,3 +250,11 @@ describe('revert-red settings (#5466)', () => {
   expect(resolveVerifySettings({ fileConfig: { retryFailed: 0 }, env: { WE_VERIFY_RETRY_FAILED: '3' } })).toMatchObject({ values: { retryFailed: 3 }, sources: { retryFailed: 'env' } });
   for (const bad of [-1, 11, 1.5, null, '2']) expect(validateVerifySettings({ retryFailed: bad }).retryFailed).toBe(1);
  });
+
+it('F8 shared reuse defaults off, validates booleans and follows env provenance', () => {
+  expect(BUILT_IN_VERIFY_SETTINGS.sharedGreenReuse).toBe(false);
+  expect(resolveVerifySettings({ env: {} }).values.sharedGreenReuse).toBe(false);
+  expect(resolveVerifySettings({ fileConfig: { sharedGreenReuse: true }, env: { WE_VERIFY_SHARED_GREEN_REUSE: '0' } }))
+    .toMatchObject({ values: { sharedGreenReuse: false }, sources: { sharedGreenReuse: 'env' } });
+  for (const bad of ['true', 1, null]) expect(validateVerifySettings({ sharedGreenReuse: bad }).sharedGreenReuse).toBe(false);
+});

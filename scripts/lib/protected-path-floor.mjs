@@ -134,6 +134,8 @@ const FLOOR_SETTINGS = Object.freeze([
   'scripts/settings/test-timeout-policy.json',
   // Read by hold-scan holders (archive-retention.mjs, scheduled-sweep.mjs).
   'scripts/settings/archive-retention.json', 'scripts/quiet-hours-settings.json',
+  // The policy watcher uses these expectations while holding its state lock.
+  'scripts/settings/actions-policy-watch.json',
   // Read by card-dedupe.mjs and citation-check.mjs.
   'scripts/settings/card-dedupe.json', 'scripts/conveyor/flows/build-dispatch.flow.json',
   // Read by card-number-ledger.mjs (landed on main since).
@@ -163,6 +165,8 @@ export const LOCK_PRIMITIVES = Object.freeze(['scripts/readiness/file-locks.mjs'
  * modules that scan found unprotected.
  */
 export const LOCK_HOLDERS = Object.freeze(['scripts/lib/atomic-json-file.mjs', 'scripts/operations/review-extra-seats.mjs',
+  // The policy watcher serializes dedupe state updates with an exclusive lock directory.
+  'scripts/conveyor/actions-policy-watch.mjs',
   // The record-only file-class writer reserves its evaluation output with an exclusive `wx` create.
   'scripts/lib/file-class-policy.mjs',
   // The CI retry allowance is consumed with an exclusive `wx` create.
@@ -252,6 +256,8 @@ export const LOCK_API = /^(?:reserve|(?:with|acquire|release|refresh|heartbeat|r
  * user fails the test.
  */
 export const LOCK_USERS = Object.freeze([
+  // The fast review pass owns both its singleton lease and the ordinary dispatch lease.
+  'scripts/lib/review-fast-pass-cli.mjs',
   // Remote discovery imports the remote-exec lock holder for its execution adapter.
   'scripts/readiness/remote-target.mjs',
   'scripts/operations/ruled-weakened-prune.mjs',
@@ -355,6 +361,8 @@ export const GUARD_FLOOR = Object.freeze([...new Set(['scripts/**/*file-locks*',
   'scripts/conveyor/soak/breaks/lane-acquire-waiter-takes-partial.mjs',
   // The missing-run push reservation is an exclusive-create (`wx`) hold: a race in it double-pushes a recovery.
   'scripts/conveyor/missing-run-push.mjs',
+  // Shared verification greens use exclusive creation and a no-clobber hard link for write-once publication.
+  'scripts/lib/verify-shared-marker.mjs',
   // The AGY usage reader writes its record through an exclusive-create (`wx`) temp file before the rename.
   'scripts/operations/agy-usage-reader.mjs',
   'scripts/*-lock.mjs', 'scripts/**/*-lock.mjs', 'scripts/**/with-lock*', 'skills-src/**/*-lock.mjs',

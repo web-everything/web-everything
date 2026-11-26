@@ -305,13 +305,13 @@ it('reads the full-review anchor only from the producer basis slot, and fails cl
   expect(fullReviewAnchor([{ author: { login: 'someone' }, body: reviewPrVerdict('changes', prior, basis(forged), at).body }], prior)).toBeNull();
 });
 
-it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (_mode, dispatch) => {
+it.each([['session', dispatchReview], ['job', dispatchReviewJob]])('%s dispatch cannot waive the configured fast-check gate', (mode, dispatch) => {
   const spawn = vi.fn();
   for (const startAfter of ['fast-checks', 'push']) {
     const result = dispatch({ expectedHead: head, io: { liveHead: () => head }, pr: 7, repo: 'web-everything/web-everything', root: join(tmpdir(), 'review-timing-daemon-fixture'),
       dir: join(tmpdir(), 'review-timing-jobs-fixture'), checkoutExists: () => true,
       checkStaleness: () => ({ fresh: true, behind: 0 }), readCompletion: () => null,
-      spawnAgent: spawn, spawnJob: spawn, advisoryCiWaiver: { head },
+      ...(mode === 'job' ? { spawnJob: spawn } : { spawnAgent: spawn }), advisoryCiWaiver: { head },
       env: { WE_REVIEW_START_AFTER: startAfter },
       ciGate: () => ({ allowed: false, headSha: head, reason: 'ci-red', affected: [] }) });
     expect(result.skipped).toContain('ci-red');

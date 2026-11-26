@@ -8,8 +8,13 @@ import { fakeGh, fakeGit } from './merge-ai-prs-fake-ports.mjs';
 
 export function createPrestageWorld(runCommand) {
   return async function world(fn, { slug = 'fixture/prestage' } = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+    const root = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
+    const dir = join(root, 'local');
     try {
+      mkdirSync(dir);
+      // These local-repo tests do not use siblings. Existing non-repository paths
+      // keep startup fail-closed without cloning or probing a shared temp parent.
+      for (const name of ['frontierui', 'plateau-app']) mkdirSync(join(root, name));
       const bin = join(dir, 'bin'); mkdirSync(bin);
       mkdirSync(join(dir, 'backlog'));
       for (const [name, body] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), body, { mode: 0o755 });
@@ -38,6 +43,6 @@ export function createPrestageWorld(runCommand) {
         return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
       };
       await fn({pr,run,coord,ledger,slug,dir});
-    } finally { rmSync(dir,{recursive:true,force:true}); }
+    } finally { rmSync(root,{recursive:true,force:true}); }
   };
 }

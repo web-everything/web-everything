@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { runInNewContext } from 'node:vm';
 import { SHARD_RUN_SCRIPT, localPhaseReason, localPhaseBypassDetail, phaseAdmissionPlan, phaseRunLocation, shouldConfirmRemoteRed, remoteInfrastructureFailure } from '../lib/verify-remote-routing.mjs';
-import { shellQuote, isShardWrapperCommand } from '../lib/verify-lane-gate.mjs';
+import { shellQuote, isShardWrapperCommand, initializeVerifierIdentity } from '../lib/verify-lane-gate.mjs';
 import { SCAN_FILES_ENV, SCAN_ROOT_ENV } from '../lib/repo-scan-tests.mjs';
 import { runLaneGate } from '../conveyor/verify-dispatch.mjs';
 import localPolicy from '../conveyor/soak/breaks/verify-request-local-policy.mjs';
@@ -173,7 +173,7 @@ function parseCli(context, local, childArgs) {
   expect(end).toBeGreaterThan(start);
   context.process.argv = ['node', ...(childArgs ?? ['verify-lane.mjs', ...(local ? ['--local'] : [])])];
   context.process.cwd = () => process.cwd();
-  Object.assign(context, { resolve, join, homedir });
+  Object.assign(context, { resolve, join, homedir, initializeVerifierIdentity });
   runInNewContext(`${source.slice(start, end)}; Object.assign(globalThis, { FORCE_LOCAL, flags, REPO });`, context);
 }
 

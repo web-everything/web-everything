@@ -81,7 +81,7 @@ export const childProcessMock = {
 childProcessMock.default = childProcessMock;
 
 /** Sequential per file: restore ambient IO even on an exception or an injected exit. */
-export async function runInProcess(argv, { cwd, env, ports }) {
+export async function runInProcess(argv, { cwd, env, ports, mainCalls = 1 }) {
   if (active) throw new Error('Concurrent CLI harness runs are unsupported');
   const savedEnv = process.env;
   const savedArgv = process.argv;
@@ -99,10 +99,12 @@ export async function runInProcess(argv, { cwd, env, ports }) {
     active.throttle = throttle.runGhCliPassthrough;
     active.runGhSync = throttle.runGhSync;
     const { main } = await import('../../merge-ai-prs.mjs');
-    try {
-      await main(argv, { env: process.env, stdout: { write(value) { stdout += value; } },
-        exit(code) { status = code; throw stopped; } });
-    } catch (error) { if (error !== stopped) throw error; }
+    for (let call = 0; call < mainCalls; call++) {
+      try {
+        await main(argv, { env: process.env, stdout: { write(value) { stdout += value; } },
+          exit(code) { status = code; throw stopped; } });
+      } catch (error) { if (error !== stopped) throw error; }
+    }
     if (active.unexpected.length) throw new AggregateError(active.unexpected, 'Unported CLI subprocess');
     return { status, stdout, stderr };
   } finally {
