@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { BUILT_IN_VERIFY_SETTINGS, defaultVerifySettingsPath, validateVerifySettings,
   loadVerifySettingsFile, resolveVerifySettings } from '../verify-settings.mjs';
 import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, verifyPhaseAdmissionEnabled,
-  verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases } from '../verify-lane-gate.mjs';
+  verifyFastTargets, resolveDefaultGate, phaseAdmissionKind, buildVerifyPhases, formatVerifyPhases,
+  alwaysRunPlan, verifySetting, verifySettingSource } from '../verify-lane-gate.mjs';
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { sharedGreenReuse: false, shardMinTests: 24, shardSize: 12, shardParallel: 3, relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
@@ -202,6 +203,69 @@ describe('#5128 — related selection settings', () => {
 });
 
 describe('alwaysRunTests setting (#99)', () => {
+  it('empty always-run override inherits configured guards', () => {
+    const fileConfig = { alwaysRunTests: ['guard.test.mjs'] };
+    const absent = resolveVerifySettings({ fileConfig, env: {} });
+    const empty = resolveVerifySettings({ fileConfig, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } });
+    expect(empty.values.alwaysRunTests).toEqual(['guard.test.mjs']);
+    expect(empty.sources.alwaysRunTests).toBe('file');
+    expect(empty).toEqual(absent);
+  });
+
+  it.each([
+    ['file', { alwaysRunTests: ['guard.test.mjs'] }, ['guard.test.mjs']],
+    ['default', {}, []],
+  ])('empty and whitespace overrides inherit both guards and provenance (%s)', (source, fileConfig, guards) => {
+    const absent = resolveVerifySettings({ fileConfig, env: {} });
+    for (const value of [undefined, '', ' ', '\t\r\n ']) {
+      const env = value === undefined ? {} : { WE_VERIFY_ALWAYS_RUN_TESTS: value };
+      const resolved = resolveVerifySettings({ fileConfig, env });
+      expect(resolved).toEqual(absent);
+      expect(resolved.values.alwaysRunTests).toEqual(guards);
+      expect(resolved.sources.alwaysRunTests).toBe(source);
+    }
+  });
+
+  it('empty overrides keep configured guards in the lane always-run selection', () => {
+    const path = file(JSON.stringify({ alwaysRunTests: ['guard.test.mjs'] }));
+    const root = dirname(path);
+    writeFileSync(join(root, 'guard.test.mjs'), '');
+    const preferences = join(root, 'platform-preferences.json');
+    writeFileSync(preferences, '{}');
+    const fileConfig = loadVerifySettingsFile(path, { env: { WE_PLATFORM_PREFERENCES_FILE: preferences } });
+    for (const env of [{}, { WE_VERIFY_ALWAYS_RUN_TESTS: '' }, { WE_VERIFY_ALWAYS_RUN_TESTS: ' \t ' }]) {
+      const plan = alwaysRunPlan({ declared: verifySetting('alwaysRunTests', env, fileConfig),
+        fileExists: name => existsSync(join(root, name)), scanCommands: [], testTimeoutFactor: 1 });
+      expect(plan.files).toEqual(['guard.test.mjs']);
+      expect(plan.skipped).toEqual([]);
+      expect(plan.command).toBe("npx vitest run 'guard.test.mjs'");
+      expect(verifySettingSource('alwaysRunTests', env, fileConfig)).toBe('file');
+    }
+  });
+
+  it('explicit overrides preserve deliberate policy', () => {
+    expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['guard.test.mjs'] },
+      env: { WE_VERIFY_ALWAYS_RUN_TESTS: ' ./a/b.test.ts, c/d.test.cjs ' } }))
+      .toMatchObject({ values: { alwaysRunTests: ['./a/b.test.ts', 'c/d.test.cjs'] }, sources: { alwaysRunTests: 'env' } });
+    const path = file(JSON.stringify({ alwaysRunTests: [] }));
+    const preferences = join(dirname(path), 'platform-preferences.json');
+    writeFileSync(preferences, JSON.stringify({ verify: { alwaysRunTests: ['platform-guard.test.mjs'] } }));
+    const fileConfig = loadVerifySettingsFile(path, { env: { WE_PLATFORM_PREFERENCES_FILE: preferences } });
+    for (const env of [{}, { WE_VERIFY_ALWAYS_RUN_TESTS: '' }, { WE_VERIFY_ALWAYS_RUN_TESTS: ' \t ' }]) {
+      expect(resolveVerifySettings({ fileConfig, env }))
+        .toMatchObject({ values: { alwaysRunTests: [] }, sources: { alwaysRunTests: 'file' } });
+    }
+  });
+
+  it.each([',', ', ,', 'guard.test.mjs,', ',guard.test.mjs', 'guard.test.mjs,,other.test.mjs',
+    '--bail', 'guard.test.mjs,--bail', '../guard.test.mjs', 'off', '[]',
+    Array.from({ length: 51 }, (_, i) => `guard${i}.test.mjs`).join(',')])(
+    'malformed or oversized overrides retain configured guards and provenance (%s)', value => {
+      expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['configured.test.mjs'] },
+        env: { WE_VERIFY_ALWAYS_RUN_TESTS: value } }))
+        .toMatchObject({ values: { alwaysRunTests: ['configured.test.mjs'] }, sources: { alwaysRunTests: 'file' } });
+    });
+
   it('rejects unsafe entries per key and an empty-but-set env switches the set off', () => {
     for (const bad of ['a.test.mjs', ['/abs.test.mjs'], ['../x.test.mjs'], [1], ['a b.test.mjs'],
       // a leading dash is a vitest option, not a path; a non-test file would not be a guard at all
