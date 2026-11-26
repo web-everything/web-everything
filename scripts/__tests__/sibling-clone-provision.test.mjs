@@ -15,6 +15,11 @@ import { prestagePorts } from './fixtures/merge-ai-prs-fake-ports.mjs';
 
 vi.mock('../lib/git-run.mjs', () => ({ gitRun: vi.fn() }));
 
+// The lifecycle cases import the real drain CLI and may run it twice. Match the
+// pre-stage CLI suite's bound so fresh imports and label-lag repolls can finish
+// before Vitest tears down the in-process harness's ambient IO mocks.
+vi.setConfig({ testTimeout: 120_000 });
+
 const roots = [];
 afterEach(() => {
   vi.mocked(gitRun).mockReset();

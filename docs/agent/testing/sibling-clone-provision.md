@@ -23,6 +23,10 @@ CLI harness. They assert zero clones for marked test CLIs and explicit dry runs,
 provision call across repeated main calls without resetting modules, and zero calls on lease
 refusal. Their injected clone runner and private parent exercise production mode safely by
 omitting the marker. The throwing-logger test pins continued processing of both siblings.
+Keep the suite's 120-second test bound aligned with the pre-stage CLI suite: fresh module
+imports and label-lag repolls can exceed Vitest's five-second default, especially for two
+`main` calls. A premature timeout leaves the first harness call running during teardown
+and makes later cases fail with `Concurrent CLI harness runs are unsupported`.
 
 Drain CLI fixtures that deliberately exercise provisioning must also own the parent of their
 checkout: put the checkout in a nested temporary directory. Local-only prestage
