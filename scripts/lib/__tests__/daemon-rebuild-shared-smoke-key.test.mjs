@@ -1,5 +1,5 @@
 /** S1.1 identity contract. @repo-scanning-test scope=files */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -8,6 +8,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import ts from 'typescript';
+import * as pushLint from '../push-gate-lint.mjs';
 import {
   RUNNING_ROOT, SUITE_ENTRIES, SUITE_JSON_RUNTIME_NAMES, COMPUTED_LOADS, K6_AUDITED_READS,
   PER_LAUNCH_ENV, smokeIdentityComponents, suiteManifest, smokeSuiteHash,
@@ -17,6 +18,17 @@ import {
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV } from '../daemon-live-smoke.mjs';
 import { REBUILD_SMOKE_BUDGET_ENV } from '../daemon-rebuild/smoke.mjs';
 import { REPO_SCAN_TESTS, selectScanTests, scanRoot, scanScope } from '../repo-scan-tests.mjs';
+
+const auditGitPorts = vi.hoisted(() => new Map());
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal();
+  return { ...actual, spawnSync(command, args, options) {
+    if (command === 'git' && args[0] === '-C' && auditGitPorts.has(args[1])) {
+      return auditGitPorts.get(args[1])(args[1], args.slice(2));
+    }
+    return actual.spawnSync(command, args, options);
+  } };
+});
 
 const dirs = [];
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -186,7 +198,144 @@ function assertProductionAudit(audit, scope = null) {
     throw new Error(`production-presence-reader-drift:${JSON.stringify(audit.presenceReaders)}`);
   }
 }
-afterEach(() => { for (const p of dirs.splice(0)) rmSync(p, { recursive: true, force: true }); });
+afterEach(() => { auditGitPorts.clear(); for (const p of dirs.splice(0)) rmSync(p, { recursive: true, force: true }); });
+
+// Audit regressions use only private files and an injected Git port. No host,
+// checkout, installed dependency, process inspection or remote is consulted.
+function auditFixture() {
+  const base = temp(); const root = join(base, 'repo'); const pool = join(base, 'pool');
+  mkdirSync(root); mkdirSync(pool); mkdirSync(join(root, '.git')); mkdirSync(join(base, 'state'));
+  for (const file of SUITE_ENTRIES) put(root, file, 'export {};');
+  put(root, 'entry.mjs', 'export {};'); put(root, 'package-lock.json', '{}');
+  put(root, 'scripts/settings/base.json', '{}');
+  const env = { PATH: '/fixture/bin', HOME: base, TMPDIR: base, LANE_POOL_ROOT: pool,
+    LANE_POOL_CANONICAL_ORIGIN: 'https://example.test/we.git', WE_DISPATCH_CWD_ROOT: join(base, 'dispatch'),
+    WE_PLATFORM_PREFERENCES_FILE: put(base, 'preferences.json', '{}') };
+  const git = (cwd, args) => {
+    if (realpathSync(cwd) !== realpathSync(root)) throw new Error('unexpected-fixture-cwd');
+    let stdout;
+    if (args[0] === 'ls-files') stdout = 'scripts/settings/base.json\0';
+    else if (args[0] === 'rev-parse' && args[1] === '--verify') stdout = 'a'.repeat(40);
+    else if (args[0] === 'rev-parse') stdout = args[1] === '--show-toplevel' ? root : join(root, '.git');
+    else if (args[0] === 'show') stdout = '{}';
+    else if (args.join(' ') === 'remote get-url origin') stdout = env.LANE_POOL_CANONICAL_ORIGIN;
+    else throw new Error(`unexpected-fixture-git:${args.join(' ')}`);
+    return { status: 0, stdout, stderr: '' };
+  };
+  const overridesFile = put(base, 'operator-overrides.json', '{}');
+  auditGitPorts.set(root, git);
+  auditGitPorts.set(realpathSync(root), git);
+  const log = { error() {} };
+  const suite = { root, env, checks, git, overridesFile, log };
+  const key = extra => sharedSmokeIdentity({ root, sha: 'fixture-head', predictedCandidatePath: join(base, 'state', 'candidate'),
+    suiteRoot: root, env, checks, git, overridesFile, host: 'fixture-host', nodeVersion: 'v24.fixture', log, ...extra });
+  return { root, base, env, git, suite, key, overridesFile };
+}
+
+describe('fix-round audit regressions (hermetic)', () => {
+  it('finding 1: pins each admitted call and refuses a push-bearing replacement with the same count', () => {
+    const file = 'scripts/lib/daemon-rebuild/shared-smoke-key.mjs';
+    const source = "spawnSync('git', ['-C', root, ...args], { timeout: 5000 });";
+    const replacement = "spawnSync('git', ['-C', root, 'push', ...args], { timeout: 5000 });";
+    expect(pushLint.findRawPushes(source)).toHaveLength(1);
+    expect(pushLint.findRawPushes(replacement)).toHaveLength(1);
+    const entry = { status: 'pending-migration', reason: 'bounded fixture read', sites: 1,
+      callSites: [{ text: source.slice(0, -1), reason: 'read-only injected fixture port' }] };
+    expect(() => pushLint.admitRawPushSites(source, file, entry)).not.toThrow();
+    expect(() => pushLint.admitRawPushSites(replacement, file, entry)).toThrow(/site.*drift/);
+    expect(() => pushLint.admitRawPushSites(source, file, { ...entry, callSites: [] })).toThrow(/site.*drift/);
+  });
+  it('finding 2: refuses require aliases and namespace createRequire even outside changed files', () => {
+    const f = auditFixture();
+    expect(suiteManifest(f.suite)).not.toBeNull();
+    for (const source of [
+      'const r = require; r(target);',
+      "import * as mod from 'node:module'; const r = mod.createRequire(import.meta.url); r(target);",
+      "import * as mod from 'node:module'; mod['createRequire'](import.meta.url)(target);",
+      'const { createRequire: make } = require("node:module"); const r = make(import.meta.url); r(target);',
+    ]) {
+      put(f.root, 'entry.mjs', source);
+      expect(suiteManifest(f.suite), source).toBeNull();
+      expect(codeEnvNames(f.root, { ...f.suite, entries: ['entry.mjs'] }), source).toBeNull();
+    }
+  });
+  it('finding 3: refuses bare imports without verified installed version and file evidence', () => {
+    const f = auditFixture(); expect(suiteManifest(f.suite)).not.toBeNull();
+    put(f.root, 'entry.mjs', "import 'not-installed';");
+    expect(suiteManifest(f.suite)).toBeNull();
+    put(f.root, 'node_modules/not-installed/package.json', '{"name":"not-installed","version":"1.0.0","main":"index.js"}');
+    put(f.root, 'node_modules/not-installed/index.js', 'module.exports = 1;');
+    const before = smokeSuiteHash(f.suite);
+    put(f.root, 'node_modules/not-installed/index.js', 'module.exports = 2;');
+    const after = smokeSuiteHash(f.suite);
+    expect(before === null || (after !== null && before !== after)).toBe(true);
+  });
+  it('finding 4: refuses computed, aliased, rest and spread environment reads', () => {
+    const f = auditFixture();
+    expect(codeEnvNames(f.root, { ...f.suite, entries: ['entry.mjs'] })).not.toBeNull();
+    for (const source of ['process.env[name];', 'env?.[name];', 'const e = process.env; e.WE_CONTROL;',
+      'const e = env; e.WE_CONTROL;', 'const { env: e } = process; e.WE_CONTROL;',
+      'const { ...rest } = process.env;', 'const copy = { ...process.env };',
+      "process['env'][name];"]) {
+      put(f.root, 'entry.mjs', source);
+      expect(codeEnvNames(f.root, { ...f.suite, entries: ['entry.mjs'] }), source).toBeNull();
+      expect(f.key(), source).toBeNull();
+    }
+  });
+  it('finding 5: includes untracked settings JSON and refuses unreadable or malformed policy', () => {
+    const f = auditFixture(); const before = smokeSuiteHash(f.suite);
+    expect(before).toMatch(/^[a-f0-9]{64}$/);
+    const path = put(f.root, 'scripts/settings/untracked.json', '{"capacity":1}');
+    expect(smokeSuiteHash(f.suite)).not.toBe(before);
+    expect(suiteManifest(f.suite).map(([file]) => file)).toContain('scripts/settings/untracked.json');
+    expect(suiteManifest({ ...f.suite, readFile: file => {
+      if (file === path) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return readFileSync(file);
+    } })).toBeNull();
+    writeFileSync(path, '{broken'); expect(suiteManifest(f.suite)).toBeNull();
+  });
+  it('finding 6: binds operator-overrides content and refuses unreadable or malformed store state', () => {
+    const f = auditFixture(); const before = smokeSuiteHash(f.suite);
+    writeFileSync(f.overridesFile, '{"lanes.maxConcurrent":1}');
+    expect(smokeSuiteHash(f.suite)).not.toBe(before);
+    expect(suiteManifest({ ...f.suite, readFile: file => {
+      if (file === f.overridesFile) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+      return readFileSync(file);
+    } })).toBeNull();
+    writeFileSync(f.overridesFile, '{broken'); expect(suiteManifest(f.suite)).toBeNull();
+  });
+  it('finding 7: hashes inherited and closure-discovered env names automatically', () => {
+    const f = auditFixture(); put(f.root, 'entry.mjs', 'process.env.CUSTOM_AUTH_CONFIG;');
+    const before = f.key(); expect(before).not.toBeNull();
+    for (const name of ['XDG_CONFIG_HOME', 'TMPDIR', 'CUSTOM_AUTH_CONFIG', 'CI']) {
+      const changed = f.key({ env: { ...f.env, [name]: 'different' } });
+      expect(changed).not.toBeNull(); expect(changed.key, name).not.toBe(before.key);
+    }
+    expect(f.key({ env: { ...f.env, CUSTOM_AUTH_CONFIG: '' } }).key).not.toBe(before.key);
+  });
+  it('finding 8: caller envIgnore cannot remove any safety control', () => {
+    const f = auditFixture();
+    const options = { root: f.root, ownershipOk: true, envIgnore: ['WE_CONTROL'], log: f.suite.log };
+    const a = effectiveEnvHash({ ...options, env: { ...f.env, WE_CONTROL: '0' } });
+    const b = effectiveEnvHash({ ...options, env: { ...f.env, WE_CONTROL: '1' } });
+    expect(a === null || a !== b).toBe(true);
+  });
+  it('finding 9: hashes credential values and authentication metadata rather than presence', () => {
+    const f = auditFixture();
+    for (const name of ['GH_TOKEN', 'GITHUB_TOKEN', 'WE_GH_AUTH_INSTALLATION', 'CUSTOM_PASSWORD']) {
+      const options = { root: f.root, ownershipOk: true, env: { ...f.env, [name]: 'secret-one' } };
+      const entries = effectiveEnvEntries(options);
+      expect(entries).toContainEqual([name, hash('secret-one')]);
+      expect(JSON.stringify(entries)).not.toContain('secret-one');
+      expect(effectiveEnvHash(options)).not.toBe(effectiveEnvHash({ ...options, env: { ...options.env, [name]: 'secret-two' } }));
+    }
+  });
+  it('finding 10: scoped auditing refuses an unsupported load in an unchanged reachable dependency', () => {
+    const audit = { unsupported: [...PRODUCTION_REFUSED_LOADS, ['unchanged-dependency.mjs', 'import(target)']].sort(),
+      readers: ['scripts/lane-pool.mjs'], presenceReaders: PRODUCTION_PRESENCE_READS };
+    expect(() => assertProductionAudit(audit, new Set(['changed-importer.mjs']))).toThrow(/production-dynamic-load-drift/);
+  });
+});
 
 describe('K1, K7, K8: canonical identities', () => {
   it('binds tree, lockfile, Node, suite checks, origin and host with fixed-order serialization', () => {
