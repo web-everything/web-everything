@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
+    scope: 'files',
+    why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',
+    matches: (f) => f.startsWith('scripts/') && /\.(mjs|cjs|js|ts)$/.test(f) && !skipped(f),
+    inputs: ['scripts/operations/__tests__/audit-nonconvergence.test.mjs'],
+  },
+  {
     test: 'scripts/__tests__/push-gate-boundary.test.mjs',
     scope: 'files',
     why: 'pins raw-push site counts per tracked non-test script; rule or allowlist edits require the full inventory',

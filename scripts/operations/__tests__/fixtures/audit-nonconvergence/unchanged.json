@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "kind": "audit-nonconvergence-input",
+  "synthetic": true,
+  "repo": "example/audit-fixture",
+  "pr": 1,
+  "ref": "refs/heads/nonconvergence",
+  "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "completeFromStart": true,
+  "rounds": [
+    {
+      "sequence": 1,
+      "repo": "example/audit-fixture",
+      "pr": 1,
+      "ref": "refs/heads/nonconvergence",
+      "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "1111111111111111111111111111111111111111",
+      "base": "0000000000000000000000000000000000000000",
+      "verdict": "WEAKENED",
+      "findings": [
+        {
+          "id": "f1",
+          "text": "Synthetic B2 finding",
+          "file": "src/example.mjs",
+          "line": 1,
+          "class": "B2"
+        }
+      ]
+    },
+    {
+      "sequence": 2,
+      "repo": "example/audit-fixture",
+      "pr": 1,
+      "ref": "refs/heads/nonconvergence",
+      "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "2222222222222222222222222222222222222222",
+      "base": "0000000000000000000000000000000000000000",
+      "verdict": "WEAKENED",
+      "findings": [
+        {
+          "id": "f2",
+          "text": "Synthetic B2 finding",
+          "file": "src/example.mjs",
+          "line": 1,
+          "class": "B2"
+        }
+      ]
+    }
+  ],
+  "provenance": {
+    "source": "synthetic canonical JSON records (compact JSON in property order)",
+    "sourceSha256": "b39b33bfff5f9188faa6ac9c5bb3d903fa44b35b24c13e676fb4d49560953b40",
+    "selection": [
+      {
+        "sequence": 1,
+        "recordIndex": 1,
+        "recordSha256": "410da13e8f5eb2d8b54fa70c37f4936cef888cb24b0f2dd95ec576ae866f7aed"
+      },
+      {
+        "sequence": 2,
+        "recordIndex": 2,
+        "recordSha256": "0e01d741aaa78beb5799f3848eb1a6c27d60e5a2e810ace4ca0dbae2afb64fef"
+      }
+    ],
+    "verifiedBy": "synthetic fixture author"
+  }
+}

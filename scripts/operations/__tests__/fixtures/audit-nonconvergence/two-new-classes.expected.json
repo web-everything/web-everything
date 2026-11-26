@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "kind": "audit-nonconvergence-diagnostic",
+  "enforcement": false,
+  "synthetic": true,
+  "repo": "example/audit-fixture",
+  "pr": 1,
+  "ref": "refs/heads/nonconvergence",
+  "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "evidenceBasis": "operator-attested; not authenticated",
+  "status": "RECOMMEND_DESIGN",
+  "recommendationAt": 2,
+  "streak": 2,
+  "rounds": [
+    {
+      "sequence": 1,
+      "repo": "example/audit-fixture",
+      "pr": 1,
+      "ref": "refs/heads/nonconvergence",
+      "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "1111111111111111111111111111111111111111",
+      "base": "0000000000000000000000000000000000000000",
+      "verdict": "WEAKENED",
+      "findings": [
+        {
+          "id": "f1",
+          "text": "Synthetic B2 finding",
+          "file": "src/example.mjs",
+          "line": 1,
+          "class": "B2"
+        }
+      ],
+      "newClasses": [
+        "B2"
+      ],
+      "streak": 1
+    },
+    {
+      "sequence": 2,
+      "repo": "example/audit-fixture",
+      "pr": 1,
+      "ref": "refs/heads/nonconvergence",
+      "questionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head": "2222222222222222222222222222222222222222",
+      "base": "0000000000000000000000000000000000000000",
+      "verdict": "WEAKENED",
+      "findings": [
+        {
+          "id": "f2",
+          "text": "Synthetic B1 finding",
+          "file": "src/example.mjs",
+          "line": 1,
+          "class": "B1"
+        }
+      ],
+      "newClasses": [
+        "B1"
+      ],
+      "streak": 2
+    }
+  ],
+  "provenance": {
+    "source": "synthetic canonical JSON records (compact JSON in property order)",
+    "sourceSha256": "d53d826655ed204f9e852ebcff488df233ff1c4d8e3d0aa073d21cf25b7eaa23",
+    "selection": [
+      {
+        "sequence": 1,
+        "recordIndex": 1,
+        "recordSha256": "410da13e8f5eb2d8b54fa70c37f4936cef888cb24b0f2dd95ec576ae866f7aed"
+      },
+      {
+        "sequence": 2,
+        "recordIndex": 2,
+        "recordSha256": "d1d378ea39c43dba14260e7da3397c8fb4a6b0c7b84f00d0d6a4ac57e04bf0a9"
+      }
+    ],
+    "verifiedBy": "synthetic fixture author"
+  }
+}
