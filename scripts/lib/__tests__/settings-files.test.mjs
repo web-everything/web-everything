@@ -182,6 +182,19 @@ describe('readSettingsChecked — fail-closed evidence', () => {
     expect(readSettingsChecked(options).taint).toEqual([{ source: 'settings/other-policy.json', reason: 'dotted key' }]);
   }));
 
+  it.each(['delivery-strategy.json', 'delivery-strategy-table.json'])('standalone %s does not merge into live conveyor settings', (file) => fixture((options) => {
+    const data = readFileSync(join(SETTINGS_DIR, file), 'utf8');
+    const live = { version: 'live', description: 'live settings', fixDispatch: { parkedCapFactor: 2 } };
+    writeFileSync(options.legacyPath, JSON.stringify(live));
+    writeFileSync(join(options.dir, file), data);
+    expect(readDeclaredSettings(options)).toMatchObject({ settings: live, sources: ['dispatch-settings.json'], duplicates: [], errors: [] });
+    expect(readSettings(options)).toEqual(live);
+    expect(readSettingsChecked(options)).toEqual({ value: live, taint: [], duplicates: [] });
+    // Only these exact documents are standalone; other feature files still fail closed.
+    writeFileSync(join(options.dir, `other-${file}`), '{invalid');
+    expect(readSettingsChecked(options).taint).toEqual([{ source: `settings/other-${file}`, reason: 'invalid JSON' }]);
+  }));
+
   it('clean reads select whole trees, subtrees and leaves with empty taint', () => fixture((options) => {
     writeFileSync(options.legacyPath, '{"fixDispatch":{"parkedCapFactor":2}}');
     writeFileSync(join(options.dir, 'a.json'), '{"fixDispatch":{"other":3},"cap":4}');

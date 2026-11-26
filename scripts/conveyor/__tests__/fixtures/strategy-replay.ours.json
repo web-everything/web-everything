@@ -1,0 +1,4246 @@
+{
+ "note": "OURS: proposal, not ratified; placeholder numbers. Golden replay of designs/strategy-replay-2026-11-25.md through our table R0-R11. Decisions are replayed as fact; the hours in that document are model estimates, not measurements (pick P6).",
+ "source": {
+  "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25",
+  "digest": {
+   "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+  }
+ },
+ "table": {
+  "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+  "version": "r0-r11-draft-1",
+  "digest": {
+   "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+  }
+ },
+ "settings": {
+  "revision": "ours-settings-draft-1",
+  "digest": {
+   "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+  }
+ },
+ "summary": {
+  "#7458": "prototype-first",
+  "#7463": "prototype-first",
+  "#7472": "incident",
+  "#7478": "hold in the hold, then prototype-first after adoption",
+  "#7480": "hold in the hold, then prototype-first after adoption",
+  "#7485": "prototype-first after adoption, ranked first (hold-causer)"
+ },
+ "points": [
+  {
+   "at": "2026-11-24T17:36:00-05:00",
+   "note": "#7463 audited-green d5f0a159 at 17:21, before the hold (20:40): load the audited revision within the window",
+   "candidates": [
+    {
+     "id": "#7463",
+     "planOrder": 1,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": true,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 0,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-24T17:36:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    }
+   ],
+   "expected": {
+    "order": [
+     "#7463"
+    ],
+    "outputs": {
+     "#7463": {
+      "strategy": "prototype-first",
+      "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+      "rule": "R3"
+     }
+    }
+   }
+  },
+  {
+   "at": "2026-11-24T19:40:00-05:00",
+   "note": "#7458 audited-green 6129b3fd at 19:25, before the hold; #7462 already live (one overlay)",
+   "candidates": [
+    {
+     "id": "#7458",
+     "planOrder": 1,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": true,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 1,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-24T19:40:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    }
+   ],
+   "expected": {
+    "order": [
+     "#7458"
+    ],
+    "outputs": {
+     "#7458": {
+      "strategy": "prototype-first",
+      "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+      "rule": "R3"
+     }
+    }
+   }
+  },
+  {
+   "at": "2026-11-24T23:33:00-05:00",
+   "note": "inside the hold (daemons on last-good, nothing can adopt); #7472 re-audited 50cdbd2c and clears the hold; the review and drain gate is in a circular hold, so #7478 and #7480 load a stalled stage",
+   "candidates": [
+    {
+     "id": "#7478",
+     "planOrder": 1,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    },
+    {
+     "id": "#7480",
+     "planOrder": 2,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    },
+    {
+     "id": "#7472",
+     "planOrder": 3,
+     "clearsHold": true,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "hold",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-24T23:33:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    }
+   ],
+   "expected": {
+    "order": [
+     "#7472",
+     "#7478",
+     "#7480"
+    ],
+    "outputs": {
+     "#7472": {
+      "strategy": "incident",
+      "reason": "HOLD_CLEAR_NO_ADOPT",
+      "rule": "R2"
+     },
+     "#7478": {
+      "strategy": "hold",
+      "reason": "STALLED_GATE",
+      "rule": "R6"
+     },
+     "#7480": {
+      "strategy": "hold",
+      "reason": "STALLED_GATE",
+      "rule": "R6"
+     }
+    }
+   }
+  },
+  {
+   "at": "2026-11-25T06:45:00-05:00",
+   "note": "after #7472 is adopted: #7485 caused the circular send-back, so it goes first; #7478 and #7480 load their audited revisions (b086278a, b74314d4), not their moved heads; #7485 CI re-checked at f44b6e9c (assumption of the replay)",
+   "candidates": [
+    {
+     "id": "#7478",
+     "planOrder": 1,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    },
+    {
+     "id": "#7480",
+     "planOrder": 2,
+     "clearsHold": false,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "stage",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 2,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    },
+    {
+     "id": "#7485",
+     "planOrder": 3,
+     "clearsHold": true,
+     "inputs": {
+      "security-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "step-kind": {
+       "value": "daemon-fix",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "blocker": {
+       "value": "hold",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "hold-causer": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "targets-can-adopt": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "overlay-loadable": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "live-overlays": {
+       "value": 0,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "audit-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loaded-stage-stress": {
+       "value": "clear",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stress-incident": {
+       "value": "none",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "loads-stalled-stage": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "free-slots": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "review-rounds": {
+       "value": 1,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "non-convergence-evidence": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "ci-state": {
+       "value": "pass",
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "admission-clear": {
+       "value": true,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-interval-open": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "red-recovery-candidate": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "prepped-independent": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-declared": {
+       "value": false,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      },
+      "stack-depth": {
+       "value": 0,
+       "observedAt": "2026-11-25T06:45:00-05:00",
+       "source": {
+        "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+        "digest": {
+         "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+        }
+       },
+       "fresh": true
+      }
+     }
+    }
+   ],
+   "expected": {
+    "order": [
+     "#7485",
+     "#7478",
+     "#7480"
+    ],
+    "outputs": {
+     "#7485": {
+      "strategy": "prototype-first",
+      "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+      "rule": "R3"
+     },
+     "#7478": {
+      "strategy": "prototype-first",
+      "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+      "rule": "R3"
+     },
+     "#7480": {
+      "strategy": "prototype-first",
+      "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+      "rule": "R3"
+     }
+    }
+   }
+  }
+ ],
+ "records": [
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-1-7463",
+   "at": "2026-11-24T17:36:00-05:00",
+   "candidate": "#7463",
+   "position": 0,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": true,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 0,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-24T17:36:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7463",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R3",
+   "strategy": "prototype-first",
+   "build": true,
+   "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-2-7458",
+   "at": "2026-11-24T19:40:00-05:00",
+   "candidate": "#7458",
+   "position": 0,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": true,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 1,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-24T19:40:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7458",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R3",
+   "strategy": "prototype-first",
+   "build": true,
+   "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-3-7472",
+   "at": "2026-11-24T23:33:00-05:00",
+   "candidate": "#7472",
+   "position": 0,
+   "positionReason": "clears-hold",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "hold",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7472",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R2",
+   "strategy": "incident",
+   "build": true,
+   "reason": "HOLD_CLEAR_NO_ADOPT",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-3-7478",
+   "at": "2026-11-24T23:33:00-05:00",
+   "candidate": "#7478",
+   "position": 1,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R6",
+   "strategy": "hold",
+   "build": false,
+   "reason": "STALLED_GATE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "false"
+    },
+    {
+     "rule": "R4",
+     "result": "false"
+    },
+    {
+     "rule": "R5",
+     "result": "false"
+    },
+    {
+     "rule": "R6",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-3-7480",
+   "at": "2026-11-24T23:33:00-05:00",
+   "candidate": "#7480",
+   "position": 2,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-24T23:33:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R6",
+   "strategy": "hold",
+   "build": false,
+   "reason": "STALLED_GATE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "false"
+    },
+    {
+     "rule": "R4",
+     "result": "false"
+    },
+    {
+     "rule": "R5",
+     "result": "false"
+    },
+    {
+     "rule": "R6",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-4-7485",
+   "at": "2026-11-25T06:45:00-05:00",
+   "candidate": "#7485",
+   "position": 0,
+   "positionReason": "clears-hold",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "hold",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 0,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7485",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R3",
+   "strategy": "prototype-first",
+   "build": true,
+   "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-4-7478",
+   "at": "2026-11-25T06:45:00-05:00",
+   "candidate": "#7478",
+   "position": 1,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7478",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R3",
+   "strategy": "prototype-first",
+   "build": true,
+   "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  },
+  {
+   "decisionType": "https://everstandards.dev/ship/strategy-decision/v0.1",
+   "decisionId": "replay-4-7480",
+   "at": "2026-11-25T06:45:00-05:00",
+   "candidate": "#7480",
+   "position": 2,
+   "positionReason": "plan-order",
+   "inputs": {
+    "security-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "step-kind": {
+     "value": "daemon-fix",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "blocker": {
+     "value": "stage",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "hold-causer": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "targets-can-adopt": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "overlay-loadable": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "live-overlays": {
+     "value": 2,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "audit-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loaded-stage-stress": {
+     "value": "clear",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stress-incident": {
+     "value": "none",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "loads-stalled-stage": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "free-slots": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "review-rounds": {
+     "value": 1,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "non-convergence-evidence": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "ci-state": {
+     "value": "pass",
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "admission-clear": {
+     "value": true,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-interval-open": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "red-recovery-candidate": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "prepped-independent": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-declared": {
+     "value": false,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    },
+    "stack-depth": {
+     "value": 0,
+     "observedAt": "2026-11-25T06:45:00-05:00",
+     "source": {
+      "uri": "tag:plateau.app,2026-11-25:designs/strategy-replay-2026-11-25#pr-7480",
+      "digest": {
+       "sha256": "659344ce9dccf5af702348fa90280f3ac1b6946c08b37a8bfcf8ad70a329c117"
+      }
+     },
+     "fresh": true
+    }
+   },
+   "table": {
+    "uri": "https://everstandards.dev/ship/fixtures/ours/strategy-tables/ours-next",
+    "version": "r0-r11-draft-1",
+    "digest": {
+     "sha256": "a6d0e937db4b6464eebc43f86d5fb3f298904d815a2de57902227be25dad3161"
+    }
+   },
+   "settings": {
+    "revision": "ours-settings-draft-1",
+    "digest": {
+     "sha256": "4438b61db3ad7b5d0ca0a9294a5673a106912612e1c871eacfac25186a1b03cc"
+    }
+   },
+   "rule": "R3",
+   "strategy": "prototype-first",
+   "build": true,
+   "reason": "BLOCKER_OVERLAY_ELIGIBLE",
+   "evaluated": [
+    {
+     "rule": "R1",
+     "result": "false"
+    },
+    {
+     "rule": "R2",
+     "result": "false"
+    },
+    {
+     "rule": "R3",
+     "result": "match"
+    }
+   ],
+   "unknown": [],
+   "actions": []
+  }
+ ]
+}
