@@ -834,3 +834,196 @@ describe('runMainRedAlert — injected IO', () => {
     expectPersisted(repeated.writeState, plan({ prev: expected.next, readOk: false }).next);
   });
 });
+
+
+describe('red-main measurement replay', () => {
+  it('red episode crossing midnight counts each minute once after restart', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const midnight = Date.parse('2026-11-26T00:00:00Z');
+    const runs = [run(RED_SHA, 'failure', new Date(midnight - 10 * MINUTE).toISOString(), 42)];
+    const first = plan({ runs, now: midnight - 5 * MINUTE });
+    const restarted = plan({ runs, prev: JSON.parse(JSON.stringify(first.next)), now: midnight + 5 * MINUTE });
+    expect(first.metrics).toHaveLength(1);
+    expect(restarted.metrics).toEqual([]);
+    const closed = plan({ runs: greenRuns(), tip: passingTip(), prev: restarted.next, now: midnight + 10 * MINUTE });
+    const recurring = plan({ runs, prev: closed.next, now: midnight + 20 * MINUTE });
+    expect(recurring.metrics[0].seq).toBeGreaterThan(first.metrics[0].seq);
+    const events = [...first.metrics, ...first.metrics, ...closed.metrics, ...recurring.metrics];
+    const report = reportMainRedMetrics(events, { from: midnight - 10 * MINUTE, to: midnight + 30 * MINUTE, now: midnight + 30 * MINUTE });
+    expect(report.days).toEqual({ '2026-11-25': 10, '2026-11-26': 20 });
+    expect(report.timezone).toBe('UTC');
+    expect(report.openEpisodes).toBe(1);
+  });
+
+  it('unions overlapping episode signals and reports unknown observations and incomplete bounds', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const first = plan();
+    const unknown = plan({ prev: first.next, readOk: false });
+    const overlap = { ...first.metrics[0], key: 'overlap', seq: 10, since: START + MINUTE };
+    const options = { from: START, to: START + 40 * MINUTE, now: START + 40 * MINUTE };
+    expect(reportMainRedMetrics([...first.metrics, overlap], options).days['2026-10-26']).toBe(40);
+    expect(reportMainRedMetrics([...first.metrics, ...unknown.metrics], options).warnings.join(' ')).toMatch(/unknown/i);
+    expect(reportMainRedMetrics([], options).warnings.join(' ')).toMatch(/incomplete/i);
+    expect(reportMainRedMetrics([null], options).warnings.join(' ')).toMatch(/malformed/i);
+    expect(reportMainRedMetrics(Array(10001).fill(first.metrics[0]), options).warnings.join(' ')).toMatch(/limit.*archive/i);
+  });
+
+  it('replays a measured day with queue wait, red minutes and top signatures', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const measured = plan({ details: { ...details(), failureIdentifiers: { job: 'test', file: 'a.test.mjs', test: 'fails' } },
+      runs: redRuns().map(r => ({ ...r, startedAt: new Date(Date.parse(r.createdAt) + 2 * MINUTE).toISOString() })) });
+    const ended = plan({ prev: measured.next, runs: greenRuns(), tip: passingTip(), now: START + 40 * MINUTE });
+    const report = reportMainRedMetrics([...measured.metrics, ...ended.metrics], { from: START, to: START + 40 * MINUTE, now: START + 40 * MINUTE });
+    expect(report.days['2026-10-26']).toBe(40);
+    expect(report.queue.waitMs).toEqual([2 * MINUTE]);
+    expect(report.signatures[0].count).toBe(1);
+    console.info('RED-METRICS replay baseline', JSON.stringify(report));
+  });
+
+  it('journal retries survive state-write failure and bounded unreadable evidence stays visible', async () => {
+    const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { appendMainRedMetrics, readMainRedMetrics } = await import('../health-watch-main-red.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'red-metrics-'));
+    try {
+      const event = plan().metrics[0];
+      appendMainRedMetrics(dir, [event]);
+      appendMainRedMetrics(dir, [event]);
+      expect(readMainRedMetrics(dir).events).toEqual([event]);
+      writeFileSync(join(dir, 'main-red-metrics', 'bad.json'), 'x'.repeat(8193));
+      expect(readMainRedMetrics(dir).warnings.join(' ')).toMatch(/oversized.*archive/i);
+      expect(readMainRedMetrics(join(dir, 'missing')).warnings.join(' ')).toMatch(/incomplete/i);
+      const args = wrapperInput({ dir, writeMetrics: appendMainRedMetrics, writeState: vi.fn().mockRejectedValue(new Error('state failed')) });
+      await expect(runMainRedAlert(args)).rejects.toThrow('state failed');
+      await runMainRedAlert({ ...args, writeState: vi.fn(), now: START + 31 * MINUTE });
+      expect(readMainRedMetrics(dir).events).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('red metrics journal acknowledgement', () => {
+  it.each([
+    ['episode start', 'warnings'], ['recovery', 'warnings'],
+    ['episode start', 'throw'], ['recovery', 'throw'],
+    ['episode start', 'missing receipt'], ['recovery', 'missing receipt'],
+  ])('recovers the missing %s transition after journal failure (%s) and restart', async (transition, failure) => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const { appendMainRedMetrics, readMainRedMetrics, readMainRedReport } = await import('../health-watch-main-red.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'red-metrics-ack-'));
+    try {
+      let persisted = {};
+      const args = wrapperInput({ dir,
+        readState: async () => JSON.parse(JSON.stringify(persisted)),
+        writeState: async (_dir, next) => { persisted = JSON.parse(JSON.stringify(next)); },
+        writeMetrics: appendMainRedMetrics,
+      });
+      if (transition === 'recovery') await runMainRedAlert(args);
+      const probe = transition === 'recovery' ? { runs: greenRuns(), tip: passingTip() } : args.probe;
+      const at = START + 40 * MINUTE;
+      const writeMetrics = vi.fn(() => {
+        if (failure === 'throw') throw new Error('simulated disk failure');
+        return failure === 'warnings' ? { warnings: ['journal write failed; recover evidence'] } : undefined;
+      });
+      const failed = await runMainRedAlert({ ...args, probe, now: at, writeMetrics });
+      expect(failed.metricWarnings.length).toBeGreaterThan(0);
+      expect(persisted.pendingMetrics).toHaveLength(1);
+      const missing = persisted.pendingMetrics[0];
+      expect(missing.kind).toBe(transition === 'recovery' ? 'green' : 'red');
+      expect(readMainRedMetrics(dir).events.some(event => event.key === missing.key)).toBe(false);
+
+      // Fresh state read emulates restart; an unchanged sample must still retry the owed event.
+      const resumed = await runMainRedAlert({ ...args, probe, now: at + MINUTE });
+      expect(resumed.metricWarnings).toEqual([]);
+      expect(persisted.pendingMetrics).toBeUndefined();
+      expect(readMainRedMetrics(dir).events.filter(event => event.key === missing.key)).toEqual([missing]);
+      await runMainRedAlert({ ...args, probe, now: at + 2 * MINUTE });
+      expect(readMainRedMetrics(dir).events.filter(event => event.key === missing.key)).toHaveLength(1);
+      if (transition === 'recovery') {
+        const report = readMainRedReport(dir, { from: START, to: at + 2 * MINUTE, now: at + 2 * MINUTE });
+        expect(report.days['2026-10-26']).toBe(40);
+        expect(report.openEpisodes).toBe(0);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('red metrics pending evidence bounds', () => {
+  it('refuses oversized pending evidence with operator recovery and preserves persisted state', async () => {
+    const prev = plan().next;
+    prev.pendingMetrics = Array(10001).fill(plan().metrics[0]);
+    const args = wrapperInput({ readState: async () => prev, writeMetrics: vi.fn() });
+    await expect(runMainRedAlert(args)).rejects.toThrow(/archive journal.*recover source evidence/i);
+    expect(args.writeMetrics).not.toHaveBeenCalled();
+    expect(args.writeState).not.toHaveBeenCalled();
+    expect(prev.pendingMetrics).toHaveLength(10001);
+  });
+
+  it('retries pending starts before recording recovery when status changes during a journal outage', async () => {
+    let persisted = {};
+    const durable = new Map();
+    const args = wrapperInput({
+      readState: async () => structuredClone(persisted),
+      writeState: async (_dir, next) => { persisted = structuredClone(next); },
+      writeMetrics: async () => ({ warnings: ['journal unavailable'] }),
+    });
+    const start = await runMainRedAlert(args);
+    const recoveredAt = START + 40 * MINUTE;
+    const recovery = await runMainRedAlert({ ...args, now: recoveredAt,
+      probe: { runs: greenRuns(), tip: passingTip() } });
+    expect(persisted.pendingMetrics).toEqual([...start.metrics, ...recovery.metrics]);
+    await runMainRedAlert({ ...args, now: recoveredAt + MINUTE,
+      probe: { runs: greenRuns(), tip: passingTip() },
+      writeMetrics: async (_dir, events) => {
+        for (const event of events) durable.set(event.key, event);
+        return { warnings: [] };
+      },
+    });
+    expect([...durable.values()]).toEqual([...start.metrics, ...recovery.metrics]);
+    expect(persisted.pendingMetrics).toBeUndefined();
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    expect(reportMainRedMetrics([...durable.values()], {
+      from: START, to: recoveredAt + MINUTE, now: recoveredAt + MINUTE,
+    }).days['2026-10-26']).toBe(40);
+  });
+});
+
+
+describe('red metrics recurrence timing', () => {
+  it('counts a recurring failure from T1 between proven green T0 and polling observation T2 after restart', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const t0 = START + 40 * MINUTE;
+    const t1 = t0 + 5 * MINUTE;
+    const t2 = t0 + 10 * MINUTE;
+    const first = plan();
+    const green = plan({ prev: first.next, runs: greenRuns(), tip: passingTip(), now: t0 });
+    const freshRuns = [...greenRuns(), run(RED_SHA, 'failure', new Date(t1).toISOString(), 4)];
+    const red = plan({ prev: JSON.parse(JSON.stringify(green.next)), runs: freshRuns, now: t2 });
+    expect(red.metrics[0].since).toBe(t1);
+    const report = reportMainRedMetrics([...first.metrics, ...green.metrics, ...red.metrics], {
+      from: t0, to: t2, now: t2,
+    });
+    expect(report.days['2026-10-26']).toBe(5);
+  });
+
+  it('retains the latest quiet green observation across unknown status and restart', () => {
+    const green = plan({ runs: greenRuns(), tip: passingTip(), now: START + 40 * MINUTE });
+    const quiet = plan({ prev: green.next, runs: greenRuns(), tip: passingTip(), now: START + 45 * MINUTE });
+    const unknown = plan({ prev: quiet.next, readOk: false, now: START + 46 * MINUTE });
+    expect(JSON.parse(JSON.stringify(unknown.next)).measurement.previousGreenAt).toBe(START + 45 * MINUTE);
+  });
+
+  it('reports stale recurrence timing as uncertain rather than silently dating it to the poll', async () => {
+    const { reportMainRedMetrics } = await import('../main-ci-red-core.mjs');
+    const green = plan({ prev: plan().next, runs: greenRuns(), tip: passingTip(), now: START + 40 * MINUTE });
+    const stale = plan({ prev: green.next, runs: redRuns(), now: START + 50 * MINUTE });
+    const report = reportMainRedMetrics([...green.metrics, ...stale.metrics], {
+      from: START + 40 * MINUTE, to: START + 60 * MINUTE, now: START + 60 * MINUTE,
+    });
+    expect(report.warnings.join(' ')).toMatch(/incomplete.*origin/i);
+  });
+});

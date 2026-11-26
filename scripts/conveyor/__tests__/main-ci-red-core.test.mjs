@@ -98,3 +98,26 @@ describe('main-red rerun and repair declaration settings', () => {
     expect(mainCiRedSettings({ mainCiRedFlakeRerun: 'false' }).mainCiRedFlakeRerun).toBe(true);
   });
 });
+
+
+describe('red metrics evidence', () => {
+  it('keeps queued-but-not-started and missing timestamps unknown, separate from service time', async () => {
+    const { measureMainQueue } = await import('../main-ci-red-core.mjs');
+    expect(measureMainQueue({ enqueuedAt: 1000 })).toEqual({ waitMs: null, admissionWaitMs: null, serviceMs: null });
+    expect(measureMainQueue({ startedAt: 4000, completedAt: 9000 })).toEqual({ waitMs: null, admissionWaitMs: null, serviceMs: 5000 });
+    expect(measureMainQueue({ enqueuedAt: 1000, admittedAt: 3000, startedAt: 4000, completedAt: 9000 }))
+      .toEqual({ waitMs: 3000, admissionWaitMs: 1000, serviceMs: 5000 });
+    expect(measureMainQueue({ enqueuedAt: 5000, startedAt: 4000 }).waitMs).toBeNull();
+  });
+
+  it('versions stable signatures from structured identifiers and refuses secret or oversized text', async () => {
+    const { mainFailureSignature } = await import('../main-ci-red-core.mjs');
+    const ids = { job: 'test-shard (3)', file: 'scripts/a.test.mjs', test: 'rejects routes' };
+    expect(mainFailureSignature(ids)).toMatch(/^v1:[a-f0-9]{64}$/);
+    expect(mainFailureSignature({ ...ids, error: 'token=secret', log: '\u001b[31mboom' })).toBe(mainFailureSignature(ids));
+    expect(mainFailureSignature({ job: 'test\u0000' })).toBeNull();
+    expect(mainFailureSignature({ job: 'token=supersecret' })).toBeNull();
+    expect(mainFailureSignature({ job: 'a'.repeat(1025) })).toBeNull();
+    expect(mainFailureSignature({})).toBeNull();
+  });
+});
