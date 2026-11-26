@@ -99,6 +99,35 @@ export function isSmokeDryRunPr(pr, env = process.env) {
   return isSmokeSentinelPr(pr) && env.WE_SMOKE_DRYRUN_ONLY !== undefined;
 }
 
+const PENDING_EXCLUDED_MODES = ['takeover', 'stale-base-rebase', 'stacked-rebase', 'scope-bloat-rebase',
+  'operator-send-back', 'ruling-not-addressed', 'block-ruled-referral', 'mq-failure-recovery'];
+
+/**
+ * SHIP-WM-278 + FLOW-DMN-080 — red-team:pending blocks merge, not an eligible fix push. The eligible set is closed:
+ * the advisory-fix route (E1), a default-base conflict bounce (E2), and a plain review:changes send-back (E3),
+ * derived from the planned route plus live labels/mergeable/base/head read at this call. Excluded routes win over
+ * any label; any missing or unknown read keeps the hold. (The pre-existing `repair.staleBase` shortcut in
+ * readLivePushHold is separate and unchanged.)
+ */
+function pendingExemptRoute(repair, labels, view) {
+  if (!repair || labels.includes('red-team:blocked')) return false;
+  if (PENDING_EXCLUDED_MODES.includes(repair.mode) || repair.takeover || repair.staleBase || repair.scopeBloat
+    || repair.operatorSendBack || repair.rulingNotAddressed || repair.joinedInputs
+    || repair.restack || repair.blockRuledReferrals?.length) return false;
+  // Bind to the planned head: a repair planned for an older head cannot waive pending on a replacement head.
+  // A missing or unreadable head on either side keeps the hold.
+  if (!/^[0-9a-f]{40}$/.test(repair.headRefOid ?? '') || repair.headRefOid !== view.headRefOid) return false;
+  if (repair.mode === 'advisory-fix') return labels.includes('advisory:changes') && labels.includes('review:human');
+  if (repair.mode || typeof view.baseRefName !== 'string' || view.baseRefName !== 'main'
+    || !labels.includes('review:changes')) return false;
+  if (repair.isConflict === true) return view.mergeable === 'CONFLICTING';
+  // E3 (plain review:changes send-back): a planned row with no mode, joined input, MQ recovery or open operator
+  // send-back, still MERGEABLE and without the conflict label at this read. Any other read keeps the hold.
+  return repair.labels?.includes('review:changes') === true && !repair.mqFailureRecovery
+    && !(repair.openOperatorSendBacks?.length > 0) && view.mergeable === 'MERGEABLE'
+    && !labels.includes('merge-status:conflicting');
+}
+
 /**
  * PUSH-GATE-S4 — the live hold read at the spawn site. Reads labels and state fresh (no memo), right before a
  * fixer launches, and returns `null` (clear) or `{code, reason}` (do not spawn). Any throw, bad JSON or missing
@@ -107,7 +136,7 @@ export function isSmokeDryRunPr(pr, env = process.env) {
  */
 export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermetic = isUnderTestEnv() } = {}) {
   if (hermetic || isSmokeDryRunPr(pr)) return null;
-  const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state'],
+  const view = JSON.parse(run(['pr', 'view', String(pr), '--repo', ghRepoSlug(repo), '--json', 'labels,state,mergeable,baseRefName,headRefOid'],
     { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024, throttle: { noMemo: true } }));
   if (!view || !Array.isArray(view.labels) || view.labels.some(l => typeof l?.name !== 'string')
     || !['OPEN', 'CLOSED', 'MERGED'].includes(view.state)) return { code: 'unreadable', reason: 'Incomplete PR evidence' };
@@ -123,9 +152,10 @@ export function readLivePushHold({ repo, pr, repair }, { run = runGhSync, hermet
       || (repair.mode === 'advisory-fix' && labels.includes('advisory:changes'))
       || repair.operatorSendBack || repair.rulingNotAddressed || repair.blockRuledReferrals?.length
       || repair.takeover || repair.scopeBloat || repair.staleBase || repair.isConflict);
+  const pendingExempt = pendingExemptRoute(repair, labels, view);
   const label = labels.find(name => PUSH_HOLD_LABELS.includes(name)
     && !(name === 'review:human' && humanRepair)
-    && !(name === 'red-team:pending' && repair?.staleBase)
+    && !(name === 'red-team:pending' && (repair?.staleBase || pendingExempt))
     && !(name === 'review:held-mechanical' && repair?.labels?.includes(name) && labels.includes('review:changes'))
     && !(name === 'red-team:blocked' && repair?.labels?.includes(name)
       && (labels.includes('review:changes') || humanRepair)));
