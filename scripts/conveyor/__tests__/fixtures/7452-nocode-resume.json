@@ -1,0 +1,66 @@
+{
+  "provenance": "Reduced #7452 thread shape from STANDDOWN-NOCODE-REARM deep prep, 2026-11-25; ids with known suffixes are reconstructed. Headed answer and last fix-begin are the prospective regression extension.",
+  "liveHead": "8539625bf05ab56a92dfcfe11c8c04e92d753dac",
+  "comments": [
+    {
+      "id": "IC_before",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-7452`\n**Why:** conveyor fix: address review\n**Branch:** `lane/fix-7452` at `8539625bf`\n<!-- fix-claim who=fix-7452 -->"
+    },
+    {
+      "id": "IC_qlL45g",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🛑 conveyor fix — stood down, human judgment needed\n\nconveyor fix agent stopped rather than guessing: the reviewer's finding needs a judgment the fix agent could not safely make, so it did NOT guess. Is code owed?\n\nThe PR was left EXACTLY as the reviewer left it — no label was changed, the review was not re-armed, and nothing was re-pushed. This comment is the durable record that a fixer *deliberately stood down* here, which is what tells the reconciler apart from a fixer that simply died.\n\n**A human is the intended next step.** The automatic fix loop will NOT try this PR again while this comment stands — re-running it would only re-ask the same question. Take it over with `/finish`, or delete this comment once the blocker is resolved to hand the PR back to the loop.\n<!-- stand-down reason=needs-judgment -->"
+    },
+    {
+      "id": "IC_verdict",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🔁 review — changes requested\n\n<!-- reviewed-sha: 8539625bf05ab56a92dfcfe11c8c04e92d753dac -->",
+      "createdAt": "2026-11-25T11:45:50Z"
+    },
+    {
+      "id": "IC_old_answer",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "<!-- conveyor-stand-down-answer:v1 -->\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @chalbert, via claude-code-chat.\nSupersedes stand-down comment `IC_qlL45g`. This answers the escalation; it does not clear review gates.\n\n> No code is owed\n\n<!-- conveyor-stand-down-answer-record:eyJzdGFuZERvd25JZCI6IklDX3FsTDQ1ZyIsInJlYXNvbiI6Ik5vIGNvZGUgaXMgb3dlZCIsImFjdG9yIjoiY2hhbGJlcnQiLCJjaGFubmVsIjoiY2xhdWRlLWNvZGUtY2hhdCJ9 -->",
+      "createdAt": "2026-11-25T12:29:38Z"
+    },
+    {
+      "id": "IC_claim_134951",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-7452`\n**Why:** conveyor fix: address review\n**Branch:** `lane/fix-7452` at `8539625bf`\n<!-- fix-claim who=fix-7452 -->",
+      "createdAt": "2026-11-25T13:49:51Z"
+    },
+    {
+      "id": "IC_qwphsQ",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🛑 conveyor fix — stood down, human judgment needed\n\nconveyor fix agent stopped rather than guessing: the reviewer's finding needs a judgment the fix agent could not safely make, so it did NOT guess. Is code owed?\n\nThe PR was left EXACTLY as the reviewer left it — no label was changed, the review was not re-armed, and nothing was re-pushed. This comment is the durable record that a fixer *deliberately stood down* here, which is what tells the reconciler apart from a fixer that simply died.\n\n**A human is the intended next step.** The automatic fix loop will NOT try this PR again while this comment stands — re-running it would only re-ask the same question. Take it over with `/finish`, or delete this comment once the blocker is resolved to hand the PR back to the loop.\n<!-- stand-down reason=needs-judgment -->"
+    },
+    {
+      "id": "IC_headed_answer",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "<!-- conveyor-stand-down-answer:v1 -->\n## Operator answer — ruling to implement\n\nRelayed on the operator's explicit instruction: @chalbert, via claude-code-chat.\nSupersedes stand-down comment `IC_qwphsQ`. This answers the escalation; it does not clear review gates.\n\n> No code is owed\n\n**No code owed:** `true`\n\n**Disposition:** `rearm-review` — operator ruled no code is owed; review may be re-armed on the unchanged head\n\n<!-- conveyor-stand-down-answer-record:eyJzdGFuZERvd25JZCI6IklDX3F3cGhzUSIsInJlYXNvbiI6Ik5vIGNvZGUgaXMgb3dlZCIsImFjdG9yIjoiY2hhbGJlcnQiLCJjaGFubmVsIjoiY2xhdWRlLWNvZGUtY2hhdCIsImRpc3Bvc2l0aW9uIjoicmVhcm0tcmV2aWV3Iiwibm9Db2RlT3dlZCI6dHJ1ZSwiaGVhZCI6Ijg1Mzk2MjViZjA1YWI1NmE5MmRmY2ZlMTFjOGMwNGU5MmQ3NTNkYWMifQ== -->"
+    },
+    {
+      "id": "IC_resumed_claim",
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-7452`\n**Why:** conveyor fix: address review\n**Branch:** `lane/fix-7452` at `8539625bf`\n<!-- fix-claim who=fix-7452 -->",
+      "createdAt": "2026-11-25T13:49:51Z"
+    }
+  ]
+}
