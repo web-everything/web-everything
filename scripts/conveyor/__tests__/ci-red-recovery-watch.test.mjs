@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { homedir } from 'node:os';
 import { REPO_ROOT } from '../../operations/dispatch-lane-io.mjs';
 import {
-  buildCandidates, sweepCiRedRecovery, refreshOntoMain, formatReport, defaultPostRebaseComment,
+  buildCandidates, sweepCiRedRecovery as sweepCiRedRecoveryWithIo, refreshOntoMain, formatReport, defaultPostRebaseComment,
   HUNG_CI_COMMENT_MARKER, buildHungCiComment, countHungCiComments, countHungCiCommentsByJob, bodyHasExactLine,
   cancelAndRerunHungRun, cancelHungRun, defaultReadRunAttempt, describeExecError, isRunNotFoundError, redactTokenShapes, sweepHungCiRecovery, formatHungReport,
   defaultReadRequiredContexts, defaultReadAttributedRequiredChecks, defaultReadHeadCommittedAt, triggerCiForPr, clearStaleCheckingLabel,
@@ -25,6 +25,12 @@ import { join } from 'node:path';
 import { restampAcceptance } from '../../merge-ai-prs.mjs';
 import { spawnCiHealRearm } from '../ci-heal-mark.mjs';
 import { REVIEW_LABELS } from '../../lib/review-escalation.mjs';
+
+// Apply fixtures name their repository explicitly; dry-run fixtures retain their historical read defaults.
+const sweepCiRedRecovery = options => sweepCiRedRecoveryWithIo({
+  ...(options?.apply ? { repo: 'web-everything/web-everything' } : {}),
+  ...options,
+});
 
 const sweepMissingRunRecovery = (options) => sweepMissingRunRecoveryWithIo({
   readAttributedRequiredChecks: () => null,
@@ -400,7 +406,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
   // Review round 4 of #6340: ticks used to be stateless, so five slow free deferrals at the front of a stable queue
   // spent every tick's whole budget and the refreshable sixth PR was never tried (three ticks, same result).
   const memoryLedger = () => {
-    let state = null;
+    let state = { seq: 0, at: {}, ts: {} };
     return { read: () => state, write: vi.fn((s) => { state = JSON.parse(JSON.stringify(s)); }) };
   };
   const slowQueueTick = ({ prs, ledger, refreshable }) => {
@@ -430,12 +436,12 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     expect(second.result.applied.find((a) => a.prNumber === 7105)).toMatchObject({ ok: true, action: 'rebased' });
   });
 
-  it('with no ledger the plan order is unchanged (the reviewer\'s scenario starves, which is why the CLI wires one)', () => {
+  it('with no ledger every candidate is deferred without trying a refresh', () => {
     const prs = Array.from({ length: 6 }, (_, i) => ({ ...PR_2635, number: 7100 + i, headRefName: `lane/h${i}` }));
-    const first = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
-    const second = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
-    expect(second.tried).toEqual(first.tried);
-    expect(second.tried).not.toContain('lane/h5');
+    const { tried, result } = slowQueueTick({ prs, ledger: null, refreshable: 'lane/h5' });
+    expect(tried).toEqual([]);
+    expect(result.applied).toHaveLength(6);
+    for (const entry of result.applied) expect(entry).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/ledger/) });
   });
 
   it('when every PR is a slow deferrer the queue still rotates: each PR is tried within ceil(n/k) ticks', () => {
@@ -522,7 +528,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
 
   it.each([
     ['read', { read: () => { throw new Error('EACCES'); }, write: vi.fn() }],
-    ['write', { read: () => null, write: () => { throw new Error('ENOSPC'); } }],
+    ['write', { read: () => ({ seq: 0, at: {} }), write: () => { throw new Error('ENOSPC'); } }],
   ])('an unreadable ledger %s refuses refresh and reports the missing fact', (kind, ledger) => {
     const prs = [{ ...PR_2635, number: 2635, headRefName: 'lane/e1' }];
     const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
@@ -598,7 +604,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
       try {
         const path = join(dir, 'ledger.json');
         const ledger = createFileApplyLedger({ path });
-        expect(ledger.read()).toBeNull();
+        expect(ledger.read()).toBeUndefined();
         ledger.write({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         expect(normalizeApplyLedger(ledger.read())).toEqual({ seq: 2, at: { 11: 2 }, ts: { 11: 50 } });
         writeFileSync(path, '{not json');
@@ -704,7 +710,7 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
     }));
   });
 
-  it('defaults `root` to REPO_ROOT (WE\'s own checkout) when no repo is given', () => {
+  it('uses REPO_ROOT (WE\'s own checkout) for the explicit WE apply fixture', () => {
     const readOpenPrs = () => [PR_2635];
     const readMainRuns = () => MAIN_RUNS;
     const readAheadBy = () => 33;
@@ -761,11 +767,12 @@ describe('ci-red-recovery-watch — sweepCiRedRecovery (dry run, apply: false by
 });
 
 describe('ci-red-recovery-watch — refreshOntoMain', () => {
-  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false };
+  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false,
+    readHeadRefName: () => 'lane/x', readOriginUrl: () => 'https://github.com/web-everything/web-everything.git' };
   it('delegates to rebaseDropManifest and reports its action verbatim on success', () => {
     const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'abc123' }));
     // #2811 — `newCommit` now threaded through verbatim (the apply loop's own re-verify/re-arm step needs it).
-    expect(refreshOntoMain('lane/xdzl6mb', { ...verified, root: '/repo', base: 'origin/main', rebase })).toEqual({ ok: true, action: 'rebased', newCommit: 'abc123' });
+    expect(refreshOntoMain('lane/xdzl6mb', { ...verified, readHeadRefName: () => 'lane/xdzl6mb', root: '/repo', base: 'origin/main', rebase })).toEqual({ ok: true, action: 'rebased', newCommit: 'abc123' });
     expect(rebase).toHaveBeenCalledWith({ laneRef: 'lane/xdzl6mb', base: 'origin/main', cwd: '/repo' });
   });
 
@@ -2865,7 +2872,8 @@ describe('ci-red-recovery-watch — fixture credential hygiene', () => {
 
 
 describe('CI-RED-RECOVERY-REBASE-FAILOPEN', () => {
-  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false };
+  const verified = { prNumber: 2635, repo: 'web-everything/web-everything', readIsCrossRepository: () => false,
+    readHeadRefName: () => 'lane/x', readOriginUrl: () => 'https://github.com/web-everything/web-everything.git' };
   it('refresh with no prNumber or an unreadable isCrossRepository refuses and never rebases', () => {
     for (const options of [
       { ...verified, prNumber: null }, { ...verified, prNumber: undefined },
@@ -2915,5 +2923,95 @@ describe('CI-RED-RECOVERY-REBASE-FAILOPEN', () => {
     const pass = xml.match(/<string>--pass=([^<]+)<\/string>/)?.[1];
     expect(pass).toBe(`ci-red-recovery-watch-${key}`);
     expect(DAEMON_MANIFEST[pass].args).toContain(`--repo=${slug}`);
+  });
+});
+
+
+describe('CI-RED-RECOVERY audit round 1', () => {
+  const repo = 'web-everything/web-everything';
+  const empty = () => ({ seq: 0, at: {} });
+  const tick = options => sweepCiRedRecovery({ repo, apply: true,
+    applyLedger: { read: empty, write: vi.fn() },
+    readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS,
+    readAheadBy: () => 33, readComments: () => [], checkClaim: () => null, ...options });
+  const assertRefused = (options, fact) => {
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased' }));
+    const postComment = vi.fn();
+    const result = tick({ refresh, postComment, ...options });
+    expect(result.applied[0]).toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(fact) });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(postComment).not.toHaveBeenCalled();
+    return result;
+  };
+  it.each([2, 3])('malformed ledger on apply read %s refuses without repairing it', atRead => {
+    let reads = 0;
+    const write = vi.fn();
+    assertRefused({ applyLedger: { read: () => ++reads >= atRead ? { seq: 'bad', at: {} } : empty(), write } }, /ledger/);
+    expect(write).not.toHaveBeenCalled();
+  });
+  it('persisted JSON null is malformed evidence, while an absent file is first-run state', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-red-null-'));
+    const path = join(dir, 'ledger.json');
+    try {
+      const ledger = createFileApplyLedger({ path });
+      const refresh = vi.fn(() => ({ ok: true, action: 'current' }));
+      tick({ applyLedger: ledger, refresh, postComment: vi.fn() });
+      expect(refresh).toHaveBeenCalledOnce();
+      writeFileSync(path, 'null');
+      assertRefused({ applyLedger: ledger }, /ledger/);
+      expect(readFileSync(path, 'utf8')).toBe('null');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a null ledger handle refuses the exported apply path', () => {
+    assertRefused({ applyLedger: null }, /ledger/);
+  });
+  it.each([undefined, null, ''])('sweep refuses missing repo %s before slug defaulting', repo => {
+    assertRefused({ repo }, /repo/);
+  });
+  const facts = { prNumber: 2635, repo, readIsCrossRepository: () => false,
+    readHeadRefName: () => 'lane/x', readOriginUrl: () => 'git@github.com:web-everything/web-everything.git' };
+  it.each([
+    ['we', 'https://github.com/web-everything/web-everything.git'],
+    [repo, 'git@github.com:web-everything/web-everything.git'],
+    [repo, 'ssh://git@github.com/web-everything/web-everything.git'],
+  ])('matching PR head and %s origin %s reach the rebase', (repository, origin) => {
+    const rebase = vi.fn(() => ({ action: 'current' }));
+    expect(refreshOntoMain('lane/x', { ...facts, repo: repository, readOriginUrl: () => origin, rebase })).toMatchObject({ ok: true });
+    expect(rebase).toHaveBeenCalledOnce();
+  });
+  it('production evidence readers address the named PR and checkout push origin with bounded argv calls', async () => {
+    const { defaultReadHeadRefName, defaultReadOriginUrl } = await import('../ci-red-recovery-watch.mjs');
+    const exec = vi.fn().mockReturnValueOnce('lane/x\n').mockReturnValueOnce('git@github.com:web-everything/web-everything.git\n');
+    expect(defaultReadHeadRefName(2635, { repo: 'we', exec })).toBe('lane/x');
+    expect(exec).toHaveBeenNthCalledWith(1, 'gh', ['pr', 'view', '2635', '--repo', repo, '--json', 'headRefName', '--jq', '.headRefName'],
+      expect.objectContaining({ timeout: expect.any(Number), killSignal: 'SIGKILL' }));
+    expect(defaultReadOriginUrl({ root: '/checkout', exec })).toBe('git@github.com:web-everything/web-everything.git');
+    expect(exec).toHaveBeenNthCalledWith(2, 'git', ['remote', 'get-url', '--push', 'origin'],
+      expect.objectContaining({ cwd: '/checkout', timeout: expect.any(Number), killSignal: 'SIGKILL' }));
+  });
+  it.each(['lane/other', null, '', 'throws'])('sink refuses a mismatched or unreadable PR head: %s', head => {
+    const rebase = vi.fn(() => ({ action: 'rebased' }));
+    const readHeadRefName = vi.fn(() => { if (head === 'throws') throw new Error('unreadable'); return head; });
+    expect(refreshOntoMain('lane/x', { ...facts, readHeadRefName, rebase }))
+      .toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/head/) });
+    expect(readHeadRefName).toHaveBeenCalledWith(2635, { repo });
+    expect(rebase).not.toHaveBeenCalled();
+  });
+  it.each(['git@github.com:frontier-ui/frontierui.git', null, '', 'throws'])('sink refuses mismatched or unreadable checkout origin: %s', origin => {
+    const rebase = vi.fn(() => ({ action: 'rebased' }));
+    const readOriginUrl = vi.fn(() => { if (origin === 'throws') throw new Error('unreadable'); return origin; });
+    expect(refreshOntoMain('lane/x', { ...facts, root: '/checkout', readOriginUrl, rebase }))
+      .toMatchObject({ ok: false, deferred: true, error: expect.stringMatching(/origin/) });
+    expect(readOriginUrl).toHaveBeenCalledWith({ root: '/checkout' });
+    expect(rebase).not.toHaveBeenCalled();
+  });
+  it('restacking preserves a second verification deferral for the sweep to leave uncounted', async () => {
+    const { restackStackedPr } = await import('../ci-red-recovery-watch.mjs');
+    const pr = { number: 2635, headRefName: 'lane/x', baseRefName: 'main' };
+    const refresh = vi.fn(() => refreshOntoMain('lane/x', { ...facts, readIsCrossRepository: () => null, rebase: vi.fn() }));
+    expect(restackStackedPr(pr, { prs: [pr], repo, checkClaim: () => null,
+      readIsCrossRepository: () => false, refresh }))
+      .toMatchObject({ ok: false, action: 'stack-restack', deferred: true, error: expect.stringMatching(/verified/) });
+    expect(refresh).toHaveBeenCalledOnce();
   });
 });

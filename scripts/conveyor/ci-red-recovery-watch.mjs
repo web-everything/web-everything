@@ -183,12 +183,13 @@ export function buildCandidates(prs, {
  * ({@link sameRepoRefusal}) before anything is rebased or pushed — a fork PR, or one whose head name merely
  * shadows a same-repo lane, would otherwise have `origin/<laneRef>` (someone else's branch) force-pushed.
  * @param {string} laneRef
- * @param {{root?:string, base?:string, rebase?:Function, prNumber?:number, repo?:(string|null), readIsCrossRepository?:Function}} [o]
+ * @param {{root?:string, base?:string, rebase?:Function, prNumber?:number, repo?:(string|null), readIsCrossRepository?:Function, readHeadRefName?:Function, readOriginUrl?:Function}} [o]
  * @returns {{ok:boolean, action:string, error?:string, deferred?:boolean}}
  */
 export function refreshOntoMain(laneRef, {
   root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest,
   prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository,
+  readHeadRefName = defaultReadHeadRefName, readOriginUrl = defaultReadOriginUrl,
 } = {}) {
   const defer = error => ({ ok: false, action: 'refresh', deferred: true, error: `${error}; retry next tick after restoring the missing fact` });
   if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return defer('missing or invalid prNumber');
@@ -196,6 +197,13 @@ export function refreshOntoMain(laneRef, {
   if (typeof laneRef !== 'string' || !laneRef.trim()) return defer('missing or unreadable head ref');
   const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
   if (refused) return refused;
+  let head, origin;
+  try { head = readHeadRefName(prNumber, { repo }); } catch { return defer('unreadable PR head ref'); }
+  if (typeof head !== 'string' || !head || head !== laneRef) return defer('missing or mismatched PR head ref');
+  try { origin = readOriginUrl({ root }); } catch { return defer('unreadable checkout origin'); }
+  const originSlug = typeof origin === 'string'
+    ? origin.trim().match(/^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)([^/\s]+\/[^/\s]+?)(?:\.git)?$/)?.[1] : null;
+  if (!originSlug || originSlug.toLowerCase() !== repoSlug(repo).toLowerCase()) return defer('missing or mismatched checkout origin repository');
   const result = rebase({ laneRef, base, cwd: root });
   if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
@@ -262,8 +270,8 @@ export function sweepCiRedRecovery({
   // Review round 4 of #6340: ticks are stateless, so slow free deferrals at the front of a stable queue spent every
   // tick's budget and the refreshable PR behind them was never tried. `applyLedger` ({ read, write }, see
   // {@link createFileApplyLedger}) remembers which PRs were attempted so the next tick starts with the
-  // least-recently-attempted. null = no memory (the plan's own order); the CLI wires the file-backed one.
-  applyLedger = null,
+  // least-recently-attempted. Every apply needs readable, writable evidence, including exported callers.
+  applyLedger = createFileApplyLedger({ repo }),
 } = {}) {
   let ledgerError = null;
   const tickStartedAt = now();
@@ -307,7 +315,7 @@ export function sweepCiRedRecovery({
   // tick skipped first (the apply stamps alone would miss claim-held or refused PRs and starve those behind them).
   const discoveryKey = (c) => `d:${c.prNumber}`;
   let discoverySeen = {};
-  try { if (apply && applyLedger) discoverySeen = readApplyLedgerState(applyLedger).at; } catch (e) { ledgerError = `discovery: ${e?.message ?? e}`; }
+  try { if (apply) discoverySeen = readApplyLedgerState(applyLedger).at; } catch (e) { ledgerError = `discovery: ${e?.message ?? e}`; }
   const discoveryOrder = rawCandidates.map((c, i) => ({ c, i, seen: discoverySeen[discoveryKey(c)] ?? 0 }))
     .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.c);
   let discoveryReads = 0;
@@ -408,9 +416,9 @@ export function sweepCiRedRecovery({
     // transient comment-read failure) — it expires only after APPLY_LEDGER_TTL_MS, and the file is capped.
     const applyKey = (d) => String(d.prNumber);
     const readLedger = () => {
-      try { return normalizeApplyLedger(applyLedger.read()); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; return null; }
+      try { return readApplyLedgerState(applyLedger); } catch (e) { ledgerError = `read: ${e?.message ?? e}`; return null; }
     };
-    let ledger = (applyLedger && readLedger()) || normalizeApplyLedger(null);
+    let ledger = readLedger() ?? { seq: 0, at: {}, ts: {} };
     const order = plan.dispatch.map((d, i) => ({ d, i, seen: ledger.at[applyKey(d)] ?? 0 }))
       .sort((a, b) => a.seen - b.seen || a.i - b.i).map((x) => x.d);
     for (const d of order) {
@@ -424,13 +432,18 @@ export function sweepCiRedRecovery({
           error: 'tick apply budget spent — left for the next tick (no rebase comment posted, the per-sha cap is untouched)' });
         continue;
       }
+      if (typeof repo !== 'string' || repoKeyForSlug(repo) === null) {
+        applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true,
+          error: 'missing or unknown repo; supply the repository before retrying' });
+        continue;
+      }
       if (ledgerError) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true,
           error: `apply ledger unavailable (${ledgerError}); restore ledger access or repair its contents before retrying` });
         continue;
       }
       const held = checkClaim({ repo, branch: d.headRefName });
-      if (!held && applyLedger) {
+      if (!held) {
         // Re-read and merge (max per key) just before writing: a sweep that overlapped this one (a manual run, or a
         // slow predecessor) must not lose its stamps to this tick's older snapshot.
         const fresh = readLedger();
@@ -453,7 +466,7 @@ export function sweepCiRedRecovery({
       }
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
-        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo: repoSlug(repo), readIsCrossRepository });
+        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
       // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
       if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {
@@ -653,7 +666,7 @@ export function sweepExhaustedRetry({ repo = null, apply = false, defaultBranch 
     try {
       const claimed = checkClaim({ repo, branch: c.headRefName });
       result = claimed ? { ok: false, deferred: true, error: claimed.message }
-        : decision.mode === 'rebase' ? refresh(c.headRefName, { repo: repoSlug(repo), root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
+        : decision.mode === 'rebase' ? refresh(c.headRefName, { repo, root, base: `origin/${defaultBranch}`, prNumber: c.prNumber, readIsCrossRepository })
         : trigger(c, { repo: repoSlug(repo), defaultBranch });
     } catch (e) { result = { ok: false, error: describeExecError(e) }; }
     if (!result.ok && checkClaim({ repo, branch: c.headRefName })) result = { ...result, deferred: true };
@@ -1463,6 +1476,19 @@ function repoSlug(repo) {
   return !repo ? CONSTELLATION_REPOS.we.slug : (CONSTELLATION_REPOS[repo]?.slug ?? repo);
 }
 
+/** Fresh PR identity and checkout evidence at the push sink; read failures defer without spending retries. */
+export function defaultReadHeadRefName(prNumber, { repo, exec = execFileSyncThrottled } = {}) {
+  return String(exec('gh', ['pr', 'view', String(prNumber), '--repo', repoSlug(repo), '--json', 'headRefName', '--jq', '.headRefName'], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  })).trim();
+}
+
+export function defaultReadOriginUrl({ root = REPO_ROOT, exec = execFileSyncThrottled } = {}) {
+  return String(exec('git', ['remote', 'get-url', '--push', 'origin'], {
+    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+  })).trim();
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadIsCrossRepository — whether PR `prNumber`'s head lives
  * in a fork. A per-PR read (the shared open-PR snapshot carries no head-repo field), paid only for a stacked
@@ -1567,8 +1593,8 @@ export function restackStackedPr(d, {
         const fetched = fetchRef(pr.baseRefName, { root });
         if (!fetched.ok) return failed(fetched.error);
       }
-      const result = refresh(pr.headRefName, { base: `origin/${pr.baseRefName}`, root, prNumber: pr.prNumber ?? pr.number, repo: repoSlug(repo), readIsCrossRepository });
-      if (!result.ok) return failed(result.error);
+      const result = refresh(pr.headRefName, { base: `origin/${pr.baseRefName}`, root, prNumber: pr.prNumber ?? pr.number, repo, readIsCrossRepository });
+      if (!result.ok) return result.deferred ? { ...result, action } : failed(result.error);
       steps.push({ prNumber: pr.prNumber ?? pr.number, headRefName: pr.headRefName, action: result.action, newCommit: result.newCommit });
     } catch (e) { return failed(describeExecError(e)); }
   }
@@ -2116,10 +2142,11 @@ function applyLedgerPath(repo = null, home = handoffHome()) {
   return join(home, `ci-red-recovery-apply-ledger.${encodeURIComponent(repoSlug(repo))}.json`);
 }
 
-/** Missing files are first-run state; malformed persisted evidence must never be normalized into permission to push. */
+/** Only undefined (an absent file) is first-run state; persisted null and malformed evidence refuse pushes. */
 function readApplyLedgerState(ledger) {
+  if (!ledger || typeof ledger.read !== 'function' || typeof ledger.write !== 'function') throw new Error('missing apply ledger');
   const raw = ledger.read();
-  if (raw !== null && (!raw || typeof raw !== 'object' || Array.isArray(raw)
+  if (raw !== undefined && (!raw || typeof raw !== 'object' || Array.isArray(raw)
     || !Number.isSafeInteger(raw.seq) || raw.seq < 0
     || !raw.at || typeof raw.at !== 'object' || Array.isArray(raw.at)
     || Object.entries(raw.at).some(([key, stamp]) => key === '__proto__' || !Number.isSafeInteger(stamp) || stamp <= 0)
@@ -2139,7 +2166,7 @@ export function createFileApplyLedger({ repo = null, path, env = process.env } =
   return {
     read() {
       try { return JSON.parse(readFileSync(file, 'utf8')); }
-      catch (e) { if (e.code === 'ENOENT') return null; throw e; }
+      catch (e) { if (e.code === 'ENOENT') return undefined; throw e; }
     },
     write(state) { writeMainRetriggerRecord(file, { v: 1, seq: state.seq, at: { ...state.at }, ts: { ...state.ts } }); },
   };
