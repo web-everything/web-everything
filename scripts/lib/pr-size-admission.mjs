@@ -73,6 +73,92 @@ export function createGitReader(cwd, exec = execFileSync) {
   };
 }
 
+/** Read-only ancestry admission. Lane refs are local evidence, never proof of forge PR status.
+ * A declared lane base excludes its ancestry; squash landings require patch evidence, not a PR title alone.
+ */
+export function checkSiblingBase({ git, ref, sha, base = 'main' }) {
+  const deadline = performance.now() + 15_000;
+  const read = (args, options = {}) => {
+    const timeout = Math.ceil(deadline - performance.now());
+    if (timeout <= 0) throw new Error('sibling history inspection timed out');
+    return git(args, { ...options, timeout, maxBuffer: 8 * 1024 * 1024 });
+  };
+  const resolveCommit = value => commitSha(read(['rev-parse', '--verify', '--end-of-options', `${value}^{commit}`]));
+  const list = text => text === '' ? [] : text.trimEnd().split('\n');
+  const commits = (...revs) => {
+    const rows = list(read(['rev-list', '--max-count=2049', ...revs, '--']));
+    if (rows.length > 2048) throw new Error('sibling history exceeds 2048 commits');
+    return rows.map(commitSha);
+  };
+  try {
+    const headRef = qualifiedRef(ref?.startsWith('refs/') ? ref : `refs/heads/${ref}`);
+    const head = resolveCommit(sha || headRef);
+    const main = resolveCommit('refs/remotes/origin/main');
+    const parentRef = base.startsWith('lane/') ? qualifiedRef(`refs/heads/${base}`)
+      : base.startsWith('origin/lane/') ? qualifiedRef(`refs/remotes/${base}`)
+        : base.startsWith('refs/heads/lane/') || base.startsWith('refs/remotes/origin/lane/') ? qualifiedRef(base) : null;
+    if (!parentRef && !['main', 'origin/main', 'refs/remotes/origin/main'].includes(base)) {
+      throw new Error('unknown declared base; use main or an explicit lane parent');
+    }
+    const parent = parentRef ? resolveCommit(parentRef) : main;
+    if (parentRef && read(['merge-base', head, parent]).trim() !== parent) throw new Error('declared parent is not contained in this head');
+    const carried = new Set(commits(head, `^${main}`, `^${parent}`));
+    const rows = list(read(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/lane/', 'refs/remotes/origin/lane/']));
+    if (rows.length > 256) throw new Error('sibling evidence exceeds 256 lane refs');
+    const candidates = [];
+    for (const row of rows) {
+      const match = /^(refs\/(?:heads|remotes\/origin)\/lane\/\S+) ([a-f0-9]{40})$/.exec(row);
+      if (!match) throw new Error('unreadable lane ref');
+      const [, name, tip] = match;
+      const lane = name.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
+      if (lane === headRef.replace(/^refs\/heads\//, '') || tip === head) continue;
+      // A lane may have advanced since this branch forked. Inspect the shared ancestry,
+      // and judge only the inherited portion for squash equivalence below.
+      const shared = list(read(['merge-base', '--all', head, tip])).map(commitSha);
+      if (!shared.length) throw new Error('missing sibling ancestry');
+      if (!shared.some(inherited => inherited !== head && carried.has(inherited))) continue;
+      // Shared ancestry alone has no ownership direction. A local creation record
+      // bounds this lane's own first-parent work, excluding the history it inherited.
+      // Missing/expired records cannot safely establish that direction.
+      const history = list(read(['reflog', 'show', '--max-count=2049', '--format=%H%x00%gs', name, '--']));
+      if (history.length > 2048) throw new Error('lane creation evidence exceeds 2048 reflog entries');
+      const creation = /^([a-f0-9]{40})\0branch: Created from .+$/.exec(history.at(-1) || '');
+      if (!creation) throw new Error(`missing lane creation evidence for ${lane}`);
+      const ownHistory = new Set(commits('--first-parent', tip, `^${creation[1]}`, `^${main}`, `^${parent}`));
+      if (![...ownHistory].some(commit => carried.has(commit))) continue;
+      for (const inherited of shared) {
+        if (inherited !== head && carried.has(inherited)) candidates.push({ lane, tip: inherited });
+      }
+    }
+    if (!candidates.length) return { ok: true };
+    const fork = commitSha(read(['merge-base', head, main]));
+    const landed = commits(main, `^${fork}`);
+    const patchId = patch => {
+      if (!patch) return null;
+      const output = read(['patch-id', '--stable'], { input: patch }).trim();
+      if (!/^[a-f0-9]{40} [a-f0-9]{40}$/.test(output)) throw new Error('unreadable patch identity');
+      return output.split(' ')[0];
+    };
+    const patch = (from, to) => patchId(read(['diff', '--no-ext-diff', '--no-textconv', '--binary', from, to, '--']));
+    const landedPatches = new Set(landed.map(commit => patch(`${commit}^`, commit)).filter(Boolean));
+    const siblings = [];
+    for (const { lane, tip } of candidates) {
+      const start = commitSha(read(['merge-base', tip, main]));
+      const combined = patch(start, tip);
+      if (combined && landedPatches.has(combined)) continue;
+      const individual = commits(tip, `^${main}`);
+      if (individual.length && individual.every(commit => {
+        const id = patch(`${commit}^`, commit);
+        return id && landedPatches.has(id);
+      })) continue;
+      siblings.push(lane);
+    }
+    return siblings.length ? { ok: false, reason: 'sibling-base', detail: `Unmerged sibling lanes carried by this branch: ${[...new Set(siblings)].sort().join(', ')}` } : { ok: true };
+  } catch (error) {
+    return { ok: false, reason: 'sibling-base-unknown', detail: `Cannot establish sibling history: ${error.message}` };
+  }
+}
+
 /** Attributes can override --text. Recover binary rows from immutable blobs, counting the
  * whole old and new files conservatively. Only a successful tree read proves a missing side.
  */
