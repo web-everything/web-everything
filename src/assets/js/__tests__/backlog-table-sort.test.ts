@@ -117,6 +117,64 @@ describe('prioritisation lazy loading', () => {
     await vi.waitFor(() => expect(document.querySelector('[data-ptable-count]')!.textContent).toBe(action === 'chip' ? '0' : '1'));
   });
 
+  it('restores saved filters after failed initial loading and explicit retry', async () => {
+    fetcher.mockRejectedValueOnce(new Error('Network unavailable'));
+    localStorage.setItem('we-backlog-priority-kind', JSON.stringify(['task']));
+    mount(true);
+    await vi.waitFor(() => expect(document.querySelector('[data-prio-status]')!.textContent).toContain('Retry'));
+    expect(ids()).toEqual(['1']);
+
+    (document.querySelector('[data-prio-load]') as HTMLElement).click();
+    await loaded();
+    expect((document.querySelector('[data-ptable-search]') as HTMLInputElement).value).toBe('3');
+    expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('1');
+    expect(document.querySelector('[data-pkind="decision"]')!.getAttribute('aria-pressed')).toBe('false');
+    expect(localStorage.getItem('we-backlog-priority-search')).toBe('3');
+    expect(Array.from(document.querySelectorAll('tbody tr')).filter(row => (row as HTMLElement).style.display !== 'none')
+      .map(row => row.firstElementChild!.textContent)).toEqual(['3']);
+  });
+
+  it('keeps restored filters across repeated failures and script reinitialization', async () => {
+    fetcher.mockRejectedValueOnce(new Error('Offline')).mockRejectedValueOnce(new Error('Still offline'));
+    mount(true);
+    const button = document.querySelector('[data-prio-load]') as HTMLButtonElement;
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    new Function(script)();
+    button.click();
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    button.click();
+    await loaded();
+    expect((document.querySelector('input') as HTMLInputElement).value).toBe('3');
+    expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('1');
+    expect(ids()).toEqual(['1', '2', '3']);
+  });
+
+  it('keeps newer search input when it retries failed initial loading', async () => {
+    fetcher.mockRejectedValueOnce(new Error('Offline'));
+    mount(true);
+    await vi.waitFor(() => expect(document.querySelector('[data-prio-status]')!.textContent).toContain('Retry'));
+    const input = document.querySelector('input') as HTMLInputElement;
+    input.value = '2';
+    input.dispatchEvent(new Event('input'));
+    await loaded();
+    expect(input.value).toBe('2');
+    expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('1');
+    expect(localStorage.getItem('we-backlog-priority-search')).toBe('2');
+  });
+
+  it('applies restored filters when sorting retries failed initial loading', async () => {
+    fetcher.mockRejectedValueOnce(new Error('Offline'));
+    mount(true);
+    await vi.waitFor(() => expect(document.querySelector('[data-prio-status]')!.textContent).toContain('Retry'));
+    (document.querySelector('th') as HTMLElement).click();
+    await loaded();
+    expect(ids()).toEqual(['3', '2', '1']);
+    expect((document.querySelector('input') as HTMLInputElement).value).toBe('3');
+    expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('1');
+    expect(Array.from(document.querySelectorAll('tbody tr')).filter(row => (row as HTMLElement).style.display !== 'none')
+      .map(row => row.firstElementChild!.textContent)).toEqual(['3']);
+  });
+
   it.each(['http', 'malformed', 'oversized'])('fails atomically on %s and offers a retry without duplicates', async (failure) => {
     mount();
     fetcher.mockImplementationOnce(async () => ({ ok: true, text: async () => row(2) }))

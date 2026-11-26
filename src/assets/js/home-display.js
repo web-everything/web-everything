@@ -292,6 +292,8 @@
 
         let savedView = 'grid';
         try { savedView = localStorage.getItem(viewKey) || 'grid'; } catch (e) { /* ignore */ }
+        // Restore the layout independently of loading so a failed request cannot discard it.
+        setView(savedView);
         // Persisted preferences can target tiles beyond the preview. Restore against the
         // complete corpus; defaults leave the SSR total intact without fetching anything.
         const hasSubset = (set, all, excluded) => set &&
@@ -300,8 +302,8 @@
             hasSubset(activeStatuses(), statusAll, statusDefaultExclude) ||
             hasSubset(activeKinds(), kindAll, []) || hasSubset(activeSizes(), sizeAll, []) ||
             hasSubset(activeTiers(), tierAll, [])) {
-            withTiles(function () { setView(savedView); applyFilter(); });
-        } else { setView(savedView); }
+            withTiles(applyFilter);
+        }
     }
 
     function init() {

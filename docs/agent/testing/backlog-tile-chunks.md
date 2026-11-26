@@ -23,6 +23,14 @@ Happy DOM 12 does not implement `HTMLTableCellElement.cellIndex`; the table
 fixture supplies a getter on its headers. Keep numeric and text columns with
 different orders so sorting the wrong column or comparing empty values fails.
 
+Restore saved controls and tile layout before starting fragment requests; a
+failed request discards its completion callback. The retry regressions combine
+saved preferences with a failed initial request and an explicit retry, checking
+the restored search, facet, layout and visible result count. Table coverage also
+checks repeated failures, script reinitialization, newer search edits and a retry
+triggered by sorting. Apply filters when rows arrive so every successful loader
+caller observes the restored controls.
+
 After `build:docs`, the required CI smoke job runs the unchanged 24 MiB
 deployment guard, then `node --test tests/build/site-asset-size.test.mjs`.
 These post-build tests require `_site/backlog/index.html` and assert that both
@@ -31,6 +39,10 @@ not skip missing builds. If the ceiling fails, inspect the reported assets and
 reduce inline content or move it into bounded fragments before merging.
 The workflow wiring is pinned by `backlog-prio-chunks.test.ts`; individual
 fragment bounds alone cannot protect the complete rendered page.
+The named default-limit test invokes the deployment CLI without a limit override
+on sparse files: exactly 24 MiB passes, while one byte above and the reported
+pre-fix 24.010340 MiB fail. It also pins the exported scanner's default; the
+separate 20 MiB acceptance ceiling does not establish the deployment default.
 
 `hotpatch-build-test-ci-definition` in `scripts/conveyor/soak/breaks/` replays
 hotpatch admission with green CI and an own-sha audit. Full-build check edits

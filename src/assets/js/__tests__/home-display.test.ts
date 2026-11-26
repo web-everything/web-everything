@@ -70,6 +70,23 @@ describe('home display bounded tile loading', () => {
     mount(saved); await loaded();
     await vi.waitFor(() => expect(document.querySelector('[data-count-target]')!.textContent).toBe(saved === 'search' ? '1' : saved === 'view' ? '3' : '0'));
   });
+  it.each([false, true])('restores saved view and search after failed initial loading and explicit retry (resolved=%s)', async resolved => {
+    const heading = resolved ? 'Resolved work' : 'Tracked work';
+    localStorage.setItem('we-search-filter:' + heading, '3');
+    if (resolved) fetcher.mockImplementation(async (url: string) => ({ ok: true,
+      text: async () => fragment(url === '/one' ? 2 : 3).replace('data-status="open"', 'data-status="resolved"') }));
+    fetcher.mockRejectedValueOnce(new Error('Offline'));
+    mount('view', resolved);
+    await vi.waitFor(() => expect(document.querySelector('[data-tiles-status]')!.textContent).toContain('Retry'));
+    click('[data-tiles-load]');
+    await loaded();
+    expect(document.querySelector('section')!.classList.contains('home-list-view')).toBe(true);
+    expect(document.querySelector('[data-view="list"]')!.getAttribute('aria-pressed')).toBe('true');
+    expect((document.querySelector('input') as HTMLInputElement).value).toBe('3');
+    expect(document.querySelector('[data-count-target]')!.textContent).toBe('1');
+    expect(cards().filter(card => !card.classList.contains('is-filtered-out'))
+      .map(card => card.querySelector('a')!.getAttribute('href'))).toEqual(['/backlog/3/']);
+  });
   it('shares a pending load across actions and script reinitialization, using the latest search', async () => {
     mount();
     click('[data-view="list"]');

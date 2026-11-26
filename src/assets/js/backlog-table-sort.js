@@ -106,6 +106,8 @@
   var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr'));
   table.addEventListener('prio-rows-loaded', function () {
     rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr:not(.ptable-empty)'));
+    // Sorting can also retry a failed initial load without dispatching prio-apply.
+    apply();
   });
   table.addEventListener('prio-apply', function () { apply(); });
   // Live accessors — the #2028 persistent-host base (#2122) also copies data-p* attrs onto the wrapped
@@ -344,6 +346,10 @@
       return localStorage.getItem(key) !== null;
     });
   } catch (e) { /* storage unavailable */ }
-  if (hasSaved) table.withPrioRows(function () { restore(); apply(); });
-  else if (table.prioLoaded) apply();
+  if (hasSaved) {
+    // Restore controls before loading: a failed request discards its callback, but a retry
+    // must still apply the saved preferences (or any newer user edits to those controls).
+    restore();
+    table.withPrioRows(apply);
+  } else if (table.prioLoaded) apply();
 })();
