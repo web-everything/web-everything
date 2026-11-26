@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import standDown3507 from './fixtures/stand-down-3507.json';
 import { buildOperatorAnswer, isOperatorAnswerStandDownSuperseded, latestUnresolvedStandDown, latestOperatorAnswer, parseOperatorAnswer } from '../stand-down-answer-core.mjs';
+import { rearmCoversVerdict } from '../../review-set-label.mjs';
 import { runStandDownAnswer } from '../stand-down-answer.mjs';
 import { decideEmptyFixRound, rearmWindow, REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
@@ -542,11 +543,11 @@ describe('explicit no-code-owed ceremony', () => {
     expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: 'IC_third', noCodeOwed: true });
     expect(decideEmptyFixRound({ comments: [...comments, posted], liveHead: HEAD }).empty).toBe(false);
   });
-  it('rearm-review succeeds after a cap-blocked no-code-owed answer', () => {
+  const makeRearmCli = (over = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'no-code-rearm-'));
     const stateFile = join(dir, 'state.json');
     const logFile = join(dir, 'calls.jsonl');
-    const snapshot = { ...pr(comments), headRefOid: HEAD, comments: [...comments] };
+    const snapshot = { ...pr(comments), headRefOid: HEAD, comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, ...comments], ...over };
     writeFileSync(stateFile, JSON.stringify(snapshot));
     writeFileSync(logFile, '');
     // Every subprocess stays local. Unknown GitHub calls fail; git cannot read or write a real checkout.
@@ -556,13 +557,25 @@ const fs = require('node:fs');
 const a = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(process.env.REARM_STATE, 'utf8'));
 fs.appendFileSync(process.env.REARM_CALLS, JSON.stringify(a) + '\\n');
-if (a[0] === 'pr' && a[1] === 'view') console.log(JSON.stringify(state));
+if (a[0] === 'pr' && a[1] === 'view') {
+  if (!a.includes('headRefOid')) {
+    state.fullViews = (state.fullViews || 0) + 1;
+    if (state.moveBeforeSwap && state.fullViews >= 2) {
+      state.headRefOid = state.moveBeforeSwap;
+      delete state.moveBeforeSwap;
+    }
+    fs.writeFileSync(process.env.REARM_STATE, JSON.stringify(state));
+  }
+  console.log(JSON.stringify(state));
+}
 else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/3181/comments' && a.includes('--slurp')) {
   console.log(JSON.stringify([state.comments.map(({ author, id, ...c }, i) => ({ ...c, user: author, id: i + 1, node_id: id }))]));
 } else if (a[0] === 'pr' && a[1] === 'edit') {
   const remove = a.filter((v, i) => a[i - 1] === '--remove-label');
   state.labels = state.labels.filter(l => !remove.includes(l.name));
   if (a.includes('--add-label')) state.labels.push({ name: a[a.indexOf('--add-label') + 1] });
+  if (state.moveOnSwap) { state.headRefOid = state.moveOnSwap; delete state.moveOnSwap; }
+  if (state.holdOnSwap) { state.labels.push({ name: state.holdOnSwap }); delete state.holdOnSwap; }
   fs.writeFileSync(process.env.REARM_STATE, JSON.stringify(state));
 } else if (a[0] === 'pr' && a[1] === 'comment') {
   const f = a[a.indexOf('--body-file') + 1];
@@ -571,13 +584,20 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
 } else { console.error('unsupported fake gh call: ' + JSON.stringify(a)); process.exit(1); }
 `, { mode: 0o755 });
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
-    const rearm = () => spawnSync(process.execPath,
-      [resolve(dirname(fileURLToPath(import.meta.url)), '../rearm-review.mjs'), '3181', '--repo=web-everything/web-everything'], {
+    const rearm = (extra = []) => spawnSync(process.execPath,
+      [resolve(dirname(fileURLToPath(import.meta.url)), '../rearm-review.mjs'), '3181', '--repo=web-everything/web-everything', ...extra], {
         cwd: dir, encoding: 'utf8', timeout: 60000,
         env: { ...env, PATH: `${dir}:${process.env.PATH}`, HOME: dir, TMPDIR: dir,
           WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), WE_VERDICT_LEDGER_DIR: join(dir, 'ledger'),
           WE_VERDICT_LEDGER_STORE: 'home', REARM_STATE: stateFile, REARM_CALLS: logFile },
       });
+    return { dir, stateFile, logFile, rearm,
+      state: () => JSON.parse(readFileSync(stateFile, 'utf8')),
+      calls: () => readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse),
+    };
+  };
+  it('rearm-review succeeds after a cap-blocked no-code-owed answer', () => {
+    const { dir, stateFile, logFile, rearm } = makeRearmCli();
     try {
       const before = rearm();
       expect(before.status, before.stderr).toBe(1);
@@ -592,6 +612,9 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
       });
       expect(runStandDownAnswer(args, { gh })).toBe('posted');
       expect(gh).toHaveBeenCalledTimes(2);
+      const resumed = JSON.parse(readFileSync(stateFile, 'utf8'));
+      resumed.comments.push({ ...begin, id: 'IC_resumed' });
+      writeFileSync(stateFile, JSON.stringify(resumed));
       const after = rearm();
       expect(after.status, after.stderr + after.stdout).toBe(0);
       expect(JSON.parse(after.stdout.trim().split('\n').at(-1))).toMatchObject({ ok: true, rearmed: true });
@@ -604,4 +627,174 @@ else if (a[0] === 'api' && a[1] === 'repos/web-everything/web-everything/issues/
       rmSync(dir, { recursive: true, force: true });
     }
   }, 120000);
+  const Y = 'c'.repeat(40);
+  const headedSnapshot = () => ({ comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, begin, stop,
+    trusted(buildOperatorAnswer({ ...record, standDownId: stop.id, disposition: 'rearm-review', noCodeOwed: true, head: HEAD }), 'IC_headed'),
+    { ...begin, id: 'IC_resumed' }] });
+  it('headed answer → resumed claim → pinned review:pending swap and durable 🔧 marker', () => {
+    const h = makeRearmCli(headedSnapshot());
+    try {
+      const r = h.rearm();
+      expect(r.status, r.stdout + r.stderr).toBe(0);
+      expect(h.state().labels).toEqual([{ name: 'review:pending' }]);
+      expect(h.state().comments.filter(c => c.body.startsWith(REARM_COMMENT_MARKER))).toHaveLength(1);
+      expect(h.state().comments.filter(c => c.body.includes('no change made'))).toHaveLength(0);
+      // The plain pinned path swaps BEFORE the marker; unpinned rearm posts first.
+      const writes = h.calls().filter(a => a[0] === 'pr' && ['edit', 'comment'].includes(a[1]));
+      expect(writes.map(a => a[1])).toEqual(['edit', 'comment']);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  }, 120000);
+  it('conflicting caller --expect-head refuses with no write', () => {
+    const h = makeRearmCli(headedSnapshot());
+    try {
+      const r = h.rearm([`--expect-head=${Y}`]);
+      expect(r.status, r.stdout + r.stderr).toBe(1);
+      expect(r.stdout + r.stderr).toMatch(/expect-head/);
+      expect(h.calls().filter(a => a[0] === 'pr' && ['edit', 'comment'].includes(a[1]))).toEqual([]);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  }, 120000);
+  it('head moves before the swap: no label or comment write (α)', () => {
+    const h = makeRearmCli({ ...headedSnapshot(), moveBeforeSwap: Y });
+    try {
+      const r = h.rearm();
+      expect(r.status, r.stdout + r.stderr).toBe(1);
+      expect(r.stdout + r.stderr).toMatch(/live head differs from --expect-head/);
+      expect(h.state().headRefOid).toBe(Y);
+      expect(h.state().labels).toEqual([{ name: 'review:changes' }]);
+      expect(h.calls().filter(a => a[0] === 'pr' && ['edit', 'comment'].includes(a[1]))).toEqual([]);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  }, 120000);
+  it.each([null, 'review:human', 'review:held-mechanical'])('head moves between swap and marker (β): pinned recovery with hold %s', holdOnSwap => {
+    const h = makeRearmCli({ ...headedSnapshot(), moveOnSwap: Y, holdOnSwap });
+    try {
+      const first = h.rearm();
+      expect(first.status, first.stdout + first.stderr).toBe(1);
+      expect(first.stdout + first.stderr).toMatch(/live head differs from --expect-head/);
+      expect(h.state().labels.map(l => l.name)).toEqual(['review:pending', ...(holdOnSwap ? [holdOnSwap] : [])]);
+      expect(h.calls().filter(a => a[0] === 'pr' && a[1] === 'comment')).toEqual([]);
+      const callCount = h.calls().length;
+      const second = h.rearm([`--expect-head=${Y}`]);
+      expect(second.status, second.stdout + second.stderr).toBe(holdOnSwap ? 1 : 0);
+      const writes = h.calls().slice(callCount).filter(a => a[0] === 'pr' && ['edit', 'comment'].includes(a[1]));
+      expect(writes.map(a => a[1])).toEqual(holdOnSwap ? [] : ['comment']);
+      const markers = h.state().comments.filter(c => c.body.startsWith(REARM_COMMENT_MARKER));
+      expect(markers).toHaveLength(holdOnSwap ? 0 : 1);
+      if (!holdOnSwap) expect(rearmCoversVerdict(markers[0].body, h.state().comments[0])).toBe(true);
+    } finally { rmSync(h.dir, { recursive: true, force: true }); }
+  }, 120000);
+
+});
+
+
+describe('headed answer record and preview ceremony', () => {
+  const HEAD = '8539625bf05ab56a92dfcfe11c8c04e92d753dac';
+  const headed = { ...record, disposition: 'rearm-review', noCodeOwed: true, head: HEAD };
+  const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\``, 'IC_begin');
+  const snapshot = () => ({ comments: [begin, stop], labels: [], headRefOid: HEAD });
+  const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
+  const fake = view => vi.fn(a => {
+    if (a[1] !== 'view') return 'posted';
+    if (view instanceof Error) throw view;
+    return JSON.stringify(view);
+  });
+  it('--no-code-owed records the live head and parse round-trips it', () => {
+    const gh = fake(snapshot());
+    runStandDownAnswer(args, { gh });
+    expect(parseOperatorAnswer(trusted(gh.mock.calls[1][0].at(-1)))).toEqual(headed);
+    expect(parseOperatorAnswer(trusted(buildOperatorAnswer(headed)))).toEqual(headed);
+    const legacy = { ...record, disposition: 'rearm-review', noCodeOwed: true };
+    expect(parseOperatorAnswer(trusted(buildOperatorAnswer(legacy)))).toEqual(legacy);
+  });
+  it.each([
+    { ...record, head: HEAD }, { ...headed, noCodeOwed: false }, { ...headed, head: null },
+    ...['', 'abc1234', 'b'.repeat(39), 'g'.repeat(40), 'a'.repeat(41)].map(head => ({ ...headed, head })),
+  ])('buildOperatorAnswer refuses head without noCodeOwed or non-40-hex head: %j', rec => {
+    expect(() => buildOperatorAnswer(rec)).toThrow(/head/);
+  });
+  it.each([null, 'bad', 'a'.repeat(39), 'z'.repeat(40), 'b'.repeat(41)])('malformed head record parses as null: %j', head => {
+    const body = buildOperatorAnswer(headed).replace(/conveyor-stand-down-answer-record:[A-Za-z0-9+/=]+/,
+      'conveyor-stand-down-answer-record:' + Buffer.from(JSON.stringify({ ...headed, head })).toString('base64'));
+    expect(parseOperatorAnswer(trusted(body))).toBeNull();
+  });
+  it.each([undefined, false])('a record with head but noCodeOwed=%s parses as null', noCodeOwed => {
+    const body = buildOperatorAnswer(headed).replace(/conveyor-stand-down-answer-record:[A-Za-z0-9+/=]+/,
+      'conveyor-stand-down-answer-record:' + Buffer.from(JSON.stringify({ ...headed, noCodeOwed })).toString('base64'));
+    expect(parseOperatorAnswer(trusted(body))).toBeNull();
+  });
+  it('parse checks build-equality for the head field', () => {
+    const body = buildOperatorAnswer(headed).replace(/conveyor-stand-down-answer-record:[A-Za-z0-9+/=]+/,
+      'conveyor-stand-down-answer-record:' + Buffer.from(JSON.stringify({ ...headed, head: 'b'.repeat(40) })).toString('base64'));
+    // The changed head itself is valid; the canonical body's record must exactly reflect it.
+    expect(parseOperatorAnswer(trusted(body))).toEqual({ ...headed, head: 'b'.repeat(40) });
+    expect(parseOperatorAnswer(trusted(body.replace('ruling to implement', 'tampered')))).toBeNull();
+  });
+  it.each([false, true])('--preview prints typed JSON, posts no comment, body equals posting on identical snapshot (supersedes=%s)', superseding => {
+    const view = snapshot();
+    if (superseding) {
+      view.comments = view.comments.map(c => ({ ...c, createdAt: '2026-11-25T14:00:00Z' }));
+      view.comments.push(answer);
+      view.labels.push({ name: 'status:answered-waiting-fixer' });
+      view.commits = [{ oid: HEAD, committedDate: '2026-11-25T13:00:00Z' }];
+    }
+    const ghPreview = fake(view), ghPost = fake(view);
+    const result = JSON.parse(runStandDownAnswer([...args, '--preview'], { gh: ghPreview }));
+    expect(ghPreview).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ ok: true, preview: true, pr: 3181, target: stop.id,
+      supersedes: superseding ? answer.id : null, head: HEAD, body: expect.any(String) });
+    expect(runStandDownAnswer(args, { gh: ghPost })).toBe('posted');
+    expect(result.body).toBe(ghPost.mock.calls[1][0].at(-1));
+    expect(parseOperatorAnswer(trusted(result.body)).head).toBe(HEAD);
+  });
+  it('plain answer preview reports null head', () => {
+    const gh = fake(snapshot());
+    const out = JSON.parse(runStandDownAnswer([...argv, '--preview'], { gh }));
+    expect(out).toMatchObject({ ok: true, preview: true, head: null, supersedes: null });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+  it('--preview subprocess exits 0 with typed JSON and no comment write', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'standdown-preview-'));
+    try {
+      writeFileSync(join(dir, 'snapshot.json'), JSON.stringify(snapshot()));
+      writeFileSync(join(dir, 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+if (process.argv[3] !== 'view') { fs.writeFileSync(__dirname + '/unexpected-write', 'write'); process.exit(1); }
+process.stdout.write(fs.readFileSync(__dirname + '/snapshot.json', 'utf8'));
+`, { mode: 0o755 });
+      const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(WE_|GH_|GITHUB_|LANE_POOL_ROOT$)/.test(k)));
+      const result = spawnSync(process.execPath, [resolve(dirname(fileURLToPath(import.meta.url)), '../stand-down-answer.mjs'),
+        ...args, '--preview'], { cwd: dir, encoding: 'utf8', timeout: 60000, maxBuffer: 1024 * 1024,
+        env: { ...env, PATH: `${dir}:${process.env.PATH}`, TMPDIR: dir, HOME: dir } });
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, preview: true, pr: 3181, head: HEAD, target: stop.id });
+      expect(() => readFileSync(join(dir, 'unexpected-write'))).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 120000);
+  const refusals = [
+    ['bad PR', a => ['0', ...a.slice(1)], snapshot, /PR/],
+    ...['repo', 'reason', 'actor', 'channel'].map(key => [`missing ${key}`, a => a.filter(x => !x.startsWith(`--${key}=`)), snapshot, new RegExp(key)]),
+    ['bad repo', a => a.map(x => x.startsWith('--repo=') ? '--repo=bad' : x), snapshot, /repo/],
+    ['unknown flag', a => [...a, '--unknown'], snapshot, /unknown/],
+    ['duplicate flag', a => [...a, '--actor=chalbert'], snapshot, /duplicate/],
+    ['duplicate --preview', a => [...a, '--preview', '--preview'], snapshot, /duplicate/],
+    ['unreadable snapshot', a => a, () => new Error('unreadable snapshot'), /Could not read/],
+    ['incomplete labels', a => a, () => ({ ...snapshot(), labels: [{}] }), /labels/],
+    ...['blocked', 'pending'].map(status => [`red-team:${status}`, a => a, () => ({ ...snapshot(), labels: [{ name: `red-team:${status}` }] }), new RegExp(`red-team:${status}`)]),
+    ['no unresolved stand-down', a => a, () => ({ ...snapshot(), comments: [] }), /no unresolved/],
+    ['guard-would-ignore', a => a, () => ({ ...snapshot(), comments: [stop] }), /guard would ignore/],
+    ['no durable id', a => a.filter(x => !['--no-code-owed', '--disposition=rearm-review'].includes(x)), () => ({ ...snapshot(), comments: [{ ...stop, id: undefined }] }), /durable comment id/],
+    ['non-40-hex head', a => a, () => ({ ...snapshot(), headRefOid: 'abc1234' }), /40-hex/],
+    ['oversize body', a => a.map(x => x.startsWith('--reason=') ? '--reason=' + 'x'.repeat(65536) : x), snapshot, /comment limit/],
+  ];
+  it.each(refusals)('--preview refuses exactly as posting does: %s', (_name, changeArgs, view, message) => {
+    const errors = [];
+    for (const preview of [false, true]) {
+      const gh = fake(view());
+      try { runStandDownAnswer([...changeArgs(args), ...(preview ? ['--preview'] : [])], { gh }); }
+      catch (error) { errors.push(error.message); }
+      expect(gh.mock.calls.every(([a]) => a[1] === 'view')).toBe(true);
+    }
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toMatch(message);
+    expect(errors[1]).toBe(errors[0]);
+  });
 });
