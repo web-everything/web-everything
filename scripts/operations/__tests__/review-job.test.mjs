@@ -1,3 +1,4 @@
+import * as reviewJob from '../review-job.mjs';
 import * as reviewDispatch from '../review-dispatch.mjs';
 import * as ghShim from '../../lib/gh-app-shim.mjs';
 import { runReviewTick } from '../../../skills-src/conveyor/review-daemon.mjs';
@@ -24,6 +25,8 @@ import { assessLiveness, bindAgents } from '../../conveyor/reconcile-core.mjs';
 import { deriveReviewStatus, tagReviewStatus } from '../../conveyor/review-status-tag.mjs';
 import { defaultReadAgents } from '../../conveyor/reconcile-pass.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
+import { findUnmanagedKeepAlives } from '../../check-standards-rules.mjs';
+import { keepAliveScript } from '../../lib/test-keepalive.mjs';
 
 const REPO = 'web-everything/web-everything';
 const HEAD = 'a'.repeat(40);
@@ -768,4 +771,92 @@ it('classifies juror-timeout and writes the named seat to the ended record', () 
   const { io } = fakeIo({ writeEnded, runLoop: () => ({ status: 1, stdout: JSON.stringify(payload), stderr: '' }) });
   expect(runReviewJob({ pr: 10, repo: REPO, pid: 99 }, io)).toMatchObject({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId });
   expect(writeEnded).toHaveBeenCalledWith({ slug: 'review-10', pid: 99 }, expect.objectContaining({ outcome: BLOCKED_ON_INFRA, reason: 'juror-timeout', lens: payload.lens, provider: payload.provider, model: payload.model, head: HEAD, timeoutMs: 5, wallMs: 6, runId: payload.runId }));
+});
+
+
+describe('review loop process-group timeout', () => {
+  it('generates a timeout fixture without unmanaged keep-alive timers', () => {
+    const { root } = fixture(false);
+    expect(findUnmanagedKeepAlives([{
+      file: 'review-loop-cli.mjs',
+      content: readFileSync(join(root, 'scripts/operations/review-loop-cli.mjs'), 'utf8'),
+    }])).toEqual([]);
+  });
+  function fixture(finishes) {
+    const root = join(dir, 'runtime');
+    mkdirSync(join(root, 'scripts/operations'), { recursive: true });
+    const effect = join(root, 'effect.json');
+    const childPid = join(root, 'child-pid');
+    const loopPid = join(root, 'loop-pid');
+    writeFileSync(join(root, 'scripts/operations/review-loop-cli.mjs'), `
+      import { spawn } from 'node:child_process';
+      import { writeFileSync } from 'node:fs';
+      writeFileSync(${JSON.stringify(loopPid)}, String(process.pid));
+      const child = spawn('python3', ['-c', ${JSON.stringify(`
+import os, signal, time, json
+signal.signal(signal.SIGTERM, lambda *_: None)
+with open(${JSON.stringify(childPid)}, 'w') as f:
+    json.dump({'pid': os.getpid(), 'pgid': os.getpgrp()}, f)
+time.sleep(4)
+`)}], { stdio: 'ignore' });
+      process.on('SIGTERM', () => {
+        ${finishes ? `setTimeout(() => {
+          writeFileSync(${JSON.stringify(effect)}, JSON.stringify({ effect: 'applied' }));
+          console.log(JSON.stringify({ runId: 'grace-run', stopped: 'complete' }));
+          process.exit(0);
+        }, 100);` : ''}
+      });
+      ${keepAliveScript()}
+    `);
+    return { root, effect, childPid, loopPid };
+  }
+  function runFixture(finishes) {
+    const paths = fixture(finishes);
+    const logs = [];
+    try {
+      const io = createReviewJobIo({ root: paths.root,
+        env: { ...process.env, WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '500' }, log: line => logs.push(line) });
+      const result = io.runLoop({ pr: 10, repo: REPO, lanePath: paths.root, timeoutMs: 700 });
+      expect(existsSync(paths.childPid), result.stderr || JSON.stringify(result)).toBe(true);
+      const child = JSON.parse(readFileSync(paths.childPid, 'utf8'));
+      const pid = Number(readFileSync(paths.loopPid, 'utf8'));
+      expect(() => process.kill(child.pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+      expect(child.pgid).toBe(pid);
+      expect(result).toMatchObject({ timedOut: true, groupTermination: 'group-killed' });
+      expect(logs.join('\n')).toMatch(/group-term[\s\S]*group-kill/);
+      return { paths, result };
+    } finally {
+      // Also clean up on a red run, where the old direct-child timeout leaves the sink alive.
+      for (const file of [paths.childPid, paths.loopPid]) {
+        if (!existsSync(file)) continue;
+        const raw = readFileSync(file, 'utf8');
+        const pid = file === paths.childPid ? JSON.parse(raw).pid : Number(raw);
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  }
+  it('timeout terminates the whole process group, so no grandchild outlives the job', () => {
+    const { paths } = runFixture(false);
+    expect(existsSync(paths.effect)).toBe(false);
+  });
+  it('a sink finishing within the grace period records its effect before the group is killed', () => {
+    const { paths, result } = runFixture(true);
+    expect(JSON.parse(readFileSync(paths.effect, 'utf8'))).toEqual({ effect: 'applied' });
+    expect(parseReviewLoopStdout(result.stdout)).toMatchObject({ runId: 'grace-run' });
+  });
+});
+
+
+describe('review timeout grace setting', () => {
+  it.each([undefined, '', 'bad', '0', '-1', 'Infinity', '1.5', '2147483648'])('uses the 60 second default for malformed grace %s', raw => {
+    const setting = reviewJob.resolveLoopTimeoutGrace({ env: { WE_REVIEW_JOB_TIMEOUT_GRACE_MS: raw }, platform: {}, tool: {} });
+    expect(setting.value.timeoutGraceMs).toBe(60_000);
+    expect(setting.sources.timeoutGraceMs).toBe('standard');
+  });
+  it('resolves grace through standard, platform, tool and environment with provenance', () => {
+    const resolve = (tool, env) => reviewJob.resolveLoopTimeoutGrace({ platform: { timeoutGraceMs: 2000 }, tool, env });
+    expect(resolve({}, {})).toMatchObject({ value: { timeoutGraceMs: 2000 }, sources: { timeoutGraceMs: 'platform' } });
+    expect(resolve({ timeoutGraceMs: 3000 }, {})).toMatchObject({ value: { timeoutGraceMs: 3000 }, sources: { timeoutGraceMs: 'tool' } });
+    expect(resolve({ timeoutGraceMs: 3000 }, { WE_REVIEW_JOB_TIMEOUT_GRACE_MS: '4000' })).toMatchObject({ value: { timeoutGraceMs: 4000 }, sources: { timeoutGraceMs: 'env' } });
+  });
 });

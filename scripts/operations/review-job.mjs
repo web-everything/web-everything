@@ -5,6 +5,7 @@ import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTe
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
@@ -180,6 +181,83 @@ const LANE_DEFERRALS_LABEL = 'lane-deferrals:';
  *  slowest recent wrapper sessions ran ~21 min end to end. 45 min is a hang, not a slow review. */
 export const DEFAULT_LOOP_TIMEOUT_MS = 45 * 60 * 1000;
 export const LOOP_TIMEOUT_ENV = 'WE_REVIEW_JOB_TIMEOUT_MS';
+
+/** Allow an in-flight sink to finish and record its effect before killing descendants.
+ * reviewJob.timeoutGraceMs: standard → platform → scripts/settings/review.json job → env.
+ * Node timers must fit a signed 32-bit delay; overflow would otherwise become an immediate kill. */
+export function resolveLoopTimeoutGrace({ env = process.env, platform, tool, readFile = readFileSync, log } = {}) {
+  if (tool === undefined) {
+    try { tool = JSON.parse(readFile(new URL('../settings/review.json', import.meta.url), 'utf8')).job; }
+    catch { tool = {}; }
+  }
+  return cascadePolicy('reviewJob', tool, {
+    standard: { timeoutGraceMs: 60_000 }, platform, env, log,
+    envValues: { timeoutGraceMs: env.WE_REVIEW_JOB_TIMEOUT_GRACE_MS === undefined ? undefined : Number(env.WE_REVIEW_JOB_TIMEOUT_GRACE_MS) },
+    valid: { timeoutGraceMs: n => Number.isSafeInteger(n) && n > 0 && n <= 2_147_483_647 },
+  });
+}
+
+/** Runs in a small supervisor so the job can retain its synchronous IO contract. The
+ * supervisor stays outside the detached loop's group and owns BOTH timeout signals.
+ * fd 3 is lifecycle evidence, separate from the loop's untrusted stdout/stderr. */
+function superviseReviewLoop() {
+  const { spawn } = require('node:child_process');
+  const { writeFileSync } = require('node:fs');
+  const [timeoutMs, graceMs, ...args] = JSON.parse(process.argv[1]);
+  const child = spawn(process.execPath, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  const result = { status: null, signal: null, timedOut: false, groupTermination: null, events: [] };
+  let exited = false, graceTimer, graceElapsed = false;
+  const finish = () => { writeFileSync(3, JSON.stringify(result)); process.exit(0); };
+  const signalGroup = signal => {
+    try { process.kill(-child.pid, signal); return true; }
+    catch (error) {
+      if (error.code === 'ESRCH') return false;
+      result.groupTermination = 'group-kill-failed';
+      result.events.push(`group signal ${signal} failed: ${error.code}; operator must inspect and terminate group ${child.pid}`);
+      return false;
+    }
+  };
+  const timer = setTimeout(() => {
+    result.timedOut = true;
+    result.events.push(`group-term pgid=${child.pid} graceMs=${graceMs}`);
+    signalGroup('SIGTERM');
+    // Do not clear this timer when the leader exits: descendants can still be alive.
+    graceTimer = setTimeout(() => {
+      graceElapsed = true;
+      result.events.push(`group-kill pgid=${child.pid}`);
+      const killed = signalGroup('SIGKILL');
+      if (result.groupTermination !== 'group-kill-failed') result.groupTermination = killed ? 'group-killed' : 'group-already-gone';
+      if (exited || result.groupTermination === 'group-kill-failed') finish();
+    }, graceMs);
+  }, timeoutMs);
+  // Bound each output stream below the synchronous caller's maxBuffer. Killing only
+  // the supervisor on buffer overflow would orphan the very group it owns.
+  for (const [stream, fd] of [[child.stdout, 1], [child.stderr, 2]]) {
+    let bytes = 0;
+    stream.on('data', chunk => {
+      bytes += chunk.length;
+      if (bytes <= 32 * 1024 * 1024) writeFileSync(fd, chunk);
+      else {
+        result.events.push('loop output exceeded 32 MiB; terminating process group');
+        signalGroup('SIGKILL');
+        stream.removeAllListeners('data');
+        stream.resume();
+      }
+    });
+  }
+  child.on('error', error => {
+    clearTimeout(timer); clearTimeout(graceTimer);
+    result.status = 1;
+    result.events.push(`loop spawn failed: ${error.message}`);
+    finish();
+  });
+  child.on('close', (status, signal) => {
+    exited = true;
+    result.status = status; result.signal = signal;
+    if (!result.timedOut) { clearTimeout(timer); finish(); }
+    else if (graceElapsed) finish();
+  });
+}
 
 /** @param {object} [env] @returns {number} */
 export function resolveLoopTimeoutMs(env = process.env) {
@@ -432,12 +510,15 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnNode(process.execPath, [...heapCapArgs(basename(args[0], '.mjs')), ...args], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null, groupGraceMs = null } = {}) => spawnNode(process.execPath,
+    groupGraceMs === null ? [...heapCapArgs(basename(args[0], '.mjs')), ...args]
+      : ['-e', `(${superviseReviewLoop.toString()})()`, JSON.stringify([timeoutMs, groupGraceMs, ...heapCapArgs(basename(args[0], '.mjs')), ...args])], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
     env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}), ...(extraEnv ?? {}) },
-    ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
+    ...(groupGraceMs !== null ? { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }
+      : timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   const readComments = ({ repo, pr }) => readCompletePrComments(Number(pr), {
     repo, exec: (file, args, options) => exec(file, args, { ...options, cwd: root, env }),
@@ -638,14 +719,24 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
     runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null }) => {
+      const grace = resolveLoopTimeoutGrace({ env, readFile });
+      log(`review-job timeoutGraceMs=${grace.value.timeoutGraceMs} (${grace.sources.timeoutGraceMs})`);
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
         ...(reviewModel ? [`--model=${reviewModel}`] : []),
-      ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
+      ], { actorId, timeoutMs, groupGraceMs: grace.value.timeoutGraceMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
+      let lifecycle;
+      try {
+        lifecycle = JSON.parse(String(r.output?.[3] ?? ''));
+        if (typeof lifecycle.timedOut !== 'boolean' || !Array.isArray(lifecycle.events)) throw Error('invalid lifecycle');
+      } catch {
+        throw Error(`review-loop supervisor returned incomplete lifecycle evidence; operator must inspect loop processes (${r.error?.message ?? r.signal ?? r.status})`);
+      }
+      for (const event of lifecycle.events) log(`review-job ${event}`);
       return {
-        status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
-        timedOut: r.error?.code === 'ETIMEDOUT' || (r.signal === 'SIGKILL' && r.status === null),
+        status: lifecycle.status, signal: lifecycle.signal, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
+        timedOut: lifecycle.timedOut, groupTermination: lifecycle.groupTermination,
       };
     },
     releaseLane: (slug) => node(['scripts/lane-pool.mjs', 'release', '--all-pools', `--session=${slug}`], { timeoutMs: 5 * 60 * 1000 }),
@@ -1574,7 +1665,8 @@ function runReviewArc({
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
     if (loop.timedOut) {
-      classified = { outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: parsed?.runId ?? null, label: `review-loop timed out after ${loopTimeoutMs}ms` };
+      classified = { outcome: BLOCKED_ON_INFRA, verdict: null, loopOutcome: null, runId: parsed?.runId ?? null,
+        label: `review-loop timed out after ${loopTimeoutMs}ms (${loop.groupTermination ?? 'group outcome unavailable; operator must inspect loop processes'})` };
     } else if (parsed) {
       // #3647 — classify what the loop PRINTED even on a non-zero exit: a finished review whose secondary
       // filing step failed is still that review's real outcome.
