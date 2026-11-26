@@ -392,8 +392,11 @@ describe('explicit no-code-owed ceremony', () => {
   const rearm = (standDownId) => trusted(buildOperatorAnswer({ ...record, standDownId, disposition: 'rearm-review' }));
   const comments = [begin, stop, rearm(stop.id), begin, { ...stop, id: 'IC_second' }, rearm('IC_second'),
     begin, { ...stop, id: 'IC_third' }];
+  // Successful no-code ceremonies now require the stand-down itself to pin the head.
+  const headedComments = comments.map(c => c.body === stop.body
+    ? { ...c, body: c.body.replace(/ -->$/, ` head=${HEAD} -->`) } : c);
   const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
-  const mock = (labels) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments, labels, headRefOid: HEAD }) : 'posted');
+  const mock = (labels, thread = comments) => vi.fn(a => a[1] === 'view' ? JSON.stringify({ comments: thread, labels, headRefOid: HEAD }) : 'posted');
 
   it('refuses noCodeOwed without rearm-review or with a non-boolean value', () => {
     for (const noCodeOwed of [true, false, 'true', null]) {
@@ -484,7 +487,7 @@ describe('explicit no-code-owed ceremony', () => {
   it('a new changes verdict permits another cap override through the CLI and reader', () => {
     const override = trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_third',
       disposition: 'rearm-review', noCodeOwed: true }), 'IC_override');
-    const snapshot = { comments: [...comments, override, trusted('🔁 review — changes requested', 'IC_new_verdict'), ...comments],
+    const snapshot = { comments: [...headedComments, override, trusted('🔁 review — changes requested', 'IC_new_verdict'), ...headedComments],
       labels: [], headRefOid: HEAD };
     const gh = vi.fn(a => {
       if (a[1] === 'view') return JSON.stringify(snapshot);
@@ -525,7 +528,7 @@ describe('explicit no-code-owed ceremony', () => {
   it.each([undefined, 'rearm-review'])('supersedes a prior cap-ignored answer (%s) once', disposition => {
     const prior = trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_third',
       ...(disposition ? { disposition } : {}) }), 'IC_prior');
-    const snapshot = { comments: [...comments, prior].map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' })),
+    const snapshot = { comments: [...headedComments, prior].map(c => ({ ...c, createdAt: '2026-11-14T10:00:00Z' })),
       labels: [{ name: 'status:answered-waiting-fixer' }], headRefOid: HEAD,
       commits: [{ oid: HEAD, committedDate: '2026-11-14T09:00:00Z' }] };
     const gh = vi.fn(a => a[1] === 'view' ? JSON.stringify(snapshot) : 'posted');
@@ -537,7 +540,7 @@ describe('explicit no-code-owed ceremony', () => {
     expect(() => runStandDownAnswer(args, { gh })).toThrow('no unresolved');
   });
   it('posts the explicit ruling for the latest cap-blocked stand-down and the guard accepts it', () => {
-    const gh = mock([]);
+    const gh = mock([], headedComments);
     expect(runStandDownAnswer(args, { gh })).toBe('posted');
     const posted = trusted(gh.mock.calls[1][0].at(-1));
     expect(parseOperatorAnswer(posted)).toMatchObject({ standDownId: 'IC_third', noCodeOwed: true });
@@ -547,7 +550,7 @@ describe('explicit no-code-owed ceremony', () => {
     const dir = mkdtempSync(join(tmpdir(), 'no-code-rearm-'));
     const stateFile = join(dir, 'state.json');
     const logFile = join(dir, 'calls.jsonl');
-    const snapshot = { ...pr(comments), headRefOid: HEAD, comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, ...comments], ...over };
+    const snapshot = { ...pr(headedComments), headRefOid: HEAD, comments: [{ ...trusted('🔁 review — changes requested', 'IC_changes'), createdAt: '2026-11-25T11:45:50Z' }, ...headedComments], ...over };
     writeFileSync(stateFile, JSON.stringify(snapshot));
     writeFileSync(logFile, '');
     // Every subprocess stays local. Unknown GitHub calls fail; git cannot read or write a real checkout.
@@ -690,7 +693,7 @@ describe('headed answer record and preview ceremony', () => {
   const HEAD = '8539625bf05ab56a92dfcfe11c8c04e92d753dac';
   const headed = { ...record, disposition: 'rearm-review', noCodeOwed: true, head: HEAD };
   const begin = trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\``, 'IC_begin');
-  const snapshot = () => ({ comments: [begin, stop], labels: [], headRefOid: HEAD });
+  const snapshot = () => ({ comments: [begin, { ...stop, body: stop.body.replace(/ -->$/, ` head=${HEAD} -->`) }], labels: [], headRefOid: HEAD });
   const args = [...argv, '--disposition=rearm-review', '--no-code-owed'];
   const fake = view => vi.fn(a => {
     if (a[1] !== 'view') return 'posted';

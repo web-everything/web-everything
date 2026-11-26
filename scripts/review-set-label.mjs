@@ -2469,7 +2469,7 @@ export function runReviewLabelCli({
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — re-read the labels so the printed result reflects the
   // true post-swap state (tolerant: fall back to a locally-derived set if the re-read fails).
-  let newLabels;
+  let newLabels, labelsObserved;
   if (onlyIf === 'missing') {
     try {
       const after = provider.readPrState(repo, pr);
@@ -2480,7 +2480,9 @@ export function runReviewLabelCli({
         || decision.removeLabels.some(l => newLabels.includes(l))) throw new Error('label transition was not observed');
     } catch (e) { fail(`missing review handoff could not be verified: ${e.message}`, 1); }
   } else try {
-    newLabels = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean);
+    const readback = provider.readLabels(repo, pr).map((l) => (typeof l === 'string' ? l : l && l.name));
+    newLabels = readback.filter(Boolean);
+    labelsObserved = readback.every(l => typeof l === 'string' && l.trim().length > 0);
   } catch {
     const names = (Array.isArray(currentLabels) ? currentLabels : [])
       .map((l) => (typeof l === 'string' ? l : l && l.name)).filter(Boolean)
@@ -2489,6 +2491,7 @@ export function runReviewLabelCli({
   }
 
   emit(`${JSON.stringify({ ...successResult({ pr: Number(pr), to, decision, labels: newLabels }),
+    ...(labelsObserved ? { labelsObserved: true } : {}),
     ...(gateRefresh ? { gateRefresh } : {}) })}\n`);
   process.exit(0);
 }
