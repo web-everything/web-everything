@@ -53,6 +53,35 @@ describe('prioritisation lazy loading', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['pending', 'completed'])('shares loaded and pending rows across script reinitialization (%s)', async (phase) => {
+    let release!: () => void;
+    const responseReady = new Promise<void>(resolve => { release = resolve; });
+    fetcher.mockImplementationOnce(async () => ({ ok: true, text: async () => { await responseReady; return row(2); } }));
+    mount();
+    const button = document.querySelector('[data-prio-load]') as HTMLButtonElement;
+    button.click();
+    if (phase === 'completed') {
+      release();
+      await loaded();
+    }
+
+    new Function(script)();
+    // Exercise the new initialization while the original load is pending or retained.
+    const table = document.querySelector('table') as HTMLTableElement & { withPrioRows: (action: () => void) => void };
+    const action = vi.fn();
+    table.withPrioRows(action);
+    release();
+    await vi.waitFor(() => expect(action).toHaveBeenCalledOnce());
+    expect(ids()).toEqual(['1', '2', '3']);
+    expect(new Set(ids()).size).toBe(3);
+    expect(fetcher.mock.calls.map((call: any[]) => call[0])).toEqual(['/one', '/two']);
+    expect(button.hidden).toBe(true);
+    (document.querySelector('th') as HTMLElement).click();
+    expect(ids()).toEqual(['3', '2', '1']);
+    (document.querySelector('[data-pkind="task"]') as HTMLElement).click();
+    expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('0');
+  });
+
   it.each(['search', 'chip', 'restore'])('loads all rows before applying %s and updates counts', async (action) => {
     mount(action === 'restore');
     if (action === 'search') {
@@ -72,8 +101,10 @@ describe('prioritisation lazy loading', () => {
     await vi.waitFor(() => expect(document.querySelector('[data-prio-status]')!.textContent).toContain('Retry'));
     expect(ids()).toEqual(['1']);
     expect(document.querySelector('[data-ptable-count]')!.textContent).toBe('3');
+    new Function(script)();
     (document.querySelector('[data-prio-load]') as HTMLElement).click();
     await loaded();
     expect(ids()).toEqual(['1', '2', '3']);
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 });

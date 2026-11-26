@@ -19,6 +19,18 @@ const render = (rows: any[]) => env.renderString('{% include "backlog-prio-rows.
 const pieces = [model.inline, ...model.chunks.map((chunk: any) => chunk.rows)];
 const html = pieces.map(render);
 
+it('gates the full-build acceptance ceiling and deployment asset guard before merge', () => {
+  const workflow = require('js-yaml').safeLoad(readFileSync('.github/workflows/ci.yml', 'utf8'));
+  const steps = workflow.jobs.smoke.steps;
+  const build = steps.findIndex((step: any) => step.run === 'npm run build:docs');
+  const check = steps.findIndex((step: any) => step.run?.includes('node --test tests/build/site-asset-size.test.mjs'));
+  expect(build).toBeGreaterThanOrEqual(0);
+  expect(check).toBeGreaterThan(build);
+  expect(steps[check].run).toContain('node scripts/check-site-asset-size.mjs _site\n');
+  expect(steps[check]['working-directory']).toBe('web-everything');
+  expect(steps[check].if).toBe(steps[build].if);
+});
+
 describe('bounded prioritisation output from the current backlog corpus', () => {
   it('preserves the old ranking and pinned groups, with every card reachable exactly once in order', () => {
     const expected = env.renderString(`{% set ranked = backlog | where("status", "active") | where("kind", "decision") | sort(attribute="leverageScore", reverse=true) %}

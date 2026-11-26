@@ -960,6 +960,13 @@ jobs:
         working-directory: web-everything
         run: npm run build:docs
 
+      - name: Guard full-build asset sizes
+        if: ${{ needs.changes.outputs.light != 'true' }}
+        working-directory: web-everything
+        run: |
+          node scripts/check-site-asset-size.mjs _site
+          node --test tests/build/site-asset-size.test.mjs
+
       # Deterministic Playwright interaction lane (#2070): drives the client-side backlog-table behaviour
       # over a fixed fixture page served by tests/interaction/serve.mjs. WE_INTERACTION_ONLY skips the app
       # dev-server webServer entry (see playwright.config.ts) so no build/live-data is needed.

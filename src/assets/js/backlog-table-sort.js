@@ -2,6 +2,8 @@
 (function () {
   'use strict';
   document.querySelectorAll('table.sortable').forEach(function (table) {
+    // The retained table owns this loader and its pending promise across script reinitialization.
+    if (table.withPrioRows) return;
     var urls = (table.getAttribute('data-prio-chunks') || '').split(/\s+/).filter(Boolean);
     var pending = null;
     var button = document.querySelector('[data-prio-load]');
@@ -54,6 +56,8 @@
   Array.prototype.forEach.call(tables, function (table) {
     var headers = table.querySelectorAll('thead th[data-sort-key]');
     Array.prototype.forEach.call(headers, function (th) {
+      if (th.__prioSortBound) return;
+      th.__prioSortBound = true;
       th.style.cursor = 'pointer';
       th.setAttribute('role', 'button');
       th.setAttribute('tabindex', '0');
@@ -98,7 +102,7 @@
 (function () {
   'use strict';
   var table = document.querySelector('table.sortable');
-  if (!table) return;
+  if (!table || table.__prioFilterBound) return;
   var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr'));
   table.addEventListener('prio-rows-loaded', function () {
     rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr:not(.ptable-empty)'));
@@ -123,6 +127,7 @@
   var search = document.querySelector('[data-ptable-search]');
   var countEl = document.querySelector('[data-ptable-count]');
   if (!readyChips().length && !kindChips().length && !search) return;
+  table.__prioFilterBound = true;
 
   // Empty-state row — when the active filter (chip combo, the split toggle, or a persisted search term)
   // hides every row, the table would otherwise look silently broken: a header and nothing under it, with
