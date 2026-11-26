@@ -122,6 +122,18 @@ function makeFixture() {
 
 const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
 
+// The setting is default-OFF with no env override and no production seam: the on path mocks the settings reader.
+const adoptFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('../settings-files.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readSettingsChecked: (o) => (adoptFlag.on && o?.namespace === 'rebuildAdoptNotWorse'
+      ? { value: { enabled: true }, taint: [], duplicates: [] } : actual.readSettingsChecked(o)),
+  };
+});
+afterEach(() => { adoptFlag.on = false; });
+
 beforeEach(() => {
   tempDirs.length = 0;
 });
@@ -644,7 +656,8 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     else {
       successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n'));
       env = { ...env0 };
-      extra = { runSmoke: failing(), adoptNotWorse: () => ({ enabled: true }) }; // the on path, injected in-process (default-OFF, no env override)
+      adoptFlag.on = true; // the on path (default-OFF, no env override, no production seam)
+      extra = { runSmoke: failing() };
     }
     await tick(cloneDir, env, { ...extra, forceWatchProbe: healthy });
     expect(headOf(cloneDir)).toBe(successor);
@@ -1167,7 +1180,8 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     const env = forceEnv(env0, base);
     const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
     const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
-    const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy, adoptNotWorse: () => ({ enabled: true }) });
+    adoptFlag.on = true;
+    const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy });
     expect(r.reason).toBe('harness-broken-adopted-not-worse');
     expect(headOf(cloneDir)).toBe(F);
     advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// only the pool changed\n'));

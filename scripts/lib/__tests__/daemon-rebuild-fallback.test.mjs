@@ -440,8 +440,22 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
 
 // ── e. smoke-harness-broken (the control fails identically) ────────────────────────────────────────────────
 
-/** The on path, injected in-process: the setting is default-OFF and has no env override. */
-const rebuildCloneAdoptOn = (options) => rebuildClone({ ...options, adoptNotWorse: () => ({ enabled: true }) });
+// The setting is default-OFF with no env override and no production seam. The on path mocks the settings reader
+// for the one namespace, so production has exactly one way in: the tighten-only setting.
+const adoptFlag = vi.hoisted(() => ({ on: false }));
+vi.mock('../settings-files.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    readSettingsChecked: (o) => (adoptFlag.on && o?.namespace === 'rebuildAdoptNotWorse'
+      ? { value: { enabled: true }, taint: [], duplicates: [] } : actual.readSettingsChecked(o)),
+  };
+});
+afterEach(() => { adoptFlag.on = false; });
+const rebuildCloneAdoptOn = async (options) => {
+  adoptFlag.on = true;
+  try { return await rebuildClone(options); } finally { adoptFlag.on = false; }
+};
 
 describe('smoke-harness-broken (x5wbsbc)', () => {
   it('a last-good control whose same-named rows were refused never adopts the candidate', async () => {

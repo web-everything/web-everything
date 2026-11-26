@@ -390,7 +390,6 @@ async function resolveDispatchSmoke(opt, env) {
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
   finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
-  adoptNotWorse = resolveAdoptNotWorse, // in-process test seam only: production never passes it, so the setting alone decides
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -1032,7 +1031,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && adoptNotWorse(env).enabled === true) {
+    if (!c.reused && resolveAdoptNotWorse(env).enabled === true) {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
