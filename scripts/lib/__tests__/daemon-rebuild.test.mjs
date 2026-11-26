@@ -34,6 +34,7 @@ import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes, markOverlayConflictWake } from '../overlay-conflict-wake.mjs';
 import { writeRebuildState } from '../daemon-rebuild/state.mjs';
 import { rebuildCommitEnv } from '../daemon-rebuild/shared.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -133,7 +134,8 @@ function makeFixture() {
 }
 
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+    smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }));
 }
 
 function writeFixtureOverlays(root, overlays, options) {

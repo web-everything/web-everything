@@ -72,7 +72,7 @@ describe('strict ready pins cannot downgrade audit or history proof', () => {
   it('accepts a legacy ready record with a proven registered, adopted and audited pin', () => {
     const f = fixture();
     writeFileSync(f.env.WE_FIX_READY_PATH, JSON.stringify({ ref, sha, tests: 'green', audit: 'NOT WEAKENED' }) + '\n');
-    expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
+    expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual({ ...f.ready, strictAdopt: true, freshSmoke: null });
   });
 });
 
@@ -94,7 +94,7 @@ function resetFixture(stage = 'inProgress') {
 
 it.each(['inProgress', 'adopted'])('strict pin proof accepts the production post-reset %s transition', stage => {
   const f = resetFixture(stage);
-  expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual(f.ready);
+  expect(readProvenReadyCandidate(f.root, f.env, readFileSync, { run: f.run })).toEqual({ ...f.ready, strictAdopt: true, freshSmoke: null });
 });
 
 it.each([

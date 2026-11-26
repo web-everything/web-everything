@@ -16,6 +16,7 @@ import { rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { readRebuildState } from '../daemon-rebuild/state.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -72,7 +73,8 @@ function fixture() {
   const overlays = [{ ref: 'lane/moving', pr: 5793 }, { ref: 'lane/fix-a', pr: 5801 }, { ref: 'lane/fix-b', pr: 5802 }];
   for (const o of overlays) addOverlay(clone, o, { env });
   const logs = [];
-  const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 10 }] } }));
+  const smoke = vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+    smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true, ms: 10 })) } }));
   const tick = () => rebuildClone({
     root: clone, env, runSmoke: smoke, prState: async () => 'OPEN', log: { error: (m) => logs.push(m) },
   });

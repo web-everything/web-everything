@@ -53,6 +53,7 @@ export function alertsFilePath(root, env = process.env) {
 }
 
 const EMPTY_STATE = Object.freeze({
+  setAside: undefined,
   adopted: null, rejected: null, inProgress: null, quarantine: null, unverified: null, building: null, held: null, busySkippedTrees: null, forceUnverifiedTrees: null, smokePassed: null, pinnedNotified: null,
 });
 
@@ -131,6 +132,15 @@ function readState(root, env, strict, read = readFileSync) {
         throw new Error(`Invalid rebuild state ${key}`);
       }
     }
+    // Legacy/missing continuity remains unknown (undefined), not a known empty map.
+    // Planning must require audit evidence before any omitted content can return.
+    // Present malformed records are unknown to ordinary ticks; strict admission refuses them.
+    const validSetAside = parsed?.setAside == null || (object(parsed.setAside)
+      && Object.entries(parsed.setAside).every(([ref, v]) => fields(v,
+        { eligible: v => v === true, ref: string, sha: v => typeof v === 'string' && FULL_SHA_RE.test(v),
+          mainSha: v => typeof v === 'string' && FULL_SHA_RE.test(v), reason: v => v === 'main-sync-conflict',
+          files: v => strings(v) && v.length > 0 }) && ref === v.ref));
+    if (strict && !validSetAside) throw new Error('Invalid rebuild state setAside');
     if (strict) return parsed; // Preserve the one validated snapshot, without legacy coercion.
     return {
       adopted: parsed?.adopted ?? null,
@@ -144,6 +154,7 @@ function readState(root, env, strict, read = readFileSync) {
       forceUnverifiedTrees: parsed?.forceUnverifiedTrees ?? null,
       smokePassed: parsed?.smokePassed ?? null,
       pinnedNotified: parsed?.pinnedNotified ?? null,
+      setAside: validSetAside ? parsed?.setAside : undefined,
     };
   } catch (error) {
     if (strict && error?.code !== 'ENOENT') throw error;
@@ -217,7 +228,14 @@ export function readReadyCandidateStrict(root, env = process.env, read = readFil
     && (!FULL_SHA_RE.test(r.prevHead) || !FULL_SHA_RE.test(r.adopt.mainSha))) throw new Error('Invalid ready pin history bounds');
   // Pre-upgrade normal candidates omitted forced; normalize only after validating
   // present values, without rewriting the persisted evidence.
-  return { forced: false, ...r };
+  // Invalid smoke metadata must retain the candidate's strict gate, never discard
+  // the record into a non-strict rebuild or preserve an untrusted smoke mark.
+  if ((Object.hasOwn(r, 'strictAdopt') && !boolean(r.strictAdopt))
+    || (Object.hasOwn(r, 'freshSmoke') && r.freshSmoke !== null
+      && (typeof r.freshSmoke !== 'string' || !FULL_SHA_RE.test(r.freshSmoke)))) {
+    return { forced: false, ...r, strictAdopt: true, freshSmoke: null };
+  }
+  return { forced: false, ...r, strictAdopt: r.strictAdopt !== false, freshSmoke: r.freshSmoke ?? null };
 }
 
 // A readable record can outlive its proof. Only adoption needs live pin proof;

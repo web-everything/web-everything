@@ -32,7 +32,7 @@ import {
   readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
-import { planRebuild } from './plan.mjs';
+import { planRebuild, planStrictAdopt } from './plan.mjs';
 import { askPinMoved } from './orchestrator-ask.mjs';
 import { readPendingDrops } from '../overlay-drop-pending.mjs';
 import { detectOverlayStale } from './overlay-prune.mjs';
@@ -410,8 +410,15 @@ export async function prepareRebuild({
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
   const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
+  let mainSyncConflicts = {};
+  try {
+    // The sync worker imports daemon-self-sync/rebuild; load it after module initialization.
+    const { readMainSyncConflicts } = await import('./overlay-main-sync.mjs');
+    mainSyncConflicts = readMainSyncConflicts(root, env);
+  }
+  catch (error) { alert('overlay-main-sync-state-unknown', { message: `${error.message}; keeping existing overlay loss protections — repair main-sync state` }); }
   const plan = await planRebuild({
-    auditedTip: makeAuditedTipGate(env),
+    auditedTip: makeAuditedTipGate(env), mainSyncConflicts, setAside: state.setAside === undefined ? null : state.setAside ?? {},
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
     prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
@@ -427,6 +434,8 @@ export async function prepareRebuild({
   if (!strictState && chainOf.fresh?.size > 0) {
     try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
+  // Omission records describe adopted content only. Finalize commits them after smoke.
+  const asideBefore = state.setAside ?? {};
   // overlay-pin — `overlay-pinned` is logged ONCE per (ref, new tip), not every tick the pin holds; the record
   // (`state.pinnedNotified`: ref → the new tip last reported) is pruned only after a complete plan.
   const pinnedBefore = state.pinnedNotified && typeof state.pinnedNotified === 'object' ? state.pinnedNotified : {};
@@ -436,6 +445,10 @@ export async function prepareRebuild({
   if (!plan.ok) Object.assign(pinnedNow, pinnedBefore);
   let askAlerted = false;
   for (const event of plan.alerts || []) {
+    // A set-aside has one actionable notice; do not also repeat the resolver's
+    // lower-level unresolved diagnostic on every otherwise healthy rebuild tick.
+    if (event.kind === 'overlay-conflict-unresolved'
+      && plan.decisions?.some(d => d.ref === event.detail.ref && d.setAside)) continue;
     // unaudited-tip shares the once-per-(ref, new tip) record, but under a kind-tagged value: a tip held back for
     // audit on one tick can be pinned on the next (its record lands, then it conflicts), and that pin notice must
     // still log. The record is pruned as soon as a plan stops reporting it.
@@ -451,6 +464,16 @@ export async function prepareRebuild({
       // The branch's own fixer still learns its new head conflicts (the wake keeps its first `at`).
       if (!strictState && event.kind === 'overlay-pinned' && pr != null) markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
       if (Object.hasOwn(pinnedBefore, ref) && pinnedBefore[ref] === noticeKey) continue;
+    }
+    if (event.kind === 'overlay-main-sync-set-aside') {
+      // Keep the fixer wake even though the lower-level unresolved alert is suppressed.
+      if (!strictState && event.detail.pr != null) {
+        const { pr, ref, files } = event.detail;
+        markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
+      }
+      const old = asideBefore[event.detail.ref];
+      if (old?.sha === event.detail.sha && JSON.stringify(old.files) === JSON.stringify(event.detail.files)) continue;
+      if (!strictState) appendOverlayEvent(root, { kind: event.kind, ...event.detail }, { env });
     }
     alert(event.kind, event.detail);
     if (!strictState && event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {
@@ -507,6 +530,19 @@ export async function prepareRebuild({
   const contains = (sha, build) => !!build && git(['merge-base', '--is-ancestor', sha, build]).status === 0;
   const lost = mainOnly ? [] : (plan.establishedLost ?? []).filter((l) => !(l.sha
     && contains(l.sha, prevHead) && contains(l.sha, plan.finalSha)));
+  const omitted = mainOnly ? [] : plan.decisions.filter(d => d.setAside).map(d => ({
+    ref: d.ref, pr: d.pr, sha: d.sha, reason: 'conflict', files: d.files,
+  }));
+  // Repair launch is independent of the live-overlay hold: a safe omission still
+  // needs its branch rebased, while only establishedLost blocks the build.
+  if (!strictState && omitted.length > 0) {
+    try {
+      const setting = autoRebase.resolveAutoRebaseSwitch(env);
+      if (setting.enabled) await autoRebase.kickAutoRebase({ root, env, lost: omitted });
+    } catch (error) { alert('overlay-conflict-unresolved', {
+      refs: omitted.map(o => o.ref), message: `automatic rebase unavailable; rebase the set-aside branches manually: ${error.message}`,
+    }); }
+  }
   if (!mainOnly && lost.length > 0) {
     const detail = {
       refs: lost.map((l) => l.ref), lost,
@@ -557,7 +593,7 @@ export async function prepareRebuild({
       if (refused) return terminal({ moved: false, reason: refused, plan });
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason, ...proof }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
-    } else if (d.action === 'drop') {
+    } else if (d.action === 'drop' && !d.setAside) {
       alert('overlay-conflict-dropped', {
         ref: d.ref, reason: d.reason, ...(d.files ? { files: d.files } : {}),
       });
@@ -744,8 +780,12 @@ export async function prepareRebuild({
           stateOpts,
           now,
           plan: m.adopt,
+          pinPlan: plan,
           prevHead,
           lease: { token: ready.token ?? null },
+          mainOnly,
+          strictAdopt: ready.strictAdopt !== false || planStrictAdopt(plan),
+          freshSmoke: typeof ready.freshSmoke === 'string' ? ready.freshSmoke : null,
           onAdopted: m.dropRefs.length
             ? ({ alert: finAlert }) => dropSuspectOverlays({
               root, env, suspects: m.dropRefs, failed: m.failed, alert: finAlert,
@@ -823,7 +863,9 @@ export async function prepareRebuild({
   const busyTrees = Array.isArray(state.busySkippedTrees) ? state.busySkippedTrees : [];
   const headTree = busyTrees.length ? verifyRev(git, `${prevHead}^{tree}`) : null;
   const busyUnverified = busyTrees.length > 0 && (!headTree || busyTrees.includes(headTree));
-  if (typeof skipCheck === 'function' && state.adopted?.head === prevHead && !state.held && !state.quarantine
+  // An omission (set-aside or dropped overlay) changes what runs: it always gets the full candidate smoke.
+  const hasOmission = planStrictAdopt(plan);
+  if (typeof skipCheck === 'function' && !hasOmission && state.adopted?.head === prevHead && !state.held && !state.quarantine
     && !busyUnverified && !buildLeaseIsLive(state.building, { env: stEnv, nowMs: nowMs() })) {
     // --no-renames: a renamed file must list BOTH endpoints, or a renamed-away imported module hides from the closure.
     // -z: NUL-separated, so a non-ASCII path is not C-quoted into a string that never matches a closure member.
@@ -860,7 +902,7 @@ export async function prepareRebuild({
       } else {
       log?.error?.(`daemon-rebuild: skipped rebuild+smoke for ${String(plan.finalSha).slice(0, 9)} — ${d.reason} (daemonRebuild.skipUnrelated)`);
       const fin = await finalizeRebuild({
-        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null },
+        root, env, log, run, stateOpts, now, plan, prevHead, lease: { token: null }, mainOnly,
       });
       const { alerts: finAlerts = [], ...finResult } = fin;
       return {

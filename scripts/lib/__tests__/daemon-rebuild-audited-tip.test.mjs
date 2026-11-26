@@ -210,6 +210,24 @@ describe('unaudited-tip plans', () => {
     expect(ok.applied).toEqual([{ ref, pr: 42, sha: b2 }]);
     expect(ok.alerts.some(a => a.kind === 'established-overlay-dropped')).toBe(false);
   });
+  it('strict omitted-base adoption holds a new stack top containing a set-aside unaudited tip', async () => {
+    const f = await fixture();
+    const child = 'lane/child';
+    write(f.root, 'c.txt', 'child on unaudited B');
+    gitOk(f.root, ['add', '-A']);
+    gitOk(f.root, ['commit', '-q', '-m', 'child on B']);
+    const top = gitOk(f.root, ['rev-parse', 'HEAD']);
+    gitOk(f.root, ['update-ref', `refs/remotes/origin/${child}`, top]);
+    const p = await f.plan({
+      overlays: [{ ref, pr: 42 }, { ref: child, pr: 43 }], stackMode: 'tops',
+      prState: async () => 'OPEN', prBaseChain: async pr => pr === 43 ? [ref] : [],
+      setAside: { [ref]: { sha: f.a } },
+    });
+    expect(p.ok).toBe(true);
+    expect(p.decisions.find(d => d.ref === child)).toMatchObject({ action: 'skip', reason: 'unaudited-tip-held' });
+    expect(p.applied.some(a => a.ref === child)).toBe(false);
+  });
+
   it('stack fallback never applies an unaudited tip: the set-aside base returns at its adopted head', async () => {
     const f = await fixture();
     // child C is built on unaudited B and conflicts with main, so the base (set aside as stack-contained) falls back.

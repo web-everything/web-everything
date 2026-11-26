@@ -109,7 +109,8 @@ function makeFixture() {
 }
 
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+    smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }));
 }
 
 

@@ -20,6 +20,7 @@ import {
   addOverlay, resolveOverlayStackMode, OVERLAY_STACK_MODE_ENV, makePrBaseChain, persistStackBases, readOverlays, GH_TIMED_OUT,
 } from '../daemon-overlays.mjs';
 import { gitRun } from '../main-staleness.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -109,7 +110,8 @@ function fixture({ githubLike = false } = {}) {
   return { clone, author, env, init, bOld, ladder, last, ruling, moveBase, runGit, fetch, push, adopt, build };
 }
 
-const passSmoke = () => vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+const passSmoke = () => vi.fn(async () => ({ verdict: 'pass', attempts: 1,
+  smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }));
 
 describe('held item 212 — stacked overlays apply as stack tops', () => {
   it('live 2026-10-10: #4756 moved and is live; #4792/#4797/#4757 go live as tops, #4756 is set aside and logged', async () => {

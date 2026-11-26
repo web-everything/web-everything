@@ -15,6 +15,7 @@ import { planRebuild, rebuildClone } from '../daemon-rebuild.mjs';
 import { addOverlay } from '../daemon-overlays.mjs';
 import { gitRun } from '../main-staleness.mjs';
 import { readOverlayConflictWakes } from '../overlay-conflict-wake.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
 
@@ -84,7 +85,9 @@ function fixture() {
 }
 
 const passSmoke = () => vi.fn(async () => ({
-  verdict: 'pass', attempts: 1, smoke: { results: [{ name: 'reconcile-dry-run', ok: true, ms: 148_000 }, { name: 'lane-acquire-release', ok: true, ms: 32_000 }] },
+  verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(({ name }) => ({
+    name, ok: true, ms: name === 'reconcile-dry-run' ? 148_000 : name === 'lane-acquire-release' ? 32_000 : 0,
+  })) },
 }));
 
 describe('x5059uu — rebuild keeps established overlays and parks the conflicting newcomer', () => {
@@ -424,7 +427,7 @@ describe('x5059uu — rebuild keeps established overlays and parks the conflicti
 
     const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, BAD))
       ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', mayBeTransient: false, detail: `exited 1: file://${root}/${BAD}:20` }] } }
-      : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+      : { verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } }));
     const second = await rebuildClone({ root: f.clone, env: f.env, runSmoke, prState: async () => 'OPEN' });
 
     expect(second.reason).not.toBe('overlay-set-aside');

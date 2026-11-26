@@ -28,6 +28,7 @@ import { overlayRetiredByOperator, readyBuildVerified } from '../daemon-rebuild/
 import * as adoption from '../daemon-rebuild/adopt.mjs';
 import { OPERATOR_LOGINS } from '../marker-authorship.mjs';
 import * as preparation from '../daemon-rebuild/prepare.mjs';
+import { SMOKE_CHECKS } from '../daemon-live-smoke.mjs';
 process.env.WE_DAEMON_OVERLAY_FOLLOW_TIP = 'follow'; // legacy tip-following; the audited-tip gate has its own test
 
 const tempDirs = [];
@@ -88,7 +89,8 @@ function makeFixture() {
 }
 
 const LOCK_OPTS = { waitMs: 1500, pollMs: 20 };
-const PASS = { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+const PASS = { verdict: 'pass', attempts: 1,
+  smoke: { results: SMOKE_CHECKS.map(({ name }) => ({ name, ok: true })) } };
 const FAIL = { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } };
 
 /** A passing smoke during which a SIBLING daemon starts a tick (takes a read slot) and is still ticking when the
@@ -119,6 +121,9 @@ describe('the Git proof of omitted content in the candidate build', () => {
     delete env.WE_DAEMON_OVERLAY_EDGE_RESOLVE;
     const ref = 'lane/benign-removal';
     const tip = pushBranch(originDir, ref, (dir) => writeFile(dir, 'removed.txt', 'overlay content\n'));
+    // Missing omission history requires evidence even for this fixture's first adoption.
+    env.WE_FIX_READY_PATH = join(mktemp('we-ready-audit-'), 'fix-ready.jsonl');
+    writeFileSync(env.WE_FIX_READY_PATH, `${JSON.stringify({ ref, sha: tip, tests: 'green', audit: 'NOT WEAKENED' })}\n`);
     addOverlay(cloneDir, { ref, now: '2026-11-18T20:00:00Z' }, { env });
     appendOverlayEvent(cloneDir, { kind: 'added', ref, at: '2026-11-18T20:00:00Z' }, { env });
     const options = { root: cloneDir, env, lockOpts: LOCK_OPTS };

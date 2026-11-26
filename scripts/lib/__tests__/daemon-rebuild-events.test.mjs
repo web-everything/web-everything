@@ -301,13 +301,14 @@ describe('rebuildClone coordination events', () => {
       'readonly-job-mutation-due',
       'adopted', 'already-adopted', 'already-head', 'already-on-main', 'applied', 'applied-',
       'applied-pinned', 'applied-retry', 'applied-stack-fallback', 'auto-rebase of ',
-      'branch-not-allowlisted', 'clone-recloned', 'conflict', 'deps-job-running', 'deps-job-spaced',
+      'branch-not-allowlisted', 'clone-recloned', 'conflict', 'conflict-evidence-unknown', 'deps-job-running', 'deps-job-spaced',
       'deps-job-started', 'detached-off-main', 'detached-or-unreadable-head', 'detached-with-changes',
       'diff-unknown', 'dirty', 'disabled', 'dispatch-smoke', 'executable-or-runtime-file-change',
       'expired', 'fallback-inputs-moved', 'fallback-not-allowed', 'fallback-plain-main', 'forced-sha-pinned',
       'forced-watch-missing', 'forced-watch-owed', 'forced-watch-unreadable',
       'harness-broken-adopted-not-worse', 'held-after-rollback', 'imported-change', 'in-main',
       'index-locked', 'invalid-ready-applied', 'invalid-probation', 'local-commits', 'manifest-or-config-change', 'merge-in-progress',
+      'main-conflict-free', 'main-sync-conflict', 'running-history-unknown', // set-aside eligibility diagnostics
       'merge conflicts remain after the ref tip moved', // overlay-main-sync-conflict diagnostic
       'needs-build', 'no-change', 'no-local-main', 'no-lockfile', 'no-result', 'non-store-changes',
       'none', 'none of ', 'not-on-main', 'not-state-files', 'operation-in-progress', 'origin/main ',

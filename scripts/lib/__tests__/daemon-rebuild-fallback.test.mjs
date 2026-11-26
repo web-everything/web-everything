@@ -29,6 +29,7 @@ import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
+import * as rebuildPlan from '../daemon-rebuild/plan.mjs';
 
 // Pre-dates daemonRebuild.skipUnrelated: these tests assert a smoke runs for non-code moves, so pin the knob off.
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -124,8 +125,10 @@ function makeFixture() {
   };
 }
 
+// A COMPLETE passing table (strict adoption only accepts a fresh complete smoke pass).
+const fullPass = () => ({ verdict: 'pass', attempts: 1, smoke: { results: SMOKE_CHECKS.map(c => ({ name: c.name, ok: true })) } });
 function passSmoke() {
-  return vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+  return vi.fn(async () => fullPass());
 }
 
 // x5wbsbc — a smoke that fails ONLY the candidate carrying `file` and passes every other tree (in particular the
@@ -133,7 +136,7 @@ function passSmoke() {
 function failsWhenFile(file, result) {
   return vi.fn(async ({ root }) => (existsSync(join(root, file))
     ? result
-    : { verdict: 'pass', attempts: 1, smoke: { results: [] } }));
+    : fullPass()));
 }
 
 const LOCK_OPTS = { waitMs: 2000, pollMs: 20 };
@@ -204,7 +207,7 @@ describe('rebuildClone passes candidateSmokeEnv to runSmoke', () => {
     const calls = [];
     const runSmoke = vi.fn(async (args) => {
       calls.push(args);
-      return { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+      return fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -291,6 +294,28 @@ describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
     expect(result.alerts.some((a) => a.kind === 'overlay-set-aside-attributed')).toBe(attributable);
     if (!attributable) expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('a fallback whose plain-main smoke reused a row from an earlier run is NOT adopted (no fresh smoke)', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'bad.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/bad' }, { env });
+    const reusedPass = () => {
+      const pass = fullPass();
+      pass.smoke.results[0] = { ...pass.smoke.results[0], reused: true };
+      return pass;
+    };
+    const runSmoke = vi.fn(async ({ root }) => (existsSync(join(root, 'bad.txt'))
+      ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
+      : reusedPass()));
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(result.adopted).not.toBe(true);
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(readOverlays(cloneDir, { env }).map(o => o.ref)).toEqual(['lane/bad']);
   });
 
   it('a bad NON-pinned overlay: falls back to plain main, adopts it, drops the overlay, alerts both kinds', async () => {
@@ -515,6 +540,36 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
+  it('strict set-aside adoption holds when candidate and last-good share a broken harness', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1';
+    pushBranch(originDir, 'lane/harness-fix', dir => writeFile(dir, 'harness-fix.txt', 'fix\n'));
+    addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const originalPlan = rebuildPlan.planRebuild;
+    const planner = vi.spyOn(rebuildPlan, 'planRebuild').mockImplementation(async options => {
+      const plan = await originalPlan(options);
+      plan.decisions.push({ ref: 'lane/omitted', action: 'skip', setAside: { eligible: true } });
+      return plan;
+    });
+    const runSmoke = vi.fn(async () => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [{ ok: false, name: 'reconcile-dry-run', detail: 'shared cross-org auth failure' }] },
+    }));
+    try {
+      const result = await rebuildClone({
+        root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+      });
+      expect(runSmoke).toHaveBeenCalledTimes(2); // A + C: the pinned overlay prevents B.
+      expect(result.reason).not.toBe('harness-broken-adopted-not-worse');
+      expect(result.reason).toBe('smoke-harness-broken');
+      expect(result.adopted).not.toBe(true);
+      expect(result.moved).toBe(false);
+      expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+      expect(readRebuildState(cloneDir, env).held?.reason).toBe('smoke-harness-broken');
+    } finally { planner.mockRestore(); }
+  });
+
   it('rejects a candidate failing x and y when the last-good control fails only x', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
@@ -592,7 +647,7 @@ describe('single-flight build lease across the fallback (x5wbsbc on #2731)', () 
       heldDuring.push(!!readRebuildState(cloneDir, env).building);
       return existsSync(join(root, 'lease-bad.txt'))
         ? { verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'x', detail: 'boom' }] } }
-        : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+        : fullPass();
     });
     const result = await rebuildClone({
       root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
@@ -681,7 +736,7 @@ const loadFail = () => ({
     ],
   },
 });
-const PASS = () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } });
+const PASS = () => fullPass();
 
 async function loadFixture(ref = 'lane/verify-pool-scan-non-dir', pr = 3903) {
   const fx = makeFixture();
