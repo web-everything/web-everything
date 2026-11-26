@@ -29,9 +29,19 @@ export default {
     const kinds = result => result.dispatch.map(d => d.kind);
     const violations = [];
     if (JSON.stringify(kinds(plan(['review:changes']))) !== JSON.stringify(['rearm-no-code'])) violations.push('initial ruling did not plan one mechanical rearm');
+    for (const label of ['red-team:blocked', 'red-team:pending']) {
+      const result = plan(['review:changes', label], 'b'.repeat(40));
+      if (JSON.stringify(kinds(result)) !== JSON.stringify(['fix'])) violations.push(`${label}: changed head did not resume ordinary fix planning`);
+      if (result.refusals.some(r => r.kind.startsWith('no-code-rearm'))) violations.push(`${label}: obsolete ruling still holds changed head`);
+    }
     comments.push(c('receipt', NO_CODE_REARM_RECEIPT('answer', head)), c('rearmed', REARM_COMMENT_MARKER));
     if (kinds(plan(['review:pending'])).includes('fix')) violations.push('rearmed pending review dispatched a fixer');
     comments.push({ ...verdict, id: 'new-verdict' });
+    for (const label of ['red-team:blocked', 'red-team:pending']) {
+      const result = plan(['review:changes', label]);
+      if (JSON.stringify(kinds(result)) !== JSON.stringify(['fix'])) violations.push(`${label}: later verdict did not resume ordinary fix planning`);
+      if (result.refusals.some(r => r.kind.startsWith('no-code-rearm'))) violations.push(`${label}: obsolete ruling still holds later verdict`);
+    }
     if (JSON.stringify(kinds(plan(['review:changes']))) !== JSON.stringify(['fix'])) violations.push('later changes verdict did not resume ordinary fix planning');
     if (JSON.stringify(kinds(plan(['review:changes'], 'b'.repeat(40)))) !== JSON.stringify(['fix'])) violations.push('changed head did not resume ordinary fix planning');
     return { violations };

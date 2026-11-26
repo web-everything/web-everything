@@ -766,10 +766,10 @@ Fix defect`);
     const release = s.options.acquireRearmLock({ repoSlug: 'web-everything/web-everything', prNumber: 42 });
     release();
   });
-  it('actual rearm-review writer transitions labels once across two executor ticks', () => {
+  function actualWriterFixture(comments = thread()) {
     const stateFile = join(lockRoot, 'state.json');
     const ghPath = join(lockRoot, 'gh');
-    writeFileSync(stateFile, JSON.stringify({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments: thread(), writes: [] }));
+    writeFileSync(stateFile, JSON.stringify({ state: 'OPEN', headRefOid: head, labels: ['review:changes'], comments, writes: [] }));
     writeFileSync(ghPath, [
       `#!${process.execPath}`,
       "const fs = require('node:fs');",
@@ -778,7 +778,7 @@ Fix defect`);
       "if (a[0] === 'pr' && a[1] === 'view') console.log(JSON.stringify(s));",
       "else if (a[0] === 'api' && a[1].includes('/comments')) console.log(JSON.stringify([s.comments]));",
       "else if (a[0] === 'pr' && a[1] === 'edit') { s.labels = s.labels.filter(l => !a.some((v,i) => v === '--remove-label' && a[i+1] === l)); const i = a.indexOf('--add-label'); if (i >= 0) s.labels.push(a[i+1]); s.writes.push('labels'); save(); }",
-      "else if (a[0] === 'pr' && a[1] === 'comment') { const body = fs.readFileSync(a[a.indexOf('--body-file')+1], 'utf8'); s.comments.push({ id: 'writer-comment', body, author: { login: 'web-everything' } }); s.writes.push('comment'); save(); }",
+      "else if (a[0] === 'pr' && a[1] === 'comment') { const file = a[a.indexOf('--body-file')+1]; const body = fs.readFileSync(file === '-' ? 0 : file, 'utf8'); s.comments.push({ id: 'writer-comment', body, author: { login: 'web-everything' } }); s.writes.push('comment'); save(); }",
       "else { console.error('unexpected hermetic gh call', a); process.exit(1); }",
     ].join('\n'));
     chmodSync(ghPath, 0o755);
@@ -789,6 +789,10 @@ Fix defect`);
         WE_GH_THROTTLE_LOCK_ROOT: join(lockRoot, 'throttle'), REARM_TEST_STATE: stateFile },
     }) }));
     const postComment = vi.fn(({ comment }) => { const s = read(); s.comments.push(c('receipt', comment)); s.writes.push('receipt'); writeFileSync(stateFile, JSON.stringify(s)); });
+    return { read, writer, postComment, write: state => writeFileSync(stateFile, JSON.stringify(state)) };
+  }
+  it('actual rearm-review writer transitions labels once across two executor ticks', () => {
+    const { read, writer, postComment } = actualWriterFixture();
     const planned = [];
     const reconcile = () => {
       const result = planReconcile({ agents: [], requiredChecks: ['gate'], prs: [{ ...read(), number: 42,
@@ -812,6 +816,66 @@ Fix defect`);
     expect(writer).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledTimes(1);
   }, 120000);
+  it.each([false, true])('receipted replacement preserves consumed writer budgets: noCodeOwed=%s', noCodeOwed => {
+    const ordinary = (id, standDownId) => c(id, buildOperatorAnswer({ standDownId, actor: 'chalbert',
+      reason: 'Allow one retry', channel: 'chat', disposition: 'rearm-review' }));
+    const exhausted = [verdict, begin, { ...stop, id: 'waiver-stop-1' }, ordinary('waiver-1', 'waiver-stop-1'),
+      { ...begin, id: 'begin-2' }, { ...stop, id: 'waiver-stop-2' }, ordinary('waiver-2', 'waiver-stop-2'),
+      { ...begin, id: 'begin-3' }, stop, answer, c('original-receipt', NO_CODE_REARM_RECEIPT('answer', head))];
+    const replacement = c('replacement', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert',
+      reason: 'Inspected failed handoff', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true, supersedes: 'answer' }));
+    const { read, write, writer, postComment } = actualWriterFixture([...exhausted, replacement]);
+    const s = setup({ reconcile: () => ({ dispatch: [{ ...entry, answerId: 'replacement' }], refusals: [] }),
+      readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
+      postComment: args => {
+        postComment(args);
+        // A new empty round arrives after admission. The replacement must not reset either
+        // of the two spent waivers or the single spent no-code cap override in the writer.
+        const state = read();
+        state.comments.push({ ...begin, id: 'begin-4' }, { ...stop, id: 'stop-4' },
+          c('over-budget', buildOperatorAnswer({ standDownId: 'stop-4', actor: 'chalbert',
+            reason: 'Retry again', channel: 'chat', disposition: 'rearm-review', noCodeOwed })));
+        write(state);
+      },
+    });
+    const first = s.run();
+    expect(first.dispatched).toEqual([]);
+    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(writer.mock.results[0].value.status).toBe(1);
+    expect(writer.mock.results[0].value.stdout).toContain('no change made');
+    expect(read().labels).toEqual(['review:changes']);
+    expect(read().writes.filter(kind => kind === 'labels')).toEqual([]);
+    const after = read();
+    expect(s.run().dispatched).toEqual([]);
+    expect(read()).toEqual(after);
+    expect(writer).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledTimes(1);
+  }, 120000);
+  it.each(['red-team:blocked', 'red-team:pending', 'changes verdict', 'stand-down'])(
+    'post-receipt %s permits exactly one extra review through the actual writer', lateEvidence => {
+      const { read, write, writer, postComment } = actualWriterFixture();
+      const s = setup({ readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
+        postComment: args => {
+          postComment(args);
+          const state = read();
+          if (lateEvidence.startsWith('red-team:')) state.labels.push(lateEvidence);
+          else state.comments.push({ ...(lateEvidence === 'changes verdict' ? verdict : stop), id: 'late-evidence' });
+          write(state);
+        },
+      });
+      // Pin the disclosed admission-to-writer window; the receipt still bounds the attempt.
+      expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+      expect(read().labels).toContain('review:pending');
+      expect(read().labels).not.toContain('review:changes');
+      expect(read().labels).not.toContain('review:accepted');
+      const after = read();
+      expect(s.run().dispatched).toEqual([]);
+      expect(read()).toEqual(after);
+      expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
+      expect(writer).toHaveBeenCalledTimes(1);
+      expect(postComment).toHaveBeenCalledTimes(1);
+    }, 120000);
   it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {
     const readClaim = vi.fn(() => { if (mode === 'unreadable') throw Error('store unreadable'); return { meta: { who: 'fixer' } }; });
     const s = setup({ readClaim });

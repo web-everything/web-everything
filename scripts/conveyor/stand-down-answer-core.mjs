@@ -269,7 +269,6 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
   if (!ruledHead) return held('stand-down has no head; a fresh answer is needed');
   if (!Array.isArray(labels) || !labels.every(l => typeof l === 'string')) return held('labels unreadable');
   if (!labels.includes('review:changes')) return result('none', 'review:changes is gone', answerId);
-  if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
   // A ruling only owns its original window. Later work/verdicts and pushes retire it for
   // ordinary planning, while the executor still refuses every result except `ready`.
   if (!headRefOid.toLowerCase().startsWith(ruledHead.toLowerCase())) return result('none', 'ruling superseded by a changed head', answerId);
@@ -278,6 +277,7 @@ export function noCodeRearmPlan({ comments, labels, headRefOid } = {}) {
     || /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i.test(c.body))) {
     return result('none', 'ruling superseded by a later fix claim or changes verdict', answerId);
   }
+  if (labels.some(l => ['red-team:blocked', 'red-team:pending'].includes(l))) return held('red-team hold stands');
   if (!noCodeRearmWindowHonours(comments.slice(0, answerAt), answer, headRefOid)) return held('answer does not clear the rearm window');
   if (comments.indexOf(latestUnresolvedStandDown(comments)) > answerAt) return held('unanswered stand-down after answer');
   if (comments.some(c => parseNoCodeRearmReceipt(c)?.answerId === answerId)

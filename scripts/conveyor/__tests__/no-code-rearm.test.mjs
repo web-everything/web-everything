@@ -89,6 +89,18 @@ describe('no-code rearm predicate', () => {
 });
 
 describe('no-code rearm planning', () => {
+  it.each(['red-team:blocked', 'red-team:pending'].flatMap(label => [
+    { label, cause: 'changed head', thread: comments, headRefOid: 'b'.repeat(40) },
+    { label, cause: 'later changes verdict', thread: [...comments, verdict], headRefOid: HEAD },
+    { label, cause: 'later fix claim', thread: [...comments, begin], headRefOid: HEAD },
+  ]))('superseded no-code ruling does not hold a red-team fix: $label / $cause', ({ label, thread, headRefOid }) => {
+    const labels = ['review:changes', label];
+    expect(predicate({ comments: thread, labels, headRefOid })).toMatchObject({ state: 'none' });
+    const result = plan(thread, { labels, headRefOid });
+    expect(result.refusals.filter(r => r.kind.startsWith('no-code-rearm'))).toEqual([]);
+    expect(result.dispatch.some(d => d.kind === 'rearm-no-code')).toBe(false);
+    expect(result.dispatch.map(d => d.kind)).toEqual(['fix']);
+  });
   it.each([7, 9, 39, 40])('ceremony and planner agree on an unchanged %i-character stand-down SHA', length => {
     const body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD.slice(0, length) });
     const pinned = c('stop', body.replace(/head=([0-9a-f]+)/, (_, sha) => `head=${sha.toUpperCase()}`));

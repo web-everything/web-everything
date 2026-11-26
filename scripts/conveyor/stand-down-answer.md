@@ -90,3 +90,10 @@ before another replacement. The receipt must name the prior answer and the curre
 untrusted receipts, an intervening stand-down, fix claim, changes verdict, successful rearm or no-change
 marker, or a moved head refuse recovery. This exception does not replenish the shared writer's waiver
 or cap-override budget. Full and abbreviated stand-down SHAs use the same case-insensitive prefix match.
+
+Regression coverage: `superseded no-code ruling does not hold a red-team fix` in
+`scripts/conveyor/__tests__/no-code-rearm.test.mjs` combines retirement with both red-team holds;
+`receipted replacement preserves consumed writer budgets` in
+`scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs` exercises the actual writer's
+exhausted waiver and cap-override refusals. The same file's `post-receipt ... permits exactly one
+extra review through the actual writer` cases pin the accepted late-evidence window and its one-attempt bound.
