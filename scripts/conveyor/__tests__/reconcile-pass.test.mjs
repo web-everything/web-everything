@@ -1268,6 +1268,148 @@ import timeoutTs from 'typescript';
 import { classifyTimeoutEvidence, parseTimeoutFailures, enrichPrsWithTimeoutEvidence, readTimeoutEvidence, timeoutImpact, isDerivedTimeoutCheck } from '../reconcile-pass.mjs';
 import { planReconcile as timeoutPlanReconcile } from '../reconcile-core.mjs';
 
+describe('failed CI step timeout attribution', () => {
+  const repo = 'web-everything/web-everything', head = 'a'.repeat(40), prefix = `repos/${repo}`;
+  const at = seconds => `2026-11-24T12:00:${String(seconds).padStart(2, '0')}Z`;
+  const step = (number, name, conclusion, start, end) => ({ number, name, status: 'completed', conclusion,
+    started_at: at(start), completed_at: at(end) });
+  const timeout = ' FAIL unit.test.mjs > suite > timeout\nError: Test timed out in 5000ms.\n Test Files 1 failed\n Tests 1 failed\n Duration 5.2s\n';
+  const stamped = (text, seconds) => text.trimEnd().split('\n').map(line => `${at(seconds)} ${line}\n`).join('');
+  function fixture() {
+    const pr = { number: 3415, headRefOid: head, state: 'OPEN', labels: [], statusCheckRollup: [{
+      name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: `https://github.com/${repo}/actions/runs/10/job/20` }] };
+    const sources = { 'vitest.config.ts': 'export default {test:{}};', 'unit.test.mjs': 'import {it} from "vitest";' };
+    const data = {
+      [`${prefix}/pulls/3415`]: { state: 'open', head: { sha: head }, base: { sha: 'b'.repeat(40) }, changed_files: 1 },
+      [`${prefix}/pulls/3415/files?per_page=100&page=1`]: [{ filename: 'other.mjs' }],
+      [`${prefix}/commits/${head}/check-runs?per_page=100&page=1&filter=latest`]: { total_count: 1, check_runs: [{
+        name: 'test', status: 'completed', conclusion: 'failure', details_url: pr.statusCheckRollup[0].detailsUrl }] },
+      [`${prefix}/commits/${head}/status`]: { total_count: 0 },
+      [`${prefix}/actions/jobs/20`]: { id: 20, run_id: 10, head_sha: head, run_attempt: 1, name: 'test',
+        status: 'completed', conclusion: 'failure', steps: [step(1, 'Passing timeout fixture', 'success', 0, 10), step(2, 'Deploy', 'failure', 20, 30)] },
+      [`${prefix}/actions/runs/10`]: { id: 10, head_sha: head, run_attempt: 1, repository: { full_name: repo }, path: '.github/workflows/ci.yml' },
+      [`${prefix}/actions/jobs/20/logs`]: stamped('Starting job', 0) + stamped(timeout, 5)
+        + stamped('Deploy failed: permission denied', 25) + stamped('Complete job', 40),
+      [`${prefix}/git/trees/${head}?recursive=1`]: { truncated: false, tree: Object.keys(sources).map((path, i) => ({ type: 'blob', path, sha: `blob${i}` })) },
+    };
+    Object.values(sources).forEach((source, i) => { data[`${prefix}/git/blobs/blob${i}`] = { encoding: 'base64', content: Buffer.from(source).toString('base64') }; });
+    const exec = vi.fn((command, args) => {
+      expect(command).toBe('gh'); expect(args[0]).toBe('api');
+      const path = args.at(-1);
+      if (!Object.hasOwn(data, path)) throw new Error(`Unexpected attribution fixture read: ${path}`);
+      return typeof data[path] === 'string' ? data[path] : JSON.stringify(data[path]);
+    });
+    return { data, pr, exec, collect: () => readTimeoutEvidence(pr, { repo, exec, ts: timeoutTs }) };
+  }
+
+  it('passing-step timeout followed by unrelated failed step is ineligible', () => {
+    expect(fixture().collect().eligible).toBe(false);
+  });
+
+  const plan = (f, result) => timeoutPlanReconcile({ prs: [{ ...f.pr, timeoutRetry: result,
+    timeoutRetryBudget: { confirmed: 0, pending: false } }], requiredChecks: ['test'] });
+  const expectInvestigation = (f, result) => {
+    expect(result.eligible).toBe(false);
+    expect(result.reason).toContain('ordinary CI investigation required');
+    expect(f.exec.mock.calls.some(([, args]) => args.at(-1).includes('/git/'))).toBe(false);
+    const out = plan(f, result);
+    expect(out.dispatch.some(row => row.kind === 'ci-timeout-rerun')).toBe(false);
+    expect(out.dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal', timeoutRetryFallback: result.reason }));
+    expect(out.refusals).toContainEqual(expect.objectContaining({ kind: 'timeout-retry-ineligible', why: expect.stringContaining(result.reason) }));
+  };
+
+  it('collector preserves failed-step attribution through eligibility', () => {
+    const failed = fixture(), result = failed.collect();
+    expectInvestigation(failed, result);
+    expect(result.failedSteps).toEqual([{ job: 20, number: 2, name: 'Deploy' }]);
+    expect(result.reason).toContain('2:Deploy');
+    const control = fixture();
+    control.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 25) + stamped('Complete job', 40);
+    const eligible = control.collect();
+    expect(eligible).toMatchObject({ eligible: true, failures: [{ path: 'unit.test.mjs', step: { number: 2, name: 'Deploy' } }] });
+    expect(eligible.jobs[0].steps).toEqual(control.data[`${prefix}/actions/jobs/20`].steps);
+    expect(plan(control, eligible).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun' }));
+  });
+
+  it('CI-LOG-READ-DEADLINE audit replay names the unrelated failed step', () => {
+    // R1085 audit scenario: a complete timeout inventory from a passing step, then a deploy error.
+    // Sanitized replay uses injected API bytes through the production collector; no forge writes.
+    const f = fixture(), result = f.collect();
+    expectInvestigation(f, result);
+    expect(result.failedSteps).toEqual([{ job: 20, number: 2, name: 'Deploy' }]);
+    console.info(`CI-LOG-READ-DEADLINE replay: eligible=${result.eligible}; failed-step=2:Deploy; ${result.reason}`);
+  });
+
+  const mutations = [
+    ['absent metadata', f => { delete f.data[`${prefix}/actions/jobs/20`].steps; }],
+    ['empty metadata', f => { f.data[`${prefix}/actions/jobs/20`].steps = []; }],
+    ['malformed metadata', f => { f.data[`${prefix}/actions/jobs/20`].steps = {}; }],
+    ['missing failed step', f => { f.data[`${prefix}/actions/jobs/20`].steps[1].conclusion = 'success'; }],
+    ['truncated head', f => { f.data[`${prefix}/actions/jobs/20/logs`] = stamped(timeout, 25) + stamped('Complete job', 40); }],
+    ['truncated tail', f => { f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 25); }],
+    ['truncation notice', f => { f.data[`${prefix}/actions/jobs/20/logs`] += stamped('[log truncated]', 41); }],
+    ['absent boundaries', f => { f.data[`${prefix}/actions/jobs/20/logs`] = timeout; }],
+    ['duplicate-name boundaries absent', f => { f.data[`${prefix}/actions/jobs/20`].steps[0].name = 'Deploy'; f.data[`${prefix}/actions/jobs/20/logs`] = timeout; }],
+    ['duplicate step numbers', f => { f.data[`${prefix}/actions/jobs/20`].steps[1].number = 1; }],
+    ['missing completion time', f => { delete f.data[`${prefix}/actions/jobs/20`].steps[1].completed_at; }],
+    ['invalid calendar time', f => { f.data[`${prefix}/actions/jobs/20`].steps[1].started_at = '2026-02-30T12:00:20Z'; }],
+    ['overlapping steps', f => { f.data[`${prefix}/actions/jobs/20`].steps[0].completed_at = at(25); }],
+    ['equal boundaries', f => { f.data[`${prefix}/actions/jobs/20`].steps[0].completed_at = at(20); f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 20) + stamped('Complete job', 40); }],
+    ['nonterminal step', f => { f.data[`${prefix}/actions/jobs/20`].steps[1].status = 'in_progress'; }],
+    ['unknown conclusion', f => { f.data[`${prefix}/actions/jobs/20`].steps[0].conclusion = null; }],
+    ['untimestamped continuation', f => { f.data[`${prefix}/actions/jobs/20/logs`] += 'Error: Test timed out in 5000ms.\n'; }],
+    ['nonmonotonic timestamps', f => { f.data[`${prefix}/actions/jobs/20/logs`] += stamped('old output', 0); }],
+    ['oversized log', f => { f.data[`${prefix}/actions/jobs/20/logs`] += ' '.repeat(2 * 1024 * 1024 + 1); }],
+    ['oversized line', f => { f.data[`${prefix}/actions/jobs/20/logs`] += stamped('x'.repeat(16 * 1024 + 1), 41); }],
+    ['oversized metadata', f => { f.data[`${prefix}/actions/jobs/20`].steps = Array(513).fill(step(1, 'step', 'failure', 0, 30)); }],
+  ];
+  it.each(mutations)('ambiguous timeout attribution routes to investigation: %s', (_name, mutate) => {
+    const f = fixture(); mutate(f);
+    const result = f.collect();
+    expect(result).toMatchObject({ eligible: false, attribution: 'unknown', reason: expect.stringContaining('failed-step-attribution-unknown:') });
+    expectInvestigation(f, result);
+  });
+
+  it('duplicate names are resolved by step numbers and disjoint timestamps, with ANSI stripped', () => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps[0].name = 'Deploy';
+    f.data[`${prefix}/actions/jobs/20/logs`] = '\x1b[32m' + stamped('Starting job', 0) + '\x1b[0m'
+      + stamped(timeout.replace('FAIL', '\x1b[31mFAIL\x1b[0m'), 5)
+      + stamped(timeout, 25) + stamped('Complete job', 40);
+    expect(f.collect()).toMatchObject({ eligible: true, failures: [{ step: { number: 2, name: 'Deploy' } }] });
+  });
+
+  it('requires a complete timeout inventory for every failed step', () => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps[0].conclusion = 'failure';
+    f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 5)
+      + stamped(timeout.replace('unit.test.mjs', 'other.test.mjs'), 25) + stamped('Complete job', 40);
+    f.data[`${prefix}/git/trees/${head}?recursive=1`].tree.push({ type: 'blob', path: 'other.test.mjs', sha: 'other' });
+    f.data[`${prefix}/git/blobs/other`] = { encoding: 'base64', content: Buffer.from('import {it} from "vitest";').toString('base64') };
+    expect(f.collect()).toMatchObject({ eligible: true, failures: [
+      { path: 'unit.test.mjs', step: { number: 1 } }, { path: 'other.test.mjs', step: { number: 2 } },
+    ] });
+    f.exec.mockClear();
+    f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 5)
+      + stamped('Deploy failed: permission denied', 25) + stamped('Complete job', 40);
+    expectInvestigation(f, f.collect());
+  });
+
+  it('refuses an assertion failure alongside a real failed-step timeout', () => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps[0].conclusion = 'failure';
+    f.data[`${prefix}/actions/jobs/20/logs`] = stamped('Starting job', 0) + stamped(timeout, 5)
+      + stamped(timeout.replace('Error: Test timed out in 5000ms.', 'AssertionError: mismatch'), 25) + stamped('Complete job', 40);
+    expectInvestigation(f, f.collect());
+  });
+
+  it('a skipped step without timestamps cannot own a passing-step timeout', () => {
+    const f = fixture();
+    f.data[`${prefix}/actions/jobs/20`].steps.push({ number: 3, name: 'Skipped', status: 'completed', conclusion: 'skipped', started_at: null, completed_at: null });
+    expectInvestigation(f, f.collect());
+  });
+});
+
 it('xng7q1p immutable GitHub reads feed enrichment → planner without checkout-derived scope', () => {
   const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
   const prefix = `repos/${repo}`;
