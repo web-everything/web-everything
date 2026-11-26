@@ -662,3 +662,92 @@ describe('configured settings wrappers executed via sh -c', () => {
     expect(f.command(f.lane,bashCommand,{})).toMatchObject({status:2,stdout:'',stderr:expect.stringContaining('launcher missing')});
   });
 });
+
+
+describe('handoff guard content pins', () => {
+  function handoffFixture() {
+    const f = fixture();
+    f.handoff = join(f.temp, 'handoff');
+    mkdirSync(f.handoff);
+    f.guard = join(f.handoff, 'guard-agent-model.mjs');
+    writeFileSync(f.guard, "console.log('original guard');");
+    f.pin = (mode = '--pin') => spawnSync(process.execPath,
+      [join(f.clone, 'scripts/hooks/sync-guard-clone.mjs'), `--handoff=${f.handoff}`, mode],
+      { cwd: f.lane, env: f.env, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+    f.hook = (name = 'guard-agent-model.mjs') => f.run(f.lane, `--handoff=${f.handoff}`, {}, [name]);
+    return f;
+  }
+  function pin(f) {
+    const result = f.pin();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toMatch(/pinned.*by.*at/i);
+  }
+  it('a matching hash runs the pinned guard', () => {
+    const f = handoffFixture(); pin(f);
+    expect(f.hook()).toMatchObject({ status: 0, stdout: 'original guard\n' });
+  });
+  it('a guard whose content hash differs from the manifest is refused (deny), not run', () => {
+    const f = handoffFixture(); pin(f);
+    writeFileSync(f.guard, "console.log('modified guard');");
+    const result = f.hook();
+    expect(result).toMatchObject({ status: 2, stdout: '' });
+    expect(result.stderr).toContain('content hash differs from the manifest');
+    // Live fixture proof: the same modified file runs only after explicit re-pin.
+    pin(f);
+    expect(f.hook()).toMatchObject({ status: 0, stdout: 'modified guard\n' });
+  });
+  it.each(['missing', 'malformed', 'empty', 'unknown version'])('denies a %s manifest', kind => {
+    const f = handoffFixture(); pin(f);
+    const path = join(f.handoff, 'hooks-manifest.json');
+    if (kind === 'missing') rmSync(path);
+    else writeFileSync(path, kind === 'malformed' ? '{' : JSON.stringify(kind === 'empty' ? {} : { version: 9 }));
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('denies a missing guard file', () => {
+    const f = handoffFixture(); pin(f); rmSync(f.guard);
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('ignores backup files and reports them in the check', () => {
+    const f = handoffFixture();
+    writeFileSync(`${f.guard}.bak`, "throw Error('backup must never run');"); pin(f);
+    const result = f.pin('--check');
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain('ignored backup: guard-agent-model.mjs.bak');
+    expect(f.hook()).toMatchObject({ status: 0, stdout: 'original guard\n' });
+    expect(f.hook('guard-agent-model.mjs.bak')).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('a sync running uses the last-good snapshot', () => {
+    const f = handoffFixture(); pin(f);
+    writeFileSync(f.guard, "console.log('half-written guard');");
+    writeFileSync(`${f.handoff}.hooks-pin-lock`, `${process.pid} ${Date.now() - process.uptime() * 1000} fixture`);
+    const result = f.hook();
+    expect(result).toMatchObject({ status: 0, stdout: 'original guard\n' });
+    expect(result.stderr).toContain('last-good handoff snapshot');
+  });
+  it('denies drift under an abandoned pin lock', () => {
+    const f = handoffFixture(); pin(f);
+    writeFileSync(f.guard, "console.log('drift');");
+    writeFileSync(`${f.handoff}.hooks-pin-lock`, `${deadPid()} 1 fixture`);
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('refuses corrupted snapshot bytes and symlinked guards', () => {
+    const f = handoffFixture(); pin(f);
+    const manifest = JSON.parse(readFileSync(join(f.handoff, 'hooks-manifest.json'), 'utf8'));
+    writeFileSync(join(f.handoff, '.hooks-pinned', manifest.snapshot, 'guard-agent-model.mjs'), "console.log('corrupt');");
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+    rmSync(f.guard); symlinkSync(join(f.temp, 'outside.mjs'), f.guard);
+    writeFileSync(join(f.temp, 'outside.mjs'), "console.log('outside');");
+    expect(f.pin().status).toBe(1);
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+  });
+  it('logs explicit operator break-glass recovery; other flag values still deny', () => {
+    const f = handoffFixture();
+    f.env.WE_GUARD_HANDOFF_BREAK_GLASS = 'true';
+    expect(f.hook()).toMatchObject({ status: 2, stdout: '' });
+    f.env.WE_GUARD_HANDOFF_BREAK_GLASS = '1';
+    const result = f.hook();
+    expect(result).toMatchObject({ status: 0, stdout: 'original guard\n' });
+    expect(result.stderr).toContain('BREAK-GLASS');
+    expect(result.stderr).toContain('WE_GUARD_HANDOFF_BREAK_GLASS');
+  });
+});

@@ -1,6 +1,7 @@
 /** Run guards only from the clone containing this launcher at scripts/hooks/run-pinned-guard.mjs.
  * Preserve the operated checkout as WE_HOOK_ROOT; never fetch from a hook.
  * Usage: run-pinned-guard.mjs [--stop-hook] scripts/<guard>.mjs [guard arguments...]
+ * Handoff: run-pinned-guard.mjs [--stop-hook] --handoff=<directory> <guard>.mjs [arguments...]
  *
  * Locking: hooks run in parallel (six share the Edit|Write matcher), so each launcher takes only a
  * shared lease, a `<clone>.guard-readers/<pid>-<nonce>` file holding its start time. Only sync
@@ -15,7 +16,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const env = { ...process.env };
 for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
@@ -200,7 +201,13 @@ if (stopHook) argv.shift();
 const failureCode = stopHook ? 1 : 2;
 let lease;
 try {
-  const [script, ...args] = argv;
+  const handoff = argv[0]?.startsWith('--handoff=') ? argv.shift().slice(10) : undefined;
+  const handoffGuard = handoff !== undefined ? argv.shift() : undefined;
+  if (handoff !== undefined && !handoff) throw new Error('handoff directory is required');
+  // Verify the launcher and sync helper through the existing clone/snapshot gate
+  // before loading handoff support. Never import code from the operated checkout.
+  const [script, ...args] = handoff !== undefined
+    ? ['scripts/hooks/run-pinned-guard.mjs', ...argv] : argv;
   if (!script?.startsWith('scripts/') || script.split('/').includes('..')) {
     throw new Error('expected a relative path inside scripts without ..');
   }
@@ -246,7 +253,7 @@ try {
     pause(50);
   }
   const scripts = join(clone, 'scripts');
-  const target = good?.target ?? realpathSync(join(clone, script));
+  let target = good?.target ?? realpathSync(join(clone, script));
   // Snapshot bytes were checked against Git objects; only live-clone reads need index checks.
   if (!good) {
     const withinScripts = relative(scripts, target);
@@ -305,6 +312,12 @@ try {
     if (Date.now() - fetchTime > 24 * 60 * 60 * 1000) {
       throw new Error(`guard clone is stale: last sync was more than 24h ago (FETCH_HEAD mtime); ${syncHelp}`);
     }
+  }
+  if (handoff !== undefined) {
+    const { resolveHandoffGuard } = await import(pathToFileURL(join(dirname(target), 'sync-guard-clone.mjs')).href);
+    target = resolveHandoffGuard(handoff, handoffGuard, {
+      breakGlass: env.WE_GUARD_HANDOFF_BREAK_GLASS === '1',
+    });
   }
   const hookRoot = operatedRoot(clone);
   // Run the canonical entry point in place so Node's module URL and argv[1]

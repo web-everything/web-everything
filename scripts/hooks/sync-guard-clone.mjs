@@ -8,10 +8,10 @@
  * itself is serialised behind `<clone>.guard-lock.reclaim`, so a moved-aside lock is never live.
  */
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 // Bootstrap uses only built-ins so a concurrent reset cannot rewrite a lock helper during
@@ -263,7 +263,7 @@ const invokedAsCli = (() => {
   try { return realpathSync(process.argv[1] ?? '') === realpathSync(fileURLToPath(import.meta.url)); }
   catch { return false; }
 })();
-if (invokedAsCli) main();
+
 
 function main() {
 let lock;
@@ -542,4 +542,130 @@ try {
     process.stderr.write(`guard-sync-timing lock_hold_ms=${lockStartedAt === undefined ? 0 : endedAt - lockStartedAt} fetch_ms=${fetchMs} total_ms=${endedAt - startedAt}\n`);
   }
 }
+}
+
+
+/** Handoff pins deliberately have no Git/network dependency. Publish the manifest last;
+ * old snapshot directories remain available to launchers already using them.
+ * CLI: sync-guard-clone.mjs --handoff=<directory> --pin|--check
+ */
+const handoffName = name => typeof name === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]*\.mjs$/.test(name);
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+const printable = value => String(value).replace(/[^\x20-\x7e]/g, '?');
+function realDirectory(path) {
+  if (!lstatSync(path).isDirectory() || realpathSync(path) !== path) throw new Error('handoff directory must be real, without symlinks');
+}
+function regularBytes(path) {
+  if (!lstatSync(path).isFile() || realpathSync(path) !== path) throw new Error('handoff guard evidence must be a regular file without symlinks');
+  return readFileSync(path);
+}
+function handoffManifest(root) {
+  const manifest = JSON.parse(regularBytes(join(root, 'hooks-manifest.json')).toString('utf8'));
+  if (manifest?.version !== 1 || !/^[0-9a-f]{24}$/.test(manifest.snapshot) ||
+      typeof manifest.pinnedBy !== 'string' || !manifest.pinnedBy ||
+      typeof manifest.pinnedAt !== 'string' || !Number.isFinite(Date.parse(manifest.pinnedAt)) ||
+      !manifest.guards || typeof manifest.guards !== 'object' || Array.isArray(manifest.guards) ||
+      !Object.keys(manifest.guards).length ||
+      Object.entries(manifest.guards).some(([name, hash]) => !handoffName(name) || typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash))) {
+    throw new Error('invalid handoff hooks manifest');
+  }
+  return manifest;
+}
+function handoffPinRunning(root) {
+  const record = readRecord(`${root}.hooks-pin-lock`);
+  if (record === LEGACY) throw new Error('unreadable handoff pin lock; operator must repair it');
+  return holderAlive(record);
+}
+/** Called only after the launcher has verified and leased its own code. A live pin
+ * may be copying partial source bytes; only its previously published snapshot is eligible.
+ * Break-glass is an explicit operator environment override, never a hook argument.
+ */
+export function resolveHandoffGuard(root, name, { breakGlass = false, check = false } = {}) {
+  root = resolve(root);
+  realDirectory(root);
+  if (!handoffName(name)) throw new Error('expected a handoff .mjs filename without path components');
+  if (breakGlass) {
+    const target = join(root, name);
+    regularBytes(target);
+    process.stderr.write(`Pinned guard: BREAK-GLASS WE_GUARD_HANDOFF_BREAK_GLASS=1 (environment), by ${printable(userInfo().username)} at ${new Date().toISOString()} for ${name}\n`);
+    return target;
+  }
+  try {
+    const manifest = handoffManifest(root);
+    if (!Object.hasOwn(manifest.guards, name)) throw new Error('guard missing from handoff manifest');
+    const snapshots = join(root, '.hooks-pinned');
+    const snapshot = join(snapshots, manifest.snapshot);
+    realDirectory(snapshots); realDirectory(snapshot);
+    const names = Object.keys(manifest.guards).sort();
+    if (JSON.stringify(readdirSync(snapshot).sort()) !== JSON.stringify(names)) throw new Error('handoff snapshot contains unknown or missing files');
+    for (const entry of names) {
+      if (sha256(regularBytes(join(snapshot, entry))) !== manifest.guards[entry]) throw new Error('handoff snapshot content hash differs from the manifest');
+    }
+    if (!check && handoffPinRunning(root)) {
+      process.stderr.write('Pinned guard: using last-good handoff snapshot during pin\n');
+    } else if (sha256(regularBytes(join(root, name))) !== manifest.guards[name]) {
+      throw new Error('handoff guard content hash differs from the manifest');
+    }
+    return join(snapshot, name);
+  } catch (error) {
+    throw new Error(`${error.message}; re-pin with sync-guard-clone.mjs --handoff=<directory> --pin; operator recovery: WE_GUARD_HANDOFF_BREAK_GLASS=1`);
+  }
+}
+function handoffMain() {
+  let lock;
+  let owner;
+  let staging;
+  let manifestTemp;
+  try {
+    const args = process.argv.slice(2);
+    const option = args.find(arg => arg.startsWith('--handoff='));
+    const mode = args.find(arg => arg === '--pin' || arg === '--check');
+    if (args.length !== 2 || !option?.slice(10) || !mode) throw new Error('usage: sync-guard-clone.mjs --handoff=<directory> --pin|--check');
+    const root = resolve(option.slice(10));
+    realDirectory(root);
+    lock = `${root}.hooks-pin-lock`;
+    owner = `${process.pid} ${STARTED} ${nonce()}\n`;
+    acquireLock(lock, owner);
+    const entries = readdirSync(root).sort();
+    for (const name of entries.filter(name => name.endsWith('.bak'))) process.stderr.write(`Handoff pins: ignored backup: ${printable(name)}\n`);
+    const names = entries.filter(handoffName);
+    if (!names.length) throw new Error('no handoff guards to pin');
+    if (mode === '--check') {
+      const manifest = handoffManifest(root);
+      if (JSON.stringify(Object.keys(manifest.guards).sort()) !== JSON.stringify(names)) throw new Error('handoff guard set differs from the manifest; re-pin required');
+      for (const name of names) resolveHandoffGuard(root, name, { check: true });
+      process.stdout.write('Handoff pins verified.\n');
+      return;
+    }
+    const snapshots = join(root, '.hooks-pinned');
+    mkdirSync(snapshots, { recursive: true }); realDirectory(snapshots);
+    const snapshot = randomBytes(12).toString('hex');
+    staging = join(snapshots, snapshot);
+    mkdirSync(staging);
+    const guards = Object.create(null);
+    for (const name of names) {
+      const bytes = regularBytes(join(root, name));
+      guards[name] = sha256(bytes);
+      writeFileSync(join(staging, name), bytes, { flag: 'wx' });
+    }
+    const pinnedBy = userInfo().username;
+    const pinnedAt = new Date().toISOString();
+    manifestTemp = join(root, `.hooks-manifest-${nonce()}.json`);
+    writeFileSync(manifestTemp, JSON.stringify({ version: 1, snapshot, guards, pinnedBy, pinnedAt }, null, 2) + '\n', { flag: 'wx' });
+    renameSync(manifestTemp, join(root, 'hooks-manifest.json'));
+    staging = undefined;
+    process.stderr.write(`Handoff guards pinned by ${printable(pinnedBy)} at ${pinnedAt}\n`);
+  } catch (error) {
+    process.stderr.write(`Handoff pin refused: ${printable(error.message)}\n`);
+    process.exitCode = 1;
+  } finally {
+    if (staging) rmSync(staging, { recursive: true, force: true });
+    if (manifestTemp) rmSync(manifestTemp, { force: true });
+    if (lock && owner && readRecord(lock) === owner) rmSync(lock, { force: true });
+  }
+}
+
+if (invokedAsCli) {
+  if (process.argv.slice(2).some(arg => arg.startsWith('--handoff='))) handoffMain();
+  else main();
 }

@@ -26,6 +26,7 @@ export function pinnedFixture({ launcherOnly = false } = {}) {
   if (launcherOnly) {
     mkdirSync(join(primary, 'scripts/hooks'), { recursive: true });
     cpSync(join(source, 'scripts/hooks/run-pinned-guard.mjs'), join(primary, 'scripts/hooks/run-pinned-guard.mjs'));
+    cpSync(join(source, 'scripts/hooks/sync-guard-clone.mjs'), join(primary, 'scripts/hooks/sync-guard-clone.mjs'));
   } else {
     cpSync(join(source, 'scripts'), join(primary, 'scripts'), {
       recursive: true, filter: path => !path.split('/').includes('__tests__') && !/\.(?:test|spec)\.[^/]+$/.test(path),
