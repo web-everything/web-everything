@@ -15,7 +15,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   ghThrottleLockRoot, runGhCliPassthrough, runGhSync, failOpenGate, resetGhThrottleFailOpenWarning, ghThrottleLogPath,
-} from '../gh-throttle.mjs';
+} from './gh-throttle.window-fixture.mjs';
 
 const THROTTLE_CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'gh-throttle.mjs');
 
@@ -84,7 +84,7 @@ describe('the real CLI, run from a cwd OUTSIDE any workspace (the live repro)', 
     const fakeGh = join(home, 'fake-gh');
     writeFileSync(fakeGh, '#!/bin/sh\necho "fake-gh:$*"\n');
     chmodSync(fakeGh, 0o755);
-    const env = { PATH: process.env.PATH, HOME: home, WE_GH_THROTTLE_GH_BIN: fakeGh };
+    const env = { PATH: process.env.PATH, HOME: home, WE_GH_THROTTLE_GH_BIN: fakeGh, WE_GH_THROTTLE_POINTS_ALGORITHM: 'window' };
     const r = spawnSync(process.execPath, [THROTTLE_CLI, 'pr', 'list'], { cwd: '/', env, encoding: 'utf8' });
     expect(r.stderr).not.toMatch(/gh-throttle error/);
     expect(r.status).toBe(0);

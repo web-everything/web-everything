@@ -26,7 +26,7 @@ import {
   decideGhPointsSpend, acquireGhPointsSync, ghThrottleLogPath, recordGhCallLogEntry,
   acquireGhWriteBudgetSync, classifyGhWrite, deriveGhCaller,
   runGhSync, execFileSyncThrottled, runGhCliPassthrough, stripGhDebug, scanGhApiFlags,
-} from '../gh-throttle.mjs';
+} from './gh-throttle.window-fixture.mjs';
 
 function readJsonl(path) {
   return readFileSync(path, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
