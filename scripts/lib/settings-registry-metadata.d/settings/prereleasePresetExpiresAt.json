@@ -1,5 +1,5 @@
 {
-  "description": "UTC ISO expiry, null until activation; activation stamps seven elapsed days. Expired or malformed evidence disables the preset; repair by reviewed PR.",
+  "description": "UTC ISO expiry; tool null blocks inheritance. Activation stamps seven days; active must share its layer. Invalid/expired disables; repair through a reviewed PR.",
   "owner": "scripts/settings/delivery-tiers.json",
   "changeVia": "pr",
   "instant": false

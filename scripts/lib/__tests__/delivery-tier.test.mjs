@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { classifyTier, fileTier, HIGH_MUST_STAY, TIER_RULES, NARROWED_NAME_GLOBS, readPrereleasePreset, activatePrereleasePreset } from '../delivery-tier.mjs';
 import { GUARD_FLOOR, REVIEW_AUTH_FLOOR, AUDITOR_FLOOR } from '../protected-path-floor.mjs';
 import { TRUST_CHAIN } from '../gate-config.mjs';
+import * as policyCascade from '../policy-cascade.mjs';
 
 
 // Concrete witnesses, including directory-marker entries from the protected floors.
@@ -317,5 +318,51 @@ describe('prerelease preset settings (observe-only)', () => {
     readPrereleasePreset({ now, platform: {}, env: { WE_POLICY_CASCADE_LOG: '1' }, log });
     expect(log.mock.calls.flat().join(' ')).toContain('tool');
     expect(log.mock.calls.flat().join(' ')).toContain('prereleasePresetActive');
+  });
+  it('rejects an object resolved from platform active leaves despite explicit tool opt-out, with a warning', () => {
+    const log = vi.fn();
+    expect(readPrereleasePreset({ now, env: {}, log,
+      platform: { prereleasePresetActive: { unexpected: true } },
+      settings: { prereleasePresetActive: false, prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+    })).toEqual(off);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/prereleasePresetActive.*boolean/);
+  });
+  it.each([{ unexpected: true }, 'true', null])('rejects non-boolean tool active %j with a validation warning', active => {
+    const log = vi.fn();
+    expect(readPrereleasePreset({ now, env: {}, log,
+      platform: activatePrereleasePreset({}, now),
+      settings: { prereleasePresetActive: active, prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+    })).toEqual(off);
+    expect(log.mock.calls.flat().join(' ')).toMatch(/prereleasePresetActive.*boolean/);
+  });
+  it('preserves explicit tool null expiry instead of borrowing a platform expiry for a tool active bit', () => {
+    expect(readPrereleasePreset({ now, env: {},
+      platform: { prereleasePresetExpiresAt: '2026-11-06T16:00:00.000Z' },
+      settings: { prereleasePresetActive: true, prereleasePresetExpiresAt: null },
+    })).toEqual(off);
+  });
+  it('uses the future expiry from the tool activation layer even when platform expiry differs', () => {
+    expect(readPrereleasePreset({ now, env: {},
+      platform: { prereleasePresetActive: false, prereleasePresetExpiresAt: '2026-10-29T16:00:00.000Z' },
+      settings: activatePrereleasePreset({}, now),
+    })).toEqual({ active: true, expiresAt: '2026-11-06T16:00:00.000Z' });
+  });
+  it('rejects activation resolved from platform with a valid future expiry resolved from tool', () => {
+    const settings = activatePrereleasePreset({}, now);
+    const active = policyCascade.resolveCascade({ standard: false, platform: true });
+    const expiry = policyCascade.resolveCascade({ tool: { expiresAt: settings.prereleasePresetExpiresAt } });
+    expect(active.value).toBe(true);
+    expect(active.sources['']).toBe('platform');
+    expect(Date.parse(expiry.value.expiresAt)).toBeGreaterThan(now);
+    expect(expiry.sources.expiresAt).toBe('tool');
+    // Isolate the reader's source check from its input validation using real cascade results.
+    const cascade = vi.spyOn(policyCascade, 'cascadePolicy')
+      .mockReturnValueOnce(active).mockReturnValueOnce(expiry);
+    try {
+      expect(readPrereleasePreset({ settings, now, platform: {}, env: {} })).toEqual(off);
+      expect(cascade).toHaveBeenCalledTimes(2);
+    } finally {
+      cascade.mockRestore();
+    }
   });
 });
