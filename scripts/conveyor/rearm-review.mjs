@@ -183,9 +183,10 @@ const CHANGES_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+ch
  * different (earlier) head proves a fix was already pushed during this send-back, so an orphan-recovery re-arm of
  * that pushed fix is never stranded. Any moved head (a rebase-only re-push included) counts as a change.
  * An exact trusted `rearm-review` answer to the latest stand-down after a fix-begin clears the window and
- * reviewed head; later claims still count. An unrelated or nonexistent target grants no exception.
+ * reviewed head. A headed no-code answer exempts its first matching resume claim; any later claim or stand-down
+ * first counts that resume as a claim. An unrelated or nonexistent target grants no exception.
  * FAILS OPEN: no/forged claim, an unparseable claim, or an unreadable head → `empty:false`.
- * @returns {{empty:boolean, since?:string}}
+ * @returns {{empty:boolean, since?:string, noCodeResume?:boolean}}
  */
 /** REST uses `user` and numeric `id`; gh uses `author` and the GraphQL ID. Prefer REST's matching `node_id`. */
 function normaliseComment(c) {
@@ -209,6 +210,8 @@ const NO_CODE_OWED_CAP = 1;
 export function rearmWindow(comments) {
   let claims = [];
   let reviewedHead = null;
+  let noCodeHead = null; // first post-answer claim consumes this eligibility
+  let resumeHead = null; // answered resume; materialised before any later trusted claim or stand-down
   let standDownIds = [];
   let rearmed = false;
   let capBlockedId = null;
@@ -230,6 +233,8 @@ export function rearmWindow(comments) {
     if (wouldHonour(answer) && operatorPoster) {
       claims = [];
       reviewedHead = null;
+      noCodeHead = answer.noCodeOwed === true ? answer.head?.toLowerCase() ?? null : null;
+      resumeHead = null;
       standDownIds = [];
       rearmed = true;
       capBlockedId = null;
@@ -244,19 +249,26 @@ export function rearmWindow(comments) {
     if (CHANGES_VERDICT_HEADING_RE.test(text)) {
       claims = [];
       reviewedHead = verdictReviewedHead(c);
+      noCodeHead = null;
+      resumeHead = null;
       standDownIds = [];
       rearmed = false;
       waivers = 0;
       overrides = 0;
       capBlockedId = null;
     } else if (text.startsWith(FIX_BEGIN_FIRST_LINE)) {
+      if (resumeHead) { claims.push(resumeHead); resumeHead = null; }
       const sha = claimStartSha(body);
       if (!sha) return { claims: null, reviewedHead: null, standDownIds: [], standDownId: null, rearmed: false, capBlocked: false, wouldHonour: () => false };
-      claims.push(sha);
-    } else if (claims.length && standDownComments([c]).length
+      if (noCodeHead && noCodeHead.startsWith(sha)) resumeHead = noCodeHead;
+      else claims.push(sha);
+      noCodeHead = null;
+    } else if (standDownComments([c]).length
       // Reopening permits another waiver: require the actual trusted poster, never viewerDidAuthor alone.
       && isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })) {
-      if (c.id != null) {
+      if (resumeHead) { claims.push(resumeHead); resumeHead = null; }
+      noCodeHead = null; // a fresh stop after the answer revokes the unused exemption
+      if (claims.length && c.id != null) {
         standDownIds.push(String(c.id));
         // A fresh stop after a later claim needs its own answer; the cleared old id stays unanswerable.
         if (waivers < REARM_WAIVER_CAP) rearmed = false;
@@ -264,21 +276,33 @@ export function rearmWindow(comments) {
       }
     }
   }
-  return { claims, reviewedHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed, wouldHonour,
+  return { claims, reviewedHead, resumeHead, standDownIds, standDownId: standDownIds.at(-1) ?? null, rearmed, wouldHonour,
     capBlocked: capBlockedId !== null && capBlockedId === standDownIds.at(-1) };
 }
 
 export function decideEmptyFixRound({ comments, liveHead } = {}) {
   const live = String(liveHead ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(live) || !Array.isArray(comments)) return { empty: false };
-  const { claims, reviewedHead } = rearmWindow(comments);
+  const { claims, reviewedHead, resumeHead } = rearmWindow(comments);
   if (!claims) return { empty: false };
-  if (!claims.length) return { empty: false };
+  if (!claims.length) return resumeHead === live ? { empty: false, noCodeResume: true } : { empty: false };
   // A fix pushed AFTER the verdict by a session whose claim predates it leaves no earlier-head claim in the
   // window; the head the verdict named still proves the push (live PR #6798: verdict on 83f39cd, live 4c14f91).
   if (reviewedHead && !(live.startsWith(reviewedHead) || reviewedHead.startsWith(live))) return { empty: false };
   const same = (sha) => live.startsWith(sha) || sha.startsWith(live);
   return claims.every(same) ? { empty: true, since: claims[claims.length - 1] } : { empty: false };
+}
+
+/** Preserve caller flags; the answered same-head resume must use the shared writer's head pin. Pure. */
+export function rearmLabelArgv(argv, verdict, liveHead) {
+  const live = String(liveHead ?? '').toLowerCase();
+  const supplied = argv.find(a => a.startsWith('--expect-head='));
+  if (supplied && supplied.slice('--expect-head='.length).toLowerCase() !== live) {
+    throw new Error('refused: caller --expect-head differs from the guard live head');
+  }
+  if (!verdict?.noCodeResume) return [...argv];
+  if (!/^[0-9a-f]{40}$/.test(live)) throw new Error('refused: no-code resume requires a 40-hex live head');
+  return supplied ? [...argv] : [...argv, `--expect-head=${live}`];
 }
 
 /** True unless argv carries exactly ONE positional and it is a positive-integer PR number. */
@@ -366,17 +390,27 @@ if (IS_CLI) {
   }
   const prArg = process.argv.slice(2).find((a) => !a.startsWith('--'));
   const repoVal = argOf('repo');
+  let labelArgv = process.argv.slice(2);
   if (prArg && !isConflictRound && !argOf('only-if')) {
     const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' };
     let verdict = { empty: false };
+    let liveHead;
     try {
       const repoFlag = repoVal ? [`--repo=${repoVal}`] : [];
-      const head = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
+      liveHead = JSON.parse(readGh(['pr', 'view', prArg, ...repoFlag, '--json', 'headRefOid'], opts)).headRefOid;
       // The FULL paginated thread (a latest fix-begin beyond the first page must not be missed).
       const apiRepo = repoVal || ':owner/:repo';
       const pages = JSON.parse(readGh(['api', `repos/${apiRepo}/issues/${prArg}/comments`, '--paginate', '--slurp'], opts));
-      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead: head });
+      verdict = decideEmptyFixRound({ comments: pages.flat(), liveHead });
     } catch { /* fail open: never block a real push on a read error */ }
+    // Outside the read-error catch: a conflicting pin must refuse before even the no-change note.
+    if (liveHead !== undefined || verdict.noCodeResume) {
+      try { labelArgv = rearmLabelArgv(labelArgv, verdict, liveHead); }
+      catch (error) {
+        writeLineSync(1, JSON.stringify({ ok: false, pr: Number(prArg), reason: error.message }));
+        process.exit(1);
+      }
+    }
     if (verdict.empty) {
       try {
         readGh(['pr', 'comment', prArg, ...(repoVal ? [`--repo=${repoVal}`] : []), '--body-file', '-'],
@@ -387,6 +421,7 @@ if (IS_CLI) {
     }
   }
   runReviewLabelCli({
+    argv: labelArgv,
     fixedTo: 'rearm',
     defaultActor: 'conveyor fix agent',
     repoOptional: true, // the fix agent runs inside its WE lane clone, so a missing --repo derives from cwd.

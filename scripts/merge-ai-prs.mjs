@@ -6272,7 +6272,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   }));
   if (!DRY_RUN) {
     try {
-      const sendBacks = sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf: queueRequiredChecksOf, localSlug,
+      const sendBacks = sendBackBlockedGates({ prsByRepo, verdicts, requiredChecksOf: queueRequiredChecksOf, localSlug, defaultBranchOf,
         cwdOf: repo => isLocalRepo(repo) ? undefined : siblingCloneDir(repo),
         ledgerPath: join(dirname(refreshedStatePath()), 'drain-gate-send-backs.json') });
       for (const outcome of sendBacks) process.stderr.write(`  ${repoTag(outcome.repo)}${outcome.num} required-check send-back: ${outcome.sent ? 'review:changes' : 'skipped'}${outcome.reason ? `; ${outcome.reason}` : ''}\n`);

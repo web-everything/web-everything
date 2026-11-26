@@ -1,4 +1,4 @@
-/** SHIP-WM-296: four PRs (#7453, #7491, #7497, #7515) deadlocked because red-team:pending refused every repair push. */
+/** SHIP-WM-278 + FLOW-DMN-080 (re-cited from SHIP-WM-296, the size rule): four PRs (#7453, #7491, #7497, #7515) deadlocked because red-team:pending refused every repair push. */
 import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -16,6 +16,12 @@ const CASES = [
     { labels: ['review:human', 'advisory:changes', 'red-team:pending'] }, 'red-team:pending'],
   ['E2 with UNKNOWN mergeable stays held', { isConflict: true, labels: ['review:changes'] },
     { labels: ['review:changes', 'red-team:pending'], mergeable: 'UNKNOWN', baseRefName: 'main' }, 'red-team:pending'],
+  ['E3 plain send-back launches through pending', { isConflict: false, labels: ['review:changes'] },
+    { labels: ['review:changes', 'red-team:pending'], mergeable: 'MERGEABLE', baseRefName: 'main' }, null],
+  ['E3 with UNKNOWN mergeable stays held', { isConflict: false, labels: ['review:changes'] },
+    { labels: ['review:changes', 'red-team:pending'], mergeable: 'UNKNOWN', baseRefName: 'main' }, 'red-team:pending'],
+  ['E3 with joinedInputs stays held', { isConflict: false, labels: ['review:changes'], joinedInputs: [{}] },
+    { labels: ['review:changes', 'red-team:pending'], mergeable: 'MERGEABLE', baseRefName: 'main' }, 'red-team:pending'],
   ['red-team:blocked stays held', { mode: 'advisory-fix', labels: ['review:human'] },
     { labels: ['review:human', 'advisory:changes', 'red-team:pending', 'red-team:blocked'] }, 'red-team:pending'],
 ];
@@ -40,14 +46,14 @@ function probe(root) {
 
 export default {
   id: 'fix-push-hold-pending-eligible-route',
-  title: 'red-team:pending blocks merge, not an eligible advisory-fix or conflict-bounce push',
-  card: 'REDTEAM-REQUEST-RECOVERY S1 (SHIP-WM-296)',
+  title: 'red-team:pending blocks merge, not an eligible advisory-fix, conflict-bounce or plain send-back push',
+  card: 'REDTEAM-RECOVERY-V2 (SHIP-WM-278, FLOW-DMN-080)',
   fixedBy: { sha: 'pending', where: 'lane/redteam-request-recovery', paths: [DISPATCH] },
   // Decided by behaviour: the two eligible routes launch through pending.
   fixPresent(root) {
     const out = probe(root);
     // Either route launching marks the fix as present; run() then demands both, so a one-route regression fails loudly.
-    return !!out && (out[0]?.[1] === null || out[1]?.[1] === null);
+    return !!out && (out[0]?.[1] === null || out[1]?.[1] === null || out[5]?.[1] === null);
   },
   async run({ sourceRoot = ROOT, log } = {}) {
     const out = probe(sourceRoot);
