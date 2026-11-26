@@ -103,9 +103,11 @@ const PENDING_EXCLUDED_MODES = ['takeover', 'stale-base-rebase', 'stacked-rebase
   'operator-send-back', 'ruling-not-addressed', 'block-ruled-referral', 'mq-failure-recovery'];
 
 /**
- * SHIP-WM-296 — red-team:pending blocks merge, not an eligible fix push. True only for the advisory-fix route (E1) or
- * a default-base conflict bounce (E2), derived from the planned route plus live labels/mergeable/base read at this call.
- * Excluded routes win over any label; any missing or unknown read keeps the hold.
+ * SHIP-WM-278 + FLOW-DMN-080 — red-team:pending blocks merge, not an eligible fix push. The eligible set is closed:
+ * the advisory-fix route (E1), a default-base conflict bounce (E2), and a plain review:changes send-back (E3),
+ * derived from the planned route plus live labels/mergeable/base/head read at this call. Excluded routes win over
+ * any label; any missing or unknown read keeps the hold. (The pre-existing `repair.staleBase` shortcut in
+ * readLivePushHold is separate and unchanged.)
  */
 function pendingExemptRoute(repair, labels, view) {
   if (!repair || labels.includes('red-team:blocked')) return false;
@@ -116,9 +118,14 @@ function pendingExemptRoute(repair, labels, view) {
   // A missing or unreadable head on either side keeps the hold.
   if (!/^[0-9a-f]{40}$/.test(repair.headRefOid ?? '') || repair.headRefOid !== view.headRefOid) return false;
   if (repair.mode === 'advisory-fix') return labels.includes('advisory:changes') && labels.includes('review:human');
-  return repair.isConflict === true && !repair.mode && view.mergeable === 'CONFLICTING'
-    && typeof view.baseRefName === 'string' && view.baseRefName === 'main'
-    && labels.includes('review:changes');
+  if (repair.mode || typeof view.baseRefName !== 'string' || view.baseRefName !== 'main'
+    || !labels.includes('review:changes')) return false;
+  if (repair.isConflict === true) return view.mergeable === 'CONFLICTING';
+  // E3 (plain review:changes send-back): a planned row with no mode, joined input, MQ recovery or open operator
+  // send-back, still MERGEABLE and without the conflict label at this read. Any other read keeps the hold.
+  return repair.labels?.includes('review:changes') === true && !repair.mqFailureRecovery
+    && !(repair.openOperatorSendBacks?.length > 0) && view.mergeable === 'MERGEABLE'
+    && !labels.includes('merge-status:conflicting');
 }
 
 /**

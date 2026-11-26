@@ -3054,6 +3054,58 @@ describe('PUSH-GATE-S4 — a live hold read right before launch stops a fixer sp
       expect(dispatch).not.toHaveBeenCalled();
       expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
     });
+    const E3 = { labels: ['review:changes', 'review-round:1'], headRefOid: H, isConflict: false };
+    const E3L = ['review:changes', 'review-round:1', 'red-team:pending'];
+    const OKV = { mergeable: 'MERGEABLE', baseRefName: 'main' };
+    it('E3 plain send-back launches through pending at admission and at the launch re-read', () => {
+      expect(read(E3, E3L, OKV)).toBeNull();
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      const readPushHold = context => readLivePushHold(context, { hermetic: false, run: () => view(E3L, OKV) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E3 }]);
+      expect(result.refusals).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    });
+    it('E3 resume path passes the same re-read', () => {
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      const tryResume = vi.fn(() => ({ resumed: true, sessionId: 's' }));
+      const readPushHold = context => readLivePushHold(context, { hermetic: false, run: () => view(E3L, OKV) });
+      const result = run({ dispatch, readPushHold, tryResume }, [{ ...entry, ...E3 }]);
+      expect(result.refusals).toEqual([]);
+    });
+    it('the launch re-read holds E3 when the conflict label appears between admission and launch', () => {
+      const dispatch = vi.fn(p => ({ sessionId: 's', pr: p.pr }));
+      let reads = 0;
+      const readPushHold = context => readLivePushHold(context, { hermetic: false,
+        run: () => view(++reads === 1 ? E3L : [...E3L, 'merge-status:conflicting'], OKV) });
+      const result = run({ dispatch, readPushHold, tryResume: () => ({ resumed: false }) }, [{ ...entry, ...E3 }]);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'push-hold' }));
+    });
+    it.each([
+      ['E3 with live mergeable UNKNOWN is held', E3, E3L, { mergeable: 'UNKNOWN', baseRefName: 'main' }],
+      ['E3 with live mergeable CONFLICTING is held', E3, E3L, { mergeable: 'CONFLICTING', baseRefName: 'main' }],
+      ['E3 with the conflict label is held', E3, [...E3L, 'merge-status:conflicting'], OKV],
+      ['E3 base off main is held', E3, E3L, { mergeable: 'MERGEABLE', baseRefName: 'lane/x' }],
+      ['E3 with live review:changes gone is held', E3, ['red-team:pending'], OKV],
+      ['E3 planned head differs from live head is held', { ...E3, headRefOid: 'b'.repeat(40) }, E3L, OKV],
+      ['E3 with joinedInputs is held', { ...E3, joinedInputs: [{}] }, E3L, OKV],
+      ['E3 with open operator send-backs is held', { ...E3, openOperatorSendBacks: [{}] }, E3L, OKV],
+      ['E3 with mqFailureRecovery is held', { ...E3, mqFailureRecovery: {} }, E3L, OKV],
+      ['E3 with red-team:blocked is held', E3, [...E3L, 'red-team:blocked'], OKV],
+      ['E3 without a planned review:changes label is held', { ...E3, labels: [] }, E3L, OKV],
+      ['E3 fixture without mergeable or base is held', E3, E3L, {}],
+      ['E3 fixture without head is held', { ...E3, headRefOid: undefined }, E3L, OKV],
+    ])('%s', (_name, repair, labels, extra) => {
+      expect(read(repair, labels, extra)).not.toBeNull();
+    });
+    it('E3 with review:held-mechanical stays held', () => {
+      expect(read(E3, [...E3L, 'review:held-mechanical'], OKV)).toEqual({ code: 'hold-label', reason: 'review:held-mechanical' });
+    });
+    it('staleBase behaviour is byte-identical: it still bypasses pending and nothing else changes', () => {
+      expect(read({ staleBase: {}, labels: ['red-team:pending'] }, ['red-team:pending'])).toBeNull();
+      expect(read({ ...E3, staleBase: {} }, E3L, OKV)).toBeNull();
+      expect(read({ staleBase: {} }, ['red-team:blocked', 'red-team:pending'])).toEqual({ code: 'hold-label', reason: 'red-team:blocked' });
+    });
     it('pending stays a hold for E1 when the pending label is the only exemption absent (no repair)', () => {
       expect(read(undefined, ['red-team:pending'])).toEqual(HELD);
     });
