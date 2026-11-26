@@ -173,7 +173,7 @@
     "scripts/lib/daemon-clone-card-salvage.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
     "scripts/lib/daemon-job-snapshots.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/lib/daemon-load-overlay.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":13},
-    "scripts/lib/daemon-rebuild/adopt.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":15},
+    "scripts/lib/daemon-rebuild/adopt.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":16},
     "scripts/lib/daemon-rebuild/advisory-merge.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":17},
     "scripts/lib/daemon-rebuild/audited-tip.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
     "scripts/lib/daemon-rebuild/candidate.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":5},
