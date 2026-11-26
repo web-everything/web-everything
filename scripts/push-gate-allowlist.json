@@ -29,6 +29,7 @@
     "scripts/conveyor/soak/breaks/stale-ready-candidate-missing-overlay.mjs": {"status":"pending-migration","reason":"S6: seed main and competing lane branches for stale-ready overlay probes.","sites":16},
     "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.mjs": {"status":"pending-migration","reason":"S6: attempt worker and fixer pushes to verify claim ownership enforcement.","sites":6},
     "scripts/conveyor/soak/fixtures/rebuild-evidence-probe.mjs": {"status":"pending-migration","reason":"S6: publish authored fixture changes to local remote refs for rebuild evidence; includes the read-only held-tip merge-base ancestry probe.","sites":16},
+    "scripts/conveyor/soak/fixtures/rebuild-set-aside-probe.mjs": {"status":"pending-migration","reason":"S6: seed local origin and lane refs for the main-sync set-aside rebuild probe.","sites":22},
     "scripts/lib/card-group.mjs": {"status":"pending-migration","reason":"S5: publish the combined card-group commit before queue admission.","sites":21},
     "scripts/lib/card-number-allocator.mjs": {"status":"pending-migration","reason":"S5: atomically reserve number and identity refs with absent-ref leases.","sites":11},
     "scripts/lib/daemon-edge.mjs": {"status":"pending-migration","reason":"S5: lease-publish the planned daemon edge branch.","sites":16},
