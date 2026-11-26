@@ -30,7 +30,10 @@ const isTest = p => hasAllowedTestSubject(p) && /\.(mjs|js|ts|cjs)$/.test(p)
 // A test scope is a prefix only; every applied file is still checked by isTest, so no filesystem probe is needed.
 const isTestScope = p => hasAllowedTestSubject(p)
   && (isTest(p) || /(^|\/)(__tests__|tests)(\/|$)/.test(p) && !/\.[^/]+$/.test(p));
-/** Applied files must be prose or code tests; directory prefixes are scope-only. */
+// Runtime repairs use the same ordinary block subjects, excluding tests and their support trees.
+const isRuntime = p => hasAllowedTestSubject(p) && /\.(mjs|js|ts|cjs)$/.test(p)
+  && !isTest(p) && !/(^|\/)(__tests__|tests)(\/|$)/.test(p);
+/** Applied files must be prose, ordinary runtime code or code tests; directory prefixes are scope-only. */
 export const isAdmissibleTargetPath = p => admissible(p, false);
 export const isAdmissibleTargetScope = p => admissible(p, true);
 function admissible(p, scope) {
@@ -49,7 +52,7 @@ function admissible(p, scope) {
     || /\.(json|yml|yaml|toml)$/.test(p) || /\.real\.test\.mjs$/.test(p)
     || /(^|\/)(?:[^/]*\.config\.[^/]+|tsconfig[^/]*|[^/]*\.lockb?)$/.test(p)
     || p.startsWith('docs/') && !isDoc(p) && !(scope && isDirectory(p))
-    || !((scope ? isDocScope(p) : isDoc(p)) || (scope ? isTestScope(p) : isTest(p)))) return false;
+    || !((scope ? isDocScope(p) : isDoc(p)) || (scope ? isTestScope(p) : isTest(p)) || isRuntime(p))) return false;
   // Fixtures and tests of critical modules protect enforcement: a test is admissible only when its SUBJECT is not critical.
   if (/(^|\/)(?:fixtures?|__fixtures?__)(\/|$)/i.test(p)) return false;
   const subject = inferTestSubject(p);
@@ -87,11 +90,12 @@ export function deriveAgyFixAdmission(item = {}, launch = {}) {
       risk, tags: [...new Set([...(launch.tags ?? []), ...(item.tags ?? [])])], taskType: taskKind,
       filesTouched: scope.flatMap(p => [p, `${p}/`]) }).critical) return null;
   } catch { return null; } // Unknown criticality advances to the next provider/operator.
-  if (!Number.isFinite(size) || size !== 1) return null;
+  if (!Number.isInteger(size) || size < 1 || size > 3) return null;
   if (typeof taskKind !== 'string' || !/^[a-z][a-z0-9-]*$/.test(taskKind)) return null;
   const kind = taskKind === 'fix' && scope.every(isDocScope) ? 'doc-fix'
     : taskKind === 'fix' && scope.every(isTestScope) ? 'test-fix' : taskKind;
+  if (kind === 'fix' && scope.every(isRuntime)) return { kind, size, scope };
   // #8606: no agy-authored test may execute on the host before review, regardless of settings.
-  if (kind !== 'doc-fix' || !scope.every(isDocScope)) return null;
+  if (kind !== 'doc-fix' || size !== 1 || !scope.every(isDocScope)) return null;
   return { kind, size, scope };
 }

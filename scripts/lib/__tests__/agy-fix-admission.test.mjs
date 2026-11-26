@@ -44,6 +44,25 @@ it('marks depth-1 local enforcement imports, the AgY spawn/juror chain and exist
 });
 
 describe('repair scope admission', () => {
+  it('admits ordinary runtime paths for bounded fixes while retaining enforcement exclusions', () => {
+    const path = 'blocks/resource-cache/ResourceCache.ts';
+    expect(isAdmissibleTargetPath(path)).toBe(true);
+    expect(isAdmissibleTargetScope(path)).toBe(true);
+    for (const size of [1, 2, 3]) {
+      expect(admit({ taskKind: 'fix', size, scope: [path] }))
+        .toEqual({ kind: 'fix', size, scope: [path] });
+    }
+    for (const size of [0, 1.5, 4, 5, Infinity, NaN, undefined])
+      expect(admit({ taskKind: 'fix', size, scope: [path] })).toBeNull();
+    for (const taskKind of ['doc-fix', 'test-fix', 'feature'])
+      expect(admit({ taskKind, size: 3, scope: [path] })).toBeNull();
+    expect(admit({ taskKind: 'fix', size: 3, scope: [path], humanRequired: true })).toBeNull();
+    for (const name of ['gate', 'guard', 'merge', 'audit', 'sandbox', 'settings', 'ledger']) {
+      const target = `blocks/selection/${name}.ts`;
+      expect(isAdmissibleTargetPath(target)).toBe(false);
+      expect(admit({ taskKind: 'fix', size: 3, scope: [target] })).toBeNull();
+    }
+  });
   it('admits a normal-sized fix to an ordinary runtime file', () => {
     expect(admit({ taskKind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] }))
       .toEqual({ kind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] });
