@@ -45,6 +45,13 @@ const skipped = (file) => /(?:^|\/)(?:__tests__|__fixtures__|node_modules)(?:\/|
 /** @type {readonly RepoScanTest[]} */
 export const REPO_SCAN_TESTS = Object.freeze([
   {
+    test: 'scripts/lib/__tests__/daemon-rebuild-shared-smoke-key.test.mjs',
+    scope: 'files',
+    why: 'validates tracked smoke entries, the strict running smoke closure and presence-only live-clone reader; inventory assertions honour scanScope',
+    matches: (f) => /^(scripts|skills-src|src\/_data)\//.test(f) && /\.(mjs|cjs|js|json)$/.test(f) && !skipped(f),
+    inputs: ['scripts/lib/daemon-rebuild/shared-smoke-key.mjs', 'scripts/lib/__tests__/daemon-rebuild-shared-smoke-key.test.mjs'],
+  },
+  {
     test: 'scripts/operations/__tests__/audit-nonconvergence.test.mjs',
     scope: 'files',
     why: 'keeps the explicitly invoked diagnostic free of production consumers and mutating adapters',

@@ -184,6 +184,7 @@
     "scripts/lib/daemon-rebuild/plan.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":36},
     "scripts/lib/daemon-rebuild/prepare.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":12},
     "scripts/lib/daemon-rebuild/preview.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
+    "scripts/lib/daemon-rebuild/shared-smoke-key.mjs": {"status":"pending-migration","reason":"Reviewed eight unresolved Git sites: bounded gitAt spawn; injected rev-parse, show and ls-tree identity reads; tracked JSON ls-files; ownership rev-parse; identity callback forwarding; and origin get-url. These compute smoke identity and ownership without push; dynamic argv remain explicitly pinned for review.","sites":8},
     "scripts/lib/daemon-rebuild/shared.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":2},
     "scripts/lib/daemon-rebuild/smoke.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":7},
     "scripts/lib/daemon-rebuild/state.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":3},
