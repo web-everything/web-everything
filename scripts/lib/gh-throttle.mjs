@@ -1431,12 +1431,15 @@ export function ghPointsBucketAdopted(settings, { env = process.env,
 const ghPidAlive = pid => {
   try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; }
 };
-const bucketStateValid = s => s && Number.isFinite(s.tokens) && s.tokens >= -60 && s.tokens <= 60
+// Total validator: a null/primitive/array/sparse entry is invalid state (conservative reset), never a throw.
+// Array.from turns holes into undefined, which `every` would otherwise skip.
+const ghRecord = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+const bucketStateValid = s => ghRecord(s) && Number.isFinite(s.tokens) && s.tokens >= -60 && s.tokens <= 60
   && Number.isFinite(s.lastRefillMs) && ['compat', 'bucket'].includes(s.mode)
   && Number.isFinite(s.legacyWindowStartMs) && Number.isFinite(s.legacyChargedByNew) && s.legacyChargedByNew >= 0
-  && Array.isArray(s.batchLog) && s.batchLog.every(e => Number.isFinite(e.ms) && validGhPoints(e.p))
-  && Array.isArray(s.tickets) && s.tickets.every(t => typeof t.owner === 'string' && Number.isSafeInteger(t.pid)
-    && t.pid > 0 && Number.isFinite(t.since) && validGhPoints(t.p));
+  && Array.isArray(s.batchLog) && Array.from(s.batchLog).every(e => ghRecord(e) && Number.isFinite(e.ms) && validGhPoints(e.p))
+  && Array.isArray(s.tickets) && Array.from(s.tickets).every(t => ghRecord(t) && typeof t.owner === 'string'
+    && Number.isSafeInteger(t.pid) && t.pid > 0 && Number.isFinite(t.since) && validGhPoints(t.p));
 const resetGhBucket = ms => ({ tokens: -60, lastRefillMs: ms, batchLog: [{ ms, p: 60 }], tickets: [],
   mode: 'compat', legacyWindowStartMs: ms, legacyChargedByNew: 0 });
 

@@ -92,6 +92,20 @@ it('corrupt-state-means-negative-60-and-full-batch-cap-for-60s', () => {
   expect(decide({ state: load(bucketFile()), pointClass: 'batch', nowMs: clock + 59999 }).allowed).toBe(false);
   expect(decide({ state: load(bucketFile()), pointClass: 'batch', nowMs: clock + 60000 }).allowed).toBe(true);
 });
+it('null-or-non-object-log-entries-take-the-conservative-reset-not-a-throw', () => {
+  const bad = [null, 7, 'x', [], undefined];
+  for (const entry of bad) {
+    for (const extra of [{ batchLog: [entry] }, { tickets: [entry] },
+      { batchLog: [{ ms: clock, p: 1 }, entry] }, { tickets: [{ owner: 'a', pid: process.pid, since: clock, p: 1 }, entry] }]) {
+      const r = decide({ state: state(extra), pointClass: 'batch' });
+      expect(r.allowed, JSON.stringify(extra)).toBe(false);
+      expect(r.nextState).toMatchObject({ tokens: -60, mode: 'compat' });
+    }
+    save(bucketFile(), state({ batchLog: [entry] }));
+    expect(acquire({ pointClass: 'batch', timeoutMs: 0 }).ok).toBe(false);
+    expect(load(bucketFile())).toMatchObject({ tokens: -60, batchLog: [{ ms: clock, p: 60 }] });
+  }
+});
 it('unreadable-state-never-adds-capacity', () => {
   mkdirSync(bucketFile());
   expect(() => acquire({ pointClass: 'batch', timeoutMs: 0 })).toThrow();
