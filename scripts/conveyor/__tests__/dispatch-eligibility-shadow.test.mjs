@@ -352,6 +352,40 @@ describe('explicit shadow evaluation coverage', () => {
     return { result, coverage, diagnostics };
   };
 
+  it('isolates top-level PR mutations by the local reader without reading unrelated getters', () => {
+    const p = sentBackPr(6001, { readerEvidence: 'fixture' });
+    const unused = vi.fn(() => { throw new Error('unused PR field'); });
+    Object.defineProperty(p, 'unrelated', { enumerable: true, get: unused });
+    const appendLine = vi.fn();
+    const readLocals = vi.fn((_entry, snapshot) => {
+      expect(snapshot).not.toBe(p);
+      expect(snapshot.readerEvidence).toBe('fixture');
+      snapshot.state = 'CLOSED';
+      snapshot.readerEvidence = 'changed';
+      return locals();
+    });
+    const onError = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [p], readLocals, appendLine, onError });
+    expect(readLocals).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+    expect(p.state).toBe('OPEN');
+    expect(p.readerEvidence).toBe('fixture');
+    expect(unused).not.toHaveBeenCalled();
+    expect(appendLine).not.toHaveBeenCalled();
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 1, failed: 0, disagreements: 0, complete: true });
+  });
+
+  it('refuses complete coverage for a disagreement without a ledger writer and requires repair and replay', () => {
+    const onError = vi.fn();
+    const out = replay({ dispatch: [entry()], prs: [sentBackPr(6001, { isDraft: true })],
+      appendLine: undefined, onError });
+    expect(out.result).toEqual({ checked: 1, disagreements: 1 });
+    expect(out.coverage).toEqual({ attempted: 1, evaluated: 0, failed: 1, disagreements: 1, complete: false });
+    expect(out.diagnostics).toEqual([expect.objectContaining({ gate: 'error',
+      reasons: ['evaluation-failed'], action: expect.stringMatching(/repair.*replay/i) })]);
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/ledger.*writer/i) }));
+  });
+
   it('an unrelated throwing PR getter cannot suppress a real eligibility disagreement', () => {
     const p = sentBackPr(6001, { isDraft: true });
     const unused = vi.fn(() => { throw new Error('unused PR field'); });
