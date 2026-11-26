@@ -10,7 +10,9 @@ import * as admission from '../agy-fix-admission.mjs';
 
 import { admissibleTargets, refusedTargets } from './fixtures/agy-target-path-cases.mjs';
 
-const admit = item => deriveAgyFixAdmission(item, { scope: item.scope });
+// Code-capability tests opt in to executable repairs explicitly; the shipped setting keeps them refused.
+const admit = item => deriveAgyFixAdmission(item, { scope: item.scope }, { allowedKinds: ['doc-fix', 'fix'], share: 0 });
+const admitShipped = item => deriveAgyFixAdmission(item, { scope: item.scope });
 
 it('marks depth-1 local enforcement imports, the AgY spawn/juror chain and existing sibling tests critical', () => {
   const root = fileURLToPath(new URL('../../../', import.meta.url));
@@ -229,6 +231,7 @@ it.each(['setup.test.ts', 'conformance.test.ts', 'a11y.spec.ts', 'e2e.spec.ts',
   });
 it('executable repair admission agrees with the shipped fix policy', () => {
   const settings = JSON.parse(readFileSync(new URL('../../settings/ai-routing.json', import.meta.url), 'utf8'));
-  expect(settings.agyFix?.allowedKinds).toContain('fix');
-  expect(admit({ taskKind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] })).not.toBeNull();
+  expect(settings.agyFix?.allowedKinds).toEqual(['doc-fix']);
+  expect(admitShipped({ taskKind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] })).toBeNull();
+  expect(admitShipped({ taskKind: 'fix', size: 1, scope: ['docs'] })).not.toBeNull();
 });

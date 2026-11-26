@@ -3,8 +3,7 @@
   "aiRouting": {},
   "agyFix": {
     "allowedKinds": [
-      "doc-fix",
-      "fix"
+      "doc-fix"
     ],
     "share": 0.1
   }
