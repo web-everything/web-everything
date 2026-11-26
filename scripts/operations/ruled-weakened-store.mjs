@@ -51,19 +51,24 @@ export function withdrawnRevocations({ env = process.env, fs = nodeFs, warn = co
   const damaged = (i, count, request) => {
     const named = request && typeof request === 'object' && !Array.isArray(request) && nonblank(request.ref) && !/[\r\n]/.test(request.ref);
     let other = scopeRef !== undefined && named && bareRef(request.ref) !== bareRef(scopeRef);
-    // Unparseable text blocks when it could be a revocation, names the scoped ref, or ends partway through its ref value.
+    // Unknown attribution blocks. Only a complete JSON ref can establish unrelated damage.
     // Opt-in only (rewaive-plan, a read-only planner): every other caller keeps the fail-closed default.
     if (relaxUnattributed && scopeRef !== undefined && !named) {
-      const raw = lines.slice(i, i + count).join('\n').toLowerCase()
+      const text = lines.slice(i, i + count).join('\n');
+      const raw = text.toLowerCase()
         .replace(/\\u([0-9a-f]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).toLowerCase()
         .trimEnd().replace(/\\(?:u[0-9a-f]{0,3})?$/, '').replaceAll('\\', '');
       // Could be a revocation: names revok/withdrawn, or is cut off inside "withdrawn" (e.g. a truncated "WITH").
       const hint = /revok|withdraw/.test(raw) || /(?:^|[^a-z])w(?:i(?:t(?:h(?:d(?:r(?:a(?:w(?:n)?)?)?)?)?)?)?)?["'\s]*$/.test(raw);
-      const ref = bareRef(scopeRef).toLowerCase();
-      const tail = /["']ref["']\s*:\s*["']([^"'\r\n]*)$/.exec(raw.trimEnd())?.[1];
-      // Check both spellings before stripping refs/heads/: a cut inside that prefix is uncertain too.
-      const truncatedRef = !!tail && [ref, `refs/heads/${ref}`].some(name => name.startsWith(tail));
-      other = !hint && !truncatedRef && !raw.includes(ref);
+      // Narrow compatibility for a truncated object: supply only its missing final value/brace.
+      // Never close a string/key or invent a ref. JSON.parse handles escapes, nesting and duplicate
+      // keys, so an empty, partial, nested or overwritten ref cannot prove unrelatedness.
+      let attributed;
+      try { attributed = JSON.parse(`${text}null}`); } catch { /* incomplete attribution blocks */ }
+      const ref = attributed && typeof attributed === 'object' && !Array.isArray(attributed) && attributed.ref;
+      other = !hint && !raw.includes(bareRef(scopeRef).toLowerCase())
+        && nonblank(ref) && !/[\r\n]/.test(ref) && nonblank(bareRef(ref))
+        && bareRef(ref) !== bareRef(scopeRef);
     }
     const span = count > 1 ? `lines ${i + 1}-${i + count}` : `line ${i + 1}`;
     (other ? warnOther : warn)(`WARNING: waiver request log ${span}: malformed JSON or invalid request; ignored`);

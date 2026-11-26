@@ -52,6 +52,22 @@ function damageWarnings(line, scopeRef, relaxUnattributed) {
 
 describe('rewaive-plan: a malformed waiver-log line', () => {
   it.each([
+    '{"ref":"', '{"ref":', '{"re', '{',
+    '{"ruling":"WITHDRAWM","sha":', '{"action":"???","sha":', 'broken log record',
+    '{"ref":"lane/other","ref":', '{"metadata":{"ref":"lane/other"},"sha":',
+    '[{"ref":"lane/other"},', '{"ref":"lane/other","re', '{"ref":"refs/heads/","sha":',
+    '{"ref":"lane/other","sha":"truncated', '{"ref":null,"sha":',
+    '{"ref":"lane/other","ref":"lane/x","sha":',
+    '{"ref":"lane/other","\\u0072ef":', '{"ref":"lane/other"\u2028,"sha":',
+    "{'ref':'lane/other','sha':", '{"ref":"lane/other","sha":`',
+    '{"ref":"lane/other","sha":--x', '{"ref":"lane/other","sha":..',
+    '{"ref":"lane/other","\u200bref":"lane/x","sha":',
+  ])('unattributable damaged withdrawal cannot preserve an earlier waiver: %s', line => {
+    const out = run(mk([valid, line, valid]));
+    expect(out.state).toBe('refuse');
+    expect(out.detail).toMatch(/waiver evidence warnings:.*line 2/);
+  });
+  it.each([
     '{"ref":"lane/', '{"ref":"refs/heads/lane/', '{"ref":"lane\\u002f', '{"ref":"l', '{"ref":"refs/hea',
     '{"ref":"lane\\u00', '{"ref":"lane\\', '{"ref":"lane/\r', '{"ref":"lane/\u2028',
   ])('ref-prefix-truncated evidence refuses the plan: %s', (line) => {
@@ -83,10 +99,18 @@ describe('rewaive-plan: a malformed waiver-log line', () => {
     expect(out.blocking).toEqual([]);
     expect(out.unrelated).toHaveLength(1);
   });
+  it.each(['lane\\/other', 'lane\\u002fother', 'refs\\/heads\\/lane\\/other'])('a complete unrelated JSON ref is decoded for attribution: %s', ref => {
+    const out = damageWarnings(`{"ref":"${ref}","sha":`, REF, true);
+    expect(out.blocking).toEqual([]);
+    expect(out.unrelated).toHaveLength(1);
+  });
+  it('an escaped top-level ref key is decoded for attribution', () => {
+    expect(damageWarnings('{"\\u0072ef":"lane/other","sha":', REF, true).unrelated).toHaveLength(1);
+  });
   it('callers that omit relaxation keep refusing unattributable malformed evidence', () => {
     expect(damageWarnings('broken log record', REF).blocking).toHaveLength(1);
     expect(damageWarnings('broken log record', undefined, true).blocking).toHaveLength(1);
-    expect(damageWarnings('broken log record', REF, true).unrelated).toHaveLength(1);
+    expect(damageWarnings('broken log record', REF, true).blocking).toHaveLength(1);
   });
   it('unrelated malformed evidence preserves an eligible request', () => {
     const r = mk([valid, '{"ref":"lane/unrelated","sha":', valid]);
