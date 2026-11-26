@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDispatchThrottle, resolveFixBorrowSettings } from '../dispatch-throttle.mjs';
@@ -237,6 +237,54 @@ describe('routed Codex outcomes', () => {
       rmSync(path); rmSync(join(dir, 'fix-routed-outcomes'), { recursive: true });
       writeFileSync(join(dir, 'fix-routed-outcomes'), 'blocks directory');
       expect(() => recordRoutedOutcome({ ...id, outcome: 'failed', cause: 'unknown', readClaim: () => null })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([
+    ['array', []], ['empty object', {}],
+    ['missing head', { at: 0, outcome: 'failed', cause: 'unknown' }],
+    ...[null, 1, {}, '', ' ', ' abc '].map(head => [`invalid head ${JSON.stringify(head)}`, { at: 0, head, outcome: 'failed' }]),
+    ...[undefined, null, 1, {}, '', 'typo'].map(outcome => [`invalid outcome ${JSON.stringify(outcome)}`, { at: 0, head: 'abc', outcome }]),
+    ...[undefined, null, '0', -1, Infinity].map(at => [`invalid timestamp ${String(at)}`, { at, head: 'abc', outcome: 'failed' }]),
+    ['invalid reason', { at: 0, head: 'abc', outcome: 'failed', reason: {} }],
+    ['invalid note', { at: 0, head: 'abc', outcome: 'failed', note: [] }],
+  ])('strict routed evidence rejects %s without overwriting it', async (_name, row) => {
+    const { readRoutedOutcomes, recordRoutedOutcome, routedOutcomePath } = await import('../fix-slot-borrow.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'malformed-routed-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', dir);
+    try {
+      const id = { repo: 'we', pr: 7, head: 'abc' }, path = routedOutcomePath(id);
+      mkdirSync(join(dir, 'fix-routed-outcomes'));
+      const bytes = JSON.stringify({ 'we#7': [row] });
+      writeFileSync(path, bytes);
+      expect(() => readRoutedOutcomes({ ...id, strict: true })).toThrow('Invalid routed outcome ledger');
+      expect(() => recordRoutedOutcome({ ...id, outcome: 'failed', readClaim: () => null })).toThrow('Invalid routed outcome ledger');
+      expect(readFileSync(path, 'utf8')).toBe(bytes);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('strict routed evidence validates the PR key and preserves legacy rows and explicit invalid causes', async () => {
+    const { readRoutedOutcomes, routedOutcomePath, consecutiveUnproductiveOnHead, unparkedUnknownOnHead } = await import('../fix-slot-borrow.mjs');
+    const { FIX_RUN_OUTCOME } = await import('../../conveyor/fix-loop-ledger.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'valid-routed-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', dir);
+    try {
+      const id = { repo: 'we', pr: 7, head: 'abc' }, path = routedOutcomePath(id);
+      mkdirSync(join(dir, 'fix-routed-outcomes'));
+      const legacy = { at: 0, head: 'abc', outcome: 'no-change' };
+      writeFileSync(path, JSON.stringify({ 'we#8': [legacy] }));
+      expect(() => readRoutedOutcomes({ ...id, strict: true })).toThrow('Invalid routed outcome ledger');
+      for (const outcome of Object.values(FIX_RUN_OUTCOME)) {
+        const table = { 'we#7': [{ ...legacy, outcome }] };
+        writeFileSync(path, JSON.stringify(table));
+        expect(readRoutedOutcomes({ ...id, strict: true })).toEqual(table);
+      }
+      for (const cause of ['model', 'input', 'launcher', 'infra', 'unknown', null, '', 'typo', 1, {}]) {
+        const table = { 'we#7': [legacy, { ...legacy, cause }] };
+        writeFileSync(path, JSON.stringify(table));
+        const read = readRoutedOutcomes({ ...id, strict: true });
+        expect(read).toEqual(table);
+        expect(consecutiveUnproductiveOnHead(read, id)).toBe(cause === 'model' ? 2 : 1);
+        expect(unparkedUnknownOnHead(read, id, [])).toBe(!['model', 'input', 'launcher', 'infra'].includes(cause));
+      }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('excluded rows on another head never reset model history', async () => {

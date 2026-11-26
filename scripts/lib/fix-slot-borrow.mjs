@@ -172,7 +172,8 @@ export const ROUTED_CODEX_MAX_UNPRODUCTIVE = 2;
  *  one entry, which only delays the Claude fallback by one run. Content keeps the `{ "<repo>#<pr>": [...] }` shape. */
 export const routedOutcomePath = ({ repo = 'we', pr }) =>
   join(resolveCoordinationRoot(), 'fix-routed-outcomes', `${String(repo).replace(/[^A-Za-z0-9._-]/g, '_')}_${String(pr).replace(/[^0-9]/g, '')}.json`);
-export const readRoutedOutcomes = ({ repo = 'we', pr, strict = false } = {}) => fileLedger(routedOutcomePath({ repo, pr }), { strict }).read();
+export const readRoutedOutcomes = ({ repo = 'we', pr, strict = false } = {}) =>
+  fileLedger(routedOutcomePath({ repo, pr }), { strict, expectedKey: `${repo}#${pr}` }).read();
 
 /** Sentinel merge target: fix-run resolves it to the PR's live `baseRefName` from `gh pr view` (never guesses `main`). */
 export const PR_BASE_MERGE_TARGET = '@pr-base';
@@ -181,6 +182,16 @@ export const PR_BASE_MERGE_TARGET = '@pr-base';
 export const mergeOntoFor = (planned) => planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName || PR_BASE_MERGE_TARGET : null);
 
 const ROUTED_CAUSES = new Set(['model', 'input', 'launcher', 'infra', 'unknown']);
+// Kept in sync with FIX_RUN_OUTCOME by the strict-reader compatibility test.
+const ROUTED_OUTCOMES = new Set(['failed', 'no-change', 'no-change-unproven', 'pushed', 'lease-lost']);
+function validRoutedOutcome(row) {
+  // Missing causes are legacy evidence; explicit invalid causes remain unknown and park admission.
+  return row !== null && typeof row === 'object' && !Array.isArray(row)
+    && typeof row.head === 'string' && row.head.length > 0 && row.head.trim() === row.head
+    && ROUTED_OUTCOMES.has(row.outcome)
+    && Number.isFinite(row.at) && row.at >= 0
+    && ['reason', 'note'].every(key => !Object.hasOwn(row, key) || typeof row[key] === 'string');
+}
 const LEGACY_LAUNCHER_PATTERNS = [/conflict not resolvable/i, /lane git config/i, /rearm-review/i, /non-fast-forward|fast-forward hint|fetch first/i];
 
 /** PURE. Explicit invalid causes fail closed; only absent causes use the legacy table. */
@@ -219,7 +230,7 @@ export function unparkedUnknownOnHead(table, { repo = 'we', pr, head }, rows) {
 const oneLine = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
 
 /** `reason` is the local diagnosis (may hold command errors); `note` is the agent's final message, the only text a PR comment shows. */
-export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, cause, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr }), { strict: true }),
+export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, cause, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr }), { strict: true, expectedKey: `${repo}#${pr}` }),
   readClaim = (kind) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind })),
 }) {
   // Borrowed launches keep their existing ledger and retry policy.
@@ -268,13 +279,14 @@ export function recentBorrowFailures(table, { repo, pr, now = Date.now(), window
 
 export const defaultBorrowLedgerPath = () => join(resolveCoordinationRoot(), 'fix-cap-waits.json');
 
-function fileLedger(path, { strict = false } = {}) {
+function fileLedger(path, { strict = false, expectedKey } = {}) {
   return {
     read() {
       try {
         const v = JSON.parse(readFileSync(path, 'utf8'));
         if (strict && (!v || typeof v !== 'object' || Array.isArray(v)
-            || Object.values(v).some(rows => !Array.isArray(rows) || rows.some(row => !row || typeof row !== 'object')))) {
+            || Object.entries(v).some(([key, rows]) => key !== expectedKey
+              || !Array.isArray(rows) || rows.some(row => !validRoutedOutcome(row))))) {
           throw new Error('Invalid routed outcome ledger');
         }
         return v && typeof v === 'object' ? v : {};

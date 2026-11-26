@@ -3433,6 +3433,29 @@ describe('unknown-cause park recovery', () => {
     if (variant === 'unreadable-outcomes') expect(result.reconcileRefusalDetails[0].why)
       .toMatch(/restore.*routed.*operator answer cannot/i);
   });
+  it.each([[], {}, { at: 0, outcome: 'failed', cause: 'unknown' }, { at: 0, head, outcome: 'typo' }].map(row => [row]))(
+    'malformed persisted routed row %j visibly blocks admission until repaired', async row => {
+      const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { routedOutcomePath } = await import('../../lib/fix-slot-borrow.mjs');
+      const dir = mkdtempSync(join(tmpdir(), 'routed-admission-'));
+      vi.stubEnv('WE_COORDINATION_ROOT', dir);
+      try {
+        const path = routedOutcomePath({ repo: 'we', pr: entry.prNumber });
+        mkdirSync(join(dir, 'fix-routed-outcomes'));
+        writeFileSync(path, JSON.stringify({ 'we#1764': [row] }));
+        const dispatch = vi.fn(() => ({ agentId: 'test' }));
+        const options = { dispatch, fixLoop: { readRows: () => [], append: vi.fn() } };
+        const result = run(options);
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(result.reconcileRefusalDetails).toContainEqual(expect.objectContaining({
+          kind: 'routed-outcomes-unreadable', why: expect.stringMatching(/restore.*routed.*operator answer cannot/i),
+        }));
+        writeFileSync(path, JSON.stringify({ 'we#1764': [{ at: now, head, outcome: 'failed', cause: 'infra' }] }));
+        expect(run(options).dispatched).toHaveLength(1);
+        expect(dispatch).toHaveBeenCalledTimes(1);
+      } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+    });
   it('a failed park write retains the stand-down and retries on the next pass', async () => {
     const { buildStandDownComment } = await import('../stand-down.mjs');
     let rows = [];
