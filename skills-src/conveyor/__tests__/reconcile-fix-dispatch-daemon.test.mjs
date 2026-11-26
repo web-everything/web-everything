@@ -22,7 +22,7 @@ import {
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
-  resolveFixPassBudgets, formatPassPhaseTiming, createPassCallRecorder,
+  resolveFixPassBudgets, formatPassPhaseTiming, createPassCallRecorder, loadFixPassCursors, saveFixPassCursors,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -47,6 +47,8 @@ import * as heavyAdmission from '../../../scripts/readiness/heavy-admission.mjs'
 import * as resourceGate from '../../../scripts/lib/resource-gate.mjs';
 import * as unsupportedRepo from '../../../scripts/conveyor/unsupported-repo.mjs';
 import * as rulingStandDown from '../../../scripts/conveyor/ruling-resolved-stand-down.mjs';
+import { buildOperatorAnswer } from '../../../scripts/conveyor/stand-down-answer-core.mjs';
+import { buildStandDownComment } from '../../../scripts/conveyor/stand-down.mjs';
 import { FIX_END_MARKER } from '../../../scripts/conveyor/fix-procedure.mjs';
 
 describe('R242 fixDispatch.skipEmptySteps policy cascade', () => {
@@ -3046,6 +3048,66 @@ describe('fix pass budgets', () => {
       { repo: 'a', cursor: 42, deadlineAt: 1000, clock: 0 },
       { repo: 'a', cursor: undefined, deadlineAt: 1000, clock: 0 },
     ]);
+  });
+
+  it('persists a separate scalar last-served rearm cursor and resumes it after restart without changing legacy or unrelated cursors', async () => {
+    let saved;
+    const cursors = { fix: { a: 17 }, notes: { a: '42:note' }, 'promote-draft': { a: 2 } };
+    const tick = vi.fn(() => ({ ...empty(), handled: 1, deferred: [43], nextCursor: 2, nextRearmCursor: 'we#42' }));
+    await runTickAllRepos(fixture({ repos: ['a'], now: () => 0, prCursors: cursors, promoteDraftTick: tick }));
+    await saveFixPassCursors({ path: 'fixture', rotation: { notes: 'a' }, prCursors: cursors, write: (_, data) => { saved = data; } });
+    const loaded = loadFixPassCursors({ path: 'fixture', readFile: () => saved });
+    expect(loaded.prCursors['promote-draft-rearm']).toEqual({ a: 'we#42' });
+    expect(loaded.prCursors['promote-draft']).toEqual({ a: 2 });
+    // Other phases legitimately clear their own completed work; seed their historical persisted values again.
+    loaded.prCursors.fix = { a: 17 }; loaded.prCursors.notes = { a: '42:note' };
+    await runTickAllRepos(fixture({ repos: ['a'], now: () => 0, prCursors: loaded.prCursors,
+      promoteDraftTick: opts => { expect(opts).toMatchObject({ cursor: 2, rearmCursor: 'we#42' }); return { ...empty(), nextCursor: null, nextRearmCursor: null }; } }));
+    expect(loaded.prCursors['promote-draft-rearm']).toEqual({});
+    expect(loaded.prCursors['promote-draft']).toEqual({});
+  });
+  it.each([{}, [], 42, '', 'we#0', 'we#42junk', 'wrong#42'])('malformed rearm cursor %j resets only rearm progress, preserving unrelated saved state', value => {
+    const state = { version: 1, rotation: { fix: 'a' }, prCursors: { fix: { a: 7 }, notes: { a: '42:note' }, 'promote-draft': { a: 2 }, 'promote-draft-rearm': { a: value, b: 'frontierui#43' } } };
+    expect(loadFixPassCursors({ path: 'fixture', readFile: () => JSON.stringify(state) })).toEqual({
+      rotation: state.rotation, prCursors: { ...state.prCursors, 'promote-draft-rearm': { b: 'frontierui#43' } },
+    });
+  });
+  it('legacy numeric promote state loads without a rearm cursor', () => {
+    const state = { version: 1, rotation: {}, prCursors: { 'promote-draft': { a: 42 }, notes: { a: '42:note' } } };
+    expect(loadFixPassCursors({ path: 'fixture', readFile: () => JSON.stringify(state) })).toEqual({ rotation: {}, prCursors: state.prCursors });
+  });
+  it.each(['budget', 'adoption'])('promote phase logs exactly one PR-numbered line per deferred rearm, with distinct budget and adoption reasons (%s)', async mode => {
+    let time = 0, yieldNow = false;
+    const head = 'a'.repeat(40), repo = 'web-everything/web-everything';
+    const c = (id, body) => ({ id, body, author: { login: 'chalbert' } });
+    const comments = [c('verdict', `🔁 review — changes requested\n\nFix defect`),
+      c('begin', `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${head}\``),
+      c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head })),
+      c('answer', buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', reason: 'No code owed', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true }))];
+    const posted = [], postComment = vi.fn(({ comment }) => posted.push(c('receipt', comment)));
+    const rearm = vi.fn(() => ({ status: 0, stdout: JSON.stringify({ ok: true, labelsObserved: true, labels: ['review:pending'] }) }));
+    const result = await runTickAllRepos(fixture({ repos: [repo], now: () => time,
+      promoteDraftTick: opts => promoteDispatch.runReconcilePromoteDraftDispatch({ ...opts, root: '/repo', checkStaleness: () => ({ fresh: true }),
+        provider: {}, shouldYield: () => yieldNow,
+        reconcile: () => { time = 1001; yieldNow = mode === 'adoption'; return { dispatch: [42, 43].map(prNumber => ({ kind: 'rearm-no-code', prNumber, expectHead: head, answerId: 'answer' })), refusals: [] }; },
+        readPrLabels: () => ['review:changes'], readThread: () => [...comments, ...posted], readClaim: () => null,
+        acquireRearmLock: () => () => {}, postComment, rearm,
+      }),
+    }));
+    const lines = [];
+    buildCliDaemonEffects({ owner: 'test', log: { error: line => lines.push(line) } }).onTick(result);
+    const rearmLines = lines.filter(line => /(?:refused rearm-no-code|re-armed .*rearm-no-code)/.test(line));
+    expect(rearmLines).toHaveLength(2);
+    for (const pr of [42, 43]) expect(rearmLines.filter(line => line.includes(`PR #${pr}`))).toHaveLength(1);
+    expect(rearmLines).toContainEqual(expect.stringContaining(`refused rearm-no-code-deferred-${mode} ${repo} PR #43 —`));
+    if (mode === 'budget') {
+      expect(rearmLines).toContainEqual(expect.stringContaining(`re-armed ${repo} PR #42 (rearm-no-code)`));
+      expect(rearmLines).toContainEqual(expect.stringContaining('(after budget: deadline 1970-01-01T00:00:01.000Z, started 1970-01-01T00:00:01.001Z)'));
+      expect(postComment).toHaveBeenCalledTimes(1); expect(rearm).toHaveBeenCalledTimes(1);
+    } else {
+      expect(rearmLines).toContainEqual(expect.stringContaining(`refused rearm-no-code-deferred-adoption ${repo} PR #42 —`));
+      expect(postComment).not.toHaveBeenCalled(); expect(rearm).not.toHaveBeenCalled();
+    }
   });
 
   it('main-red-rebase honors its pass budget', async () => {

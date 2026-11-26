@@ -12,6 +12,10 @@ import { isTerminalStatus } from '../lib/backlog-status.cjs';
  *   `scripts/operations/ci-heal-pr-dispatch.mjs`'s lane/claim/brief machinery): nothing here spawns a
  *   session, so there is no claim to race, no lane to pop, no capability profile to gate on.
  *
+ * NO-CODE REARM SCHEDULING: an admitted call attempts one rearm despite a planning overrun, unless
+ * a fresh adoption probe yields. Later entries respect the budget. Its scalar last-served cursor is
+ * independent of promotion; every deferral is named and successful late starts carry timing evidence.
+ *
  * WHAT UN-DRAFTING ACTUALLY DOES: it does not itself dispatch a review. `gh pr ready` only flips GitHub's own
  * draft bit; the review daemon's OWN next tick reads `pr.isDraft: false` off the SAME PR and, since its
  * `review:*` label was already applied at open (`pr-land.mjs --park`'s existing behavior, unchanged), reaches
@@ -282,6 +286,15 @@ export function ownedCards(cards, view = {}) {
  *   off whatever tick they wrap (see e.g. `runReconcileCiHealDispatchAllRepos`) — a differently-named field
  *   here would have silently produced an empty `dispatched` array for the daemon composing this pass in.
  */
+/** Scalar last-served key; malformed evidence starts only this rearm rotation afresh. */
+export function rearmCursorPr(cursor, repoKey) {
+  if (typeof cursor !== 'string') return null;
+  const match = /^([a-z0-9-]+)#([1-9][0-9]*)(?![\s\S])/.exec(cursor);
+  if (!match || !Object.hasOwn(CONSTELLATION_REPOS, match[1]) || (repoKey != null && match[1] !== repoKey)) return null;
+  const pr = Number(match[2]);
+  return Number.isSafeInteger(pr) ? pr : null;
+}
+
 export function runReconcilePromoteDraftDispatch({
   resolveProfile = repoProfile,
   root = process.cwd(),
@@ -321,13 +334,16 @@ export function runReconcilePromoteDraftDispatch({
   // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
   // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
   reviewWhileBaseOpen = undefined,
-  deadlineAt, cursor, shouldYield, now = Date.now,
+  deadlineAt, cursor, rearmCursor, shouldYield, now = Date.now,
 } = {}) {
   let yieldedForAdoption = false;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
-  const deadlineResult = () => ({ handled: 0, deferred: cursor == null ? [] : [cursor],
-    nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
+  const lastRearmPr = rearmCursorPr(rearmCursor, repoKey);
+  const savedRearmCursor = lastRearmPr == null ? null : rearmCursor;
+  const deferredCursor = cursor ?? lastRearmPr;
+  const deadlineResult = () => ({ handled: 0, deferred: deferredCursor == null ? [] : [deferredCursor],
+    nextCursor: cursor ?? null, nextRearmCursor: savedRearmCursor, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
     dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
   if ((yieldedForAdoption ||= safeAdoptYield(shouldYield)) || (deadlineAt != null && now() > deadlineAt)) return deadlineResult();
   // #x1rr9rh (multi-repo slice 2) — guards THIS dispatching checkout's own import path, same as every sibling
@@ -500,16 +516,35 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
-  // Finish each entry atomically; defer the remaining entries when the tick must yield.
-  const rearmEntries = (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code');
+  // Promotion deferrals never determine rearm progress. An admitted call gets one rearm attempt
+  // even after planning overruns; fresh adoption probes still precede every lock and effect.
+  const nextCursor = deferred[0] ?? null;
+  let rearmEntries = (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code')
+    .sort((a, b) => a.prNumber - b.prNumber);
+  const rearmStart = lastRearmPr == null ? 0 : rearmEntries.findIndex(e => e.prNumber > lastRearmPr);
+  if (rearmStart > 0) rearmEntries = [...rearmEntries.slice(rearmStart), ...rearmEntries.slice(0, rearmStart)];
+  let rearmAttempted = 0, nextRearmCursor = null;
+  let lastServed = savedRearmCursor;
   for (const [index, entry] of rearmEntries.entries()) {
     yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
-      deferred.push(...rearmEntries.slice(index).map(row => row.prNumber));
+    const startedAt = now();
+    const afterDeadline = deadlineAt != null && startedAt > deadlineAt;
+    if (yieldedForAdoption || (afterDeadline && rearmAttempted > 0)) {
+      nextRearmCursor = lastServed ?? `${repoKey}#${rearmEntries.at(-1).prNumber}`;
+      for (const row of rearmEntries.slice(index)) {
+        deferred.push(row.prNumber);
+        refusals.push({ pr: row.prNumber,
+          kind: yieldedForAdoption ? 'rearm-no-code-deferred-adoption' : 'rearm-no-code-deferred-budget',
+          why: yieldedForAdoption ? 'daemon adoption yield — no lock, receipt or child ran'
+            : `promote-draft deadline ${new Date(deadlineAt).toISOString()} passed after ${rearmAttempted} rearm attempt(s); resumes at rearm cursor PR #${entry.prNumber}`,
+        });
+      }
       break;
     }
+    rearmAttempted += 1;
     handled += 1;
     const prNumber = entry.prNumber;
+    lastServed = `${repoKey}#${prNumber}`;
     let release;
     try {
       release = acquireRearmLock({ repoSlug, prNumber });
@@ -569,7 +604,7 @@ export function runReconcilePromoteDraftDispatch({
           || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
           throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
         }
-        dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
+        dispatched.push({ pr: prNumber, kind: 'rearm-no-code', ...(afterDeadline ? { afterDeadline: { deadlineAt, startedAt } } : {}) });
       } catch (e) {
         refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
       }
@@ -597,7 +632,7 @@ export function runReconcilePromoteDraftDispatch({
       refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
   }
-  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
+  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor, nextRearmCursor, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
 }
 
 const IS_CLI = process.argv[1] && new URL(import.meta.url).pathname === process.argv[1];

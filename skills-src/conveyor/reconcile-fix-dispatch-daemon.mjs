@@ -66,7 +66,7 @@ import { withCiHealCycleLock, spawnCiHealLoop, createCiHealLoopController } from
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
-import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
+import { runReconcilePromoteDraftDispatch, rearmCursorPr } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { execFileSyncThrottled, withCommandTiming } from '../../scripts/lib/gh-throttle.mjs';
@@ -1032,6 +1032,12 @@ export function loadFixPassCursors({ path, readFile = readFileSync } = {}) {
   try {
     const state = JSON.parse(readFile(path ?? FIX_PASS_CURSORS_PATH, 'utf8'));
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    // Rearm's new scalar slot is independently recoverable; it must never reset legacy rotations.
+    if (record(state?.prCursors) && Object.hasOwn(state.prCursors, 'promote-draft-rearm')) {
+      const saved = state.prCursors['promote-draft-rearm'];
+      state.prCursors['promote-draft-rearm'] = record(saved)
+        ? Object.fromEntries(Object.entries(saved).filter(([, value]) => rearmCursorPr(value) != null)) : {};
+    }
     if (state?.version !== 1 || !record(state.rotation) || !record(state.prCursors)
       || !Object.values(state.rotation).every(value => typeof value === 'string')
       || !Object.values(state.prCursors).every(cursors => record(cursors)
@@ -1203,7 +1209,8 @@ export async function runTickAllRepos({
     // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
     // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
     // The orphan guard lists every repo before it reads a PR, so its head is set from its result instead (PR #7330).
-    const retainedCursor = repo => phase !== 'orphan-guard' && prCursors[phase]?.[repo] != null;
+    const retainedCursor = repo => phase !== 'orphan-guard' && (prCursors[phase]?.[repo] != null
+      || (phase === 'promote-draft' && prCursors['promote-draft-rearm']?.[repo] != null));
     for (let i = 0; i < ordered.length; i += 1) {
       if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
         budget.hit = true;
@@ -1230,8 +1237,14 @@ export async function runTickAllRepos({
       const counts = phasePrCounts[phase] ??= { handled: 0, deferred: 0 };
       counts.handled += result?.handled ?? 0;
       counts.deferred += result?.deferred?.length ?? 0;
-      if (result?.nextCursor != null) {
-        cursors[options.repo] = result.nextCursor;
+      if (phase === 'promote-draft' && Object.hasOwn(result ?? {}, 'nextRearmCursor')) {
+        const rearmCursors = prCursors['promote-draft-rearm'] ??= {};
+        if (rearmCursorPr(result.nextRearmCursor) != null) rearmCursors[options.repo] = result.nextRearmCursor;
+        else delete rearmCursors[options.repo];
+      }
+      if (result?.nextCursor != null || (phase === 'promote-draft' && result?.nextRearmCursor != null)) {
+        if (result?.nextCursor != null) cursors[options.repo] = result.nextCursor;
+        else delete cursors[options.repo];
         budgets[phase].hit = true;
         budgets[phase].skipped.push(...(result.deferred ?? []));
       } else delete cursors[options.repo];
@@ -1240,7 +1253,9 @@ export async function runTickAllRepos({
     };
     // shouldYield is only threaded when a probe exists, so probe-less ticks see the exact pre-S1 option shape.
     const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
-      cursor: cursors[options.repo], now, ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
+      cursor: cursors[options.repo], now,
+      ...(phase === 'promote-draft' && prCursors['promote-draft-rearm']?.[options.repo] != null
+        ? { rearmCursor: prCursors['promote-draft-rearm'][options.repo] } : {}), ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
     return result && typeof result.then === 'function' ? result.then(record) : record(result);
   };
   const finishPhase = (name, start) => {
@@ -1699,7 +1714,11 @@ export function formatRefusalLine(label, r) {
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
  *  promote outcome" (live incident 2026-10-03, PR #3806). Mirrors {@link formatRefusalLine}'s shape. */
 export function formatPromoteActionLine(d) {
-  if (d?.kind === 'rearm-no-code') return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} (rearm-no-code) — operator ruling, no fix agent`;
+  if (d?.kind === 'rearm-no-code') {
+    const late = d.afterDeadline;
+    return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} (rearm-no-code) — operator ruling, no fix agent`
+      + (late ? ` (after budget: deadline ${new Date(late.deadlineAt).toISOString()}, started ${new Date(late.startedAt).toISOString()})` : '');
+  }
   if (d?.kind === 'close-superseded') {
     return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent`;
   }

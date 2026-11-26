@@ -455,6 +455,14 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     return { ...r, log, calls, wrote, out: r.stdout.trim().split('\n').filter(Boolean).pop() ?? '' };
   };
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
+  it('--expect-head that differs from the guard live head refuses with no label write', () => {
+    const r = run(['6798', '--repo=o/r', `--expect-head=${'b'.repeat(40)}`], { head: H0, comments: [verdict, claim('c'.repeat(40))] });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toContain('caller --expect-head differs from the guard live head');
+    expect(r.wrote).toBe(false);
+    expect(r.calls.every(a => (a[0] === 'pr' && a[1] === 'view') || (a[0] === 'api' && a[1].includes('/comments')))).toBe(true);
+  });
+
 
   it.each([{ login: 'chalbert' }, BOT, { login: 'web-everything[bot]', type: 'Bot' }])('passes a REST operator answer posted by $login with a GraphQL target through to the shared label CLI', (user) => {
     const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };

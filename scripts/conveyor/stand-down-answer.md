@@ -45,6 +45,18 @@ we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.
 This test does not replace the post-load live proof owed on #7321.
 
+**Mechanical executor scheduling.** In a promote-draft call admitted before its deadline with no
+adoption yield, the no-code rearm executor attempts at least one planned entry, unless a fresh adoption
+probe before that entry yields. The budget bounds only later entries: once over budget, at most one
+rearm entry is attempted, including refusals. Each entry still acquires its lock and rechecks the plan;
+its duration is bounded by the existing I/O timeouts, not a new wall-clock guarantee. Rearm entries
+sort by PR number and resume after their own scalar last-served key (for example `we#42`), independently
+of the promotion cursor. The daemon persists that key separately; an unreadable rearm key resets only
+that rearm cursor. Every unattempted entry is logged once with its budget or adoption reason, and a
+successful attempt started after the deadline logs its deadline and start time. With N stable rearm
+entries, each is attempted within N admitted calls without adoption yields. An attempt can refuse;
+a writer failure after a receipt spends the ruling and requires an operator replacement answer.
+
 The predicate in we:scripts/conveyor/stand-down-answer-core.mjs requires a trusted `author.login`, an
 exact versioned record, and a later answer targeting the specific stand-down. A quoted marker, unrelated
 comment ID, outsider's body, or `viewerDidAuthor` alone cannot clear the hold. Other unresolved stand-downs

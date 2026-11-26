@@ -132,7 +132,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
       readHeadCheckState: () => { throw new Error('must not be called'); },
       clearAwaitingCi: NOOP_STATUS,
     });
-    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
+    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, nextRearmCursor: null, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
   });
 
   it('a gh failure on one PR is reported as a refusal and does not stop the rest of the batch', () => {
@@ -930,16 +930,82 @@ Fix defect`);
       rearm: vi.fn(() => { time = 11; yieldNow = mode === 'adoption'; return { status: 0, stdout: json(['review:pending']) }; }),
     });
     const result = s.run();
-    expect(result).toMatchObject({ handled: 1, deferred: [43] });
+    expect(result).toMatchObject({ handled: 1, deferred: [43], nextRearmCursor: 'we#42' });
     if (mode === 'adoption') expect(result.yieldedForAdoption).toBe(true);
     expect(s.options.rearm).toHaveBeenCalledTimes(1);
   });
-  it('rearm loop defers every entry when planning exhausts the deadline', () => {
+  it('rearm-no-code: a reconcile that always overruns the budget still attempts one rearm per admitted pass (no starvation)', () => {
     let time = 0;
-    const s = setup({ now: () => time, deadlineAt: 10, reconcile: () => { time = 11; return { dispatch: [entry], refusals: [] }; } });
-    expect(s.run()).toMatchObject({ handled: 0, deferred: [42] });
-    expect(s.postComment).not.toHaveBeenCalled();
-    expect(s.rearm).not.toHaveBeenCalled();
+    const posted = new Map([[42, []], [43, []]]);
+    const s = setup({ now: () => time, deadlineAt: 10,
+      reconcile: () => { time = 11; return { dispatch: [entry, { ...entry, prNumber: 43 }], refusals: [] }; },
+      readThread: pr => [...thread(), ...posted.get(pr)],
+      postComment: vi.fn(({ prNumber, comment }) => posted.get(prNumber).push(c('receipt', comment))),
+    });
+    const first = s.run();
+    expect(first).toMatchObject({ handled: 1, deferred: [43], nextCursor: null, nextRearmCursor: 'we#42' });
+    expect(first.refusals).toContainEqual(expect.objectContaining({ pr: 43, kind: 'rearm-no-code-deferred-budget' }));
+    expect(first.dispatched[0].afterDeadline).toEqual({ deadlineAt: 10, startedAt: 11 });
+    time = 0;
+    s.options.rearmCursor = first.nextRearmCursor;
+    s.run();
+    expect(s.options.postComment.mock.calls.map(([a]) => a.prNumber)).toEqual([42, 43]);
+    expect(s.rearm.mock.calls.map(([a]) => a.prNumber)).toEqual([42, 43]);
+  });
+  it('rearm progress is independent of persistent promote deferrals', () => {
+    let time = 0;
+    const attempts = [];
+    const s = setup({ now: () => time, deadlineAt: 10,
+      reconcile: () => ({ dispatch: [1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: head })).concat([entry, { ...entry, prNumber: 43 }]), refusals: [] }),
+      readHeadCheckState: () => { time = 11; return { state: 'pending' }; },
+      acquireRearmLock: ({ prNumber }) => { attempts.push(prNumber); if (prNumber === 42) throw Error('busy'); return () => {}; },
+    });
+    for (let pass = 0; pass < 3; pass++) {
+      time = 0;
+      const result = s.run();
+      expect(result.handled).toBe(2);
+      expect(result.nextCursor).toBe(pass === 1 ? 1 : 2);
+      s.options.cursor = result.nextCursor;
+      s.options.rearmCursor = result.nextRearmCursor;
+      if (pass === 1) expect(result.dispatched).toContainEqual(expect.objectContaining({ pr: 43, kind: 'rearm-no-code' }));
+    }
+    expect(attempts).toEqual([42, 43, 42]);
+  });
+  it.each(['planning', 'promote'])('adoption requested during %s defers every rearm with zero lock, receipt or child', stage => {
+    let yieldNow = false;
+    const acquireRearmLock = vi.fn(), readThread = vi.fn();
+    const s = setup({ shouldYield: () => yieldNow, acquireRearmLock, readThread,
+      reconcile: () => { yieldNow = stage === 'planning'; return { dispatch: (stage === 'promote' ? [1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: head })) : []).concat([entry, { ...entry, prNumber: 43 }]), refusals: [] }; },
+      readHeadCheckState: () => { yieldNow = true; return { state: 'pending' }; },
+    });
+    const result = s.run();
+    expect(result.yieldedForAdoption).toBe(true);
+    expect(result.refusals.filter(r => r.kind === 'rearm-no-code-deferred-adoption').map(r => r.pr)).toEqual([42, 43]);
+    for (const fn of [acquireRearmLock, readThread, s.postComment, s.rearm]) expect(fn).not.toHaveBeenCalled();
+  });
+  it.each([
+    ['we#41', [42, 43], 'we#42'],
+    ['we#42', [43, 42], 'we#43'],
+    ['we#99', [42, 43], 'we#42'],
+    ['we#40', [42, 43], 'we#42'],
+    ['malformed', [42, 43], 'we#42'],
+  ])('sorts unsorted rearm entries and resumes after last served cursor %s', (rearmCursor, order, next) => {
+    let time = 0;
+    const attempted = [];
+    const s = setup({ now: () => time, deadlineAt: 10, rearmCursor,
+      reconcile: () => { time = 11; return { dispatch: [{ ...entry, prNumber: 43 }, entry], refusals: [] }; },
+      acquireRearmLock: ({ prNumber }) => { attempted.push(prNumber); throw Error('busy'); },
+    });
+    expect(s.run()).toMatchObject({ nextRearmCursor: next, deferred: [order[1]] });
+    time = 0; s.options.deadlineAt = 20;
+    expect(s.run()).toMatchObject({ nextCursor: null, nextRearmCursor: null, deferred: [] });
+    expect(attempted).toEqual([order[0], ...order]);
+  });
+  it.each([undefined, 7])('a call not admitted keeps separate scalar cursors (%s)', cursor => {
+    const reconcile = vi.fn();
+    const s = setup({ now: () => 11, deadlineAt: 10, cursor, rearmCursor: 'we#42', reconcile });
+    expect(s.run()).toMatchObject({ handled: 0, nextCursor: cursor ?? null, nextRearmCursor: 'we#42', deferred: [cursor ?? 42] });
+    expect(reconcile).not.toHaveBeenCalled();
   });
   it.each(['review:pending', 'review:human'])('confirms exactly once from observed %s and pins the head', label => {
     const s = setup({ rearm: vi.fn(() => ({ status: 0, stdout: `diagnostic\n${json([label])}\n` })) });
