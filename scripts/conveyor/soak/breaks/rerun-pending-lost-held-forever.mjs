@@ -104,7 +104,7 @@ export async function scenario(sourceRoot) {
         }
         const result = await disp.runReconcileCiHealDispatch({ root: dir, repo: 'we', now: () => now,
           checkStaleness: () => ({ fresh: true, behind: 0 }),
-          reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 7431, headRefOid: head }], refusals: [] }),
+          reconcile: () => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 7431, headRefOid: head }], refusals: [] }),
           flushOwed: () => ({}), flushTimeouts: async () => [], pollAttempts: () => [],
           unsupportedPath: join(dir, 'unsupported'), pickFreeLanes: () => [3], currentBuild: () => null,
           resolveWorkUnit: () => ({ itemNum: null, scope: [] }), salvage: async () => null,

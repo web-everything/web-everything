@@ -10,6 +10,10 @@ import { parsePrResultTable as rawParse, classifyMergeGateHold, excuseMergeGateR
 import { runReconcilePass } from '../../conveyor/reconcile-pass.mjs';
 import { defaultReadHeadCheckState } from '../../operations/promote-draft-pr-dispatch.mjs';
 
+import * as holdClass from '../merge-gate-hold-class.mjs';
+import { reviewHoldGatesOnlyRed } from '../../conveyor/reconcile-core.mjs';
+import { realRequiredFailures } from '../../conveyor/exhausted-retry.mjs';
+import { summarize } from '../check-state-predicate.mjs';
 import { GATE_IDS } from '../merge-gate-inventory.mjs';
 
 // Real merge-gate tables list the whole gate inventory; abridged fixtures are completed with passing rows so they
@@ -249,14 +253,19 @@ function plan({ setting = 'on', draft = false, testRed = false, readVerdict = ()
     resolveMainSha: () => null, readPriority: () => null, ...extra });
 }
 describe('reconcile planner and fresh promotion', () => {
-  it('off reproduces ci-heal; on owes review', () => {
-    expect(plan({ setting: 'off' }).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
+  it('off no longer plans ci-heal for a review-only hold (admission refuses); on owes review', () => {
+    expect(plan({ setting: 'off' }).dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
     const after = plan();
     expect(after.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
     expect(after.dispatch.some(d => d.kind === 'review')).toBe(true);
   });
   it('promotes a candidacy-held draft', () => expect(plan({ draft: true }).dispatch.some(d => d.kind === 'promote-draft')).toBe(true));
-  it.each([{ testRed: true }, { readVerdict: () => ({ error: 'missing' }) }])('keeps real CI failure red (#5020) or unreadable verdict', args => expect(plan(args).dispatch.some(d => d.kind === 'ci-heal')).toBe(true));
+  it('keeps real CI failure red (#5020): a failing test check still plans ci-heal', () => expect(plan({ testRed: true }).dispatch.some(d => d.kind === 'ci-heal')).toBe(true));
+  it('an unreadable verdict plans no ci-heal and refuses x-merge-gate-unreadable', () => {
+    const out = plan({ readVerdict: () => ({ error: 'missing' }) });
+    expect(out.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+    expect(out.refusals.some(r => r.kind === 'x-merge-gate-unreadable')).toBe(true);
+  });
   it('does not read freeze for candidacy', () => { const readFreeze = vi.fn(); plan({ readFreeze }); expect(readFreeze).not.toHaveBeenCalled(); });
   it.each([[candidacy, 'green'], [log4965, 'red']])('fresh head read classifies verdict as %s', (log, state) => {
     const readPrLabels = vi.fn(() => ['review:pending']);
@@ -274,7 +283,11 @@ it('reads a shared freeze at most once across a pass', () => {
   expect(result.dispatch.filter(d => d.kind === 'promote-draft')).toHaveLength(2);
 });
 it('keeps all PR rows unchanged when the injected excusal step throws', () => {
-  expect(plan({ excuseMergeGateHolds: () => { throw Error('unavailable'); } }).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
+  // Rows stay red; the separate admission annotation still classes the review-only hold, so no ci-heal is planned.
+  const out = plan({ excuseMergeGateHolds: () => { throw Error('unavailable'); } });
+  expect(out.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+  // The PR is still planned (not dropped) and the red check stays red: it is refused as a review-owned hold.
+  expect(out.refusals.some(r => r.prNumber === 4965 && r.kind === 'review-hold')).toBe(true);
 });
 it('uses a rollup detailsUrl job id and case-insensitive head binding', () => {
   const readVerdict = vi.fn(() => ({ ...verdict(), head_sha: sha.toUpperCase() }));
@@ -417,7 +430,10 @@ describe('fresh review CI merge-gate holds', () => {
     const log = candidacy.replace('merge-gate: HOLD — held', footer);
     expect(gate({ readMergeGateVerdict: () => verdict(log) }))
       .toMatchObject({ allowed: false, affected: [{ name: 'merge-gate', reason: 'failure' }] });
-    expect(plan({ readVerdict: () => verdict(log) }).dispatch.some(d => d.kind === 'ci-heal')).toBe(true);
+    // Unreadable evidence is refused by admission (x-merge-gate-unreadable), never healed.
+    const planned = plan({ readVerdict: () => verdict(log) });
+    expect(planned.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
+    expect(planned.refusals.some(r => r.prNumber === 4965 && r.kind === 'x-merge-gate-unreadable')).toBe(true);
     expect(defaultReadHeadCheckState({ repoSlug: repo, prNumber: 4965, sha,
       runGh: () => JSON.stringify(row), getRequiredChecks: () => ({ checks: ['merge-gate'] }),
       readPrLabels: () => [], readMergeGateVerdict: () => verdict(log), mergeGateSetting: { value: 'on' } }).state).toBe('red');
@@ -741,5 +757,121 @@ describe('workflow-edit protection uses PR 7106 job-backed rollup evidence', () 
   it('preserves a separate real CI failure alongside the annotated workflow hold', () => {
     const red = { ...green, conclusion: 'FAILURE' };
     expect(probe(() => {}, [workflowRow, red]).out.statusCheckRollup[1]).toEqual(red);
+  });
+});
+
+
+describe('merge-gate CI-heal admission annotation', () => {
+  const results = (...holds) => GATE_IDS.map(id => holds.find(r => r.id === id)
+    ?? { id, status: 'pass', reason: 'fixture pass' });
+  const hold = (id, status = 'hold', reason = 'fixture hold') => ({ id, status, reason });
+  const sourcePr = (extra = {}) => ({ number: 4965, headRefOid: sha, labels: ['review:pending'],
+    statusCheckRollup: [{ ...row }, { ...green }], ...extra });
+  const proof = (rows = results(hold('review-acceptance')), extra = {}) => ({
+    num: 4965, head_sha: sha, ok: false, results: rows, ...extra,
+  });
+  const annotate = (prs, verdict = proof(), extra = {}) => holdClass.annotateMergeGateAdmission(prs, {
+    repo: 'owner/repo', mergeGateSetting: { value: 'off' },
+    readMergeGateVerdict: () => verdict, ...extra,
+  });
+  const annotation = prs => prs[0].statusCheckRollup.find(r => r.name === 'merge-gate').mergeGateAdmission;
+
+  it('annotates the class with the excusal setting off', () => {
+    for (const value of ['off', 'on']) {
+      const reader = vi.fn(() => proof());
+      const out = annotate([sourcePr()], undefined, { mergeGateSetting: { value }, readMergeGateVerdict: reader });
+      expect(annotation(out)).toEqual({ class: 'review', why: expect.any(String), jobId: 123 });
+      expect(reader).toHaveBeenCalledWith(expect.objectContaining({ repo: 'owner/repo', jobId: 123, prNumber: 4965 }));
+    }
+  });
+  it('every early exit (bad job id, missing head, PR or head mismatch, malformed, thrown reader) classes unreadable', () => {
+    const cases = [
+      { pr: sourcePr({ statusCheckRollup: [{ ...row, id: 'bad' }] }) },
+      { pr: sourcePr({ headRefOid: null }) },
+      { pr: sourcePr({ number: '4965' }) },
+      { verdict: proof(undefined, { num: 999 }) },
+      { verdict: proof(undefined, { head_sha: 'b'.repeat(40) }) },
+      { verdict: proof(undefined, { head_sha: null }) },
+      { verdict: { error: 'unreadable job' } },
+      { verdict: proof(undefined, { ok: true }) },
+      { verdict: proof(undefined, { ok: undefined }) },
+      ...[undefined, null, {}, [], [null], [{ id: 'review-acceptance', status: 'bogus' }]]
+        .map(rows => ({ verdict: { ...proof(), results: rows } })),
+      { reader: () => { throw new Error('reader failed'); } },
+    ];
+    for (const c of cases) {
+      const out = annotate([c.pr ?? sourcePr()], c.verdict ?? proof(),
+        c.reader ? { readMergeGateVerdict: c.reader } : {});
+      expect(annotation(out), JSON.stringify(c)).toMatchObject({ class: 'unreadable', why: expect.any(String) });
+    }
+  });
+  it('the annotation never changes conclusion or sets mergeGateReviewHold', () => {
+    for (const evidence of [proof(), proof(results(hold('red-main-freeze', 'fail-closed'))),
+      proof(results(hold('test-gaming'))), { error: 'unreadable' }]) {
+      const input = sourcePr();
+      const before = structuredClone(input);
+      const out = annotate([input], evidence);
+      expect(input).toEqual(before);
+      expect(out[0].statusCheckRollup[0].conclusion).toBe('FAILURE');
+      expect(out[0].statusCheckRollup[0]).not.toHaveProperty('mergeGateReviewHold');
+      expect(out[0].statusCheckRollup[0]).not.toHaveProperty('mergeGateHoldExcused');
+      expect(out[0].statusCheckRollup[1]).toEqual(green);
+    }
+  });
+  it.each(['hold', 'fail-closed'])('red-main-freeze (%s) plus only review holds classes main', status => {
+    expect(annotation(annotate([sourcePr()], proof(results(hold('red-main-freeze', status),
+      hold('review-acceptance')))))).toMatchObject({ class: 'main' });
+  });
+  it('a main hold plus an extra readable non-review hold classes real', () => {
+    expect(annotation(annotate([sourcePr()], proof(results(hold('red-main-freeze'),
+      hold('manifest-baseline')))))).toMatchObject({ class: 'real' });
+  });
+  it('workflow-protection evidence classes review', () => {
+    const evidence = workflowEvidence();
+    const verdict = readMergeGateVerdict({ repo: 'owner/repo', jobId: 123, prNumber: 7106, cache: new Map(),
+      runGh: args => args.some(a => String(a).endsWith('/logs')) ? evidence.log : JSON.stringify(evidence.job) });
+    expect(verdict.workflowEditProtection).toBe(true);
+    expect(annotation(annotate([sourcePr({ number: 7106, headRefOid: HEAD,
+      statusCheckRollup: [workflowRow] })], verdict))).toMatchObject({ class: 'review', jobId: 123 });
+  });
+  it('workflow hold plus a real hold classes real', () => {
+    const workflowHold = hold('review-acceptance', 'hold',
+      `human-only: the diff at ${sha.slice(0, 9)} touches .github/workflows/ci.yml — workflow files decide the required checks`);
+    const verdict = proof(results(workflowHold, hold('manifest-baseline')), { workflowEditProtection: true });
+    expect(annotation(annotate([sourcePr()], verdict))).toMatchObject({ class: 'real' });
+  });
+  it('annotates only the latest failing merge-gate and adds nothing without a failing merge-gate', () => {
+    const older = { ...row, id: 122, completedAt: '2026-11-26T05:00:00Z' };
+    const latest = { ...row, completedAt: '2026-11-26T06:00:00Z' };
+    const out = annotate([sourcePr({ statusCheckRollup: [older, latest, green] })]);
+    expect(out[0].statusCheckRollup[0]).toEqual(older);
+    expect(out[0].statusCheckRollup[1].mergeGateAdmission).toMatchObject({ jobId: 123 });
+    const reader = vi.fn();
+    for (const rows of [[green], [older, { ...latest, conclusion: 'SUCCESS' }]]) {
+      const input = [sourcePr({ statusCheckRollup: rows })];
+      expect(annotate(input, undefined, { readMergeGateVerdict: reader })).toEqual(input);
+    }
+    expect(reader).not.toHaveBeenCalled();
+  });
+  it('annotation never changes conclusion: merge-path predicates are identical with and without the annotation', () => {
+    const strip = value => JSON.parse(JSON.stringify(value, (key, v) => key === 'mergeGateAdmission' ? undefined : v));
+    for (const evidence of [proof(), proof(results(hold('red-main-freeze', 'fail-closed'))),
+      proof(results(hold('test-gaming'))), { error: 'unreadable' }]) {
+      const input = sourcePr();
+      const annotated = annotate([input], evidence)[0];
+      const originalRows = input.statusCheckRollup, annotatedRows = annotated.statusCheckRollup;
+      expect(annotatedRows.map(r => r.conclusion)).toEqual(originalRows.map(r => r.conclusion));
+      expect(strip(holdClass.latestFailingMergeGate(annotatedRows))).toEqual(holdClass.latestFailingMergeGate(originalRows));
+      for (const setting of ['on', 'off']) {
+        const options = opts({ setting, readVerdict: () => evidence });
+        expect(strip(excuseMergeGateRows(annotatedRows, options))).toEqual(excuseMergeGateRows(originalRows, options));
+      }
+      expect(reviewHoldGatesOnlyRed(annotatedRows, ['test', 'merge-gate']))
+        .toEqual(reviewHoldGatesOnlyRed(originalRows, ['test', 'merge-gate']));
+      expect(realRequiredFailures(annotated, ['test', 'merge-gate']))
+        .toEqual(realRequiredFailures(input, ['test', 'merge-gate']));
+      expect(summarize(annotatedRows, { requiredNames: ['test', 'merge-gate'] }))
+        .toEqual(summarize(originalRows, { requiredNames: ['test', 'merge-gate'] }));
+    }
   });
 });

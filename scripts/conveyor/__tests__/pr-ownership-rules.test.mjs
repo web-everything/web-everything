@@ -21,6 +21,11 @@ function replay(name, settings = {}, mutate = () => {}) {
 const on = { advisoryReviewOnHumanHandoff: 'on' };
 const healing = { unlabeledRedAgentPr: 'review-label', now: Date.parse(fixture(unlabeled).observedAt) + 2 * 60_000 };
 const reviews = p => p.dispatch.filter(d => d.kind === 'review');
+// The admission annotation the reconcile pass attaches for a readable, non-review merge-gate hold.
+const real = pr => {
+  const rows = pr.statusCheckRollup.filter(r => r.name === 'merge-gate');
+  rows[rows.length - 1].mergeGateAdmission = { class: 'real', why: 'readable real hold', jobId: 1 };
+};
 const annotate = pr => {
   const rows = pr.statusCheckRollup.filter(r => r.name === 'merge-gate');
   rows[rows.length - 1].mergeGateReviewHold = { holds: ['test-gaming'], jobId: 1 };
@@ -28,7 +33,7 @@ const annotate = pr => {
 
 describe('cards 273 and 278 incident replays', () => {
   it('pins all three live baselines with settings off', () => {
-    expect(replay(before).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
+    expect(replay(before, {}, real).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
     const handed = replay(escalated);
     expect(handed.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-heal-escalated' }));
     expect(reviews(handed)).toEqual([]);
@@ -48,7 +53,7 @@ describe('cards 273 and 278 incident replays', () => {
     expect(result.dispatch.some(d => d.kind === 'ci-heal')).toBe(false);
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'review-hold-red' }));
     expect(reviews(result)[0].advisoryReview).toMatchObject({ reason: 'review-hold', ciWaived: true });
-    expect(replay(before, on).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
+    expect(replay(before, on, real).dispatch).toContainEqual(expect.objectContaining({ kind: 'ci-heal' }));
   });
   it.each([escalated, before])('never repeats a current advisory on %s', name => {
     const result = replay(name, on, pr => {

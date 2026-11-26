@@ -1049,7 +1049,7 @@ describe('case 5h — a CANCELLED required check reads ci-red and is ci-healed, 
 
   it('under the cap: dispatches `ci-heal`, exactly PR #2636\'s real live count (2 of 3) at the moment of the incident', () => {
     const comments = Array.from({ length: 2 }, () => ({ body: buildCiHealComment({ reason: 'red-ci' }), author: AUTOMATION }));
-    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW });
+    const plan = planReconcile({ prs: [pr2636({ comments })], agents: [], now: NOW, requiredChecks: ['test-shard (1)'] });
     expect(plan.refusals).toEqual([]);
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2636, attempts: 2 })]);
     expect(plan.dispatch[0].phase).toBe('ci-red');
@@ -1296,7 +1296,7 @@ describe('case 5k — a stale ci:failed label beside a RESTARTED (not yet conclu
     const genuinelyFailed = restartedRollup.map((c) => (c.name === 'test' ? { name: 'test', status: 'COMPLETED', conclusion: 'FAILURE' } : c));
     const plan = planReconcile({
       prs: [pr2782({ statusCheckRollup: genuinelyFailed, labels: lbl('ci:failed') })],
-      agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS,
+      agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS, requiredChecks: ['test'],
     });
     expect(plan.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 2782, phase: 'ci-red' })]);
   });
@@ -3743,13 +3743,16 @@ describe('review-hold-only required reds do not deadlock draft promotion or revi
     expect(result.refusals).toEqual([]);
   });
 
-  it.each([
-    ['unannotated red merge-gate', () => [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')]],
-    ['another required red check', () => heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row)],
-  ])('does not promote a draft with %s; CI healing still owns the failure', (_, rollup) => {
-    const result = plan({ statusCheckRollup: rollup() });
+  it('does not promote a draft with another required red check; CI healing still owns the failure', () => {
+    const result = plan({ statusCheckRollup: heldRollup().map(row => row.name === 'test' ? check('test', 'failure') : row) });
     expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 1563 })]);
     expect(result.dispatch.some(row => row.kind === 'promote-draft')).toBe(false);
+  });
+
+  it('does not promote a draft with an unannotated red merge-gate; admission refuses it as unreadable, never heals it', () => {
+    const result = plan({ statusCheckRollup: [check('test'), check('merge-gate', 'failure'), check('review-gate', 'failure')] });
+    expect(result.dispatch.some(row => row.kind === 'promote-draft' || row.kind === 'ci-heal')).toBe(false);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'x-merge-gate-unreadable', prNumber: 1563 }));
   });
 
   it.each(['red-team:blocked', 'red-team:pending', 'review-status:draft-withdrawn'])(

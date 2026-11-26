@@ -24,7 +24,7 @@ export default {
         shouldYield: adoption == null ? undefined : () => adoption === 'during-admission' ? ++probes >= 3 : yieldRequested,
         reconcile: () => ({
           dispatch: [1, 2, 3, 4, 5, 6].map(prNumber => ({
-            kind: 'ci-heal', prNumber, headRefOid: 'a'.repeat(40),
+            kind: 'ci-heal', admission: { admitted: true }, prNumber, headRefOid: 'a'.repeat(40),
           })),
           refusals: [],
         }),

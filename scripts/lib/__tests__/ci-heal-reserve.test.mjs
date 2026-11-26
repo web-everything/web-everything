@@ -72,7 +72,7 @@ describe('ci-heal reserve slot', () => {
         root: '/repo', dispatchThrottle: createDispatchThrottle({ ...idle, env: {}, listClaims }),
         ciHealReserve: createCiHealReserve({ ...idle, env: {}, listClaims }),
         dispatch, queueAdmission: null, salvage: async () => null,
-        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', prNumber: 9, headRefName: 'lane/x', headRefOid: 'a'.repeat(40) }], refusals: [] }),
+        reconcile: () => ({ dispatch: [{ kind: 'ci-heal', admission: { admitted: true }, prNumber: 9, headRefName: 'lane/x', headRefOid: 'a'.repeat(40) }], refusals: [] }),
         checkStaleness: () => ({ fresh: true, behind: 0 }), flushOwed: () => ({}), pollAttempts: () => [],
         flushTimeouts: async () => [], timeoutHold: () => null,
         resolveProfile: () => ({ capabilities: { ciHeal: true }, lanePoolRepo: 'x' }),
