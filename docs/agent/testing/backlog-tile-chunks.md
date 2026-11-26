@@ -31,3 +31,8 @@ not skip missing builds. If the ceiling fails, inspect the reported assets and
 reduce inline content or move it into bounded fragments before merging.
 The workflow wiring is pinned by `backlog-prio-chunks.test.ts`; individual
 fragment bounds alone cannot protect the complete rendered page.
+
+`hotpatch-build-test-ci-definition` in `scripts/conveyor/soak/breaks/` replays
+hotpatch admission with green CI and an own-sha audit. Full-build check edits
+must still use the normal merge path, including after an unreadable path
+snapshot recovers. The registry discovers this replay without an index edit.
