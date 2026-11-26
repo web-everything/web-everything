@@ -89,6 +89,7 @@ import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync, mkdirSync, readdirSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { stripVTControlCharacters } from 'node:util';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -314,6 +315,7 @@ export const ACQUIRE_TIMEOUT_MS = 3 * 60_000;
 export const FILE_ITEM_TIMEOUT_MS = 2 * 60_000;
 export const VERIFY_TIMEOUT_MS = 70 * 60_000;
 export const OPEN_PR_TIMEOUT_MS = 45 * 60_000;
+export const AUDIT_TIMEOUT_MS = 70 * 60_000;
 
 /**
  * THE DEDUPE STEP, run in the acquired lane before `file-item`. Returns the plan from
@@ -479,6 +481,7 @@ export async function foldOpenSingles({ lane }, {
  */
 export async function landPreventionCard(input, {
   exec = defaultExec,
+  auditExec = exec,
   pendingDir = pendingPreventionDir(),
   write = (line) => process.stdout.write(line),
   mkTmp = () => mkdtempSync(join(tmpdir(), 'land-prevention-card-')),
@@ -725,6 +728,37 @@ export async function landPreventionCard(input, {
     }
     if (!verified?.verdict?.ok) {
       return fail('verify', `gate not green: ${JSON.stringify(verified?.verdict?.blocking ?? verified?.error ?? 'unrun')}`, { num, rel });
+    }
+
+    // Always audit this committed head; a carried audit or operator waiver is not a substitute.
+    write('land-prevention-card: auditing the card commit…\n');
+    const auditFailure = (detail) => fail('codex-audit',
+      `${stripVTControlCharacters(String(detail)).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}; retry the canonical audit or request human review of the full diff`,
+      { num, rel });
+    try {
+      const head = String(auditExec('git', ['-C', lane, 'rev-parse', 'HEAD'], {
+        cwd: lane, timeout: ACQUIRE_TIMEOUT_MS,
+      })).trim();
+      if (!/^[a-f0-9]{40}$/i.test(head)) return auditFailure('cannot resolve the committed card head');
+      let audited;
+      try {
+        audited = parseRunJsonTail(auditExec('node', [
+          laneRunMjs, 'codex-audit', '--base=origin/main', `--head=${head}`, '--json',
+        ], { cwd: lane, timeout: AUDIT_TIMEOUT_MS }));
+      } catch (error) {
+        const refused = parseRunJsonTail(error?.stdout)?.verdict;
+        return auditFailure([refused?.stdout, refused?.stderr, error?.stderr, error?.message]
+          .filter(Boolean).join('\n') || 'audit failed');
+      }
+      const verdict = audited?.verdict;
+      const lines = typeof verdict?.stdout === 'string' ? verdict.stdout.trim().split(/\r?\n/) : [];
+      if (verdict?.ok !== true || verdict.code !== 0 || lines[0] !== 'NOT WEAKENED'
+        || lines.slice(1).some(line => line.trim() === 'WEAKENED') || verdict.stderr !== '') {
+        return auditFailure([verdict?.stdout, verdict?.stderr, audited?.error]
+          .filter(Boolean).join('\n') || 'missing or incomplete canonical audit result');
+      }
+    } catch (error) {
+      return auditFailure(error?.message || error);
     }
 
     write('land-prevention-card: opening the PR…\n');
