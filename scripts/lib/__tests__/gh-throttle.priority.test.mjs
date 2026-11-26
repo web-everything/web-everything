@@ -2,8 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ghCallerPriority, deriveGhCaller, recordGhHeadroom, ghPriorityAdmission, runGhSync, runGhCliPassthrough, isGhDeferred } from '../gh-throttle.mjs';
-import { writeBudgetBlock } from '../gh-throttle.mjs';
+import { ghCallerPriority, deriveGhCaller, recordGhHeadroom, ghPriorityAdmission, runGhSync, runGhCliPassthrough, isGhDeferred } from './gh-throttle.window-fixture.mjs';
+import { writeBudgetBlock } from './gh-throttle.window-fixture.mjs';
 import { rollupSpend, summarizeSpendRows, renderSpendReport } from '../gh-spend.mjs';
 
 const now = Date.now();
