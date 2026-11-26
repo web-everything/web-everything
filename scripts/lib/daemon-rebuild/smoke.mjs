@@ -193,8 +193,31 @@ function failedRows(smokeResult) {
 /** PURE: does `control` fail every check `candidate` failed (by name)? — the "the harness itself is broken"
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
-  const c = new Set((controlFailed || []).map((r) => r.name));
-  return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+  if (!Array.isArray(candidateFailed) || candidateFailed.length === 0 || !Array.isArray(controlFailed)) return false;
+  // S2a (strict, fails closed): a control vouches for a candidate failure ONLY with typed, executed-check evidence
+  // (a failed boot ENTRY whose import failed with a typed error class) AND the same identity: same check, same boot
+  // entry, same normalised error signature. Untyped / textual-only rows, budget refusals, skips, timeouts and
+  // infrastructure errors (spawn ENOENT...) never match. S1's typed ledger will extend this to the other checks.
+  return candidateFailed.every((row) => {
+    if (!row || row.name !== 'daemon-entries-boot' || !Array.isArray(row.entries)) return false;
+    const control = controlFailed.find((r) => r && r.name === row.name && r.ok === false && !r.budgetInterrupted && !r.budgetSkipped && Array.isArray(r.entries));
+    if (!control) return false;
+    const have = new Set(control.entries.filter(typedBootFailure).map(bootFailureIdentity));
+    const failed = row.entries.filter((e) => e && e.ok === false);
+    return failed.length > 0 && failed.every((e) => typedBootFailure(e) && have.has(bootFailureIdentity(e)));
+  });
+}
+
+/** SHIP-WM-321: a boot entry failure with executed-check evidence: an import that ran and failed with a typed error class. */
+function typedBootFailure(entry) {
+  return !!entry && entry.ok === false && typeof entry.entry === 'string' && entry.kind === 'import failed'
+    && typeof entry.errorClass === 'string' && entry.errorClass.length > 0
+    && !/ENOENT|EACCES|EMFILE|ENOMEM|EAGAIN|spawn|timed out|timeout|budget|skipped/i.test(entry.errorClass);
+}
+
+function bootFailureIdentity(entry) {
+  const signature = entry.errorClass.toLowerCase().replace(/0x[0-9a-f]+|\d+/g, '#').replace(/\s+/g, ' ').trim();
+  return `${entry.entry}\u0000${signature}`;
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
