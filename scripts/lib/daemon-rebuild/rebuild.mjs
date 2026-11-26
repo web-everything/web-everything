@@ -301,7 +301,7 @@ function defaultForceWatchProbe(run, env) {
 async function rebuildCloneInternal({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), prBaseChain, lockOpts = {}, stateOpts = {}, mainOnly = false,
-  now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
+  now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false, adoptNotWorse,
   asJob, urgent = false, launchOnly = false, launchedBy = 'tick-start', waitInFlightTickMs = 0, admissionWaitMs,
   spawnerOwners = defaultSpawnerOwners, readerStartTimeOf = processStartMs, admissionEvidence,
   stEnv = { ...env, ...(stateOpts?.env || {}) },
@@ -503,7 +503,7 @@ async function rebuildCloneInternal({
       const result = await smokeAndAdopt({
         root, env, stEnv, log, run, runSmoke,
         stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
+        finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly, adoptNotWorse,
       });
       // Preserve the smoke result's identity; the public wrapper hides these transport fields.
       return Object.assign(result ?? {}, { waitInFlightTickMs: readerWaitMs, waitSmokeSlotMs });

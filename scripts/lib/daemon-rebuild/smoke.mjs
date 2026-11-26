@@ -26,7 +26,7 @@ import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
 import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
-import { readDeclaredSettings } from '../settings-files.mjs';
+import { readDeclaredSettings, readSettingsChecked } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -183,20 +183,18 @@ export function rejectRetryDelayMs(env, attempts) {
 /** Default ON: when last-good fails every check the candidate failed, adopt the candidate as no worse.
  *  A harness fix that lives in the candidate can only ever arrive this way when the running harness also
  *  fails last-good. Set to '0' to retain the hold-on-last-good and retry-backoff behavior. */
-export const HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV = 'WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE';
-
-/** IO: `daemons.rebuild.adoptNotWorse` through the cascade. DEFAULT OFF: a failed-smoke candidate is never adopted
- *  (hold on last-good; force-adopt is the fallback). Env '1' turns it on, '0' off. Never throws. */
-export function resolveAdoptNotWorse(env = process.env) {
-  let tool;
-  try { tool = readDeclaredSettings().settings?.rebuildAdoptNotWorse; } catch { tool = undefined; }
-  const ev = env?.[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV];
-  const r = cascadePolicy('rebuildAdoptNotWorse', tool, {
-    env, standard: { enabled: false },
-    envValues: { enabled: ev === '1' ? true : ev === '0' ? false : undefined },
-    valid: { enabled: v => typeof v === 'boolean' },
-  });
-  return { enabled: r.value.enabled === true, source: r.sources.enabled };
+/** IO: `rebuildAdoptNotWorse.enabled` (daemons.rebuild.adoptNotWorse). DEFAULT OFF: a failed-smoke candidate is never
+ *  adopted (hold on last-good; force-adopt is the fallback). There is NO env override (the former
+ *  WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE is ignored), and the key is tighten-only in the safe-direction table.
+ *  Strict read: a read error, a duplicate owner or any value other than boolean true means false. Never throws. */
+export function resolveAdoptNotWorse(_env = process.env) {
+  try {
+    const { value, taint, duplicates } = readSettingsChecked({ namespace: 'rebuildAdoptNotWorse' });
+    if (taint.length || duplicates.length) return { enabled: false, source: 'unreadable' };
+    return { enabled: value?.enabled === true, source: 'file' };
+  } catch {
+    return { enabled: false, source: 'unreadable' };
+  }
 }
 
 /** The failed check rows of a smoke result (`[]` for a pass or a missing result). */
@@ -392,6 +390,7 @@ async function resolveDispatchSmoke(opt, env) {
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
   finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
+  adoptNotWorse = resolveAdoptNotWorse, // in-process test seam only: production never passes it, so the setting alone decides
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -1033,7 +1032,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && resolveAdoptNotWorse(env).enabled) {
+    if (!c.reused && adoptNotWorse(env).enabled === true) {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);
