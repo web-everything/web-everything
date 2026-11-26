@@ -8,7 +8,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, isGhLocalOnly, writeBudgetBlock } from '../gh-throttle.mjs';
+import { runGhSync, isGhLocalOnly, writeBudgetBlock } from './gh-throttle.window-fixture.mjs';
 
 const NOW = Date.parse('2026-10-07T17:09:00Z');
 const blockedRoot = () => {

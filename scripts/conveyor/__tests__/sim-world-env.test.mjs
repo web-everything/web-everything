@@ -17,7 +17,7 @@ it('keeps a future, exhausted scenario budget out of the next world while sharin
     const secondRoot = ghThrottleLockRoot(null, second);
     const nowMs = Date.now();
     const spend = (lockRoot, now, points) => acquireGhPointsSync({
-      lockRoot, now: () => now, points, budgetPerMin: 1, owner: `test-${process.pid}`,
+      lockRoot, now: () => now, points, budgetPerMin: 1, owner: `test-${process.pid}`, pointsAlgorithm: 'window',
       timeoutMs: 0,
     });
 
@@ -47,7 +47,7 @@ function spend(env, cwd, startMs) {
   let nowMs = startMs;
   const sleep = vi.fn((ms) => { nowMs += ms; });
   const result = acquireGhPointsSync({
-    lockRoot: ghThrottleLockRoot(cwd, env), points: 1, budgetPerMin: 1,
+    lockRoot: ghThrottleLockRoot(cwd, env), points: 1, budgetPerMin: 1, pointsAlgorithm: 'window',
     owner: `sim-${process.pid}`, now: () => nowMs, sleep, timeoutMs: 1_000,
   });
   return { result, sleep };

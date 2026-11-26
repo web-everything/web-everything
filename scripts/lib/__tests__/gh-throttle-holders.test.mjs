@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { keepAliveScript } from '../test-keepalive.mjs';
-import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough, classifyGhWrite, ghCallerPriority, classifyGhResource } from '../gh-throttle.mjs';
+import { acquireGhSlotSync, noteSlotTimeout, runGhSync, runGhCliPassthrough, classifyGhWrite, ghCallerPriority, classifyGhResource } from './gh-throttle.window-fixture.mjs';
 import { ghHolderMeta, readGhSlotHolders, loadGhThrottleSettings, ghExecOptions, ghCallerKey, redactGhArgs, isGhWatch, ghOpLabel, acquireGhHolderSlot, describeLegacyHolders, ghHoldersSummary } from '../gh-throttle-holders.mjs';
 import { readLockEntry, reserve, releaseLockDir } from '../../readiness/file-locks.mjs';
 import { slotPath } from '../../readiness/heavy-admission.mjs';

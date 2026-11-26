@@ -59,7 +59,7 @@ describe('simulator git and budget regressions', () => {
             import { acquireGhPointsSync } from ${JSON.stringify(throttle)};
             console.log(JSON.stringify(acquireGhPointsSync({
               lockRoot: process.env.WE_GH_THROTTLE_LOCK_ROOT,
-              budgetPerMin: 1, owner: 'sim-world-regression', timeoutMs: 100,
+              budgetPerMin: 1, pointsAlgorithm: 'window', owner: 'sim-world-regression', timeoutMs: 100,
             })));
           `], { env: w.env, encoding: 'utf8', timeout: 5_000 }));
           expect(spend()).toMatchObject({ ok: true, timedOut: false });
