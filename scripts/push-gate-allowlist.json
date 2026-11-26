@@ -281,7 +281,7 @@
     "scripts/operations/card-batch-file.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/card-batch-seal-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":8},
     "scripts/operations/claim-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
-    "scripts/operations/codex-audit-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
+    "scripts/operations/codex-audit-io.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push. Site 5 is the read-only runCodex git diff call that supplies fenced hunk evidence; its validated range and context arguments are dynamic.","sites":5},
     "scripts/operations/codex-worker.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":4},
     "scripts/operations/coroner-extract.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},
     "scripts/operations/coroner-rounds.mjs": {"status":"pending-migration","reason":"S2: inspect existing raw or unresolved git calls and migrate push paths to authorized push.","sites":1},

@@ -1363,11 +1363,12 @@ describe('AU1 PR-A is inert', () => {
       && !/audit-(verdict|settings)\.mjs$/.test(m.file) && !commentOnly(m.text) && !floorDataOnly(m))).map(m => m?.file ?? 'unparsed grep line'))];
     // R1053 S1a: these pure modules may import the vocabulary, but must have no runtime callers.
     // PR #7334: codex-audit.mjs is the one deliberate runtime caller. Its delta re-audit (off by default) vetoes a
-    // change touching protected paths, via resolveAuditSettings and matchesSome only (pinned just below).
+    // change touching protected paths, via resolveAuditSettings and matchesSome. AUDIT-DIFF-HUNKS also resolves
+    // hunk context through resolveHunkContextSettings; keep the exact permitted imports pinned just below.
     expect(hits.sort()).toEqual(['scripts/lib/audit-finding-key.mjs', 'scripts/operations/audit-base-repro.mjs', 'scripts/operations/codex-audit.mjs']);
     const auditCode = matches.filter(m => m?.file === 'scripts/operations/codex-audit.mjs' && !commentOnly(m.text)).map(m => m.text.trim());
     expect(auditCode).toEqual([
-      "import { resolveAuditSettings } from '../lib/audit-settings.mjs';",
+      "import { resolveAuditSettings, resolveHunkContextSettings } from '../lib/audit-settings.mjs';",
       "import { matchesSome } from './audit-verdict.mjs';",
     ]);
     const callers = spawnSync('git', ['grep', '--untracked', '-nE', 'audit-finding-key\\.mjs|audit-base-repro\\.mjs', '--', 'scripts', 'skills-src', '.claude', 'src'],

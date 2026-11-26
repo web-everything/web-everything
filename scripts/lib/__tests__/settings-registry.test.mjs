@@ -463,18 +463,20 @@ test('generated documentation preserves original bytes except the intentional pe
   // The original declaration fixture no longer advertises the retired MQ signature setting.
   assert.equal(createHash('sha256').update(original).digest('hex'), '307ab2610c6c0c5efe3bd91c0d6a1c9d7afa5fe5e6e3d3152de798299783bd9d');
 });
-test('generated documentation retains rotation, rerun, audit debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
+test('generated documentation retains rotation, rerun, audit hunk/debounce/delta, audit-owed and build-priority scope rows and authoring instructions', () => {
   const registry = buildRegistry(), doc = renderMarkdown(registry);
   for (const key of ['providerRotation', 'ciUnitRerun', 'audit', 'reviewAutoAudit', 'allowedFiles']) assert.match(doc, new RegExp(`^\\| ${key} \\|`, 'm'));
   const reviewAutoAudit = registry.rows.find(row => row.key === 'reviewAutoAudit');
   assert.deepEqual(reviewAutoAudit.owners, ['scripts/settings/review-auto-audit.json']);
   assert.equal(reviewAutoAudit.value.mode, 'shadow');
   const audit = registry.rows.find(row => row.key === 'audit');
+  assert.equal(audit.value.hunkContextLines, 3);
   assert.deepEqual(audit.value.debounce, { minutes: 5 });
   assert.deepEqual(audit.value.delta, { maxFiles: 0 });
   const auditRow = doc.split('\n').find(line => line.startsWith('| audit |'));
-  assert.ok(auditRow.includes('"debounce":{"minutes":5}'));
-  assert.ok(auditRow.includes('"delta":{"maxFiles":0}'));
+  // The new hunk leaf pushes delta beyond the documented 60-character preview;
+  // retain the full defaults above and pin the rendered abbreviation separately.
+  assert.ok(auditRow.includes(' | {"hunkContextLines":3,"debounce":{"minutes":5},"delta":{"ma… | '));
   // Forge host sizes are operator-private: the repo default names no hosts.
   assert.deepEqual(registry.rows.find(row => row.key === 'forgeSlots').value, { default: 8, hosts: {} });
   assert.ok(doc.split('\n').find(line => line.startsWith('| forgeSlots |')).includes('{"default":8,"hosts":{}}'));
