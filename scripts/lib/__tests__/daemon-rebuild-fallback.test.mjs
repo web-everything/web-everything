@@ -677,6 +677,59 @@ describe('an adoption after a hold clears state.held', () => {
 // ── h. failsSameChecks — pure ────────────────────────────────────────────────────────────────────────────────
 
 describe('failsSameChecks', () => {
+  it('a budget-refused control never matches a same-named candidate failure', async () => {
+    const child = vi.fn();
+    const control = await runLiveSmoke({
+      root: mktemp('we-smoke-refused-control-'), env: {}, clock: () => 1_000,
+      runChild: budgetedRunChild({ runChild: child, deadline: 1_000, now: () => 1_000 }),
+      reuseRows: SMOKE_CHECKS.filter(check => check.name !== 'tree-stays-clean')
+        .map(({ name }) => ({ name, ok: true })),
+    });
+
+    expect(child).not.toHaveBeenCalled();
+    const failed = control.results.filter(row => !row.ok);
+    expect(failed).toEqual([expect.objectContaining({ name: 'tree-stays-clean', budgetInterrupted: true })]);
+    expect(failsSameChecks([{ ok: false, name: 'tree-stays-clean' }], failed)).toBe(false);
+  });
+
+  it('a name-only control has no affirmative failure evidence', () => {
+    expect(failsSameChecks([{ name: 'a' }, { name: 'b' }], [{ name: 'a' }, { name: 'b' }, { name: 'c' }])).toBe(false);
+  });
+
+  it('an executed timeout-only control never matches a candidate failure', async () => {
+    const child = vi.fn(async () => {
+      throw Object.assign(new Error('timed out after 45000ms (process group killed)'), { signal: 'SIGKILL', status: null });
+    });
+    const control = await runLiveSmoke({
+      root: mktemp('we-smoke-timeout-control-'), env: {}, clock: () => 1_000, runChild: child,
+      reuseRows: SMOKE_CHECKS.filter(check => check.name !== 'daemon-entries-boot')
+        .map(({ name }) => ({ name, ok: true })),
+    });
+    const failed = control.results.filter(row => !row.ok);
+
+    expect(child).toHaveBeenCalled();
+    expect(failed).toEqual([expect.objectContaining({ name: 'daemon-entries-boot' })]);
+    expect(failed[0].entries.every(entry => entry.errorClass === null && entry.signal === 'SIGKILL')).toBe(true);
+    expect(failsSameChecks([{ ok: false, name: 'daemon-entries-boot' }], failed)).toBe(false);
+  });
+
+  it('a matching affirmative control with an executed import failure still matches', async () => {
+    const child = vi.fn(async () => JSON.stringify({ ok: false, error: 'TypeError: broken smoke harness' }));
+    const control = await runLiveSmoke({
+      root: mktemp('we-smoke-affirmative-control-'), env: {}, clock: () => 1_000, runChild: child,
+      reuseRows: SMOKE_CHECKS.filter(check => check.name !== 'daemon-entries-boot')
+        .map(({ name }) => ({ name, ok: true })),
+    });
+    const failed = control.results.filter(row => !row.ok);
+
+    expect(child).toHaveBeenCalled();
+    expect(failed).toEqual([expect.objectContaining({ name: 'daemon-entries-boot' })]);
+    expect(failed[0].entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ok: false, kind: 'import failed', errorClass: 'TypeError: broken smoke harness' }),
+    ]));
+    expect(failsSameChecks([{ ok: false, name: 'daemon-entries-boot' }], failed)).toBe(true);
+  });
+
   it('an evidence-less control row never establishes harness-broken', () => {
     const candidate = [{ ok: false, name: 'tree-stays-clean', detail: 'smoke introduced tracked dirt' }];
     const control = [{ ok: false, name: 'tree-stays-clean', detail: 'same name without gate evidence' }];
