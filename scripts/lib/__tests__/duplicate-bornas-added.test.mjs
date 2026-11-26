@@ -36,13 +36,15 @@ describe('checkDuplicateBornAs (fact gathering)', () => {
 });
 
 describe('open-pr runner surfaces the warning', () => {
+  // Supply independent history evidence so this exercises submission after an advisory duplicate warning.
   it('writes a stderr WARNING and still submits', () => {
     const chunks = [];
     const orig = process.stderr.write;
     process.stderr.write = (c) => { chunks.push(String(c)); return true; };
     let spawned = false;
+    let result;
     try {
-      createPrLandRunner({ canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
+      result = createPrLandRunner({ siblingBase: () => ({ ok: true }), canonicalAudit: () => ({ ok: true }), prepGate: () => ({ ok: true }), readPrepBody: () => '',
         prePrReview: () => ({ action: 'pass' }),
         dupBornAs: () => ['backlog/xa.md adds bornAs xa, dup'],
         spawn: () => { spawned = true; return { status: 0, stdout: '{"pr":1}' }; },
@@ -50,5 +52,6 @@ describe('open-pr runner surfaces the warning', () => {
     } finally { process.stderr.write = orig; }
     expect(chunks.join('')).toContain('duplicate card');
     expect(spawned).toBe(true);
+    expect(result).toMatchObject({ outcome: 'opened', pr: 1 });
   });
 });

@@ -7,13 +7,14 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createPrLandRunner } from '../operations/open-pr-io.mjs';
 
 const prep = 'PREP:\nAcceptance: visible outcome\nPre-mortem: missing events\nFiles: scripts/example.mjs\nTests: focused unit tests';
+// These prep fixtures supply sibling-history admission independently of their scratch body directories.
 function fixture(test, enforce = true) {
   const dir = mkdtempSync(join(tmpdir(), 'open-pr-prep-'));
   const bodyFile = join(dir, 'body.md');
   const logPath = join(dir, 'events.log');
   const spawn = vi.fn((_command, args) => ({ status: 0, stdout: args.includes('--check') ? '{"reason":"check-ok"}' : '{"pr":123,"url":"example"}' }));
   const review = vi.fn(() => ({ action: 'pass' }));
-  const runner = (options = {}) => createPrLandRunner({ canonicalAudit: () => ({ ok: true }), spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
+  const runner = (options = {}) => createPrLandRunner({ siblingBase: () => ({ ok: true }), canonicalAudit: () => ({ ok: true }), spawn, prePrReview: review, cwd: dir, prepLogPath: logPath, ...(enforce ? { prepMode: 'enforce' } : {}), ...options });
   const argv = ['--ref=lane/prep', '--title=feature', `--body-file=${bodyFile}`];
   try { test({ dir, bodyFile, logPath, spawn, review, runner, argv }); }
   finally { rmSync(dir, { recursive: true, force: true }); }
@@ -129,7 +130,7 @@ describe('open-pr prep admission', () => {
       import { createPrLandRunner } from ${JSON.stringify(moduleUrl)};
       import { prepVerdict } from ${JSON.stringify(pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '../lib/prep-block.mjs')).href)};
       let copiedBody, gatedBody, prepPath, spawns = 0;
-      const run = createPrLandRunner({ canonicalAudit: () => ({ ok: true }),
+      const run = createPrLandRunner({ siblingBase: () => ({ ok: true }), canonicalAudit: () => ({ ok: true }),
         readPrepBody: (path, encoding) => {
           prepPath = path;
           return readFileSync(path, encoding);
