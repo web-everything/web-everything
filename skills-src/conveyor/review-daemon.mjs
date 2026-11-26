@@ -93,7 +93,7 @@ import { recordScopeBloatRefresh, noteScopeBloatMarkerFailure } from '../../scri
 // x26lw6u — the review is dispatched as a deterministic JOB (`review-job.mjs`: acquire → review-loop-cli →
 // report → release, no Claude wrapper session); `WE_REVIEW_DISPATCH_MODE=session` keeps the old `claude --bg`
 // path reachable. The jurors review-loop-cli spawns are the fresh, independent reviewers either way.
-import { parseEscalationReason } from '../../scripts/review-detail.mjs';
+import { reviewDispatchContext } from '../../scripts/lib/review-dispatch-context.mjs';
 import { dispatchReviewJob, dispatchReviewByMode } from '../../scripts/operations/review-job.mjs';
 import { reviewSessionSlug } from '../../scripts/conveyor/review-session-slug.mjs';
 import { diagnoseEndedJob, summarizeDiagnosis, writeEndedJobDiagnosis } from '../../scripts/operations/review-job-end-diagnosis.mjs';
@@ -152,6 +152,7 @@ import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '..
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
 import { makePrepReviewDeps } from '../../scripts/conveyor/prep-review-io.mjs';
+import { saveFastPlan, runFastPassCli, readRemoteMainSha, withReviewDispatchLease } from '../../scripts/lib/review-fast-pass-cli.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel, #3870's Fix-dispatch key,
  *  and any future daemon's own key (#3877). */
@@ -412,6 +413,7 @@ export function runReviewTick({
   // admitted ⇒ at most `maxPerTick` new sessions. The default admits everything so pure-function callers are unchanged;
   // the real daemon wires {@link defaultReviewHostAdmission} (host load + memory headroom, cascade-sourced).
   hostAdmission = () => ({ admitted: true, reason: 'not checked', maxPerTick: Infinity }),
+  leaseHeld = () => true,
   // EMERGENCY 2026-10-20 — `{left:number}` shared by every repo of one daemon tick (see
   // {@link liveReviewRoundBudget}); `null` (the default) never caps, so pure-function callers are unchanged.
   liveReviewBudget = null,
@@ -453,6 +455,7 @@ export function runReviewTick({
   rearmStaleAccepts = null,
   noteRearms = null,
   onPlan = null,
+  readMainSha = () => null,
   executeOwedReruns = executeOwedCiReruns,
   // One-line failure causes (status sweep / status tag). The real daemon wires `log.error`; tests inject a spy.
   log = () => {},
@@ -510,6 +513,8 @@ export function runReviewTick({
   // Shared PRs were read before the hold sweep; agent discovery and any captured PR-read failure
   // are isolated with reconcile here. Its injected readers reuse those same snapshots.
   let plan;
+  const readPlanMain = () => { try { return readMainSha({ repo }); } catch { return null; } };
+  const planMainSha = onPlan ? readPlanMain() : null;
   let rawAgents = null;
   try {
     if (sharedReads) {
@@ -613,7 +618,8 @@ export function runReviewTick({
     replanError = replanError ?? out.replanError ?? null;
     if (out.rearms.length) { try { noteRearms?.({ repo, rearms: out.rearms, replanError: out.replanError }); } catch { /* report only */ } }
   }
-  try { onPlan?.({ repo, plan, rawPrs }); } catch { /* observation never breaks a tick */ }
+  try { onPlan?.({ repo, plan, rawPrs,
+    mainSha: planMainSha === readPlanMain() ? planMainSha : null }); } catch { /* observation never breaks a tick */ }
   // Keep the synchronous tick API; the daemon awaits this mechanical work before its next pass.
   const rerunRows = replanError ? [] : (plan.dispatch ?? []).filter(row => row.kind === 'ci-timeout-rerun');
   let owedCiReruns;
@@ -681,16 +687,23 @@ export function runReviewTick({
       // One immediate retry keeps its place; repeated failures yield to waiting peers.
       if (count >= 2) dispatchState.firstOwedAt.set(key, observedAt);
       let diagnosis = 'exit=? signal=? last="diagnosis unavailable"';
+      let timeout = null;
       try {
         const slug = prior.slug ?? reviewSessionSlug(d.prNumber, repoKeyForSlug(repo));
         const job = { slug, pid: prior.pid };
         const detail = diagnoseJob(job);
+        if (detail?.reason === 'juror-timeout') timeout = detail;
         diagnosis = summarizeDiagnosis(detail);
         writeJobDiagnosis(job, detail);
       } catch { /* Diagnostics must never interrupt a retry. */ }
-      endedNoVerdict.push({ prNumber: d.prNumber, reason: 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
+      endedNoVerdict.push({ prNumber: d.prNumber, reason: timeout ? 'juror-timeout' : 'review-job-ended-no-verdict', jobPid: prior.pid, diagnosis });
       dispatchState.lastDispatched.delete(key);
-      try { log(`review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`); } catch {}
+      try {
+        const safe = value => String(value ?? '?').replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, ' ').slice(0, 80);
+        log(timeout
+          ? `review-daemon: ${key} review-job-ended juror-timeout (${safe(timeout.lens)} ${safe(timeout.provider)}/${safe(timeout.model)} ${safe(timeout.wallMs)}ms; run ${safe(timeout.runId)}; head ${safe(timeout.head).slice(0, 12)})`
+          : `review-daemon: ${key} review-job-ended-no-verdict (job pid ${prior.pid}; ${diagnosis}) - will retry`);
+      } catch {}
     }
     owedSince.set(Number(d.prNumber), dispatchState.firstOwedAt.get(key));
   }
@@ -827,6 +840,7 @@ export function runReviewTick({
   const refused = [];
   const attention = [];
   for (const d of reviews) {
+    if (leaseHeld() !== true) { failed.push({ prNumber: d.prNumber, error: 'dispatch lease lost' }); break; }
     if (paused || !host.admitted || occupiedLanes >= hostLimit || occupiedLanes >= acquirable || remainingReviewCapacity() <= 0) break;
     dispatchable.push(d);
     // Reserve only this start. A confirmed refusal releases the seat for the next PR (including later
@@ -847,8 +861,7 @@ export function runReviewTick({
         ...(plannedHead ? { expectedHead: plannedHead } : {}),
         ...(d.advisoryReview?.ciWaived === true ? { advisoryCiWaiver: { head: d.advisoryReview.head, reason: d.advisoryReview.reason } } : {}),
         ...(Array.isArray(lanes) ? { preferLane: lanes[occupiedLanes] } : {}),
-        escalationReason: parseEscalationReason(subject?.body ?? ''),
-        scopePaths: (subject?.files ?? []).map(f => typeof f === 'string' ? f : f.path),
+        ...reviewDispatchContext(subject),
       });
       // x26lw6u — a job dispatch that declined to start (a live job already on this PR, or the lane cool-off)
       // did not advance the round, so it gets no round tag — same rule as a failed dispatch.
@@ -1528,7 +1541,8 @@ export function runAutoAuditShadow({ repo, rawPrs, mode, check, seen = autoAudit
   } catch { /* Audit observation must never block the capacity queue. */ }
 }
 let lastRedTeamQueueFloorLine;
-export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr } = {}) {
+export function cliReviewTickOpts({ log = console, factCache = null, listCommands, readLivePr = readLiveRedTeamPr, leaseHeld = () => true,
+  dispatchWithLease = (dispatch, args) => dispatch({ ...args, leaseHeld }) } = {}) {
   const factsProvider = withFactsLabels(createGhProvider());
   const livePrs = new Map();
   const readQueuePr = args => {
@@ -1570,9 +1584,11 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
     log: line => log.error(line),
     acquirableLanes: defaultAcquirableLaneNumbers, recoveryAcquirableLanes: defaultRecoveryLaneNumbers,
     readPrs: factCache ? opts => defaultReadPrs({ ...opts, factCache }) : defaultReadPrs, readAgents: defaultReadAgents,
+    readMainSha: ({ repo }) => readRemoteMainSha(repo),
     hostAdmission: defaultReviewHostAdmission,
     // `listCommands` is a test seam: the default lists the host's real processes (`ps`), which a hermetic test must not.
     liveReviewBudget: liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
+    readLiveReviewBudget: () => liveReviewRoundBudget({ queueSize, ...(listCommands ? { listCommands } : {}) }),
     reconcileRedTeamQueue: ({ inventoryComplete: complete = true } = {}) => {
       livePrs.clear();
       inventoryComplete = complete;
@@ -1626,9 +1642,10 @@ export function cliReviewTickOpts({ log = console, factCache = null, listCommand
       } catch { /* Audit observation must never block the capacity queue. */ }
       const options = { ...o, rawPrs,
         dispatch: d => {
+          if (!leaseHeld()) throw Error('dispatch lease lost');
           const refusal = assertCapability(o.repo, 'review', { resolveProfile: o.resolveProfile });
           if (refusal) return { skipped: refusal.why };
-          return dispatchReviewJob(d);
+          return dispatchWithLease(dispatchReviewJob, d, { recovery: true });
         }, log: line => log.error(line) };
       // Operator escape hatch: WE_RED_TEAM_DISPATCH_QUEUE=off runs the recovery directly, with no queue filtering or IO.
       const queueSetting = process.env.WE_RED_TEAM_DISPATCH_QUEUE;
@@ -2065,8 +2082,33 @@ export function liveReviewRoundBudget({ env = process.env, listCommands = () => 
     } };
 }
 
+export function runReviewDispatchPass({ owner, lockRoot = RUNNER_LOCK_ROOT, log = console,
+  reviewTickOpts = cliReviewTickOpts, tick = runReviewTick, factCache = null, ...opts } = {}) {
+  let lost = false;
+  const leaseHeld = () => !lost;
+  const dispatchWithLease = (dispatch, args, { recovery = false } = {}) => withReviewDispatchLease(owned => {
+    const currentLeaseHeld = () => {
+      try { if (owned() !== true) lost = true; } catch { lost = true; }
+      return !lost;
+    };
+    if (!currentLeaseHeld()) throw Error('dispatch lease lost');
+    const capacity = options.readLiveReviewBudget?.();
+    if (options.readLiveReviewBudget && (!Number.isFinite(capacity?.left) || !Number.isFinite(capacity.reserve ?? 0))) throw Error('live-review budget unknown');
+    if (capacity && !(capacity.left > (recovery ? 0 : (capacity.reserve ?? 0)))) return { skipped: 'live-review cap exhausted' };
+    const readLanes = recovery ? options.recoveryAcquirableLanes ?? options.acquirableLanes : options.acquirableLanes;
+    const lanes = readLanes?.({ repo: args.repo });
+    if (readLanes && !(Array.isArray(lanes) ? lanes.length : lanes > 0)) return { skipped: 'lane inventory empty or unknown' };
+    return dispatch({ ...args, ...(Array.isArray(lanes) ? { preferLane: lanes.includes(args.preferLane) ? args.preferLane : lanes[0] } : {}), leaseHeld: currentLeaseHeld });
+  }, { lockRoot, owner, log: line => log.error(line) });
+  const options = reviewTickOpts({ log, factCache, leaseHeld, dispatchWithLease });
+  const dispatch = options.dispatch ?? dispatchReviewByMode;
+  options.dispatch = args => dispatchWithLease(dispatch, args);
+  return runReviewTickAllRepos({ tick, ...options, ...opts, dispatch: options.dispatch, leaseHeld });
+}
+
 export function buildCliDaemonEffects({
   owner, intervalMs = DEFAULT_INTERVAL_MS, log = console, factCache = null,
+  dispatchLockRoot = RUNNER_LOCK_ROOT,
   reapSessions = defaultReapSessions,
   // Keep the production runReview closure testable without replacing its executor bindings.
   tick = runReviewTick,
@@ -2081,7 +2123,7 @@ export function buildCliDaemonEffects({
   // store is stale or partial; label READS try the store, label WRITES and the drain/merge path never do.
   // The real review-pass effects ({@link cliReviewTickOpts}); injectable so a test can drive this default `runReview`.
   reviewTickOpts = cliReviewTickOpts,
-  runReview = (opts) => runReviewTickAllRepos({ tick, ...reviewTickOpts({ log, factCache }), ...opts }),
+  runReview = opts => runReviewDispatchPass({ owner, lockRoot: dispatchLockRoot, log, reviewTickOpts, tick, factCache, ...opts }),
   // #xconv1 — the SAME shared-reads optimization `runReview` above opts into, wired the same way for its own
   // separate, additive async stage (see `runConvertAdvisoryTick`'s own doc for why this is not folded into
   // `runReview`/`runReviewTick`).
@@ -2111,7 +2153,10 @@ export function buildCliDaemonEffects({
       factCache?.resetStats();
       const sharing = resolveReviewTickSharing();
       const plans = new Map();
-      const onPlan = sharing.reusePlan ? ({ repo, plan, rawPrs }) => plans.set(repo, { plan, rawPrs }) : null;
+      const onPlan = snapshot => {
+        if (sharing.reusePlan) plans.set(snapshot.repo, { plan: snapshot.plan, rawPrs: snapshot.rawPrs });
+        try { saveFastPlan(snapshot); } catch (error) { log.error(`review-fast-pass: plan save failed: ${error.message}`); }
+      };
       let phaseStarted = Date.now();
       const phaseMs = {};
       // Live-caught 2026-09-26: the reap runs BEFORE discovery, not after. A hung fix/ci-heal session bound to a
@@ -2266,6 +2311,10 @@ export function buildCliDaemonEffects({
 
 async function main() {
   installDaemonLog(); // item 68a: ISO-stamp every log line (WE_DAEMON_LOG_TIMESTAMPS=0 turns it off)
+  if (process.argv.includes('--fast-pass')) return runFastPassCli({
+    repos: REVIEW_DAEMON_REPOS, cliReviewTickOpts, sharedHostBudget, runDaemonLoop,
+    selfSyncOptions: { root: resolve(fileURLToPath(import.meta.url), '..', '..', '..'), onRestart: () => process.exit(0), hasStaleRefusal: hasStaleMainRefusal },
+  });
   const intervalMs = resolveReviewIntervalMs();
   const owner = makeOwner('review-daemon');
   const acquired = acquireRunnerLease(RUNNER_LOCK_ROOT, owner, { key: REVIEW_DAEMON_LEASE_KEY });

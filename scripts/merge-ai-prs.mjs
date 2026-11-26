@@ -192,6 +192,7 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { listOpenPrsPagedHydratedCompleteAsync as listOpenPrsPagedHydrated, resolvePrListPaging, parseListOutput } from './lib/pr-list-paged.mjs'; // refuses a short inventory (rows < totalCount)
 import { withListRetryAsync as withListRetry } from './lib/gh-list-retry.mjs'; // 504 incident 2026-11-03 — retry a transient 5xx list with backoff; a persistent failure throws + raises gh-list-failed
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+const FAST_DRAIN_SOURCE_MAX_AGE_MS = 10 * 60_000;
 import { backfillAllReviewRuns, backfillOpenReviewRuns } from './lib/review-run-index.mjs';
 /** Optional discovery hints must never reject the drain's open-PR context. */
 export function backfillDrainReviewRuns(context, {
@@ -261,6 +262,7 @@ import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: t
 import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
 import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { resolveSiblingRepoName, siblingCloneStatus, provisionMissingSiblingClones } from './lib/sibling-clone-provision.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
@@ -4035,9 +4037,7 @@ export function resolveContextRepos(repos, self) {
  * @returns {string|null}
  */
 export function siblingCloneName(repo) {
-  if (!repo || !repo.includes('/')) return null;
-  const name = repo.split('/').pop();
-  return CONSTELLATION_REPO_NAMES.includes(name) ? name : null;
+  return resolveSiblingRepoName(repo);
 }
 
 /**
@@ -4953,6 +4953,8 @@ export function describeGhListError(e) {
 
 // ── CLI boundary ───────────────────────────────────────────────────────────────────────────────────────
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+let siblingClonesChecked = false;
+let siblingProvisionFailures = [];
 if (IS_CLI) main(process.argv.slice(2)).catch((e) => { process.stderr.write(`merge-ai-prs ✗ ${String(e && e.stack || e)}\n`); process.exit(1); });
 
 export async function main(argv, { env = process.env, stdout = process.stdout, exit = process.exit } = {}) {
@@ -5139,15 +5141,19 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
   // #2263 — a SIBLING clone of a non-local constellation repo (`../frontierui`, `../plateau-app` next to this
   // WE clone) lets the rebase-drop plumbing rebuild THAT repo's lane tip too, instead of leaving every
   // CONFLICTING/BEHIND frontierui/plateau-app PR for its author. Best-effort + read-only-check: a repo whose
-  // sibling directory is missing (not provisioned) or isn't a git working copy falls back to the prior skip —
-  // nothing here clones on the fly (provisioning is the lane-pool allocator's job — #2303, see
-  // skills-src/drain/SKILL.md's Preconditions).
+  // sibling directory is still missing after the startup repair falls back to the prior skip.
   const siblingCloneDir = (repo) => {
     if (isLocalRepo(repo)) return null;
     const name = siblingCloneName(repo);
-    if (!name) return null;
-    const dir = resolve(process.cwd(), '..', name);
-    try { return existsSync(join(dir, '.git')) ? dir : null; } catch { return null; }
+    if (!name || siblingProvisionFailures.some(row => row.name === name)) return null;
+    const status = siblingCloneStatus({ cwd: process.cwd() }).find(row => row.name === name);
+    return status?.present ? status.dir : null;
+  };
+  const siblingCloneReason = repo => {
+    const name = siblingCloneName(repo);
+    return siblingProvisionFailures.find(row => row.name === name)?.reason
+      ?? siblingCloneStatus({ cwd: process.cwd() }).find(row => row.name === name)?.reason
+      ?? 'unknown constellation sibling';
   };
 
   // #2313 — post (or skip, if already posted) a drain reason comment on a PR. Best-effort: a `gh` miss never
@@ -5930,7 +5936,14 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
         return stdout;
       },
     });
-    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs', cacheOnly: true });
+    // Source rows are only BASE facts: every non-target row is identity-checked (head/updatedAt) against a live lean
+    // inventory and re-read when it differs, and the target plus its related set are read live. A mutation-dirtied
+    // source therefore stays usable, bounded by an age cap that covers a full pass (a refresh itself takes ~80s,
+    // longer than the 75s snapshot TTL, so a TTL-only source could never be served).
+    // mergeQueue.fastDrain.selfRefresh (standard OFF): while off, every read below is exactly what main does.
+    const selfRefresh = fastDrainListing.selfRefresh === true;
+    const readSnapshot = repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
+      cacheOnly: true, ...(selfRefresh ? { ignoreDirty: true, ttlMs: FAST_DRAIN_SOURCE_MAX_AGE_MS } : {}) });
     // Cross-PR gates need: open item/dependency identities (blockedBy/stackParents), couple refs
     // and carrier health, card-group membership, and complete file sets for overlap/queue ordering.
     // The lean number/head/updatedAt/base/draft/state inventory validates cached facts; only the target
@@ -5942,8 +5955,13 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     let passBranchChanged = false;
     const rows = await __t.timeAsync('listing', () => readFastDrainContext({ repos: slugs, targetRepo: localSlug, onlyPr,
       concurrency: resolvedMergePolicy.policy.concurrency.gateReads, failClosed: !!flags['from-catch-up'],
+      ...(selfRefresh ? { targetMaxAgeMs: 60_000 } : {}),
       readInventory: flags['from-catch-up'] && passListingSnapshot ? () => readFastDrainPassInventory({ path: passListingSnapshot,
         repos: slugs, targetRepo: localSlug, readSnapshot, listLean,
+        // A stale cache-only source would otherwise fail every catch-up child until the next full pass.
+        // Strict TTL/dirty only: the stale-ok allowance must never serve a source that catch-up already rejected.
+        refreshSnapshot: selfRefresh ? repo => readSharedOpenPrs({ repo, fields: `${SWEEP_LIST_FIELDS},updatedAt,rowsHead,rowsComplete`, caller: 'merge-ai-prs.mjs',
+          env: Object.fromEntries(Object.entries(process.env).filter(([k]) => k !== 'WE_PR_SNAPSHOT_STALE_OK_MS')) }) : null,
         log: line => process.stderr.write(`${line}\n`),
         concurrency: resolvedMergePolicy.policy.concurrency.gateReads,
         readMain: async repo => {
@@ -6482,7 +6500,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
       // prior "left for its author" skip (rebasing it needs a clone of that repo).
       const cloneDir = isLocalRepo(v.repo) ? undefined : siblingCloneDir(v.repo);
       if (!isLocalRepo(v.repo) && !cloneDir) {
-        if (isRebaseDropCandidate(v)) { v.rebaseDrop = 'skipped-remote'; if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} needs rebase in a ${v.repo} clone (no sibling clone provisioned — rebase-drop is local-only); left for its author\n`); }
+        if (isRebaseDropCandidate(v)) { v.rebaseDrop = 'skipped-remote'; if (!AS_JSON) process.stderr.write(`  ↻ ${repoTag(v.repo)}${v.num} needs rebase in a ${v.repo} clone (no sibling clone provisioned: ${siblingCloneReason(v.repo)} — rebase-drop is local-only); left for its author\n`); }
         continue;
       }
       if (DRY_RUN) {
@@ -7504,7 +7522,7 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
     let out;
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
-    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned: ${siblingCloneReason(cand.repo)}` };
     else out = await refreshApprovedHead(cand, { laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
     // Once per pass on a head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git
     // error, no clone) is retried next pass rather than parking the head as `wait` forever. The record names the pass
@@ -8391,6 +8409,20 @@ export async function main(argv, { env = process.env, stdout = process.stdout, e
     // releaseDrainLease only frees a lease THIS owner still holds, so a reclaimer who seized it is never stomped.
     process.on('exit', () => { releaseDrainLease(DRAIN_LOCK_ROOT, leaseOwner, { repoKey: localSlug }); });
     for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => exit(0)); // → triggers the exit handler → frees the lease
+  }
+
+  // The daemon's pool may have no PORT_BANDS entry, so lane-pool healing never visits it.
+  // Check once per process, before any sweep; dry runs only report missing-clone status.
+  if (!siblingClonesChecked) {
+    siblingClonesChecked = true;
+    // Vitest setup marks this process and its spawned CLIs. Incidental startup
+    // checks must never clone beside a fixture (which may live in shared tmpdir).
+    // Some CLI fixtures clear WE_UNDER_TEST to exercise production readers but
+    // retain the inherited hermetic marker. Either marker forbids startup clones.
+    const testStatusOnly = ['WE_UNDER_TEST', 'WE_TEST_HERMETIC'].find(key => env[key] === '1');
+    if (testStatusOnly) process.stderr.write(`sibling clones: status-only (${testStatusOnly}=1, test environment)\n`);
+    siblingProvisionFailures = provisionMissingSiblingClones({ cwd: process.cwd(), dryRun: DRY_RUN || Boolean(testStatusOnly),
+      log: line => process.stderr.write(`${line}\n`) }).failed;
   }
 
   // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────

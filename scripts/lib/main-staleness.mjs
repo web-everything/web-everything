@@ -77,24 +77,40 @@ export function classifyStaleness({ behind, ahead, dirty, autoFf, base = 'main',
  * @param {{base?:string, autoFf?:boolean, cleanOnly?:boolean, run?:typeof gitRun}} o
  * @returns {{offline?:true}|{fresh:true,behind:0}|{synced:true,behind:number}|{action:'warn',reason?:string,behind,ahead,dirty,warning:string}}
  */
-export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = false, run = gitRun } = {}) {
+export function checkMainStaleness({ base = 'main', autoFf = true, cleanOnly = false, strict = false, run = gitRun } = {}) {
   const fetched = run(['fetch', 'origin', base, '--quiet']);
   if (fetched.status !== 0) return { offline: true };
   const rev = (a) => { const r = run(['rev-parse', a]); return r.status === 0 ? r.stdout.trim() : null; };
   const local = rev(base);
   const origin = rev(`origin/${base}`);
   if (!local || !origin) return { offline: true };
-  if (local === origin) return { fresh: true, behind: 0 };
-  const count = (range) => { const r = run(['rev-list', '--count', range]); return r.status === 0 ? Number(r.stdout.trim()) || 0 : 0; };
+  if (local === origin) {
+    if (strict) {
+      // Fail closed: unreadable status or branch evidence is stale, never fresh.
+      const st = run(['status', '--porcelain']);
+      if (st.status !== 0 || (cleanOnly && st.stdout && st.stdout.trim())) return { offline: true };
+      if (cleanOnly) {
+        const hd = run(['symbolic-ref', '--short', 'HEAD']);
+        if (hd.status !== 0 || hd.stdout.trim() !== base) return { offline: true };
+      }
+    }
+    return { fresh: true, behind: 0 };
+  }
+  const count = (range) => { const r = run(['rev-list', '--count', range]);
+    if (strict && (r.status !== 0 || !/^\d+$/.test(r.stdout.trim()))) return NaN;
+    return r.status === 0 ? Number(r.stdout.trim()) || 0 : 0; };
   const behind = count(`${base}..origin/${base}`);
   const ahead = count(`origin/${base}..${base}`);
   const st = run(['status', '--porcelain']);
+  if (strict && (!Number.isFinite(behind) || !Number.isFinite(ahead) || st.status !== 0)) return { offline: true };
   const dirty = !!(st.stdout && st.stdout.trim());
   let onBase = true;
   if (cleanOnly) {
     const head = run(['symbolic-ref', '--short', 'HEAD']);
+    if (strict && head.status !== 0) return { offline: true };
     onBase = head.status === 0 && head.stdout.trim() === base;
   }
+  if (strict && cleanOnly && (dirty || !onBase)) return { offline: true };
   const cls = classifyStaleness({ behind, ahead, dirty, autoFf, base, cleanOnly, onBase });
   if (cls.action === 'auto-ff') {
     const synced = cleanOnly ? run(['merge', '--ff-only', `origin/${base}`]) : run(['pull', '--ff-only', '--autostash']);
