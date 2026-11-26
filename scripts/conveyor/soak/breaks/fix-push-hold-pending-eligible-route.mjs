@@ -23,9 +23,10 @@ const CASES = [
 const PROBE = `
 const [file, cases] = [process.argv[1], JSON.parse(process.argv[2])];
 const { readLivePushHold } = await import(file);
+const H = 'a'.repeat(40);
 const out = cases.map(([name, repair, view]) => {
-  const run = () => JSON.stringify({ state: 'OPEN', ...view, labels: view.labels.map(n => ({ name: n })) });
-  const hold = readLivePushHold({ repo: 'we', pr: 1, repair }, { hermetic: false, run });
+  const run = () => JSON.stringify({ state: 'OPEN', headRefOid: H, ...view, labels: view.labels.map(n => ({ name: n })) });
+  const hold = readLivePushHold({ repo: 'we', pr: 1, repair: { headRefOid: H, ...repair } }, { hermetic: false, run });
   return [name, hold ? hold.reason : null];
 });
 console.log(JSON.stringify(out));`;

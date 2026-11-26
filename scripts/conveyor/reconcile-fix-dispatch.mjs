@@ -113,7 +113,8 @@ function pendingExemptRoute(repair, labels, view) {
     || repair.operatorSendBack || repair.rulingNotAddressed || repair.joinedInputs
     || repair.restack || repair.blockRuledReferrals?.length) return false;
   // Bind to the planned head: a repair planned for an older head cannot waive pending on a replacement head.
-  if (repair.headRefOid && repair.headRefOid !== view.headRefOid) return false;
+  // A missing or unreadable head on either side keeps the hold.
+  if (!/^[0-9a-f]{40}$/.test(repair.headRefOid ?? '') || repair.headRefOid !== view.headRefOid) return false;
   if (repair.mode === 'advisory-fix') return labels.includes('advisory:changes') && labels.includes('review:human');
   return repair.isConflict === true && !repair.mode && view.mergeable === 'CONFLICTING'
     && typeof view.baseRefName === 'string' && view.baseRefName === 'main'
