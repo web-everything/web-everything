@@ -44,6 +44,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readBotLogins } from '../lib/github-app-identity.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 
 /**
  * we:scripts/conveyor/stand-down.mjs#STAND_DOWN_MARKER — the stable FIRST LINE of the durable stand-down comment.
@@ -526,7 +527,7 @@ export function buildLoadFlakeRedispatchResolvedComment({ result, detail = '' })
 }
 
 export function buildLoadFlakeHoldComment({ head, alt, altSha, detail = '' }) {
-  if (!alt || !altSha) return buildStandDownComment({ reason: 'gate-red', detail });
+  if (!alt || !altSha) return buildStandDownComment({ reason: 'gate-red', head, detail });
   return `${LOAD_FLAKE_HOLD_MARKER}\n\n${detail}\n<!-- load-flake-hold${head ? ` head=${head}` : ''} alt=${alt} alt-sha=${altSha} outcome=blocked-on-load-flake -->`;
 }
 
@@ -748,10 +749,14 @@ export function standDownReason(body) {
  * The body states the ASYMMETRY explicitly — terminal for the reconciler, cleared by a person — because that is
  * the difference between a marker and a burial. A reader who finds this comment must be able to see, without
  * reading any code, that the automation has deliberately stopped and that they are the intended next step.
- * @param {{ actor?:string, reason?:string, detail?:string }} o
+ * Head is required outside tests; tests may still construct historical headless comments.
+ * @param {{ actor?:string, reason?:string, detail?:string, head:string }} o
  * @returns {string}
  */
 export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null, findingRefs } = {}) {
+  if (!isUnderTest() && (!isSafeGitSha(head) || head.trim() !== head)) {
+    throw new TypeError('stand-down: a valid head is required; pass the PR head SHA');
+  }
   if (findingRefs !== undefined && (reason !== 'needs-judgment' || !validFindingRefs(findingRefs))) {
     throw new Error('findingRefs requires needs-judgment and a non-empty list of {runId, key} subjects');
   }

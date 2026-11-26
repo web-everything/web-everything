@@ -16,10 +16,11 @@
  *   invisible.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import ts from 'typescript';
 import {
   standDownHead, standDownLapse, annotateLapsedStandDowns, resolveStandDownLapseOnNewHead,
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
@@ -704,4 +705,54 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
   it('a bare timeout with no unrelated/other-tests-pass evidence stays terminal', () => {
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
   });
+});
+
+
+it('every production stand-down poster includes the head trailer', () => {
+  const root = resolve(HERE, '../../..');
+  const missing = [];
+  let callers = 0;
+  function inspect(dir) {
+    for (const entry of readdirSync(resolve(root, dir), { withFileTypes: true })) {
+      const path = `${dir}/${entry.name}`;
+      // Soak breaks and fixtures are test producers of historical comments.
+      if (entry.isDirectory()) {
+        if (!['__tests__', 'soak', 'fixtures', 'node_modules'].includes(entry.name)) inspect(path);
+        continue;
+      }
+      if (!entry.name.endsWith('.mjs')) continue;
+      const source = ts.createSourceFile(path, readFileSync(resolve(root, path), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      function visit(node) {
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'buildStandDownComment') {
+          callers++;
+          const arg = node.arguments[0];
+          if (!arg || !ts.isObjectLiteralExpression(arg) || !arg.properties.some(p =>
+            (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && p.name.getText(source) === 'head')) {
+            missing.push(`${path}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`);
+          }
+        }
+        ts.forEachChild(node, visit);
+      }
+      visit(source);
+    }
+  }
+  inspect('scripts');
+  inspect('skills-src');
+  expect(callers).toBeGreaterThan(0);
+  expect(missing).toEqual([]);
+  const head = 'a'.repeat(40);
+  expect(standDownHead(buildLoadFlakeHoldComment({ head, detail: 'No saved alternate' }))).toBe(head);
+});
+
+it('refuses missing or unsafe stand-down heads outside tests', () => {
+  vi.stubEnv('VITEST', '');
+  vi.stubEnv('WE_UNDER_TEST', '');
+  try {
+    expect(() => buildStandDownComment()).toThrow(/head.*required/i);
+    for (const head of [null, '', 'not-a-sha', 'a'.repeat(40) + '\n']) {
+      expect(() => buildStandDownComment({ head })).toThrow(/head.*required/i);
+    }
+    const head = 'a'.repeat(40);
+    expect(buildStandDownComment({ head }).split('\n').at(-1)).toContain(` head=${head}`);
+  } finally { vi.unstubAllEnvs(); }
 });
