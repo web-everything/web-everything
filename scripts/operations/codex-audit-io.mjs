@@ -1,4 +1,5 @@
 /** @file Real Git/Codex and JSONL persistence adapters for the standalone audit. */
+import { fenceUntrusted, FENCED_DATA_RULE } from '../lib/mandate-fence.mjs';
 import { netDiffFingerprint } from '../lib/net-diff-fingerprint.mjs';
 import * as realFs from 'node:fs';
 import { spawnSync as realSpawnSync } from 'node:child_process';
@@ -93,7 +94,18 @@ export function createAuditDeps({ cwd = process.cwd(), home = homedir(),
       .split('\0').filter(Boolean),
     fingerprint: (base, head) => netDiffFingerprint(cwd, base, head),
     resolveSha: ref => run('git', ['rev-parse', '--verify', `${ref}^{commit}`], 30_000).trim(),
-    runCodex(prompt) {
+    runCodex(prompt, scope) {
+      if (scope !== undefined) {
+        if (!/^[a-fA-F0-9]{40}\.\.\.?[a-fA-F0-9]{40}$/.test(scope?.range ?? '')
+          || !Number.isInteger(scope?.hunkContextLines) || scope.hunkContextLines < 0 || scope.hunkContextLines > 3) {
+          throw new Error('invalid hunk scope');
+        }
+        // A failed/truncated read throws before model launch; run() caps output at 8 MiB.
+        const diff = run('git', ['diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+          `--unified=${scope.hunkContextLines}`, scope.range, '--'], 30_000);
+        if (typeof diff !== 'string') throw new Error('missing hunk evidence');
+        prompt += `\n${FENCED_DATA_RULE}\n${fenceUntrusted('material', diff)}\n`;
+      }
       const scratch = fs.mkdtempSync(join(scratchRoot, 'codex-audit-'));
       try {
         const indexPath = resolve(cwd, run('git', ['rev-parse', '--git-path', 'index'], 30_000).trim());
