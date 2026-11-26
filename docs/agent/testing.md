@@ -1044,7 +1044,9 @@ from 1 to 60. Invalid or oversized costs refuse execution; split larger work int
 attempts. The host bucket refills at `pointsBudgetPerMin / 60` points per second (300/minute
 by default), holds at most 60 points, and shares the existing `points-budget` mutex.
 Priority (writes, critical callers, reserved reads) retains a floor of 0; standard retains
-10; batch retains 30, reduced to 10 after a ticket at 20 seconds. Batch classification uses
+10; batch retains 30, reduced to 10 after a ticket at 20 seconds. For ticketed batch costs
+above 50, the reserve reduces further to `60 - cost`, so every valid batch cost can fit
+on an idle host after aging. Batch classification uses
 the first matching normalized caller pattern, default `^rebuild-smoke`. Malformed patterns
 are skipped. Batch spends at most 60 points in any rolling 60 seconds; entries expire at
 exactly 60 seconds. Only the oldest live ticket may admit batch work while tickets exist;
@@ -1092,6 +1094,10 @@ Adoption fixtures inject `testOnlyAdoptionCheck` through the separate second arg
 `acquireGhPointsSync`; production wrappers always use real evidence. Roster holes, malformed
 entries and non-string heads retain compat. Pending-charge repair treats an existing corrupt
 legacy ledger as full for a fresh window; only an absent ledger can recover from the journal alone.
+Every conservative legacy recovery persists that full window under the shared mutex even
+when admission is refused. Retries reuse its start time, and unknown recovery spend clears
+new-build charge attribution so adoption cannot bypass the recovery window. The window
+expires normally; a batch request that reaches its deadline first retries on the next tick.
 
 ## GitHub priority admission
 

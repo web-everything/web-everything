@@ -283,6 +283,59 @@ it('corrupt-legacy-refuses-batch-and-restores-compat', () => {
   expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
   expect(load(bucketFile())).toMatchObject({ mode: 'compat', tokens: 60 });
 });
+describe.each(['{', 'null', '{"windowStartMs":1000000,"spent":null}'])('legacy-recovery-from-%s', raw => {
+  it('persists-one-conservative-window-across-callers-and-idle-retry', () => {
+    const recoveryStart = clock;
+    save(bucketFile(), state({ mode: 'bucket' }));
+    writeFileSync(legacyFile(), raw);
+    expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
+    clock += 1000;
+    expect(acquire({ pointClass: 'priority', reserved: true, timeoutMs: 0, owner: 'reserved' }).ok).toBe(false);
+    expect(load(legacyFile())).toEqual({ windowStartMs: recoveryStart, spent: 300 });
+    clock = recoveryStart + 120000;
+    expect(acquire({ pointClass: 'batch' })).toMatchObject({ ok: true, waitedMs: 0 });
+    expect(load(legacyFile())).toEqual({ windowStartMs: clock, spent: 1 });
+  });
+  it('default-batch-timeout-does-not-restart-recovery-on-the-next-attempt', () => {
+    save(bucketFile(), state());
+    writeFileSync(legacyFile(), raw);
+    expect(acquire({ pointClass: 'batch' })).toMatchObject({ ok: false, closed: true, waitedMs: 60000 });
+    clock += 60000;
+    expect(acquire({ pointClass: 'batch' })).toMatchObject({ ok: true, waitedMs: 0 });
+  });
+});
+it.each(['no-journal', 'corrupt-ledger-with-journal', 'mismatched-window-with-journal'])('legacy-recovery-%s-clears-attribution-before-adoption-can-reopen-admission', scenario => {
+  const recoveryStart = clock;
+  save(bucketFile(), state({ mode: 'bucket', legacyChargedByNew: 300,
+    ...(scenario === 'no-journal' ? {} : { pendingLegacy: { windowStartMs: clock, spent: 300 } }) }));
+  if (scenario === 'mismatched-window-with-journal') save(legacyFile(), { windowStartMs: clock - 1, spent: 1 });
+  else writeFileSync(legacyFile(), '{');
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
+  expect(load(legacyFile())).toEqual({ windowStartMs: recoveryStart, spent: 300 });
+  expect(load(bucketFile()).legacyChargedByNew).toBe(0);
+  clock += 1000;
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(false);
+  expect(load(legacyFile())).toEqual({ windowStartMs: recoveryStart, spent: 300 });
+  clock = recoveryStart + 60000;
+  expect(acquire({ pointClass: 'batch', timeoutMs: 0, testOnlyAdoptionCheck: () => true }).ok).toBe(true);
+});
+it.each([50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60])('batch-cost-%i-eventually-fits-on-an-idle-host', points => {
+  save(bucketFile(), state());
+  save(legacyFile(), { windowStartMs: clock, spent: 0 });
+  const result = acquire({ pointClass: 'batch', points });
+  expect(result.ok).toBe(true);
+  expect(result.waitedMs).toBe(20000);
+  expect(load(bucketFile())).toMatchObject({ tokens: 60 - points, batchLog: [{ ms: clock, p: points }], tickets: [] });
+  expect(load(legacyFile()).spent).toBe(points);
+});
+it.each([51, 60])('aged-batch-cost-%i-fits-at-capacity-and-still-obeys-cap-and-ticket-order', points => {
+  const ticket = { owner: 'test', pid: process.pid, since: clock - 21000, p: points };
+  const args = { points, pointClass: 'batch', startedAt: ticket.since };
+  expect(decide({ ...args, state: state({ tickets: [ticket] }) })).toMatchObject({ allowed: true, nextState: { tokens: 60 - points, tickets: [] } });
+  expect(decide({ ...args, state: state({ tokens: points - 1, tickets: [ticket] }) }).allowed).toBe(false);
+  expect(decide({ ...args, state: state({ batchLog: [{ ms: clock, p: 61 - points }], tickets: [ticket] }) }).allowed).toBe(false);
+  expect(decide({ ...args, state: state({ tickets: [{ ...ticket, owner: 'older', since: ticket.since - 1 }, ticket] }) }).allowed).toBe(false);
+});
 it('deadlines-refuse-batch-even-if-capacity-arrives-at-60s', () => {
   save(bucketFile(), state({ tokens: 0 }));
   expect(acquire({ pointClass: 'batch', sleep: ms => {
@@ -318,12 +371,23 @@ describe.each(['sync', 'cli'])('%s closed execution paths', mode => {
     expect(pointsAdoptionCheck).not.toHaveBeenCalled();
     expect(load(bucketFile()).mode).toBe('compat');
   });
-  it.each(['lock-root-failure', 'gate-exception', 'held-lock-timeout', 'slot-ungated-override'])('batch-%s-never-executes', failure => {
+  it('full-bucket-batch-cost-60-executes-after-ticket-aging-and-charges-both-ledgers', () => {
+    save(bucketFile(), state());
+    const started = clock;
+    const exec = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok') }));
+    invoke(options({ caller: 'rebuild-smoke.mjs:we', points: 60, exec, warn: vi.fn() }));
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(clock - started).toBe(20000);
+    expect(load(bucketFile())).toMatchObject({ tokens: 0, tickets: [], batchLog: [{ ms: clock, p: 60 }] });
+    expect(load(legacyFile()).spent).toBe(60);
+  });
+  it.each(['lock-root-failure', 'gate-exception', 'legacy-gate-exception', 'held-lock-timeout', 'slot-ungated-override'])('batch-%s-never-executes', failure => {
     const exec = vi.fn(() => ({ status: 0, stdout: Buffer.from('ok') }));
     const throttle = options({ caller: 'rebuild-smoke.mjs:we', exec, cap: 1, warn: vi.fn(), acquireTimeoutMs: 5, env: { ...env(), WE_GH_THROTTLE_ON_SLOT_TIMEOUT: 'ungated' } });
     save(bucketFile(), state());
     if (failure === 'lock-root-failure') { throttle.lockRoot = join(root, 'file'); writeFileSync(throttle.lockRoot, 'blocked'); }
     if (failure === 'gate-exception') { rmSync(bucketFile()); mkdirSync(bucketFile()); }
+    if (failure === 'legacy-gate-exception') mkdirSync(legacyFile());
     if (failure === 'held-lock-timeout') reserve(root, 'points-budget', 'holder', clock, new Date(clock).toISOString(), process.pid);
     if (failure === 'slot-ungated-override') gh.acquireGhSlotSync({ lockRoot: root, cap: 1, owner: 'holder', now: () => clock, timeoutMs: 0 });
     if (mode === 'sync') expect(() => invoke(throttle)).toThrow(/throttled/); else expect(invoke(throttle)).toMatchObject({ status: 1, throttled: true });

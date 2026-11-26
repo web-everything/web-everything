@@ -1456,7 +1456,8 @@ export function decideGhBucketSpend({ state, points = 1, pointClass = 'standard'
     s.tickets = [...s.tickets, { owner, pid, since: startedAt, p: points }];
   s.tickets.sort((a, b) => a.since - b.since);
   const oldest = s.tickets[0], ticketed = s.tickets.some(t => t.owner === owner);
-  const floor = pointClass === 'priority' ? 0 : batch ? (ticketed ? 10 : 30) : 10 + (oldest?.p ?? 0);
+  // Aged batch work must fit at capacity even when its cost leaves less than the usual reserve.
+  const floor = pointClass === 'priority' ? 0 : batch ? (ticketed ? Math.min(10, GH_BUCKET_SIZE - points) : 30) : 10 + (oldest?.p ?? 0);
   const batchSpent = s.batchLog.reduce((n, e) => n + e.p, 0);
   const normal = eligible && validGhPoints(points) && s.tokens - points >= floor
     && (!batch || (batchSpent + points <= 60 && (!oldest || oldest.owner === owner)));
@@ -1528,22 +1529,33 @@ export function acquireGhPointsSync({
           // Only an existing but unreadable/invalid file is conservative (-60 tokens, batch cap full).
           if (s == null && !existsSync(bucketPath)) s = { ...resetGhBucket(nowMs), tokens: 60, batchLog: [] };
           else if (!bucketStateValid(s)) { s = resetGhBucket(nowMs); log({ outcome: 'points_state_reset' }); }
+          const conservativeLegacy = () => {
+            // Recovery is unknown spend, never a charge attributable to this bucket build.
+            s.legacyChargedByNew = 0;
+            // Clear attribution durably first: a crash after the legacy rename must stay in compat.
+            writeGhPointsAtomic(bucketPath, s);
+            return { windowStartMs: nowMs, spent: budgetPerMin };
+          };
           if (s.pendingLegacy) {
             // A crash may precede OR follow the legacy rename. Max, never add, makes repair idempotent.
             const pending = s.pendingLegacy;
-            if (!validLegacyPoints(pending)) { s = resetGhBucket(nowMs); legacy = { windowStartMs: nowMs, spent: budgetPerMin }; }
+            if (!validLegacyPoints(pending)) { s = resetGhBucket(nowMs); legacy = conservativeLegacy(); }
             else if (!validLegacyPoints(legacy)) {
               // An absent ledger is an interrupted first write. An existing invalid ledger is full,
               // even if its journal is old: never coerce bad spent values or serialize NaN as null.
-              legacy = existsSync(legacyPath) ? { windowStartMs: nowMs, spent: budgetPerMin } : { ...pending };
+              legacy = existsSync(legacyPath) ? conservativeLegacy() : { ...pending };
             } else if (legacy.windowStartMs === pending.windowStartMs)
               legacy = { windowStartMs: pending.windowStartMs, spent: Math.max(legacy.spent, pending.spent) };
-            else legacy = { windowStartMs: nowMs, spent: budgetPerMin };
+            else legacy = conservativeLegacy();
             writeGhPointsAtomic(legacyPath, legacy);
             delete s.pendingLegacy;
           }
           const legacyCorrupt = !validLegacyPoints(legacy) && existsSync(legacyPath);
-          if (legacyCorrupt) legacy = { windowStartMs: nowMs, spent: budgetPerMin };
+          if (legacyCorrupt) {
+            legacy = conservativeLegacy();
+            // Persist once even when admission is refused, so retries share an expiring window.
+            writeGhPointsAtomic(legacyPath, legacy);
+          }
           const oldSpend = legacyCorrupt || (validLegacyPoints(legacy) && legacy.spent > 0
             && (legacy.windowStartMs !== s.legacyWindowStartMs || legacy.spent > s.legacyChargedByNew));
           const mode = !oldSpend && adopted ? 'bucket' : 'compat';
