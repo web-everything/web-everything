@@ -23,6 +23,7 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
+import { classify, directionFor, isLoosening } from '../settings-safe-direction.mjs';
 import { resolveAdoptNotWorse, budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
 import { runLiveSmoke, SMOKE_CHECKS, DISPATCH_DRY_RUN_SCRIPT } from '../daemon-live-smoke.mjs';
 import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
@@ -439,10 +440,13 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
 
 // ── e. smoke-harness-broken (the control fails identically) ────────────────────────────────────────────────
 
+/** The on path, injected in-process: the setting is default-OFF and has no env override. */
+const rebuildCloneAdoptOn = (options) => rebuildClone({ ...options, adoptNotWorse: () => ({ enabled: true }) });
+
 describe('smoke-harness-broken (x5wbsbc)', () => {
   it('a last-good control whose same-named rows were refused never adopts the candidate', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
+    const rebuildClone = rebuildCloneAdoptOn; // the setting is default-OFF with no env override: inject the on path
     pushBranch(originDir, 'lane/refused-control', (dir) => writeFile(dir, 'candidate.txt', 'bad\n'));
     addOverlay(cloneDir, { ref: 'lane/refused-control', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
@@ -532,7 +536,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
 
   it('adopts a pinned candidate by default when the last-good control fails the same cross-org check', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
+    const rebuildClone = rebuildCloneAdoptOn; // the setting is default-OFF with no env override: inject the on path
     pushBranch(originDir, 'lane/harness-fix', (dir) => writeFile(dir, 'harness-fix.txt', 'fix\n'));
     addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
@@ -580,15 +584,21 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(result.alerts.some((a) => a.kind === 'smoke-harness-broken-adopted-not-worse')).toBe(false);
   });
 
-  it('resolveAdoptNotWorse: default false, env 1 on, env 0 off', () => {
+  it('resolveAdoptNotWorse ignores the env entirely (no override can enable it)', () => {
     expect(resolveAdoptNotWorse({})).toMatchObject({ enabled: false });
-    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '1' })).toMatchObject({ enabled: true });
-    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' })).toMatchObject({ enabled: false });
+    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '1' })).toMatchObject({ enabled: false });
+    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: 'true' })).toMatchObject({ enabled: false });
+  });
+
+  it('adoptNotWorse is tighten-only in the safe-direction table', () => {
+    expect(classify('rebuildAdoptNotWorse', 'enabled')).toBe('safety');
+    expect(isLoosening(directionFor('rebuildAdoptNotWorse', 'enabled'), false, true)).toBe(true);
+    expect(isLoosening(directionFor('rebuildAdoptNotWorse', 'enabled'), true, false)).toBe(false);
   });
 
   it('rejects a candidate failing x and y when the last-good control fails only x', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
+    const rebuildClone = rebuildCloneAdoptOn; // the setting is default-OFF with no env override: inject the on path
     pushBranch(originDir, 'lane/worse', (dir) => writeFile(dir, 'worse.txt', 'bad\n'));
     addOverlay(cloneDir, { ref: 'lane/worse', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
