@@ -440,6 +440,47 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
 // ── e. smoke-harness-broken (the control fails identically) ────────────────────────────────────────────────
 
 describe('smoke-harness-broken (x5wbsbc)', () => {
+  it('a last-good control whose same-named rows were refused never adopts the candidate', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    pushBranch(originDir, 'lane/refused-control', (dir) => writeFile(dir, 'candidate.txt', 'bad\n'));
+    addOverlay(cloneDir, { ref: 'lane/refused-control', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const child = vi.fn();
+    let control;
+    const runSmoke = vi.fn(async ({ root, env: smokeEnv }) => {
+      if (existsSync(join(root, 'candidate.txt'))) return {
+        verdict: 'code', attempts: 1,
+        smoke: { results: [{ ok: false, name: 'tree-stays-clean', detail: 'smoke introduced tracked dirt' }] },
+      };
+      control = await runLiveSmoke({
+        root, env: smokeEnv, clock: () => 1_000,
+        runChild: budgetedRunChild({ runChild: child, deadline: 1_000, now: () => 1_000 }),
+        reuseRows: SMOKE_CHECKS.filter(check => check.name !== 'tree-stays-clean')
+          .map(({ name }) => ({ name, ok: true })),
+      });
+      return { verdict: 'code', attempts: 1, smoke: control };
+    });
+
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+
+    expect(control.results.filter(row => !row.ok)).toEqual([
+      expect.objectContaining({ name: 'tree-stays-clean', budgetInterrupted: true }),
+    ]);
+    expect(child).not.toHaveBeenCalled();
+    expect(result.adopted).not.toBe(true);
+    expect(result.reason).toBe('smoke-rejected');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(result.alerts.some(alert => alert.kind === 'smoke-harness-broken-adopted-not-worse')).toBe(false);
+    const state = readRebuildState(cloneDir, env);
+    expect(state.held?.reason).toBe('smoke-rejected');
+    expect(state.rejected?.harnessBroken).not.toBe(true);
+    expect(readOverlays(cloneDir, env).some(overlay => overlay.ref === 'lane/refused-control')).toBe(true);
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects as smoke-harness-broken when the last-good control fails the same check, backs off, then retries', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '0';
@@ -636,6 +677,12 @@ describe('an adoption after a hold clears state.held', () => {
 // ── h. failsSameChecks — pure ────────────────────────────────────────────────────────────────────────────────
 
 describe('failsSameChecks', () => {
+  it('an evidence-less control row never establishes harness-broken', () => {
+    const candidate = [{ ok: false, name: 'tree-stays-clean', detail: 'smoke introduced tracked dirt' }];
+    const control = [{ ok: false, name: 'tree-stays-clean', detail: 'same name without gate evidence' }];
+    expect(failsSameChecks(candidate, control)).toBe(false);
+  });
+
   it('true when the control fails every check the candidate failed', () => {
     const candidate = [{ name: 'a' }, { name: 'b' }];
     const control = [{ name: 'a' }, { name: 'b' }, { name: 'c' }];
