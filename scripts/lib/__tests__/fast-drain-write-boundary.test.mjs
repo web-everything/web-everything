@@ -8,6 +8,19 @@ import { provisionMissingSiblingClones } from '../sibling-clone-provision.mjs';
 import { sendBackBlockedGates } from '../drain-blocked-reason.mjs';
 import { strategyFixture, HEAD, REPO } from './fixtures/fast-drain-strategy.mjs';
 
+test('full passes preserve executor identity while limited scopes keep command guards', () => {
+  const calls = [], run = (...args) => { calls.push(args); return 'read result'; };
+  const full = scope.createFastDrainWriteBoundary({ writeScope: 'full' });
+  assert.equal(full.exec(run), run);
+  for (const writeScope of ['none', 'enqueue-only']) {
+    const guarded = scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 }).exec(run);
+    assert.notEqual(guarded, run);
+    assert.equal(guarded('git', ['rev-parse', 'HEAD']), 'read result');
+    assert.throws(() => guarded('git', ['push', 'origin', 'HEAD']), /write-boundary:numbering-push/);
+  }
+  assert.deepEqual(calls, Array(2).fill(['git', ['rev-parse', 'HEAD'], undefined]));
+});
+
 test('skipped sweeps never run', () => {
   const h = strategyFixture();
   h.strategy.dequeueSendBacks([{ number: 8, labels: ['review:changes'] }]);

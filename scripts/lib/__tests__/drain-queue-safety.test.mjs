@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import * as queueSafety from '../drain-queue-safety.mjs';
 import { assertCapability } from '../repo-profile.mjs';
+import { createFastDrainWriteBoundary } from '../fast-drain-scope.mjs';
 import { readDrainQueueSafety, redTeamEnqueueHold, dequeueSentBack, sendBackReason, decideMqSameHead, readMqTimeline, mqSameHeadGuard, createMqSameHeadRefreshStore, createMqSameHeadRefreshOptions, mqSameHeadRefreshStatePath } from '../drain-queue-safety.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 import { parseRedTeamComment, redTeamGateMarker, redTeamMarker, redTeamResultId } from '../red-team-gate.mjs';
@@ -174,6 +175,7 @@ describe('merge-queue same-head failure admission', () => {
         const start = source.indexOf('  function enqueueWithSameHeadGuard(');
         const end = source.indexOf('  // xym8nt4 — post-approval', start);
         const wiring = { ...dependencies, assertCapability, DRY_RUN: false, mqSameHeadRefreshStore: f.store,
+          enqueueOnly: false, writeBoundary: createFastDrainWriteBoundary({ writeScope: 'full', repo, num: pr }),
           execFileSyncThrottled: exec, createMqLiveReader: (reader = exec) => queueSafety.createMqLiveReader(reader),
           readCompletePrComments, readPinnedChangedFiles,
           readDrainQueueSafety: () => ({ value: { waitForRedTeamBeforeEnqueue: true } }),

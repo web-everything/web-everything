@@ -20,6 +20,7 @@ import { assertCapability } from '../repo-profile.mjs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { createFastDrainWriteBoundary } from '../fast-drain-scope.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -321,12 +322,14 @@ describe('main-fix goes first; couple halves never move', () => {
 describe('R761 step 0 — fail-open guards', () => {
   // Like drain-queue-safety.test.mjs, execute the actual CLI closures with hermetic IO.
   // Keep the real readers and refresh helper: injecting readHold/readRunId would miss wiring regressions.
-  const productionGuards = ({ override = 'on', failure = null, queueOwns = true, settingsUnreadable = false } = {}) => {
+  const productionGuards = ({ override = 'on', failure = null, queueOwns = true, settingsUnreadable = false, writeScope = 'full' } = {}) => {
     vi.stubEnv('WE_GH_READ_MEMO_DIR', '/fixture/stale-memo');
     const head = 'a'.repeat(40), base = 'b'.repeat(40);
     const calls = [], warnings = [], rebases = [], reruns = [];
     const candidate = { num: 7, repo: REPO, headSha: head };
     const dependencies = {
+      enqueueOnly: writeScope === 'enqueue-only',
+      writeBoundary: createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 }),
       assertCapability,
       approvedHeadSetting: resolveSkipRebaseApprovedHumanSurface({
         env: { WE_MERGE_QUEUE_SKIP_REBASE_APPROVED_HUMAN_SURFACE: override },
@@ -392,6 +395,13 @@ describe('R761 step 0 — fail-open guards', () => {
     });
     return { ...guards, candidate, refresh, calls, warnings, rebases, reruns };
   };
+  it('production wiring: enqueue-only refuses refresh before proof reads, rebase or rerun', () => {
+    const p = productionGuards({ writeScope: 'enqueue-only' });
+    expect(p.refresh).toThrow('defer-to-pass:write-boundary:refresh');
+    expect(p.calls).toEqual([]);
+    expect(p.rebases).toEqual([]);
+    expect(p.reruns).toEqual([]);
+  });
   it.each(['on', 'bogus'])('production wiring: %s preserves an approved head and discovers its required run', async override => {
     const p = await productionGuards({ override });
     expect(await p.refresh()).toMatchObject({ ok: true, action: 'rerun', newCommit: null });

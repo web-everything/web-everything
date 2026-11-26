@@ -299,8 +299,8 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
       ensureLabel: () => { if (noWrites) refuse('labels'); },
       setLabels: (r, n, plan) => { labels(r, n, plan); allow('labels'); return provider.setLabels(r, n, plan); },
     },
-    exec: run => (file, args, options) => {
-      if (!limited) return run(file, args, options);
+    // Full passes retain the caller's executor, including its identity at helper seams.
+    exec: run => !limited ? run : (file, args, options) => {
       const value = flag => args[args.indexOf(flag) + 1];
       let bindIdentity = false;
       if (file === 'git') {

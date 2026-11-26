@@ -167,6 +167,7 @@ describe('#4389 merge failure isolation', () => {
     const executeCatch = new Function('e', 'c', 'ghListErrText', `
       const remaining = [c], pendingRebased = [], failedMerges = [];
       const AS_JSON = true;
+      const enqueueOnly = false; // This fixture exercises the legacy/full-pass recovery branch.
       const isPrAlreadyMerged = () => false;
       const sameCand = (a, b) => a.num === b.num;
       const noteSplit = () => {};
