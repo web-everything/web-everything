@@ -1202,7 +1202,17 @@ export async function runTickAllRepos({
   let completedRepo = false;
   const shouldYield = o => {
     if (yieldedForAdoption) return true;
-    if (o?.fresh) return (yieldedForAdoption = typeof adoptYieldProbe === 'function' && adoptYieldProbe(o) === true);
+    if (o?.fresh) {
+      if (typeof adoptYieldProbe !== 'function') return false;
+      try {
+        const result = adoptYieldProbe(o);
+        if (result !== true && result !== false) throw Error('ambiguous adoption probe result');
+        return (yieldedForAdoption = result);
+      } catch (error) {
+        yieldedForAdoption = true;
+        throw error; // The executor records the refusal; every later check keeps this pass yielded.
+      }
+    }
     return (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
   };
   const passStart = now();

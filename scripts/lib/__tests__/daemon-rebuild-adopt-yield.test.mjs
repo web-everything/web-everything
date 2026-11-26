@@ -124,6 +124,21 @@ describe('createAdoptYieldProbe — S1 fail-closed safe-point signal', () => {
 
 
 describe('fresh write-point adoption evidence', () => {
+  it('fresh probes report current readiness after a throttled probe consumed the same identity', () => {
+    let candidate = ready();
+    const readReady = vi.fn(() => candidate), readReadyStrict = vi.fn(() => candidate);
+    const probe = createAdoptYieldProbe({ bootHead: BOOT, now: () => 0, readReady, readReadyStrict });
+    expect(probe()).toBe(true);
+    expect(probe({ fresh: true })).toBe(true);
+    expect(probe({ fresh: true })).toBe(true);
+    candidate = null;
+    expect(probe({ fresh: true })).toBe(false);
+    candidate = ready();
+    expect(probe({ fresh: true })).toBe(true);
+    expect(probe()).toBe(false);
+    expect(readReady).toHaveBeenCalledTimes(1);
+    expect(readReadyStrict).toHaveBeenCalledTimes(4);
+  });
   it.each(['ENOTDIR','corrupt JSON','invalid fields','ENOENT'])('fresh probe: %s throws except ENOENT, which is clear', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'adopt-fresh-')); temps.push(dir);
     const env = { WE_DAEMON_STATE_DIR: join(dir,'state') }, root = join(dir,'clone');

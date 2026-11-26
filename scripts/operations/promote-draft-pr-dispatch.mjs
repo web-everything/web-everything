@@ -397,7 +397,7 @@ export function runReconcilePromoteDraftDispatch({
     let attempted = 0, lastServed = incoming, unattempted = 0;
     for (let i = 0; i < entries.length; i++) {
       const started = yieldedForAdoption ? null : now();
-      if (yieldedForAdoption || (deadlineAt != null && started > deadlineAt && attempted > 0)) {
+      if (yieldedForAdoption || (deadlineAt != null && started > deadlineAt && handled > 0)) {
         const rest = entries.slice(i);
         unattempted = rest.length;
         for (const row of rest) {
@@ -576,6 +576,11 @@ export function runReconcilePromoteDraftDispatch({
         comments: () => {
           const comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
           if (!Array.isArray(comments)) throw Error('complete PR thread unreadable');
+          const receipts = comments.filter(c => c?.id != null && String(c.id) === receiptId);
+          if (receipts.length !== 1 || receipts[0].body !== NO_CODE_REARM_RECEIPT(entry.answerId, entry.expectHead)
+            || parseNoCodeRearmReceipt(receipts[0])?.answerId !== entry.answerId) {
+            throw Error('posted no-code rearm receipt missing, changed or ambiguous; operator must inspect the complete thread');
+          }
           return comments.filter(c => String(c?.id) !== receiptId);
         } }, decide })) return;
       try {

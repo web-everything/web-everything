@@ -826,30 +826,77 @@ Fix defect`);
       reason: 'Inspected failed handoff', channel: 'chat', disposition: 'rearm-review', noCodeOwed: true, supersedes: 'answer' }));
     const { read, write, writer, postComment } = actualWriterFixture([...exhausted, replacement]);
     const s = setup({ reconcile: () => ({ dispatch: [{ ...entry, answerId: 'replacement' }], refusals: [] }),
-      readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
-      postComment: args => {
-        postComment(args);
-        // A new empty round arrives after admission. The replacement must not reset either
+      readThread: () => read().comments, readPrLabels: () => read().labels, postComment,
+      rearm: args => {
+        // A new empty round arrives after the complete guard, before the real writer reads.
+        // The replacement must not reset either
         // of the two spent waivers or the single spent no-code cap override in the writer.
         const state = read();
         state.comments.push({ ...begin, id: 'begin-4' }, { ...stop, id: 'stop-4' },
           c('over-budget', buildOperatorAnswer({ standDownId: 'stop-4', actor: 'chalbert',
             reason: 'Retry again', channel: 'chat', disposition: 'rearm-review', noCodeOwed })));
         write(state);
+        return writer(args);
       },
     });
     const first = s.run();
     expect(first.dispatched).toEqual([]);
-    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
-    expect(writer).not.toHaveBeenCalled();
+    expect(writer).toHaveBeenCalledTimes(1);
+    const child = writer.mock.results[0].value;
+    expect(child.status).toBe(1);
+    expect(JSON.parse(child.stdout.trim().split('\n').at(-1))).toMatchObject({ ok: false, reason: expect.stringContaining('no change made') });
+    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed', why: expect.stringContaining('no change made') }));
     expect(read().labels).toEqual(['review:changes']);
     expect(read().writes.filter(kind => kind === 'labels')).toEqual([]);
     const after = read();
     expect(s.run().dispatched).toEqual([]);
     expect(read()).toEqual(after);
-    expect(writer).not.toHaveBeenCalled();
+    expect(writer).toHaveBeenCalledTimes(1);
     expect(postComment).toHaveBeenCalledTimes(1);
   }, 120000);
+  it.each(['deleted', 'stand-down', 'different answer', 'different head', 'untrusted author', 'duplicate id'])(
+    'complete guard refuses a %s receipt before excluding it from the live thread', mode => {
+      let reads = 0, receipt;
+      const s = setup({ postComment: ({ comment }) => { receipt = c(17, comment); },
+        readThread: () => {
+          reads++;
+          if (!receipt) return thread();
+          if (reads === 2) return [...thread(), receipt];
+          const changed = mode === 'deleted' ? []
+            : mode === 'stand-down' ? [{ ...receipt, body: stop.body }]
+            : mode === 'different answer' ? [{ ...receipt, body: NO_CODE_REARM_RECEIPT('another-answer', head) }]
+            : mode === 'different head' ? [{ ...receipt, body: NO_CODE_REARM_RECEIPT('answer', 'b'.repeat(40)) }]
+            : mode === 'untrusted author' ? [{ ...receipt, author: { login: 'outsider' } }]
+            : [receipt, { ...receipt }];
+          return [...thread(), ...changed];
+        } });
+      const result = s.run();
+      expect(result.dispatched).toEqual([]);
+      expect(s.rearm).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unreadable', why: expect.stringMatching(/receipt.*(missing|changed|ambiguous)/) }));
+    });
+  it.each(['succeeds', 'refuses'])('only the first entry of an admitted call may overrun; later halves defer when that entry %s', outcome => {
+    let time = 0;
+    const readPrLabels = vi.fn(() => []), readThread = vi.fn(), closePr = vi.fn(), addLabel = vi.fn();
+    const s = setup({ now: () => time, deadlineAt: 10,
+      halfCursors: { restore: 'we#51', rearm: 'we#41', close: 'we#61' },
+      reconcile: () => { time = 11; return { dispatch: [
+        { kind: 'promote-draft', prNumber: 1, headRefOid: head },
+        { kind: 'restore-review-label', prNumber: 52 }, entry,
+        { kind: 'close-superseded', prNumber: 62 },
+      ] }; },
+      readHeadCheckState: () => outcome === 'succeeds' ? ALWAYS_GREEN() : { state: 'pending' },
+      readPrLabels, readComments: () => [], readThread, closePr, addLabel });
+    const result = s.run();
+    expect(result).toMatchObject({ handled: 1, deferred: [52, 42, 62],
+      nextHalfCursors: { restore: 'we#51', rearm: 'we#41', close: 'we#61' } });
+    expect(result.refusals.filter(r => r.kind.endsWith('-deferred-budget')).map(r => [r.pr, r.kind])).toEqual([
+      [52, 'restore-review-label-deferred-budget'], [42, 'rearm-no-code-deferred-budget'], [62, 'close-superseded-deferred-budget'],
+    ]);
+    expect(readPrLabels.mock.calls.map(([args]) => args.prNumber)).toEqual(outcome === 'succeeds' ? [1] : []);
+    expect(readThread).not.toHaveBeenCalled(); expect(closePr).not.toHaveBeenCalled(); expect(addLabel).not.toHaveBeenCalled();
+    expect(s.postComment).not.toHaveBeenCalled(); expect(s.rearm).not.toHaveBeenCalled();
+  });
   it.each(['red-team:blocked', 'red-team:pending', 'changes verdict', 'stand-down'])(
     'post-receipt %s refuses the writer; ruling spent, zero label writes', lateEvidence => {
       const { read, write, writer, postComment } = actualWriterFixture();

@@ -21,9 +21,8 @@ export function createAdoptYieldProbe({ root, bootHead, env = process.env,
       if (!bootHead) throw new Error('adoption boot head unreadable');
       if (swapMinIntervalMs > 0 && (!Number.isFinite(bootAt) || time - bootAt < swapMinIntervalMs)) return false;
       if (ready.prevHead !== bootHead) return false;
-      const identity = JSON.stringify([ready.adopt.finalSha, ready.passedAt]);
-      if (yielded.has(identity)) return false;
-      yielded.add(identity);
+      // A write-point probe reports live readiness even after a prior pass saw this identity.
+      // Only the throttled safe-point path consumes the process-wide one-shot signal.
       return true;
     }
     try {

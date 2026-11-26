@@ -50,20 +50,25 @@ This test does not replace the post-load live proof owed on #7321.
 Every grant or spend write uses one guard, with no intervening I/O after its decision. It reads
 fresh evidence in this order: promotion reads labels, complete comments, and the fix claim;
 restore-review-label reads labels and the claim; a no-code receipt reads labels, complete comments,
-and the claim; its writer reads labels, complete comments excluding only its own confirmed receipt
-(by string ID), and the claim again; close-superseded reads complete comments and the claim.
+and the claim; its writer reads labels, complete comments excluding only its own confirmed receipt,
+and the claim again; close-superseded reads complete comments and the claim. Before excluding that
+receipt by string ID, the fresh thread must contain exactly one matching comment with the same
+trusted receipt body, answer ID and head. A missing, edited or ambiguous receipt refuses the writer.
 Each guard re-decides from that evidence. Missing, malformed, incomplete or unreadable evidence
 refuses the entry; inspect the named evidence and restore it before retrying. A live claim waits
-for its owner. At the first durable write it also probes adoption fresh; errors latch an adoption
-yield. Once the receipt commits, adoption cannot strand its writer. Late evidence after the receipt
+for its owner. At the first durable write it also probes adoption fresh; errors and ambiguous results
+latch an adoption yield. Fresh probes report current readiness even for a previously seen candidate;
+one-shot suppression applies only to throttled safe-point probes. Once the receipt commits, adoption
+cannot strand its writer. Late evidence after the receipt
 refuses the writer and leaves the ruling spent; an operator must inspect the handoff before replacing it.
 
 Clearing awaiting-CI status and removing ready-to-merge after a committed write are authority-reducing
 follow-ups. They finish with the entry; failures are reported. Adoption is observed after every attempted
 entry, including refusals and follow-ups. A latched yield defers all later entries and halves.
 
-A call admitted before its deadline attempts at least one entry per half unless adoption has latched.
-Only later entries are bounded by the phase deadline, with at most one late entry in each half.
+A call admitted before its deadline attempts its first entry unless adoption has latched.
+Every later entry, including the first entry of a later half, is bounded by the phase deadline.
+The first-entry exception is consumed by an attempt even when that attempt refuses or fails.
 Promotion keeps its numeric cursor; rearm, restore and close rotate independently after scalar
 repo-key/PR cursors. Exhaustion clears a cursor; zero attempts preserve it. Every unattempted entry
 and skipped repo is named once, with adoption taking precedence over the deadline. Action timestamps
@@ -73,7 +78,7 @@ cursor persistence keeps memory authoritative until restart, which resumes the l
 
 The isolated CLI accepts --budget-ms=<positive integer>; invalid values refuse before planning.
 The deadline starts at CLI entry. A deterministic injected clock proves both pre-admission expiry
-(zero work) and planning overruns after admission (one attempt per half). Each external operation
+(zero work) and planning overruns after admission (one attempt per call). Each external operation
 retains its timeout; this bounds attempts, not total wall time. Option B rearm uses three complete
 thread reads, each at most ten pages plus a count query; its writer is bounded to 120 seconds.
 Promotion also reads required checks, check rows, and conditionally merge-gate labels/verdict/freeze

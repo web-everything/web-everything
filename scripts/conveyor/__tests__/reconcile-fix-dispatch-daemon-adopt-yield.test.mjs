@@ -6,6 +6,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runTickAllRepos, resolveFixPassBudgets } from '../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs';
 import { runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
+import { runReconcilePromoteDraftDispatch } from '../../operations/promote-draft-pr-dispatch.mjs';
 
 const empty = () => ({ dispatched: [], refusals: [] });
 function fixture(extra = {}) {
@@ -34,6 +35,29 @@ function realFixTick(dispatch) {
 }
 
 describe('fix daemon — S1 adoption yield', () => {
+  it.each([undefined, null, 0, 'false', {}, new Error('adoption evidence timed out')])(
+    'fresh adoption result %j cannot authorize the real promote writer', async evidence => {
+      const ready = vi.fn();
+      const probe = vi.fn(options => {
+        if (!options?.fresh) return false;
+        if (evidence instanceof Error) throw evidence;
+        return evidence;
+      });
+      const result = await runTickAllRepos(fixture({ repos: ['we'], adoptYieldProbe: probe,
+        promoteDraftTick: options => runReconcilePromoteDraftDispatch({ ...options, root: '/repo',
+          checkStaleness: () => ({ fresh: true, behind: 0 }),
+          reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 42, headRefOid: 'a'.repeat(40) }] }),
+          readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => [],
+          readComments: () => [], readClaim: () => null, provider: { ready }, clearAwaitingCi: () => {},
+        }) }));
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.yieldedForAdoption).toBe(true);
+      const executor = result.promoteDraft.repos[0].result;
+      expect(executor.dispatched).toEqual([]);
+      expect(executor.refusals).toContainEqual(expect.objectContaining({ pr: 42, kind: 'promote-draft-deferred-adoption' }));
+      expect(executor.yieldReason).toMatch(/ambiguous adoption probe result|adoption evidence timed out/);
+      expect(probe.mock.calls.filter(([o]) => o?.fresh)).toHaveLength(1);
+    });
   it('yields after PR 1, keeps its cursor, and resumes deferred PRs on the next tick', async () => {
     let ready = false;
     let yielded = false;
