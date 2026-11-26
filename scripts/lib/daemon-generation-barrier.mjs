@@ -162,10 +162,99 @@ function allowedDetachment(node, file, allowlist) {
   });
 }
 
+const PROCESS_CALLS = new Set(['spawn', 'spawnSync', 'fork', 'exec', 'execSync', 'execFile', 'execFileSync']);
+const unwrap = (node) => node && ts.isParenthesizedExpression(node) ? unwrap(node.expression) : node;
+
+// Do not try to evaluate arbitrary factories, JSON, proxies or mutable option aliases. A clean syntax
+// scan is evidence only when the options' own keys are visible at the process call. This deliberately
+// refuses safe-but-opaque options too: inline the bag or obtain additional evidence before handover.
+function inspectProcessOptions(tree, report) {
+  // Bind aliases by declaration, not spelling: an injected execFileSync named `exec` has the
+  // argv/options signature, and an unrelated RegExp.exec must not become a process launch.
+  const host = {
+    getSourceFile: (name) => name === tree.fileName ? tree : undefined,
+    getDefaultLibFileName: () => '', writeFile() {}, getCurrentDirectory: () => '',
+    getDirectories: () => [], fileExists: (name) => name === tree.fileName,
+    readFile: () => undefined, getCanonicalFileName: (name) => name,
+    useCaseSensitiveFileNames: () => true, getNewLine: () => '\n',
+  };
+  const checker = ts.createProgram([tree.fileName], { allowJs: true, noLib: true, noResolve: true }, host).getTypeChecker();
+  const isProcessModule = (node) => ['child_process', 'node:child_process'].includes(literalText(node));
+  const isRequire = (node) => node && ts.isCallExpression(node)
+    && ts.isIdentifier(node.expression) && node.expression.text === 'require' && isProcessModule(node.arguments[0]);
+  const processCall = (expression, seen = new Set()) => {
+    const node = unwrap(expression);
+    if (!node || seen.has(node)) return null;
+    seen.add(node);
+    if (isRequire(node)) return 'namespace';
+    if (ts.isIdentifier(node)) {
+      const declarations = checker.getSymbolAtLocation(node)?.declarations ?? [];
+      for (const declaration of declarations) {
+        if (ts.isImportSpecifier(declaration) && isProcessModule(declaration.parent.parent.parent.moduleSpecifier)) {
+          const name = (declaration.propertyName ?? declaration.name).text;
+          if (PROCESS_CALLS.has(name)) return name;
+        }
+        if ((ts.isNamespaceImport(declaration) && isProcessModule(declaration.parent.parent.moduleSpecifier))
+          || (ts.isImportClause(declaration) && isProcessModule(declaration.parent.moduleSpecifier))) return 'namespace';
+        if (declaration.initializer) {
+          const name = processCall(declaration.initializer, seen);
+          if (name) return name;
+        }
+        if (ts.isBindingElement(declaration) && processCall(declaration.parent.parent.initializer, seen) === 'namespace') {
+          const name = propertyName(declaration.propertyName ?? declaration.name);
+          if (PROCESS_CALLS.has(name)) return name;
+        }
+      }
+      // A locally declared wrapper is audited at its implementation, rather than assuming that an
+      // arbitrary parameter called `exec` has Node's shell-exec signature.
+      if (declarations.length) return null;
+      return PROCESS_CALLS.has(node.text) ? node.text
+        : ['childProcess', 'child_process'].includes(node.text) ? 'namespace' : null;
+    }
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+      const key = memberName(node), owner = unwrap(node.expression);
+      if (['call', 'apply', 'bind'].includes(key)) return processCall(owner, seen);
+      // `exec` is also RegExp.exec; only treat member calls as process calls on a known namespace.
+      const namespace = processCall(owner, seen) === 'namespace';
+      if (namespace && key === null) return 'unknown';
+      if (PROCESS_CALLS.has(key) && (key !== 'exec' || namespace)) return key;
+    }
+    return null;
+  };
+  const inspect = (node) => {
+    // Mutable aliases cannot be bound to one declaration initializer. Refuse the transfer itself;
+    // otherwise `let launch; launch = spawn; launch(..., opaque)` would lose the process-call identity.
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment
+      && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment && processCall(node.right)) report(node);
+    if (ts.isCallExpression(node)) {
+      const name = processCall(node.expression);
+      if (name && name !== 'namespace') {
+        const indirect = ['call', 'apply', 'bind'].includes(memberName(unwrap(node.expression)));
+        const args = node.arguments;
+        let options = null;
+        if (name === 'exec' || name === 'execSync') options = args[1];
+        else if (args.length >= 3) options = args[2];
+        else if (args[1] && !ts.isArrayLiteralExpression(unwrap(args[1]))) options = args[1];
+        options = unwrap(options);
+        const opaque = options && (!ts.isObjectLiteralExpression(options)
+          || options.properties.some((property) => ts.isSpreadAssignment(property)
+            || propertyName(property.name) === null || propertyName(property.name) === '__proto__'));
+        if (name === 'unknown' || indirect || args.some(ts.isSpreadElement) || opaque) {
+          report(node);
+        }
+      }
+    }
+    ts.forEachChild(node, inspect);
+  };
+  inspect(tree);
+}
+
 /**
  * Scan executable syntax for group escapes, including detached option writes and session launchers.
  * Only a detached option belonging directly to an allowlisted spawn in its declared file is exempt.
  * The parser handles comment markers in strings, regexes and templates; unreadable syntax fails closed.
+ * Opaque process options also fail closed. This source audit does not prove arbitrary dynamically loaded
+ * code safe; callers must audit the complete executed source closure before relying on group death.
  * @returns {{line:number, text:string}[]} violations
  */
 export function scanNewSessionSpawns(source, { file = null, allowlist = MERGE_CAPABLE_SPAWN_ALLOWLIST } = {}) {
@@ -212,5 +301,10 @@ export function scanNewSessionSpawns(source, { file = null, allowlist = MERGE_CA
     ts.forEachChild(node, visit);
   };
   visit(tree);
+  // Explicit escapes already refuse the source. Avoid duplicate diagnostics for their option aliases.
+  if (out.length === 0) inspectProcessOptions(tree, (node) => out.push({
+    line: tree.getLineAndCharacterOfPosition(node.getStart(tree)).line + 1,
+    text: `Uninspectable process options; inspect before permitting handover: ${node.getText(tree)}`,
+  }));
   return out;
 }

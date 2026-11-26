@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { keepAliveScript } from '../lib/test-keepalive.mjs';
-import { awaitGroupDeath, decidePromotion } from '../lib/daemon-generation-barrier.mjs';
+import { awaitGroupDeath, decidePromotion, scanNewSessionSpawns } from '../lib/daemon-generation-barrier.mjs';
 import { acquireDrainLease, releaseDrainLease, localRepoSlug } from '../readiness/drain-lock.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -54,6 +54,50 @@ const canReap = await (async () => {
 })();
 
 describe('generation handover (ordered exit)', () => {
+  it('refuses constructed options even when a detached worker outlives a clean blue group', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gen-constructed-'));
+    const sink = join(dir, 'effects'), ready = join(dir, 'ready'), release = join(dir, 'release');
+    writeFileSync(sink, '');
+    const workerSource = `
+      const fs = require('node:fs');
+      fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+      const poll = setInterval(() => {
+        if (fs.existsSync(${JSON.stringify(release)})) {
+          fs.appendFileSync(${JSON.stringify(sink)}, 'blue-late-effect\\n');
+          process.exit(0);
+        }
+      }, 10);
+      setTimeout(() => process.exit(2), 10000);
+    `;
+    const source = `
+      const { spawn } = require('node:child_process');
+      const fs = require('node:fs');
+      const workerSource = ${JSON.stringify(workerSource)};
+      const opts = Object.fromEntries([["detached", true], ["stdio", "inherit"]]);
+      spawn(process.execPath, ["-e", workerSource], opts);
+      setInterval(() => { if (fs.existsSync(${JSON.stringify(ready)})) process.exit(77); }, 10);
+      setTimeout(() => process.exit(2), 10000);
+    `;
+    const violations = scanNewSessionSpawns(source);
+    // Execute the rejected source only as a negative fixture: ESRCH alone cannot certify this program.
+    const leader = spawn(process.execPath, ['-e', source], { detached: true, stdio: 'ignore' });
+    killers.push(leader.pid);
+    expect(await new Promise((resolve, reject) => { leader.once('exit', resolve); leader.once('error', reject); })).toBe(77);
+    const workerPid = Number(readFileSync(ready, 'utf8'));
+    killers.push(workerPid);
+    process.kill(workerPid, 0); // the escaped worker is alive after the leader exited 77
+    const groupDeath = await awaitGroupDeath({ pgid: leader.pid, identity: 'blue-spawn', probeIdentity: () => null,
+      killGroup: (pgid, signal) => process.kill(-pgid, signal), sleep, probeMs: 20, timeoutMs: 2000 });
+    expect(groupDeath).toBe('dead');
+    expect(decide(groupDeath).promote).toBe(true); // proves why the source scan is a mandatory prerequisite
+    if (violations.length === 0 && decide(groupDeath).promote) appendFileSync(sink, 'green-first-effect\n');
+    writeFileSync(release, 'go');
+    const deadline = Date.now() + 3000;
+    while (!readFileSync(sink, 'utf8').includes('blue-late-effect') && Date.now() < deadline) await sleep(10);
+    expect(readFileSync(sink, 'utf8')).toBe('blue-late-effect\n');
+    expect(violations.length).toBeGreaterThan(0);
+  }, 20_000);
+
   it.runIf(process.platform === 'darwin')('requires the real ordering proof to run on the Darwin drain host', () => {
     expect(canReap, 'The drain host must reap orphan groups; an ordering-proof skip is not acceptance evidence').toBe(true);
   });

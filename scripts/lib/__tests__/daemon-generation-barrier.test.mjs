@@ -189,6 +189,49 @@ describe('mayHandOver', () => {
 });
 
 describe('new-session spawn allowlist', () => {
+  it.each([
+    'const opts = Object.fromEntries([["detached", true], ["stdio", "inherit"]]); spawn(process.execPath, ["-e", workerSource], opts)',
+    'spawn(process.execPath, [], Object.fromEntries(entries))',
+    'spawn(process.execPath, [], Object.assign({}, supplied))',
+    'spawn(process.execPath, [], JSON.parse(serialized))',
+    'spawn(process.execPath, [], makeOptions())',
+    'spawn(process.execPath, [], { ...supplied, stdio: "inherit" })',
+    'spawn(process.execPath, [], { [key]: true })',
+    'spawn(process.execPath, [], { __proto__: supplied })',
+    'spawn(process.execPath, opts)',
+    'spawnSync(process.execPath, [], opts)',
+    'fork(workerPath, [], opts)',
+    'execFile(process.execPath, [], opts, callback)',
+    'execFileSync(process.execPath, [], opts)',
+    'exec(command, opts, callback)',
+    'execSync(command, opts)',
+    'childProcess.spawn(process.execPath, [], opts)',
+    'import { spawn as launch } from "node:child_process"; launch(process.execPath, [], opts)',
+    'const launch = spawn; launch(process.execPath, [], opts)',
+    'let launch; launch = spawn; launch(process.execPath, [], opts)',
+    'const launch = spawn.bind(null); launch(process.execPath, [], opts)',
+    'const { spawn: launch } = require("node:child_process"); launch(process.execPath, [], opts)',
+    'import * as cp from "node:child_process"; cp[method](process.execPath, [], opts)',
+    'import { spawn as launch } from "node:child_process"; function run(launch = null) {} launch(process.execPath, [], opts)',
+    'spawn.call(null, process.execPath, [], opts)',
+    'spawn.apply(null, callArgs)',
+    'spawn(...callArgs)',
+  ])('requires inspectable options before handover: %s', (source) => {
+    expect(scanNewSessionSpawns(source).length).toBeGreaterThan(0);
+  });
+  it('does not exempt constructed options even for an allowlisted command', () => {
+    expect(scanNewSessionSpawns('spawn("osascript", [], options)', { file: 'branch-sync.mjs' }).length).toBeGreaterThan(0);
+  });
+  it.each([
+    'spawn(process.execPath)',
+    'spawn(process.execPath, ["worker.mjs"])',
+    'spawn(process.execPath, args, { stdio: "inherit", env, cwd })',
+    'spawn(process.execPath, { stdio: "inherit" })',
+    'execFile(process.execPath, args, { timeout: 1000 }, callback)',
+    'exec(command, { timeout: 1000 }, callback)',
+  ])('accepts inspectable inherited-group options: %s', (source) => {
+    expect(scanNewSessionSpawns(source)).toEqual([]);
+  });
   it('declares exactly the three known non-merging-or-disclosed spawns', () => {
     expect(MERGE_CAPABLE_SPAWN_ALLOWLIST.map((e) => e.name)).toEqual(['osascript', 'deps-job', 'drain-followup-job']);
   });
@@ -293,9 +336,26 @@ describe('new-session spawn allowlist', () => {
       }
     }
   });
-  it('no merge-capable spawn outside the allowlist is detached or in a new session', () => {
+  it('requires additional evidence for opaque forwarding in the real source inventory', () => {
     const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
     // the sibling repo's daemon.mjs is out of reach for a hermetic test: its scan is the live PGID probe (acceptance 6)
-    for (const f of files) expect(scanNewSessionSpawns(readFileSync(join(root, f), 'utf8'), { file: f.split('/').pop() }), f).toEqual([]);
+    // These are REFUSALS, not allowlist entries. The old empty-result expectation incorrectly certified
+    // opaque bags; S1.4 cannot enable exit handover until these sites have inspectable options/evidence.
+    const unresolved = new Map([
+      [855, 'exec(cmd, args, { cwd, ...opts })'],
+      [885, 'exec(cmd, args, { cwd, ...opts })'],
+      [903, "exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),\n    '--json', 'headRefOid'], opts)"],
+      [910, "exec('gh', GH_ARGV.readPrReviews(slug, pr), opts)"],
+      [5287, 'execFileSync(cmd, args, { ...opts, timeout: 60_000 })'],
+      [5288, 'execFileSync(cmd, args, { ...opts, timeout: 60_000 })'],
+      [5818, 'execFileSync(file, args, { ...opts, cwd })'],
+      [6711, 'execFileSync(cmd, args, { cwd: escCwd, ...opts })'],
+    ]);
+    for (const f of files) {
+      const expected = f === 'merge-ai-prs.mjs' ? [...unresolved].map(([line, text]) => ({
+        line, text: `Uninspectable process options; inspect before permitting handover: ${text}`,
+      })) : [];
+      expect(scanNewSessionSpawns(readFileSync(join(root, f), 'utf8'), { file: f.split('/').pop() }), f).toEqual(expected);
+    }
   });
 });
