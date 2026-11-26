@@ -352,7 +352,12 @@ describe('new-session spawn allowlist', () => {
       'execFileSync(cmd, args, { cwd: escCwd, ...opts })',
     ];
     for (const f of files) {
-      const source = '\n'.repeat(prefixLines) + readFileSync(join(root, f), 'utf8');
+      const original = readFileSync(join(root, f), 'utf8');
+      // A hashbang is valid only at the start of the source. Shift the body without moving it.
+      const prefixOffset = original.startsWith('#!') ? original.indexOf('\n') + 1 : 0;
+      const source = original.slice(0, prefixOffset) + '\n'.repeat(prefixLines) + original.slice(prefixOffset);
+      const tree = ts.createSourceFile(f, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+      expect(tree.parseDiagnostics, `${f}: line-shift fixture must remain valid JavaScript`).toEqual([]);
       // Locate each audited call independently of the scanner, preserving duplicate occurrences.
       // Unrelated line shifts must not change the inventory, but missing/new calls must still fail.
       let offset = 0;
