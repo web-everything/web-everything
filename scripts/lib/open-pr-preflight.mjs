@@ -2,6 +2,8 @@
 const verify = 'run verify-lane';
 const audit = 'run node scripts/operations/run.mjs codex-audit --base=origin/main --head=<fullsha>; if WEAKENED needs a waiver request for sha X';
 export const HINTS = Object.freeze({
+  'sibling-base': 'inspect the named sibling boundaries, then git rebase --onto origin/main <last-inherited-sibling-commit> <own-lane>; alternatively declare the actual parent with --base=lane/<parent>, then re-run --check',
+  'sibling-base-unconfirmed': 'operator: restore complete origin/main and lane history, or inspect the oversized history and prune obsolete lane refs; then re-run --check',
   'canonical-audit-missing': audit, 'canonical-audit-weakened': audit,
   unverified: verify, untracked: verify, 'verify-unfinished': verify,
   'verify-red': verify, 'verify-corrupt': verify, 'red-ci-gated': verify,

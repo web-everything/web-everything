@@ -73,6 +73,112 @@ export function createGitReader(cwd, exec = execFileSync) {
   };
 }
 
+/** Read-only sibling ancestry admission. Local and origin lane refs are evidence of
+ * ownership; unresolved evidence requires operator inspection, never a publishing fallback.
+ * A declared lane base exempts only the ancestry actually carried by that parent.
+ */
+export function checkSiblingBase({ git, ref, base = 'main', sha = 'HEAD' }) {
+  const deadline = performance.now() + 30_000;
+  const read = (args, options = {}) => {
+    const timeout = Math.ceil(deadline - performance.now());
+    if (timeout <= 0) throw new Error('sibling ancestry time bound exceeded');
+    return git(args, { maxBuffer: 8 * 1024 * 1024, timeout, ...options });
+  };
+  const resolveCommit = value => commitSha(read(['rev-parse', '--verify', '--end-of-options', `${value}^{commit}`]));
+  const commits = range => {
+    const output = read(['rev-list', '--max-count=2049', range]);
+    const rows = output.trim() ? output.trim().split('\n').map(commitSha) : [];
+    if (rows.length > 2048) throw new Error('sibling ancestry exceeds 2048 commits');
+    return rows;
+  };
+  try {
+    if (read(['rev-parse', '--is-shallow-repository']).trim() !== 'false') throw new Error('complete git history required');
+    const main = resolveCommit('refs/remotes/origin/main');
+    const head = resolveCommit(FULL_SHA.test(sha) || sha === 'HEAD' ? sha : qualifiedRef(`refs/heads/${sha}`));
+    const ownRef = qualifiedRef(ref?.startsWith('refs/') ? ref : `refs/heads/${ref}`);
+    const baseRef = base === 'main' || base === 'origin/main' || base === 'refs/remotes/origin/main'
+      ? 'refs/remotes/origin/main'
+      : qualifiedRef(base.startsWith('refs/') ? base : base.startsWith('origin/') ? `refs/remotes/${base}` : `refs/heads/${base}`);
+    const parent = resolveCommit(baseRef);
+    const declared = new Set(commits(`${main}..${parent}`));
+    const carried = new Set(commits(`${main}..${head}`));
+    const output = read(['for-each-ref', '--format=%(refname)\t%(objectname)', 'refs/heads/lane/', 'refs/remotes/origin/lane/']);
+    if (output && !output.endsWith('\n')) throw new Error('incomplete lane refs');
+    const rows = output ? output.slice(0, -1).split('\n') : [];
+    if (rows.length > 256) throw new Error('sibling ancestry exceeds 256 lane refs');
+    const candidates = rows.map(row => {
+      const parts = row.split('\t');
+      if (parts.length !== 2) throw new Error('unreadable lane ref');
+      return { ref: qualifiedRef(parts[0]), sha: commitSha(parts[1]) };
+    });
+    const ownName = ownRef.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
+    const fork = commitSha(read(['merge-base', main, head]));
+    const upstream = commits(`${fork}..${main}`);
+    const patch = (from, to) => {
+      const diff = read(['diff', '--no-ext-diff', '--no-textconv', '--binary', from, to, '--']);
+      if (!diff) return '';
+      const result = read(['patch-id', '--stable'], { input: diff }).trim();
+      if (!/^[a-f0-9]{40} [a-f0-9]{40}$/.test(result)) throw new Error('unreadable patch identity');
+      return result.slice(0, 40);
+    };
+    let landedPatches;
+    const branchLogs = new Map();
+    const branchLog = branchRef => {
+      if (branchLogs.has(branchRef)) return branchLogs.get(branchRef);
+      const text = read(['reflog', 'show', '--max-count=2049', '--format=%H%x09%gs', branchRef]);
+      if (text && !text.endsWith('\n')) throw new Error('incomplete branch provenance');
+      const entries = text ? text.slice(0, -1).split('\n') : [];
+      if (entries.length > 2048) throw new Error('branch provenance exceeds 2048 entries');
+      const parsed = entries.map(entry => {
+        const tab = entry.indexOf('\t');
+        if (tab < 0) throw new Error('unreadable branch provenance');
+        return { sha: commitSha(entry.slice(0, tab)), action: entry.slice(tab + 1) };
+      });
+      branchLogs.set(branchRef, parsed);
+      return parsed;
+    };
+    const siblings = [];
+    for (const lane of candidates) {
+      const name = lane.ref.replace(/^refs\/(?:heads|remotes\/origin)\//, '');
+      if (name === ownName) continue;
+      const shared = commitSha(read(['merge-base', head, lane.sha]));
+      // A descendant lane carries our work, rather than contributing its base to us.
+      if (shared === head) continue;
+      const inherited = commits(`${main}..${shared}`).filter(id => carried.has(id) && !declared.has(id));
+      if (!inherited.length) continue;
+      // A merge base is symmetric. A diverged child does not own its parent's
+      // earlier work: require positive local provenance before exempting it.
+      // The parent recorded the shared commit, and the child's creation entry
+      // starts there. Missing/expired creation evidence grants no exemption.
+      const localRef = `refs/heads/${name}`;
+      const provenanceRef = candidates.some(candidate => candidate.ref === localRef && candidate.sha === lane.sha)
+        ? localRef : lane.ref;
+      const created = branchLog(provenanceRef).at(-1);
+      if (created?.sha === shared && created.action.startsWith('branch: Created from ')
+        && branchLog(ownRef).some(entry => entry.sha === shared && /^commit(?: \([^)]+\))?: /.test(entry.action))) continue;
+      const cherry = read(['cherry', main, shared]);
+      const entries = cherry.trim() ? cherry.trim().split('\n') : [];
+      if (entries.some(row => !/^[+-] [a-f0-9]{40}$/.test(row))) throw new Error('unreadable cherry evidence');
+      const equivalent = new Set(entries.filter(row => row.startsWith('- ')).map(row => row.slice(2)));
+      if (inherited.every(id => equivalent.has(id))) continue;
+      // Per-commit cherry misses multi-commit squash merges. Compare the inherited
+      // net patch with actual main commits (whose subjects preserve PR lineage).
+      const start = commitSha(read(['merge-base', main, shared]));
+      const net = patch(start, shared);
+      if (net) {
+        landedPatches ??= new Set(upstream.map(id => patch(`${id}^`, id)).filter(Boolean));
+        if (landedPatches.has(net)) continue;
+      }
+      siblings.push(`${name} (${shared})`);
+    }
+    return siblings.length ? { ok: false, reason: 'sibling-base',
+      detail: `branch carries unmerged sibling lanes: ${[...new Set(siblings)].join(', ')}` } : { ok: true };
+  } catch (error) {
+    return { ok: false, reason: 'sibling-base-unconfirmed',
+      detail: `sibling ancestry unconfirmed: ${String(error?.message || error)}; operator must inspect complete history before retrying` };
+  }
+}
+
 /** Attributes can override --text. Recover binary rows from immutable blobs, counting the
  * whole old and new files conservatively. Only a successful tree read proves a missing side.
  */

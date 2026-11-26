@@ -134,7 +134,7 @@ function failedGate(e, loadSettings) {
 }
 
 export { createPrDiffStatReader, OPEN_PR_MAX_NON_TEST_LINES, measureNonTestLines } from '../lib/pr-size-admission.mjs';
-import { createGitReader } from '../lib/pr-size-admission.mjs';
+import { createGitReader, checkSiblingBase } from '../lib/pr-size-admission.mjs';
 
 /**
  * The runner the declaration is injected with. ONE spawn; `spawn` is injected so every branch of
@@ -149,6 +149,9 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
   // a caller that injected `spawn` is a rehearsal/test and writes no shim.
   env: envOpt, resolveEnv = spawn !== spawnSync ? () => process.env : resolveGhCredentialEnv,
   git: gitOpt,
+  // As with the duplicate scan, injected spawns without a Git port are hermetic
+  // rehearsals. A real publisher always reads ancestry; fixtures inject real Git.
+  siblingBase = spawn !== spawnSync && gitOpt === undefined ? () => ({ ok: true }) : checkSiblingBase,
   // Real git/gh only when the real spawn is in use: a caller that injected `spawn` is a rehearsal/test and must stay hermetic.
   dupBornAs = spawn !== spawnSync ? () => [] : ({ env: execEnv, ...opts }) => checkDuplicateBornAs({ ...opts, exec: (cmd, args) => execFileSync(cmd, args, { cwd, env: execEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 }) }),
 } = {}) {
@@ -232,6 +235,10 @@ export function createPrLandRunner({ canonicalAudit = checkCanonicalAuditForOpen
     if (audit?.ok !== true) collect('canonical-audit', audit?.reason || 'canonical-audit-missing',
       audit?.message || 'canonical audit check returned no decision', audit?.sha || arg('sha'));
     if (audit?.sha) argv = [...argv.filter(a => !a.startsWith('--sha=')), `--sha=${audit.sha}`];
+    let ancestry;
+    try { ancestry = siblingBase({ git, ref: arg('ref'), base: arg('base') || 'main', sha: arg('sha') || 'HEAD' }); }
+    catch { ancestry = { ok: false, reason: 'sibling-base-unconfirmed', detail: 'operator must inspect unreadable sibling ancestry' }; }
+    if (ancestry?.ok !== true) collect('sibling-base', ancestry?.reason || 'sibling-base-unconfirmed', ancestry?.detail);
     const collectOnly = checking || blockers.length > 0;
     if (collectOnly) argv = [...argv.filter(a => a !== '--check' && a !== '--dry-run'), '--check'];
     else if (bypass) {
