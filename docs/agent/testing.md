@@ -324,16 +324,18 @@ An import failure already reported on child stdout remains `import failed` even 
 timer keeps the child alive until a timeout kills it.
 Mixed import failures, crashes, budget slices and missing entry evidence remain code failures.
 
-At the failure-set level, env-timeout requires at least one qualifying timeout and every other
-failed row must be a qualifying timeout, a transient failure from a check allowed to be transient,
-or a row the gate itself flagged `budgetInterrupted`. Ordinary bounded kills require measured
-row time of at least `min(minElapsedMs, cap * 0.9)` (default floor 30s); boot entries and attempts
-keep the full-cap rule above. A flagged boot budget refusal is neutral, never qualifying timeout
-evidence by itself. On the widened retry only, prior qualifying timeout evidence plus at least
-one gate-flagged skip also permits a failure set consisting solely of budget skips and allowed
-transient failures. Skip text without the gate flag, or an independent code failure, keeps the
-verdict code. Checks cannot set the gate flag themselves. Env-timeout holds last-good with timed
-backoff and never adopts the build or writes a sticky rejection. Regression coverage lives in
+At the failure-set level, env-timeout requires a fresh, unflagged qualifying timeout on the
+same attempt. Every other failed row must pass timeout validation, be a transient failure from
+an eligible check, or contain only gate-observed budget refusals and independently validated
+remaining failures. Bounded kills require measured row time of at least `cap * 0.9`; other timeout
+signatures use the configured `minElapsedMs`. Boot entries and every attempt keep the full-cap
+rule above, using final outcomes so import failures on stdout remain code failures. A flagged
+row is neutral and can never supply the required timeout. Child GitHub error text cannot grant
+neutrality. Checks cannot set the gate flag or its remaining-failure evidence themselves.
+On the widened retry, failed budget-skipped checks execute again; prior evidence and retained
+skips cannot replace a fresh timeout. Skip text without gate accounting, invalid timing, or an
+independent code failure keeps the verdict code. Env-timeout holds last-good with timed backoff
+and never adopts the build or writes a sticky rejection. Regression coverage lives in
 `daemon-live-smoke.test.mjs` and `daemon-rebuild-recovery.test.mjs` (SMOKE-ENVTIMEOUT-BUDGET).
 
 

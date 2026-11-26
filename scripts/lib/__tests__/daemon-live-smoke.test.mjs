@@ -3092,7 +3092,7 @@ describe('SMOKE-ENVTIMEOUT-BUDGET failure sets', () => {
     const rows = [incidentTimeout, { ...incidentDispatchTimeout, ms: 40000 }, await gateBudgetSkip()];
     expect(isEnvTimeoutFailureSet(rows, { minElapsedMs: 100000 })).toBe(false);
     rows[1].budgetInterrupted = true;
-    expect(isEnvTimeoutFailureSet(rows, { minElapsedMs: 100000 })).toBe(true);
+    expect(isEnvTimeoutFailureSet(rows, { minElapsedMs: 100000 })).toBe(false);
   });
   it('a forged budgetInterrupted from a check result is overwritten', async () => {
     const check = SMOKE_CHECKS.find(r => r.name === 'lane-pool-list');
@@ -3155,17 +3155,18 @@ describe('SMOKE-ENVTIMEOUT-BUDGET retry wrapper', () => {
     expect(result.smoke.results.find(r => r.name === 'tree-stays-clean').budgetInterrupted).toBe(true);
     expect(result.smoke.results.find(r => r.name === 'dispatch-dry-run').ms).toBe(50000);
   });
-  it('runLiveSmokeWithRetry: second attempt with only budget skips', async () => {
+  it('runLiveSmokeWithRetry: second attempt with only budget skips stays code', async () => {
     const { result } = await replayTimeoutBudget('only-skips');
     expect(isEnvTimeoutFailureSet(result.smoke.results)).toBe(false);
-    expect(result).toMatchObject({ verdict: 'env-timeout', attempts: 2 });
-    expect(result.envTimeout.retry.length).toBeGreaterThan(0);
+    expect(result).toMatchObject({ verdict: 'code', attempts: 2 });
+    expect(result.envTimeout.retry).toBeUndefined();
   });
-  it('runLiveSmokeWithRetry: kept flagged row stays neutral', async () => {
+  it('runLiveSmokeWithRetry: flagged row is retried and cannot supply fresh timeout evidence', async () => {
     const { result } = await replayTimeoutBudget('kept-flag');
-    expect(result).toMatchObject({ verdict: 'env-timeout', attempts: 2 });
+    expect(result).toMatchObject({ verdict: 'code', attempts: 2 });
     expect(result.smoke.results.find(r => r.name === 'daemon-entries-boot'))
-      .toMatchObject({ budgetInterrupted: true, reused: true });
+      .toMatchObject({ budgetInterrupted: true });
+    expect(result.smoke.results.find(r => r.name === 'daemon-entries-boot').reused).toBeUndefined();
   });
   it('runLiveSmokeWithRetry: second attempt with a code row', async () => {
     expect((await replayTimeoutBudget('code')).result).toMatchObject({ verdict: 'code', attempts: 2 });
@@ -3175,5 +3176,74 @@ describe('SMOKE-ENVTIMEOUT-BUDGET retry wrapper', () => {
   });
   it('retry with only transient failures and no budget skip is not env-timeout', async () => {
     expect((await replayTimeoutBudget('transient-only')).result).toMatchObject({ verdict: 'transient', attempts: 2 });
+  });
+});
+
+
+describe('SMOKE-ENVTIMEOUT-BUDGET audit regressions', () => {
+  async function mixed({ boot = false, message, elapsed = 30000, stdout, env = {} }) {
+    let t = 0;
+    const defaults = withNewCheckDefaults(async (_cmd, args) => args[1] === 'list' ? '[]'
+      : args[1] === 'acquire' ? '{"lane":1}' : '');
+    const runChild = budgetedRunChild({ deadline: elapsed, now: () => t,
+      runChild: async (cmd, args, opts) => {
+        const target = boot ? String(args[2] ?? '').includes('daemon-boot-smoke:entry-boot')
+          : args[0] === 'scripts/conveyor/reconcile-pass.mjs';
+        if (target) {
+          t += elapsed;
+          throw Object.assign(new Error(message), { stdout });
+        }
+        return defaults(cmd, args, opts);
+      } });
+    const smoke = await runLiveSmoke({ root: '/x', repos: ['a/a', 'b/b'],
+      env: { ...githubSmokeEnv, WE_SMOKE_BOOT_CONCURRENCY: '1', WE_SMOKE_DAEMON_ENTRIES: 'a.mjs,b.mjs', ...env },
+      clock: () => t, runChild });
+    return smoke.results.find(r => r.name === (boot ? 'daemon-entries-boot' : 'reconcile-dry-run'));
+  }
+  it('audit 1: flagged failures still validate timeouts and mayBeTransient false', () => {
+    for (const row of [{ ...incidentTimeout, ms: 1 }, { ...budgetTransient, mayBeTransient: false }]) {
+      expect(isEnvTimeoutFailureSet([incidentTimeout, { ...row, budgetInterrupted: true }])).toBe(false);
+    }
+  });
+  it('audit 2: GitHub-shaped child text cannot grant neutrality to a TypeError', async () => {
+    const row = await mixed({ message: 'exited 1: HTTP 502 TypeError: could not read state' });
+    expect(row.detail).toContain('TypeError: could not read state');
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutFailureSet([incidentTimeout, row])).toBe(false);
+  });
+  it('audit 3: boot import stdout overrides timeout before budget neutrality', async () => {
+    const row = await mixed({ boot: true, elapsed: 45000,
+      message: 'timed out after 45000ms (process group killed)', stdout: '{"ok":false,"error":"SyntaxError: import broken"}' });
+    expect(row.entries[0].kind).toBe('import failed');
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutFailureSet([incidentTimeout, row])).toBe(false);
+  });
+  it('audit 4: boot budget neutrality requires full caps and valid attempts', async () => {
+    const row = await mixed({ boot: true, elapsed: 30000, message: 'timed out after 30000ms (process group killed)' });
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutFailureSet([incidentTimeout, row])).toBe(false);
+  });
+  it('audit 5: budget neutrality respects configured minElapsedMs', async () => {
+    const row = await mixed({ message: 'scan exceeded its 120000ms budget',
+      env: { WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS: '60000' } });
+    expect(row.budgetInterrupted).toBeUndefined();
+    expect(isEnvTimeoutFailureSet([incidentTimeout, row], { minElapsedMs: 60000 })).toBe(false);
+  });
+  it('audit 6: failed budget-skipped checks execute again on widened retry', async () => {
+    const { result } = await replayTimeoutBudget('kept-flag');
+    const row = result.smoke.results.find(r => r.name === 'daemon-entries-boot');
+    expect(row.budgetInterrupted).toBe(true);
+    expect(row.reused).toBeUndefined();
+  });
+  it('audit 7: prior evidence cannot replace a fresh qualifying timeout', async () => {
+    const { result } = await replayTimeoutBudget('only-skips');
+    expect(result).toMatchObject({ verdict: 'code', attempts: 2 });
+  });
+  it('audit 8: flagged timeout alone cannot supply qualifying evidence', () => {
+    expect(isEnvTimeoutFailureSet([{ ...incidentTimeout, budgetInterrupted: true }])).toBe(false);
+  });
+  it('audit 9: a 750000ms kill needs observed full-cap elapsed', () => {
+    expect(isEnvTimeoutRow({ ...incidentTimeout, ms: 30000 })).toBe(false);
+    expect(isEnvTimeoutFailureSet([{ ...incidentTimeout, ms: 30000 }])).toBe(false);
   });
 });

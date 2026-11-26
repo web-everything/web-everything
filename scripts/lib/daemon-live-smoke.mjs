@@ -1053,16 +1053,28 @@ export async function runLiveSmoke({
       } catch (e) {
         result = { ok: false, detail: `threw: ${firstLine(e)}` };
       }
-      // Reconcile aggregates child failures only; other checks can parse a successful child's output into a
-      // code failure. Never hide that output just because a later child was refused by the budget wrapper.
-      const budgetInterrupted = !result.ok && childFailures.some((r) => r.budgetSkipped)
+      // Only observed deadline refusals are neutral. Preserve all other child evidence so the
+      // failure-set predicate can validate it again with the caller's elapsed threshold.
+      const timeoutOpts = { minElapsedMs: envMs(env, SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS_ENV, DEFAULT_ENV_TIMEOUT_MIN_ELAPSED_MS) };
+      let budgetFailures = childFailures.filter(r => !r.budgetSkipped);
+      if (check.name === 'daemon-entries-boot') {
+        // Inspect final entry outcomes, including stdout import failures and every retry attempt.
+        const isRefused = r => /^child failed: skipped: rebuild smoke budget exhausted \(\d+ms left\)$/.test(r?.kind);
+        const entries = result.entries?.filter(r => !r.ok);
+        const refused = entries?.filter(r => isRefused(r) && r.attempts?.every(isRefused));
+        budgetFailures = entries && refused?.length === childFailures.filter(r => r.budgetSkipped).length
+          ? entries.filter(r => !refused.includes(r)).map(r => ({ name: check.name, ok: false, entries: [r] }))
+          : [ { ok: false, detail: 'incomplete boot budget evidence', mayBeTransient: false } ];
+      }
+      const budgetInterrupted = !result.ok && childFailures.some(r => r.budgetSkipped)
         && (check.name === 'reconcile-dry-run' || childFailures.length === childCalls
           || (check.name === 'daemon-entries-boot' && bootOutputsOk))
-        && childFailures.every((r) => r.budgetSkipped || isGithubReadFailureRow(r)
-          || isEnvTimeoutRow(r) || (r.mayBeTransient && isTransientDetail(r.detail)));
+        && budgetFailures.every(r => isEnvTimeoutRow(r, timeoutOpts)
+          || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
       const completedAt = clock();
       results.push({ name: check.name, ms: completedAt - startedAt, ...result, completedAt,
-        budgetInterrupted: budgetInterrupted ? true : undefined, mayBeTransient: check.mayBeTransient !== false });
+        budgetInterrupted: budgetInterrupted ? true : undefined,
+        budgetFailures: budgetInterrupted ? budgetFailures : undefined, mayBeTransient: check.mayBeTransient !== false });
       // Both external probes have completed before the expensive tree checks begin. Budgets are a fresh
       // per-run object from resolveSmokeBudgets; explicit operator timeouts remain absolute.
       if (check.name === 'gh-pr-list' && env.WE_SMOKE_GH_LATENCY_SCALE !== '0') {
@@ -1240,13 +1252,8 @@ export async function runLiveSmokeWithRetry({
     }
     // ENVIRONMENT TIMEOUT (live 2026-09-26 22:37Z) — see {@link isEnvTimeoutFailureSet}. Retry ONCE with every
     // budget widened; still timing out → `'env-timeout'` (held, never a reject record, never an overlay suspect).
-    // Prior qualifying timeouts explain a retry consumed entirely by gate-observed refusals.
-    // Require a skip as well: transient noise alone is not new timeout evidence.
-    const failures = smoke.results.filter((r) => !r.ok);
-    const budgetOnlyRetry = envTimeout && failures.some((r) => r.budgetInterrupted === true)
-      && failures.every((r) => r.budgetInterrupted === true
-        || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
-    if (verdict === 'code' && (isEnvTimeoutFailureSet(smoke.results, { minElapsedMs }) || budgetOnlyRetry)) {
+    // Each attempt needs fresh qualifying timeout evidence; prior timeouts cannot explain skips alone.
+    if (verdict === 'code' && isEnvTimeoutFailureSet(smoke.results, { minElapsedMs })) {
       const rows = smoke.results.filter((r) => !r.ok).map((r) => ({ name: r.name, ms: r.ms, detail: r.detail }));
       if (!envTimeout) {
         const factor = envMs(env, SMOKE_ENV_TIMEOUT_BUDGET_FACTOR_ENV, DEFAULT_ENV_TIMEOUT_BUDGET_FACTOR);
@@ -1255,7 +1262,7 @@ export async function runLiveSmokeWithRetry({
         // Keep completed non-timeout rows, including transient failures. Always re-run the final
         // cleanliness check after the retried checks, with this attempt's fresh beforePorcelain.
         retryRetainedRows = smoke.results.filter(row => row.name !== 'tree-stays-clean'
-          && !isEnvTimeoutRow(row, { minElapsedMs }));
+          && !row.budgetInterrupted && !isEnvTimeoutRow(row, { minElapsedMs }));
         continue;
       }
       envTimeout.retry = rows;
@@ -1324,7 +1331,7 @@ export async function runLiveSmokeWithRetry({
 // that ran out of TIME is evidence about the host, not the tree.
 //
 // NO LAUNDERING (PR #2625's rule): a timeout signature counts only when the gate's OWN clock shows the row really
-// spent at least `WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS` (default 30s) — a tree that merely PRINTS "exceeded its
+// spent at least `WE_SMOKE_ENV_TIMEOUT_MIN_ELAPSED_MS` (default 30s), or 90% of a bounded kill's cap — a tree that merely PRINTS "exceeded its
 // budget" fails fast and stays `'code'`. And `'env-timeout'` never ADOPTS anything: it holds on last-good, so a
 // genuine performance regression is still kept off the daemon (it is just not blamed on an overlay).
 
@@ -1382,7 +1389,7 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
   // a cap that is a real budget: one under {@link MIN_OWN_CAP_MS} is a starved harness (the soak break
   // `broken-smoke-harness-holds-last-good` sets 1ms), which load cannot explain, so it keeps the 30s floor.
   const killed = /timed out after (\d+)ms \(process group killed\)$/.exec(detail);
-  if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Math.min(minElapsedMs, Number(killed[1]) * 0.9);
+  if (killed && Number(killed[1]) >= MIN_OWN_CAP_MS) return Number(row.ms) >= Number(killed[1]) * 0.9;
   // Background gh slots normally give up after 8s. Only markers emitted after throttleCause's exit/stderr
   // checks qualify; check elapsed time against their own wait, as for a bounded kill. With several failed
   // repos use the longest wait, so one short refusal cannot excuse a longer one that failed too quickly.
@@ -1398,8 +1405,10 @@ export function isEnvTimeoutRow(row, { minElapsedMs = DEFAULT_ENV_TIMEOUT_MIN_EL
  *  failure is allowed transient noise or a gate-flagged budget refusal? One code-shaped row ⇒ false. */
 export function isEnvTimeoutFailureSet(results, opts = {}) {
   const failures = (Array.isArray(results) ? results : []).filter((r) => !r.ok);
-  if (!failures.some((r) => isEnvTimeoutRow(r, opts))) return false;
-  return failures.every((r) => r.budgetInterrupted === true || isEnvTimeoutRow(r, opts)
+  if (!failures.some((r) => !r.budgetInterrupted && !r.reused && isEnvTimeoutRow(r, opts))) return false;
+  return failures.every((r) => (r.budgetInterrupted === true && Array.isArray(r.budgetFailures)
+      && r.budgetFailures.every(child => isEnvTimeoutRow(child, opts)
+        || (child.mayBeTransient !== false && isTransientDetail(child.detail)))) || isEnvTimeoutRow(r, opts)
     || (r.mayBeTransient !== false && isTransientDetail(r.detail)));
 }
 
