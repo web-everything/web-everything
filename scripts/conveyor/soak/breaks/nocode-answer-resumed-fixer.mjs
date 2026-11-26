@@ -13,6 +13,10 @@ async function runCase(caseName) {
   const { buildStandDownComment } = await import(pathToFileURL(join(ROOT, 'scripts/conveyor/stand-down.mjs')).href);
   const fixture = JSON.parse(readFileSync(join(ROOT, 'scripts/conveyor/__tests__/fixtures/7452-nocode-resume.json'), 'utf8'));
   const comments = fixture.comments.slice(0, -2);
+  // Extend the historical replay with the head-bound stop required by the current answer producer.
+  comments[comments.length - 1] = { ...comments.at(-1), body: buildStandDownComment({
+    reason: 'needs-judgment', detail: 'Code owed?', head: fixture.liveHead,
+  }) };
   const state = { number: 7452, state: 'OPEN', isDraft: false, headRefName: 'lane/fix-7452',
     headRefOid: fixture.liveHead, labels: [{ name: 'review:changes' }], comments };
   // Real producer, then the resumed fixer's claim, then the real re-arm subprocess and shared label writer.
