@@ -10,9 +10,10 @@ const namedStandDownHead = c => standDownHead(c.body)?.toLowerCase();
 function requireNoCodeHead(snapshot, target) {
   const live = String(snapshot.headRefOid ?? '').toLowerCase();
   const named = namedStandDownHead(target);
-  if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
   if (live.length !== 40 || !/^[0-9a-f]{40}$/.test(live)) throw new Error('rearm-review --no-code-owed refused: live head is not a 40-hex SHA');
+  if (named && !live.startsWith(named)) throw new Error('rearm-review --no-code-owed refused: head moved since the stand-down');
   if (!named) throw new Error('rearm-review --no-code-owed refused: stand-down has no head; record a new stand-down with the current head');
+  return live;
 }
 
 function failedNoCodeStandDownToRearm(snapshot, noCodeOwed) {
@@ -72,8 +73,9 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
   if (!/^[1-9]\d*$/.test(pr ?? '')) throw new Error('PR must be a positive integer');
   const flags = {};
   for (const arg of args) {
-    if (arg === '--no-code-owed' && !Object.hasOwn(flags, 'noCodeOwed')) {
-      flags.noCodeOwed = true;
+    const booleanFlag = arg === '--no-code-owed' ? 'noCodeOwed' : arg === '--preview' ? 'preview' : null;
+    if (booleanFlag && !Object.hasOwn(flags, booleanFlag)) {
+      flags[booleanFlag] = true;
       continue;
     }
     const m = arg.match(/^--(repo|reason|actor|channel|disposition)=([\s\S]*)$/);
@@ -116,9 +118,10 @@ export function runStandDownAnswer(argv, { gh = (args) => execFileSync('gh', arg
     }
   }
   if (!target.id) throw new Error('unresolved stand-down has no durable comment id');
-  if (flags.noCodeOwed) requireNoCodeHead(snapshot, target);
-  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}) });
+  const head = flags.noCodeOwed ? requireNoCodeHead(snapshot, target) : null;
+  const body = buildOperatorAnswer({ standDownId: String(target.id), ...flags, ...(supersedes ? { supersedes } : {}), ...(head ? { head } : {}) });
   if (body.length > 65536) throw new Error('operator answer exceeds GitHub comment limit');
+  if (flags.preview) return JSON.stringify({ ok: true, preview: true, pr: Number(pr), target: String(target.id), supersedes: supersedes ?? null, head, body });
   // ONE durable write; no label swap, deletion, or automatic retry after an ambiguous write failure.
   return gh(['pr', 'comment', pr, `--repo=${flags.repo}`, '--body', body]);
 }

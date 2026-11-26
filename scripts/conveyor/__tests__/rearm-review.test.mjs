@@ -16,6 +16,8 @@ import { decideRearm, buildRearmComment, presentRemoveLabels, countRearmComments
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../../lib/review-escalation.mjs';
 import { RED_TEAM_STATUS_LABELS } from '../../lib/red-team-status-label-meta.mjs';
 
+import nocode7452 from './fixtures/7452-nocode-resume.json';
+import * as rearmModule from '../rearm-review.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 
@@ -685,5 +687,113 @@ describe('buildSameHeadWakeComment — the same-head pause wake', () => {
     expect(countRearmComments([{ body, author: { login: 'chalbert' } }])).toBe(0);
     const quoted = `${REARM_COMMENT_MARKER}\n\nquoted ${SAME_HEAD_WAKE_TRAILER} mid-body`;
     expect(countRearmComments([{ body: quoted, author: { login: 'chalbert' } }])).toBe(1);
+  });
+});
+
+
+describe('headed no-code answer: one resumed fixer claim', () => {
+  const H = nocode7452.liveHead, X = 'b'.repeat(40), Y = 'c'.repeat(40);
+  const BOT = { login: 'web-everything' };
+  const claim = sha => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`` });
+  const stop = id => ({ id, author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) });
+  const answer = (standDownId, head = H, extra = {}) => ({ author: BOT, body: buildOperatorAnswer({
+    standDownId, disposition: 'rearm-review', noCodeOwed: true, head,
+    reason: 'No code owed', actor: 'chalbert', channel: 'chat', ...extra,
+  }) });
+  const before = [claim(H), stop('IC_stop')];
+  const base = () => [...before, answer('IC_stop')];
+  const resume = () => [...base(), claim(H)];
+  const decide = (comments, liveHead = H) => decideEmptyFixRound({ comments, liveHead });
+
+  it("no-code answer with recorded head: the resumed fixer's first fix-begin at that head is not an empty round (#7452)", () => {
+    expect(nocode7452.comments.at(-2).body).toContain('IC_qwphsQ');
+    expect(decide(nocode7452.comments)).toEqual({ empty: false, noCodeResume: true });
+  });
+  it('claim A → stand-down → claim B → answer at B → resume B is not empty', () => {
+    expect(decide([claim(X), stop('IC_stop'), claim(H), answer('IC_stop'), claim(H)]))
+      .toEqual({ empty: false, noCodeResume: true });
+  });
+  it('first post-answer claim at another head uses up the exemption (b)', () => {
+    expect(decide([...base(), claim(X)], X).empty).toBe(true);
+  });
+  it('mismatching then matching claim follows the strict rule (c)', () => {
+    const comments = [...base(), claim(X), claim(H)];
+    expect(rearmWindow(comments).claims).toEqual([X.slice(0, 9), H.slice(0, 9)]);
+    expect(decide(comments)).toEqual({ empty: false });
+  });
+  it('second same-head claim after the resume is empty (d)', () => {
+    expect(decide([...resume(), claim(H)]).empty).toBe(true);
+  });
+  it('abbreviated 9-hex resume claim matches a 40-hex answer head', () => {
+    expect(decide(resume())).toEqual({ empty: false, noCodeResume: true });
+  });
+  it('uppercase 40-hex answer heads still match the lowercase claim prefix', () => {
+    expect(decide([...before, answer('IC_stop', H.toUpperCase()), claim(H)])).toEqual({ empty: false, noCodeResume: true });
+  });
+  it('moved live head after the resume gives no pin (e)', () => {
+    expect(decide(resume(), Y)).toEqual({ empty: false });
+    expect(rearmModule.rearmLabelArgv(['7452'], decide(resume(), Y), Y)).toEqual(['7452']);
+  });
+  it.each([undefined, false])('legacy headless no-code answer or noCodeOwed=%s grants no exemption (f)', noCodeOwed => {
+    const legacy = answer('IC_stop', undefined, { noCodeOwed, head: undefined });
+    expect(decide([...before, legacy, claim(H)]).empty).toBe(true);
+  });
+  it('legacy #7451 headless no-code answer grants no exemption', () => {
+    // Reduced sequence recorded in the prep: answer 12:29:09 -> claim 5aae2cd28 -> no-change -> stand-down vIc5g.
+    const head = '5aae2cd28369752374489c36f5eb6464ec72e21d';
+    const comments = [claim(head), stop('IC_7451_stop'), answer('IC_7451_stop', undefined, { head: undefined }),
+      { ...claim(head), createdAt: '2026-11-25T12:30:00Z' }];
+    expect(decide(comments, head).empty).toBe(true);
+  });
+  it('plain rearm-review and untrusted headed answers grant no exemption (f)', () => {
+    const plain = answer('IC_stop', undefined, { head: undefined, noCodeOwed: undefined });
+    const forged = { ...answer('IC_stop'), author: { login: 'outsider' }, viewerDidAuthor: true };
+    for (const a of [plain, forged]) expect(decide([...before, a, claim(H)]).empty).toBe(true);
+  });
+  it('a headed answer naming a non-latest stand-down grants no exemption', () => {
+    expect(decide([...before, stop('IC_new'), answer('IC_stop'), claim(H)]).empty).toBe(true);
+  });
+  it('changes verdict after the answer clears the exemption (g)', () => {
+    const verdict = { author: BOT, body: '🔁 review — changes requested' };
+    for (const comments of [base(), resume()]) expect(decide([...comments, verdict, claim(H)]).empty).toBe(true);
+  });
+  it('new stand-down after the resume claim revokes the exemption before a fresh answer (h)', () => {
+    const comments = [...resume(), stop('IC_second')];
+    expect(decide(comments).empty).toBe(true);
+    expect(rearmWindow(comments).standDownId).toBe('IC_second');
+    expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_second', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
+  });
+  it('stand-down between the answer and the first claim revokes the exemption until a fresh answer', () => {
+    expect(decide([...base(), stop('IC_second'), claim(H)]).empty).toBe(true);
+  });
+  it('fresh headed answer to the new stand-down re-grants once (i)', () => {
+    const comments = [...resume(), stop('IC_second'), answer('IC_second', X), claim(X)];
+    expect(decide(comments, X)).toEqual({ empty: false, noCodeResume: true });
+    expect(decide([...comments, claim(X)], X).empty).toBe(true);
+  });
+  it('resume claim, push, then a claim at the new head re-arms: [H,X] is not empty (j)', () => {
+    const comments = [...resume(), claim(X)];
+    expect(rearmWindow(comments).claims).toEqual([H, X.slice(0, 9)]);
+    expect(decide(comments, X)).toEqual({ empty: false });
+  });
+  it('thread order alone decides; timestamps cannot reorder the exemption', () => {
+    expect(decide(resume().map((c, i) => ({ ...c, createdAt: `2026-11-${25 - i}T00:00:00Z` }))))
+      .toEqual({ empty: false, noCodeResume: true });
+  });
+  it('untrusted later claims and stand-downs cannot consume a trusted resume', () => {
+    const forged = c => ({ ...c, author: { login: 'outsider' }, viewerDidAuthor: false });
+    expect(decide([...resume(), forged(claim(H)), forged(stop('IC_fake'))])).toEqual({ empty: false, noCodeResume: true });
+  });
+  it('rearmLabelArgv pins only on a no-code resume and refuses a conflicting caller --expect-head', () => {
+    const argv = ['7452', '--repo=o/r'];
+    const pin = `--expect-head=${H}`;
+    expect(rearmModule.rearmLabelArgv(argv, { empty: false, noCodeResume: true }, H)).toEqual([...argv, pin]);
+    expect(argv).toEqual(['7452', '--repo=o/r']);
+    expect(rearmModule.rearmLabelArgv([...argv, pin], { noCodeResume: true }, H)).toEqual([...argv, pin]);
+    const upperPin = `--expect-head=${H.toUpperCase()}`;
+    expect(rearmModule.rearmLabelArgv([...argv, upperPin], { noCodeResume: true }, H)).toEqual([...argv, upperPin]);
+    expect(rearmModule.rearmLabelArgv(argv, { empty: false }, H)).toEqual(argv);
+    expect(() => rearmModule.rearmLabelArgv([...argv, `--expect-head=${X}`], { noCodeResume: true }, H)).toThrow(/expect-head/);
+    expect(() => rearmModule.rearmLabelArgv(argv, { noCodeResume: true }, 'bad')).toThrow(/head/i);
   });
 });
