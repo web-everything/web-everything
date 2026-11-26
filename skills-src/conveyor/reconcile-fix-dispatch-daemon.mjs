@@ -1205,7 +1205,8 @@ export async function runTickAllRepos({
     if (o?.fresh) {
       if (typeof adoptYieldProbe !== 'function') return false;
       try {
-        const result = adoptYieldProbe(o);
+        const result = typeof adoptYieldProbe.probeFresh === 'function'
+          ? adoptYieldProbe.probeFresh() : adoptYieldProbe(o);
         if (result !== true && result !== false) throw Error('ambiguous adoption probe result');
         return (yieldedForAdoption = result);
       } catch (error) {

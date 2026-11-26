@@ -57,8 +57,9 @@ trusted receipt body, answer ID and head. A missing, edited or ambiguous receipt
 Each guard re-decides from that evidence. Missing, malformed, incomplete or unreadable evidence
 refuses the entry; inspect the named evidence and restore it before retrying. A live claim waits
 for its owner. At the first durable write it also probes adoption fresh; errors and ambiguous results
-latch an adoption yield. Fresh probes report current readiness even for a previously seen candidate;
-one-shot suppression applies only to throttled safe-point probes. Once the receipt commits, adoption
+latch an adoption yield. The explicit `probeFresh()` write-point probe reports current readiness even
+for a previously seen candidate. Regular probes, including unthrottled `{fresh: true}` reads, keep
+one-shot suppression per identity across passes. Once the receipt commits, adoption
 cannot strand its writer. Late evidence after the receipt
 refuses the writer and leaves the ruling spent; an operator must inspect the handoff before replacing it.
 
@@ -66,9 +67,9 @@ Clearing awaiting-CI status and removing ready-to-merge after a committed write 
 follow-ups. They finish with the entry; failures are reported. Adoption is observed after every attempted
 entry, including refusals and follow-ups. A latched yield defers all later entries and halves.
 
-A call admitted before its deadline attempts its first entry unless adoption has latched.
-Every later entry, including the first entry of a later half, is bounded by the phase deadline.
-The first-entry exception is consumed by an attempt even when that attempt refuses or fails.
+A call admitted before its deadline attempts the first entry of each half unless adoption has latched.
+The phase deadline defers later entries within that half. Each half consumes its first-entry exception
+with an attempt even when that attempt refuses or fails.
 Promotion keeps its numeric cursor; rearm, restore and close rotate independently after scalar
 repo-key/PR cursors. Exhaustion clears a cursor; zero attempts preserve it. Every unattempted entry
 and skipped repo is named once, with adoption taking precedence over the deadline. Action timestamps

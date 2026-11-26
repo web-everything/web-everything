@@ -1130,6 +1130,36 @@ Fix defect`);
     }
     expect(attempts).toEqual([42, 43, 42]);
   });
+  it('each half attempts its first entry after planning overruns and defers every later entry', () => {
+    let time = 0;
+    const attempts = [];
+    const kinds = ['promote-draft', 'restore-review-label', 'rearm-no-code', 'close-superseded'];
+    const s = setup({ now: () => time, deadlineAt: 10,
+      reconcile: () => {
+        time = 11;
+        return { dispatch: kinds.flatMap((kind, i) => [1, 2].map(n => ({ ...entry, kind, prNumber: i * 10 + n }))) };
+      },
+      readHeadCheckState: () => { attempts.push('promote-draft'); throw Error('checks unreadable'); },
+      readPrLabels: () => { attempts.push('restore-review-label'); throw Error('labels unreadable'); },
+      acquireRearmLock: () => { attempts.push('rearm-no-code'); throw Error('lock busy'); },
+      readCardsOnMain: () => { attempts.push('close-superseded'); throw Error('cards unreadable'); },
+    });
+    const result = s.run();
+    expect(attempts).toEqual(kinds);
+    expect(result.handled).toBe(4);
+    expect(result.dispatched).toEqual([]);
+    expect(result.refusals.filter(r => r.kind.endsWith('-deferred-budget'))).toEqual(
+      kinds.map((kind, i) => expect.objectContaining({ kind: `${kind}-deferred-budget`, pr: i * 10 + 2,
+        why: expect.stringContaining(`passed after 1 ${kind} attempt(s)`) })),
+    );
+    expect(result.nextCursor).toBe(2);
+    expect(result.nextHalfCursors).toEqual({ restore: 'we#11', rearm: 'we#21', close: 'we#31' });
+    expect(s.postComment).not.toHaveBeenCalled();
+    expect(s.rearm).not.toHaveBeenCalled();
+    expect(s.options.provider.ready).not.toHaveBeenCalled();
+    expect(s.options.addLabel).not.toHaveBeenCalled();
+    expect(s.options.closePr).not.toHaveBeenCalled();
+  });
   it('rearm progress is independent of persistent promote deferrals', () => {
     let time = 0, halfCursors, cursor;
     const attempts = [];

@@ -124,20 +124,44 @@ describe('createAdoptYieldProbe — S1 fail-closed safe-point signal', () => {
 
 
 describe('fresh write-point adoption evidence', () => {
+  it('explicit write-point probes report live readiness without consuming regular pass identities', () => {
+    let candidate = ready();
+    const probe = createAdoptYieldProbe({ bootHead: BOOT, readReadyStrict: () => candidate, now: () => 1 });
+    expect(probe.probeFresh()).toBe(true);
+    expect(probe.probeFresh()).toBe(true);
+    expect(probe({ fresh: true })).toBe(true);
+    expect(probe({ fresh: true })).toBe(false);
+    expect(probe.probeFresh()).toBe(true);
+    candidate = null;
+    expect(probe.probeFresh()).toBe(false);
+    candidate = ready({ passedAt: '2026-11-14T20:02:00Z' });
+    expect(probe({ fresh: true })).toBe(true);
+    expect(probe({ fresh: true })).toBe(false);
+    expect(probe.probeFresh()).toBe(true);
+  });
+  it.each([undefined, {}, [], new Error('readiness timed out')])(
+    'explicit write-point probes throw on unreadable or ambiguous evidence %j', evidence => {
+      const probe = createAdoptYieldProbe({ bootHead: BOOT, now: () => 1,
+        readReadyStrict: () => { if (evidence instanceof Error) throw evidence; return evidence; } });
+      expect(typeof probe.probeFresh).toBe('function');
+      expect(() => probe.probeFresh()).toThrow();
+    },
+  );
   it('fresh probes report current readiness after a throttled probe consumed the same identity', () => {
     let candidate = ready();
     const readReady = vi.fn(() => candidate), readReadyStrict = vi.fn(() => candidate);
     const probe = createAdoptYieldProbe({ bootHead: BOOT, now: () => 0, readReady, readReadyStrict });
     expect(probe()).toBe(true);
-    expect(probe({ fresh: true })).toBe(true);
-    expect(probe({ fresh: true })).toBe(true);
+    expect(probe.probeFresh()).toBe(true);
+    expect(probe.probeFresh()).toBe(true);
     candidate = null;
-    expect(probe({ fresh: true })).toBe(false);
+    expect(probe.probeFresh()).toBe(false);
     candidate = ready();
-    expect(probe({ fresh: true })).toBe(true);
+    expect(probe.probeFresh()).toBe(true);
     expect(probe()).toBe(false);
     expect(readReady).toHaveBeenCalledTimes(1);
     expect(readReadyStrict).toHaveBeenCalledTimes(4);
+    expect(probe({ fresh: true })).toBe(false);
   });
   it.each(['ENOTDIR','corrupt JSON','invalid fields','ENOENT'])('fresh probe: %s throws except ENOENT, which is clear', mode => {
     const dir = mkdtempSync(join(tmpdir(), 'adopt-fresh-')); temps.push(dir);

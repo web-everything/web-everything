@@ -35,6 +35,51 @@ function realFixTick(dispatch) {
 }
 
 describe('fix daemon — S1 adoption yield', () => {
+  it('uses the explicit write-point probe every pass after the regular signal is exhausted', async () => {
+    const ready = vi.fn();
+    const probe = Object.assign(vi.fn(() => false), { probeFresh: vi.fn(() => true) });
+    const options = fixture({ repos: ['we'], adoptYieldProbe: probe,
+      promoteDraftTick: tickOptions => runReconcilePromoteDraftDispatch({ ...tickOptions, root: '/repo',
+        checkStaleness: () => ({ fresh: true, behind: 0 }),
+        reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 42, headRefOid: 'a'.repeat(40) }] }),
+        readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => [],
+        readComments: () => [], readClaim: () => null, provider: { ready }, clearAwaitingCi: () => {},
+      }) });
+    for (let pass = 0; pass < 2; pass++) {
+      const result = await runTickAllRepos(options);
+      expect(result.yieldedForAdoption).toBe(true);
+      expect(result.promoteDraft.repos[0].result.refusals).toContainEqual(expect.objectContaining({
+        pr: 42, kind: 'promote-draft-deferred-adoption',
+      }));
+    }
+    expect(probe.probeFresh).toHaveBeenCalledTimes(2);
+    expect(probe.mock.calls.every(([o]) => o === undefined)).toBe(true);
+    expect(ready).not.toHaveBeenCalled();
+  });
+  it.each([undefined, null, {}, new Error('write-point evidence timed out')])(
+    'an explicit write-point result %j holds without falling through to the regular probe', async evidence => {
+      const probe = Object.assign(vi.fn(() => false), { probeFresh: vi.fn(() => {
+        if (evidence instanceof Error) throw evidence;
+        return evidence;
+      }) });
+      const ready = vi.fn();
+      const result = await runTickAllRepos(fixture({ repos: ['we'], adoptYieldProbe: probe,
+        promoteDraftTick: tickOptions => runReconcilePromoteDraftDispatch({ ...tickOptions, root: '/repo',
+          checkStaleness: () => ({ fresh: true, behind: 0 }),
+          reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 42, headRefOid: 'a'.repeat(40) }] }),
+          readHeadCheckState: () => ({ state: 'green' }), readPrLabels: () => [],
+          readComments: () => [], readClaim: () => null, provider: { ready }, clearAwaitingCi: () => {},
+        }) }));
+      expect(result.yieldedForAdoption).toBe(true);
+      expect(probe.probeFresh).toHaveBeenCalledOnce();
+      expect(probe.mock.calls.every(([o]) => o === undefined)).toBe(true);
+      expect(ready).not.toHaveBeenCalled();
+      expect(result.promoteDraft.repos[0].result.refusals).toContainEqual(expect.objectContaining({
+        pr: 42, kind: 'promote-draft-deferred-adoption',
+        why: expect.stringMatching(/ambiguous adoption probe result|write-point evidence timed out/),
+      }));
+    },
+  );
   it.each([undefined, null, 0, 'false', {}, new Error('adoption evidence timed out')])(
     'fresh adoption result %j cannot authorize the real promote writer', async evidence => {
       const ready = vi.fn();

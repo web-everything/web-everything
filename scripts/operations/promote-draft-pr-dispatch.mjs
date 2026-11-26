@@ -380,7 +380,8 @@ export function runReconcilePromoteDraftDispatch({
   function adoptionDeferral(kind, pr, unattempted = false) {
     defer(`${kind}-deferred-adoption`, pr, `daemon adoption yield (${yieldReason}) — ${unattempted ? 'no lock, read or write ran' : 'commit guard stopped before the grant/spend write'}`, yieldedAt);
   }
-  // One scheduler for every half. Only admission checks the deadline; entries finish together.
+  // Each half gets its own first attempt; the deadline defers that half's later entries.
+  // Only admission checks the deadline; entries finish together.
   function runHalf({ kind, entries, rotate, body }) {
     entries = [...entries].sort((a, b) => a.prNumber - b.prNumber);
     let incoming = rotate ? nextHalfCursors[rotate] : cursor;
@@ -397,7 +398,7 @@ export function runReconcilePromoteDraftDispatch({
     let attempted = 0, lastServed = incoming, unattempted = 0;
     for (let i = 0; i < entries.length; i++) {
       const started = yieldedForAdoption ? null : now();
-      if (yieldedForAdoption || (deadlineAt != null && started > deadlineAt && handled > 0)) {
+      if (yieldedForAdoption || (deadlineAt != null && started > deadlineAt && attempted > 0)) {
         const rest = entries.slice(i);
         unattempted = rest.length;
         for (const row of rest) {
