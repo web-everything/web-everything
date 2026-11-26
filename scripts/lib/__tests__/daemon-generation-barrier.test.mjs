@@ -336,26 +336,36 @@ describe('new-session spawn allowlist', () => {
       }
     }
   });
-  it('requires additional evidence for opaque forwarding in the real source inventory', () => {
+  it.each([0, 2])('requires additional evidence for opaque forwarding in the real source inventory (prefix lines: %i)', (prefixLines) => {
     const files = ['merge-ai-prs.mjs', 'lib/enqueue-on-event.mjs', 'lib/drain-followup-job.mjs', 'lib/daemon-jobs-runtime.mjs'];
     // the sibling repo's daemon.mjs is out of reach for a hermetic test: its scan is the live PGID probe (acceptance 6)
     // These are REFUSALS, not allowlist entries. The old empty-result expectation incorrectly certified
     // opaque bags; S1.4 cannot enable exit handover until these sites have inspectable options/evidence.
-    const unresolved = new Map([
-      [855, 'exec(cmd, args, { cwd, ...opts })'],
-      [885, 'exec(cmd, args, { cwd, ...opts })'],
-      [903, "exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),\n    '--json', 'headRefOid'], opts)"],
-      [910, "exec('gh', GH_ARGV.readPrReviews(slug, pr), opts)"],
-      [5287, 'execFileSync(cmd, args, { ...opts, timeout: 60_000 })'],
-      [5288, 'execFileSync(cmd, args, { ...opts, timeout: 60_000 })'],
-      [5818, 'execFileSync(file, args, { ...opts, cwd })'],
-      [6711, 'execFileSync(cmd, args, { cwd: escCwd, ...opts })'],
-    ]);
+    const unresolved = [
+      'exec(cmd, args, { cwd, ...opts })',
+      'exec(cmd, args, { cwd, ...opts })',
+      "exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),\n    '--json', 'headRefOid'], opts)",
+      "exec('gh', GH_ARGV.readPrReviews(slug, pr), opts)",
+      'execFileSync(cmd, args, { ...opts, timeout: 60_000 })',
+      'execFileSync(cmd, args, { ...opts, timeout: 60_000 })',
+      'execFileSync(file, args, { ...opts, cwd })',
+      'execFileSync(cmd, args, { cwd: escCwd, ...opts })',
+    ];
     for (const f of files) {
-      const expected = f === 'merge-ai-prs.mjs' ? [...unresolved].map(([line, text]) => ({
-        line, text: `Uninspectable process options; inspect before permitting handover: ${text}`,
-      })) : [];
-      expect(scanNewSessionSpawns(readFileSync(join(root, f), 'utf8'), { file: f.split('/').pop() }), f).toEqual(expected);
+      const source = '\n'.repeat(prefixLines) + readFileSync(join(root, f), 'utf8');
+      // Locate each audited call independently of the scanner, preserving duplicate occurrences.
+      // Unrelated line shifts must not change the inventory, but missing/new calls must still fail.
+      let offset = 0;
+      const expected = f === 'merge-ai-prs.mjs' ? unresolved.map((text) => {
+        const position = source.indexOf(text, offset);
+        expect(position, `${f}: missing audited call ${text}`).toBeGreaterThanOrEqual(0);
+        offset = position + text.length;
+        return {
+          line: source.slice(0, position).split('\n').length,
+          text: `Uninspectable process options; inspect before permitting handover: ${text}`,
+        };
+      }) : [];
+      expect(scanNewSessionSpawns(source, { file: f.split('/').pop() }), f).toEqual(expected);
     }
   });
 });
