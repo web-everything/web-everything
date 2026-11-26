@@ -252,6 +252,7 @@ export function createDrainMergeStrategy({
   const boundary = writeBoundary ?? createFastDrainWriteBoundary({ writeScope, repo: localSlug, num: targetPr,
     log: line => log.write(`${line}\n`) });
   exec = boundary.exec(exec);
+  if (writeScope === 'none') writeState = boundary.helper('local-state', writeState);
   postConflictFinding = boundary.helper('post-conflict-finding', postConflictFinding);
   if (requestRedTeamOpt) requestRedTeamOpt = boundary.helper('red-team-request', requestRedTeamOpt);
   // The red-team readers credit an automatic round grant exactly as the gate does; unreadable = no automatic credit.

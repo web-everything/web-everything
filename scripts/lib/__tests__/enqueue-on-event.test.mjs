@@ -679,7 +679,7 @@ describe('O1-O10 table', () => {
     const json = result.skip ? { considered: 1, skipped: [{ num: 42, reason: result.skip }], skipReasons: [{ num: 42, reason: result.skip }] }
       : result.absent ? { considered: 0 } : result.refused ? { ok: false, reason: 'unavailable' }
         : { considered: 1, enqueueOutcomes: [{ num: 42, outcome: result.enqueued ? 'enqueued' : 'not-enqueued', ...result }] };
-    const f = catchUpSetup({ manualFinish: true, timeoutMs: 1000,
+    const f = catchUpSetup({ env: { WE_FAST_DRAIN_INDEX_MODE: 'on' }, manualFinish: true, timeoutMs: 1000,
       readCodeVersion: () => 'c'.repeat(40),
       readPr: async () => row, readCandidates: async () => ({ ok: true, queued: 0, mainCiRunId: 1, prs: [candidate(42, 0, row)] }),
       readMembership: async () => membership === 'unknown' ? { ok: false } : { ok: true, inQueue: membership === 'yes' },
@@ -713,7 +713,7 @@ describe('O1-O10 table', () => {
     } finally { f.handle.kill(); vi.useRealTimers(); }
   });
   it.each(['merge state BLOCKED', 'merge-gate hold', 'required check pending'])('O5 skip returns room while retaining round backoff: %s', async reason => {
-    const f = catchUpSetup({ readPr: async () => ({ ...READY_PR, headRefOid: 'room-head' }),
+    const f = catchUpSetup({ env: { WE_FAST_DRAIN_INDEX_MODE: 'on' }, readPr: async () => ({ ...READY_PR, headRefOid: 'room-head' }),
       readCandidates: async () => ({ ok: true, queued: 0, prs: [candidate(42, 0), candidate(43, 1)] }),
       readCapacity: () => ({ capacity: 1 }),
       drainResult: num => ({ skipReasons: [{ num, reason }] }) });
@@ -2023,9 +2023,17 @@ describe('BLOCKED catch-up back-off', () => {
   });
 
   it.each(['merge-gate hold review-acceptance not cleared on this head', 'unrelated gate skip'])('backs off classifier skips for the configured rounds (%s)', async (skip) => {
-    const { handle, calls, advance } = blockedSetup({ drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
+    const { handle, calls, advance } = blockedSetup({ env: { WE_FAST_DRAIN_INDEX_MODE: 'on' }, drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: skip }] } : { toMerge: [{ num }] } });
     await handle.catchUp(); advance(600_000); await handle.catchUp();
     expect(nums(calls).filter(n => n === 5193)).toHaveLength(1);
+  });
+
+  it.each(['off', 'shadow', 'unknown'])('mode %s preserves main retry behavior for an ordinary classifier skip', async mode => {
+    const { handle, calls, advance } = blockedSetup({ env: { WE_FAST_DRAIN_INDEX_MODE: mode },
+      drainResult: num => num === 5193 ? { skipReasons: [{ num, reason: 'required check pending' }] } : { toMerge: [{ num }] } });
+    await handle.catchUp(); advance(600_000); await handle.catchUp();
+    expect(nums(calls).filter(n => n === 5193)).toHaveLength(2);
+    expect(handle.blocked().has(5193)).toBe(false);
   });
 
   it('bypasses back-off for an event folded into retained catch-up work', async () => {
@@ -2754,6 +2762,7 @@ describe('catch-up miss backoff', () => {
   // Timers, queue/base state and unreadable evidence can recover without a head/label change.
   const holdEligibility = [
     ['defer-to-pass', false],
+    ['prestage', false],
     ['batching-deferred', false], ['merge-lock-held', false],
     ['branch-preparation', false], ['card-group-hold', false], ['card-grouped', false],
     ['enqueue-backoff', false], ['live-state-unreadable', false], ['bornas-unreadable', false],

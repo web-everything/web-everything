@@ -1,6 +1,6 @@
 import { daemonAppEnv } from './daemon-app-env.mjs';
 import { expect } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 const sha = 'a'.repeat(40);
@@ -32,7 +32,7 @@ export function createPrestageWorld(runCommand) {
         commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
         statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
         comments: [{author:{login:'chalbert'},body:REVIEW_RECORD_HEADLINES.restamp+'\n<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-      const run = async (green = false, { expectedStatus = 0, rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
+      const run = async (green = false, { expectedStatus = 0, rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', indexMode = 'on', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
         // The live queue precondition now pins all five producers. Explicit test
         // failures/pending states win; omitted companion checks are successful.
         pr.statusCheckRollup.push(...['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']
@@ -70,14 +70,15 @@ export function createPrestageWorld(runCommand) {
             PRESTAGE_DEFAULT_BRANCH:defaultBranch, PRESTAGE_FAIL_BRANCH:failDefaultBranch ? '1' : '0',
             ...(failDefaultBranch ? { WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS:'1' } : {}),
             WE_COORDINATION_ROOT:coord, WE_ASYNC_DRAIN:shadowMode, LANE_POOL_ROOT:dir, WE_MERGE_DELIVERY_SETTINGS_FILE:settings,
-            WE_DRAIN_LABEL_MEMO_PATH:labelMemo,
+            WE_FAST_DRAIN_INDEX_MODE: indexMode, WE_FAST_DRAIN_SHADOW_PATH: join(dir, 'index-shadow.jsonl'), WE_DRAIN_LABEL_MEMO_PATH:labelMemo,
             WE_DRAIN_CARD_GROUP_STATE:groups,
             WE_PR_SNAPSHOT:green ? '1' : '0', WE_PR_SNAPSHOT_DIR:snapshots,
             WE_DRAIN_WAIT_FOR_RED_TEAM_BEFORE_ENQUEUE:'off',WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE:numbering ? 'on' : 'off',
             WE_DRAIN_WORKFLOW_EDIT_HUMAN:'off',WE_REVIEW_LEDGER_MODE:'off',WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES:'0',
             WE_VERDICT_LEDGER_DIR:ledger, WE_VERDICT_LEDGER_STORE:'home' } });
         expect(r.status, r.stderr + r.stdout).toBe(expectedStatus);
-        return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr };
+        return { report:JSON.parse(r.stdout), stdout:r.stdout, calls:readFileSync(log,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse), stderr:r.stderr,
+          indexShadow: existsSync(join(dir, 'index-shadow.jsonl')) ? readFileSync(join(dir, 'index-shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [] };
       };
       await fn({pr,run,coord,ledger,slug,dir});
     } finally { rmSync(root,{recursive:true,force:true}); }

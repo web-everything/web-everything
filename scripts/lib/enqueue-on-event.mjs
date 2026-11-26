@@ -75,7 +75,7 @@
  * SCOPE. Only PRs of the local repo (the clone's origin): that is the repo whose ready PRs the drain enqueues on
  *   GitHub's merge queue. A mark with no PR number (`repo#?`) or a full-sweep mark (`*`) is left to the full pass.
  */
-import { writeFastDrainRoundDefaultBranch, isFastDrainDeferKind } from './fast-drain-scope.mjs';
+import { writeFastDrainRoundDefaultBranch, isFastDrainDeferKind, resolveFastDrainIndexModeSetting } from './fast-drain-scope.mjs';
 import { classifyChildFailure } from './child-failure-class.mjs';
 import { PASS_STEP_ORDER } from './pass-timings.mjs';
 export { classifyChildFailure } from './child-failure-class.mjs';
@@ -333,6 +333,7 @@ export const MISS_BACKOFF_HOLD_ELIGIBILITY = Object.freeze({
   'defer-to-pass': false,
   'batching-deferred': false,
   'merge-lock-held': false,
+  prestage: false,
   'branch-preparation': false,
   'card-group-hold': false,
   'card-grouped': false,
@@ -1302,7 +1303,8 @@ export function createEnqueueOnEvent({
             untilRound: catchUpRound + blockedRounds, reason: 'same-head-failed' });
         }
         // Classifier skips retain their configured round limiter; they do not create a decline cache entry.
-        if (p.catchUp && !spawnFailed && !r.timedOut && blockedRounds > 0 && signature && summary.startsWith('skipped:')) {
+        if (p.catchUp && !spawnFailed && blockedRounds > 0 && signature && summary.startsWith('skipped:')
+          && (resolveFastDrainIndexModeSetting({ env }).mode === 'on' ? !r.timedOut : /merge state BLOCKED|merge-gate hold/.test(summary))) {
           backoff.set(p.num, { signature, rounds: blockedRounds, untilRound: catchUpRound + blockedRounds, reason: 'blocked' });
         }
         if (p.catchUp && r.timedOut && timeoutRounds > 0 && signature) {

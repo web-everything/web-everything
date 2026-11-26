@@ -376,7 +376,7 @@ async function refreshRelatedContext({ byRepo, readGroups, readManifests, target
 export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnapshot, listLean, readFull,
   readManifest, concurrency = 4, readInventory, failClosed = false, refreshPr = () => false,
   readManifests = entries => readManifestEntries(entries, readManifest, concurrency),
-  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {}, now = Date.now, targetMaxAgeMs = Infinity, indexSetting }) {
+  readGroups = () => ({ groups: [] }), time = (_phase, f) => f(), log = () => {}, now = Date.now, targetMaxAgeMs = Infinity, indexSetting, legacy = false }) {
   try {
     if (indexSetting) {
       if (!indexSetting.ok) throw new Error('defer-to-pass:index-setting');
@@ -386,7 +386,7 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
     // Own ordering is read at the live head before any non-target full read. Bulk readers
     // use the same body-first / legacy-tree lookup as the ordinary context path.
     let checkedTarget, targetReadAt;
-    if (failClosed) {
+    if (failClosed && !legacy) {
       checkedTarget = requireFullPr(await readFull(targetRepo, Number(onlyPr)), Number(onlyPr));
       targetReadAt = now();
       let own;
@@ -439,12 +439,12 @@ export async function readFastDrainContext({ repos, targetRepo, onlyPr, readSnap
     if (!(now() - targetReadAt < targetMaxAgeMs)) throw new Error('target read older than the pass bound');
     const { snapshots, inventories, indexMeta } = base;
     const liveReads = new Set([fastDrainPrKey(targetRepo, onlyPr)]);
-    const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, indexMeta, now, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency, refreshPr, failClosed }));
-    await time('listing.related', () => refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads, concurrency, failClosed, log, verifyIdentity: !!indexSetting }));
+    const byRepo = await time('listing.lean', () => hydrateLiveInventory({ repos, snapshots, indexMeta, now, target, targetRepo, onlyPr, listLean: inventories ? repo => inventories.get(repo) : listLean, readFull, liveReads, concurrency, refreshPr, failClosed: failClosed && !legacy }));
+    await time('listing.related', () => refreshRelatedContext({ byRepo, readGroups, readManifests, targetRepo, onlyPr, readFull, liveReads, concurrency, failClosed: failClosed && !legacy, log, verifyIdentity: !!indexSetting }));
     return byRepo;
   } catch (e) {
     const reason = String(e?.message ?? e).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 180);
-    if (failClosed) throw new Error(reason.startsWith('defer-to-pass:') ? reason : `fast-drain: incomplete pass context (${reason}) — retry next pass`, { cause: e });
+    if (failClosed) throw new Error(!legacy && reason.startsWith('defer-to-pass:') ? reason : `fast-drain: incomplete pass context (${reason}) — retry next pass`, { cause: e });
     log(`fast-drain: context fell back to full listing (${reason})`);
     return null;
   }

@@ -1,5 +1,20 @@
 ## Fast-drain live proof
 
+The identity-index child is default `shadow`. Pin
+`WE_FAST_DRAIN_INDEX_MODE=on` in fixtures testing its live admission gates;
+`off` and the live half of `shadow` retain the origin/main prestage and
+snapshot-context paths, including the legacy BLOCKED/merge-gate round limiter.
+`fast-drain-index-mode.test.mjs` compares the real child's off/shadow mutation
+traces and exercises the stricter `none` write scope. Shadow telemetry has one
+seven-field JSONL row per PR/pass; use `WE_FAST_DRAIN_SHADOW_PATH` for isolated
+tests. A shadow exception or telemetry failure must leave legacy work runnable.
+This setting change does not authorize a live experiment or switching it on.
+
+Live `review:hold` vetoes are unconditional across `full`, `enqueue-only`, and
+`none` write scopes. Keep named regressions for a hold observed at initial
+admission and one added during final revalidation, asserting the hold reason
+and zero enqueue calls. Mode isolation must preserve these shared vetoes.
+
 Use this procedure for FASTDRAIN-SELF-REFRESH-HARDEN S6. Unit tests do not
 replace the S3 throwaway-PR proof that label add, label removal and body edits
 each change `updatedAt`. Record before/after timestamps for each edit before

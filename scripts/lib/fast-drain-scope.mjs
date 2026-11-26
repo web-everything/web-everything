@@ -1,8 +1,8 @@
 import { setTimeout as delay } from 'node:timers/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { hostname } from 'node:os';
-import { readFileSync, statSync } from 'node:fs';
+import { hostname, homedir } from 'node:os';
+import { readFileSync, statSync, mkdirSync, appendFileSync } from 'node:fs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { localRepoSlug } from '../readiness/drain-lock.mjs';
 import { withWriteLock } from './daemon-clone-lock.mjs';
@@ -34,6 +34,69 @@ export function requireFastDrainDeferKind(kind) {
 /** The cwd-repo sentinel must share the full pass's persistent cache namespace. */
 export function shaCacheRepo(repo, localSlug) {
   return repo || localSlug;
+}
+
+/** Invalid evidence disables the index, including invalid lower-precedence layers. */
+export function resolveFastDrainIndexModeSetting({ env = process.env, tool, platform,
+  readSettings = readDeclaredSettings, readPlatform = readPlatformPreferences } = {}) {
+  const closed = () => ({ mode: 'off', source: 'invalid', line: 'fast-drain: mergeQueue.fastDrain.index.mode=off (invalid/unreadable setting)' });
+  const valid = v => ['off', 'shadow', 'on'].includes(v);
+  try {
+    let nested;
+    if (tool === undefined) {
+      const settings = readSettings();
+      if (settings.errors?.length || settings.duplicates?.some(d => d.path.startsWith('mergeQueue.fastDrain.index'))) return closed();
+      tool = settings.settings?.mergeQueue?.fastDrain;
+    }
+    if (platform === undefined) {
+      const p = readPlatform({ env });
+      if (p.errors?.length) return closed();
+      platform = p.prefs?.['mergeQueue.fastDrain'];
+      nested = p.prefs?.['mergeQueue.fastDrain.index'];
+    }
+    for (const block of [tool, platform, ...(nested === undefined ? [] : [{ index: nested }])]) {
+      if (block !== undefined && (!block || typeof block !== 'object' || Array.isArray(block))) return closed();
+      if (block && Object.hasOwn(block, 'index') && (!block.index || typeof block.index !== 'object' || Array.isArray(block.index))) return closed();
+      if (block?.index && Object.hasOwn(block.index, 'mode') && !valid(block.index.mode)) return closed();
+    }
+    const p = resolveCascade({ platform: platform?.index, tool: nested, valid: { mode: valid } });
+    const c = cascadePolicy('mergeQueue.fastDrain.index', tool?.index, { env, platform: p.value ?? {},
+      standard: { mode: 'shadow' }, envValues: { mode: env.WE_FAST_DRAIN_INDEX_MODE }, valid: { mode: valid }, log: () => {} });
+    if (p.invalid.length || c.invalid.length || !valid(c.value.mode)) return closed();
+    return { mode: c.value.mode, source: c.sources.mode,
+      line: `fast-drain: mergeQueue.fastDrain.index.mode=${c.value.mode} (${c.sources.mode})` };
+  } catch { return closed(); }
+}
+
+/** One dispatch for the child. Shadow errors, including telemetry IO, cannot escape into live work. */
+export async function dispatchFastDrainIndex({ mode, legacy, index, repo = null, pr = null, head = null, mainSha = null,
+  observe = () => ({}), env = process.env, shadowPath = env.WE_FAST_DRAIN_SHADOW_PATH,
+  now = Date.now, log = () => {}, append = (path, row) => {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, JSON.stringify(row) + '\n');
+  } }) {
+  if (mode === 'on') return index({ writeScope: 'enqueue-only' });
+  if (mode === 'shadow') {
+    let decision = { indexDecision: 'error', reason: 'shadow incomplete' }, failure;
+    try {
+      const writeBoundary = createFastDrainWriteBoundary({ writeScope: 'none', repo, num: pr });
+      const identity = await observe(writeBoundary);
+      head = identity.head ?? head;
+      mainSha = identity.mainSha ?? mainSha;
+      repo = identity.repo ?? repo;
+      decision = await index({ writeScope: 'none', writeBoundary });
+    } catch (error) { failure = error; decision = { indexDecision: 'error', reason: String(error?.message ?? error) }; }
+    try {
+      append(shadowPath || join(homedir(), '.claude', 'daemon-self-sync-state', 'fast-drain-shadow.jsonl'),
+        { at: new Date(now()).toISOString(), pr, repo, head, indexDecision: decision?.indexDecision ?? 'unknown',
+          reason: decision?.reason ?? null, mainSha });
+    } catch (error) { failure ??= error; }
+    if (failure) {
+      try { log(`fast-drain shadow: ${String(failure?.message ?? failure).replace(/[\x00-\x1f\x7f-\x9f]/g, ' ')}`); }
+      catch { /* Shadow diagnostics cannot block the live child either. */ }
+    }
+  }
+  return legacy();
 }
 
 /** Safety bounds: an invalid layer refuses rather than silently falling through to a lower value. */
@@ -108,7 +171,7 @@ export function resolveFastDrainScopeSetting({ env = process.env, tool, platform
 }
 
 /** Resolve standard → platform → tool → env; injected layers keep unit probes deterministic. */
-export function resolveFastDrainListingSetting({ env = process.env, tool, platform, readSettings = readDeclaredSettings } = {}) {
+export function resolveFastDrainListingSetting({ env = process.env, tool, platform, readSettings = readDeclaredSettings, legacy = false } = {}) {
   let block = tool;
   if (block === undefined) {
     try { block = readSettings().settings?.mergeQueue?.fastDrain; } catch { block = undefined; }
@@ -116,15 +179,16 @@ export function resolveFastDrainListingSetting({ env = process.env, tool, platfo
   const raw = String(env?.WE_FAST_DRAIN_LISTING ?? '').trim().toLowerCase();
   const contextRaw = String(env?.WE_FAST_DRAIN_CONTEXT ?? '').trim().toLowerCase();
   const c = cascadePolicy('mergeQueue.fastDrain', block, {
-    env, standard: { listing: 'snapshot', context: 'snapshot' },
+    env, standard: { listing: 'snapshot', context: 'snapshot', ...(legacy ? { selfRefresh: 'off' } : {}) },
     envValues: { listing: raw || undefined, context: contextRaw || undefined },
-    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live' },
+    valid: { listing: (v) => v === 'snapshot' || v === 'live', context: (v) => v === 'snapshot' || v === 'live',
+      ...(legacy ? { selfRefresh: v => v === 'on' || v === 'off' } : {}) },
     ...(platform !== undefined ? { platform } : {}), log: () => {},
   });
   const listing = c.value.listing, source = c.sources.listing;
   const context = c.value.context, contextSource = c.sources.context;
   const line = `fast-drain: mergeQueue.fastDrain.listing=${listing} (${source}), context=${context} (${contextSource})${c.invalid.length ? ` · ignored invalid: ${c.invalid.join('; ')}` : ''}`;
-  return { listing, source, context, contextSource, line };
+  return { listing, source, context, contextSource, ...(legacy ? { selfRefresh: c.value.selfRefresh === 'on' } : {}), line };
 }
 
 /** Keep subverbs and flags finite: several otherwise read-only Git verbs can write output or run helpers. */
@@ -181,7 +245,8 @@ function ghOptions(args, valueFlags, switches = []) {
 
 /** One boundary for injected writers and their subprocesses. Unknown mutations refuse. */
 export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, log = () => {} } = {}) {
-  const limited = writeScope === 'enqueue-only';
+  const noWrites = writeScope === 'none';
+  const limited = noWrites || writeScope === 'enqueue-only';
   let confirmed = false;
   let judgedHead = null, nodeId = null;
   const violations = [];
@@ -206,6 +271,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
   const allow = kind => { if (limited) log(`fast-drain write: ${repo}#${num} ${kind}`); };
   const labels = (r, n, plan) => {
     if (!limited) return;
+    if (noWrites) refuse('labels');
     target(r, n);
     if (!Array.isArray(plan?.remove ?? [])) refuse('label-removal');
     const remove = plan.remove ?? [];
@@ -223,13 +289,14 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
     fullPassDuty: (fn, fallback) => limited ? fallback : fn(),
     confirm: () => { confirmed = true; },
     helper: (kind, fn) => (...args) => {
+      if (noWrites) refuse(kind);
       if (limited && !['hold-comment', 'red-team-request', 'local-state', 'operator-feed', 'enqueue'].includes(kind)
         && !(confirmed && ['clearance-stamp', 'ledger'].includes(kind))) refuse(kind);
       allow(kind); return fn(...args);
     },
     labelProvider: provider => !limited ? provider : { ...provider,
       // The full pass provisions repository labels; a child only edits target membership.
-      ensureLabel: () => {},
+      ensureLabel: () => { if (noWrites) refuse('labels'); },
       setLabels: (r, n, plan) => { labels(r, n, plan); allow('labels'); return provider.setLabels(r, n, plan); },
     },
     exec: run => (file, args, options) => {
@@ -247,6 +314,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
           if (!safeConfig.has(verbArgs[1])) refuse('git');
           verbArgs = verbArgs.slice(2);
         }
+        if (noWrites && verbArgs[0] === 'fetch') refuse('git');
         if (verbArgs[0] === 'push') refuse('numbering-push');
         if (!safeGitRead(verbArgs)) refuse('git');
       } else if (file === 'gh') {
@@ -257,6 +325,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
           bindIdentity = true;
         }
         if (args[0] === 'pr' && !['view', 'list', 'diff', 'checks'].includes(args[1])) {
+          if (noWrites) refuse('pr');
           const selectors = ghOptions(args.slice(3), ['--repo', '-R', '--add-label', '--remove-label', '--body', '--body-file', '--base', '--title', '-B', '-b', '-F', '-t']);
           if (!selectors) refuse('pr-edit');
           target(resolveCommandRepo(selectors, options, run), args[2]);
@@ -284,6 +353,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
           const methods = parsed.values.filter(([f]) => ['--method', '-X'].includes(f));
           const input = parsed.values.some(([f]) => f === '--input');
           if (query && /\bmutation\b/.test(query)) {
+            if (noWrites) refuse('graphql');
             if (query.includes('dequeuePullRequest')) refuse('dequeue');
             if (!isPinnedQueueEntryCommand(args) || !nodeId || args[5] !== `id=${nodeId}` || args[7] !== `sha=${judgedHead}`) refuse('graphql');
             if (violations.length) refuse('prior-refusal');

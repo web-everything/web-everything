@@ -321,7 +321,7 @@ test('enqueue-only defers collision repair without calling its private writer; f
         return Function(...Object.keys(ports), source)(...Object.values(ports));
       },
       resolvedMergePolicy: {}, DRY_RUN: false, AS_JSON: false, isLocalRepo: () => true, localSlug: REPO, isMainFix() {},
-      enqueueOnly: writeScope === 'enqueue-only', onlyPr: 7, writeBoundary: boundary, fastDrainValidatedBase: 'main',
+      writeScope, enqueueOnly: writeScope === 'enqueue-only', onlyPr: 7, writeBoundary: boundary, fastDrainValidatedBase: 'main',
       withLandWriteLock() {}, resolvePrimaryPath: () => 'primary', process: { cwd: () => 'fixture' }, flags: {}, env: {} };
     const run = () => Function(...Object.keys(ports), source)(...Object.values(ports));
     if (writeScope === 'enqueue-only') assert.throws(run, /defer-to-pass:write-boundary:lane-repair/);

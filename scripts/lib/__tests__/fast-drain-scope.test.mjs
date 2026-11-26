@@ -17,7 +17,7 @@ import {
 describe('fast-drain identity index bounds', () => {
   it('ships fastDrain.index settings with bounded defaults', () => {
     const settings = JSON.parse(readFileSync(resolve('scripts/settings/merge-queue.json'), 'utf8'));
-    expect(settings.mergeQueue.fastDrain.index).toEqual({ maxAgeMinutes: 40, hydrateBudget: 10 });
+    expect(settings.mergeQueue.fastDrain.index).toEqual({ mode: 'shadow', maxAgeMinutes: 40, hydrateBudget: 10 });
   });
   const setting = options => resolveFastDrainIndexSetting({ env: {}, tool: {}, platform: {}, ...options });
   it('age at cap −1 ms accepted, at cap deferred', () => {

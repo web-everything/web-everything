@@ -1053,7 +1053,7 @@ describe('merge-ai-prs hook wiring', () => {
   });
   it('follow-up collection runs before the post-land steps read `merged`', () => {
     const collect = src.indexOf('mergeStrategy.collectQueueMerged(');
-    const followup = src.indexOf('const landedLocalAny = !DRY_RUN && !localWriteRefusal && merged.some(');
+    const followup = src.indexOf('const landedLocalAny = !enqueueOnly && !DRY_RUN && !localWriteRefusal && merged.some(');
     expect(collect).toBeGreaterThan(-1);
     expect(followup).toBeGreaterThan(-1);
     expect(collect).toBeLessThan(followup);

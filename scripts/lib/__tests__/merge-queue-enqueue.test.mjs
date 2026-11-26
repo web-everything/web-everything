@@ -23,6 +23,26 @@ describe('fast-drain final head and label validators', () => {
     expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ enqueued: false });
     expect(h.writes).toEqual([]);
   });
+  it.each(['full', 'enqueue-only', 'none'])('review:hold introduced during final revalidation vetoes enqueue in %s scope', writeScope => {
+    const h = strategyFixture({ writeScope, onLive: n => ({ headRefOid: FAST_HEAD,
+      labels: ['ready-to-merge', ...(n === 2 ? ['review:hold'] : [])] }) });
+    expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({
+      enqueued: false, deferred: true, reason: 'state is review:hold',
+    });
+    expect(h.liveReads()).toBe(2);
+    expect(h.calls.filter(call => call.some(arg => arg.includes('enqueuePullRequest')))).toEqual([]);
+    expect(h.writes).toEqual([]);
+  });
+  it.each(['full', 'enqueue-only', 'none'])('review:hold observed at initial admission vetoes enqueue in %s scope', writeScope => {
+    const h = strategyFixture({ writeScope, onLive: () => ({ headRefOid: FAST_HEAD,
+      labels: ['ready-to-merge', 'review:hold'] }) });
+    expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({
+      enqueued: false, deferred: true, reason: 'state is review:hold',
+    });
+    expect(h.liveReads()).toBe(1);
+    expect(h.calls.filter(call => call.some(arg => arg.includes('enqueuePullRequest')))).toEqual([]);
+    expect(h.writes).toEqual([]);
+  });
   it('head moved before the judged read: live-state-unreadable', () => {
     const h = strategyFixture({ onLive: () => ({ headRefOid: 'b'.repeat(40), labels: ['ready-to-merge'] }) });
     expect(h.strategy.enqueue({ num: 7 }, FAST_HEAD)).toMatchObject({ kind: 'live-state-unreadable' });
