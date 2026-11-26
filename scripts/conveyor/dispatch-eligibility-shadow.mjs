@@ -1,16 +1,15 @@
 /** Observational eligibility only: no result from this module controls dispatch. */
 import * as nodeFs from 'node:fs';
 import { dirname, join } from 'node:path';
-import { eligibility } from './dispatch-eligibility.mjs';
+import { eligibility, ELIGIBILITY_PR_FIELDS } from './dispatch-eligibility.mjs';
 import { GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
 
 // An explicit flag always wins; with the flag unset, a listed thread strictly below the list cap is complete.
 function threadComplete(pr) {
-  if (pr.commentsComplete === true) return true;
-  if (pr.commentsComplete === false) return false;
+  if (pr.commentsComplete !== undefined) return pr.commentsComplete === true;
   return Array.isArray(pr.comments) && pr.comments.length < GH_LIST_COMMENT_CAP;
 }
-import { buildEligibilityFacts } from './dispatch-eligibility-facts.mjs';
+import { buildEligibilityFacts, ELIGIBILITY_FACT_PR_FIELDS } from './dispatch-eligibility-facts.mjs';
 import { resolveCascade, platformPreference } from '../lib/policy-cascade.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { daemonConveyorStateRoot } from '../lib/daemon-last-good.mjs';
@@ -65,10 +64,10 @@ export function createBoundedShadowLog({ file, maxBytes = 1024 * 1024, keep = 2,
 /** Shared defaults; injected callers and tests never fall through to a home-directory writer. */
 export function eligibilityShadowDeps({ hermetic = isUnderTestEnv(), ...injected } = {}) {
   const { mode } = resolveShadowMode(process.env, { hermetic });
-  return { mode,
-    appendLine: hermetic || mode === 'off' ? () => {} : createBoundedShadowLog({
+  const appendLine = hermetic || mode === 'off' ? () => {} : createBoundedShadowLog({
       file: join(daemonConveyorStateRoot(process.env), '.conveyor', 'dispatch-eligibility-shadow.jsonl'),
-    }),
+    });
+  return { mode, appendLine, appendDiagnostic: appendLine,
     // No extra local IO: absent facts remain unread in the fact builder.
     readLocals: entry => ({ rounds: { attempts: entry.attempts, cap: entry.cap } }),
     ...injected };
@@ -80,27 +79,65 @@ export function reportShadowError(error) {
   catch { /* diagnostics cannot affect dispatch */ }
 }
 
+// No enumeration of the source: unrelated getters must never affect the gate.
+const SHADOW_PR_FIELDS = Object.freeze([...new Set([
+  ...ELIGIBILITY_PR_FIELDS, ...ELIGIBILITY_FACT_PR_FIELDS, 'comments',
+])]);
+function projectPr(listed) {
+  const pr = {};
+  for (const field of SHADOW_PR_FIELDS) pr[field] = listed[field];
+  pr.commentsComplete = threadComplete(pr);
+  return pr;
+}
+
+/**
+ * Observational only. `checked` remains the legacy attempt count, never promotion evidence.
+ * Optional caller-owned `coverage` receives attempted/evaluated/failed/disagreements and complete.
+ * A disagreement is evaluated only after its ledger write succeeds. `complete` proves coverage,
+ * not policy agreement; off/empty runs prove nothing. Failure diagnostics use a separate sink so
+ * existing disagreement consumers retain their record format. Production binds both to the ledger.
+ */
 export function runEligibilityShadow({ dispatch = [], prs = [], mode = 'shadow', appendLine = () => {},
-  readLocals = () => undefined, now = () => new Date(), pathId = 'reconcile-core', onError = reportShadowError } = {}) {
+  readLocals = () => undefined, now = () => new Date(), pathId = 'reconcile-core', onError = reportShadowError,
+  coverage = {}, appendDiagnostic } = {}) {
   const result = { checked: 0, disagreements: 0 };
+  Object.assign(coverage, { attempted: 0, evaluated: 0, failed: 0, disagreements: 0, complete: false });
   if (mode === 'off') return result;
   for (const entry of dispatch) {
     if (!['fix', 'ci-heal'].includes(entry.kind)) continue;
     result.checked++;
+    coverage.attempted++;
     try {
       const listed = prs.find(p => p.number === entry.prNumber) ?? {};
-      const pr = { ...listed, commentsComplete: threadComplete(listed) }; // copy: the listed PR is never modified
+      const pr = projectPr(listed);
+      // Preserve the local reader's existing PR input contract; the gate consumes only the projection.
       const facts = buildEligibilityFacts({ pr, comments: pr.comments, commentsComplete: pr.commentsComplete,
-        population: entry.kind, locals: readLocals(entry, pr) });
+        population: entry.kind, locals: readLocals(entry, listed) });
       const gate = eligibility(pr, facts);
-      if (gate.dispatch === true) continue;
-      result.disagreements++;
-      appendLine(JSON.stringify({ at: new Date(now()).toISOString(), pathId, pr: entry.prNumber,
-        head: pr.headRefOid ?? null, path: 'dispatch', gate: gate.hold ? 'hold' : 'unknown',
-        reasons: [gate.hold ?? gate.unknown] }));
+      if (gate.dispatch !== true) {
+        result.disagreements++;
+        coverage.disagreements++;
+        appendLine(JSON.stringify({ at: new Date(now()).toISOString(), pathId, pr: entry.prNumber,
+          head: pr.headRefOid ?? null, path: 'dispatch', gate: gate.hold ? 'hold' : 'unknown',
+          reasons: [gate.hold ?? gate.unknown] }));
+      }
+      coverage.evaluated++;
     } catch (error) {
-      try { onError(error); } catch { /* keep checking the next entry */ }
+      coverage.failed++;
+      // No re-reading broken evidence or the injected clock while reporting its failure.
+      const diagnostic = JSON.stringify({ pathId, pr: entry.prNumber, path: 'dispatch', gate: 'error',
+        reasons: ['evaluation-failed'], action: 'Repair the evidence or ledger and replay the complete batch before promotion' });
+      try {
+        if (appendDiagnostic) appendDiagnostic(diagnostic);
+        else reportShadowError(diagnostic);
+      } catch {
+        reportShadowError(diagnostic);
+      }
+      if (onError !== reportShadowError) {
+        try { onError(error); } catch { /* keep checking the next entry */ }
+      }
     }
   }
+  coverage.complete = coverage.attempted > 0 && coverage.failed === 0 && coverage.evaluated === coverage.attempted;
   return result;
 }
