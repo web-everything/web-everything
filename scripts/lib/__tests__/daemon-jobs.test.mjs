@@ -4,12 +4,12 @@
  *   reattach plan and its 3-attempt cap, the per-daemon cap and serial lane, the sleep rule, snapshot-store
  *   eviction, and the record transitions.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 
 import {
   admitJobs, backoffMs, classifyJob, defineJobKind, detectSleep, kindRegistry, markClaimed, markCheckpoint,
   markLaunching, markQueued, markRequeued, markHeartbeat, planReattach, selectEvictions, SLEEP_GAP_THRESHOLD_MS,
-  validateTaskPolicy, taskDeadlineDecision, TASK_OUTCOMES, taskFailureCharge, taskRunId,
+  validateTaskPolicy, taskDeadlineDecision, TASK_OUTCOMES, taskFailureCharge, taskRunId, createToolVersionWatch,
 } from '../daemon-jobs.mjs';
 import { newJobRunRecord, isValidRunId } from '../../operations/run-record.mjs';
 import { resolveCascade } from '../policy-cascade.mjs';
@@ -280,5 +280,149 @@ describe('defineJobKind', () => {
     expect(() => defineJobKind({ kind: 'm', entry: '/abs.mjs' })).toThrow(/repo-relative/);
     expect(() => defineJobKind({ kind: 'm', entry: '../up.mjs' })).toThrow(/repo-relative/);
     expect(() => kindRegistry([{ kind: 'x', entry: 'a' }, { kind: 'x', entry: 'b' }])).toThrow(/twice/);
+  });
+});
+
+
+// Homebrew's v2 installed-info and outdated outputs, including formula and cask naming differences.
+const WEEK = 7 * 24 * 60 * 60_000;
+function watchFixture() {
+  const inventory = {
+    formulae: [{ name: 'gh', full_name: 'gh', installed: [{ version: '2.80.0' }], versions: { stable: '2.80.0' } }],
+    casks: [
+      { token: 'antigravity-cli', full_token: 'vendor/tap/antigravity-cli', installed: '1.5.11', version: '1.5.16' },
+      { token: 'codex', installed: '0.60.0', version: '0.60.0' },
+    ],
+  };
+  const outdated = { formulae: [], casks: [{ name: 'antigravity-cli', installed_versions: ['1.5.11'], current_version: '1.5.16' }] };
+  let state = null, tail = Promise.resolve();
+  const io = {
+    env: { HOMEBREW_NO_AUTO_UPDATE: '0' },
+    exec: vi.fn(async (_command, args) => ({ status: 0, stdout: JSON.stringify(args[0] === 'info' ? inventory : outdated), stderr: '' })),
+    readState: vi.fn(async () => structuredClone(state)),
+    writeState: vi.fn(async value => { state = structuredClone(value); }),
+    // Shared across factory instances, just as the runtime's durable store lock must be.
+    withLock: vi.fn((_key, action) => {
+      const result = tail.then(action);
+      tail = result.catch(() => {});
+      return result;
+    }),
+    alert: vi.fn(async () => {}),
+  };
+  return { io, inventory, outdated, state: () => state };
+}
+
+describe('weekly tool version advisory', () => {
+  it('weekly CLI watch reports outdated and unknown without self-updating', async () => {
+    const { io } = watchFixture();
+    const job = createToolVersionWatch(io);
+    const result = await job.tick({ now: T0 });
+    expect(result.tools.find(t => t.tool === 'antigravity-cli')).toMatchObject({ status: 'outdated', installed: ['1.5.11'], latest: '1.5.16' });
+    expect(io.alert).toHaveBeenCalledOnce();
+    io.exec.mockResolvedValue({ status: 1, stdout: '', stderr: 'unavailable' });
+    const failed = await job.tick({ now: T0 + WEEK });
+    expect(failed.tools.map(t => t.status)).toEqual(['unknown', 'unknown', 'unknown', 'unknown']);
+    expect(failed.tools.every(t => /inspect.*Homebrew/i.test(t.diagnostic))).toBe(true);
+    expect(io.exec.mock.calls.every(([cmd, args]) => cmd === 'brew' && ['info', 'outdated'].includes(args[0]))).toBe(true);
+  });
+
+  it('weekly inventory resolves all tools and bounded statuses', async () => {
+    const { io, inventory } = watchFixture();
+    const job = createToolVersionWatch(io);
+    expect(job).toMatchObject({ kind: 'tool-version-watch', intervalMs: WEEK });
+    const result = await job.tick({ now: T0 });
+    expect(result.nextDueAt).toBe(T0 + WEEK);
+    expect(result.tools.map(t => [t.tool, t.status])).toEqual([
+      ['antigravity-cli', 'outdated'], ['codex', 'current'], ['gh', 'current'], ['claude', 'not-installed'],
+    ]);
+    expect(result.tools[0]).toMatchObject({ package: 'vendor/tap/antigravity-cli', type: 'cask', provenance: 'homebrew' });
+    expect(result.tools[2]).toMatchObject({ package: 'gh', type: 'formula', installed: ['2.80.0'], latest: '2.80.0' });
+    for (const [, , options] of io.exec.mock.calls) {
+      expect(options.timeout).toBe(15000);
+      expect(options.maxBuffer).toBe(1048576);
+      expect(options.env.HOMEBREW_NO_AUTO_UPDATE).toBe('1');
+    }
+    inventory.casks.push({ token: 'claude-code', installed: '2.0.0', version: '2.0.0' });
+    expect((await job.tick({ now: T0 + WEEK })).tools[3]).toMatchObject({ package: 'claude-code', status: 'current' });
+  });
+
+  it('version episodes alert once without auto-upgrade', async () => {
+    const { io, inventory, outdated, state } = watchFixture();
+    const first = createToolVersionWatch(io), restarted = createToolVersionWatch(io);
+    await Promise.all([first.tick({ now: T0 }), restarted.tick({ now: T0 })]);
+    expect(io.exec).toHaveBeenCalledTimes(2);
+    expect(io.alert).toHaveBeenCalledOnce();
+    expect(state().nextDueAt).toBe(T0 + WEEK);
+    await restarted.tick({ now: T0 + WEEK });
+    expect(io.alert).toHaveBeenCalledOnce();
+    inventory.casks[0].version = '1.5.17';
+    outdated.casks[0].current_version = '1.5.17';
+    await first.tick({ now: T0 + WEEK * 2 });
+    expect(io.alert).toHaveBeenCalledTimes(2);
+    inventory.casks[0].installed = '1.5.17';
+    outdated.casks = [];
+    await first.tick({ now: T0 + WEEK * 3 });
+    inventory.casks[0].installed = '1.5.11';
+    outdated.casks = [{ name: 'antigravity-cli', installed_versions: ['1.5.11'], current_version: '1.5.17' }];
+    await first.tick({ now: T0 + WEEK * 4 });
+    expect(io.alert).toHaveBeenCalledTimes(3);
+    expect(io.exec.mock.calls.every(([, args, opts]) => ['info', 'outdated'].includes(args[0]) && opts.env.HOMEBREW_NO_AUTO_UPDATE === '1')).toBe(true);
+  });
+
+  it.each([
+    ['missing brew', () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }],
+    ['timeout', () => { throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }); }],
+    ['nonzero exit', () => ({ status: 1, stdout: '{}', stderr: 'failed' })],
+    ['malformed JSON', () => ({ status: 0, stdout: '{' })],
+    ['incomplete inventory', () => ({ status: 0, stdout: '{"casks":[]}' })],
+    ['oversized stdout', () => ({ status: 0, stdout: ' '.repeat(1048577) })],
+    ['oversized stderr', () => ({ status: 0, stdout: '{}', stderr: 'x'.repeat(1048577) })],
+  ])('%s stays unknown, alerts once, and recovers', async (_name, badRead) => {
+    const { io } = watchFixture();
+    const goodRead = io.exec.getMockImplementation();
+    io.exec.mockImplementation(badRead);
+    const job = createToolVersionWatch(io);
+    const failed = await job.tick({ now: T0 });
+    expect(failed.tools.every(t => t.status === 'unknown' && /inspect.*Homebrew/i.test(t.diagnostic))).toBe(true);
+    expect(io.alert).toHaveBeenCalledTimes(4);
+    await job.tick({ now: T0 + WEEK });
+    expect(io.alert).toHaveBeenCalledTimes(4);
+    io.exec.mockImplementation(goodRead);
+    expect((await job.tick({ now: T0 + 2 * WEEK })).tools[1].status).toBe('current');
+    expect(io.alert).toHaveBeenCalledTimes(5);
+  });
+
+  it('refuses conflicting, incomplete or ambiguous package evidence', async () => {
+    const { io, inventory, outdated } = watchFixture();
+    inventory.casks[1].installed = null;
+    inventory.formulae.push({ name: 'codex', installed: [{ version: '1' }], versions: { stable: '1' } });
+    outdated.casks[0].current_version = 'different';
+    const result = await createToolVersionWatch(io).tick({ now: T0 });
+    expect(result.tools[0].status).toBe('unknown');
+    expect(result.tools[1].status).toBe('unknown');
+    expect(result.tools[2].status).toBe('current');
+  });
+
+  it('a failed alert leaves the episode and due time retryable', async () => {
+    const { io, state } = watchFixture();
+    io.alert.mockRejectedValueOnce(new Error('feed unavailable'));
+    const job = createToolVersionWatch(io);
+    await expect(job.tick({ now: T0 })).rejects.toThrow('feed unavailable');
+    expect(state()).toBeNull();
+    await job.tick({ now: T0 });
+    expect(io.alert).toHaveBeenCalledTimes(2);
+  });
+
+  it('unreadable or invalid persisted state refuses IO with an operator diagnostic', async () => {
+    const { io } = watchFixture();
+    const job = createToolVersionWatch(io);
+    for (const value of [{}, { nextDueAt: 'tomorrow', episodes: {} }, { nextDueAt: T0, episodes: null }]) {
+      io.readState.mockResolvedValueOnce(value);
+      await expect(job.tick({ now: T0 })).rejects.toThrow(/inspect.*state/i);
+    }
+    io.readState.mockRejectedValueOnce(new Error('unreadable'));
+    await expect(job.tick({ now: T0 })).rejects.toThrow(/inspect.*state/i);
+    expect(io.exec).not.toHaveBeenCalled();
+    expect(io.writeState).not.toHaveBeenCalled();
   });
 });

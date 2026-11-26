@@ -359,3 +359,115 @@ export function markRequeued(record, { at, now, reason, resume = true, backoffBa
 export function markFailed(record, { at, reason }) {
   return setJob(record, { status: 'failed', finishedAt: at, handle: null, error: reason }, { at, event: 'failed', reason });
 }
+
+
+const TOOL_WATCH_INTERVAL_MS = 7 * 24 * 60 * 60_000;
+const TOOL_WATCH_MAX_BYTES = 1048576;
+const WATCHED_TOOLS = Object.freeze({
+  'antigravity-cli': ['antigravity-cli'], codex: ['codex'], gh: ['gh'], claude: ['claude', 'claude-code'],
+});
+
+/**
+ * Weekly advisory job contract (flow/daemon-profile, Tool freshness).
+ * The runtime registers this descriptor once and invokes tick in a job, never in its blocking tick loop.
+ * All IO is required and injected: exec(command, argv, {timeout, maxBuffer, env}) must enforce the
+ * process bounds and return {status, stdout, stderr}; withLock(key, action) must hold the shared durable
+ * store lock through action. readState returns null ONLY for a missing record; unreadable records throw.
+ * writeState atomically persists the value. alert resolves only after confirmed publication and must
+ * dedupe its supplied episode id across a crash between publication and persistence.
+ * No process is launched on import; this policy neither installs a daemon nor upgrades any package.
+ */
+export function createToolVersionWatch({ exec, withLock, readState, writeState, alert, env = {} }) {
+  for (const fn of [exec, withLock, readState, writeState, alert]) {
+    if (typeof fn !== 'function') throw new TypeError('tool-version-watch requires process, locked state and alert IO');
+  }
+  const readBrew = async args => {
+    try {
+      const result = await exec('brew', args, { timeout: 15000, maxBuffer: TOOL_WATCH_MAX_BYTES,
+        env: { ...env, HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_ANALYTICS: '1' } });
+      if (!result || result.status !== 0 || result.signal || result.error) throw new Error('read failed');
+      if (typeof result.stdout !== 'string' || (result.stderr != null && typeof result.stderr !== 'string')) throw new Error('invalid output');
+      if (Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr ?? '') > TOOL_WATCH_MAX_BYTES) throw new Error('output limit');
+      const data = JSON.parse(result.stdout);
+      if (!Array.isArray(data?.formulae) || !Array.isArray(data?.casks)) throw new Error('incomplete inventory');
+      for (const [type, rows] of [['formula', data.formulae], ['cask', data.casks]]) {
+        if (rows.some(row => !row || typeof row !== 'object' || typeof (type === 'formula' ? row.name : row.token ?? row.name) !== 'string'))
+          throw new Error('incomplete package identity');
+      }
+      return { data };
+    } catch {
+      return { diagnostic: `Inspect Homebrew with brew ${args.join(' ')}; read failed, timed out, exceeded 1 MiB, or returned incomplete evidence. Retry after repairing Homebrew.` };
+    }
+  };
+  return Object.freeze({
+    kind: 'tool-version-watch', intervalMs: TOOL_WATCH_INTERVAL_MS,
+    async tick({ now }) {
+      if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + TOOL_WATCH_INTERVAL_MS)) throw new TypeError('tool-version-watch needs a valid now');
+      return withLock('tool-version-watch', async () => {
+        let state;
+        try {
+          state = await readState();
+          if (state !== null && (!Number.isSafeInteger(state?.nextDueAt) || state.nextDueAt < 0 ||
+            !state.episodes || typeof state.episodes !== 'object' || Array.isArray(state.episodes) ||
+            Object.entries(state.episodes).some(([tool, id]) => !Object.hasOwn(WATCHED_TOOLS, tool) || !/^[a-f0-9]{64}$/.test(id))))
+            throw new Error('invalid state');
+        } catch {
+          throw new Error('Inspect tool-version-watch state; unreadable or invalid evidence requires operator repair before retry.');
+        }
+        if (state && now < state.nextDueAt) return { status: 'not-due', nextDueAt: state.nextDueAt };
+        state = state ?? { nextDueAt: 0, episodes: {} };
+        // Two fixed reads per due week. Never execute tool binaries, brew update, upgrade or install.
+        const inventory = await readBrew(['info', '--json=v2', '--installed']);
+        const outdated = await readBrew(['outdated', '--json=v2', '--greedy']);
+        const tools = Object.entries(WATCHED_TOOLS).map(([tool, aliases]) => {
+          const base = { tool, provenance: 'homebrew', installed: [], latest: null, package: null, type: null };
+          const unknown = diagnostic => ({ ...base, status: 'unknown', diagnostic });
+          if (!inventory.data || !outdated.data) return unknown(inventory.diagnostic ?? outdated.diagnostic);
+          const matches = [];
+          for (const [type, rows] of [['formula', inventory.data.formulae], ['cask', inventory.data.casks]]) {
+            for (const row of rows) {
+              const names = [row.name, row.token, row.full_name, row.full_token, ...(Array.isArray(row.aliases) ? row.aliases : [])];
+              if (names.some(name => typeof name === 'string' && aliases.includes(name.split('/').at(-1)))) matches.push({ type, row });
+            }
+          }
+          if (matches.length === 0) return { ...base, status: 'not-installed', diagnostic: 'Not installed through Homebrew; other installation managers are outside this inventory.' };
+          if (matches.length !== 1) return unknown('Inspect Homebrew inventory; multiple packages match this tool.');
+          const { type, row } = matches[0];
+          base.type = type;
+          base.package = type === 'formula' ? row.full_name ?? row.name : row.full_token ?? row.token;
+          base.installed = type === 'formula' && Array.isArray(row.installed) ? row.installed.map(item => item?.version) : [row.installed];
+          base.latest = type === 'formula' ? row.versions?.stable : row.version;
+          const validVersion = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value);
+          if (!base.installed.length || !base.installed.every(validVersion) || !validVersion(base.latest))
+            return unknown('Inspect Homebrew inventory; installed or latest version is incomplete.');
+          const stale = (type === 'formula' ? outdated.data.formulae : outdated.data.casks).filter(item =>
+            [item.name, item.token, item.full_name, item.full_token].some(name => typeof name === 'string' && [base.package, row.name, row.token].includes(name)));
+          if (stale.length > 1 || (stale.length === 1 && (stale[0].current_version !== base.latest ||
+            !Array.isArray(stale[0].installed_versions) ||
+            JSON.stringify([...stale[0].installed_versions].sort()) !== JSON.stringify([...base.installed].sort()))))
+            return unknown('Inspect Homebrew inventory and outdated output; version evidence conflicts.');
+          if (!stale.length && base.installed.some(version => version !== base.latest))
+            return unknown('Inspect Homebrew inventory and outdated output; freshness is unconfirmed.');
+          return { ...base, status: stale.length ? 'outdated' : 'current' };
+        });
+        for (const tool of tools) {
+          if (tool.status === 'outdated' || tool.status === 'unknown') {
+            const episode = createHash('sha256').update(JSON.stringify(tool)).digest('hex');
+            if (state.episodes[tool.tool] !== episode) {
+              await alert({ ...tool, episode, advisory: true,
+                diagnostic: tool.diagnostic ?? `Inspect Homebrew package ${tool.package}: installed ${tool.installed.join(', ')}, latest ${tool.latest}. Upgrade manually if appropriate.` });
+              state.episodes[tool.tool] = episode;
+              await writeState(state);
+            }
+          } else if (Object.hasOwn(state.episodes, tool.tool)) {
+            delete state.episodes[tool.tool];
+            await writeState(state);
+          }
+        }
+        state.nextDueAt = now + TOOL_WATCH_INTERVAL_MS;
+        await writeState(state);
+        return { status: 'checked', nextDueAt: state.nextDueAt, tools };
+      });
+    },
+  });
+}
