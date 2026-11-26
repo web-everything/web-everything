@@ -2547,8 +2547,6 @@
   "scripts/conveyor/soak/breaks/daemon-git-developer-dir.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/watchdog-pr-list-transient-retry.soak.test.mjs": 3,
   "scripts/conveyor/soak/breaks/rebuild-launch-before-next-tick.soak.test.mjs": 2,
-  "scripts/conveyor/soak/breaks/rebuild-main-sync-set-aside.soak.test.mjs": 8,
-  "scripts/lib/daemon-rebuild/__tests__/main-sync-set-aside.test.mjs": 22,
   "scripts/conveyor/soak/breaks/rebuild-held-recovery.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/rebuild-evidence-compatibility.soak.test.mjs": 1,
   "scripts/conveyor/soak/breaks/mq-unreadable-log-single-retry.soak.test.mjs": 1
