@@ -174,7 +174,8 @@ describe('main sibling provisioning lifecycle', () => {
     vi.doMock('node:child_process', () => childProcessMock);
     const options = fixture();
     if (failClone) options.run.mockImplementationOnce(() => { throw new Error('clone failed'); });
-    const provision = vi.fn(args => provisionMissingSiblingClones({ ...options, ...args }));
+    // Preserve the fixture's clone port when the CLI supplies its guarded runner.
+    const provision = vi.fn(args => provisionMissingSiblingClones({ ...options, ...args, run: options.run }));
     vi.doMock('../lib/sibling-clone-provision.mjs', async importOriginal => ({
       ...await importOriginal(), provisionMissingSiblingClones: provision,
     }));

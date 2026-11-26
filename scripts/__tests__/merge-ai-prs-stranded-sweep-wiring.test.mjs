@@ -292,7 +292,8 @@ describe('xvr2o8r / PR #2700 — defaultStrandedSweepSync: only an attached, fas
 // PR #2700 review round 1 (codex-correctness) — the direct unit calls above cannot notice the call being
 // deleted, duplicated, or gated from `runCli`'s pass. `sweepOnce` is a closure inside a 5000-line CLI, so this
 // pins its one call site structurally: exactly one call, never nested under the `landedLocal` resolve-on-land
-// block (it must run on passes that land nothing), and fed the pass's own `DRY_RUN`.
+// block (it must run on live passes that land nothing), and fed the pass's own `DRY_RUN`.
+// Index shadow passes skip this helper entirely to preserve their no-write/no-fetch boundary.
 describe('xvr2o8r / PR #2700 — runCli wires the sweep exactly once per pass', () => {
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
   const sweepOnceStart = src.indexOf('const sweepOnce = async () => {');
@@ -308,8 +309,25 @@ describe('xvr2o8r / PR #2700 — runCli wires the sweep exactly once per pass', 
     expect(calls[0]).toBeLessThan(sweepOnceEnd);
   });
 
-  it('runs unconditionally at the pass\'s top level, passing the pass\'s own DRY_RUN', () => {
-    const line = body.split('\n').find((l) => l.includes('runStrandedSweepStep({'));
-    expect(line).toMatch(/^ {2}const strandedSweep = runStrandedSweepStep\(\{ dryRun: DRY_RUN\b/);
+  const declaration = body.match(/^ {2}const strandedSweep = [\s\S]*?;/m)?.[0];
+  const callSweep = (shadow, dryRun, localWriteRefusal, sweep) => {
+    expect(declaration).toBeDefined(); // Remains at sweepOnce's top level, outside landedLocal.
+    return new Function('isDrainShadow', 'DRY_RUN', 'localWriteRefusal', 'AS_JSON', 'redMainHeld', 'runStrandedSweepStep',
+      `${declaration}\nreturn strandedSweep;`)(() => shadow, dryRun, localWriteRefusal, true, true, sweep);
+  };
+
+  it.each([
+    [false, null, false], [true, null, true], [false, 'write refused', true], [true, 'write refused', true],
+  ])('runs once at the live pass top level with dryRun=%s and refusal=%s', (dryRun, refusal, expectedDryRun) => {
+    const report = okReport(), sweep = vi.fn(() => report);
+    expect(callSweep(false, dryRun, refusal, sweep)).toBe(report);
+    expect(sweep).toHaveBeenCalledTimes(1);
+    expect(sweep).toHaveBeenCalledWith({ dryRun: expectedDryRun, asJson: true, redMainHeld: true });
+  });
+
+  it.each([false, true])('skips the sweep helper entirely in shadow (dryRun=%s)', dryRun => {
+    const sweep = vi.fn(() => { throw new Error('shadow must not call the sweep'); });
+    expect(callSweep(true, dryRun, null, sweep)).toEqual({ ok: true, autoResolvable: [], applied: [] });
+    expect(sweep).not.toHaveBeenCalled();
   });
 });

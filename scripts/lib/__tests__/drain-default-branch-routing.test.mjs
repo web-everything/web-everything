@@ -80,7 +80,7 @@ it('publishes only a fixed class for hostile default-branch stderr', async () =>
 
 // Exercise the actual CLI and its App refusal shim. Positional `repo view` must
 // select the target owner's installation through GH_REPO, even with a local ambient repo.
-function catchUpCli(unreadable = '', probeQuery = null) {
+function catchUpCli(unreadable = '', probeQuery = null, { indexMode = 'shadow', branchError = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'branch-routing-'));
   try {
     const bin = join(dir, 'bin'), snapshots = join(dir, 'snapshots');
@@ -112,7 +112,7 @@ const checks = completeCheckReadFixture([target], a);
 if (checks !== undefined) out(checks);
 if (a[0] === 'repo' && a[1] === 'view') {
   if (repo?.split('/')[0] !== a[2]?.split('/')[0] || a[2] === process.env.ROUTING_UNREADABLE) {
-    process.stderr.write('GraphQL: Could not resolve to a Repository\\n for ' + a[2]); process.exit(1);
+    process.stderr.write(process.env.ROUTING_BRANCH_ERROR || 'GraphQL: Could not resolve to a Repository\\n for ' + a[2]); process.exit(1);
   }
   process.stdout.write('trunk'); process.exit(0);
 }
@@ -143,10 +143,12 @@ process.stderr.write('unported fixture call: ' + a.join(' ')); process.exit(1);
       cwd: dir, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024,
       env: { ...process.env, ...daemonAppEnv(dir), PATH: `${bin}:${process.env.PATH}`, GH_REPO: localRepo,
         WE_UNDER_TEST: '1', WE_FAST_DRAIN_CONTEXT: 'snapshot', WE_FAST_DRAIN_LISTING: 'snapshot', WE_FAST_DRAIN_SCOPE: 'target',
+        WE_FAST_DRAIN_INDEX_MODE: indexMode,
         WE_PR_SNAPSHOT: '1', WE_PR_SNAPSHOT_DIR: snapshots, WE_PR_SNAPSHOT_TTL_MS: '75000',
         WE_DEFAULT_BRANCH_CACHE_DIR: join(dir, 'branches'), WE_GH_THROTTLE_GH_BIN: join(bin, 'gh'),
         WE_GH_THROTTLE_RETRY_MAX_ATTEMPTS: '1', WE_GH_THROTTLE_COST_HEADERS: '0',
-        ROUTING_UNREADABLE: unreadable, ROUTING_CALLS: join(dir, 'calls.jsonl'), ROUTING_TARGET: join(dir, 'target.json') },
+        ROUTING_UNREADABLE: unreadable, ROUTING_BRANCH_ERROR: branchError || '',
+        ROUTING_CALLS: join(dir, 'calls.jsonl'), ROUTING_TARGET: join(dir, 'target.json') },
     });
     expect(result.stderr).not.toContain('unported fixture call');
     const calls = readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
@@ -179,6 +181,29 @@ it.each(repos)('catch-up snapshot refuses unreadable branch %s before merge or e
   expect(r.stderr).toContain(`${repo}: default branch unresolved live (class=gh-not-found)`);
   expect(r.stderr).not.toContain('Could not resolve to a Repository');
   expect(r.stdout.trim()).toBe('');
+  expect(r.round).toBeNull();
+  expect(r.calls.some(c => c.args[0] === 'pr' && ['merge', 'edit'].includes(c.args[1]))).toBe(false);
+  expect(r.calls.some(c => c.args[0] === 'api' && c.args.some(a => /enqueuePullRequest|mergePullRequest|\bmutation\b|POST/.test(a)))).toBe(false);
+}, 40_000);
+
+it.each(['shadow', 'on'])('captures hostile synchronous branch stderr and defers without writes (index %s)', indexMode => {
+  const secret = 'ghp_' + 'Z'.repeat(100);
+  const r = catchUpCli(localRepo, null, { indexMode,
+    branchError: `GraphQL: Could not resolve to a Repository\nAuthorization: Negotiate ${secret}` });
+  expect(r.error, r.stderr).toBeUndefined();
+  expect(r.stderr).not.toContain(secret);
+  expect(r.stderr).not.toContain('Authorization');
+  expect(r.stderr).not.toContain('Could not resolve to a Repository');
+  if (indexMode === 'shadow') {
+    expect(r.status, r.stderr).toBe(1);
+    expect(r.stderr).toContain('fast-drain: incomplete pass context (default branch unresolved live)');
+    expect(r.stderr).toContain(`${localRepo}: default branch unresolved live (class=gh-not-found)`);
+    expect(r.stdout.trim()).toBe('');
+  } else {
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout)).toMatchObject({ ok: true, considered: 0,
+      enqueueOutcomes: [{ enqueued: false, deferred: true, kind: 'defer-to-pass:queue-precondition' }] });
+  }
   expect(r.round).toBeNull();
   expect(r.calls.some(c => c.args[0] === 'pr' && ['merge', 'edit'].includes(c.args[1]))).toBe(false);
   expect(r.calls.some(c => c.args[0] === 'api' && c.args.some(a => /enqueuePullRequest|mergePullRequest|\bmutation\b|POST/.test(a)))).toBe(false);

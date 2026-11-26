@@ -5012,7 +5012,8 @@ export async function main(argv, options = {}) {
       await ensureFreshGithubAppEnv({ log: console, perOwner: true, daemon: !isCiReadonlyDryRun(env, argv) });
       const exec = boundary.exec((_file, args, opts) => rawReadGh(args, opts)), repo = boundary.repo;
       let head = null, mainSha = null;
-      const readOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024 };
+      const readOptions = { encoding: 'utf8', timeout: 60_000, maxBuffer: 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, GH_REPO: repo } };
       try { head = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'], readOptions)).headRefOid ?? null; } catch { /* telemetry remains explicitly unknown */ }
       try {
         const branch = exec('gh', ['repo', 'view', repo, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'], readOptions).trim();
@@ -5207,7 +5208,8 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   if (enqueueOnly) {
     let defaultBranch;
     try { defaultBranch = execFileSync('gh', ['repo', 'view', onlyRepo || localSlug, '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name'],
-      { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024 }).trim(); } catch { /* missing is a refusal */ }
+      { encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, GH_REPO: onlyRepo || localSlug } }).trim(); } catch { /* missing is a refusal */ }
     fastDrainValidatedBase = defaultBranch;
     const precondition = validateFastDrainQueuePrecondition({ repo: onlyRepo || localSlug, defaultBranch, exec: execFileSync });
     if (!precondition.ok) {
