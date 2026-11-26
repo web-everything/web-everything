@@ -5,7 +5,6 @@ import { recordRedTeamStatus, readDrainRedTeamEvidence, readRedTeamStatus, redTe
 import { pidNamespace } from '../lib/pid-alive.mjs';
 import { writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 import { resolveTimingPolicy } from '../lib/review-timing-settings.mjs';
-import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { reviewUsesRequiredChecks } from '../lib/review-timing.mjs';
 import { speculativeSeatTimings } from '../lib/review-speculative-red-team.mjs';
 import { resolveFinalHeadSeats, decideFinalHeadSeats } from '../lib/review-final-head-seats.mjs';
@@ -182,170 +181,115 @@ const LANE_DEFERRALS_LABEL = 'lane-deferrals:';
 export const DEFAULT_LOOP_TIMEOUT_MS = 45 * 60 * 1000;
 export const LOOP_TIMEOUT_ENV = 'WE_REVIEW_JOB_TIMEOUT_MS';
 
-/** Allow an in-flight sink to finish and record its effect before killing descendants.
- * reviewJob.timeoutGraceMs: standard → platform → scripts/settings/review.json job. No environment override.
- * Grace is bounded to five minutes; invalid settings fall back to the lower layer. */
-export function resolveLoopTimeoutGrace({ env = process.env, platform, tool, readFile = readFileSync, log } = {}) {
-  if (tool === undefined) {
-    try { tool = JSON.parse(readFile(new URL('../settings/review.json', import.meta.url), 'utf8')).job; }
-    catch { tool = {}; }
-  }
-  return cascadePolicy('reviewJob', tool, {
-    standard: { timeoutGraceMs: 60_000 }, platform, env, log,
-    envValues: {},
-    valid: { timeoutGraceMs: n => Number.isSafeInteger(n) && n > 0 && n <= 300_000 },
+/** The original IPC endpoint binds this start time to the spawned leader's lifetime.
+ * Identity requests must neither defer termination nor keep a completed loop alive. */
+function publishReviewLoopIdentity() {
+  const identity = { pid: process.pid, startTime: String(performance.timeOrigin) };
+  process.send({ type: 'loop-identity', ...identity });
+  process.on('message', message => {
+    if (message?.type === 'verify-loop-identity') process.send({ type: 'loop-identity', ...identity, nonce: message.nonce });
   });
+  process.channel.unref();
 }
 
-/** Runs in a small supervisor so the job can retain its synchronous IO contract. The
- * supervisor stays outside the detached loop's group and owns BOTH timeout signals.
- * fd 3 is lifecycle evidence, separate from the loop's untrusted stdout/stderr. */
-export function installReviewLoopTerminationHandler(proc = process) {
-  // The supervisor owns the hard deadline. Keep the loop alive long enough for its
-  // current effect promise (or synchronous sink) to return and persist its outcome.
-  const deferTermination = () => {};
-  proc.on('SIGTERM', deferTermination);
-  if (proc.send) {
-    const identity = { pid: proc.pid, startTime: String(proc.hrtime.bigint()) };
-    proc.send({ type: 'loop-identity', ...identity });
-    proc.on('message', message => {
-      if (message?.type === 'verify-loop-identity') proc.send({ type: 'loop-identity', ...identity, nonce: message.nonce });
-    });
-    // Listening for identity requests must not keep a completed loop alive.
-    proc.channel.unref();
-  }
-  return () => proc.removeListener('SIGTERM', deferTermination);
-}
-
-function superviseReviewLoop(installTerminationHandler) {
+/** Runs outside the detached loop group; fd 3 carries trusted lifecycle evidence. */
+function superviseReviewLoop(publishIdentity) {
   const { spawn } = require('node:child_process');
   const { writeFileSync } = require('node:fs');
-  const [timeoutMs, graceMs, ...args] = JSON.parse(process.argv[1]);
-  // Install before loading the production entry point, including during module evaluation.
-  const preload = `data:text/javascript,${encodeURIComponent(`(${installTerminationHandler.toString()})()` )}`;
+  const [timeoutMs, ...args] = JSON.parse(process.argv[1]);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
+    throw Error('invalid review-loop timeout (must be 1–2147483647 ms)');
+  }
+  const preload = `data:text/javascript,${encodeURIComponent(`(${publishIdentity.toString()})()`)}`;
   const child = spawn(process.execPath, ['--import', preload, ...args], { detached: true, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   const result = { status: null, signal: null, timedOut: false, supervisionFailed: false, groupTermination: null, events: [] };
-  let finished = false, closed = false, graceTimer, verificationTimer, graceElapsed = false;
-  // A startup token and challenge reply over the original IPC endpoint bind the
-  // PID to this leader's lifetime. A recycled numeric PID cannot inherit that pipe.
-  let originalIdentity = null, leaderExited = false, sequence = 0, pendingVerification = null;
-  child.on('exit', () => { leaderExited = true; });
+  let finished = false, stopping = false, leaderExited = false, timer, hardTimer;
+  let originalIdentity = null;
   child.on('message', message => {
     if (message?.type !== 'loop-identity' || message.pid !== child.pid || typeof message.startTime !== 'string') return;
-    if (!originalIdentity && message.nonce === undefined) originalIdentity = message.startTime;
-    if (pendingVerification && message.nonce === pendingVerification.nonce) {
-      const callback = pendingVerification.callback;
-      clearTimeout(verificationTimer);
-      pendingVerification = null;
-      callback(message.startTime === originalIdentity && !leaderExited);
-    }
+    if (originalIdentity === null && message.nonce === undefined) originalIdentity = message.startTime;
+    else if (message.startTime !== originalIdentity) originalIdentity = null;
   });
+  // The original connected endpoint and unreaped child handle cannot be inherited
+  // by a reused PID, even when synchronous sink work blocks the leader's JS thread.
+  const originalLeader = () => originalIdentity !== null && !leaderExited
+    && child.connected && child.exitCode === null && child.signalCode === null;
   const fail = message => {
     result.supervisionFailed = true;
     result.groupTermination = 'group-kill-failed';
     result.events.push(`ALERT ${message}; retain lane and job claim; operator must inspect group ${child.pid}`);
   };
-  const signalGroup = signal => {
-    try { process.kill(-child.pid, signal); return true; }
-    catch (error) {
-      if (error.code === 'ESRCH') return false;
-      fail(`group signal ${signal} failed: ${error.code}`);
-      return false;
+  const killVerifiedGroup = () => {
+    if (originalLeader()) {
+      try { child.send({ type: 'verify-loop-identity', nonce: 1 }, () => {}); } catch { originalIdentity = null; }
+    }
+    if (!originalLeader()) {
+      fail('group leader pid or start time changed or unavailable');
+      return;
+    }
+    result.events.push(`group-kill pgid=${child.pid}`);
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+      result.groupTermination = 'group-killed';
+    } catch (error) {
+      fail(`group SIGKILL failed: ${error.code}`);
     }
   };
-  const originalChildStillLive = () => originalIdentity !== null && !leaderExited
-    && child.connected && child.exitCode === null && child.signalCode === null;
-  const finishPendingVerification = () => {
-    if (!pendingVerification) return;
-    const callback = pendingVerification.callback;
-    pendingVerification = null;
-    // A blocked JS thread cannot answer, but it still owns the original IPC
-    // endpoint and live child handle. A replacement PID cannot inherit either.
-    callback(originalChildStillLive());
-  };
-  const killVerifiedGroup = callback => {
-    const refuse = () => {
-      try { process.kill(-child.pid, 0); }
-      catch (error) { if (error.code === 'ESRCH') { result.groupTermination = 'group-already-gone'; callback(); return; } }
-      fail('group leader identity changed or unavailable'); callback();
-    };
-    if (!originalIdentity || leaderExited || !child.connected) { refuse(); return; }
-    const nonce = ++sequence;
-    pendingVerification = { nonce, callback: verified => {
-      if (!verified) { refuse(); return; }
-      const killed = signalGroup('SIGKILL');
-      if (result.groupTermination !== 'group-kill-failed') result.groupTermination = killed ? 'group-killed' : 'group-already-gone';
-      callback();
-    } };
-    verificationTimer = setTimeout(finishPendingVerification, 1000);
-    try { child.send({ type: 'verify-loop-identity', nonce }, error => {
-      if (error && pendingVerification?.nonce === nonce) { pendingVerification = null; refuse(); }
-    }); } catch { pendingVerification = null; refuse(); }
-  };
-  // exit handlers cannot await IPC. An open original endpoint plus an unreaped
-  // child handle still identifies this leader; never use a stale numeric PGID.
-  process.on('exit', () => {
-    if (!finished && originalChildStillLive()) signalGroup('SIGKILL');
-  });
-  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => {
-    result.supervisionFailed = true;
-    killVerifiedGroup(finish);
-  });
   const finish = () => {
     if (finished) return;
     finished = true;
-    clearTimeout(timer); clearTimeout(graceTimer); clearTimeout(verificationTimer); clearTimeout(hardTimer);
+    clearTimeout(timer); clearTimeout(hardTimer);
     child.stdout.destroy(); child.stderr.destroy();
-    writeFileSync(3, JSON.stringify(result)); process.exit(0);
+    writeFileSync(3, JSON.stringify(result));
+    process.exit(0);
   };
-  const hardTimer = setTimeout(() => {
-    result.timedOut = true; result.supervisionFailed = true;
-    result.events.push('hard overall deadline; destroying retained output pipes');
-    finishPendingVerification();
-    if (!['group-killed', 'group-already-gone'].includes(result.groupTermination)) fail('hard deadline without confirmed group termination');
+  const stop = () => {
+    if (stopping || finished) return;
+    stopping = true;
+    result.supervisionFailed = true;
+    killVerifiedGroup();
     finish();
-  }, timeoutMs + graceMs + 10_000);
-  const timer = setTimeout(() => {
-    result.timedOut = true; result.supervisionFailed = true;
-    result.events.push(`group-term pgid=${child.pid} graceMs=${graceMs}`);
-    signalGroup('SIGTERM');
-    graceTimer = setTimeout(() => {
-      graceElapsed = true;
-      result.events.push(`group-kill pgid=${child.pid}`);
-      killVerifiedGroup(() => {
-        if (closed || result.groupTermination === 'group-kill-failed') finish();
-      });
-    }, graceMs);
+  };
+  // A separate ten-second timer avoids overflowing Node's timer ceiling when
+  // timeoutMs itself is the maximum timer value.
+  timer = setTimeout(() => {
+    result.timedOut = true;
+    hardTimer = setTimeout(() => {
+      fail('hard deadline without confirmed group termination');
+      finish();
+    }, 10_000);
+    stop();
   }, timeoutMs);
+  process.on('exit', () => { if (!finished) killVerifiedGroup(); });
+  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, stop);
   for (const [stream, fd] of [[child.stdout, 1], [child.stderr, 2]]) {
     let bytes = 0;
     stream.on('data', chunk => {
+      if (stopping || finished) return;
       bytes += chunk.length;
       if (bytes <= 32 * 1024 * 1024) writeFileSync(fd, chunk);
       else {
-        result.supervisionFailed = true;
         result.events.push('loop output exceeded 32 MiB; terminating process group');
-        killVerifiedGroup(finish);
+        stop();
       }
     });
   }
+  child.on('exit', () => { leaderExited = true; });
   child.on('error', error => {
     result.status = 1; result.supervisionFailed = true;
     result.events.push(`loop spawn failed: ${error.message}`);
     finish();
   });
   child.on('close', (status, signal) => {
-    closed = true;
     result.status = status; result.signal = signal;
-    if (result.groupTermination === 'group-killed') setTimeout(finish, 100);
-    else if (!result.timedOut || graceElapsed) finish();
+    finish();
   });
 }
 
 /** @param {object} [env] @returns {number} */
 export function resolveLoopTimeoutMs(env = process.env) {
   const n = Number(env?.[LOOP_TIMEOUT_ENV]);
-  return Number.isFinite(n) && n >= 60_000 ? n : DEFAULT_LOOP_TIMEOUT_MS;
+  return Number.isSafeInteger(n) && n >= 60_000 && n <= 2147483647 ? n : DEFAULT_LOOP_TIMEOUT_MS;
 }
 
 /** @param {object} [env] @returns {'job'|'session'} — anything unrecognised reads as the default `job`. */
@@ -593,14 +537,14 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     const admission = recoveryAdmissions.get(path);
     if (admission) restoreRecoveryWriter({ repo, pr, head, env }, admission.witness, admission.admissionId);
   };
-  const node = (args, { actorId, timeoutMs, extraEnv = null, groupGraceMs = null } = {}) => spawnNode(process.execPath,
-    groupGraceMs === null ? [...heapCapArgs(basename(args[0], '.mjs')), ...args]
-      : ['-e', `(${superviseReviewLoop.toString()})(${installReviewLoopTerminationHandler.toString()})`, JSON.stringify([timeoutMs, groupGraceMs, ...heapCapArgs(basename(args[0], '.mjs')), ...args])], {
+  const node = (args, { actorId, timeoutMs, extraEnv = null, supervised = false } = {}) => spawnNode(process.execPath,
+    !supervised ? [...heapCapArgs(basename(args[0], '.mjs')), ...args]
+      : ['-e', `(${superviseReviewLoop.toString()})(${publishReviewLoopIdentity.toString()})`, JSON.stringify([timeoutMs, ...heapCapArgs(basename(args[0], '.mjs')), ...args])], {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
     env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}), ...(extraEnv ?? {}) },
-    ...(groupGraceMs !== null ? { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }
+    ...(supervised ? { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] }
       : timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   const readComments = ({ repo, pr }) => readCompletePrComments(Number(pr), {
@@ -802,13 +746,12 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
     runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null, reviewModel = null }) => {
-      const grace = resolveLoopTimeoutGrace({ env, readFile });
-      log(`review-job timeoutGraceMs=${grace.value.timeoutGraceMs} (${grace.sources.timeoutGraceMs})`);
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) throw Error('invalid review-loop timeout (must be 1–2147483647 ms)');
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
         ...(reviewModel ? [`--model=${reviewModel}`] : []),
-      ], { actorId, timeoutMs, groupGraceMs: grace.value.timeoutGraceMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
+      ], { actorId, timeoutMs, supervised: true, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       let lifecycle;
       try {
         lifecycle = JSON.parse(String(r.output?.[3] ?? ''));
