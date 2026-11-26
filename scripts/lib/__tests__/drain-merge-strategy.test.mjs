@@ -139,11 +139,11 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
   });
 
   it.each([true, false])('eligible PR pushes a new head with no red-team check run on it, so admission returns deferred red-team-pending (pending label=%s)', withLabel => {
-    const appId = 5037855;
+    const gateApp = 4242;
     const OLD = 'd'.repeat(40);
-    const runs = [{ id: 1, name: 'red-team', head_sha: OLD, external_id: `${LOCAL}#5283`, app: { id: appId }, status: 'completed', conclusion: 'success' }];
+    const runs = [{ id: 1, name: 'red-team', head_sha: OLD, external_id: `${LOCAL}#5283`, app: { id: gateApp }, status: 'completed', conclusion: 'success' }];
     const readRedTeamEvidence = vi.fn(() => ({ scheduled: false, inFlight: false }));
-    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId, checkRuns: runs }));
+    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId: gateApp, checkRuns: runs }));
     const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
       env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
       strategyExtra: { readRedTeamEvidence, readRedTeamCheck },
