@@ -138,6 +138,20 @@ describe('enqueue delegates red-team verdicts to merge-gate', () => {
     expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
   });
 
+  it.each([true, false])('eligible PR pushes a new head with no red-team check run on it, so admission returns deferred red-team-pending (pending label=%s)', withLabel => {
+    const gateApp = 4242;
+    const OLD = 'd'.repeat(40);
+    const runs = [{ id: 1, name: 'red-team', head_sha: OLD, external_id: `${LOCAL}#5283`, app: { id: gateApp }, status: 'completed', conclusion: 'success' }];
+    const readRedTeamEvidence = vi.fn(() => ({ scheduled: false, inFlight: false }));
+    const readRedTeamCheck = vi.fn(() => evaluateRedTeamCheckFact({ repo: LOCAL, pr: 5283, headSha: HEAD, appId: gateApp, checkRuns: runs }));
+    const h = harness({ strategy: 'github-merge-queue', labels: ['ready-to-merge', 'review:accepted'],
+      env: { WE_UNDER_TEST: '1', WE_RED_TEAM_GATE_SOURCE: 'check-run' },
+      strategyExtra: { readRedTeamEvidence, readRedTeamCheck },
+      onView: { readLive: () => ({ headRefOid: HEAD, labels: ['ready-to-merge', 'review:accepted', ...(withLabel ? ['red-team:pending'] : [])] }) } });
+    expect(h.s.enqueue({ num: 5283 }, HEAD)).toMatchObject({ enqueued: false, deferred: true, kind: 'red-team-pending' });
+    expect(h.calls.some(call => call.some(arg => String(arg).includes('enqueuePullRequest')))).toBe(false);
+  });
+
   it.each(['fresh state', 'legacy current-head spend'])('drain-scan A→B→A across restart dispatches each head at most once: %s', kind => {
     const clock = { t: 1000 }, requests = [];
     const otherHead = 'c'.repeat(40);
