@@ -104,10 +104,7 @@ describe('lane-pool acquire reclaim log', () => {
     expect(git(['rev-parse', 'HEAD'], lane(1))).toBe(head);
   }, 120_000);
 
-  it.each([
-    { count: 2, resumeAfterExit: true, reader: 'resumes after child exit' },
-    { count: 2000, resumeAfterExit: false, reader: 'resumes after a delay' },
-  ])('delivers the whole stderr, ✗ reason included, to an initially paused reader that $reader', async ({ count, resumeAfterExit }) => {
+  async function expectPausedStderr({ count, resumeAfterExit }) {
     // The 2000-flag case makes one fail() write larger than a pipe buffer, then process.exit(1): an async pipe loses the tail.
     // Many short unknown flags avoid E2BIG for a single huge argv string; fail() lists them in one ~200KB line.
     const flags = Array.from({ length: count }, (_, i) => `--unknown-${String(i).padStart(4, '0')}-${'x'.repeat(90)}`);
@@ -144,5 +141,13 @@ describe('lane-pool acquire reclaim log', () => {
     expect(err).toContain(flags[flags.length - 1]);
     expect(err.endsWith('is exactly the footgun this check exists to close.\n')).toBe(true);
     expect(existsSync(pool)).toBe(false);
+  }
+
+  it('delivers the whole stderr, ✗ reason included, to an initially paused reader that resumes after child exit', async () => {
+    await expectPausedStderr({ count: 2, resumeAfterExit: true });
+  }, 60_000);
+
+  it('delivers the whole stderr, ✗ reason included, to an initially paused reader that resumes after a delay', async () => {
+    await expectPausedStderr({ count: 2000, resumeAfterExit: false });
   }, 60_000);
 });
