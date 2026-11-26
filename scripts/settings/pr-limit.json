@@ -1,6 +1,6 @@
 {
   "prLimit": {
-    "limits": { "we": 15, "frontierui": 15, "plateau-app": 15 },
+    "limits": { "we": 25, "frontierui": 25, "plateau-app": 25 },
     "excludeCardOnly": true,
     "excludeStackedAwaitingBase": true,
     "excludeFocus": true,
