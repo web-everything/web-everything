@@ -890,7 +890,7 @@ export function buildResumePrompt({ pr, itemNum, cwd = null }) {
     'Resolve the conflict: rebase or merge `main`, resolve every conflicted hunk by reading BOTH sides\' intent ' +
       '(your own and whatever landed on `main` since), run the gate green, and push. If you cannot safely ' +
       "resolve it, follow `skills-src/conveyor/fix-agent-brief.md`'s own conflict-escalation step: run " +
-      `\`node scripts/conveyor/stand-down.mjs ${pr} --reason=conflict\`, then report and stop — do not guess.`,
+      `\`node scripts/conveyor/stand-down.mjs ${pr} --reason=conflict --head="$(gh pr view ${pr} --json headRefOid --jq .headRefOid)"\`, then report and stop — do not guess.`,
   ].join('\n');
 }
 

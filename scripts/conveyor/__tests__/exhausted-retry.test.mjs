@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { resolveExhaustedRetry, exhaustionFacts, countExhaustedRetries, planExhaustedRetry,
   buildExhaustedRetryComment, buildExhaustedRetrySpentComment, retryOutcome, realRequiredFailures, wrongSpentStandDowns,
@@ -279,7 +280,7 @@ describe('exhausted retry', () => {
     expect(countBlockingRetryStandDowns([watcherStop, trusted(SUPERSEDE_STAND_DOWN_MARKER)], headSha)).toBe(0);
     expect(countBlockingRetryStandDowns([trusted(ADVISORY_NOTE_MARKER), trusted(ADVISORY_FIX_COMMENT_MARKER), stop], headSha)).toBe(0);
     expect(countBlockingRetryStandDowns([trusted(buildStandDownComment({ reason: 'superseded', head: mainSha }))], headSha)).toBe(1);
-    expect(countBlockingRetryStandDowns([trusted(buildStandDownComment({ reason: 'needs-judgment' }))], headSha)).toBe(1);
+    expect(countBlockingRetryStandDowns([trusted(legacyStandDownComment({ reason: 'needs-judgment' }))], headSha)).toBe(1);
     for (const [reason, head] of [['fix-loop-exhausted', headSha], ['needs-judgment', mainSha]]) {
       const newer = { ...trusted(buildStandDownComment({ reason, head })), id: 'IC_newer' };
       const resolveNewer = trusted(buildOperatorAnswer({ standDownId: newer.id, reason: 'Proceed', actor: 'chalbert', channel: 'Codex chat' }));

@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file scripts/conveyor/__tests__/stuck-pr-watch-core.test.mjs
  * @description Pins the stuck-PR watch's pure core (epic #3383): the four per-stage thresholds (and their env
@@ -91,7 +92,7 @@ describe('isNeverStuckPr — the three exclusions', () => {
   });
   it('a stood-down PR is never stuck', () => {
     // #3383 — a trusted author is now required for the stand-down marker to count.
-    const comments = [{ body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'web-everything' } }];
+    const comments = [{ body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'web-everything' } }];
     expect(isNeverStuckPr({ labels: [CHANGES], comments })).toBe(true);
   });
   it('an ordinary PR is not excluded', () => {

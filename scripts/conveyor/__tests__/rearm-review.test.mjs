@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file scripts/conveyor/__tests__/rearm-review.test.mjs
  * @description Pins the PURE re-arm decision for the conveyor fix agent (WE #2630). `decideRearm` swaps a
@@ -176,7 +177,7 @@ describe('decideEmptyFixRound — a fix round that left the head where the fix b
     expect(d.since).toBe(HEAD.slice(0, 9));
   });
 
-  const stop = { id: 'IC_stop', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const stop = { id: 'IC_stop', author: BOT, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
   const operatorAnswer = (disposition = 'rearm-review') => ({
     author: { login: 'chalbert' },
     body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition }),
@@ -457,7 +458,7 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
   const EMPTY = { head: H0, comments: [verdict, claim(H0)] };
 
   it.each([{ login: 'chalbert' }, BOT, { login: 'web-everything[bot]', type: 'Bot' }])('passes a REST operator answer posted by $login with a GraphQL target through to the shared label CLI', (user) => {
-    const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+    const stop = { id: 4242, node_id: 'IC_stop', user: BOT, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
     const answer = { id: 4300, node_id: 'IC_answer', user, body: buildOperatorAnswer({ standDownId: 'IC_stop', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
     const r = run(['6798', '--repo=o/r'], { head: H0, comments: [...EMPTY.comments, stop, answer] });
     expect(r.calls.some((c) => c[0] === 'api' && String(c[1]).includes('/comments'))).toBe(true);
@@ -558,7 +559,7 @@ describe('decideEmptyFixRound — REST-shaped comments (user.login, numeric id)'
   const BOT = { login: 'web-everything' };
   const HEAD = '4288acd6aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const begin = { body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`, user: BOT, id: 1 };
-  const stop = { id: 4242, user: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const stop = { id: 4242, user: BOT, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
   const ans = { id: 4300, user: { login: 'chalbert' },
     body: buildOperatorAnswer({ standDownId: '4242', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
   it('a REST-shaped rearm-review answer is recognised the same as the gh shape', () => {
@@ -594,7 +595,7 @@ describe('#6748 real sequence: stand-down 106 -> answer 108 (no rearm) -> fix-be
   const HEAD = '4e4a927e9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
   const begin = (id) => ({ id, author: BOT, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->` });
   const verdict = { id: 'IC_99', author: BOT, body: '🔁 review — changes requested\n\nx\n<!-- reviewed-sha: ' + HEAD + ' -->' };
-  const stop106 = { id: 'IC_106', author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
+  const stop106 = { id: 'IC_106', author: BOT, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }) };
   const ans = (id, standDownId, disposition, extra = {}) => ({ id, author: { login: 'chalbert' },
     body: buildOperatorAnswer({ standDownId, reason: 'ruled', actor: 'chalbert', channel: 'chat', ...(disposition ? { disposition } : {}), ...extra }) });
   const seq = [verdict, begin('IC_105'), stop106, ans('IC_108', 'IC_106'), begin('IC_110'), begin('IC_113')];
@@ -695,7 +696,7 @@ describe('headed no-code answer: one resumed fixer claim', () => {
   const H = nocode7452.liveHead, X = 'b'.repeat(40), Y = 'c'.repeat(40);
   const BOT = { login: 'web-everything' };
   const claim = sha => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${sha.slice(0, 9)}\`` });
-  const stop = id => ({ id, author: BOT, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) });
+  const stop = id => ({ id, author: BOT, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) });
   const answer = (standDownId, head = H, extra = {}) => ({ author: BOT, body: buildOperatorAnswer({
     standDownId, disposition: 'rearm-review', noCodeOwed: true, head,
     reason: 'No code owed', actor: 'chalbert', channel: 'chat', ...extra,

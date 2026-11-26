@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -320,7 +321,7 @@ it('does not indirectly answer an older reviewer-question via newest-wins', () =
   expect(classifyStandDownAutoProceed(args(rerun, { pr: pr([stand('needs-judgment', 'OLD'), stand()]) })).action).toBe('hold');
 });
 const legacyLoadFlake = () => ({ ...stand('gate-red', 'OLD'), createdAt: '2026-10-04T12:00:00Z',
-  body: buildStandDownComment({ reason: 'gate-red',
+  body: legacyStandDownComment({ reason: 'gate-red',
     detail: 'load flakiness; saved fix on lane/repair-alt (`bbbbbbb`)' }) });
 it.each([false, true])('holds a same-head legacy load-flake with zero reservations/posts (newer CI hold: %s)', newer => {
   const older = { ...legacyLoadFlake(), body: buildStandDownComment({ reason: 'gate-red', head,
@@ -446,7 +447,7 @@ it.each([
     'hold', /missing stand-down identity\/time/);
 });
 it('holds and never posts for an unbound stand-down head', () => {
-  const unbound = { ...stand(), body: buildStandDownComment({ reason: 'gate-red' }) };
+  const unbound = { ...stand(), body: legacyStandDownComment({ reason: 'gate-red' }) };
   assertAuthorizationBoundary(args(rerun, { pr: pr([unbound]) }), 'hold', /unbound stand-down/);
 });
 it('accepts and posts at the 2000-comment thread limit', () => {

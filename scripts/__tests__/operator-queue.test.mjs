@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from '../conveyor/__tests__/fixtures/legacy-stand-down.mjs';
 /** @file Operator readiness gates (label gate, label/comment cross-check, transient mergeability) and the read-only CLI report over inline gh fixtures. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -325,7 +326,7 @@ describe('standDownRow', () => {
   });
 
   it('extracts the stated reason and timestamp from a leading-line stand-down comment', () => {
-    const body = buildStandDownComment({ reason: 'gate-red' });
+    const body = legacyStandDownComment({ reason: 'gate-red' });
     const pr = fixture({ labels: [], comments: [{ body, createdAt: '2026-09-20T10:00:00Z', author: { login: 'web-everything' } }] });
     expect(standDownRow('o/n', pr)).toEqual({
       repo: 'o/n', number: 42, title: 'Ready for review',
@@ -341,15 +342,15 @@ describe('standDownRow', () => {
   });
 
   it('flags alsoReviewHuman when the PR still carries review:human', () => {
-    const body = buildStandDownComment({ reason: 'conflict' });
+    const body = legacyStandDownComment({ reason: 'conflict' });
     const pr = fixture({ labels: [HUMAN], comments: [{ body, createdAt: 't', author: { login: 'web-everything' } }] });
     expect(standDownRow('o/n', pr).alsoReviewHuman).toBe(true);
   });
 
   it('picks the most recent stand-down comment when a PR has stood down more than once', () => {
     const pr = fixture({ labels: [], comments: [
-      { body: buildStandDownComment({ reason: 'gate-red' }), createdAt: '2026-09-20T10:00:00Z', author: { login: 'web-everything' } },
-      { body: buildStandDownComment({ reason: 'conflict' }), createdAt: '2026-09-18T10:00:00Z', author: { login: 'web-everything' } },
+      { body: legacyStandDownComment({ reason: 'gate-red' }), createdAt: '2026-09-20T10:00:00Z', author: { login: 'web-everything' } },
+      { body: legacyStandDownComment({ reason: 'conflict' }), createdAt: '2026-09-18T10:00:00Z', author: { login: 'web-everything' } },
     ] });
     expect(standDownRow('o/n', pr).reason).toContain('gate stayed RED');
   });
@@ -360,7 +361,7 @@ describe('main — STOOD DOWN section', () => {
 
   it('lists an open PR with a leading-line stand-down comment regardless of labels, with its reason', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const body = buildStandDownComment({ reason: 'needs-judgment' });
+    const body = legacyStandDownComment({ reason: 'needs-judgment' });
     list(fixture({ number: 99, labels: [], comments: [{ body, createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } }] }));
     main(['--repo=o/n', '--json'], { unsupportedPath: NO_UNSUPPORTED });
     expect(JSON.parse(log.mock.calls[0][0]).stoodDown).toEqual([{
@@ -380,7 +381,7 @@ describe('main — STOOD DOWN section', () => {
 
   it('never duplicates a PR already listed in NEEDS YOU', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const body = buildStandDownComment({ reason: 'conflict' });
+    const body = legacyStandDownComment({ reason: 'conflict' });
     // fixture() is a fully-ready PR by default; give it a stand-down comment too (e.g. stood down, then cleared
     // and re-armed by a human without deleting the old comment).
     list(fixture({ comments: [advisory(), { body, createdAt: 't', author: { login: 'web-everything' } }] }));
@@ -392,7 +393,7 @@ describe('main — STOOD DOWN section', () => {
 
   it('notes when a listed PR also still carries review:human, rather than hiding it', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const body = buildStandDownComment({ reason: 'lane-ref-gone' });
+    const body = legacyStandDownComment({ reason: 'lane-ref-gone' });
     // review:human alone, with no advisory/CI, is NOT ready — so it is not in NEEDS YOU and is free to also
     // appear here, flagged.
     list(fixture({ number: 7, labels: [HUMAN], comments: [{ body, createdAt: 't', author: { login: 'web-everything' } }] }));
@@ -417,7 +418,7 @@ describe('main — STOOD DOWN section', () => {
 
   it('renders a real stood-down row as text, with reason and repo#number', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const body = buildStandDownComment({ reason: 'gate-red' });
+    const body = legacyStandDownComment({ reason: 'gate-red' });
     list(fixture({ number: 55, labels: [], comments: [{ body, createdAt: '2026-09-21T00:00:00Z', author: { login: 'web-everything' } }] }));
     main(['--repo=o/n'], { unsupportedPath: NO_UNSUPPORTED });
     const out = log.mock.calls.map(([line]) => line).join('\n');

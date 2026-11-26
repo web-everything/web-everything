@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +18,7 @@ import { dispatchFix, planFixesFromReconcile, tryResumeFix } from '../reconcile-
 const reason = 'Scope correction is fine but must be careful to going against goal and decision and escalate if needed';
 const record = { standDownId: 'IC_stopped', reason, actor: 'chalbert', channel: 'Codex chat' };
 const trusted = (body, id = 'IC_answer') => ({ id, body, author: { login: 'web-everything' }, viewerDidAuthor: false });
-const stop = trusted(buildStandDownComment({ reason: 'needs-judgment', detail: '#4650 conflicts with #4658' }), record.standDownId);
+const stop = trusted(legacyStandDownComment({ reason: 'needs-judgment', detail: '#4650 conflicts with #4658' }), record.standDownId);
 const answer = trusted(buildOperatorAnswer(record));
 const argv = ['3181', '--repo=web-everything/web-everything', `--reason=${reason}`, '--actor=chalbert', '--channel=Codex chat'];
 const pr = (comments) => ({ number: 3181, state: 'OPEN', headRefName: 'lane/answer-test', headRefOid: 'a'.repeat(40),
@@ -305,7 +306,7 @@ describe('rearm-review re-answer supersedes an answered stand-down (#6748 deadlo
 describe('#6748 real sequence at the CLI: 106 -> answer 108 -> fix-begin 110 -> fix-begin 113 (same head)', () => {
   const HEAD = '4'.repeat(9) + 'e'.repeat(31);
   const begin = (id, at) => ({ ...trusted(`🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-6748 -->`, id), createdAt: at });
-  const s106 = { ...trusted(buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }), 'IC_106'), createdAt: '2026-11-14T19:47:47Z' };
+  const s106 = { ...trusted(legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }), 'IC_106'), createdAt: '2026-11-14T19:47:47Z' };
   const a108 = { ...trusted(buildOperatorAnswer({ ...record, standDownId: 'IC_106' }), 'IC_108'), createdAt: '2026-11-14T19:54:00Z' };
   const snap = (extra = []) => ({
     comments: [begin('IC_105', '2026-11-14T19:47:37Z'), s106, a108, begin('IC_110', '2026-11-14T22:49:59Z'), begin('IC_113', '2026-11-14T23:35:29Z'), ...extra],

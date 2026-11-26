@@ -180,7 +180,7 @@ For a question unrelated to referral findings, omit `--finding-refs` and require
 answer. Legacy stand-downs without these subjects also require an explicit answer.
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=needs-judgment --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)" \
   --finding-refs="$(cat -- "$FINDING_REFS_FILE")" \
   --detail="<one line — what you could not decide>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-judgment
@@ -209,7 +209,7 @@ gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
 Take the **latest** such comment as the authoritative ask — read its findings table and its
 `**Advisory outcome:** \`changes\`` line. Everything else in step 2 above still applies unchanged: reproduce the
 finding red before you touch code, and if it is ambiguous or needs judgment you cannot safely make, **stand
-down** exactly as step 2 says (`stand-down.mjs {{PR_NUM}} --reason=needs-judgment`) — this population is never
+down** exactly as step 2 says (`stand-down.mjs {{PR_NUM}} --reason=needs-judgment --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)"`) — this population is never
 exempt from that escalation path. **Do NOT** treat this comment as a human-ceremony bounce: it explicitly is
 not one (its own text says so, twice), so nothing here ever touches `review:human`, `review:pending`, or
 `review:accepted` — this repair's only output is the fix itself plus the durable marker at step 7a.
@@ -309,7 +309,7 @@ base is something else; the same reproduce/resolve/escalate discipline applies e
 different ref.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=conflict --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)" \
   --detail="<one line — what made the overlap unsafe to resolve automatically>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-conflict
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -362,7 +362,7 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 > ```
 >
 > If the overlap is a genuine same-line conflict you cannot safely resolve, the same stand-down escalation above
-> applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --detail=...`) — this mode
+> applies unchanged (`stand-down.mjs {{PR_NUM}} --repo={{REPO}} --reason=conflict --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)" --detail=...`) — this mode
 > changes only what a *successful* resolution hands back with, never the escalation path.
 
 > **STALE-BASE MODE — dispatched with `mode: stale-base-rebase`.** The PR base is main but a required job
@@ -526,7 +526,7 @@ The same holds for the blocked-on-infra and load-flake exits: they release the c
 unverified head is never handed back for review or landed.)
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
+node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)" \
   --detail="<one line — which check stayed red>"
 node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=gate-red
 node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
@@ -605,7 +605,7 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 ```
 
 The planner re-arms the PR on its own once the head moves again or goes quiet, and the next fixer is told to
-start from your saved branch. Never use `--reason=conflict` for this — that is a same-line conflict with `main`.
+start from your saved branch. Never use `--reason=conflict --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)"` for this — that is a same-line conflict with `main`.
 
 Write the commit message to a file and `commit -F` it — a heredoc runs backticks (e.g. `` `scope:` ``) as a
 subshell (`bad substitution`); a message file has no such footgun. Pushing to `lane/*` is allowed by the
@@ -733,7 +733,7 @@ it. When a human takes over a `review:changes` bounce (the `/finish` `review-cha
    NEVER use `git checkout --ours/--theirs`, `git checkout -- <file>`, `git restore`, or `git reset` on a file:
    the auto-mode classifier denies those as "[Irreversible Local Destruction]" (live: fix-3964, PR #3964).
    Hand-merged hunks still use the Edit tool, then `git add`.
-   If you stop instead, run `node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict`
+   If you stop instead, run `node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --reason=conflict --head="$(gh pr view {{PR_NUM}} --repo={{REPO}} --json headRefOid --jq .headRefOid)"`
    so the PR records that a repair was attempted and deliberately abandoned — the auto-fix loop then leaves it
    to you (#3296).
 4. **Re-push HEAD to the same `lane/*` ref** — update the PR in place, never open a new one (step 6 above).

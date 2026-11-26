@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file scripts/conveyor/__tests__/fix-procedure.test.mjs — the fix procedure (operator-approved 2026-09-27,
  *   live incident PR #2811).
@@ -487,7 +488,7 @@ describe('stand-down semantics — a concurrent author is a pause, not a burial'
   });
 
   it('a genuine terminal stand-down stays terminal', () => {
-    const comments = [{ body: buildStandDownComment({ reason: 'needs-judgment' }), author: AUTOMATION }];
+    const comments = [{ body: legacyStandDownComment({ reason: 'needs-judgment' }), author: AUTOMATION }];
     const plan = planReconcile({ prs: [pr(comments)], agents: [], now: T0 });
     expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'stood-down' })]);
   });
@@ -509,7 +510,7 @@ describe('stand-down semantics — a concurrent author is a pause, not a burial'
   for (const reason of ['needs-judgment', 'gate-red', 'conflict', 'lane-ref-gone', 'bogus-reason']) {
     for (const detail of RED_HERRINGS) {
       it(`stays terminal: --reason=${reason} with detail "${detail.slice(0, 40)}…"`, () => {
-        const comments = [{ body: buildStandDownComment({ reason, detail }), author: AUTOMATION, createdAt: '2026-09-27T15:00:00Z' }];
+        const comments = [{ body: legacyStandDownComment({ reason, detail }), author: AUTOMATION, createdAt: '2026-09-27T15:00:00Z' }];
         expect(countStandDownComments(comments)).toBe(1);
         expect(countTerminalStandDowns(comments)).toBe(1);
         expect(concurrentAuthorPauses(comments)).toEqual([]);
@@ -523,7 +524,7 @@ describe('stand-down semantics — a concurrent author is a pause, not a burial'
   }
 
   it('the `concurrent-author` reason built through buildStandDownComment IS a pause', () => {
-    const comments = [{ body: buildStandDownComment({ reason: 'concurrent-author', detail: 'x' }), author: AUTOMATION }];
+    const comments = [{ body: legacyStandDownComment({ reason: 'concurrent-author', detail: 'x' }), author: AUTOMATION }];
     expect(countStandDownComments(comments)).toBe(0);
     expect(concurrentAuthorPauses(comments)).toHaveLength(1);
   });

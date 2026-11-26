@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 // Takeover budget — fix.takeoverBudget takeovers per PR, a further one only when the previous one reduced the open
 // findings; gate holds never trigger one. Live: #4708 needed a second, operator-approved takeover by hand.
 import { describe, it, expect } from 'vitest';
@@ -554,7 +555,7 @@ describe('a thread cut at the list cap grants no takeover and no takeover review
 
   it('planReconcile: a cut list that hides a stand-down dispatches nothing at the stood-down PR', async () => {
     const { buildStandDownComment } = await import('../stand-down.mjs');
-    const standDown = { author: BOT, createdAt: at(2), body: buildStandDownComment({ reason: 'needs-judgment' }) };
+    const standDown = { author: BOT, createdAt: at(2), body: legacyStandDownComment({ reason: 'needs-judgment' }) };
     const full = [...filler(GH_LIST_COMMENT_CAP), rearm(1), standDown];
     const complete = plan(pr(R5, full, { commentsComplete: true }), { durableCounts: {} });
     expect(complete.dispatch.filter((x) => x.prNumber === 7)).toEqual([]); // control: seen in full, it is terminal

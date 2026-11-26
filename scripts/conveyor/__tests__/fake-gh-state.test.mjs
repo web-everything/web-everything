@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file fake-gh-state.test.mjs — proves generation 2 of `helpers/fake-gh.mjs` (#3383, daemon-scenario
  * simulator part 2 "Fake GitHub") against REAL git, exercised through the REAL `execFileSync('gh', …)` call
@@ -400,7 +401,7 @@ describe('fake-gh generation 2 — stateful fake GitHub (#3383)', () => {
     const gh = makeGithub(originPath);
     seedBranchAt(originPath, 'lane/answer-id');
     const number = gh.openPr({ repo: SLUG, head: 'lane/answer-id', title: 'operator answer identity' });
-    const inserted = gh.comment(SLUG, number, buildStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
+    const inserted = gh.comment(SLUG, number, legacyStandDownComment({ reason: 'needs-judgment' }), { author: 'web-everything' });
     const stop = gh.pr(SLUG, number).comments[0];
     expect(stop.id).not.toBe(String(inserted.id));
     const body = buildOperatorAnswer({ standDownId: stop.id, actor: 'chalbert', channel: 'chat', reason: 'Proceed with the repair' });

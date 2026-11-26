@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from '../../conveyor/__tests__/fixtures/legacy-stand-down.mjs';
 /**
  * pr-sweep — fixtures are the shapes seen live on 2026-10-20/21: #5485 (paused referrals), #5769/#5530 (red-team
  * round cap), #5784 (ruling dispute), #5787 (draft-withdrawn), #5771 (red-team result missing, drain skip),
@@ -36,7 +37,7 @@ describe('repair process identity at a terminal stand-down', async () => {
   const { buildStandDownComment } = await import('../../conveyor/stand-down.mjs');
   const stoppedAt = Date.parse('2026-10-21T11:00:00Z');
   const pr = mkPr({ labels: L('review:changes'), comments: [c('web-everything', new Date(stoppedAt).toISOString(),
-    buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }))] });
+    legacyStandDownComment({ reason: 'gate-red', detail: 'verify red' }))] });
   const laterJob = { pr: pr.number, startedAt: stoppedAt + 60_000 };
   const kinds = ['fix-run', 'ci-heal', 'deliver-item-run'];
   it.each(kinds.flatMap((kind) => [undefined, null, '', 'o/other'].map((repo) => [kind, repo])))

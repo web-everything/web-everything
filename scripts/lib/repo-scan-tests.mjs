@@ -47,10 +47,10 @@ export const REPO_SCAN_TESTS = Object.freeze([
   {
     test: 'scripts/conveyor/__tests__/stand-down.test.mjs',
     scope: 'files',
-    why: 'every production stand-down poster supplies a head; changed conveyor callers are checked individually',
-    matches: (f) => /\.mjs$/.test(f) && inTree(f, ['scripts/conveyor'])
+    why: 'every production stand-down poster supplies a head; changed scripts and briefs are checked individually',
+    matches: (f) => /\.(?:[cm]?[jt]s|md)$/.test(f) && inTree(f, ['scripts', 'skills-src'])
       && !/(?:^|\/)(?:__tests__|soak|fixtures|node_modules)(?:\/|$)/.test(f),
-    inputs: ['scripts/conveyor/stand-down.mjs', 'scripts/conveyor/__tests__/stand-down.test.mjs'],
+    inputs: ['scripts/conveyor/stand-down.mjs', 'scripts/lib/stand-down-posters.mjs', 'scripts/conveyor/__tests__/stand-down.test.mjs'],
   },
   {
     test: 'scripts/__tests__/push-gate-boundary.test.mjs',

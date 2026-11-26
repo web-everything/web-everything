@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file stand-down-disposition.test.mjs — #3850: the operator answered a stand-down "Close as superseded".
  *   The fixer got that as free text, read it as "delete the card's files", was denied, and ended blocked-on-infra
@@ -67,13 +68,13 @@ describe('#3850 — structured dispositions', () => {
     expect(parseOperatorAnswer(comment)).toEqual(record);
     expect(answerDisposition(record)).toBe('rearm-review');
     expect(withOperatorAnswer('BRIEF', record)).not.toContain('The conveyor closes it mechanically');
-    const stop = { id: record.standDownId, author: comment.author, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) };
+    const stop = { id: record.standDownId, author: comment.author, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?' }) };
     const plan = planReconcile({ prs: [{ ...pr3850, comments: [stop, comment] }], agents: [], durableCounts: {}, now: 0 });
     expect(plan.dispatch.filter((d) => d.kind === 'close-superseded')).toEqual([]);
   });
 
   it('a rearm-review answer resolves only the stand-down it names; a newer unanswered one stays held', () => {
-    const mk = (id) => ({ id, author: { login: 'chalbert' }, body: buildStandDownComment({ reason: 'needs-judgment', detail: id }) });
+    const mk = (id) => ({ id, author: { login: 'chalbert' }, body: legacyStandDownComment({ reason: 'needs-judgment', detail: id }) });
     const answer = { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_a', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
     const comments = [mk('IC_a'), mk('IC_b'), answer];
     expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(true);
@@ -81,7 +82,7 @@ describe('#3850 — structured dispositions', () => {
   });
 
   it('a rearm-review answer leaves an older unnamed stand-down held', () => {
-    const mk = (id) => ({ id, author: { login: 'chalbert' }, body: buildStandDownComment({ reason: 'needs-judgment', detail: id }) });
+    const mk = (id) => ({ id, author: { login: 'chalbert' }, body: legacyStandDownComment({ reason: 'needs-judgment', detail: id }) });
     const answer = { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_b', reason: 'No code is owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review' }) };
     const comments = [mk('IC_a'), mk('IC_b'), answer];
     expect(isOperatorAnswerStandDownSuperseded(comments, 0)).toBe(false);
@@ -259,7 +260,7 @@ describe('plateau #220 — an operator answer clears every blocking stand-down/e
   const hold = (id, createdAt) => ({ id, createdAt, author: bot, body: buildLoadFlakeRedispatchComment({ detail: 'timing' }) });
   const answer = (id, createdAt, standDownId, reason) => ({ id, createdAt, author: op, body: buildOperatorAnswer({ standDownId, reason, actor: 'chalbert', channel: 'claude-code-chat' }) });
   const before = [
-    { id: 'IC_sd', createdAt: '2026-10-09T18:57:01Z', author: bot, body: buildStandDownComment({ reason: 'gate-red', detail: 'red only on host load timing' }) },
+    { id: 'IC_sd', createdAt: '2026-10-09T18:57:01Z', author: bot, body: legacyStandDownComment({ reason: 'gate-red', detail: 'red only on host load timing' }) },
     hold('IC_h1', '2026-10-10T03:20:00Z'), resolved('IC_r1', '2026-10-10T03:31:18Z', 'redispatched'),
     hold('IC_h2', '2026-10-10T03:44:57Z'), resolved('IC_r2', '2026-10-10T03:46:37Z', 'redispatched'),
     hold('IC_h3', '2026-10-10T04:06:45Z'), resolved('IC_r3', '2026-10-10T04:07:01Z', 'redispatched'),

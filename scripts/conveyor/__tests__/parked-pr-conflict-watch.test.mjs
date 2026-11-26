@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file parked-pr-conflict-watch.test.mjs — `#xw0odtv`. PURE logic tests for `isParkedConflictTarget` /
  * `planConflictLabelChange` + IO-shell tests over injected fakes (no `gh` process anywhere in this file),
@@ -1300,7 +1301,7 @@ describe('#4118 — marker dedups are scoped to the CURRENT conflict episode', (
   const statutePr = (number) => ({
     number, mergeable: 'CONFLICTING', labels: [{ name: 'review:pending' }], files: [{ path: 'docs/agent/platform-decisions.md' }],
   });
-  const standDownAt = (msAgo) => ({ body: buildStandDownComment({ reason: 'conflict' }), createdAt: iso(msAgo), author: trusted });
+  const standDownAt = (msAgo) => ({ body: legacyStandDownComment({ reason: 'conflict' }), createdAt: iso(msAgo), author: trusted });
 
   it('a fresh statute-tier episode posts its OWN stand-down even with an old episode\'s stand-down on the thread', () => {
     const routed = [];
@@ -1810,13 +1811,13 @@ describe('defaultListMainStatutePatchesSinceMergeBase — argv shape + failure m
 
 describe('findWatcherStandDownComment', () => {
   it('finds a stand-down comment posted by the watch itself', () => {
-    const body = buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' });
+    const body = legacyStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' });
     // #3383 — the watch posts under the automation's own login; a trusted author is now required to count.
     expect(findWatcherStandDownComment([{ body, author: { login: 'web-everything' } }])).toEqual({ body, createdAt: null });
   });
 
   it('null: a fix agent\'s own judgment stand-down does not match', () => {
-    const body = buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' });
+    const body = legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' });
     expect(findWatcherStandDownComment([{ body, author: { login: 'web-everything' } }])).toBeNull();
   });
 
@@ -1910,8 +1911,8 @@ describe('watchParkedPrConflicts — #xu2krte Fork 2 review-human statute amendm
 
 describe('watchParkedPrConflicts — #xu2krte Fork 2 recheck of an ALREADY stood-down parked PR (live PR #2549 shape)', () => {
   // #3383 — every marker (this one included) now requires a trusted author; both are posted by the automation.
-  const watcherMarkerComment = { body: buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), author: { login: 'web-everything' } };
-  const humanJudgmentComment = { body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), author: { login: 'web-everything' } };
+  const watcherMarkerComment = { body: legacyStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), author: { login: 'web-everything' } };
+  const humanJudgmentComment = { body: legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), author: { login: 'web-everything' } };
   const alreadyLabelledPr = (over = {}) => ({
     number: 2549, mergeable: 'CONFLICTING', headRefName: 'lane/3681-ratify-daemon-lifecycle',
     labels: [{ name: 'review:human' }, { name: CONFLICT_LABEL }], ...over,
@@ -3519,7 +3520,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
   it('graceDue: a PRIOR watcher stand-down (the false-positive #2772 already posted) is SUPERSEDED, not left contradicting the new dispatch', () => {
     const provider = fakeProvider();
     const routed = [];
-    const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
+    const priorStandDown = { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
     const listPrs = () => [{
       number: 2772, mergeable: 'CONFLICTING', baseRefName: 'main', labels: L('review:accepted', 'ready-to-merge', CONFLICT_LABEL),
     }];
@@ -3579,7 +3580,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
   it('recheckCandidate (a review:human parked PR, previously stood down): narrowing to "no longer statute-tier" now supersedes and dispatches too', () => {
     const provider = fakeProvider();
     const routed = [];
-    const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } };
+    const priorStandDown = { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } };
     const listPrs = () => [{
       number: 2549, mergeable: 'CONFLICTING', labels: L('review:human', CONFLICT_LABEL),
     }];
@@ -3635,7 +3636,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
   // the queued labels, so a finding posted before a failed supersede would strand the PR behind its old
   // stand-down with nothing ever picking it up again.
   it('graceDue retries superseding across sweeps when the supersede post fails (two-sweep fault injection)', () => {
-    const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
+    const priorStandDown = { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
     const thread = [priorStandDown];
     let labels = L('review:accepted', 'ready-to-merge', CONFLICT_LABEL);
     const routed = [];
@@ -3673,7 +3674,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
   });
 
   it('graceDue: a finding that fails AFTER a good supersede is retried alone next sweep (no second supersede)', () => {
-    const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
+    const priorStandDown = { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', author: { login: 'web-everything' } };
     const thread = [priorStandDown];
     let supersedes = 0;
     const routed = [];
@@ -3701,7 +3702,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
 
   it('graceDue: a SUPERSEDED watcher stand-down does not silence a fresh one when the conflict turns human-only again', () => {
     const thread = [
-      { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', viewerDidAuthor: true, author: { login: 'web-everything' } },
+      { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-27T01:44:54Z', viewerDidAuthor: true, author: { login: 'web-everything' } },
       { body: buildSupersedeStandDownComment({ number: 2772 }), createdAt: '2026-09-27T02:00:00Z', viewerDidAuthor: true, author: { login: 'web-everything' } },
     ];
     const routed = [];
@@ -3722,7 +3723,7 @@ describe('#xconflres1 — statute-tier classification narrows to the ACTUALLY-co
   });
 
   it('recheckCandidate: a failed supersede is not reported as superseded', () => {
-    const priorStandDown = { body: buildStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } };
+    const priorStandDown = { body: legacyStandDownComment({ reason: 'conflict', actor: WATCHER_STAND_DOWN_ACTOR }), createdAt: '2026-09-20T00:00:00Z', author: { login: 'web-everything' } };
     const [r] = watchParkedPrConflicts({ sameLineConflict: 'stand-down',
       repo: 'o/n',
       listPrs: () => [{ number: 2549, mergeable: 'CONFLICTING', labels: L('review:human', CONFLICT_LABEL) }],

@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { describe, it, expect } from 'vitest';
 import * as core from '../stand-down-answer-core.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
@@ -41,7 +42,7 @@ describe('no-code rearm predicate', () => {
     ['poster is not operator', { comments: [...comments.slice(0, -1), { ...answer, author: { login: 'outsider' } }] }],
   ])('holds when %s', (_, over) => expect(predicate(over).state).toBe('held'));
   it('holds when an unanswered terminal stand-down follows the operator answer', () => {
-    const newer = c('newer', buildStandDownComment({ reason: 'needs-judgment', detail: 'A new question' }));
+    const newer = c('newer', legacyStandDownComment({ reason: 'needs-judgment', detail: 'A new question' }));
     expect(predicate({ comments: [...comments, newer] })).toMatchObject({ state: 'held', answerId: 'answer' });
   });
   it.each([[HEAD, 'ready'], ['b'.repeat(40), 'none']])('binds the ruling to stand-down head %s: %s', (head, state) => {
@@ -49,16 +50,16 @@ describe('no-code rearm predicate', () => {
     expect(predicate({ comments: [verdict, begin, pinned, answer] }).state).toBe(state);
   });
   it('holds an unheaded stand-down and requires a fresh answer', () => {
-    const unheaded = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
+    const unheaded = c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
     expect(predicate({ comments: [verdict, begin, unheaded, answer] })).toMatchObject({ state: 'held', why: 'stand-down has no head; a fresh answer is needed' });
   });
   it.each([begin, verdict])('an untrusted later marker cannot retire a headless ruling: $id', marker => {
-    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const headless = c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
     expect(predicate({ comments: [verdict, begin, headless, answer,
       { ...marker, author: { login: 'outsider' } }] }).state).toBe('held');
   });
   it('holds a headless ruling without trusted prior head evidence instead of inferring a push', () => {
-    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const headless = c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
     expect(predicate({ headRefOid: 'b'.repeat(40), comments: [
       { ...verdict, author: { login: 'outsider' } }, { ...begin, author: { login: 'outsider' } },
       headless, answer] }).state).toBe('held');
@@ -70,7 +71,7 @@ describe('no-code rearm predicate', () => {
     ['uppercase abbreviated claim on same head', [{ ...begin, body: begin.body.replace(HEAD, HEAD.slice(0, 9).toUpperCase()) }], HEAD, 'held'],
     ['uppercase abbreviated claim after push', [{ ...begin, body: begin.body.replace(HEAD, HEAD.slice(0, 9).toUpperCase()) }], 'b'.repeat(40), 'none'],
   ])('headless retirement uses trusted window evidence: %s', (_, before, headRefOid, state) => {
-    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const headless = c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
     expect(predicate({ comments: [...before, headless, answer], headRefOid }).state).toBe(state);
   });
   it.each([REARM_COMMENT_MARKER, NO_CHANGE_COMMENT_MARKER])('legacy marker spends ruling: %s', marker => expect(predicate({ comments: [...comments, c('legacy', marker)] }).state).toBe('spent'));
@@ -123,7 +124,7 @@ describe('no-code rearm planning', () => {
     expect(writes).toBe(0);
   });
   it.each([false, true])('ceremony refuses a headless stand-down before posting (replacement: %s)', replacement => {
-    const headless = { ...c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' })),
+    const headless = { ...c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' })),
       createdAt: '2026-01-02T00:00:00Z' };
     const ordinary = c('ordinary', core.buildOperatorAnswer({ standDownId: 'stop', actor: 'chalbert', channel: 'chat', reason: 'Inspect it' }), 'chalbert');
     const thread = [verdict, begin, headless, ...(replacement ? [ordinary] : [])];
@@ -145,7 +146,7 @@ describe('no-code rearm planning', () => {
     { cause: 'later claim', later: [begin], headRefOid: HEAD, labels: ['review:changes'] },
     { cause: 'removed changes label', later: [], headRefOid: HEAD, labels: ['review:pending'] },
   ])('retires a persisted headless ruling after $cause without passing it to a fixer', ({ later, headRefOid, labels }) => {
-    const headless = c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
+    const headless = c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Legacy question' }));
     const thread = [verdict, begin, headless, answer, ...later];
     expect(predicate({ comments: thread, headRefOid, labels }).state).toBe('none');
     const result = plan(thread, { headRefOid, labels });
@@ -170,7 +171,7 @@ describe('no-code rearm planning', () => {
     expect(result.dispatch[0]).not.toHaveProperty('operatorAnswer');
   });
   it.each([7, 9, 39, 40])('ceremony and planner agree on an unchanged %i-character stand-down SHA', length => {
-    const body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD.slice(0, length) });
+    const body = legacyStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: HEAD.slice(0, length) });
     const pinned = c('stop', body.replace(/head=([0-9a-f]+)/, (_, sha) => `head=${sha.toUpperCase()}`));
     const thread = [verdict, begin, pinned];
     runStandDownAnswer(['42', '--repo=web-everything/web-everything', '--reason=No code owed',

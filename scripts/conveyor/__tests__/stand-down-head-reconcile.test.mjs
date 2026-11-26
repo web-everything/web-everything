@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { buildStandDownComment, resolveStandDownHoldsAcrossHeads } from '../stand-down.mjs';
@@ -9,7 +10,7 @@ const old = '7eee9db73f8b111de10559fdb629d6ccbbee6472';
 const head = '5dd818e6c' + 'a'.repeat(31);
 const at = '2026-10-13T22:52:00Z';
 const held = (options = {}) => ({ author: { login: 'web-everything' }, createdAt: at,
-  body: buildStandDownComment({ reason: 'fix-loop-exhausted', ...options }) });
+  body: legacyStandDownComment({ reason: 'fix-loop-exhausted', ...options }) });
 const pr = (comment, extra = {}) => ({ number: 5195, title: 'Repair', state: 'OPEN',
   headRefOid: head, headRefName: 'lane/repair', mergeStateStatus: 'DIRTY', mergeable: 'CONFLICTING',
   labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }],

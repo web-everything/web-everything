@@ -67,7 +67,7 @@ export function buildConflictFindingBody(pr, { appendOnlyStatute = false, review
       '**Genuine same-line conflict with `main` in a statute/leash-tier file.** Resolve each conflicting hunk ' +
         "by keeping BOTH sides' intent: main's newer rule text plus this PR's addition. Make no unrelated edits. " +
         'If a hunk is a true either/or choice of rule text you cannot reconcile safely, stand down ' +
-        `with \`node scripts/conveyor/stand-down.mjs ${pr?.num ?? pr?.number ?? '?'} --reason=conflict\`, ` +
+        `with \`node scripts/conveyor/stand-down.mjs ${pr?.num ?? pr?.number ?? '?'} --reason=conflict --head="$(gh pr view ${pr?.num ?? pr?.number ?? '?'} --json headRefOid --jq .headRefOid)"\`, ` +
         'naming the hunk rather than guessing. Post before/after of each resolved hunk as evidence.',
     ] : []),
     ...appendOnlyInstruction,

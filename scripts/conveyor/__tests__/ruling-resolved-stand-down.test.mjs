@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { buildStandDownComment, standDownFindingRefs, standDownHead, standDownTrailerReason } from '../stand-down.mjs';
@@ -27,7 +28,7 @@ function fixture({ second = false, file = 'scripts/y.mjs', actor = 'chalbert', r
     at: '2026-10-04T14:00:03Z', clearerId: 'session-1', rulings: [{ runId, key: referrals[0].key, result: actor === 'auto-policy' ? 'block' : 'not-real' }] };
   return { number: 7, headRefOid: head, labels: ['review:changes', 'review:human'], labelEvents: [], body: rec.authorBody,
     createdAt: '2026-10-04T13:00:00Z', comments: [comment(1, renderReferralRecord(rec)),
-      comment(2, buildStandDownComment({ reason, detail: 'Please rule not-real.',
+      comment(2, legacyStandDownComment({ reason, detail: 'Please rule not-real.',
         findingRefs: bound && reason === 'needs-judgment' ? [{ runId, key: referrals[0].key }] : undefined })),
       comment(3, buildOperatorRulingComment(record), actor === 'auto-policy' ? 'web-everything' : actor)] };
 }
@@ -112,12 +113,12 @@ it('retries after a failed answer post without a stood-down status label', async
 
 it('a ruling does not resolve a non-finding needs-judgment question', () => {
   const pr = fixture({ bound: false });
-  pr.comments[1].body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Which conflicting instruction should I follow?' });
+  pr.comments[1].body = legacyStandDownComment({ reason: 'needs-judgment', detail: 'Which conflicting instruction should I follow?' });
   expect(planRulingResolvedStandDown(pr, { repo })).toBeNull();
 });
 it.each(['needs-judgment', 'conflict'])('does not silently supersede an older unanswered %s hold', (reason) => {
   const pr = fixture();
-  pr.comments.unshift(comment(0, buildStandDownComment({ reason, detail: 'An older unrelated question' })));
+  pr.comments.unshift(comment(0, legacyStandDownComment({ reason, detail: 'An older unrelated question' })));
   expect(planRulingResolvedStandDown(pr, { repo })).toBeNull();
 });
 it('requires later rulings for every named finding in the same review run', () => {
@@ -128,7 +129,7 @@ it('requires later rulings for every named finding in the same review run', () =
     [{ runId: 'review-pr-1', key: referralFindingKey('judgeCorrectnessAdvisory', { file: 'scripts/x.mjs', summary: 'first' }) },
       { runId: 'review-pr-1', key: 'unrelated-finding' }],
   ]) {
-    pr.comments[1].body = buildStandDownComment({ reason: 'needs-judgment', findingRefs: refs });
+    pr.comments[1].body = legacyStandDownComment({ reason: 'needs-judgment', findingRefs: refs });
     expect(planRulingResolvedStandDown(pr, { repo })).toBeNull();
   }
 });
@@ -157,7 +158,7 @@ it.each(['blocked', 'new-review', 'malformed', 'answered', 'new-question'])('hol
   } else if (state === 'answered') {
     fresh = fixture(); fresh.comments.push(comment(4, buildOperatorAnswer({ standDownId: '2', actor: 'chalbert', channel: 'chat', reason: 'Handled by hand' })));
   } else if (state === 'new-question') {
-    fresh = fixture(); fresh.comments.push(comment(4, buildStandDownComment({ reason: 'needs-judgment', detail: 'Choose a design' })));
+    fresh = fixture(); fresh.comments.push(comment(4, legacyStandDownComment({ reason: 'needs-judgment', detail: 'Choose a design' })));
   }
   await runRulingResolvesStandDownPass({ repo, setting: 'on', listPrs: () => [pr],
     readPr: () => ++reads === 1 ? pr : fresh, editLabels: () => writes.push('labels'),
@@ -183,10 +184,10 @@ it('finding subjects round-trip without changing head/reason readers or trusting
   expect(standDownFindingRefs(body)).toEqual(refs);
   expect(standDownHead(body)).toBe(head);
   expect(standDownTrailerReason(body)).toBe('needs-judgment');
-  expect(standDownFindingRefs(buildStandDownComment({ reason: 'needs-judgment', detail: body }))).toBeNull();
+  expect(standDownFindingRefs(legacyStandDownComment({ reason: 'needs-judgment', detail: body }))).toBeNull();
   expect(standDownFindingRefs(body.replace(/findings=\S+/, 'findings=not-json'))).toBeNull();
-  expect(() => buildStandDownComment({ reason: 'conflict', findingRefs: refs })).toThrow();
-  expect(() => buildStandDownComment({ reason: 'needs-judgment', findingRefs: [] })).toThrow();
+  expect(() => legacyStandDownComment({ reason: 'conflict', findingRefs: refs })).toThrow();
+  expect(() => legacyStandDownComment({ reason: 'needs-judgment', findingRefs: [] })).toThrow();
 });
 it('does not use a prior relay to remove labels after a newer review', async () => {
   const pr = fixture();

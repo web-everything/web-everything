@@ -44,7 +44,6 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { readBotLogins } from '../lib/github-app-identity.mjs';
 import { cascadePolicy } from '../lib/policy-cascade.mjs';
-import { isUnderTest } from '../lib/under-test.mjs';
 
 /**
  * we:scripts/conveyor/stand-down.mjs#STAND_DOWN_MARKER — the stable FIRST LINE of the durable stand-down comment.
@@ -749,12 +748,12 @@ export function standDownReason(body) {
  * The body states the ASYMMETRY explicitly — terminal for the reconciler, cleared by a person — because that is
  * the difference between a marker and a burial. A reader who finds this comment must be able to see, without
  * reading any code, that the automation has deliberately stopped and that they are the intended next step.
- * Head is required outside tests; tests may still construct historical headless comments.
+ * Head is always required. Historical comments belong in explicit reader fixtures.
  * @param {{ actor?:string, reason?:string, detail?:string, head:string }} o
  * @returns {string}
  */
 export function buildStandDownComment({ actor = 'conveyor fix agent', reason = '', detail = '', head = null, findingRefs } = {}) {
-  if (!isUnderTest() && (!isSafeGitSha(head) || head.trim() !== head)) {
+  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head.length !== 40) {
     throw new TypeError('stand-down: a valid head is required; pass the PR head SHA');
   }
   if (findingRefs !== undefined && (reason !== 'needs-judgment' || !validFindingRefs(findingRefs))) {

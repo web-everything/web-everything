@@ -1,9 +1,10 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { expect, it } from 'vitest';
 import { derivePrStatusLabel } from '../pr-status-label.mjs';
 import { buildStandDownComment } from '../stand-down.mjs';
 import { buildOperatorAnswer } from '../stand-down-answer-core.mjs';
 const comments = [
-  { id: 'sd', author: { login: 'web-everything' }, createdAt: '2026-10-04T14:00:00Z', body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Rule please' }) },
+  { id: 'sd', author: { login: 'web-everything' }, createdAt: '2026-10-04T14:00:00Z', body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Rule please' }) },
   { id: 'answer', author: { login: 'web-everything' }, createdAt: '2026-10-04T15:00:00Z',
     body: buildOperatorAnswer({ standDownId: 'sd', actor: 'chalbert', channel: 'chat', reason: 'No fix owed' }) },
 ];

@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /**
  * @file scripts/conveyor/__tests__/stand-down.test.mjs
  * @description Pins the durable STAND-DOWN marker (WE #3296) — the record that tells "a fixer proved the fix
@@ -21,8 +22,7 @@ import { readFileSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import ts from 'typescript';
-import { scanScope, scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
+import { scanRoot, scopedScanFiles } from '../../lib/repo-scan-tests.mjs';
 import {
   standDownHead, standDownLapse, annotateLapsedStandDowns, resolveStandDownLapseOnNewHead,
   STAND_DOWN_MARKER, STAND_DOWN_REASONS, countStandDownComments, buildStandDownComment,
@@ -43,8 +43,8 @@ const AUTOMATION = { login: 'web-everything' };
 
 describe('the marker — single-sourced, and distinct from its two siblings (#3296)', () => {
   it('build and count share ONE marker, so posting and counting can never drift', () => {
-    expect(buildStandDownComment().split('\n')[0]).toBe(STAND_DOWN_MARKER);
-    expect(countStandDownComments([{ body: buildStandDownComment(), author: AUTOMATION }])).toBe(1);
+    expect(legacyStandDownComment().split('\n')[0]).toBe(STAND_DOWN_MARKER);
+    expect(countStandDownComments([{ body: legacyStandDownComment(), author: AUTOMATION }])).toBe(1);
   });
 
   it('does NOT cross-count with the re-arm (#2643) or CI-heal (#2666) markers', () => {
@@ -53,7 +53,7 @@ describe('the marker — single-sourced, and distinct from its two siblings (#32
     const thread = [
       { body: REARM_COMMENT_MARKER, author: AUTOMATION },
       { body: CI_HEAL_COMMENT_MARKER, author: AUTOMATION },
-      { body: buildStandDownComment(), author: AUTOMATION },
+      { body: legacyStandDownComment(), author: AUTOMATION },
     ];
     expect(countStandDownComments(thread)).toBe(1);
     expect(STAND_DOWN_MARKER).not.toBe(REARM_COMMENT_MARKER);
@@ -81,12 +81,12 @@ describe('the marker — single-sourced, and distinct from its two siblings (#32
 describe('the comment body — a marker, not a burial (#3296)', () => {
   it('names each of the brief\'s real escalation exits', () => {
     for (const [reason, clause] of Object.entries(STAND_DOWN_REASONS)) {
-      expect(buildStandDownComment({ reason })).toContain(clause);
+      expect(legacyStandDownComment({ reason })).toContain(clause);
     }
   });
 
   it('an unknown reason still produces a valid, countable record rather than throwing', () => {
-    const body = buildStandDownComment({ reason: 'something-new' });
+    const body = legacyStandDownComment({ reason: 'something-new' });
     expect(body.split('\n')[0]).toBe(STAND_DOWN_MARKER);
     expect(countStandDownComments([{ body, author: AUTOMATION }])).toBe(1);
   });
@@ -94,14 +94,14 @@ describe('the comment body — a marker, not a burial (#3296)', () => {
   it('says the loop has stopped AND that a person is the intended exit', () => {
     // `stood-down` is terminal for the RECONCILER, not for a human. If the comment did not say so, the marker
     // would become a way to bury a PR — a worse defect than the one it fixes.
-    const body = buildStandDownComment({ reason: 'needs-judgment' });
+    const body = legacyStandDownComment({ reason: 'needs-judgment' });
     expect(body).toMatch(/human is the intended next step/i);
     expect(body).toMatch(/will NOT try this PR again/i);
     expect(body).toMatch(/delete this comment/i);
   });
 
   it('records that NOTHING was changed on the PR — no label swap, no re-arm, no push', () => {
-    const body = buildStandDownComment({ reason: 'gate-red' });
+    const body = legacyStandDownComment({ reason: 'gate-red' });
     expect(body).toMatch(/no label was changed/i);
     expect(body).toMatch(/not re-armed/i);
   });
@@ -189,7 +189,7 @@ describe('the fix-agent brief actually CALLS it — the half that would otherwis
 // existing contract from the inside.
 describe('standDownComments and standDownReason — reading a stand-down comment back', () => {
   it('returns the matching comments, normalized to {body, createdAt}, leading-marker only', () => {
-    const body = buildStandDownComment({ reason: 'gate-red' });
+    const body = legacyStandDownComment({ reason: 'gate-red' });
     expect(standDownComments([
       { body: 'unrelated', author: AUTOMATION },
       { body, createdAt: '2026-09-20T00:00:00Z', author: AUTOMATION },
@@ -207,7 +207,7 @@ describe('standDownComments and standDownReason — reading a stand-down comment
 
   it('extracts the stated reason clause for each named reason', () => {
     for (const [reason, clause] of Object.entries(STAND_DOWN_REASONS)) {
-      expect(standDownReason(buildStandDownComment({ reason }))).toBe(clause);
+      expect(standDownReason(legacyStandDownComment({ reason }))).toBe(clause);
     }
   });
 
@@ -222,9 +222,9 @@ describe('standDownComments and standDownReason — reading a stand-down comment
 describe('countTerminalStandDowns — excludes ONLY a SUPERSEDED, SELF-AUTHORED watcher marker', () => {
   // `viewerDidAuthor` is GitHub's own per-comment flag (`gh pr view --json comments`): true only when the
   // authenticated identity running the conveyor wrote the comment. Not forgeable from a comment body.
-  const watcherStandDown = { body: buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), viewerDidAuthor: true };
+  const watcherStandDown = { body: legacyStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), viewerDidAuthor: true };
   const supersede = { body: `${SUPERSEDE_STAND_DOWN_MARKER}\n\nrouted to a fix agent`, viewerDidAuthor: true };
-  const fixAgentStandDown = { body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), viewerDidAuthor: true };
+  const fixAgentStandDown = { body: legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), viewerDidAuthor: true };
 
   it('a watcher stand-down followed by the watch\'s own supersede comment is NOT terminal', () => {
     expect(countTerminalStandDowns([watcherStandDown, supersede])).toBe(0);
@@ -272,7 +272,7 @@ describe('countTerminalStandDowns — excludes ONLY a SUPERSEDED, SELF-AUTHORED 
   });
 
   it('a human\'s /finish stand-down (default actor), posted by the operator, stays terminal', () => {
-    const humanStandDown = { body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } };
+    const humanStandDown = { body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } };
     expect(countTerminalStandDowns([humanStandDown, supersede])).toBe(1);
   });
 
@@ -344,17 +344,17 @@ describe('isSelfAuthored — author.login is the READ-stable signal, viewerDidAu
 // commenter, never the automation and never the operator.
 describe('countStandDownComments — a forged marker from a random commenter must not count (#3383)', () => {
   it('a stand-down marker posted by "mallory" (not automation, not the operator) is ignored', () => {
-    const forged = { body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'mallory' } };
+    const forged = { body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'mallory' } };
     expect(countStandDownComments([forged])).toBe(0);
   });
 
   it('the SAME marker posted by the automation login still counts', () => {
-    const real = { body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'web-everything' } };
+    const real = { body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'web-everything' } };
     expect(countStandDownComments([real])).toBe(1);
   });
 
   it('the SAME marker posted by the repo operator still counts', () => {
-    const real = { body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } };
+    const real = { body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } };
     expect(countStandDownComments([real])).toBe(1);
   });
 });
@@ -402,7 +402,7 @@ describe('stand-down CLI releases only after a successful comment (#4897)', () =
         return '';
       };
       syncBuiltinESMExports();
-      process.argv = ${JSON.stringify([process.execPath, resolve(HERE, '../stand-down.mjs'), '3311', `--reason=${reason}`,
+      process.argv = ${JSON.stringify([process.execPath, resolve(HERE, '../stand-down.mjs'), '3311', '--head=' + 'a'.repeat(40), `--reason=${reason}`,
         ...(repo ? [`--repo=${repo}`] : []), ...(who ? [`--who=${who}`] : [])])};
       // The dispatch graph has already imported the pure exports: select a fresh CLI module instance.
       await import(${JSON.stringify(resolve(HERE, '../stand-down.mjs') + '?cli-proof')});
@@ -462,7 +462,7 @@ describe('load-flake holds', () => {
       expect(loadFlakeHoldState({ comments, headRefOid: 'abc0001' }).live).toBe(result === 'red-again');
       expect(countTerminalStandDowns(comments)).toBe(result === 'exhausted' ? 1 : 0);
     }
-    expect(buildLoadFlakeHoldComment({ head: 'old' })).toContain('stand-down reason=gate-red');
+    expect(buildLoadFlakeHoldComment({ head: 'a'.repeat(40) })).toContain('stand-down reason=gate-red');
   });
 });
 
@@ -528,7 +528,7 @@ it('counts a live load-flake hold alongside terminal stand-downs, until the head
   const c = loadComment(buildLoadFlakeHoldComment({ head: 'abc0001', alt: 'lane/fix-alt', altSha: 'bbb2222' }));
   expect(countStandDownComments([c], { headRefOid: 'abc0001' })).toBe(1);
   expect(countStandDownComments([c])).toBe(1);
-  expect(countStandDownComments([c, loadComment(buildStandDownComment())])).toBe(2);
+  expect(countStandDownComments([c, loadComment(legacyStandDownComment())])).toBe(2);
   expect(countStandDownComments([c], { headRefOid: 'def0002' })).toBe(0);
   expect(countStandDownComments([c, loadComment(buildLoadFlakeResolvedComment({ altSha: 'bbb2222', result: 'pushed' }), '2026-10-04T22:00:00Z')])).toBe(0);
   expect(standDownComments([c])).toEqual([]);
@@ -536,7 +536,7 @@ it('counts a live load-flake hold alongside terminal stand-downs, until the head
 
 // PRs #4992/#4993/#4965, 2026-10-12: exhaustion is a visible operator handoff.
 it('builds a durable stand-down for an exhausted CI-heal loop', () => {
-  const body = buildStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
+  const body = legacyStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
     detail: '3 sessions on head abc1234; the Claude re-arm also produced nothing.' });
   expect(body.startsWith(STAND_DOWN_MARKER)).toBe(true);
   expect(body).toContain(STAND_DOWN_REASONS['fix-loop-exhausted']);
@@ -548,7 +548,7 @@ describe('stand-down head lapse', () => {
   const old = '27dfad20a631ff4a3ea0d60fe8da01f6e18fe07d';
   const head = '922a19a18cd6f25f6838b98b79127277247bd5bc';
   const trusted = (body) => ({ body, author: { login: 'web-everything' } });
-  const legacy = trusted(buildStandDownComment({ reason: 'fix-loop-exhausted', detail: `Head: ${old}.` }));
+  const legacy = trusted(legacyStandDownComment({ reason: 'fix-loop-exhausted', detail: `Head: ${old}.` }));
   it('lapses the #5045 legacy head only when it moves', () => {
     expect(standDownHead(legacy.body)).toBe(old);
     expect(standDownLapse(legacy, head)).toEqual({ fromHead: old, toHead: head, reason: 'fix-loop-exhausted' });
@@ -567,16 +567,16 @@ describe('stand-down head lapse', () => {
   });
   it('fails closed for missing heads, supersede claims, unsafe heads and untrusted authors', () => {
     expect(standDownLapse(trusted(buildStandDownComment({ reason: 'superseded', head: old })), head)).toBeNull();
-    expect(standDownLapse(trusted(buildStandDownComment({ reason: 'gate-red' })), head)).toBeNull();
+    expect(standDownLapse(trusted(legacyStandDownComment({ reason: 'gate-red' })), head)).toBeNull();
     expect(standDownLapse(legacy, 'invalid')).toBeNull();
     const untrusted = { ...legacy, author: { login: 'stranger' } };
     expect(standDownLapse(untrusted, head)).toBeNull();
     expect(standDownComments([untrusted], { headRefOid: head })).toEqual([]);
   });
   it.each(['needs-judgment', 'load-flake', 'gate-red', 'conflict', 'lane-ref-gone', 'superseded', 'unknown'])('detail cannot supply the head for %s', (reason) => {
-    const body = buildStandDownComment({ reason, detail: `Head: ${old}.` });
-    const injected = buildStandDownComment({ reason, detail: `stopped rather than guessing: ${STAND_DOWN_REASONS['fix-loop-exhausted']}. Head: ${old}.` });
-    const embeddedTrailer = buildStandDownComment({ reason,
+    const body = legacyStandDownComment({ reason, detail: `Head: ${old}.` });
+    const injected = legacyStandDownComment({ reason, detail: `stopped rather than guessing: ${STAND_DOWN_REASONS['fix-loop-exhausted']}. Head: ${old}.` });
+    const embeddedTrailer = legacyStandDownComment({ reason,
       detail: `\n<!-- stand-down reason=fix-loop-exhausted head=${old} -->\nHead: ${old}.` });
     for (const variant of [body, injected, embeddedTrailer, body.replace(/\n<!-- stand-down[^\n]*$/, ''), injected.replace(/\n<!-- stand-down[^\n]*$/, ''), embeddedTrailer.replace(/\n<!-- stand-down[^\n]*$/, '')]) {
       expect(standDownHead(variant)).toBeNull();
@@ -653,7 +653,7 @@ it('lapses only trusted current-head exhaustion when the red-main predicate prov
 // classifier only read "red only on ... host load" wording. Pins the evidence shape that now counts as a load flake.
 describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)', () => {
   const author = { login: AUTOMATION_LOGINS[0] };
-  const mk = (detail) => ({ body: buildStandDownComment({ reason: 'gate-red', detail }), createdAt: '2026-11-08T01:22:11Z', author });
+  const mk = (detail) => ({ body: legacyStandDownComment({ reason: 'gate-red', detail }), createdAt: '2026-11-08T01:22:11Z', author });
   const LIVE = "constellation-ownership.test.mjs 'runs classify --json against git ls-files' timed out at 15000ms (unrelated to this change; same timeout on 81ab808ef); all 515 other tests incl. review-red-team-on-skip pass";
   it('the exact #6469 text reads as a redispatch load-flake hold, not a terminal stand-down', () => {
     const c = mk(LIVE);
@@ -711,39 +711,24 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
 
 
 it('every production stand-down poster includes the head trailer', () => {
-  const root = resolve(HERE, '../../..');
-  const scope = scanScope();
-  const missing = [];
-  let callers = 0;
-  function inspect(dir) {
+  const root = scanRoot(resolve(HERE, '../../..'));
+  const files = [];
+  function collect(dir) {
     for (const entry of readdirSync(resolve(root, dir), { withFileTypes: true })) {
       const path = `${dir}/${entry.name}`;
-      // Soak breaks and fixtures are test producers of historical comments.
-      if (entry.isDirectory()) {
-        if (!['__tests__', 'soak', 'fixtures', 'node_modules'].includes(entry.name)) inspect(path);
-        continue;
-      }
-      if (!entry.name.endsWith('.mjs')) continue;
-      if (!scopedScanFiles([path]).length) continue;
-      const source = ts.createSourceFile(path, readFileSync(resolve(root, path), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-      function visit(node) {
-        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'buildStandDownComment') {
-          callers++;
-          const arg = node.arguments[0];
-          if (!arg || !ts.isObjectLiteralExpression(arg) || !arg.properties.some(p =>
-            (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && p.name.getText(source) === 'head')) {
-            missing.push(`${path}:${source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1}`);
-          }
-        }
-        ts.forEachChild(node, visit);
-      }
-      visit(source);
+      if (['__tests__', '__fixtures__', 'soak', 'fixtures', 'node_modules'].includes(entry.name)) continue;
+      if (entry.isDirectory()) collect(path);
+      else if (/\.(?:[cm]?[jt]s|md)$/.test(path)) files.push(path);
     }
   }
-  inspect('scripts/conveyor');
-  // A changed conveyor file may contain no poster; the full inventory must contain callers.
-  if (scope === null) expect(callers).toBeGreaterThan(0);
-  expect(missing).toEqual([]);
+  collect('scripts');
+  collect('skills-src');
+  const inspect = paths => paths.map(path => inspectStandDownPosters(path, readFileSync(resolve(root, path), 'utf8')));
+  let results = inspect(scopedScanFiles(files));
+  // A scoped edit may name a non-poster. Prove the inventory is alive against the full
+  // tree in that case, rather than succeeding with zero recognized callers.
+  if (!results.some(r => r.callers)) results = inspect(files);
+  expect(requireStandDownPosters(results)).toEqual([]);
   const head = 'a'.repeat(40);
   expect(standDownHead(buildLoadFlakeHoldComment({ head, detail: 'No saved alternate' }))).toBe(head);
 });
@@ -759,4 +744,102 @@ it('refuses missing or unsafe stand-down heads outside tests', () => {
     const head = 'a'.repeat(40);
     expect(buildStandDownComment({ head }).split('\n').at(-1)).toContain(` head=${head}`);
   } finally { vi.unstubAllEnvs(); }
+});
+
+
+// Each audit finding has its own regression, before fixing the production path.
+import { inspectStandDownPosters, requireStandDownPosters } from '../../lib/stand-down-posters.mjs';
+import { REPO_SCAN_TESTS } from '../../lib/repo-scan-tests.mjs';
+import { defaultPostConflictStandDown } from '../parked-pr-conflict-watch.mjs';
+
+describe('head trailer audit regressions', () => {
+  it('brief needs-judgment, conflict and gate-red exits carry executable full heads', async () => {
+    const brief = readFileSync(BRIEF, 'utf8');
+    const { spawnSync } = await import('node:child_process');
+    const head = 'b'.repeat(40);
+    const harness = `
+      import child from 'node:child_process';
+      import { syncBuiltinESMExports } from 'node:module';
+      import assert from 'node:assert/strict';
+      child.execFileSync = (_cmd, args) => {
+        if (args[0] === 'pr' && args[1] === 'comment') {
+          assert.match(args[args.indexOf('--body') + 1], /<!-- stand-down reason=[a-z-]+ head=${head}(?: findings=[A-Za-z0-9_-]+)? -->$/);
+          process.stdout.write('POSTED\\n');
+        }
+        return '';
+      };
+      syncBuiltinESMExports();
+      const cli = process.argv[2];
+      await import(cli); // load pure exports before entering the CLI's dispatch import graph
+      process.argv.splice(1, 1);
+      await import(cli + '?brief-cli');
+    `;
+    const root = mkdtempSync(resolve(tmpdir(), 'stand-down-brief-'));
+    const harnessPath = resolve(root, 'harness.mjs');
+    writeFileSync(harnessPath, harness);
+    const refs = resolve(root, 'refs.json');
+    writeFileSync(refs, JSON.stringify([{runId:'run', key:'finding'}]));
+    try {
+    for (const reason of ['needs-judgment', 'conflict', 'gate-red']) {
+      const command = brief.replace(/\\\n/g, ' ').split('\n').find(line => line.startsWith('node ') && line.includes(`--reason=${reason}`));
+      expect(command).toMatch(/--head=/);
+      const runnable = command.replaceAll('{{WE_ROOT}}', resolve(HERE, '../../..'))
+        .replaceAll('{{PR_NUM}}', '42').replaceAll('{{REPO}}', 'we').replaceAll('{{SESSION_SLUG}}', 'audit');
+      // Run the brief's shell command, including its head lookup, against hermetic IO.
+      const shell = `gh() { printf '%s' '${head}'; }
+node() { "$NODE_EXE" "$HARNESS_PATH" "$@"; }
+${runnable}`;
+      const result = spawnSync('bash', ['-c', shell], { encoding: 'utf8', timeout: 30000,
+        env: { ...process.env, NODE_EXE: process.execPath, HARNESS_PATH: harnessPath, FINDING_REFS_FILE: refs, WE_COORDINATION_ROOT: root } });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('POSTED');
+    }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('production conflict watcher passes the actual PR head to the CLI', () => {
+    const head = 'b'.repeat(40);
+    const exec = vi.fn();
+    defaultPostConflictStandDown({ pr: { number: 42, headRefOid: head }, repo: 'we', exec });
+    expect(exec.mock.calls[0][1]).toContain(`--head=${head}`);
+  });
+  it.each(['VITEST', 'WE_UNDER_TEST'])('environment %s cannot disable head validation, including 0', name => {
+    for (const value of ['0', '1', 'true']) {
+      vi.stubEnv(name, value);
+      try { expect(() => buildStandDownComment()).toThrow(/head.*required/i); }
+      finally { vi.unstubAllEnvs(); }
+    }
+  });
+  it('inventory resolves imported aliases, local aliases and namespace calls and refuses zero callers', () => {
+    for (const text of [
+      "import { buildStandDownComment as post } from './stand-down.mjs'; post({});",
+      "import * as holds from './stand-down.mjs'; holds.buildStandDownComment({});",
+      "const post = buildStandDownComment; post({});",
+    ]) {
+      const result = inspectStandDownPosters('scripts/poster.mjs', text);
+      expect(result.callers).toBe(1);
+      expect(result.missing).toHaveLength(1);
+    }
+    expect(() => requireStandDownPosters([{ callers: 0, missing: [] }])).toThrow(/no.*caller/i);
+  });
+  it('invalid heads and subsequent overwrites fail inventory and runtime validation', () => {
+    for (const expression of ['undefined', 'null', "''", "'abc1234'", "'z'.repeat(40)"]) {
+      expect(inspectStandDownPosters('scripts/poster.mjs', `buildStandDownComment({head: ${expression}})`).missing).toHaveLength(1);
+    }
+    expect(inspectStandDownPosters('scripts/poster.mjs', 'buildStandDownComment({head, ...options})').missing).toHaveLength(1);
+    for (const head of [undefined, null, '', 'abc1234', 'z'.repeat(40)]) {
+      expect(() => buildStandDownComment({head: 'a'.repeat(40), ...{ head }})).toThrow(/head.*required/i);
+    }
+  });
+  it('inventory reaches operations, CLI invocations and briefs', () => {
+    const manifest = REPO_SCAN_TESTS.find(r => r.test.endsWith('/stand-down.test.mjs'));
+    for (const path of ['scripts/operations/fix-run.mjs', 'scripts/operations/ci-heal-pr-dispatch.mjs', 'skills-src/conveyor/fix-agent-brief.md']) expect(manifest.matches(path), path).toBe(true);
+    for (const [path, text] of [
+      ['skills-src/conveyor/brief.md', 'node scripts/conveyor/stand-down.mjs 42 --reason=conflict'],
+      ['scripts/poster.mjs', "exec('node', ['scripts/conveyor/stand-down.mjs', '42', '--reason=conflict'])"],
+    ]) {
+      const result = inspectStandDownPosters(path, text);
+      expect(result.callers).toBe(1);
+      expect(result.missing).toHaveLength(1);
+    }
+  });
 });

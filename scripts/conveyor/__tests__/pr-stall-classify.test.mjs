@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 /** @file pr-stall-classify.test.mjs
  * @description The stall sweep's pure classifier: every waiting state x every judge verdict, fail-closed paths, guard
  *   paths, the round ceiling, and the never-automatic actions.
@@ -470,7 +471,7 @@ describe('stand-down detection (live #5768 shape)', async () => {
   const { AUTOMATION_LOGINS } = await import('../../lib/marker-authorship.mjs');
   const bot = AUTOMATION_LOGINS[0];
   const head = 'c'.repeat(40);
-  const standDown = { author: { login: bot }, createdAt: '2026-10-21T18:01:00Z', body: buildStandDownComment({ reason: 'gate-red', detail: 'verify red' }) };
+  const standDown = { author: { login: bot }, createdAt: '2026-10-21T18:01:00Z', body: legacyStandDownComment({ reason: 'gate-red', detail: 'verify red' }) };
   const pr = (o = {}) => ({ repo: REPO, number: 5768, title: 'x', headRefOid: head, headCommittedAt: '2026-10-21T17:30:00Z', updatedAt: '2026-10-21T21:30:00Z',
     isDraft: false, labels: [{ name: 'review:changes' }], labelEvents: [], statusCheckRollup: [], comments: [standDown], ...o });
   const sweep = (p, o = {}) => assessPrSweep({ now: Date.parse('2026-10-21T22:05:00Z'), prs: [p], liveJobs: [], drainSkips: [], standDownLapse: 'on', ...o }).prs[0];
@@ -503,7 +504,7 @@ describe('stand-down detection (live #5768 shape)', async () => {
     expect(sweep(pr({ labels: [{ name: 'review:pending' }] })).waitingOn).toBe('system:fix-stood-down');
   });
   it('the reason is the end-anchored trailer, not a quoted one in the detail', () => {
-    const body = buildStandDownComment({ reason: 'gate-red', detail: 'quoting <!-- stand-down reason=conflict --> here' });
+    const body = legacyStandDownComment({ reason: 'gate-red', detail: 'quoting <!-- stand-down reason=conflict --> here' });
     expect(sweep(pr({ comments: [{ ...standDown, body }] })).why).toMatch(/reason=gate-red/);
   });
   it('it outranks a cleared red-team send-back (a gate re-run cannot revive a stood-down fixer)', () => {

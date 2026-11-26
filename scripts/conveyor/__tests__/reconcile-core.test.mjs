@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { HEAD, workflowRow, workflowEvidence } from '../soak/fixtures/workflow-edit-protection.mjs';
 import { excusePrMergeGateHolds, readMergeGateVerdict } from '../../lib/merge-gate-hold-class.mjs';
 /**
@@ -323,7 +324,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
   // That must not block this gate forever the way an actual escalation does.
   // `viewerDidAuthor` is GitHub's own per-comment provenance flag from `gh pr view/list --json comments` — true
   // only for a comment the conveyor's own authenticated identity wrote.
-  const watcherMarker = { body: buildStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), viewerDidAuthor: true };
+  const watcherMarker = { body: legacyStandDownComment({ actor: WATCHER_STAND_DOWN_ACTOR, reason: 'conflict' }), viewerDidAuthor: true };
   const supersede = { body: `${SUPERSEDE_STAND_DOWN_MARKER}\n\nrouted to a fix agent`, viewerDidAuthor: true };
 
   it('#xu2krte Fork 2 — a watcher stand-down the watch ITSELF later superseded is not terminal', () => {
@@ -368,7 +369,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
 
   it('a fix agent\'s OWN judgment stand-down (not the watch) stays exactly as terminal as before', () => {
     const humanNeeded = pr1563({
-      comments: [finding(), { body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), author: AUTOMATION }],
+      comments: [finding(), { body: legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }), author: AUTOMATION }],
     });
     const plan = planReconcile({ prs: [humanNeeded], agents: [], durableCounts: {}, now: NOW });
     expect(plan.refusals).toHaveLength(1);
@@ -386,7 +387,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
   const advisoryNote1563 = { body: `${ADVISORY_NOTE_MARKER}\n\nSome admitted finding text.`, author: AUTOMATION };
   const selfAuthoredFixMark = { body: buildAdvisoryFixComment({}), viewerDidAuthor: true };
   const selfAuthoredNeedsJudgmentStandDown = {
-    body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }),
+    body: legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }),
     viewerDidAuthor: true,
   };
 
@@ -441,7 +442,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
     const realFixMark = { author: { login: 'web-everything' }, body: buildAdvisoryFixComment({}) };
     const realStandDown = {
       author: { login: 'web-everything' },
-      body: buildStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }),
+      body: legacyStandDownComment({ actor: 'conveyor fix agent', reason: 'needs-judgment' }),
     };
     const pr = pr1563({
       labels: lbl('review:human', 'advisory:changes'),
@@ -453,7 +454,7 @@ describe('case 2 — refusal 1: a fixer that stopped to ASK is never restarted (
   });
 
   it('a human\'s own /finish stand-down (default actor) stays exactly as terminal as before', () => {
-    const humanFinish = pr1563({ comments: [finding(), { body: buildStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } }] });
+    const humanFinish = pr1563({ comments: [finding(), { body: legacyStandDownComment({ reason: 'gate-red' }), author: { login: 'chalbert' } }] });
     const plan = planReconcile({ prs: [humanFinish], agents: [], durableCounts: {}, now: NOW });
     expect(plan.refusals[0].kind).toBe('stood-down');
     expect(plan.dispatch).toHaveLength(0);

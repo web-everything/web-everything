@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { loadSameLineConflictSetting, resolveSameLineConflictSetting } from '../conflict-watch-same-line.mjs';
@@ -7,7 +8,7 @@ import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 
 const setting = value => ({ conflictWatch: { sameLineConflict: value } });
 const labels = (...names) => names.map(name => ({ name }));
-const marker = actor => ({ body: buildStandDownComment({ actor, reason: 'conflict' }), author: { login: 'web-everything' } });
+const marker = actor => ({ body: legacyStandDownComment({ actor, reason: 'conflict' }), author: { login: 'web-everything' } });
 const watcher = () => marker(WATCHER_STAND_DOWN_ACTOR);
 const supersede = () => ({ body: buildSupersedeStandDownComment({ number: 5017 }), author: { login: 'web-everything' } });
 

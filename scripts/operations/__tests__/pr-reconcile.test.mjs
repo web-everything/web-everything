@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from '../../conveyor/__tests__/fixtures/legacy-stand-down.mjs';
 import { describe, it, expect } from 'vitest';
 import { prReconcileOperation, shapeReconcileFinding, assessReconcilePrs } from '../pr-reconcile.mjs';
 import { createPrReconcileReader, listArgv, commentsArgv, LIST_LIMIT } from '../pr-status-io.mjs';
@@ -47,7 +48,7 @@ describe('actual labels and comment holds', () => {
   });
 
   it('finds a label-free stand-down through the canonical marker reader', () => {
-    const body = buildStandDownComment({ reason: 'needs-judgment', detail: 'Which behavior is intended?' });
+    const body = legacyStandDownComment({ reason: 'needs-judgment', detail: 'Which behavior is intended?' });
     const pr = fixture({ comments: { 1: [comment(body)] } }).report().prs[0];
     expect(pr.heldBy).toBe('stand-down');
     expect(pr.heldByEvidence).toEqual([{ source: 'comment', excerpt: body, url: 'https://example.com/comment' }]);
@@ -84,13 +85,13 @@ describe('actual labels and comment holds', () => {
   });
 
   it('does not interpret quoted markers or incidental label mentions as holds', () => {
-    const comments = [comment(`> ${buildStandDownComment()}`), comment('This change documents review:human.')];
+    const comments = [comment(`> ${legacyStandDownComment()}`), comment('This change documents review:human.')];
     expect(fixture({ comments: { 1: comments } }).report().prs[0].heldBy).toBe('none');
   });
 
   it('preserves secondary holds and deterministic precedence', () => {
     const pr = fixture({ rows: [row(1, { labels: ['blocked', 'review:pending', 'review:human'], mergeable: 'CONFLICTING' })],
-      comments: { 1: [comment(buildStandDownComment()), comment('Merge conflict with main')] } }).report().prs[0];
+      comments: { 1: [comment(legacyStandDownComment()), comment('Merge conflict with main')] } }).report().prs[0];
     expect(pr.heldBy).toBe('human');
     expect(pr.holds.map((h) => h.heldBy)).toEqual(['human', 'stand-down', 'conflict', 'dependency', 'advisory-pending']);
   });
@@ -98,7 +99,7 @@ describe('actual labels and comment holds', () => {
   it('clears ordinary comment history with a later explicit clearance, but preserves stand-down', () => {
     const comments = [comment('Human review required'), comment('Hold cleared', '2026-09-02T00:00:00Z')];
     expect(fixture({ comments: { 1: comments } }).report().prs[0].heldBy).toBe('none');
-    comments.push(comment(buildStandDownComment()));
+    comments.push(comment(legacyStandDownComment()));
     expect(fixture({ comments: { 1: comments } }).report().prs[0].heldBy).toBe('stand-down');
   });
 });

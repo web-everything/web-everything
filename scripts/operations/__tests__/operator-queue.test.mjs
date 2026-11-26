@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from '../../conveyor/__tests__/fixtures/legacy-stand-down.mjs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 
@@ -62,7 +63,7 @@ it('does not surface an answered hold that lapsed on a new head', () => {
 
 it.each([true, false])('omits stale stand-downs from the queue (recorded head: %s)', recorded => {
   const head = 'b'.repeat(40);
-  const held = { ...standDown, body: buildStandDownComment({ reason: 'fix-loop-exhausted',
+  const held = { ...standDown, body: legacyStandDownComment({ reason: 'fix-loop-exhausted',
     ...(recorded ? { head: 'a'.repeat(40) } : {}) }) };
   execFileSync.mockReturnValue(JSON.stringify([{ ...pr(5195, [held]), headRefOid: head,
     commits: [{ oid: head, committedDate: '2026-10-15T13:00:00Z' }] }]));
@@ -392,7 +393,7 @@ describe('staged copies missing an optional reader', () => {
 
 it('routes needs-judgment to NEEDS YOU with the fixer question', () => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
-  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule not-real on this finding.' }) };
+  const held = { ...standDown, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Please rule not-real on this finding.' }) };
   execFileSync.mockReturnValue(JSON.stringify([pr(7, [held])]));
   run(['--json']);
   expect(JSON.parse(stdout())).toMatchObject({ stoodDown: [], needsYouStandDowns: [
@@ -402,7 +403,7 @@ it('routes needs-judgment to NEEDS YOU with the fixer question', () => {
 it('prints the fixer question under NEEDS YOU without an empty placeholder', () => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'needs-you');
   execFileSync.mockReturnValue(JSON.stringify([pr(7, [{ ...standDown,
-    body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) }])]));
+    body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) }])]));
   run();
   const section = stdout().split('NEEDS YOU (')[1].split('RULING NEEDED')[0];
   expect(section).toContain('o/n#7  PR 7');
@@ -411,7 +412,7 @@ it('prints the fixer question under NEEDS YOU without an empty placeholder', () 
 });
 it('resolved needs-judgment drops off and the stood-down setting restores the old section', () => {
   vi.stubEnv('WE_REVIEW_STAND_DOWN_QUEUE_SECTION', 'stood-down');
-  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
+  const held = { ...standDown, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
   execFileSync.mockReturnValue(JSON.stringify([pr(7, [held]), pr(8, [held, answer])]));
   run(['--json']);
   const report = JSON.parse(stdout());
@@ -431,7 +432,7 @@ it.each([false, true])('shows outstanding findings with subsequent operator ruli
     rulings: referrals.map((f, i) => ({ id: `${runId}:${i}`, key: f.key, reviewerId: reviewer.id, lens: 'correctness', result: 'block', rationale: 'checked', evidence: ['diff'] })) };
   const ruling = { version: 1, repo, pr: 7, head, actor: 'chalbert', channel: 'chat', reason: 'Not real',
     at: '2026-10-11T11:00:00Z', clearerId: 'session-1', rulings: [{ runId, key: referrals[0].key, result: 'not-real' }] };
-  const held = { ...standDown, body: buildStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
+  const held = { ...standDown, body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'Please rule.' }) };
   const comments = [{ id: 'ref', body: renderReferralRecord(record), author: { login: 'web-everything' }, createdAt: '2026-10-11T09:00:00Z' },
     held, ...(ruled ? [{ id: 'ruling', body: buildOperatorRulingComment(ruling), author: { login: 'chalbert' }, createdAt: ruling.at }] : [])];
   execFileSync.mockReturnValue(JSON.stringify([{ ...pr(7, comments), headRefOid: head, body: record.authorBody }]));

@@ -1,3 +1,4 @@
+import { legacyStandDownComment } from './fixtures/legacy-stand-down.mjs';
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -294,7 +295,7 @@ describe('replay: #4567/#4563/#4535 green drafts left unpromoted (2026-10-09)', 
 // (so a matrix row that stopped reproducing the refusal reddens here), then proves the fast step refuses it too.
 describe('parity: the fast step refuses everything the tick refuses before promote-draft', () => {
   const TRUSTED = { login: 'web-everything' };
-  const standDown = { id: 'IC_abc', body: buildStandDownComment({ reason: 'needs-judgment', detail: 'a question' }), author: TRUSTED, createdAt: '2026-10-09T05:00:00Z' };
+  const standDown = { id: 'IC_abc', body: legacyStandDownComment({ reason: 'needs-judgment', detail: 'a question' }), author: TRUSTED, createdAt: '2026-10-09T05:00:00Z' };
   const closeSuperseded = {
     body: buildOperatorAnswer({ standDownId: 'IC_abc', reason: 'close as superseded', actor: 'chalbert', channel: 'test', disposition: 'close-superseded' }),
     author: { login: 'chalbert' },
