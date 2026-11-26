@@ -14,12 +14,13 @@
  * instead (see the last test below), sidestepping that pool difference entirely.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { discoverModuleFiles, loadModuleRegistry } from '../../registry-discovery.mjs';
+import { findRawPushes } from '../../../lib/push-gate-lint.mjs';
 import { validateBreakShape } from '../breaks-shape.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -51,14 +52,26 @@ function loadBreaks(dir) {
 }
 
 describe('soak/breaks/index.mjs — directory discovery', () => {
-  it('the real registry registers successfully during S1.1 with legacy probes in both assertion modes', () => {
+  it('every real production descriptor registers successfully with independent evidence', () => {
     const out = execFileSync(process.execPath, [join(HERE, '../fixtures/fixpresent-registration.mjs')], {
       encoding: 'utf8', timeout: 15000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
     });
     const report = JSON.parse(out);
     expect(report.total).toBe(discoverModuleFiles(REAL_BREAKS_DIR).length);
-    expect(report.legacy).toBeGreaterThan(0);
-    expect(report.registered).toBe(report.total + report.legacy);
+    expect(report.legacy).toBe(0);
+    expect(report.refused).toEqual([]);
+    expect(report.registered).toBe(report.total);
+  });
+
+  it('has no count-only Git exemption and rejects a raw push substituted for a read', () => {
+    const file = 'scripts/conveyor/soak/define-break-test.mjs';
+    const allow = JSON.parse(readFileSync(join(HERE, '../../../push-gate-allowlist.json'), 'utf8'));
+    expect(allow.entries[file]).toBeUndefined();
+    const source = readFileSync(join(HERE, '../define-break-test.mjs'), 'utf8');
+    expect(findRawPushes(source, file)).toEqual([]);
+    const mutation = source.replace(/const sha = [^;]+;/, "const sha = execFileSync('git', ['push', 'origin', 'HEAD']);");
+    expect(mutation).not.toBe(source);
+    expect(findRawPushes(mutation, file)).toHaveLength(1);
   });
 
   it('reports legacy function probes during discovery without rejecting existing breaks', async () => {

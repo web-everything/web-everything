@@ -3,16 +3,15 @@
  * (`breaks/<id>.mjs`). Declared marker evidence always requires GREEN (missing evidence is an error).
  * When the tree under test carries a declared fixCommit, the scenario must be
  * GREEN. When it does not (the fix lives on another branch still in review), the test is EXPECTED-FAIL — titled
- * with the missing fix and its card, and `it.fails` still REQUIRES the break to reproduce, so it is never a
- * silent skip; it flips to a required pass by itself the moment the fix lands on this tree.
- * S1.1 keeps legacy function execution compatible while discovery warns; S1.2 migrates those descriptors
- * before removing this execution bridge. Declared sources always use the strict resolver below.
+ * with the missing fix and its card, and a completed, nonempty judge verdict REQUIRES the break
+ * to reproduce; setup/import/judge exceptions remain failures; it flips to a required pass by itself the moment the fix lands on this tree.
+ * Discovery warns about legacy descriptors, but execution refuses them until they declare independent evidence.
  */
 
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { readGit } from '../../lib/proc-read.mjs';
 import { parse } from 'acorn';
 import { describe, expect, it } from 'vitest';
 import { validateFixPresent } from './breaks-shape.mjs';
@@ -38,16 +37,16 @@ export function resolveFixPresent(source, root) {
     if (!found) throw new Error(`soak: marker ${source.marker} missing; restore the fix module`);
     return true;
   }
-  const git = args => execFileSync('git', args, {
+  const read = args => readGit(args, {
     cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
   }).trim();
   try {
-    const sha = git(['rev-parse', '--verify', `${source.fixCommit}^{commit}`]);
+    const sha = read(['rev-parse', '--verify', `${source.fixCommit}^{commit}`]);
     if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('invalid commit');
-    try { git(['merge-base', '--is-ancestor', sha, 'HEAD']); return true; }
+    try { read(['merge-base', '--is-ancestor', sha, 'HEAD']); return true; }
     catch (error) { if (error.status !== 1) throw error; }
-    const equivalent = git(['cherry', 'HEAD', sha, `${sha}^`]);
+    const equivalent = read(['cherry', 'HEAD', sha, `${sha}^`]);
     if (equivalent === `- ${sha}`) return true;
     if (equivalent === `+ ${sha}`) return false;
     throw new Error('incomplete patch-id evidence');
@@ -57,16 +56,20 @@ export function resolveFixPresent(source, root) {
 }
 
 export function defineBreakTest(b, { root = REPO_ROOT } = {}) {
-  // Temporary S1.1 bridge: rejecting legacy descriptors here would break collection of the unmigrated
-  // registry. Discovery reports them without executing them; S1.2 owns their migration and this removal.
-  const present = typeof b.fixPresent === 'function' ? b.fixPresent(root) : resolveFixPresent(b.fixPresent, root);
+  if (typeof b.fixPresent === 'function') {
+    throw new Error(`soak: break ${b.id}: fixPresent functions are refused; declare a marker or fixCommit before running this break`);
+  }
+  const present = resolveFixPresent(b.fixPresent, root);
   const title = present
     ? `${b.title} — stays fixed (fix ${b.fixedBy.sha})`
     : `[EXPECTED-FAIL: fix ${b.fixedBy.sha} (${b.fixedBy.where}) is not in this tree — ${b.card}] ${b.title}`;
   describe(`daemon soak — break ${b.id}`, () => {
-    (present ? it : it.fails)(title, async () => {
+    it(title, async () => {
       const report = await b.run({});
-      expect(b.judge(report)).toEqual([]);
+      const verdict = b.judge(report);
+      expect(Array.isArray(verdict)).toBe(true);
+      if (present) expect(verdict).toEqual([]);
+      else expect(verdict).not.toEqual([]);
     });
   });
 }

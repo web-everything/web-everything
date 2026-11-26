@@ -1,6 +1,5 @@
 {
   "entries": {
-    "scripts/conveyor/soak/define-break-test.mjs": {"status":"pending-migration","reason":"OPEN S1.1: four read-only fixCommit evidence sites: the execFileSync Git runner and its rev-parse, merge-base ancestry and cherry patch-id calls; dynamic argv is flagged by the strict boundary. No push or network operation.","sites":4},
     "scripts/conveyor/await-verify-pass.mjs": {"status":"pending-migration","reason":"S3: publish the verified SHA to the requested branch with porcelain retry/no-op detection.","sites":13},
     "scripts/conveyor/branch-drift.mjs": {"status":"pending-migration","reason":"S5: force-publish branch drift notes to the remote notes ref.","sites":9},
     "scripts/conveyor/canary.mjs": {"status":"pending-migration","reason":"S6: delete remote canary branches during cleanup.","sites":1},

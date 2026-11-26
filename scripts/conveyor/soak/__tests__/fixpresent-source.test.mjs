@@ -24,19 +24,40 @@ afterEach(() => { registered.length = 0; for (const root of roots.splice(0)) rmS
 const strict = b => validateBreakShape(b, 'fixture.mjs', { legacy: 'reject' });
 
 describe('declared fix presence', () => {
-  test.each([true, false])('S1.1 legacy execution preserves registration mode when fixPresent returns %s', present => {
+  test.each([true, false])('refuses a legacy behavioural probe returning %s without executing it', present => {
+    const root = tempRoot(), b = markerBreak(root);
+    b.fixPresent = vi.fn(() => present);
+    expect(() => harness.defineBreakTest(b, { root })).toThrow(/marker-fixture.*fixPresent.*marker.*fixCommit/);
+    expect(b.fixPresent).not.toHaveBeenCalled();
+    expect(registered).toEqual([]);
+  });
+
+  test('an absent commit requires a completed failing judge verdict; setup and import errors fail', async () => {
     const root = tempRoot();
-    const b = markerBreak(root);
-    b.fixPresent = vi.fn(function (checkout) {
-      expect(this).toBe(b);
-      expect(checkout).toBe(root);
-      return present;
-    });
-    harness.defineBreakTest(b, { root });
-    expect(b.fixPresent).toHaveBeenCalledTimes(1);
-    expect(registered).toHaveLength(1);
-    expect(registered[0].fails).toBe(!present);
-    expect(() => harness.resolveFixPresent(b.fixPresent, root)).toThrow(/functions are rejected/);
+    const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'fixture');
+    writeFileSync(join(root, 'value'), 'before'); git('add', '.'); git('commit', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD').trim();
+    writeFileSync(join(root, 'value'), 'after'); git('add', '.'); git('commit', '-qm', 'fix');
+    const fixCommit = git('rev-parse', 'HEAD').trim();
+    git('checkout', '-q', '--detach', base);
+    const b = { ...markerBreak(root), fixPresent: { fixCommit }, run: async () => 'broken' };
+    const execute = async descriptor => {
+      registered.length = 0;
+      harness.defineBreakTest(descriptor, { root });
+      const registration = registered[0];
+      // Reproduce Vitest's expected-failure semantics, rather than just calling its callback.
+      try { await registration.run(); }
+      catch (error) { if (!registration.fails) throw error; return; }
+      if (registration.fails) throw new Error('unexpected pass');
+    };
+    await expect(execute(b)).resolves.toBeUndefined();
+    for (const message of ['setup failed', 'module import failed']) {
+      await expect(execute({ ...b, run: async () => { throw new Error(message); } })).rejects.toThrow(message);
+    }
+    await expect(execute({ ...b, judge: () => { throw new Error('judge crashed'); } })).rejects.toThrow('judge crashed');
+    await expect(execute({ ...b, judge: () => undefined })).rejects.toThrow();
+    await expect(execute({ ...b, judge: () => [] })).rejects.toThrow();
   });
 
   test('a break whose fixPresent calls the code under test is rejected', () => {

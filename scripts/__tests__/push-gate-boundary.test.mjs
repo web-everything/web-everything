@@ -77,13 +77,17 @@ it('refuses an allowlisted file with invalid syntax instead of counting a site',
 });
 
 describe('push-gate boundary over the real tree', () => {
-  it('reviews all four read-only fixCommit evidence sites in the soak harness', () => {
+  it('requires soak fixCommit evidence reads to pass without an exemption', () => {
     const file = 'scripts/conveyor/soak/define-break-test.mjs';
     if (!scopedScanFiles([file]).length) return;
     const allow = JSON.parse(readFileSync(new URL('../push-gate-allowlist.json', import.meta.url), 'utf8'));
     const source = readFileSync(join(scanRoot(root), file), 'utf8');
-    expect(findRawPushes(source, file)).toHaveLength(4);
-    admit({ [file]: source }, { [file]: allow.entries[file] });
+    expect(allow.entries[file]).toBeUndefined();
+    expect(findRawPushes(source, file)).toEqual([]);
+    admit({ [file]: source }, {});
+    const mutation = source.replace(/const sha = [^;]+;/, "const sha = execFileSync('git', ['push', 'origin', 'HEAD']);");
+    expect(mutation).not.toBe(source);
+    expect(() => admit({ [file]: mutation }, {})).toThrow(/pinned none/);
   });
   it('admits only reviewed site counts, with no stale entries or parse errors', () => {
     const allow = JSON.parse(readFileSync(new URL('../push-gate-allowlist.json', import.meta.url), 'utf8'));

@@ -1,6 +1,5 @@
-// Native Node loads the real registry without vite-node's pool restrictions. Replace only Vitest's
-// registration API; no behavioural scenario runs, and legacy probes use deterministic doubles so this
-// collection regression cannot dispatch the hundreds of independent probes in the production registry.
+// Native Node loads unchanged production descriptors. Replace only Vitest's registration API:
+// legacy evidence must be refused before any probe executes, and declared evidence resolves for real.
 import { register } from 'node:module';
 import assert from 'node:assert/strict';
 
@@ -23,15 +22,22 @@ const { BREAKS } = await import('../breaks/index.mjs');
 const { defineBreakTest } = await import('../define-break-test.mjs');
 const { registrations } = await import('vitest');
 let legacy = 0;
+const refused = [];
 for (const b of BREAKS) {
+  const before = registrations.length;
   if (typeof b.fixPresent === 'function') {
     legacy++;
-    for (const present of [true, false]) {
-      defineBreakTest({ ...b, fixPresent: () => present });
-      assert.equal(registrations.at(-1).fails, !present, b.id);
-    }
+    assert.throws(() => defineBreakTest(b), error => {
+      assert.ok(error.message.includes(b.id), b.id);
+      assert.match(error.message, /fixPresent.*marker.*fixCommit/);
+      refused.push({ id: b.id, error: error.message });
+      return true;
+    }, b.id);
+    assert.equal(registrations.length, before, b.id);
   } else {
     defineBreakTest(b);
+    assert.equal(registrations.length, before + 1, b.id);
+    assert.equal(registrations.at(-1).fails, false, b.id);
   }
 }
-process.stdout.write(JSON.stringify({ total: BREAKS.length, legacy, registered: registrations.length }));
+process.stdout.write(JSON.stringify({ total: BREAKS.length, legacy, refused, registered: registrations.length }));

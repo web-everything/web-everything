@@ -14,8 +14,8 @@
  * behaviour under test. `fixPresent` is exactly { marker: 'repo/relative/module.mjs#exportName' } or
  * { fixCommit: '<hex sha>' }. Marker modules are parsed, never executed; a missing marker is an error,
  * not permission to invert the behavioural assertion. Commit ancestry allows patch-id equivalence.
- * Discovery temporarily warns about legacy functions until S1.2 migrates them; the harness preserves
- * their execution contract during this migration window. Declared sources are always validated strictly.
+ * Discovery temporarily warns about legacy functions until S1.2 migrates them; the harness refuses
+ * to execute them. Declared sources are always validated strictly.
  */
 const REQUIRED_BREAK_FIELDS = Object.freeze(['id', 'title', 'card', 'fixedBy', 'fixPresent', 'run', 'judge']);
 
