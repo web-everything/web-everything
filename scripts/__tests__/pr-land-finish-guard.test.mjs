@@ -339,6 +339,20 @@ describe('S1 atomic local landing', () => {
   const landing = { policyKey, gatePlan, treeHash, cleanTree: true };
   const decide = (rec = record(), extra = {}) => resolveFinishGuardVerdict({ headSha: sha,
     readMarker: () => rec, landingContext: landing, ...extra });
+  it('fresh landing context is evaluated and rejects a changed key without WIP carry-forward', () => {
+    let reads = 0;
+    expect(decide(record(), { landingContext: () => {
+      reads++;
+      return { ...landing, policyKey: 'd'.repeat(64) };
+    } })).toMatchObject({ ok: false, reason: 'stale:key-mismatch' });
+    expect(reads).toBe(1);
+  });
+  it('invalid evidence refuses before a throwing identity reader or CI-only substitution', () => {
+    expect(decide({ ...record(), exitCode: 1 }, {
+      landingContext: () => { throw new Error('unavailable'); },
+      requireVerified: false, ciOnly: { ok: true }, ciCheckRuns: [],
+    })).toMatchObject({ ok: false, reason: 'invalid:exit-status' });
+  });
   it('atomic-v1-no-shadow-bypass: complete non-null v2 passes and null-key refuses', () => {
     expect(decide()).toMatchObject({ ok: true, reason: 'verified' });
     expect(decide({ ...record(), policyKey: null })).toMatchObject({ ok: false, reason: 'stale:producer-key-null' });

@@ -368,14 +368,16 @@ export function verificationInfrastructureFailure({ exitCode, signal, timedOutPh
   };
 }
 
-export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry, flakes } = {}) {
+export function verifyFinishBody(prev, { finishedAt, exitCode, sha, treeHash, suites, signal, infrastructure, failureDetails, retriedTimeouts, retriedFailures, isolatedRetry, flakes, writer = 'verify-lane', runId = null, policyKey = null, policyInputs = null, gatePlan = null } = {}) {
   const base = prev && typeof prev === 'object' ? prev : {};
   const failure = infrastructure || verificationInfrastructureFailure({ exitCode, signal, failureDetails });
   const green = exitCode != null && Number(exitCode) === 0 && !failure;
   return {
+    // Authority belongs to the finishing execution, never to a concurrent on-disk marker.
+    v: 2, writer, runId, policyKey, policyInputs, gatePlan,
     sha: sha ?? base.sha ?? null,
     status: failure ? 'infrastructure-failure' : green ? 'green' : 'red',
-    ...Object.fromEntries(['selection', 'requeue', 'gateUncapped', 'gateExplicit', 'runId'].filter(k => base[k] !== undefined).map(k => [k, base[k]])),
+    ...Object.fromEntries(['selection', 'requeue', 'gateUncapped', 'gateExplicit'].filter(k => base[k] !== undefined).map(k => [k, base[k]])),
     ...(failure ? { infrastructure: failure } : {}),
     ...retryAuditOf({ retriedTimeouts, retriedFailures, isolatedRetry, flakes }),
     // A test verdict only: an infrastructure failure produced no verdict, so it carries no failing-test names.

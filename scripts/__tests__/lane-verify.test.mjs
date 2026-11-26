@@ -1306,6 +1306,14 @@ it('markerNonceSuffix formats a hex nonce and fails closed to empty on anything 
 });
 
 describe('S1 own-run authority fields', () => {
+  it('finish uses the supplied dispatcher identity and leaves unavailable proof null', () => {
+    const result = verifyFinishBody({ runId: 'concurrent', policyKey: 'b'.repeat(64) }, {
+      sha: SHA, exitCode: 1, writer: 'verify-dispatch', runId: 'own-run',
+      policyKey: null, policyInputs: null, gatePlan: null,
+    });
+    expect(result).toMatchObject({ v: 2, writer: 'verify-dispatch', runId: 'own-run',
+      policyKey: null, policyInputs: null, gatePlan: null });
+  });
   it('finish explicit null never inherits a concurrent run identity', () => {
     const prev = { sha: SHA, runId: 'B', policyKey: 'b'.repeat(64), policyInputs: { v: 2 }, gatePlan: { command: 'B' }, treeHash: 'c'.repeat(64) };
     const result = verifyFinishBody(prev, { sha: SHA, runId: 'A', policyKey: null, policyInputs: null, gatePlan: null, treeHash: null, exitCode: 1 });

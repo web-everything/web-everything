@@ -143,6 +143,7 @@ import { writeAllSync } from './lib/write-all-sync.mjs';
 import { admittedArgv } from './readiness/heavy-admission.mjs'; // xaipsbs — the heal's check:standards waits for a heavy-command slot
 import { ciOnlyDecision, recordCiOnly } from './lib/verify-ci-only.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
+import { validateLandingMarker } from './lib/verify-marker-validator.mjs';
 import { readSharedGreen, resolveMarkerWithShared } from './lib/verify-shared-marker.mjs';
 import { verifyPolicyKey, verifyPolicyInputs, verifySetting, verifySettingSource, initializeVerifierIdentity } from './lib/verify-lane-gate.mjs';
 import { deferredToCiDecision, readDeferredForSha, appendDeferredDisclosure, syncDeferredBody, deferredLabelRefusal } from './lib/lane-verify-deferred.mjs'; // R893 — verify deferred to CI: opens only, never lands (readDeferredForSha also covers a dispatcher-killed verify, PR #6674)
@@ -820,8 +821,16 @@ export function readFinishGuardMarker({ gitDir, headSha, remote, base, runGit, e
  *   readMarker: (gitDir: string) => object|null, breakGlass?: boolean, requireVerified?: boolean}} args
  * @returns {{ ok: boolean, status: string, reason: string, detail: string }}
  */
-export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs, ciOnly = null }) {
+export function resolveFinishGuardVerdict({ gitDir, headSha, remote, base, runGit, readMarker, breakGlass = false, requireVerified = true, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs, ciOnly = null, landingContext }) {
   const verifyRecord = readMarker(gitDir);
+  if (breakGlass) return verifyGateDecision({ breakGlass: true });
+  if (landingContext !== undefined) {
+    // Identity readers may fail, but schema/producer failures still have precedence.
+    let context;
+    try { context = typeof landingContext === 'function' ? landingContext() : landingContext; }
+    catch { context = null; }
+    return validateLandingMarker(verifyRecord, { ...context, headSha });
+  }
   const laneRelevantChangeSinceRecord = laneRelevantChangeSinceForRecord({ record: verifyRecord, headSha, base: `${remote}/${base}`, runGit });
   const verdict = verifyGateDecision({ record: verifyRecord, headSha, breakGlass, requireVerified, laneRelevantChangeSince: laneRelevantChangeSinceRecord, ciCheckRuns, ciWorkflowRuns, ciStuckQueuedMs });
   // R1086: host saturation substitutes CI only for a verify that is missing or still in flight; a red or corrupt marker still refuses.
