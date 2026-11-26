@@ -44,6 +44,10 @@ it('marks depth-1 local enforcement imports, the AgY spawn/juror chain and exist
 });
 
 describe('repair scope admission', () => {
+  it('admits a normal-sized fix to an ordinary runtime file', () => {
+    expect(admit({ taskKind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] }))
+      .toEqual({ kind: 'fix', size: 3, scope: ['blocks/selection/Selection.ts'] });
+  });
   it.each([
     [['docs/guide.md'], ['docs/agent']],
     [['docs/guide.md'], ['docs']],
