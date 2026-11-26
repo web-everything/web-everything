@@ -2792,7 +2792,11 @@ export function refineOverlapRowsToNetDiff({ candidateRows = [], openPrRows = []
   if (unreadable && fastDrain) throw new Error('defer-to-pass:incomplete-context');
   return unreadable ? { candidateRows, openPrRows } : { candidateRows: out, openPrRows: ys };
 }
-const readOverlapNetDiff = ({ headSha, base }) => readPinnedChangedFiles({ headSha, base, cwd: process.cwd() });
+const readOverlapNetDiff = ({ headSha, base }) => {
+  const read = readPinnedChangedFiles({ headSha, base, cwd: process.cwd(), exec: execFileSync, fetch: !isDrainShadow() });
+  if (isDrainShadow() && read.error) drainWriteContext.getStore().needsFetch = true;
+  return read;
+};
 
 /**
  * #xc7p3q9 (Fix 4 / B12) — the narrow→classify→attach half of the pass. `narrowPrsByRepo → buildDrainVerdicts`.
@@ -3531,9 +3535,11 @@ const auditLineFor = (x) => x.hasManifest ? manifestAuditLine(x) : undefined;
  * pass. The label write is the thing that holds the PR; this only makes that hold legible to the ledger.
  *
  * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null}} o
- * @returns {{ok: boolean, errors: string[]}}
+ * Shadow returns a successful skipped receipt without entering the ledger's private writer.
+ * @returns {{ok: boolean, errors: string[], skipped?: boolean, appended?: boolean}}
  */
 export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null } = {}) {
+  if (isDrainShadow()) return { ok: true, appended: false, skipped: true, errors: [] };
   return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs' });
 }
 
@@ -3626,6 +3632,7 @@ export function drainHoldReasonCode(reason) {
  * @returns {{ok: boolean, appended: boolean, errors: string[]}}
  */
 export function recordDrainHold({ repo, pr, reason, read, append = appendVerdict } = {}) {
+  if (isDrainShadow()) return { ok: true, appended: false, skipped: true, errors: [] };
   try {
     const reasonCode = drainHoldReasonCode(reason);
     const readHome = (r) => { try { return parseLedgerEvents(readFileSync(verdictLedgerPath(r), 'utf8')); } catch { return []; } };
@@ -4754,7 +4761,13 @@ function sleepSync(ms) {
 }
 
 const drainWriteContext = new AsyncLocalStorage();
+const isDrainShadow = () => drainWriteContext.getStore()?.shadow === true;
 const guardedExec = run => (...args) => {
+  if (isDrainShadow() && args[0] === 'git') {
+    let verbAt = 0;
+    while (args[1][verbAt] === '-c') verbAt += 2;
+    if (args[1][verbAt] === 'fetch') drainWriteContext.getStore().needsFetch = true;
+  }
   const boundary = drainWriteContext.getStore()?.boundary;
   return boundary ? boundary.exec(run)(...args) : run(...args);
 };
@@ -5010,17 +5023,27 @@ export async function main(argv, options = {}) {
     index: async ({ writeScope, writeBoundary }) => {
       if (writeScope !== 'none') return runIndexMain(argv, { ...options, indexLive: true });
       let output = '';
+      const stopped = {};
+      const context = { boundary: writeBoundary, shadow: true, needsFetch: false };
       const checked = siblingClonesChecked, failures = siblingProvisionFailures;
       try {
-        await drainWriteContext.run({ boundary: writeBoundary }, () => runMain([...argv, '--json'], {
+        await drainWriteContext.run(context, () => runMain([...argv, '--json'], {
           ...options, indexLive: true, writeScope, writeBoundary,
-          stdout: { write: text => { output += text; } }, exit: code => { if (code) throw new Error(`shadow child exit ${code}`); } }));
+          stdout: { write: text => { output += text; } }, exit: code => {
+            if (code) throw new Error(`shadow child exit ${code}`);
+            throw stopped;
+          } }));
+      } catch (error) {
+        if (error !== stopped) {
+          if (!isFastDrainDeferKind(error?.kind || error?.message)) throw error;
+          return { indexDecision: 'defer', reason: context.needsFetch ? 'skipped: needs fetch' : error.kind || error.message };
+        }
       } finally { siblingClonesChecked = checked; siblingProvisionFailures = failures; }
       const result = JSON.parse(output.trim().split('\n').at(-1) || '{}');
       const outcome = result.enqueueOutcomes?.find(row => Number(row.num) === Number(pr));
       const candidate = result.toMerge?.find(row => Number(row.num) === Number(pr));
       return { indexDecision: outcome?.outcome ?? (candidate ? 'candidate' : 'skip'),
-        reason: outcome?.kind ?? result.skipped?.find(row => Number(row.num) === Number(pr))?.reason ?? null };
+        reason: context.needsFetch ? 'skipped: needs fetch' : outcome?.kind ?? result.skipped?.find(row => Number(row.num) === Number(pr))?.reason ?? null };
     },
   });
 }
@@ -7350,7 +7373,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
     // write miss is NOT a benign "re-capture fresh next pass": if the miss drops an honest baseline while a
     // tamper is live, next pass re-captures the tampered body as the trusted baseline AND the gate fails open
     // (durable bypass, not a one-pass gap — see review-baseline-state.mjs's cache-loss residual).
-    if (baselineStateChanged && !DRY_RUN) { try { writeFileSync(REVIEW_BASELINE_STATE_PATH, serializeBaselineState(baselineState)); } catch { /* best-effort local cache */ } }
+    if (baselineStateChanged && !DRY_RUN && !isDrainShadow()) { try { writeFileSync(REVIEW_BASELINE_STATE_PATH, serializeBaselineState(baselineState)); } catch { /* best-effort local cache */ } }
   }
 
   // #xc7p3q9 (R4/R5) — the couple JOIN runs HERE, AFTER the escalation/park pass, through the ONE shared seam
@@ -8332,7 +8355,7 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   // these buckets, and every bucket reaches the operator (stderr) AND `--json`. A withheld item that appears in
   // none of them is the silent skip this whole item was filed against.
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
-  if (mergeStrategy.enqueues(null) && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
+  if (mergeStrategy.enqueues(null) && !DRY_RUN && !isDrainShadow()) numbered = probeQueuedLand(process.cwd());
   const queuedHashOnMain = !!numbered.files?.length;
   if (!localWriteRefusal && queuedHashOnMain && !landedLocal && !DRY_RUN) numbered = writeBoundary.fullPassDuty(() => repairHashOnMain({ cwd: process.cwd() }), numbered);
   if (landedLocal && !DRY_RUN) {
@@ -8440,7 +8463,8 @@ async function runMain(argv, { env = process.env, stdout = process.stdout, exit 
   // exactly what a real pass would resolve, without writing anything. `runStrandedSweepStep` never throws —
   // any failure (an unreadable `backlog/`, `git log` unavailable, a thrown resolve) is logged and this pass
   // continues exactly as if the sweep found nothing.
-  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN || !!localWriteRefusal, asJson: AS_JSON, redMainHeld });
+  const strandedSweep = isDrainShadow() ? { ok: true, autoResolvable: [], applied: [] }
+    : runStrandedSweepStep({ dryRun: DRY_RUN || !!localWriteRefusal, asJson: AS_JSON, redMainHeld });
 
   // #2318 — POST-LAND DUPLICATE-NNN TRIPWIRE (LOUD-ONLY, #xsyia6k). JIT numbering (#2288) makes two lanes racing
   // to one birth-NNN structurally rare, but a bug on ANY land path could still put two files at one numeric id on

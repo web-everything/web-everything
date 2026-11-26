@@ -118,3 +118,68 @@ test('real child retains main prestage in off/shadow; shadow adds zero gh/git wr
   }
   expect(traces[1]).toEqual(traces[0]);
 });
+
+test.each(['hold', 'park', 'baseline', 'overlap', 'overlap-missing'])('full shadow pass performs no authoritative writes or fetches (%s)', async scenario => {
+  const calls = [], appends = [], pushes = [], baselineWrites = [], baselines = [], legacy = vi.fn();
+  const scopePath = new URL('../fast-drain-scope.mjs', import.meta.url).pathname;
+  const ledgerPath = new URL('../verdict-ledger.mjs', import.meta.url).pathname;
+  const baselinePath = new URL('../review-baseline-state.mjs', import.meta.url).pathname;
+  const dispatch = vi.fn(async options => {
+    const actual = await vi.importActual(scopePath);
+    return actual.dispatchFastDrainIndex({ ...options, legacy });
+  });
+  vi.doMock(scopePath, async () => ({ ...await vi.importActual(scopePath), dispatchFastDrainIndex: dispatch }));
+  vi.doMock(ledgerPath, async () => ({ ...await vi.importActual(ledgerPath), appendVerdict: (...args) => {
+    appends.push(args); pushes.push(args);
+    return { ok: true, errors: [] };
+  } }));
+  vi.doMock(baselinePath, async () => {
+    const actual = await vi.importActual(baselinePath);
+    return { ...actual, recordBaseline: (...args) => { baselines.push(args); return actual.recordBaseline(...args); } };
+  });
+  vi.doMock('node:fs', async () => {
+    const actual = await vi.importActual('node:fs');
+    return { ...actual, writeFileSync: (path, ...args) => {
+      if (String(path).endsWith('/review-baseline-state.json')) baselineWrites.push(path);
+      return actual.writeFileSync(path, ...args);
+    } };
+  });
+  const ports = Object.fromEntries(Object.entries(prestagePorts).map(([file, port]) => [file, (args, env) => {
+    calls.push([file, ...args]);
+    if (scenario === 'overlap-missing' && file === 'git' && args[0] === 'cat-file' && args.at(-1).startsWith('b'.repeat(40)))
+      return { status: 128, stdout: '', stderr: 'missing pinned object' };
+    return port(args, env);
+  }]));
+  const world = createPrestageWorld(async (argv, options) => {
+    const result = await runInProcess(argv, { ...options, ports });
+    return { ...result, stdout: '{}' }; // The live half is deliberately not invoked by this audit.
+  });
+  try {
+    await world(async ({ pr, run }) => {
+      pr.statusCheckRollup[0] = { name: 'test', status: 'COMPLETED', conclusion: scenario === 'hold' ? 'FAILURE' : 'SUCCESS', head_sha: pr.headRefOid };
+      if (scenario === 'park') pr.comments = [];
+      if (scenario.startsWith('overlap')) pr.contextPartners = [{ ...pr, number: 43, headRefOid: 'b'.repeat(40), headRefName: 'lane/partner', contextPartners: undefined,
+        statusCheckRollup: ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate'].map(name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS', head_sha: 'b'.repeat(40) })) }];
+      const next = await run(true, { indexMode: 'shadow', args: scenario.startsWith('overlap') ? ['--no-review-escalation'] : [] });
+      expect(next.indexShadow).toHaveLength(1);
+      expect(next.indexShadow[0]).toMatchObject({ pr: 42, repo: 'web-everything/web-everything', head: pr.headRefOid });
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(legacy).toHaveBeenCalledTimes(1);
+      expect(calls.filter(([file, ...args]) => file === 'git' && args.includes('fetch'))).toEqual([]);
+      const readonly = scope.createFastDrainWriteBoundary({ writeScope: 'none', repo: 'web-everything/web-everything', num: 42 }).exec(() => {});
+      expect(calls.filter(([file, ...args]) => {
+        try { readonly(file, args.map(arg => arg === '-i' ? '--include' : arg)); return false; } catch { return true; }
+      })).toEqual([]);
+      expect(appends).toEqual([]);
+      expect(pushes).toEqual([]);
+      expect(baselineWrites).toEqual([]);
+      expect(next.indexShadow[0].indexDecision).not.toBe('error');
+      if (scenario === 'baseline') expect(baselines.length).toBeGreaterThan(0);
+      if (scenario === 'overlap') expect(calls.some(([file, ...args]) => file === 'git' && args.includes('diff') && args.some(a => a.endsWith('...' + 'b'.repeat(40))))).toBe(true);
+      if (scenario === 'overlap-missing') {
+        expect(calls.some(([file, ...args]) => file === 'git' && args[0] === 'cat-file' && args.at(-1).startsWith('b'.repeat(40)))).toBe(true);
+        expect(next.indexShadow[0]).toMatchObject({ indexDecision: 'not-enqueued', reason: 'skipped: needs fetch' });
+      }
+    }, { slug: 'web-everything/web-everything' });
+  } finally { vi.doUnmock(scopePath); vi.doUnmock(ledgerPath); vi.doUnmock(baselinePath); vi.doUnmock('node:fs'); }
+});

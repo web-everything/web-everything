@@ -13,7 +13,7 @@ import { CI_LIFECYCLE_LABEL_META, buildDrainReasonComment, LAND_REASON, REVIEW_R
 import { REVIEW_LABEL_META } from '../../lib/review-escalation.mjs';
 
 export function createPrestageWorld(runCommand) {
-  return async function world(fn, { slug = 'fixture/prestage', fastTargetManifest = true, recordedLand = true } = {}) {
+  return async function world(fn, { slug = 'fixture/prestage', fastTargetManifest = true, recordedLand = true, indexMode: defaultIndexMode = 'shadow' } = {}) {
     const root = mkdtempSync(join(tmpdir(), 'prestage-cli-'));
     const dir = join(root, 'local');
     try {
@@ -32,7 +32,7 @@ export function createPrestageWorld(runCommand) {
         commits: [{oid:sha,messageHeadline:'Update readme',authors:[{name:'Claude',email:'noreply@anthropic.com'}]}],
         statusCheckRollup: [{name:'test',status:'IN_PROGRESS',conclusion:null,head_sha:sha}],
         comments: [{author:{login:'chalbert'},body:REVIEW_RECORD_HEADLINES.restamp+'\n<!-- reviewed-sha: '+sha+' -->',createdAt:new Date().toISOString()}], reviews: [] };
-      const run = async (green = false, { expectedStatus = 0, rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', indexMode = 'on', defaultBranch = 'main', failDefaultBranch = false } = {}) => {
+      const run = async (green = false, { expectedStatus = 0, rebaseDrop = false, numbering = false, thisRepo = true, args = [], shadowMode = 'off', indexMode = defaultIndexMode, defaultBranch = 'main', failDefaultBranch = false } = {}) => {
         // The live queue precondition now pins all five producers. Explicit test
         // failures/pending states win; omitted companion checks are successful.
         pr.statusCheckRollup.push(...['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']

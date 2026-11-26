@@ -334,14 +334,16 @@ test('enqueue-only defers collision repair without calling its private writer; f
 
 test('enqueue-only skips hash repair on main even when the queue probe finds hash cards', () => {
   const source = drainSection('  let numbered = { assigned: [], committed: false };', '  if (landedLocal && !DRY_RUN) {');
-  for (const writeScope of ['enqueue-only', 'full']) {
-    const calls = [];
+  for (const writeScope of ['none', 'enqueue-only', 'full']) {
+    const calls = [], probes = [];
     const ports = { writeBoundary: scope.createFastDrainWriteBoundary({ writeScope, repo: REPO, num: 7 }),
+      isDrainShadow: () => writeScope === 'none',
       mergeStrategy: { enqueues: () => true }, DRY_RUN: false, localWriteRefusal: null, landedLocal: false,
-      process: { cwd: () => 'fixture' }, probeQueuedLand: () => ({ assigned: [], files: ['backlog/xhash.md'] }),
+      process: { cwd: () => 'fixture' }, probeQueuedLand: () => { probes.push('probe'); return { assigned: [], files: ['backlog/xhash.md'] }; },
       repairHashOnMain: () => { calls.push('repair'); return { assigned: [], committed: true }; } };
     Function(...Object.keys(ports), source)(...Object.values(ports));
     assert.deepEqual(calls, writeScope === 'full' ? ['repair'] : []);
+    assert.deepEqual(probes, writeScope === 'none' ? [] : ['probe']);
   }
 });
 

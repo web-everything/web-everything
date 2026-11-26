@@ -277,14 +277,15 @@ const SAFE_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
  * `origin/<base>...<headSha>` (merge-base to head, what the queue lands) with `--no-renames`, so a rename shows
  * BOTH its old and new path. Every path is listed (no 3000-file REST cap). `{files}` or `{error}`. Never throws.
  * `withBaseSha`: also return `baseSha`, the base commit the diff was read against (null when unknown).
+ * `fetch: false`: read only existing objects and origin tracking refs; missing objects return `{error}`.
  */
-export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync, withBaseSha = false } = {}) {
+export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync, withBaseSha = false, fetch = true } = {}) {
   if (!SHA_RE.test(String(headSha))) return { error: 'head sha is not a 40-hex commit id' };
   if (!SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return { error: 'base branch name unusable' };
   if (!cwd) return { error: 'no checkout to read the pinned diff from' };
   const git = (args) => String(exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }) ?? '');
   try {
-    git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+    if (fetch) git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
     git(['cat-file', '-e', `${headSha}^{commit}`]);
     // Pin the base tip BEFORE the diff and diff against that sha: another drain sharing this checkout can move the
     // remote-tracking ref at any moment, and `baseSha` must be the commit this list was actually read against.

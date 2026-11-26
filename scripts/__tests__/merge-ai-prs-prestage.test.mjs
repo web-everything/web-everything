@@ -20,7 +20,7 @@ import { buildManifest, embedManifestInBody } from '../readiness/lane-manifest.m
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs');
 const sha = 'a'.repeat(40);
 const prestageWorld = createPrestageWorld((argv, options) => runInProcess(argv, { ...options, ports: prestagePorts }));
-const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', ...options });
+const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', indexMode: 'on', ...options });
 
 it.each(['precondition', 'F10', 'F10-F12', 'F12', 'F13', 'writeScope'])('REFINE 4: prestage hit cannot bypass %s', gate => world(async ({ pr, run, coord, slug }) => {
   await run();
@@ -174,6 +174,8 @@ describe('real drain pre-stage path', () => {
     expect(body.match(/mergeStrategy\.enqueue\s*\(/g)).toHaveLength(1);
     expect((source.slice(0, definition.index) + source.slice(end)).match(/mergeStrategy\.enqueue\s*\(/g) || []).toHaveLength(0);
   });
+  describe.each(['off', 'shadow', 'on'])('retry and scope safety (index mode: %s)', indexMode => {
+  const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', indexMode, ...options });
   it.each([false, true])('same-head failed_checks holds without enqueueing through the cascade/prestage path (green event: %s)', green => world(async ({pr,run}) => {
     if (green) expect((await run()).stderr).toContain('eligible=true');
     pr.statusCheckRollup[0] = {name:'test',status:'COMPLETED',conclusion:'SUCCESS',head_sha:sha};
@@ -272,6 +274,7 @@ describe('real drain pre-stage path', () => {
     expect(next.calls.some(a => a.some(x => x.includes('enqueuePullRequest')))).toBe(false);
     expect(readFileSync(file, 'utf8')).toBe(prepared);
   }));
+  });
   it.each([
     {thisRepo:true,args:['--base=main']},
     {thisRepo:false,args:['--repos=web-everything/web-everything','--base=main']},
@@ -324,6 +327,8 @@ describe('real drain pre-stage path', () => {
     const rows = readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows.filter(r => r.type === EVENT_TYPES.RELEASE)).toEqual([expect.objectContaining({ pr: 42, reasonCode: 'ci-red', holdSource: 'drain' })]);
   }));
+  describe.each(['off', 'shadow', 'on'])('prestage invalidation safety (index mode: %s)', indexMode => {
+  const world = (fn, options) => prestageWorld(fn, { slug: 'web-everything/web-everything', indexMode, ...options });
   it('a failed explicitly selected --check is never prepared', () => world(async ({pr,run,coord}) => {
     pr.statusCheckRollup.push({name:'smoke',status:'COMPLETED',conclusion:'FAILURE',head_sha:sha});
     expect((await run(false, { args:['--check=smoke'] })).stderr).not.toContain('prepared while CI pending');
@@ -424,6 +429,7 @@ describe('real drain pre-stage path', () => {
     expect(next.stderr).toContain('full fast drain');
     expect(next.report.prestaged).not.toBe(true);
   }));
+  });
   it('prestage refuses enqueue when the live default branch changed after preparation', () => world(async ({pr,run,coord,slug}) => {
     expect((await run()).stderr).toContain('prepared while CI pending (eligible=true)');
     const cache = createPrestageCache({ root: join(coord, 'drain-prestage') });
@@ -488,11 +494,11 @@ describe('real drain pre-stage path', () => {
     expect(listed).toBe(-1);
     expect([enqueued, retargeted, announced], JSON.stringify(next.calls)).toEqual([-1, -1, -1]);
   }));
-  it('a moved head falls back to a full listing', () => world(async ({pr,run}) => {
+  it.each(['off', 'shadow', 'on'])('a moved head falls back to a full listing (index mode: %s)', indexMode => world(async ({pr,run}) => {
     expect((await run()).stderr).toContain('eligible=true');
     pr.headRefOid = 'b'.repeat(40);
     const next = (await run(true));
     expect(next.stderr).toContain('full fast drain');
     expect(next.calls.some(a => a[0] === 'pr' && a[1] === 'list' || a.some(x => x.includes('pullRequests(')))).toBe(true);
-  }));
+  }, { indexMode }));
 });
