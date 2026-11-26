@@ -124,14 +124,15 @@ import {
 } from '../http-adapter.mjs';
 
 describe('codex-audit runner output', () => {
+  const scopeDiagnostic = 'audit scope: hunkContextLines=3 (tool)\n';
   const cases = [
-    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: '' },
+    { name: 'passing verdict', answer: 'NOT WEAKENED', code: 0, stdout: 'NOT WEAKENED\n', stderr: scopeDiagnostic },
     { name: 'weakened verdict with quoted multiline findings', answer: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding', code: 1,
-      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: '' },
+      stdout: 'WEAKENED\nscripts/x.mjs:1 — "guard" weakened\nscripts/y.mjs:2 — second finding\n', stderr: scopeDiagnostic },
     { name: 'invalid answer', answer: 'incomplete', code: 3, stdout: '',
-      stderr: 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
+      stderr: scopeDiagnostic + 'UNPARSEABLE audit (no verdict line (first line: "incomplete")): incomplete or failed evidence; retry or request human review of the full diff.\n' },
     { name: 'record write failure', answer: 'NOT WEAKENED', recordError: true, code: 3, stdout: '',
-      stderr: 'Audit record write failed; repair the record path and retry.\n' },
+      stderr: scopeDiagnostic + 'Audit record write failed; repair the record path and retry.\n' },
     { name: 'unresolved ref', resolveError: true, code: 2, stdout: '',
       stderr: 'Cannot resolve commits. usage: node scripts/operations/codex-audit.mjs --base=<ref|sha> --head=<40-hex sha> [--json] [--now] [--branch=<ref>]\n' },
     { name: 'invalid audit arguments', head: 'invalid', code: 2, stdout: '',
@@ -170,7 +171,7 @@ describe('codex-audit runner output', () => {
         expect(JSON.parse(output).verdict).toEqual({ ok: testCase.code === 0, code: testCase.code,
           stdout: testCase.stdout, stderr: testCase.stderr });
       } else {
-        expect(output).toContain((testCase.stdout || testCase.stderr).trimEnd());
+        expect(output).toBe(testCase.stdout + testCase.stderr);
       }
       expect(leakedOut).toBe('');
       expect(leakedErr).toBe('');
