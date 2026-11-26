@@ -87,6 +87,7 @@ import { salvageEnabled, laneDirsForRepo, findSalvageCommit, pushSalvage } from 
 import { loadFixerLadder } from '../conveyor/fixer-ladder.mjs';
 import { planRoundEscalation } from '../conveyor/fix-resume.mjs';
 import { deliveryDispatchLogPath } from './detached-dispatch.mjs';
+import { readRoutedOutcomes, unparkedUnknownOnHead, consecutiveUnproductiveOnHead } from '../lib/fix-slot-borrow.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixLoopSessionRows, fixLoopDisposition,
   classifyFixRunOutcome, fixDispatchKilled, fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
@@ -606,7 +607,11 @@ export async function runReconcileCiHealDispatch({
         }
       }
       let loopRows = [];
-      try { loopRows = fixLoop.readRows(); } catch { /* An unreadable ledger never blocks dispatch. */ }
+      try { loopRows = fixLoop.readRows(); if (!Array.isArray(loopRows)) throw new Error('unreadable ledger'); }
+      catch {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-unreadable', why: 'Operator must restore the repair ledger before another launch' });
+        continue;
+      }
 
       const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now: entryNow, config: fixConfig };
       const raw = fixLoopState(identity);
@@ -629,7 +634,19 @@ export async function runReconcileCiHealDispatch({
       }
       const infraFailures = infraRows.length;
       const loop = fixLoopState({ ...identity, infraFailures });
-      const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build });
+      let routed;
+      const routedId = { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid };
+      try { routed = (fixLoop.readRouted ?? readRoutedOutcomes)({ ...routedId, strict: true }); }
+      catch {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-loop-unreadable', why: 'Operator must restore routed outcome evidence before another launch' });
+        continue;
+      }
+      if (fixConfig.hold && unparkedUnknownOnHead(routed, routedId, loopRows)) {
+        refusals.push({ pr: entry.prNumber, kind: 'fix-cause-unknown', why: 'Unknown repair cause has no durable park; operator must complete the stand-down' });
+        continue;
+      }
+      const modelCount = consecutiveUnproductiveOnHead(routed, routedId);
+      const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build, modelCount });
       const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
       const counts = `${loop.count} ci-heal/fix sessions (${loop.rawCount} raw, ${loop.infraFailures} infrastructure discount) on head ${shortHead}`;
       if (disposition.action === 'park' || disposition.action === 'parked') {
@@ -650,8 +667,9 @@ export async function runReconcileCiHealDispatch({
           why: `${counts}; re-arms on the stronger-model rung at ${disposition.until} or when the fixer build changes; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})` });
         continue;
       }
-      const strongerModel = infraFailures >= 2 || disposition.action === 'rearm'
-        || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid);
+      const strongerModel = (disposition.action === 'rearm' && disposition.strongerModel !== false)
+        || loopRows.some(row => row.kind === 'rearm' && row.repo === repoKey && row.pr === entry.prNumber && row.head === entry.headRefOid
+          && (row.reason !== 'final attempt before raw per-head session ceiling' || modelCount >= 2));
       let t = dispatchThrottle ? dispatchThrottle.tryAdmit('ci-heal') : { admit: true };
       if (!t.admit && t.kind === 'fix-cap' && ciHealReserve) t = ciHealReserve.tryAdmit();
       if (!t.admit) { refusals.push({ pr: entry.prNumber, kind: t.kind, why: t.why }); continue; }
@@ -687,9 +705,8 @@ export async function runReconcileCiHealDispatch({
       const prepare = async () => {
         if (disposition.action === 'rearm') {
           await appendLoop({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'rearm', reason: disposition.reason });
-          console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} fix-loop-hold re-armed on head ${shortHead} (${disposition.reason}) → stronger-model rung (claude); rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})`);
+          console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} fix-loop-hold re-armed on head ${shortHead} (${disposition.reason}) → ${strongerModel ? 'stronger-model rung' : 'current fixer rung'}; rearmAfterMinutes=${fixConfig.rearmAfterMinutes ?? 120} (source ${fixConfig.rearmAfterMinutesSource ?? 'default'})`);
         }
-        if (infraFailures >= 2) console.error(`ci-heal-pr-dispatch: PR #${entry.prNumber} codex launcher failed ${infraFailures}× on head ${shortHead} (infrastructure) → stronger-model rung (claude)`);
       };
       launch = { entry, planned, outcome, gateMs: 0, prepare };
       if (lanes.length === 0) {

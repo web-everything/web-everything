@@ -69,7 +69,7 @@ export default {
     const dryRunWrites = [...writes];
     if (writes.length) violations.push(`dry-run wrote ${writes.join(',')}`);
     writes.length = 0;
-    const dispatchOptions = { repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+    const dispatchOptions = { repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }), fixLoop: null,
       netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) };
     runReconcileFixDispatch(dispatchOptions);
     const defaultDispatchWrites = [...writes];
@@ -79,7 +79,7 @@ export default {
     const optedOutDispatchWrites = [...writes];
     if (writes.length) violations.push(`opted-out dispatch wrote ${writes.join(',')}`);
     writes.length = 0;
-    runReconcileFixDispatch({ repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }),
+    runReconcileFixDispatch({ repo: 'we', reconcile, checkStaleness: () => ({ fresh: true }), fixLoop: null,
       allowStandDownAutoProceed: true,
       netScope: null, prStack: null, resolveProfile: () => ({ capabilities: { fix: false } }) });
     if (writes.join(',') !== 'cursor,reserve,post') violations.push('mutating dispatch did not explicitly enable automatic answers');

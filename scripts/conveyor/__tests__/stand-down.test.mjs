@@ -705,3 +705,12 @@ describe('out-of-diff timeout stand-down is a re-armable load-flake hold (#6469)
     expect(isLoadOnlyRedStandDown(mk("foo.test.mjs 'x' timed out at 15000ms"))).toBe(false);
   });
 });
+
+it('fix-cause-unknown is a frozen stand-down reason with plain wording', () => {
+  expect(Object.isFrozen(STAND_DOWN_REASONS)).toBe(true);
+  expect(STAND_DOWN_REASONS['fix-cause-unknown']).toBe('cause of the failed repair is unknown');
+  const body = buildStandDownComment({ reason: 'fix-cause-unknown', head: 'a'.repeat(40) });
+  expect(body).toContain('cause of the failed repair is unknown');
+  expect(standDownHead(body)).toBe('a'.repeat(40));
+  expect(standDownComments([{ body, author: { login: 'web-everything' } }])).toHaveLength(1);
+});

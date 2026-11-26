@@ -82,6 +82,8 @@ import { conflictHelperAllowRules, rearmReviewAllowRules } from '../lib/conflict
 import { ensureSettingsFilePermissions } from '../lib/gh-app-shim.mjs';
 
 import { renderOperatorSendBackBrief } from '../lib/operator-send-backs.mjs';
+import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopDisposition } from './fix-loop-ledger.mjs';
+import { standDownComments, standDownHead, standDownTrailerReason } from './stand-down.mjs';
 import { withOperatorAnswer } from './stand-down-answer-core.mjs';
 import { fixerRulingBrief, renderRulingNotAddressed } from '../lib/ruling-ledger.mjs';
 import { withSalvageHint } from '../lib/salvage-index.mjs';
@@ -194,7 +196,7 @@ import { readPrHeads, applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOver
 import micromatch from 'micromatch';
 import { criticalWorkVerdict } from '../lib/critical-work.mjs';
 import { resolveFixCriticalGlobs, resolveFixExecutionMode } from '../lib/fix-executor-chain.mjs';
-import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, unparkedUnknownOnHead, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -2027,6 +2029,9 @@ export function runReconcileFixDispatch({
   // seam above (never touching a real `gh`/`osascript` process unless the caller wants that).
   queueCapRefusalCap = QUEUE_CAP_REFUSAL_CAP,
   readPrComments = defaultReadPrComments,
+  // Never environment-gated: a test turns the guard off only by passing `fixLoop: null` explicitly.
+  fixLoop = { readRows: readFixLoopRows, append: appendFixLoopRow },
+  fixConfig = null,
   postQueueCapComment = postNoteComment,
   notifyQueueCapOperator = notifyDesktopChecked,
   landingBlockedState = undefined,
@@ -2142,6 +2147,47 @@ export function runReconcileFixDispatch({
   // Do not mutate a shared/cached plan consumed by other phases.
   reconciled = { ...reconciled, refusals: freshRefusals,
     dispatch: [...(Array.isArray(reconciled.dispatch) ? reconciled.dispatch : []), ...recovered] };
+  if (fixLoop) {
+    // A posted stand-down already blocks the planner. Complete interrupted comment-first parks,
+    // bounded to four PR threads per pass; the remaining refusals keep holding until next pass.
+    let rows;
+    try { rows = fixLoop.readRows(); if (!Array.isArray(rows)) throw new Error('unreadable fix-loop ledger'); }
+    catch (e) {
+      return { handled: 0, deferred: [], nextCursor: null, dispatched: [],
+        refusals: [{ kind: 'fix-loop-unreadable', why: `Operator must restore the repair ledger: ${e.message}` }],
+        reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+    }
+    if (!dryRun) for (const refusal of reconciled.refusals.filter(r => r.kind === 'stood-down').slice(0, 4)) {
+      try {
+        const comments = readPrComments(refusal.prNumber, { repo: CONSTELLATION_REPOS[repoKey].slug, root });
+        if (!Array.isArray(comments)) throw new Error('unreadable stand-down comments');
+        for (const comment of standDownComments(comments)) {
+          if (standDownTrailerReason(comment.body) !== 'fix-cause-unknown') continue;
+          const head = standDownHead(comment.body);
+          if (!/^[a-f0-9]{40}$/i.test(head ?? '')) continue;
+          if (rows.some(r => r.kind === 'park' && r.repo === repoKey && r.pr === refusal.prNumber && r.head === head)) continue;
+          const park = { kind: 'park', repo: repoKey, pr: refusal.prNumber, head, reason: 'fix-cause-unknown' };
+          fixLoop.append(park);
+          rows = [...rows, { ...park, v: 1, at: new Date(now).toISOString() }];
+        }
+      } catch (e) { console.error(`reconcile-fix-dispatch: unknown-cause park recovery incomplete for PR #${refusal.prNumber}: ${e.message}`); }
+    }
+    const config = fixConfig ?? fixLoopConfig();
+    const held = [], dispatch = [];
+    for (const entry of reconciled.dispatch) {
+      const parks = rows.filter(row => row.kind === 'park' && row.reason === 'fix-cause-unknown');
+      const disposition = fixLoopDisposition({ rows: parks, repo: repoKey, pr: entry.prNumber,
+        head: entry.headRefOid, now, config });
+      let unknown = false;
+      try {
+        unknown = config.hold && unparkedUnknownOnHead((fixLoop.readRouted ?? readRoutedOutcomes)({ repo: repoKey, pr: entry.prNumber, strict: true }),
+          { repo: repoKey, pr: entry.prNumber, head: entry.headRefOid }, rows);
+      } catch { unknown = true; }
+      if (disposition.action === 'parked' || unknown) held.push({ ...entry, kind: 'fix-loop-parked', why: 'fix-cause-unknown: operator decision required' });
+      else dispatch.push(entry);
+    }
+    reconciled = { ...reconciled, dispatch, refusals: [...reconciled.refusals, ...held] };
+  }
   if (netScope) reconciled = fixStep('net-scope', () => netScope(reconciled, { root, repoKey }));
   let dispatchEntries = reconciled.dispatch;
   const guardRefusals = [];
