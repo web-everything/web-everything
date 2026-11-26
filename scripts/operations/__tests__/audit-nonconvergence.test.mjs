@@ -1,3 +1,4 @@
+// @repo-scanning-test scope=files
 import { describe, it, expect } from 'vitest';
 import { readFileSync, writeFileSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
