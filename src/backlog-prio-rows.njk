@@ -1,0 +1,11 @@
+---
+pagination:
+    data: backlogPrioChunks.chunks
+    size: 1
+    alias: chunk
+permalink: "{{ chunk.url }}"
+layout: false
+eleventyExcludeFromCollections: true
+---
+{% set prioRows = chunk.rows %}
+{% include "backlog-prio-rows.njk" %}

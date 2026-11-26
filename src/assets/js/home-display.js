@@ -49,6 +49,70 @@
         // item is reflected without a captured stale list.
         function cards() { return Array.from(section.querySelectorAll('.project-card')); }
 
+        // Keep the load state on the section across hot-reloads. Stage chunks off-DOM so a
+        // failed request never filters a partial corpus or duplicates tiles on retry.
+        const tileState = section.__homeTiles || (section.__homeTiles = {
+            urls: (section.dataset.tileChunks || '').split(/\s+/).filter(Boolean),
+            loaded: !section.dataset.tileChunks,
+            pending: null
+        });
+        // morphdom may retain the section and its handlers while replacing the loaded
+        // grid with the SSR preview. Reset the shared object those handlers still use.
+        if (tileState.loaded && section.dataset.tileChunks && cards().length !== Number(section.dataset.tileTotal)) {
+            tileState.urls = section.dataset.tileChunks.split(/\s+/).filter(Boolean);
+            tileState.loaded = false;
+            tileState.pending = null;
+        }
+        function withTiles(action) {
+            if (tileState.loaded) { action(); return; }
+            const button = section.querySelector('[data-tiles-load]');
+            const status = section.querySelector('[data-tiles-status]');
+            if (!tileState.pending) {
+                if (button) button.disabled = true;
+                if (status) status.textContent = 'Loading all tiles…';
+                tileState.pending = (async function () {
+                    const staged = document.createDocumentFragment();
+                    const ids = new Set(cards().map(card => card.querySelector('.project-card-link').getAttribute('href')));
+                    for (const url of tileState.urls) {
+                        const response = await fetch(url);
+                        if (!response.ok) throw new Error('Could not load tiles');
+                        const html = await response.text();
+                        if (new TextEncoder().encode(html).length >= 2 * 1024 * 1024) throw new Error('Oversized tile fragment');
+                        const body = document.createElement('template');
+                        body.innerHTML = html;
+                        const grid = body.content.firstElementChild;
+                        if (body.content.children.length !== 1 || !grid.classList.contains('project-grid') ||
+                            !grid.children.length || grid.children.length > 100) throw new Error('Invalid tile fragment');
+                        for (const card of Array.from(grid.children)) {
+                            const link = card.querySelector('.project-card-link');
+                            const id = link && link.getAttribute('href');
+                            if (!card.classList.contains('project-card') || !card.dataset.status || !id || ids.has(id)) {
+                                throw new Error('Invalid or duplicate tile');
+                            }
+                            ids.add(id);
+                            staged.appendChild(card);
+                        }
+                    }
+                    if (ids.size !== Number(section.dataset.tileTotal)) throw new Error('Incomplete tile fragments');
+                    section.querySelector('.project-grid').appendChild(staged);
+                    tileState.loaded = true;
+                    if (button) button.hidden = true;
+                    if (status) status.textContent = '';
+                    section.dispatchEvent(new CustomEvent('backlog:tiles-loaded', { bubbles: true }));
+                })();
+            }
+            tileState.pending.then(action).catch(function () {
+                tileState.pending = null;
+                if (button) { button.disabled = false; button.textContent = 'Retry loading all tiles'; }
+                if (status) status.textContent = 'Tiles could not be loaded. Retry to filter or change the view for all work.';
+            });
+        }
+        const loadButton = section.querySelector('[data-tiles-load]');
+        if (loadButton && !loadButton.__homeWired) {
+            loadButton.__homeWired = true;
+            loadButton.addEventListener('click', function () { withTiles(applyFilter); });
+        }
+
         // Active filter sets are derived from localStorage on demand (never held
         // in a closure) so a re-executed script and any surviving click handlers
         // always agree on the current state. `defaultExclude` is hidden until the
@@ -97,7 +161,7 @@
                 card.classList.toggle('is-filtered-out', hidden);
                 if (!hidden) shown++;
             });
-            if (countTarget) countTarget.textContent = shown;
+            if (countTarget && tileState.loaded) countTarget.textContent = String(shown);
         }
 
         function syncChips(chips, attr, activeFn) {
@@ -122,28 +186,30 @@
                 if (!chip) return;
                 var chipVal = chip.dataset[attr];
                 if (chipVal === undefined) return;
-                var set = readSet(storageKey, allValues, defaultExclude);
-                if (e.metaKey || e.ctrlKey) {
-                    // ⌘/Ctrl-click toggles every OTHER chip in this category, leaving the clicked
-                    // one untouched — so ⌘-clicking a lone-active chip "solos" it (turns the rest
-                    // off), and ⌘-clicking again flips them all back on.
-                    allValues.forEach(function (val) {
-                        if (val === chipVal) return;
-                        if (set.has(val)) { set.delete(val); } else { set.add(val); }
-                    });
-                } else if (set.size === allValues.length) {
-                    // Plain click while every chip is active (the default — no filter in
-                    // effect) means "show only this" (solo), matching the natural expectation
-                    // that clicking a chip filters TO it. Once a real subset is in effect,
-                    // clicks toggle individual chips in/out.
-                    set.clear();
-                    set.add(chipVal);
-                } else {
-                    if (set.has(chipVal)) { set.delete(chipVal); } else { set.add(chipVal); }
-                }
-                try { localStorage.setItem(storageKey, JSON.stringify(Array.from(set))); } catch (e2) { /* ignore */ }
-                syncChips(chips, attr, activeFn);
-                applyFilter();
+                withTiles(function () {
+                    var set = readSet(storageKey, allValues, defaultExclude);
+                    if (e.metaKey || e.ctrlKey) {
+                        // ⌘/Ctrl-click toggles every OTHER chip in this category, leaving the clicked
+                        // one untouched — so ⌘-clicking a lone-active chip "solos" it (turns the rest
+                        // off), and ⌘-clicking again flips them all back on.
+                        allValues.forEach(function (val) {
+                            if (val === chipVal) return;
+                            if (set.has(val)) { set.delete(val); } else { set.add(val); }
+                        });
+                    } else if (set.size === allValues.length) {
+                        // Plain click while every chip is active (the default — no filter in
+                        // effect) means "show only this" (solo), matching the natural expectation
+                        // that clicking a chip filters TO it. Once a real subset is in effect,
+                        // clicks toggle individual chips in/out.
+                        set.clear();
+                        set.add(chipVal);
+                    } else {
+                        if (set.has(chipVal)) { set.delete(chipVal); } else { set.add(chipVal); }
+                    }
+                    try { localStorage.setItem(storageKey, JSON.stringify(Array.from(set))); } catch (e2) { /* ignore */ }
+                    syncChips(chips, attr, activeFn);
+                    applyFilter();
+                });
             });
         }
 
@@ -166,7 +232,7 @@
         buttons.forEach(function (btn) {
             if (btn.__homeWired) return;
             btn.__homeWired = true;
-            btn.addEventListener('click', function () { setView(btn.dataset.view); });
+            btn.addEventListener('click', function () { withTiles(function () { setView(btn.dataset.view); applyFilter(); }); });
         });
 
         // Expanding search: the icon reveals the field and focuses it; the field
@@ -192,14 +258,14 @@
                 });
                 filter.addEventListener('input', function () {
                     try { localStorage.setItem(searchKey, filter.value); } catch (e) { /* ignore */ }
-                    applyFilter();
+                    withTiles(applyFilter);
                 });
                 filter.addEventListener('blur', collapseIfEmpty);
                 filter.addEventListener('keydown', function (e) {
                     if (e.key === 'Escape') {
                         filter.value = '';
                         try { localStorage.removeItem(searchKey); } catch (e2) { /* ignore */ }
-                        applyFilter();
+                        withTiles(applyFilter);
                         search.classList.remove('is-open');
                         btn.setAttribute('aria-expanded', 'false');
                         btn.focus();
@@ -226,7 +292,16 @@
 
         let savedView = 'grid';
         try { savedView = localStorage.getItem(viewKey) || 'grid'; } catch (e) { /* ignore */ }
-        setView(savedView);
+        // Persisted preferences can target tiles beyond the preview. Restore against the
+        // complete corpus; defaults leave the SSR total intact without fetching anything.
+        const hasSubset = (set, all, excluded) => set &&
+            all.some(value => set.has(value) !== !excluded.includes(value));
+        if (savedView !== 'grid' || (filter && filter.value.trim()) ||
+            hasSubset(activeStatuses(), statusAll, statusDefaultExclude) ||
+            hasSubset(activeKinds(), kindAll, []) || hasSubset(activeSizes(), sizeAll, []) ||
+            hasSubset(activeTiers(), tierAll, [])) {
+            withTiles(function () { setView(savedView); applyFilter(); });
+        } else { setView(savedView); }
     }
 
     function init() {

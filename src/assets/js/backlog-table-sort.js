@@ -1,7 +1,53 @@
+// Bounded static fragments are loaded once, atomically, before interacting with the full table.
+(function () {
+  'use strict';
+  document.querySelectorAll('table.sortable').forEach(function (table) {
+    var urls = (table.getAttribute('data-prio-chunks') || '').split(/\s+/).filter(Boolean);
+    var pending = null;
+    var button = document.querySelector('[data-prio-load]');
+    var status = document.querySelector('[data-prio-status]');
+    table.prioLoaded = urls.length === 0;
+    table.withPrioRows = function (action) {
+      if (table.prioLoaded) { action(); return; }
+      if (!pending) {
+        if (button) button.disabled = true;
+        if (status) status.textContent = 'Loading all rows…';
+        // Fetch sequentially to bound concurrent requests. Stage everything off-DOM so a failure can
+        // retry without duplicate rows or filtering an incomplete corpus.
+        pending = (async function () {
+          var staged = document.createDocumentFragment();
+          for (var i = 0; i < urls.length; i++) {
+            var response = await fetch(urls[i]);
+            if (!response.ok) throw new Error('Could not load rows');
+            var body = document.createElement('tbody');
+            body.innerHTML = await response.text();
+            if (!body.children.length || body.children.length > 250 ||
+                Array.prototype.some.call(body.children, function (row) { return row.tagName !== 'TR' || !row.hasAttribute('data-search'); })) {
+              throw new Error('Invalid row fragment');
+            }
+            while (body.firstChild) staged.appendChild(body.firstChild);
+          }
+          table.querySelector('tbody').appendChild(staged);
+          table.prioLoaded = true;
+          if (button) button.hidden = true;
+          if (status) status.textContent = '';
+          table.dispatchEvent(new Event('prio-rows-loaded'));
+        })();
+      }
+      pending.then(action).catch(function () {
+        pending = null;
+        if (button) { button.disabled = false; button.textContent = 'Retry loading all rows'; }
+        if (status) status.textContent = 'Rows could not be loaded. Retry to sort or filter the full table.';
+      });
+    };
+    if (button) button.addEventListener('click', function () { table.withPrioRows(function () { table.dispatchEvent(new Event('prio-apply')); }); });
+  });
+})();
+
 // Click-to-sort for any `table.sortable` (the /backlog/ Prioritisation table, #258-ish UX).
 // Headers carry `data-sort-key` (presence = sortable) and `data-sort-type` (num | text); body cells
 // carry `data-sort-val`. Sorting is purely client-side over the already-rendered rows — the server
-// emits them in leverage order, and a click re-orders in place. No dependency, no re-fetch.
+// emits them in leverage order, and a click re-orders in place. Remaining fragments load before sorting.
 (function () {
   'use strict';
   var tables = document.querySelectorAll('table.sortable');
@@ -38,8 +84,9 @@
         });
         rows.forEach(function (r) { tbody.appendChild(r); });
       };
-      th.addEventListener('click', run);
-      th.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); run(); } });
+      var sort = function () { table.withPrioRows(run); };
+      th.addEventListener('click', sort);
+      th.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sort(); } });
     });
   });
 })();
@@ -53,6 +100,10 @@
   var table = document.querySelector('table.sortable');
   if (!table) return;
   var rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr'));
+  table.addEventListener('prio-rows-loaded', function () {
+    rows = Array.prototype.slice.call(table.querySelectorAll('tbody tr:not(.ptable-empty)'));
+  });
+  table.addEventListener('prio-apply', function () { apply(); });
   // Live accessors — the #2028 persistent-host base (#2122) also copies data-p* attrs onto the wrapped
   // inner <button>, so document.querySelectorAll matches both host and child under the same selector.
   function readyChips() { return Array.prototype.slice.call(document.querySelectorAll('[data-pready]')); }
@@ -184,7 +235,7 @@
       r.style.display = ok ? '' : 'none';
       if (ok) shown++;
     });
-    if (countEl) countEl.textContent = shown;
+    if (countEl && table.prioLoaded) countEl.textContent = String(shown);
     // "Hide low priority" applies to the whole tab, not just the rows: swap every summary/section count that
     // carries a filler-adjusted variant (the section badge + the agent-ready pill's count & points) to its
     // no-filler value while the toggle is on, and back to the full value when off. Server emits both.
@@ -229,54 +280,65 @@
   document.addEventListener('click', function (e) {
     var t = e.target.closest('[data-pready],[data-pkind],[data-psplit],[data-pfiller]');
     if (!t) return;
-    t.setAttribute('aria-pressed', t.getAttribute('aria-pressed') === 'false' ? 'true' : 'false');
-    clearSummary();
-    apply();
+    table.withPrioRows(function () {
+      t.setAttribute('aria-pressed', t.getAttribute('aria-pressed') === 'false' ? 'true' : 'false');
+      clearSummary();
+      apply();
+    });
   });
-  if (search) search.addEventListener('input', function () { clearSummary(); apply(); });
+  if (search) search.addEventListener('input', function () { table.withPrioRows(function () { clearSummary(); apply(); }); });
 
   // The summary pills (data-pfilter shortcuts and the data-psplitfilter "N to split" pill) are
   // <we-filter-chip>s too — delegate on document (same reason as the readiness/kind/split chips above).
   document.addEventListener('click', function (e) {
     // The "N to split" summary pill — reset the groups to "all", then turn the split toggle on so the
     // table isolates exactly the split candidates (any tier). Clicking it again clears.
-    var ss = e.target.closest('[data-psplitfilter]');
-    if (ss) {
-      var wasSplitActive = ss.getAttribute('aria-pressed') === 'true';
+    if (!e.target.closest('[data-psplitfilter],[data-pfilter]')) return;
+    table.withPrioRows(function () {
+      var ss = e.target.closest('[data-psplitfilter]');
+      if (ss) {
+        var wasSplitActive = ss.getAttribute('aria-pressed') === 'true';
+        clearSummary();
+        resetAllChips();
+        if (!wasSplitActive) {
+          var sc = splitChip();
+          if (sc) sc.setAttribute('aria-pressed', 'true');
+          ss.setAttribute('aria-pressed', 'true');
+          ss.style.boxShadow = '0 0 0 2px #334155';
+        }
+        apply();
+        return;
+      }
+      var chip = e.target.closest('[data-pfilter]');
+      if (!chip) return;
+      var wasActive = chip.getAttribute('aria-pressed') === 'true';
       clearSummary();
-      resetAllChips();
-      if (!wasSplitActive) {
-        var sc = splitChip();
-        if (sc) sc.setAttribute('aria-pressed', 'true');
-        ss.setAttribute('aria-pressed', 'true');
-        ss.style.boxShadow = '0 0 0 2px #334155';
+      if (wasActive) {                         // clicking the active shortcut again clears the filter
+        resetAllChips();
+      } else {
+        var cats = (chip.getAttribute('data-pfilter') || '').split(',');
+        kindChips().forEach(function (c) { c.setAttribute('aria-pressed', 'true'); });   // readiness-only shortcut
+        var sc2 = splitChip();
+        if (sc2) sc2.setAttribute('aria-pressed', 'false');   // a readiness shortcut is a fresh view — drop the split facet
+        // filler ("Hide low priority") is intentionally left untouched — a view-level control persists across
+        // readiness shortcuts, so "hide low priority + show me decisions" keeps the low-priority items hidden.
+        if (search) search.value = '';
+        readyChips().forEach(function (c) {
+          c.setAttribute('aria-pressed', cats.indexOf(c.getAttribute('data-pready')) >= 0 ? 'true' : 'false');
+        });
+        chip.setAttribute('aria-pressed', 'true');
+        chip.style.boxShadow = '0 0 0 2px #334155';     // active ring, visible on every chip colour
       }
       apply();
-      return;
-    }
-    var chip = e.target.closest('[data-pfilter]');
-    if (!chip) return;
-    var wasActive = chip.getAttribute('aria-pressed') === 'true';
-    clearSummary();
-    if (wasActive) {                         // clicking the active shortcut again clears the filter
-      resetAllChips();
-    } else {
-      var cats = (chip.getAttribute('data-pfilter') || '').split(',');
-      kindChips().forEach(function (c) { c.setAttribute('aria-pressed', 'true'); });   // readiness-only shortcut
-      var sc2 = splitChip();
-      if (sc2) sc2.setAttribute('aria-pressed', 'false');   // a readiness shortcut is a fresh view — drop the split facet
-      // filler ("Hide low priority") is intentionally left untouched — a view-level control persists across
-      // readiness shortcuts, so "hide low priority + show me decisions" keeps the low-priority items hidden.
-      if (search) search.value = '';
-      readyChips().forEach(function (c) {
-        c.setAttribute('aria-pressed', cats.indexOf(c.getAttribute('data-pready')) >= 0 ? 'true' : 'false');
-      });
-      chip.setAttribute('aria-pressed', 'true');
-      chip.style.boxShadow = '0 0 0 2px #334155';     // active ring, visible on every chip colour
-    }
-    apply();
+    });
   });
 
-  restore();
-  apply();
+  var hasSaved = false;
+  try {
+    hasSaved = [READY_KEY, KIND_KEY, SPLIT_KEY, FILLER_KEY, SEARCH_KEY].some(function (key) {
+      return localStorage.getItem(key) !== null;
+    });
+  } catch (e) { /* storage unavailable */ }
+  if (hasSaved) table.withPrioRows(function () { restore(); apply(); });
+  else if (table.prioLoaded) apply();
 })();

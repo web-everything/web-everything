@@ -1,13 +1,9 @@
 {% from "display-toolbar.njk" import displayToolbar %}
 {% import "backlog-badges.njk" as bk with context %}
-{# Select before rendering: resolved history must never add tile bytes to /backlog/. #}
-{% set gridItems = [] %}
-{% for item in backlog %}
-{% if (resolvedView and item.status == 'resolved') or (not resolvedView and item.status != 'resolved') %}
-{% set gridItems = (gridItems.push(item), gridItems) %}
-{% endif %}
-{% endfor %}
-{% set statusOrder = ["resolved"] if resolvedView else ["open", "active", "preparing", "parked", "closed"] %}
+{# Both views share one ordered selection and bounded batches with their fragment producers. #}
+{% set tileModel = backlogTileChunks.resolved if resolvedView else backlogTileChunks.tracked %}
+{% set gridItems = tileModel.items %}
+{% set statusOrder = tileModel.statusOrder %}
 {# Item kinds present in the backlog, in preferred order — the one merged nature+hierarchy axis (#466/#487). #}
 {% set kindOrder = ["feature", "story", "epic", "task", "decision", "investigation"] %}
 {% set kindChips = [] %}
@@ -20,7 +16,7 @@
 {% set tierOrder = ["A", "B", "C"] %}
 {% set tierChips = [] %}
 {% for t in tierOrder %}{% if (gridItems | where("tier", t) | length) %}{% set tierChips = (tierChips.push(t), tierChips) %}{% endif %}{% endfor %}
-<section class="mb-12" data-status-default-exclude="{{ '' if resolvedView else 'closed' }}">
+<section class="mb-12" data-tile-chunks="{{ tileModel.urls | join(' ') }}" data-tile-total="{{ gridItems | length }}" data-status-default-exclude="{{ '' if resolvedView else 'closed' }}">
     <h2 class="section-title">{{ 'Resolved work' if resolvedView else 'Tracked work' }} <span class="count-badge" data-count-target>{{ gridItems | length }}</span></h2>
     {% if resolvedView %}<p class="section-desc">Delivered stories, epics, tasks, and decisions. Filter by kind, size, or keyword, or switch to a compact list.</p>{% else %}<p class="section-desc">Stories, epics, tasks, and decisions — ordered by status. Filter by status, kind, or keyword, or switch to a compact list. Resolved history has its own <a href="/backlog/resolved/">resolved work page</a>.</p>{% endif %}
     <div class="backlog-filter-row">
@@ -89,20 +85,10 @@
     </div>
     </details>
     {% endif %}
-    {# #2018 (keystone #2016): the tracked-work tiles are SSR'd from our `we-card` at BUILD TIME. Each
-       item's inner body (the badge/tag row, blockers, summary, epic-children circles, and meta links) is
-       still composed HERE by the SHARED `backlog-badges.njk` macros — the anti-drift single source of
-       truth — captured per-item into `backlogTiles`, then `weBacklogGrid` shells out to the pinned FUI
-       build-CLI in ONE subprocess batch (render-from-data per #2007) and wraps each captured body in a real
-       `<article class="fui-card">` (the `#num Title` becomes the card title). Correct with JS off,
-       view-source-visible; the transient `<we-card>` client upgrade (base.njk) is a pure enhancement, and
-       the badge/tag children stay transient-CE as before. The outer `.project-card` chrome (grid layout +
-       the `data-status/kind/size/tier` filter facets `home-display.js` reads + the `.project-card-link`
-       overlay) is emitted by the filter around the SSR card. #}
-    {% set backlogTiles = [] %}
-    {% for group in statusOrder %}{% for item in gridItems %}{% if item.status == group %}
-    {% set inner %}<div class="backlog-badges" style="margin-bottom: 0.6rem; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;">{{ bk.kindBadge(item.kind) }}{{ bk.statusBadge(item.status) }}{{ bk.closedBadge(item) }}{{ bk.buildStateBadge(item.buildState) }}{% if item.size %}{{ bk.sizeBadge(item.size) }}{% endif %}{{ bk.tierBadge(item.tier) }}{{ bk.unshapedScopeBadge(item) }}{{ bk.epicStatusBadge(item) }}{{ bk.reasonPill(item) }}</div>{% if item.blockers | length %}<div class="backlog-blockers" style="position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin: 0 0 0.6rem;"><span style="font-size: 0.72em; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.03em; font-weight: 600;">Blocked by</span>{% for b in item.blockers %}{{ bk.blockerChip(b) }}{% endfor %}</div>{% endif %}<p class="backlog-summary" style="margin: 0 0 0.75rem 0; color: var(--color-text-muted); font-size: 0.9em;">{{ item.summary }}</p>{% if item.children | length %}<div class="epic-children" style="position: relative; z-index: 2; display: flex; flex-wrap: wrap; align-items: center; gap: 0.3rem; margin: 0 0 0.75rem;"><span style="font-size: 0.72em; color: var(--color-text-muted); text-transform: uppercase; letter-spacing: 0.03em; font-weight: 600;">Contains</span>{% for child in item.children %}{{ bk.childCircle(child) }}{% endfor %}</div>{% endif %}<div class="backlog-meta">{{ bk.tagsRow(item.tags) }}<div style="display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8em;">{% if item.crossRef %}<a href="{{ item.crossRef.url }}" style="color: var(--color-primary); text-decoration: none;">&rarr; {{ item.crossRef.label }}</a>{% endif %}{% if item.relatedProject %}<a href="/projects/{{ item.relatedProject }}/" style="color: var(--color-primary); text-decoration: none;">&rarr; project: {{ item.relatedProject }}</a>{% endif %}{% if item.relatedReport %}<span style="color: var(--color-text-muted); font-family: var(--font-mono, monospace);">report{% if item.reportDate %} · {{ item.reportDate }}{% endif %}: {{ item.relatedReport }}</span>{% endif %}{% if item.graduatedTo %}<span style="color: #166534; font-weight: 600;">graduated &rarr; {{ item.graduatedTo }}</span>{% endif %}</div></div>{% endset %}
-    {% set backlogTiles = (backlogTiles.push({ id: item.id, num: item.num, title: item.title, status: item.status, kind: item.kind, size: item.size, tier: item.tier, innerHtml: inner }), backlogTiles) %}
-    {% endif %}{% endfor %}{% endfor %}
-    {{ backlogTiles | weBacklogGrid | safe }}
+    {% set tileItems = tileModel.inline %}
+    {% include "backlog-tiles.njk" %}
+    {% if tileModel.chunks | length %}
+    <button type="button" data-tiles-load>Show all {{ gridItems | length }} tiles</button>
+    <span data-tiles-status role="status"></span>
+    {% endif %}
 </section>
