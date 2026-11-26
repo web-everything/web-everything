@@ -763,6 +763,9 @@ describe('headed no-code answer: one resumed fixer claim', () => {
     expect(rearmWindow(comments).standDownId).toBe('IC_second');
     expect(rearmWindow(comments).wouldHonour({ standDownId: 'IC_second', disposition: 'rearm-review', noCodeOwed: true })).toBe(true);
   });
+  it('stand-down between the answer and the first claim revokes the exemption until a fresh answer', () => {
+    expect(decide([...base(), stop('IC_second'), claim(H)]).empty).toBe(true);
+  });
   it('fresh headed answer to the new stand-down re-grants once (i)', () => {
     const comments = [...resume(), stop('IC_second'), answer('IC_second', X), claim(X)];
     expect(decide(comments, X)).toEqual({ empty: false, noCodeResume: true });

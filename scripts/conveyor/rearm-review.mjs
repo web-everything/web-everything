@@ -267,6 +267,7 @@ export function rearmWindow(comments) {
       // Reopening permits another waiver: require the actual trusted poster, never viewerDidAuthor alone.
       && isTrustedMarkerAuthor({ ...c, viewerDidAuthor: false })) {
       if (resumeHead) { claims.push(resumeHead); resumeHead = null; }
+      noCodeHead = null; // a fresh stop after the answer revokes the unused exemption
       if (claims.length && c.id != null) {
         standDownIds.push(String(c.id));
         // A fresh stop after a later claim needs its own answer; the cleared old id stays unanswerable.
