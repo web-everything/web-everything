@@ -23,7 +23,7 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
-import { budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
+import { resolveAdoptNotWorse, budgetedRunChild, smokeCheckOfChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
 import { runLiveSmoke, SMOKE_CHECKS, DISPATCH_DRY_RUN_SCRIPT } from '../daemon-live-smoke.mjs';
 import { buildEntryBootScript } from '../daemon-boot-smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
@@ -442,7 +442,7 @@ describe('pinned overlay stays held on smoke-rejected when the last-good control
 describe('smoke-harness-broken (x5wbsbc)', () => {
   it('a last-good control whose same-named rows were refused never adopts the candidate', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
     pushBranch(originDir, 'lane/refused-control', (dir) => writeFile(dir, 'candidate.txt', 'bad\n'));
     addOverlay(cloneDir, { ref: 'lane/refused-control', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
@@ -532,7 +532,7 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
 
   it('adopts a pinned candidate by default when the last-good control fails the same cross-org check', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
     pushBranch(originDir, 'lane/harness-fix', (dir) => writeFile(dir, 'harness-fix.txt', 'fix\n'));
     addOverlay(cloneDir, { ref: 'lane/harness-fix', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
@@ -556,9 +556,39 @@ describe('smoke-harness-broken (x5wbsbc)', () => {
     expect(runSmoke).toHaveBeenCalledTimes(2);
   });
 
+  it('adoptNotWorse is OFF by default: a failed candidate whose control fails the same typed check is never adopted', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the shipped default
+    expect(resolveAdoptNotWorse(env)).toMatchObject({ enabled: false });
+    pushBranch(originDir, 'lane/default-off', (dir) => writeFile(dir, 'off.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/default-off', pinned: true }, { env });
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    const runSmoke = vi.fn(async () => ({
+      verdict: 'code', attempts: 1,
+      smoke: { results: [(() => {
+        const entry = { entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: x' };
+        Object.defineProperty(entry, 'rawError', { value: 'TypeError: x', enumerable: false });
+        return { ok: false, name: 'daemon-entries-boot', detail: 'boom', entries: [entry] };
+      })()] },
+    }));
+
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+
+    expect(result.adopted).not.toBe(true);
+    expect(result.reason).toBe('smoke-harness-broken');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    expect(result.alerts.some((a) => a.kind === 'smoke-harness-broken-adopted-not-worse')).toBe(false);
+  });
+
+  it('resolveAdoptNotWorse: default false, env 1 on, env 0 off', () => {
+    expect(resolveAdoptNotWorse({})).toMatchObject({ enabled: false });
+    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '1' })).toMatchObject({ enabled: true });
+    expect(resolveAdoptNotWorse({ WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE: '0' })).toMatchObject({ enabled: false });
+  });
+
   it('rejects a candidate failing x and y when the last-good control fails only x', async () => {
     const { originDir, cloneDir, env } = makeFixture();
-    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE;
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path
     pushBranch(originDir, 'lane/worse', (dir) => writeFile(dir, 'worse.txt', 'bad\n'));
     addOverlay(cloneDir, { ref: 'lane/worse', pinned: true }, { env });
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();

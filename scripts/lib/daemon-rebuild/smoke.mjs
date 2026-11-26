@@ -185,6 +185,20 @@ export function rejectRetryDelayMs(env, attempts) {
  *  fails last-good. Set to '0' to retain the hold-on-last-good and retry-backoff behavior. */
 export const HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV = 'WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE';
 
+/** IO: `daemons.rebuild.adoptNotWorse` through the cascade. DEFAULT OFF: a failed-smoke candidate is never adopted
+ *  (hold on last-good; force-adopt is the fallback). Env '1' turns it on, '0' off. Never throws. */
+export function resolveAdoptNotWorse(env = process.env) {
+  let tool;
+  try { tool = readDeclaredSettings().settings?.rebuildAdoptNotWorse; } catch { tool = undefined; }
+  const ev = env?.[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV];
+  const r = cascadePolicy('rebuildAdoptNotWorse', tool, {
+    env, standard: { enabled: false },
+    envValues: { enabled: ev === '1' ? true : ev === '0' ? false : undefined },
+    valid: { enabled: v => typeof v === 'boolean' },
+  });
+  return { enabled: r.value.enabled === true, source: r.sources.enabled };
+}
+
 /** The failed check rows of a smoke result (`[]` for a pass or a missing result). */
 function failedRows(smokeResult) {
   return (smokeResult?.smoke?.results || []).filter((r) => !r.ok);
@@ -1019,7 +1033,7 @@ export async function smokeAndAdopt({
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
-    if (!c.reused && env[HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV] !== '0') {
+    if (!c.reused && resolveAdoptNotWorse(env).enabled) {
       // xhiqxz3 — "no worse" on the ordinary smoke says nothing about the worker launch: prove that first.
       if (aSuspects.length) {
         const d = await dispatchOnly(plan.finalSha, aSuspects);

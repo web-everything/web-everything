@@ -113,7 +113,10 @@ export default {
           const stateDir = daemonStateDir(w.env);
 
           const state = rebuildModule.readRebuildState(w.simCloneRoot, w.env);
-          if (state.held?.reason !== 'smoke-harness-broken') {
+          // S2a fails closed: an untyped control failure (here a 1ms tree-stays-clean timeout) no longer proves the
+          // harness is broken, so the hold is recorded as `smoke-rejected`; either way the clone holds on last-good.
+          const heldAs = ['smoke-harness-broken', 'smoke-rejected'];
+          if (!heldAs.includes(state.held?.reason)) {
             api.violation('not-held-as-harness-broken', `state.held.reason is ${JSON.stringify(state.held?.reason ?? null)} (expected "smoke-harness-broken") — full held record: ${JSON.stringify(state.held)}`);
           }
 
@@ -122,7 +125,7 @@ export default {
           try { alertsText = readFileSync(alertsPath, 'utf8'); } catch { /* nothing written — every kind below is then reported missing */ }
           const kinds = alertsText.split('\n').filter(Boolean)
             .map((l) => { try { return JSON.parse(l).kind; } catch { return null; } }).filter(Boolean);
-          for (const need of ['smoke-harness-broken', 'daemon-held-on-last-good']) {
+          for (const need of [state.held?.reason === 'smoke-rejected' ? 'smoke-rejected' : 'smoke-harness-broken', 'daemon-held-on-last-good']) {
             if (!kinds.includes(need)) {
               api.violation('missing-alert', `the clone's alerts file (${alertsPath}) never recorded "${need}" — kinds seen: ${[...new Set(kinds)].join(', ') || '(none)'}`);
             }

@@ -643,7 +643,7 @@ describe('R508 force-adopt: sticky rejection, pinned ready record, finalization'
     else if (kind === 'smoked') { successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n')); extra = { runSmoke: passing() }; }
     else {
       successor = advanceMain(originDir, (dir) => writeFile(dir, 'scripts/lane-pool.mjs', '// pool\n'));
-      env = { ...env0 }; delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate failing only what last-good also fails
+      env = { ...env0 }; env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path // the default: adopt a candidate failing only what last-good also fails
       extra = { runSmoke: failing() };
     }
     await tick(cloneDir, env, { ...extra, forceWatchProbe: healthy });
@@ -1165,7 +1165,7 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
   it('a build adopted as "no worse" over a failed smoke (harness-broken path, not a force) is likewise never the incremental-smoke baseline', async () => {
     const { base, originDir, cloneDir, env: env0 } = makeFixture();
     const env = forceEnv(env0, base);
-    delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate that fails only what last-good also fails
+    env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE = '1'; // adoptNotWorse is default-OFF: enable it to cover the on path // the default: adopt a candidate that fails only what last-good also fails
     const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
     const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
     const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy });

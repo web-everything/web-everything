@@ -10,13 +10,15 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const PROBE = `
-const { failsSameChecks } = await import(process.argv[1]);
+const { failsSameChecks, resolveAdoptNotWorse } = await import(process.argv[1]);
 const raw = 'TypeError: smoke harness broke at 12';
 const entry = (over = {}) => ({ entry: 'e.mjs', ok: false, kind: 'import failed', errorClass: raw, rawError: raw, ...over });
 const boot = (over = {}, row = {}) => ({ ok: false, name: 'daemon-entries-boot', entries: [entry(over)], ...row });
 // The candidate is ALWAYS a valid typed failure, so only the CONTROL's evidence validation can make a probe false.
 const cand = [boot()];
 const out = {
+  // The shipped default: a failed candidate is never adopted as "not worse" (daemons.rebuild.adoptNotWorse is off).
+  adoptNotWorseDefaultOn: resolveAdoptNotWorse({}).enabled,
   validControl: failsSameChecks(cand, [boot()]),
   budgetRefused: failsSameChecks(cand, [boot({}, { budgetInterrupted: true })]),
   timeoutOnly: failsSameChecks(cand, [boot({ kind: 'child failed: timed out after 45000ms (process group killed)', signal: 'SIGKILL' })]),
