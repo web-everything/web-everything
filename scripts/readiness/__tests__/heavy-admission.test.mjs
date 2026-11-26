@@ -2792,7 +2792,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     const sample = () => ({ sampledAtET: runner.easternTimestamp(state.time), cores: 8, loadPerCore: 0.12, memFreePct: 96, activeRuns: 3,
       recent: [{ runId: 'r-' + 'a'.repeat(32), startedAtET: runner.easternTimestamp(state.time - 41000), stageMs: { install: 1000, run: 40000 }, code: 0 }] });
     const f = { argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd, env: {}, lockRoot: join(cwd, 'heavy'), state, run: runWithRemoteDecision,
-      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', ...remote } } }),
+      policy: resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', ...remote } } }),
       clock: () => state.time, readTelemetry: vi.fn(async () => sample()), remoteExec: vi.fn(async () => ({ mode: 'remote', code: 0 })), log: vi.fn(),
       sleep: async (ms) => { state.sleeps.push(ms); state.time += ms; } };
     return f;
@@ -2821,7 +2821,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   ]))('wholeSuite refuse blocks %s from %s before any remote dispatch or local slot', async (_label, source, argv, options) => {
     const f = await fixture({});
     f.argv = argv;
-    f.policy = resolveAdmissionPolicy({platform:{...options.platform, remote:{enabled:true, mode:'always'}}, env:options.env ?? {}});
+    f.policy = resolveAdmissionPolicy({platform:{...options.platform, remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always'}}, env:options.env ?? {}});
     const result = await go(f);
     expect.soft(f.remoteExec).not.toHaveBeenCalled();
     expect.soft(localEntries(f)).toEqual([]);
@@ -2841,7 +2841,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
     ...filterSelectedArgv,
   ])('wholeSuite refuse permits %s files to dispatch', async (_label, argv) => {
     const f = await fixture({}); f.argv = argv;
-    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{enabled:true, mode:'always'}}, env:{}});
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'refuse', remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always'}}, env:{}});
     expect(await go(f)).toMatchObject({handled:true, exitCode:0});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
@@ -2850,7 +2850,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   it.each(wholeSuiteArgv)('wholeSuite allow preserves remote dispatch for %s', async (_label, argv) => {
     const f = await fixture({}); f.argv = argv;
     // Broad selections may need Git; use the transport that can provide it instead of rsync's Git-less snapshot.
-    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'git-bundle'}}, env:{}});
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always', transport:'git-bundle'}}, env:{}});
     expect(await go(f)).toMatchObject({handled:true, exitCode:0});
     expect(f.remoteExec).toHaveBeenCalledTimes(1);
     expect(f.log.mock.calls.flat().join('')).not.toContain(wholeSuiteRefusal);
@@ -2859,7 +2859,7 @@ describe('forge-busy wait-retry (runWithRemoteDecision)', () => {
   it('wholeSuite allow preserves the rsync needs-git refusal for a selected file alongside a match-all filter', async () => {
     const f = await fixture({});
     f.argv = ['npx', 'vitest', 'run', 'a.test.ts', './'];
-    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{enabled:true, mode:'always', transport:'rsync'}}, env:{}});
+    f.policy = resolveAdmissionPolicy({platform:{wholeSuite:'allow', remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always', transport:'rsync'}}, env:{}});
     expect(await go(f)).toEqual({handled:false});
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(fallbackRows(f)).toEqual([expect.objectContaining({reason:'needs-git', kind:'FULL'})]);
@@ -3238,7 +3238,7 @@ describe('canonical host manifest policy', () => {
 
   it.each(['direct', 'redirected'].flatMap(mode =>
     [{}, { heavyAdmission: {} }, { heavyAdmission: { remote: {} } },
-      { heavyAdmission: { remote: { enabled: true, mode: 'always' } } }].map(hostSettings => [mode, hostSettings])))('valid %s canonical preferences without a manifest use the standard default (%j)', (mode, hostSettings) => {
+      { heavyAdmission: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' } } }].map(hostSettings => [mode, hostSettings])))('valid %s canonical preferences without a manifest use the standard default (%j)', (mode, hostSettings) => {
     const home = join(lockRoot, 'host');
     const host = preferences(home, {});
     writeFileSync(host, JSON.stringify(hostSettings));
@@ -3274,7 +3274,7 @@ describe('canonical host manifest policy', () => {
 
   it('private tool and environment enablement cannot undo an invalid platform manifest', () => {
     const policy = resolveAdmissionPolicy({ platform: { remote: { manifest: 'trackd', enabled: true } },
-      tool: { remote: { enabled: true, manifest: 'legacy' } },
+      tool: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, manifest: 'legacy' } },
       env: { LANE_POOL_ROOT: join(lockRoot, 'private'), WE_HEAVY_ADMISSION_REMOTE_ENABLED: 'true' } });
     expect(policy.settings.remote.enabled).toBe(false);
     expect(formatAdmissionPolicy(policy)).toContain('invalid remote.manifest; local execution required');

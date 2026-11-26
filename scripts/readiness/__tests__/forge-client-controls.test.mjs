@@ -20,7 +20,7 @@ afterEach(() => {vi.useRealTimers(); vi.restoreAllMocks(); for(const root of roo
 const now = Date.parse('2026-10-29T21:40:00-04:00');
 const sample = (ms=now) => ({sampledAtET:runner.easternTimestamp(ms),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:3,
   recent:[{runId:'r-'+'a'.repeat(32),startedAtET:runner.easternTimestamp(ms-41000),stageMs:{install:1000,run:40000},code:0}]});
-const policy = remote => resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',...remote}}});
+const policy = remote => resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always',...remote}}});
 const command = ['npx','vitest','run','a.test.mjs'];
 const classes = [command,['npx','vitest','related','src/a.ts','--run'],['npm','run','test:integration:vitest'],['npm','run','test:coverage']];
 const withArg = (argv,arg) => argv[0]==='npm' ? [...argv,'--',arg] : [...argv,arg];
@@ -56,7 +56,7 @@ describe('Forge telemetry contracts', () => {
       server.telemetry().then(value=>done(null,JSON.stringify(value)),done);
     });
     const settings={maxLoadPerCore:Number.MAX_VALUE,minFreeRamPct:0,backoffMs:120000};
-    const check=()=>checkRemoteHealth({root:healthRoot,settings,clock:()=>time,
+    const check=()=>checkRemoteHealth({host:'forge',root:healthRoot,settings,clock:()=>time,
       readTelemetry:options=>readForgeTelemetry({...options,exec})});
     expect(await check()).toEqual({ok:true});
     time+=9999;expect(await check()).toEqual({ok:true});
@@ -388,7 +388,7 @@ describe('remote controls', () => {
       await runWithRemoteDecision({
         argv:${JSON.stringify(command)},cwd:${JSON.stringify(f.cwd)},env:{},lockRoot:${JSON.stringify(f.lockRoot)},
         clock:()=>${now},log:()=>{},
-        policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:1}}}),
+        policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always',maxConcurrent:1}}}),
         readTelemetry:async()=>({sampledAtET:easternTimestamp(${now}),cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
         remoteExec:()=>new Promise((resolve,reject)=>{
           // Anchor to the test runner, so the bounded job outlives only this client.

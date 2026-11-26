@@ -9,7 +9,7 @@
  */
 import fs from 'node:fs';
 import { dirname, join } from 'node:path';
-import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
+import { admissionLockRoot, loadAdmissionPolicy } from '../../readiness/heavy-admission.mjs';
 import { remoteHealthFile } from '../../readiness/forge-remote-health.mjs';
 
 export const DISK_USED_PCT_MAX = 80;
@@ -17,8 +17,8 @@ export const PRUNE_REFUSED_MAX = 3;
 export const TELEMETRY_MAX_AGE_MS = 15 * 60 * 1000; // older samples are not evidence of health
 export const HEALTH_FILE_MAX_BYTES = 64 * 1024;
 
-export function defaultReadForgeHealth({ io = fs } = {}) {
-  const fd = io.openSync(remoteHealthFile(join(dirname(admissionLockRoot(process.cwd())), 'remote')), 'r');
+export function defaultReadForgeHealth({ io = fs, host } = {}) {
+  const fd = io.openSync(remoteHealthFile(join(dirname(admissionLockRoot(process.cwd())), 'remote'), host), 'r');
   try {
     const buffer = Buffer.alloc(HEALTH_FILE_MAX_BYTES + 1);
     let size = 0;
@@ -40,9 +40,13 @@ export default {
   id: 'forge-disk-prune', scope: 'host', cadence: 'every-tick', probes: [],
   openAfter: 1, closeAfter: 2, severity: 'high', action: 'alert',
   recommendationHint: 'Forge disk is filling or its cache prune keeps refusing; see the refusal line.',
-  evaluate(_probes, { readForgeHealth = defaultReadForgeHealth, now = Date.now(), episodes = {} } = {}) {
+  evaluate(_probes, { hosts = loadAdmissionPolicy().settings.remote.hosts, readForgeHealth = defaultReadForgeHealth, now = Date.now(), episodes = {} } = {}) {
+    if (hosts.length === 0) return [{
+      subject: 'forge-disk-prune', breach: false, status: 'no-remote-host',
+      summary: 'no remote host configured', recommendation: 'No action.',
+    }];
     let t = null, why = 'no forge telemetry';
-    try { t = readForgeHealth()?.telemetry ?? null; } catch (e) {
+    try { t = readForgeHealth({host:hosts[0].alias})?.telemetry ?? null; } catch (e) {
       // Under test the lock root is a throwaway dir with no Forge file: not applicable. In production a missing file is a note.
       if (e?.code === 'ENOENT' && process.env.VITEST && !episodes['forge-disk-prune::forge-disk-prune']) return [];
       if (e?.code === 'ENOENT') why = 'no remote health file';

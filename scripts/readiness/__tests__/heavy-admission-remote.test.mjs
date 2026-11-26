@@ -33,7 +33,7 @@ vi.mock('../../lib/container-exec.mjs', async (importOriginal) => ({
 
 // Keep this a selected run: the shell-looking text is a test-name value, not an unknown positional filter.
 const argv = ['npm', 'run', 'test:unit', '--', 'a file.test.mjs', '-t', '$(must-stay-literal)'];
-const remoteDefaults = { hosts:[{alias:'forge',root:'/srv/forge-exec'}], enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
+const remoteDefaults = { hosts:[], enabled: false, mode: 'above-threshold', loadPerCoreThreshold: 3, clientPath: null, manifest: 'legacy',
   slotUnitsByKind:{FULL:"auto",soak:"auto",standards:"auto"},elasticSlots:{enabled:true},autoSlotUnits:3,
   maxConcurrent:8, backoffMs:120000, backoffFailures:3, maxLoadPerCore:0.8, minFreeRamPct:15, stuckMinSlots:2, stuckAgeMs:600000, stuckSignalEveryMs:600000, busyWaitMs:600000, busyBackoffMs:45000, transport:'rsync', bundle:{ mainMaxAgeMin:10 } };
 const testRoots=[];
@@ -41,7 +41,7 @@ afterEach(()=>{for(const root of testRoots.splice(0))rmSync(root,{recursive:true
 const healthyRead=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
   cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]});
 const policyFor = (remote = {}) => resolveAdmissionPolicy({
-  platform: { remote: { ...remoteDefaults, enabled: true, ...remote } },
+  platform: { remote: { ...remoteDefaults, hosts:[{alias:'forge',root:'/srv/forge-exec'}], enabled: true, ...remote } },
 });
 
 function expectDecision(result, remote) {
@@ -272,7 +272,7 @@ describe('remote admission policy', () => {
     mkdirSync(join(root, '.claude'));
     const preferences = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(preferences, JSON.stringify({ heavyAdmission: {
-      remote: { enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 },
+      remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' }, fastScale: { maxSlots: 1 },
     } }));
     const exited = new Error('test exit');
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
@@ -312,7 +312,7 @@ describe('remote admission policy', () => {
     const root=mkdtempSync(join(process.env.TMPDIR,'standards-fallback-')),pool=join(root,'pool');mkdirSync(pool);
     mkdirSync(join(root,'.claude'));
     const preferences=join(root,'.claude','platform-preferences.json');
-    writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
+    writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always'}}}));
     const exited=new Error('test exit'),transport=vi.fn(),stage=vi.fn();
     const exit=vi.spyOn(process,'exit').mockImplementation(()=>{throw exited;});
     const stderr=vi.spyOn(process.stderr,'write').mockImplementation(()=>true);
@@ -373,7 +373,7 @@ describe('remote admission policy', () => {
     mkdirSync(pool);
     mkdirSync(join(root, '.claude'));
     const prefs = join(root, '.claude', 'platform-preferences.json');
-    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always' } } }));
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' } } }));
     const exited = new Error('test exit');
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw exited; });
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
@@ -423,7 +423,7 @@ describe('remote admission policy', () => {
     mkdirSync(join(root, '.claude'));
     const prefs = join(root, '.claude', 'platform-preferences.json');
     writeFileSync(prefs, JSON.stringify({ heavyAdmission: {
-      ...(enableRemote ? { remote: { enabled: true, mode: 'always' } } : {}),
+      ...(enableRemote ? { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' } } : {}),
       fastScale: { maxSlots: 1 },
     } }));
     const exited = new Error('test exit');
@@ -455,7 +455,7 @@ describe('remote admission policy', () => {
         expect(existsSync(join(root, 'verify-report.jsonl'))).toBe(false);
       }
       expect(heldSlots({ lockRoot, cap: 2, fastSlots: 1 })).toHaveLength(0);
-      if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('remote.enabled=false (standard)'));
+      if (!enableRemote) expect(stderr).toHaveBeenCalledWith(expect.stringContaining('no remote host configured (standard)'));
     } finally {
       vi.mocked(execSync).mockReset(); vi.mocked(execContainerized).mockReset();
       exit.mockRestore(); stderr.mockRestore(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true });
@@ -464,7 +464,7 @@ describe('remote admission policy', () => {
   it('resolves valid platform remote settings and their provenance', () => {
     const remote = { enabled: true, mode: 'always', loadPerCoreThreshold: 5, clientPath: null };
     const policy = policyFor(remote);
-    expect(policy.settings.remote).toEqual({...remoteDefaults,...remote});
+    expect(policy.settings.remote).toEqual({...remoteDefaults,hosts:[{alias:'forge',root:'/srv/forge-exec'}],...remote});
     expect(policy.sources).toMatchObject({
       'remote.enabled': 'platform',
       'remote.mode': 'platform',
@@ -565,7 +565,7 @@ describe('runWithRemoteDecision', () => {
     expect(await runWithRemoteDecision({ ...f, policy: resolveAdmissionPolicy({}) })).toEqual({ handled: false });
     expect(f.remoteExec).not.toHaveBeenCalled();
     expectLines(f.log, 1, 'local');
-    expect(f.log.mock.calls[0][0]).toContain('remote.enabled=false (standard)');
+    expect(f.log.mock.calls[0][0]).toContain('no remote host configured (standard)');
   });
   it.each([
     ['below threshold -> local', {}, 2.9],

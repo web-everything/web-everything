@@ -62,7 +62,7 @@ const runRemoteCli = options => {
   const home = mkdtempSync(join(process.env.TMPDIR, 'remote-cli-policy-'));
   auxiliary.push(home);
   mkdirSync(join(home, '.claude'));
-  writeFileSync(join(home, '.claude', 'platform-preferences.json'), '{}');
+  writeFileSync(join(home, '.claude', 'platform-preferences.json'), JSON.stringify({heavyAdmission:{remote:{hosts:[{alias:'forge',root:'/srv/forge-exec'}]}}}));
   return remoteCliMain({ home, ...options });
 };
 beforeEach(() => {
@@ -830,7 +830,7 @@ describe('standards input parity', () => {
     });
     const log = vi.fn();
     expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:f.lockRoot,log,loadPerCore:()=>0,
-      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always'}}}),
       remoteExec:async () => {
         const result = await runRemote(f);
         expect(result).toEqual({mode:'cancelled',terminated:true,code:1,reason:'incomplete-standards-inputs',detail:outcome});
@@ -1300,7 +1300,7 @@ describe('runRemote', () => {
     expect(await runRemote(options)).toEqual({mode:'not-started', terminated:true, reason:'command-not-allowed',detail:expect.any(String)});
     const log = vi.fn();
     const decision = await runWithRemoteDecision({
-      ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      ...f, log, policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always'}}}),
       remoteExec:async () => adaptLegacyRemoteResult(await runRemote(options)),
     });
     expect(decision).toEqual({handled:false});
@@ -1332,7 +1332,7 @@ describe('runRemote', () => {
     f.argv=['npm','run','check:standards'];
     const log=vi.fn();
     expect(await runWithRemoteDecision({argv:f.argv,cwd,env:{},lockRoot:join(cwd,'heavy'),log,loadPerCore:()=>0,
-      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always'}}}),
+      policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always'}}}),
       remoteExec:async options=>runRemote({...f,...options}),
     })).toEqual({handled:false});
     expect(log.mock.calls.some(([message])=>message.includes('git-head-unavailable'))).toBe(true);
@@ -1547,7 +1547,7 @@ describe('runRemote', () => {
       : exec(call));
     const result = await runWithRemoteDecision({
       argv:f.argv, cwd, env:{}, lockRoot:join(cwd,'heavy'), log:vi.fn(), loadPerCore:() => 0,
-      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
+      policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
     });
     expect(result).toEqual({handled:false});
@@ -1590,7 +1590,7 @@ describe('runRemote', () => {
     const log = vi.fn();
     expect(await runWithRemoteDecision({
       argv:f.argv, cwd, env:f.env, lockRoot:f.lockRoot, log, loadPerCore:() => 0,
-      policy:resolveAdmissionPolicy({platform:{remote:{enabled:true, mode:'always'}}}),
+      policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true, mode:'always'}}}),
       remoteExec:async options => adaptLegacyRemoteResult(await runRemote({...f, ...options})),
     })).toEqual({handled:false});
     expect(log).toHaveBeenCalledWith(expect.stringContaining('unshipped-scan-file'));

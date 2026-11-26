@@ -12,9 +12,18 @@ afterEach(()=>{vi.restoreAllMocks();for(const r of roots.splice(0))rmSync(r,{rec
 const now=Date.parse('2026-10-29T12:00:00.000-04:00');
 const settings={backoffMs:120000,maxLoadPerCore:0.8,minFreeRamPct:15};
 const sample=(over={})=>({sampledAtET:easternTimestamp(now),cores:8,loadPerCore:0.12,memFreePct:96,activeRuns:0,recent:[],...over});
-const check=(root,t)=>checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>t,ping:async()=>false});
+const check=(root,t)=>checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:async()=>t,ping:async()=>false});
 const invalid=root=>readdirSync(root).filter(n=>n.startsWith('health-g2.json.invalid-')).sort();
 const legacy=()=>({v:1,lastReadAt:now,telemetry:sample(),failures:0,backoffUntil:0,trigger:'',lastGoodAt:now,lastGoodTelemetry:sample()});
+
+it('no remote host configured → status no-remote-host, no alert', async()=>{
+  const root=scratch(), readTelemetry=vi.fn(), ping=vi.fn();
+  const result=await checkRemoteHealth({root,settings:{...settings,hosts:[]},readTelemetry,ping});
+  expect(result).toEqual({ok:false,status:'no-remote-host',reason:'no remote host configured'});
+  expect(readTelemetry).not.toHaveBeenCalled();
+  expect(ping).not.toHaveBeenCalled();
+  expect(readdirSync(root)).toEqual([]);
+});
 
 describe('health state generation isolation',()=>{
   it.each(['forge','other-forge'])('seeds an active legacy breaker for %s without carrying telemetry or touching legacy bytes',async host=>{
@@ -40,7 +49,7 @@ describe('health state generation isolation',()=>{
     vi.spyOn(Date,'now').mockReturnValue(now);
     const root=scratch(),file=join(root,'health.json'),log=vi.spyOn(console,'error').mockImplementation(()=>{});
     writeFileSync(file,bytes);
-    expect(await checkRemoteHealth({root,settings,clock:()=>now-1000,readTelemetry:async()=>sample()})).toEqual({ok:true});
+    expect(await checkRemoteHealth({host:'forge',root,settings,clock:()=>now-1000,readTelemetry:async()=>sample()})).toEqual({ok:true});
     expect(JSON.parse(readFileSync(join(root,'health-g2.json'),'utf8'))).toEqual({
       v:1,lastReadAt:now-1000,telemetry:sample(),failures:0,backoffUntil:0,trigger:'',
     });
@@ -85,7 +94,7 @@ describe('health state generation isolation',()=>{
     const root=scratch(),file=join(root,'health.json'),fresh=sample({loadPerCore:0.25}),read=vi.fn(async()=>fresh);
     const bytes=JSON.stringify({...legacy(),failures:'2',backoffUntil:-1,trigger:'bad trigger'});
     writeFileSync(file,bytes);
-    expect(await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:read})).toEqual({ok:true});
+    expect(await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:read})).toEqual({ok:true});
     expect(read).toHaveBeenCalledOnce();
     expect(JSON.parse(readFileSync(join(root,'health-g2.json'),'utf8'))).toEqual({
       v:1,lastReadAt:now,telemetry:fresh,failures:0,backoffUntil:0,trigger:'',
@@ -169,14 +178,14 @@ describe('malformed Forge health state',()=>{
     vi.spyOn(console,'error').mockImplementation(()=>{});
     const root=scratch(),read=vi.fn(async()=>sample());
     writeFileSync(join(root,'health-g2.json'),JSON.stringify({...legacy(),failures:2,backoffUntil:now+60000,trigger:'copy-failed'}));
-    expect(await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:read,ping:async()=>false})).toEqual({ok:false,reason:'backoff-copy-failed',detail:'quarantined:invalid state'});
+    expect(await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:read,ping:async()=>false})).toEqual({ok:false,reason:'backoff-copy-failed',detail:'quarantined:invalid state'});
     expect(read).not.toHaveBeenCalled();
     expect(invalid(root)).toHaveLength(1);
   });
   it('preserves quarantine and probe details within 300 characters',async()=>{
     vi.spyOn(console,'error').mockImplementation(()=>{});
     const root=scratch();writeFileSync(join(root,'health-g2.json'),JSON.stringify(legacy()));
-    const result=await checkRemoteHealth({root,settings,clock:()=>now,ping:async()=>false,readTelemetry:async()=>{
+    const result=await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,ping:async()=>false,readTelemetry:async()=>{
       const error=new Error('forge-unreachable');error.detail='x'.repeat(1000);throw error;
     }});
     expect(result).toEqual({ok:false,reason:'forge-unreachable',detail:'x'.repeat(200)+'; quarantined:invalid state'});
@@ -185,7 +194,7 @@ describe('malformed Forge health state',()=>{
   it.each(['clock failed','x'.repeat(1000)])('bounds caught-error detail and preserves quarantine detail (%#)',async detail=>{
     vi.spyOn(console,'error').mockImplementation(()=>{});
     const root=scratch();writeFileSync(join(root,'health-g2.json'),JSON.stringify(legacy()));
-    const result=await checkRemoteHealth({root,settings,clock:()=>{const error=new Error('clock failed');error.detail=detail;throw error;}});
+    const result=await checkRemoteHealth({host:'forge',root,settings,clock:()=>{const error=new Error('clock failed');error.detail=detail;throw error;}});
     expect(result).toEqual({ok:false,reason:'remote-health-unreadable',detail:detail.slice(0,273)+'; quarantined:invalid state'});
     expect(result.detail.length).toBeLessThanOrEqual(300);
   });
@@ -227,28 +236,28 @@ describe('forge-unreachable backoff is short, lifted by a good probe, and carrie
   const down=()=>{const e=new Error('forge-unreachable');e.transport=true;e.detail='ssh exit 255: Connection closed by 148.251.135.244 port 22';return e;};
   it('backs off only briefly after an unreachable read and reports the probe error',async()=>{
     const root=scratch();
-    const r=await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const r=await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
     expect(r.ok).toBe(false);expect(r.reason).toBe('forge-unreachable');
     expect(r.detail).toContain('Connection closed');
     expect(JSON.parse(readFileSync(join(root,'health-g2.json'),'utf8')).backoffUntil-now).toBeLessThanOrEqual(15000);
   });
   it('keeps the backoff while the host still fails the probe',async()=>{
     const root=scratch();
-    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
-    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(now+1000)}),ping:async()=>false});
+    await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    const r=await checkRemoteHealth({host:'forge',root,settings,clock:()=>now+1000,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(now+1000)}),ping:async()=>false});
     expect(r.reason).toBe('backoff-forge-unreachable');
   });
   it('lifts the backoff when the next probe succeeds',async()=>{
     const root=scratch();
-    await checkRemoteHealth({root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
+    await checkRemoteHealth({host:'forge',root,settings,clock:()=>now,readTelemetry:async()=>{throw down();},ping:async()=>false});
     const t=now+1000;
-    const r=await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(t)}),ping:async()=>true});
+    const r=await checkRemoteHealth({host:'forge',root,settings,clock:()=>t,readTelemetry:async()=>sample({sampledAtET:easternTimestamp(t)}),ping:async()=>true});
     expect(r).toEqual({ok:true});
   });
   it('does not lift a load backoff on a good ping',async()=>{
     const root=scratch();
     await check(root,sample({loadPerCore:5}));
-    const r=await checkRemoteHealth({root,settings,clock:()=>now+1000,readTelemetry:async()=>sample(),ping:async()=>true});
+    const r=await checkRemoteHealth({host:'forge',root,settings,clock:()=>now+1000,readTelemetry:async()=>sample(),ping:async()=>true});
     expect(r.reason).toBe('backoff-maxLoadPerCore');
   });
 });
@@ -258,7 +267,7 @@ describe('repeated forge-unreachable failures keep backing off',()=>{
     const root=scratch();let t=now;const waits=[];
     const down=async()=>{const e=new Error('forge-unreachable');e.transport=true;throw e;};
     for(let i=0;i<6;i++){
-      await checkRemoteHealth({root,settings,clock:()=>t,readTelemetry:down,ping:async()=>false});
+      await checkRemoteHealth({host:'forge',root,settings,clock:()=>t,readTelemetry:down,ping:async()=>false});
       const until=JSON.parse(readFileSync(join(root,'health-g2.json'),'utf8')).backoffUntil;waits.push(until-t);t=until;
     }
     expect(waits).toEqual([15000,30000,60000,120000,120000,120000]);
@@ -267,7 +276,7 @@ describe('repeated forge-unreachable failures keep backing off',()=>{
     const root=scratch();
     await check(root,sample({loadPerCore:5}));
     for(let i=0;i<3;i++)await recordRemoteResult({root,settings:{...settings,backoffFailures:3},clock:()=>now+1000,result:{mode:'not-started',terminated:true,reason:'forge-unreachable'}});
-    const r=await checkRemoteHealth({root,settings,clock:()=>now+2000,readTelemetry:async()=>sample(),ping:async()=>true});
+    const r=await checkRemoteHealth({host:'forge',root,settings,clock:()=>now+2000,readTelemetry:async()=>sample(),ping:async()=>true});
     expect(r.reason).toBe('backoff-maxLoadPerCore');
   });
 });

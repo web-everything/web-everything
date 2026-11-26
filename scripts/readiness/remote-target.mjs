@@ -1,13 +1,13 @@
 /** Ordered SSH runner discovery. No job, credentials or remote writes are involved. */
-export const DEFAULT_REMOTE_HOSTS = Object.freeze([Object.freeze({alias:'forge',root:'/srv/forge-exec'})]);
+export const DEFAULT_REMOTE_HOSTS = Object.freeze([]);
 export function validRemoteHosts(hosts) {
-  return Array.isArray(hosts) && hosts.length > 0 && hosts.length <= 32 && hosts.every(host =>
+  return Array.isArray(hosts) && hosts.length <= 32 && hosts.every(host =>
     host && typeof host.alias === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._-]*(?![\s\S])/.test(host.alias)
     && host.root === '/srv/forge-exec');
 }
 
 export async function pickRemoteTarget({hosts, exec, cwd, sshOptions} = {}) {
-  if (!validRemoteHosts(hosts)) return null;
+  if (!validRemoteHosts(hosts) || hosts.length === 0) return null;
   exec ??= (await import('./remote-exec.mjs')).defaultExec;
   const skipped = [];
   for (const {alias, root} of hosts) {

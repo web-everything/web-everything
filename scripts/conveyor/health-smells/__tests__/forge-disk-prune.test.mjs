@@ -10,10 +10,24 @@ import { validateSmellShape } from '../../health-smells-shape.mjs';
 
 const NOW = Date.parse('2026-11-15T20:00:00-05:00');
 const fresh = '2026-11-15T19:55:00.000-05:00';
-const run = (telemetry) => smell.evaluate({}, { now: NOW, readForgeHealth: () => (telemetry === undefined ? null : { telemetry: telemetry && { sampledAtET: fresh, ...telemetry } }) });
+const run = (telemetry) => smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => (telemetry === undefined ? null : { telemetry: telemetry && { sampledAtET: fresh, ...telemetry } }) });
 const refusal = 'forge-cache-prune: refused: Invalid reserved lock evidence';
 
 describe('forge-disk-prune smell', () => {
+  it('no remote host configured → status no-remote-host, no alert', () => {
+    const readForgeHealth=vi.fn();
+    const results=smell.evaluate({}, {hosts:[],readForgeHealth,
+      episodes:{'forge-disk-prune::forge-disk-prune':{escalation:{status:'needs-you'}}}});
+    expect(results).toEqual([expect.objectContaining({status:'no-remote-host',breach:false})]);
+    expect(readForgeHealth).not.toHaveBeenCalled();
+    const tick=stepEpisodes(emptyHealthState(),[{smell,results}],NOW);
+    expect(planActions(tick.transitions,{[smell.id]:smell})).toEqual([]);
+    const breached=stepEpisodes(emptyHealthState(),[{smell,results:run({diskUsedPct:100,prune:{consecutiveRefused:0}})}],NOW);
+    const retiring=stepEpisodes(breached.state,[{smell,results}],NOW+1);
+    const retired=stepEpisodes(retiring.state,[{smell,results}],NOW+2);
+    expect(planActions([...retiring.transitions,...retired.transitions],{[smell.id]:smell})).toEqual([]);
+    expect(retired.state.episodes['forge-disk-prune::forge-disk-prune']).toBeUndefined();
+  });
   it('has a valid shape and notifies even in shadow', () => {
     expect(() => validateSmellShape(smell, 'forge-disk-prune.mjs')).not.toThrow();
     expect(NOTIFY_EVEN_IN_SHADOW.has('forge-disk-prune')).toBe(true);
@@ -51,17 +65,17 @@ describe('forge-disk-prune smell', () => {
     }
   });
   it('a throwing reader is a note, not a crash', () => {
-    const out = smell.evaluate({}, { readForgeHealth: () => { throw new Error('boom\n\x1b\u2028\u202e' + 'x'.repeat(500)); } });
+    const out = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: () => { throw new Error('boom\n\x1b\u2028\u202e' + 'x'.repeat(500)); } });
     expect(out[0].summary).toMatch(/unobservable/);
     expect(out[0].summary).not.toMatch(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u);
     expect(out[0].summary).not.toContain('x'.repeat(81));
   });
   it('missing health file -> note on the SAME subject (never closes an open episode); not applicable only under test', () => {
     const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
-    expect(smell.evaluate({}, { readForgeHealth: enoent })).toEqual([]);
+    expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: enoent })).toEqual([]);
     const prev = process.env.VITEST; delete process.env.VITEST;
     try {
-      const out = smell.evaluate({}, { readForgeHealth: enoent });
+      const out = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], readForgeHealth: enoent });
       expect(out[0]).toMatchObject({ subject: 'forge-disk-prune', breach: true, severity: 'low' });
       expect(out[0].summary).toMatch(/no remote health file/);
     } finally { process.env.VITEST = prev; }
@@ -77,10 +91,10 @@ describe('forge-disk-prune smell', () => {
     expect(g.escalation.status).toBe('needs-you');
   });
   it('a stale or undated healthy sample is an unobservable note, never an all-clear', () => {
-    const old = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    const old = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => ({ telemetry: { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
     expect(old[0].severity).toBe('low');
     expect(old[0].summary).toMatch(/stale/);
-    const undated = smell.evaluate({}, { now: NOW, readForgeHealth: () => ({ telemetry: { diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
+    const undated = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, readForgeHealth: () => ({ telemetry: { diskUsedPct: 10, prune: { consecutiveRefused: 0 } } }) });
     expect(undated[0].summary).toMatch(/unobservable/);
   });
   it('default reader sees a real breach at the writer path and rejects oversized health files', () => {
@@ -92,14 +106,14 @@ describe('forge-disk-prune smell', () => {
       const file = join(remote, 'health-g2.json');
       const json = JSON.stringify({ telemetry: { sampledAtET: fresh, diskUsedPct: 100, prune: { consecutiveRefused: 0 } } });
       writeFileSync(file, json);
-      expect(smell.evaluate({}, { now: NOW })[0].escalation?.status).toBe('needs-you');
+      expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW })[0].escalation?.status).toBe('needs-you');
       writeFileSync(file, json.padEnd(64 * 1024, ' '));
-      expect(smell.evaluate({}, { now: NOW })[0].escalation?.status).toBe('needs-you');
+      expect(smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW })[0].escalation?.status).toBe('needs-you');
       writeFileSync(file, json.padEnd(64 * 1024 + 1, ' '));
-      const [oversized] = smell.evaluate({}, { now: NOW });
+      const [oversized] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW });
       expect(oversized.severity).toBe('low');
       expect(oversized.summary).toMatch(/unobservable.*exceeds.*65536/);
-      const [sticky] = smell.evaluate({}, { now: NOW, episodes: { [key]: { escalation: { status: 'needs-you' } } } });
+      const [sticky] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, episodes: { [key]: { escalation: { status: 'needs-you' } } } });
       expect(sticky.escalation?.status).toBe('needs-you');
     } finally {
       vi.unstubAllEnvs();
@@ -143,7 +157,7 @@ describe('forge-disk-prune smell', () => {
     expect(f.measure.lastRefusal).toContain('`"--../');
   });
   it.each(['fresh note', 'persisted high note'])('unobservable episode stays low and later breach notifies once: %s', (kind) => {
-    const tick = (state, telemetry, now) => stepEpisodes(state, [{ smell, results: smell.evaluate({}, {
+    const tick = (state, telemetry, now) => stepEpisodes(state, [{ smell, results: smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}],
       now, episodes: state.episodes, readForgeHealth: () => ({ telemetry: { sampledAtET: fresh, ...telemetry } }),
     }) }], now);
     const note = tick(emptyHealthState(), {}, NOW);
@@ -163,7 +177,7 @@ describe('forge-disk-prune smell', () => {
     expect(tick(clean.state, healthy, NOW + 4).state.episodes[key]).toBeUndefined();
   });
   const key = 'forge-disk-prune::forge-disk-prune';
-  const withEpisode = (telemetry, episodes) => smell.evaluate({}, { now: NOW, episodes, readForgeHealth: () => ({ telemetry }) });
+  const withEpisode = (telemetry, episodes) => smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], now: NOW, episodes, readForgeHealth: () => ({ telemetry }) });
   it('R952 sticky: open needs-you + telemetry missing -> still needs-you "breach open, telemetry now missing"', () => {
     for (const t of [null, { cores: 1 }, { sampledAtET: '2000-01-01T00:00:00.000-05:00', diskUsedPct: 10, prune: { consecutiveRefused: 0 } }]) {
       const [f] = withEpisode(t, { [key]: { escalation: { status: 'needs-you' } } });
@@ -191,7 +205,7 @@ describe('forge-disk-prune smell', () => {
   });
   it('R952 sticky holds even under test when the health file is missing and an episode is open', () => {
     const enoent = () => { throw Object.assign(new Error('x'), { code: 'ENOENT' }); };
-    const [f] = smell.evaluate({}, { episodes: { [key]: { escalation: { status: 'needs-you' } } }, readForgeHealth: enoent });
+    const [f] = smell.evaluate({}, {hosts:[{alias:'forge',root:'/srv/forge-exec'}], episodes: { [key]: { escalation: { status: 'needs-you' } } }, readForgeHealth: enoent });
     expect(f.escalation.status).toBe('needs-you');
   });
 });

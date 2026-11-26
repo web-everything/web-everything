@@ -17,7 +17,7 @@ const sample=(ms=now)=>({sampledAtET:easternTimestamp(ms),cores:8,loadPerCore:0.
 const saved=(telemetry,lastReadAt)=>({v:1,lastReadAt,telemetry,failures:0,backoffUntil:0,trigger:''});
 const persist=(root,state)=>writeFileSync(join(root,'health-g2.json'),JSON.stringify(state));
 const load=root=>JSON.parse(readFileSync(join(root,'health-g2.json'),'utf8'));
-const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({root,settings,clock:()=>time,readTelemetry,ping});
+const check=(root,readTelemetry,time=now,ping=async()=>false)=>checkRemoteHealth({host:'forge',root,settings,clock:()=>time,readTelemetry,ping});
 
 const refusal=r=>r.endsWith('forge-unreachable')?{ok:false,reason:r,detail:expect.any(String)}:{ok:false,reason:r};
 describe('Forge health freshness',()=>{
@@ -71,7 +71,7 @@ describe('Forge health freshness',()=>{
   it('fails closed for a non-finite age without a second read',async()=>{
     const root=scratch(),readTelemetry=vi.fn(async()=>sample());
     const clock=vi.fn().mockReturnValueOnce(now).mockReturnValueOnce(NaN).mockReturnValue(now);
-    expect(await checkRemoteHealth({root,settings,clock,readTelemetry})).toEqual({ok:false,reason:'telemetry-stale'});
+    expect(await checkRemoteHealth({host:'forge',root,settings,clock,readTelemetry})).toEqual({ok:false,reason:'telemetry-stale'});
     expect(readTelemetry).toHaveBeenCalledTimes(1);
     expect(load(root)).toMatchObject({trigger:'telemetry-stale',backoffUntil:now+settings.backoffMs});
   });

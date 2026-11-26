@@ -285,7 +285,7 @@ describe('R593 client and routing', () => {
   });
   describe('needs-git tests route remote only with the capability', () => {
     let cwd;
-    const mk = (transport) => resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath: null,
+    const mk = (transport) => resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath: null,
       maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15, transport } } });
     beforeEach(async () => {
       cwd = join(root, 'repo'); await fs.mkdir(cwd);
@@ -311,11 +311,13 @@ describe('R593 client and routing', () => {
     });
     it('R807: unknown capability stays local when an external client override is configured (no affirmation possible)', async () => {
       const lockRoot = join(root, 'locks'); await fs.mkdir(lockRoot, { recursive: true });
-      const policyFor = (clientPath) => resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath,
+      const policyFor = (clientPath) => resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', loadPerCoreThreshold: 3, clientPath,
         maxConcurrent: 8, backoffMs: 120000, backoffFailures: 3, maxLoadPerCore: 0.8, minFreeRamPct: 15, transport: 'git-bundle' } } });
       const run = async (clientPath) => {
         const decisions = []; const calls = [];
         await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'git.test.mjs'], policy: policyFor(clientPath), cwd, env: {}, lockRoot, loadPerCore: () => 4,
+          readTelemetry: async () => ({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
+            cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]}),
           hostOverloaded: () => false, log: () => {}, onDecision: d => decisions.push(d),
           remoteExec: async (o) => { calls.push(o); return { mode: 'not-started', terminated: true, reason: 'forge-runner-too-old' }; } });
         return { decisions, calls };
@@ -790,7 +792,7 @@ describe('R857 advisory bundle credential policy',()=>{
         exec:transport,...(kind==='no callback'?{}:{onWarning}),warningSink,log:()=>{}};
       if(kind==='admission log') {
         const lockRoot=join(root,'heavy');
-        const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',transport:'git-bundle'}}});
+        const policy=resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always',transport:'git-bundle'}}});
         const readTelemetry=async()=>({sampledAtET:(await import('../forge-exec-run.mjs')).easternTimestamp(Date.now()),
           cores:8,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]});
         expect(await runWithRemoteDecision({argv:options.argv,cwd:lane,env:{},policy,lockRoot,readTelemetry,log:()=>{},

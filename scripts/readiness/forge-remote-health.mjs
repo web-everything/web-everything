@@ -91,7 +91,8 @@ async function transaction(root,action,host='forge',onQuarantine=()=>{}) {
     return result;
   } finally {rmSync(pending,{force:true});releaseLockDir(root,key);}
 }
-export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host='forge',ping=pingForge}) {
+export async function checkRemoteHealth({root,settings,clock=Date.now,readTelemetry=readForgeTelemetry,host=settings.hosts?.[0]?.alias,ping=pingForge}) {
+  if (!host) return {ok:false,status:'no-remote-host',reason:'no remote host configured'};
   let quarantineDetail='';
   const finish=result=>{
     if(result.ok)return result;

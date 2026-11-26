@@ -14,7 +14,7 @@ function fixture(remote={}) {
   let now=Date.now();
   const telemetry={sampledAtET:easternTimestamp(now),cores:32,loadPerCore:0.1,memFreePct:90,activeRuns:0,recent:[]};
   const f={argv:['npm','run','test:unit'],env:{},cwd:root,lockRoot:join(root,'heavy'),
-    policy:resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:4,...remote}}}),
+    policy:resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always',maxConcurrent:4,...remote}}}),
     readTelemetry:async()=>({...telemetry,sampledAtET:easternTimestamp(now)}),
     clock:()=>now,sleep:vi.fn(async ms=>{now+=ms;}),hostOverloaded:()=>false,log:vi.fn(),
     remoteExec:vi.fn(async()=>({mode:'remote',code:0}))};
@@ -297,7 +297,7 @@ describe('R324 elastic remote slot units',()=>{
 });
 
 describe('non-elastic kinds never need telemetry (remote-slot-unreadable race)',()=>{
-  const policy=resolveAdmissionPolicy({platform:{remote:{enabled:true,mode:'always',maxConcurrent:4}}});
+  const policy=resolveAdmissionPolicy({platform:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always',maxConcurrent:4}}});
   it.each(['files','selected','build','other','verify'])('%s runs on one unit when telemetry was just rewritten as null',kind=>{
     expect(resolveRemoteSlotUnits({policy,kind,telemetry:null})).toEqual({units:1,source:'default'});
   });

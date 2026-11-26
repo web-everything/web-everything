@@ -45,12 +45,14 @@ describe('ordered remote targets', () => {
     expect(f.remoteExec).not.toHaveBeenCalled();
     expect(f.log.mock.calls.flat().join('')).toContain('location=local reason=no-healthy-remote');
   });
-  it('default setting dispatches forge and its root with no target probe', async () => {
+  it('no configured hosts resolves to no remote target (no implicit forge alias)', async () => {
     const f=admission(), targetExec=vi.fn();
-    expect(f.policy.settings.remote.hosts).toEqual([hosts[1]]);
-    expect(await runWithRemoteDecision({...f,targetExec})).toEqual({handled:true,exitCode:0,remoteResult:{mode:'remote',code:0}});
+    expect(f.policy.settings.remote.hosts).toEqual([]);
+    expect(await pickRemoteTarget({hosts:f.policy.settings.remote.hosts,exec:targetExec})).toBeNull();
+    expect(await runWithRemoteDecision({...f,targetExec})).toEqual({handled:false});
     expect(targetExec).not.toHaveBeenCalled();
-    expect(f.remoteExec).toHaveBeenCalledWith(expect.objectContaining({host:'forge',root:'/srv/forge-exec'}));
+    expect(f.remoteExec).not.toHaveBeenCalled();
+    expect(f.log.mock.calls.flat()).toEqual([expect.stringContaining('no remote host configured')]);
   });
   it.each([hosts,[hosts[0]]].map(targets=>[targets]))('dispatches the selected host and root from %j', async targets => {
     const f=admission({hosts:targets}), targetExec=vi.fn(async()=>({code:0}));
@@ -68,7 +70,7 @@ describe('ordered remote targets', () => {
     expect(await probeRemoteHosts({hosts,exec})).toEqual({...hosts[0],skipped:[]});
     expect(exec).toHaveBeenCalledTimes(1);
   });
-  it.each([[],null,[{alias:'',root:'/srv/forge-exec'}],
+  it.each([null,[{alias:'',root:'/srv/forge-exec'}],
     ...['-V','user@mesa','@mesa','_mesa','.mesa','mesa\n','bad;host'].map(alias=>[{alias,root:'/srv/forge-exec'}]),
     ...['/srv/mesa-exec','/','/srv/../srv/forge-exec','/srv/forge-exec/','relative','/srv/a b','/srv/$(id)','/srv/x;id'].map(root=>[{alias:'mesa',root}]),
     Array(33).fill(hosts[0])].map(value=>[value]))('invalid hosts %j disable remote dispatch and log local fallback', async value => {

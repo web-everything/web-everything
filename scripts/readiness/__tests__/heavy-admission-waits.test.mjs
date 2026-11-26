@@ -101,7 +101,7 @@ describe('admission wait ledger', () => {
     const root = temp(), lockRoot = join(root, 'heavy'), remoteRoot = join(root, 'remote'); let time = T;
     if (busy) expect(tryAcquireSlot({ lockRoot: remoteRoot, cap: 1, owner: 'holder', nowMs: T, nowIso: new Date(T).toISOString() }).ok).toBe(true);
     const result = await runWithRemoteDecision({ argv: ['npx', 'vitest', 'run', 'a.test.mjs'], cwd: root, lockRoot, env: {},
-      policy: resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', maxConcurrent: 1 } } }),
+      policy: resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', maxConcurrent: 1 } } }),
       clock: () => time, loadPerCore: () => 0, hostOverloaded: () => false, log: () => {},
       sleep: async ms => { time += ms; releaseOwnedSlot({ lockRoot: remoteRoot, cap: 1, owner: 'holder' }); },
       remoteExec: async () => ({ mode: 'remote', code: 0 }) });

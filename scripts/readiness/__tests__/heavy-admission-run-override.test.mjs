@@ -16,7 +16,7 @@ function make() {
   const outside = join(root, 'elsewhere', 'scripts', 'readiness', 'remote-exec.mjs');
   const host = join(root, 'host', 'remote-exec.mjs');
   for (const f of [laneClient, outside, host]) { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, src); }
-  const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', clientPath: host } } });
+  const policy = resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', clientPath: host } } });
   const importClient = vi.fn(async () => ({ runRemote: async () => ({ mode: 'remote', code: 0 }) }));
   const appendEvent = vi.fn(async () => true);
   const log = vi.fn();

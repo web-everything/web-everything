@@ -13,7 +13,7 @@ function fixture() {
   writeFileSync(join(root, '.claude', 'platform-preferences.json'), '{}');
   return { path, options: { home: root, repoRoot: root, checkoutRoot: root, env: { WE_UNDER_TEST: '1', WE_PLATFORM_PREFERENCES: path, LANE_POOL_ROOT: join(root, 'pool') } } };
 }
-const block = { remote: { enabled: true, mode: 'always' } };
+const block = { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' } };
 
 it('a platform file above 256 KiB still supplies the platform layer', () => {
   const f = fixture();

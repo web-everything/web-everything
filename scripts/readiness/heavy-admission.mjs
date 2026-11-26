@@ -276,8 +276,9 @@ export const RUN_WAIT_HOST_POLL_MS = 5_000;
 
 /** Upper bound on any slot count: a typo like `cap: 1e9` would otherwise make every scan walk a billion lock entries. */
 const ADMISSION_MAX_SLOTS = 256;
-const isDefaultRemoteHosts = hosts => hosts.length === 1
-  && hosts[0].alias === DEFAULT_REMOTE_HOSTS[0].alias && hosts[0].root === DEFAULT_REMOTE_HOSTS[0].root;
+// Preserve the existing direct-dispatch path for an explicitly configured Forge alias.
+const isLegacyForgeTarget = hosts => hosts.length === 1
+  && hosts[0].alias === 'forge' && hosts[0].root === '/srv/forge-exec';
 const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
@@ -554,7 +555,7 @@ export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid
   const values = ['cap', 'fastSlots', 'onTimeout', 'wholeSuite', 'fastScale.maxSlots', ...warnLeaves, 'priority.mode',
     ...Object.keys(ADMISSION_POLICY_STANDARD.remote)
       .filter(key => (key !== 'clientPath' || settings.remote?.clientPath != null)
-        && (key !== 'hosts' || (sources['remote.hosts'] ?? 'standard') !== 'standard' || !isDefaultRemoteHosts(settings.remote?.hosts ?? DEFAULT_REMOTE_HOSTS)))
+        && (key !== 'hosts' || (sources['remote.hosts'] ?? 'standard') !== 'standard' || (settings.remote?.hosts ?? DEFAULT_REMOTE_HOSTS).length !== 0))
       .map(key => key === 'elasticSlots' ? 'remote.elasticSlots.enabled' : key === 'bundle' ? 'remote.bundle.mainMaxAgeMin' : `remote.${key}`)]
     // The policy line shows at most 960 path characters so the whole line stays under 2,000.
     .map((leaf) => `${leaf}=${leaf === 'remote.clientPath' ? clientPathForLog(admissionLeaf(settings, leaf)).slice(0, 960) : (admissionObject(admissionLeaf(settings, leaf)) || Array.isArray(admissionLeaf(settings, leaf))) ? JSON.stringify(admissionLeaf(settings, leaf)) : admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
@@ -1289,7 +1290,7 @@ function resolveTimeoutCancelWaitMs(env) {
 }
 
 export async function runWithRemoteDecision({
-  argv, policy, cwd, env, host = 'forge', clock = Date.now,
+  argv, policy, cwd, env, host, clock = Date.now,
   lockRoot = admissionLockRoot(cwd, env), readTelemetry,
   timeoutMs = classifyAdmissionCommandKind(argv.map(shellQuoteWord).join(' '), env) === 'files'
     ? resolveFastRunTimeoutMs(env)
@@ -1302,10 +1303,20 @@ export async function runWithRemoteDecision({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 }) {
   if (wholeSuiteRefused({ command: argv.map(shellQuoteWord).join(' '), policy, env, log })) return { handled: true, exitCode: 125 };
-  if (!validRemoteHosts(policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS)) {
+  if (!validRemoteHosts(policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS)
+    || policy.invalid?.some(entry => /^(platform|tool)\.remote\.hosts=/.test(entry))) {
     log(`heavy-admission: location=local reason=invalid-remote-hosts (${policy.sources['remote.hosts'] ?? 'standard'})\n`);
     return {handled:false};
   }
+  const hosts = policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS;
+  if (hosts.length === 0) {
+    const reason = 'no remote host configured';
+    onDecision?.({remote:false,reason});
+    const disabled = policy.settings.remote.enabled ? '' : `; local (remote.enabled=false (${policy.sources['remote.enabled'] ?? 'standard'}))`;
+    log(`heavy-admission: location=local reason=${reason} (${policy.sources['remote.hosts'] ?? 'standard'})${disabled}\n`);
+    return {handled:false};
+  }
+  host = hosts[0].alias;
   let load;
   try { load = loadPerCore(); } catch { /* unreadable load stays local */ }
   // 7579: a host the local admission would refuse is a reason to use Forge, not to defer. Only a definite
@@ -1316,8 +1327,7 @@ export async function runWithRemoteDecision({
     return overloaded;
   };
   let root = '/srv/forge-exec';
-  const hosts = policy.settings.remote.hosts ?? DEFAULT_REMOTE_HOSTS;
-  const customTargets = !isDefaultRemoteHosts(hosts);
+  const customTargets = !isLegacyForgeTarget(hosts);
   const externalClient = policy.settings.remote.clientPath != null || remoteClientOverride != null;
   let targetMissing = false;
   if (customTargets && policy.settings.remote.enabled

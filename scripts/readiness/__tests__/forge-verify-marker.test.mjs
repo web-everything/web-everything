@@ -10,7 +10,7 @@ const verify=resolve('scripts/verify-lane.mjs'),client=new URL('../remote-exec.m
 beforeEach(()=>{
   scratch=mkdtempSync(join(process.env.TMPDIR,'forge-marker-'));repo=join(scratch,'mac');mkdirSync(repo);
   mkdirSync(join(scratch,'.claude'));
-  writeFileSync(join(scratch,'.claude','platform-preferences.json'),'{}');
+  writeFileSync(join(scratch,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{hosts:[{alias:'forge',root:'/srv/forge-exec'}]}}}));
   const git=(...args)=>{const r=spawnSync('git',args,{cwd:repo,encoding:'utf8'});expect(r.status,r.stderr).toBe(0);};
   git('init','-q');
   writeFileSync(join(repo,'package.json'),'{}');writeFileSync(join(repo,'package-lock.json'),'{}');
@@ -21,7 +21,7 @@ afterEach(()=>rmSync(scratch,{recursive:true,force:true}));
 it('real verify-lane runGate hands WE_FORGE_GATE_DISPATCH=1 without a held local slot to heavy admission for remote dispatch',()=>{
   const gate=join(scratch,'admission-gate.mjs'),wire=join(scratch,'admission.json');
   const pool=join(scratch,'pool'),preferences=join(scratch,'preferences.json');mkdirSync(pool);
-  writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{enabled:true,mode:'always'}}}));
+  writeFileSync(preferences,JSON.stringify({heavyAdmission:{remote:{hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:'always'}}}));
   // Exercise the eligible npm wrapper; raw node gates deliberately retain local admission.
   writeFileSync(join(repo,'package.json'),JSON.stringify({scripts:{'check:standards':`node ${JSON.stringify(gate)}`}}));
   // Only telemetry IO is fake: verify's real policy, health check and admission plan still run.

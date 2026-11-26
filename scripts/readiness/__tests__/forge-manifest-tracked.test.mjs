@@ -186,7 +186,7 @@ it('tracked bundle requests ship only a full tracked rsync manifest despite a us
 it.each(['always', 'overloaded'])('tracked needsGit routing refuses bundles locally when %s and logs bundle-local', async mode => {
   await write('git.test.mjs', "import {spawnSync} from 'node:child_process'; spawnSync('git', ['status']);\n"); commit();
   const argv = ['npx', 'vitest', 'run', 'git.test.mjs'];
-  const policy = resolveAdmissionPolicy({ platform: { remote: {enabled:true,mode:mode === 'always' ? 'always' : 'above-threshold',transport:'git-bundle',manifest:'tracked'} } });
+  const policy = resolveAdmissionPolicy({ platform: { remote: {hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled:true,mode:mode === 'always' ? 'always' : 'above-threshold',transport:'git-bundle',manifest:'tracked'} } });
   expect(decideRemote({policy,argv,cwd,loadPerCore:10,runnerBundleOk:true})).toMatchObject({remote:false,needsGit:true,manifestRefusal:'bundle-local'});
   const remoteExec = vi.fn(), output = vi.fn();
   expect(await runWithRemoteDecision({policy,argv,cwd,env,lockRoot:join(root,'heavy'),remoteExec,log:output,
@@ -217,7 +217,7 @@ it.each(['direct', 'redirected'].flatMap(mode =>
 it.each(['legacy','tracked','no key'])('explicit remote CLI still forces enabled/always for valid %s policy and dispatches the effective transport', async policyCase => {
   const manifest = policyCase === 'tracked' ? 'tracked' : 'legacy';
   const home = join(root,'host'); await fs.mkdir(join(home,'.claude'),{recursive:true});
-  await fs.writeFile(join(home,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{...(policyCase !== 'no key' ? {manifest} : {}),enabled:false,transport:'git-bundle'}}}));
+  await fs.writeFile(join(home,'.claude','platform-preferences.json'),JSON.stringify({heavyAdmission:{remote:{hosts:[{alias:'forge',root:'/srv/forge-exec'}],...(policyCase !== 'no key' ? {manifest} : {}),enabled:false,transport:'git-bundle'}}}));
   await write('pure.test.mjs','// pure test\n'); commit();
   const remoteExec = vi.fn(async()=>({mode:'remote',code:0})), local = vi.fn(), output = vi.fn();
   const now = Date.now();

@@ -14,7 +14,7 @@ const scratch = () => {const root = mkdtempSync(join(process.env.TMPDIR, 'client
 afterEach(() => {for (const root of roots.splice(0)) rmSync(root, {recursive: true, force: true});});
 const now = Date.parse('2026-10-29T21:40:00-04:00');
 const sample = () => ({sampledAtET: easternTimestamp(now), cores: 8, loadPerCore: 0.12, memFreePct: 96, activeRuns: 3, recent: []});
-const policy = resolveAdmissionPolicy({platform: {remote: {enabled: true, mode: 'always'}}});
+const policy = resolveAdmissionPolicy({platform: {remote: {hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always'}}});
 const marker = (root) => join(root, 'remote', 'slot-0.unconfirmed');
 const fixture = (remoteExec) => {
   const root = scratch();
@@ -69,7 +69,7 @@ import {existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {resolveAdmissionPolicy, runWithRemoteDecision} from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts/readiness/heavy-admission.mjs')).href)};
 const root = ${JSON.stringify(root)};
-const policy = resolveAdmissionPolicy({platform: {remote: {enabled: true, mode: 'always'}}});
+const policy = resolveAdmissionPolicy({platform: {remote: {hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always'}}});
 const result = await runWithRemoteDecision({argv: ['npx','vitest','run','a.test.mjs'], policy, cwd: root, env: {}, lockRoot: join(root,'heavy'),
   clock: () => ${now}, readTelemetry: async () => (${JSON.stringify(sample())}), log: () => {}, hostOverloaded: () => false,
   remoteExec: ({signal}) => { process.stdout.write('ready\\n'); return new Promise((resolve) => signal.addEventListener('abort', () => resolve({mode:'cancelled', terminated:true}), {once:true})); }});

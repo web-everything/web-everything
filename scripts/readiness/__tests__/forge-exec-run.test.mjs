@@ -1766,7 +1766,7 @@ describe('slot resource environment and receipts',()=>{
     expect(()=>manifestAPI.parseTelemetry(JSON.stringify(telemetry))).not.toThrow();
     for(const row of telemetry.recent)for(const key of ['processCount','tasksMax','tasksNear','tasksNote'])expect(row).not.toHaveProperty(key);
     const {checkRemoteHealth}=await import('../forge-remote-health.mjs');
-    expect(await checkRemoteHealth({root:join(root,'health'),settings:{maxLoadPerCore:1e6,minFreeRamPct:0},readTelemetry:async()=>telemetry})).toEqual({ok:true});
+    expect(await checkRemoteHealth({host:'forge',root:join(root,'health'),settings:{maxLoadPerCore:1e6,minFreeRamPct:0},readTelemetry:async()=>telemetry})).toEqual({ok:true});
   });
   it('scales TasksMax with the elastic grant and preserves an unlimited operator cap',()=>{
     const limits={parent:{cpuQuota:'2800%'},slot:{cpuQuota:'800%',memoryMax:'12G',tasksMax:2048}};

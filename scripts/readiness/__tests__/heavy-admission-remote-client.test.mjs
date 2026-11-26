@@ -34,7 +34,7 @@ function fixture(source = success) {
   mkdirSync(dirname(clientPath));
   writeFileSync(clientPath, source);
   const lockRoot = join(root, 'pool', '.admission', 'heavy');
-  const policy = resolveAdmissionPolicy({ platform: { remote: { enabled: true, mode: 'always', clientPath } } });
+  const policy = resolveAdmissionPolicy({ platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', clientPath } } });
   const seams = { policy, lockRoot, laneRoots: [], readSha: vi.fn(() => 'abc123'),
     log: vi.fn(), appendEvent: vi.fn(async () => true), notice: { logged: false },
     // Real-IO provenance must not race the production 100ms deadline on a loaded coverage shard;
@@ -270,7 +270,7 @@ describe('remote client override', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const f = fixture();
     const platform = { cap: 3, fastSlots: 2, priority: { mode: 'off' },
-      remote: { enabled: true, mode: 'always', loadPerCoreThreshold: 2.5 } };
+      remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', loadPerCoreThreshold: 2.5 } };
     const withClient = resolveAdmissionPolicy({ platform: {
       ...platform, remote: { ...platform.remote, clientPath: f.clientPath },
     } });
@@ -948,13 +948,15 @@ describe('remote client override', () => {
     const f = fixture();
     const clientPath = join(f.root, `unsafe\n\x1b\x7f${'x'.repeat(4096)}`, 'remote-exec.mjs');
     f.policy.settings.remote.clientPath = clientPath;
-    const formatted = formatAdmissionPolicy(f.policy);
+    // Formatting needs no remote dispatch; exercise the hostless standard policy.
+    const displayPolicy = resolveAdmissionPolicy({platform:{remote:{clientPath}}});
+    const formatted = formatAdmissionPolicy(displayPolicy);
     const displayPath = clientPath.replace(/[^\x20-\x7e]/g, '?').slice(0, 960);
     expect(formatted).toContain(`remote.clientPath=${displayPath} (platform)`);
     expect(formatted).toMatch(/^[\x20-\x7e\u00b7]+$/);
     // Bound the displayed path independently of the policy's growing set of named settings.
-    const pathless = formatAdmissionPolicy({ ...f.policy, settings: { ...f.policy.settings,
-      remote: { ...f.policy.settings.remote, clientPath: '' } } });
+    const pathless = formatAdmissionPolicy({ ...displayPolicy, settings: { ...displayPolicy.settings,
+      remote: { ...displayPolicy.settings.remote, clientPath: '' } } });
     expect(pathless.length).toBeLessThan(1000);
     expect(formatted.length).toBeLessThan(2000);
     expect(formatted).toBe(pathless.replace('remote.clientPath= (platform)', `remote.clientPath=${displayPath} (platform)`));
@@ -988,7 +990,7 @@ describe('remote client override', () => {
       ...(layer === 'env' ? { WE_HEAVY_ADMISSION_REMOTE_CLIENT_PATH: f.clientPath } : {}) };
     expect(privateAdmissionPool(env, f.root)).toBe(true);
     const policy = resolveAdmissionPolicy({
-      platform: { remote: { enabled: true, mode: 'always' } },
+      platform: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always' } },
       tool: layer === 'tool' ? { remote: { clientPath: f.clientPath } } : {},
       env, checkoutRoot: f.root,
     });

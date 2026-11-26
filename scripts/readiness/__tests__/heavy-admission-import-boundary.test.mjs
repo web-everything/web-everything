@@ -25,7 +25,7 @@ function cliFixture(source) {
   mkdirSync(pool);
   mkdirSync(dirname(preferences));
   writeFileSync(clientPath, source);
-  writeFileSync(preferences, JSON.stringify({ heavyAdmission: { remote: { enabled: true, mode: 'always', clientPath } } }));
+  writeFileSync(preferences, JSON.stringify({ heavyAdmission: { remote: { hosts: [{alias:'forge',root:'/srv/forge-exec'}], enabled: true, mode: 'always', clientPath } } }));
   const env = { ...process.env, LANE_POOL_ROOT: pool, WE_PLATFORM_PREFERENCES: preferences,
     WE_DAEMON_EVENTS: eventPath, WE_HEAVY_ADMISSION: 'on', WE_HEAVY_ADMISSION_HELD: '',
     WE_HEAVY_ADMISSION_CONTAINER: '', WE_HEAVY_ADMISSION_CONTAINER_NODE_MODULES: '', CI: '' };
