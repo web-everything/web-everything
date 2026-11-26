@@ -138,6 +138,7 @@ describe('#3850 — structured dispositions', () => {
 describe('#3850 — the promote-draft pass executes the disposition', () => {
   const base = {
     root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }), clearAwaitingCi: () => {},
+    readClaim: () => null, readThread: () => [...comments3850, { id: "current-answer", author: { login: "chalbert" }, body: buildOperatorAnswer({ standDownId: parseOperatorAnswer(comments3850.find(c => parseOperatorAnswer(c))).standDownId, reason: "Close as superseded: the org move already happened", actor: "chalbert", channel: "claude-code-chat", disposition: "close-superseded" }) }],
     readHeadCheckState: () => ({ state: 'green', why: '', counts: {} }), provider: { ready: () => { throw new Error('no'); } },
   };
   const answer = { reason: 'Close as superseded: the org move already happened', actor: 'chalbert', channel: 'claude-code-chat' };
@@ -150,7 +151,7 @@ describe('#3850 — the promote-draft pass executes the disposition', () => {
     expect(closed[0].prNumber).toBe(3850);
     expect(closed[0].comment.startsWith(CLOSE_SUPERSEDED_MARKER)).toBe(true);
     expect(closed[0].comment).toContain('> Close as superseded: the org move already happened');
-    expect(r.dispatched).toEqual([{ pr: 3850, kind: 'close-superseded' }]);
+    expect(r.dispatched).toEqual([{ pr: 3850, kind: 'close-superseded', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
   });
 
   it('refuses (no close) when the card already exists on main, or the read fails', () => {
@@ -159,6 +160,25 @@ describe('#3850 — the promote-draft pass executes the disposition', () => {
     expect(onMain.refusals).toEqual([expect.objectContaining({ pr: 3850, kind: 'close-card-on-main' })]);
     const unreadable = runReconcilePromoteDraftDispatch({ ...base, reconcile: () => plan, readCardsOnMain: () => { throw new Error('gh down'); }, closePr: never });
     expect(unreadable.refusals).toEqual([expect.objectContaining({ pr: 3850, kind: 'close-unreadable' })]);
+  });
+
+
+  it.each(['retracted disposition','later unresolved stand-down','already executed','unreadable'])(
+    'close re-reads the thread at the write point: %s refuses with zero closePr', mode => {
+      const freshAnswer = {id:'new-answer',author:{login:'chalbert'},body:buildOperatorAnswer({standDownId:'late-stop',actor:'chalbert',channel:'chat',reason:'Keep open',disposition:'rearm-review'})};
+      const lateStop = {id:'late-stop',author:{login:'chalbert'},body:buildStandDownComment({reason:'needs-judgment',detail:'new question'})};
+      const comments = mode === 'retracted disposition' ? [...comments3850,lateStop,freshAnswer]
+        : mode === 'later unresolved stand-down' ? [...comments3850,lateStop]
+        : [...comments3850,{author:{login:'web-everything'},body:closeSupersededComment(answer)}];
+      const closed = [];
+      const result = runReconcilePromoteDraftDispatch({...base,reconcile:()=>plan,readCardsOnMain:()=>[],
+        readThread:()=>{if(mode==='unreadable') throw Error('thread timed out'); return comments;},closePr:a=>closed.push(a)});
+      expect(closed).toEqual([]); expect(result.refusals).toContainEqual(expect.objectContaining({kind:mode==='unreadable'?'close-superseded-unreadable':'close-superseded-stale'}));
+    });
+  it('the close comment quotes the fresh answer rather than the planned answer', () => {
+    const comments = [...comments3850,{id:'fresh',author:{login:'chalbert'},body:buildOperatorAnswer({standDownId:parseOperatorAnswer(comments3850.find(c=>parseOperatorAnswer(c))).standDownId,actor:'chalbert',channel:'chat',reason:'Fresh close ruling',disposition:'close-superseded'})}];
+    const closed=[]; runReconcilePromoteDraftDispatch({...base,reconcile:()=>plan,readCardsOnMain:()=>[],readThread:()=>comments,closePr:a=>closed.push(a)});
+    expect(closed).toHaveLength(1); expect(closed[0].comment).toContain('Fresh close ruling'); expect(closed[0].comment).not.toContain(answer.reason);
   });
 
   it('defaultReadCardsOnMain fails closed when gh truncated the files list at its 100-entry cap', () => {
@@ -328,7 +348,8 @@ describe('#4734 — close-superseded closes when the PR\'s own card is already r
     const plan = { dispatch: [{ kind: 'close-superseded', prNumber: 4734, operatorAnswer: { reason: 'close as superseded', actor: 'chalbert', channel: 'chat' } }], refusals: [] };
     const r = runReconcilePromoteDraftDispatch({
       root: '/repo', checkStaleness: () => ({ fresh: true, behind: 0 }), clearAwaitingCi: () => {},
-      readHeadCheckState: () => ({ state: 'green', why: '', counts: {} }), provider: { ready: () => {} },
+      readClaim: () => null, readThread: () => [...comments3850, { id: "current-answer", author: { login: "chalbert" }, body: buildOperatorAnswer({ standDownId: parseOperatorAnswer(comments3850.find(c => parseOperatorAnswer(c))).standDownId, reason: "Close as superseded: the org move already happened", actor: "chalbert", channel: "claude-code-chat", disposition: "close-superseded" }) }],
+    readHeadCheckState: () => ({ state: 'green', why: '', counts: {} }), provider: { ready: () => {} },
       reconcile: () => plan, readCardsOnMain: (a) => defaultReadCardsOnMain({ ...a, runGh: gh(view4734) }), closePr: (a) => closed.push(a),
     });
     expect(r.refusals).toEqual([]);

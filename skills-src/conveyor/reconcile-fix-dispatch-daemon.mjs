@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { stripVTControlCharacters } from 'node:util';
 import { safeAdoptYield } from '../../scripts/lib/daemon-rebuild/adopt-yield.mjs';
 /**
  * @file skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs
@@ -1023,15 +1024,32 @@ export function resolveFixPassBudgets({ env = process.env,
     { value: resolved.value[key], source: resolved.sources[key] }]));
 }
 
+function cursorDiagnostic(value) {
+  return stripVTControlCharacters(String(value)).split('\n')[0].replace(/[\x00-\x1f\x7f]/g, '');
+}
+
 const FIX_PASS_CURSORS_PATH = resolve(DAEMON_REPO_ROOT, '.conveyor/fix-pass-cursors.json');
 
 /** Missing or malformed state starts a fresh rotation; test imports never read live cursors. */
-export function loadFixPassCursors({ path, readFile = readFileSync } = {}) {
+export function loadFixPassCursors({ path, readFile = readFileSync, log = console } = {}) {
   const empty = { rotation: {}, prCursors: {} };
   if (process.env.VITEST && path == null) return empty;
   try {
     const state = JSON.parse(readFile(path ?? FIX_PASS_CURSORS_PATH, 'utf8'));
     const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+    if (record(state?.prCursors)) for (const half of ['rearm', 'restore', 'close']) {
+      const phase = `promote-draft-${half}`;
+      if (!Object.hasOwn(state.prCursors, phase)) continue;
+      const cursors = state.prCursors[phase];
+      const reset = repo => log.error(`reconcile-fix-dispatch-daemon: cursor-reset ${phase} ${cursorDiagnostic(repo)} — unreadable value; that rotation restarts at the lowest PR`);
+      if (!record(cursors)) { state.prCursors[phase] = {}; reset('(record)'); continue; }
+      for (const [repo, value] of Object.entries(cursors)) {
+        const match = typeof value === 'string' && /^([a-z0-9-]+)#([1-9][0-9]*)$/.exec(value);
+        if (!match || !Object.hasOwn(CONSTELLATION_REPOS, match[1]) || !Number.isSafeInteger(Number(match[2]))) {
+          delete cursors[repo]; reset(repo);
+        }
+      }
+    }
     if (state?.version !== 1 || !record(state.rotation) || !record(state.prCursors)
       || !Object.values(state.rotation).every(value => typeof value === 'string')
       || !Object.values(state.prCursors).every(cursors => record(cursors)
@@ -1053,11 +1071,13 @@ function writeFixPassCursors(path, content) {
 }
 
 /** Cursor persistence is best effort; injected writes receive the final path and JSON. */
-export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors } = {}) {
+export async function saveFixPassCursors({ path, rotation, prCursors, write = writeFixPassCursors, log = console } = {}) {
   if (process.env.VITEST && path == null) return;
   try {
     await write(path ?? FIX_PASS_CURSORS_PATH, JSON.stringify({ version: 1, rotation, prCursors }) + '\n');
-  } catch { /* A persistence failure must not stop dispatch. */ }
+  } catch (error) {
+    log.error(`reconcile-fix-dispatch-daemon: cursor-write-failed — the next tick resumes from in-memory cursors; the file on disk keeps the last successful save, so a restart resumes from that older, possibly stale, state — ${cursorDiagnostic(error?.message ?? error)}`);
+  }
 }
 
 // Load once for the daemon defaults; injected state stays independent.
@@ -1180,7 +1200,11 @@ export async function runTickAllRepos({
   const cursorsBefore = persistCursors ? JSON.stringify([budgetRotation, prCursors]) : null;
   let yieldedForAdoption = false;
   let completedRepo = false;
-  const shouldYield = () => (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
+  const shouldYield = o => {
+    if (yieldedForAdoption) return true;
+    if (o?.fresh) return (yieldedForAdoption = typeof adoptYieldProbe === 'function' && adoptYieldProbe(o) === true);
+    return (yieldedForAdoption ||= safeAdoptYield(adoptYieldProbe));
+  };
   const passStart = now();
   const anyTickInjected = [fixTick, ciHealTick, hungCiTick, mainRedRebaseTick, missingRunTick,
     promoteDraftTick, notesTick, awaitVerifyTick, stuckFixerTick, supersedeTick, rulingStandDownTick].some(Boolean);
@@ -1203,9 +1227,12 @@ export async function runTickAllRepos({
     // or a repo reached after the budget is spent starves despite the cursor. A budget STOP keeps the first
     // skipped (never visited) repo at the head: a visited deferred repo comes round again after it.
     // The orphan guard lists every repo before it reads a PR, so its head is set from its result instead (PR #7330).
-    const retainedCursor = repo => phase !== 'orphan-guard' && prCursors[phase]?.[repo] != null;
+    const retainedCursor = repo => phase !== 'orphan-guard' && (prCursors[phase]?.[repo] != null
+      || (phase === 'promote-draft' && ['rearm', 'restore', 'close'].some(half => prCursors[`promote-draft-${half}`]?.[repo] != null)));
     for (let i = 0; i < ordered.length; i += 1) {
-      if (((completedRepo || yieldedForAdoption) && shouldYield()) || now() - start > budget.budgetMs) {
+      const adoption = (completedRepo || yieldedForAdoption) && shouldYield();
+      if (adoption || now() - start > budget.budgetMs) {
+        if (phase === 'promote-draft') (budget.skippedRepos ??= []).push(...ordered.slice(i).map(repo => ({ repo, reason: adoption ? 'adoption' : 'budget' })));
         budget.hit = true;
         budget.skipped.push(...ordered.slice(i));
         budgetRotation[phase] = ordered[i];
@@ -1229,17 +1256,36 @@ export async function runTickAllRepos({
       if (result?.yieldedForAdoption) yieldedForAdoption = true;
       const counts = phasePrCounts[phase] ??= { handled: 0, deferred: 0 };
       counts.handled += result?.handled ?? 0;
-      counts.deferred += result?.deferred?.length ?? 0;
+      counts.deferred += phase === 'promote-draft' && Array.isArray(result?.refusals) && result?.nextHalfCursors
+        ? result.refusals.filter(r => /-deferred-(budget|adoption)$/.test(r.kind) || (r.kind === 'promote-draft-not-admitted' && r.why?.includes('cursor'))).length
+        : result?.deferred?.length ?? 0;
       if (result?.nextCursor != null) {
         cursors[options.repo] = result.nextCursor;
         budgets[phase].hit = true;
         budgets[phase].skipped.push(...(result.deferred ?? []));
       } else delete cursors[options.repo];
+      if (phase === 'promote-draft' && result?.nextHalfCursors) {
+        for (const half of ['rearm', 'restore', 'close']) {
+          const halfCursors = prCursors[`promote-draft-${half}`] ??= {};
+          const value = result.nextHalfCursors[half];
+          if (value === null) delete halfCursors[options.repo];
+          else {
+            const match = typeof value === 'string' && /^([a-z0-9-]+)#([1-9][0-9]*)$/.exec(value);
+            if (!match || !Object.hasOwn(CONSTELLATION_REPOS, match[1]) || !Number.isSafeInteger(Number(match[2]))) throw Error(`unreadable promote-draft-${half} cursor result; inspect executor`);
+            halfCursors[options.repo] = value;
+            budgets[phase].hit = true;
+          }
+        }
+        if (result.nextCursor == null && Object.values(result.nextHalfCursors).some(v => v != null)) budgets[phase].skipped.push(...(result.deferred ?? []));
+      }
       if (result?.deadlineSkipped) budgets[phase].hit = true;
       return result;
     };
     // shouldYield is only threaded when a probe exists, so probe-less ticks see the exact pre-S1 option shape.
-    const result = tick({ ...options, deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
+    const halfCursors = phase === 'promote-draft' ? Object.fromEntries(['rearm', 'restore', 'close']
+      .filter(half => prCursors[`promote-draft-${half}`]?.[options.repo] != null)
+      .map(half => [half, prCursors[`promote-draft-${half}`][options.repo]])) : {};
+    const result = tick({ ...options, ...(Object.keys(halfCursors).length ? { halfCursors } : {}), deadlineAt: phaseStarts[phase] + budgets[phase].budgetMs,
       cursor: cursors[options.repo], now, ...(typeof adoptYieldProbe === 'function' ? { shouldYield } : {}) });
     return result && typeof result.then === 'function' ? result.then(record) : record(result);
   };
@@ -1578,6 +1624,10 @@ export async function runTickAllRepos({
   // function's own docblock for why (no Claude session is ever spawned by this half).
   const promoteDraft = stepTimed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos: budgetRepos('promote-draft', stepRepos.get('promote-draft')), tick: boundedPrTick('promote-draft', sharedTick('promote-draft', promoteDraftTick ?? runReconcilePromoteDraftDispatch)) }));
   promoteDraft.budgetSkipped = budgets['promote-draft'].skipped;
+  for (const skipped of budgets['promote-draft'].skippedRepos ?? []) {
+    promoteDraft.refusals.push({ repo: skipped.repo, pr: null, kind: 'promote-draft-repo-deferred',
+      why: `${skipped.reason === 'adoption' ? 'adoption yield latched' : 'phase budget spent'} before this repo was visited; it heads the next pass` });
+  }
   planCache?.markTouched(promoteDraft);
   // #4191: surface notes after the dispatch/promote steps. With plan reuse, notes read the pass's cached plan minus
   // every PR an earlier phase acted on (fail closed); a missing or too-old plan falls back to a fresh read.
@@ -1699,14 +1749,15 @@ export function formatRefusalLine(label, r) {
 /** ONE printable line per draft the promote half un-drafted (`gh pr ready`), the success half of "log every
  *  promote outcome" (live incident 2026-10-03, PR #3806). Mirrors {@link formatRefusalLine}'s shape. */
 export function formatPromoteActionLine(d) {
-  if (d?.kind === 'rearm-no-code') return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} (rearm-no-code) — operator ruling, no fix agent`;
+  const suffix = d?.startedAt ? ` started=${d.startedAt}${d.startedSequence != null ? ` sequence=${d.startedSequence}` : ''}${d.afterDeadline ? ` (after budget: deadline ${d.afterDeadline.deadlineAt})` : ''}` : '';
+  if (d?.kind === 'rearm-no-code') return `reconcile-fix-dispatch-daemon: re-armed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} (rearm-no-code) — operator ruling, no fix agent` + suffix;
   if (d?.kind === 'close-superseded') {
-    return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent`;
+    return `reconcile-fix-dispatch-daemon: closed ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} as superseded — operator disposition (close-superseded), no fix agent` + suffix;
   }
   if (d?.kind === 'restore-review-label') {
-    return `reconcile-fix-dispatch-daemon: labelled ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} ${d?.label ?? 'review:pending'} — open lane PR, all required checks green, no review:* label (restore-review-label)`;
+    return `reconcile-fix-dispatch-daemon: labelled ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} ${d?.label ?? 'review:pending'} — open lane PR, all required checks green, no review:* label (restore-review-label)` + suffix;
   }
-  return `reconcile-fix-dispatch-daemon: promoted ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} to ready for review — every required check is green (promote-draft)`;
+  return `reconcile-fix-dispatch-daemon: promoted ${d?.repo ?? '?'} PR #${d?.pr ?? '?'} to ready for review — every required check is green (promote-draft)` + suffix;
 }
 
 /**
@@ -1936,6 +1987,10 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
       }
       // ONE LINE PER PROMOTE OUTCOME — promoted (here), refused or not-planned (the `refused` loop above:
       // `draft-not-promoted`, `stale-check-*`, `ready-failed`, ...), tick-failed (just above).
+      for (const entry of promoteDraft?.repos ?? []) if (entry.result?.yieldedForAdoption) {
+        const { yieldedAt, yieldReason, yieldedSequence } = entry.result;
+        log.error(`reconcile-fix-dispatch-daemon: promote-draft adoption-latched ${entry.repo} at ${yieldedAt} — ${yieldReason} sequence=${yieldedSequence}`);
+      }
       for (const d of (promoteDraft?.dispatched ?? [])) log.error(formatPromoteActionLine(d));
       // `reconcileRefusals` = a PR `reconcile-core.mjs#planReconcile` refused OUTRIGHT, never even offered to
       // `fix`/`ci-heal` (owed-ci-rerun, no-findings, live-process, cap-exhausted, stood-down, owed-elsewhere,

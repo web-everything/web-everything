@@ -22,7 +22,7 @@ import {
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh, defaultReadNotesForRepo, runReconcileNotesAllRepos,
   buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
-  resolveFixPassBudgets, formatPassPhaseTiming, createPassCallRecorder,
+  resolveFixPassBudgets, formatPassPhaseTiming, createPassCallRecorder, loadFixPassCursors, saveFixPassCursors,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -2167,7 +2167,7 @@ describe('runTickAllRepos — one reconcile plan per repo per pass', () => {
     }));
     const realPromote = promoteDispatch.runReconcilePromoteDraftDispatch;
     const readHeadCheckState = vi.fn(() => ({ state: live.invalid ? 'red' : 'green', why: 'live check' }));
-    vi.spyOn(promoteDispatch, 'runReconcilePromoteDraftDispatch').mockImplementation(options => realPromote({
+    vi.spyOn(promoteDispatch, 'runReconcilePromoteDraftDispatch').mockImplementation(options => realPromote({ readClaim: () => null,
       ...options, root: '/fixture', checkStaleness, readHeadCheckState,
       readPrLabels: () => [], readComments: () => [], provider: { ready: promote },
     }));
@@ -3387,4 +3387,87 @@ describe('runReconcileNotesAllRepos — cooperative deadline', () => {
     expect(tick.mock.calls.map(([options]) => options.repo)).toEqual(['repo-a', 'repo-b']);
     expect(posted).toEqual([42, 43]);
   });
+});
+
+
+describe('guarded promote half cursor persistence', () => {
+  const empty = () => ({dispatched:[],refusals:[]});
+  const fixture = extra => ({repos:['we'], fixTick:empty,ciHealTick:empty,hungCiTick:noopHungCiTick,
+    mainRedRebaseTick:noopMainRedRebaseTick,missingRunTick:noopMissingRunTick,notesTick:noopNotesTick,
+    awaitVerifyTick:async()=>({rows:[]}),stuckFixerTick:async()=>({rows:[]}),orphanGuardTick:null,
+    now:()=>0,authGateOverride:()=>({paused:false}),budgetRotation:{},prCursors:{},...extra});
+  it('promote-draft-rearm/-restore/-close scalar keys are recorded, saved, reloaded and continue after restart', async () => {
+    const prCursors = {}, rotation = {}; let disk;
+    await runTickAllRepos(fixture({prCursors,budgetRotation:rotation,promoteDraftTick:()=>({...empty(),handled:3,deferred:[43,53,63],nextCursor:null,nextHalfCursors:{rearm:'we#42',restore:'we#52',close:'we#62'}})}));
+    await saveFixPassCursors({path:'fixture',prCursors,rotation,write:(_p,s)=>{disk=s;}});
+    const restored = loadFixPassCursors({path:'fixture',readFile:()=>disk});
+    expect(restored.prCursors['promote-draft-rearm']).toEqual({we:'we#42'});
+    expect(restored.prCursors['promote-draft-restore']).toEqual({we:'we#52'});
+    expect(restored.prCursors['promote-draft-close']).toEqual({we:'we#62'});
+    let input; await runTickAllRepos(fixture({prCursors:restored.prCursors,budgetRotation:restored.rotation,promoteDraftTick:o=>{input=o;return {...empty(),nextHalfCursors:{rearm:null,restore:null,close:null}};}}));
+    expect(input.halfCursors).toEqual({rearm:'we#42',restore:'we#52',close:'we#62'});
+    expect(Object.values(restored.prCursors).flatMap(Object.values).every(v=>typeof v==='string'||typeof v==='number')).toBe(true);
+    expect(restored.prCursors['promote-draft-rearm']).toEqual({});
+  });
+  it('a malformed half-cursor drops only that value with a named line; unrelated phases and rotation survive', () => {
+    const log={error:vi.fn()}; const state={version:1,rotation:{fix:'we'},prCursors:{'promote-draft':{we:2},fix:{we:3},'ci-heal':{we:4},notes:{we:'5:note'},'orphan-guard':{we:6},'promote-draft-rearm':{we:{bad:true},fui:'frontierui#42'},'promote-draft-restore':null,'promote-draft-close':{we:'we#0'}}};
+    const loaded=loadFixPassCursors({path:'fixture',readFile:()=>JSON.stringify(state),log});
+    expect(loaded.rotation).toEqual(state.rotation); expect(loaded.prCursors.fix).toEqual({we:3});
+    expect(loaded.prCursors['promote-draft']).toEqual({we:2}); expect(loaded.prCursors['ci-heal']).toEqual({we:4});
+    expect(loaded.prCursors.notes).toEqual({we:'5:note'}); expect(loaded.prCursors['orphan-guard']).toEqual({we:6});
+    expect(loaded.prCursors['promote-draft-rearm']).toEqual({fui:'frontierui#42'});
+    expect(loaded.prCursors['promote-draft-restore']).toEqual({}); expect(loaded.prCursors['promote-draft-close']).toEqual({});
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('cursor-reset promote-draft-rearm we'));
+  });
+  it('a failed save logs cursor-write-failed once and preserves the older file; next tick uses memory', async () => {
+    const log={error:vi.fn()}, prCursors={'promote-draft-rearm':{we:'we#42'}}, rotation={}; let disk;
+    await saveFixPassCursors({path:'fixture',prCursors,rotation,write:(_p,s)=>{disk=s;}});
+    prCursors['promote-draft-rearm'].we='we#43';
+    await saveFixPassCursors({path:'fixture',prCursors,rotation,log,write:()=>{throw Error('disk full');}});
+    expect(log.error).toHaveBeenCalledTimes(1); expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/cursor-write-failed.*in-memory.*last successful save.*disk full/));
+    let input; await runTickAllRepos(fixture({prCursors,promoteDraftTick:o=>{input=o;return empty();}}));
+    expect(input.halfCursors.rearm).toBe('we#43');
+    expect(loadFixPassCursors({path:'fixture',readFile:()=>disk}).prCursors['promote-draft-rearm'].we).toBe('we#42');
+  });
+});
+
+
+import { guardedScenario } from '../../../scripts/conveyor/soak/breaks/promote-draft-guarded-executor.mjs';
+describe('promote phase names every deferral and orders by data', () => {
+  it.each(['budget','reads','mixed'])('%s: actual executor logging names PR deferrals and the actual repo skip reason', async mode => {
+    const f=guardedScenario(), {result}=await f.pass(mode), log={error:vi.fn()};
+    buildCliDaemonEffects({owner:'fixture',log}).onTick(result);
+    const lines=log.error.mock.calls.map(([line])=>line), refused=lines.filter(l=>/refused .*deferred-(budget|adoption).*PR #/.test(l));
+    const repoSkipped=lines.filter(l=>l.includes('refused promote-draft-repo-deferred'));
+    expect(repoSkipped).toHaveLength(1); expect(repoSkipped[0]).toContain('(no PR)');
+    expect(repoSkipped[0]).toContain(mode==='budget'?'phase budget spent':'adoption yield latched');
+    expect(result.phasePrCounts['promote-draft'].deferred).toBe(refused.length);
+    expect(formatPassPhaseTiming(result).find(l=>l.includes('phase=promote-draft '))).toContain(`deferred=${refused.length}`);
+    expect(new Set(refused.map(l=>/PR #(\d+)/.exec(l)[1])).size).toBe(refused.length);
+    const data=result.promoteDraft.repos[0].result;
+    if(mode==='budget') {
+      expect(lines.filter(l=>l.includes('refused rearm-no-code-deferred-budget')&&l.includes('PR #43'))).toHaveLength(1);
+      expect(lines.find(l=>l.includes('re-armed')&&l.includes('PR #42'))).toMatch(/started=.*after budget: deadline /);
+      expect(lines.some(l=>l.includes('restore-review-label-deferred-budget'))).toBe(true);
+    } else {
+      expect(lines.filter(l=>l.includes('promote-draft adoption-latched'))).toHaveLength(1);
+      for(const d of data.dispatched) expect(d.startedSequence).toBeLessThan(data.yieldedSequence);
+      if(mode==='mixed') {
+        expect(data.dispatched).toHaveLength(1); expect(data.dispatched[0].startedAt).toBe(data.yieldedAt); // equal-ms ties use sequence
+        expect(lines.findIndex(l=>l.includes('refused promote-draft-deferred-adoption'))).toBeLessThan(lines.findIndex(l=>l.includes('promoted ')));
+      }
+    }
+    expect(f.events.filter(e=>e.afterLatch&&['ready','addLabel','close','receipt'].includes(e.type))).toEqual([]);
+  });
+});
+
+
+it('cursor diagnostics strip untrusted terminal controls and keep each reason on one line', async () => {
+  const log={error:vi.fn()};
+  const state={version:1,rotation:{},prCursors:{'promote-draft-rearm':{'bad\u001b[31m\nspoof':{}}}};
+  loadFixPassCursors({path:'fixture',readFile:()=>JSON.stringify(state),log});
+  await saveFixPassCursors({path:'fixture',rotation:{},prCursors:{},log,write:()=>{throw Error('disk\u001b[31m full\nspoof');}});
+  expect(log.error).toHaveBeenCalledTimes(2);
+  for(const [line] of log.error.mock.calls) expect(line).not.toMatch(/[\u0000-\u001f\u007f]/);
+  expect(log.error.mock.calls[1][0]).toContain('disk full');
 });

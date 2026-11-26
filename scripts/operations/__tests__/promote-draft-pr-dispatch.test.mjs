@@ -65,7 +65,7 @@ describe('review-hold-only red draft promotion', () => {
     ['unchecked despite the flag', { state: 'unchecked', reviewHoldOnly: true }],
   ])('refuses %s before calling ready', (_, fresh) => {
     const ready = vi.fn();
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
       provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
@@ -83,13 +83,13 @@ describe('review-hold-only red draft promotion', () => {
     const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
     const clearAwaitingCi = vi.fn();
     try {
-      const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+      const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
         root: '/repo', repo: 'plateauapp/plateau-app',
         reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
         checkStaleness: FRESH, readPrLabels: () => [],
         readHeadCheckState: () => ({ state: 'red', reviewHoldOnly: true }), clearAwaitingCi,
       });
-      expect(result.dispatched).toEqual([{ pr: 198, kind: 'promote-draft' }]);
+      expect(result.dispatched).toEqual([{ pr: 198, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
       expect(result.refusals).toEqual([]);
       expect(runGhSyncSpy).toHaveBeenCalledTimes(1);
       expect(runGhSyncSpy.mock.calls[0][0]).toEqual(['pr', 'ready', '198', '--repo', 'plateauapp/plateau-app']);
@@ -103,7 +103,7 @@ describe('review-hold-only red draft promotion', () => {
 describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   it('calls provider.ready for every promote-draft entry, and nothing else', async () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [
@@ -120,24 +120,24 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
       clearAwaitingCi: NOOP_STATUS,
     });
     expect(readyCalls).toEqual([101, 104]);
-    expect(result.dispatched).toEqual([{ pr: 101, kind: 'promote-draft' }, { pr: 104, kind: 'promote-draft' }]);
+    expect(result.dispatched).toEqual([{ pr: 101, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }, { pr: 104, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(result.refusals).toEqual([]);
   });
 
   it('an empty plan promotes nothing and refuses nothing', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo', reconcile: () => ({ dispatch: [], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
       checkStaleness: FRESH, readPrLabels: () => [],
       readHeadCheckState: () => { throw new Error('must not be called'); },
       clearAwaitingCi: NOOP_STATUS,
     });
-    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
+    expect(result).toEqual({ handled: 0, deferred: [], nextCursor: null, nextHalfCursors: { rearm: null, restore: null, close: null }, dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
   });
 
   it('a gh failure on one PR is reported as a refusal and does not stop the rest of the batch', () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [
@@ -157,12 +157,12 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
       clearAwaitingCi: NOOP_STATUS,
     });
     expect(readyCalls).toEqual([55, 56]);
-    expect(result.dispatched).toEqual([{ pr: 56, kind: 'promote-draft' }]);
+    expect(result.dispatched).toEqual([{ pr: 56, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(result.refusals).toEqual([{ pr: 55, kind: 'ready-failed', why: 'gh pr ready failed: HTTP 502' }]);
   });
 
   it('carries the reconcile pass\'s own refusal count through, unmodified', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [], refusals: [{ kind: 'draft', prNumber: 9 }] }),
       provider: { ready: () => {} },
@@ -175,7 +175,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
   });
 
   it('refuses an unknown --repo before ever calling reconcile or provider', () => {
-    expect(() => runReconcilePromoteDraftDispatch({ readComments: () => [],
+    expect(() => runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo', repo: 'unknown/repo',
       reconcile: () => { throw new Error('must not be called'); },
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -187,7 +187,7 @@ describe('runReconcilePromoteDraftDispatch (draft-first PRs)', () => {
 
   it('reads a shared `--prs-file=` snapshot instead of asking `reconcile` for a fresh gh read, when given one', () => {
     let seenReadPrs = null;
-    runReconcilePromoteDraftDispatch({ readComments: () => [],
+    runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo', prsFile: '/tmp/some-file.json',
       reconcile: (opts) => { seenReadPrs = typeof opts.readPrs; return { dispatch: [], refusals: [] }; },
       provider: { ready: () => {} },
@@ -205,7 +205,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   it('refuses to promote when a fresh per-sha read disagrees with the plan\'s own (stale) green read', () => {
     const readyCalls = [];
     const seenArgs = [];
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2811, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: (pr) => { readyCalls.push(pr); } },
@@ -225,7 +225,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   it('still refuses on a fresh `pending` read — only a completed, all-succeeded read promotes', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2812, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -239,7 +239,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
 
   it('promotes normally once the fresh re-read confirms green', () => {
     const readyCalls = [];
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2813, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: (pr) => { readyCalls.push(pr); } },
@@ -248,12 +248,12 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       clearAwaitingCi: NOOP_STATUS,
     });
     expect(readyCalls).toEqual([2813]);
-    expect(result.dispatched).toEqual([{ pr: 2813, kind: 'promote-draft' }]);
+    expect(result.dispatched).toEqual([{ pr: 2813, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(result.refusals).toEqual([]);
   });
 
   it('a re-read that cannot be performed at all refuses rather than promoting on the stale plan alone', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2814, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => { throw new Error('must not be called'); } },
@@ -267,7 +267,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
 
   it('clears the now-stale review-status:awaiting-ci label the instant a draft promotes (#2821)', () => {
     const statusCalls = [];
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2821, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => {} },
@@ -275,7 +275,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       readHeadCheckState: () => ({ state: 'green', why: 'ok', counts: {} }),
       clearAwaitingCi: (o) => statusCalls.push(o),
     });
-    expect(result.dispatched).toEqual([{ pr: 2821, kind: 'promote-draft' }]);
+    expect(result.dispatched).toEqual([{ pr: 2821, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(statusCalls).toEqual([{ pr: 2821, repo: 'web-everything/web-everything', state: null }]);
   });
 
@@ -289,7 +289,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const readHeadCheckState = args => defaultReadHeadCheckState({ ...args,
         runGh: () => rows.map(row => JSON.stringify(row)).join('\n'),
         getRequiredChecks: () => ({ checks: [], source: 'unavailable' }) });
-      const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+      const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
         root: '/repo', repo: 'plateauapp/plateau-app',
         reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: HEAD }], refusals: [] }),
         provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [], readHeadCheckState, clearAwaitingCi: NOOP_STATUS,
@@ -330,7 +330,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const ghThrottle = await import('../../lib/gh-throttle.mjs');
       const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
       try {
-        const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+        const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
           root: '/repo',
           repo: 'plateauapp/plateau-app',
           reconcile: () => ({
@@ -341,7 +341,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
           readHeadCheckState: ALWAYS_GREEN,
           clearAwaitingCi: NOOP_STATUS,
         });
-        expect(result.dispatched).toEqual([{ pr: 187, kind: 'promote-draft' }]);
+        expect(result.dispatched).toEqual([{ pr: 187, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
         expect(result.refusals).toEqual([]);
         // THE FIX: the real `gh` transport was called with an explicit `--repo plateauapp/plateau-app` — before
         // this fix it was called as `['pr', 'ready', '187']` with no `--repo`, relying on `cwd` inference,
@@ -357,7 +357,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       const ghThrottle = await import('../../lib/gh-throttle.mjs');
       const runGhSyncSpy = vi.spyOn(ghThrottle, 'runGhSync').mockReturnValue('');
       try {
-        runReconcilePromoteDraftDispatch({ readComments: () => [],
+        runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
           root: '/repo',
           reconcile: () => ({
             dispatch: [{ kind: 'promote-draft', prNumber: 999, headRefOid: 'f'.repeat(40) }],
@@ -376,7 +376,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
   });
 
   it('a clearAwaitingCi failure is best-effort and never turns a successful promotion into a refusal', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 2822, headRefOid: HEAD }], refusals: [] }),
       provider: { ready: () => {} },
@@ -384,7 +384,7 @@ describe('runReconcilePromoteDraftDispatch — stale-green re-verification (#281
       readHeadCheckState: () => ({ state: 'green', why: 'ok', counts: {} }),
       clearAwaitingCi: () => { throw new Error('gh hiccup'); },
     });
-    expect(result.dispatched).toEqual([{ pr: 2822, kind: 'promote-draft' }]);
+    expect(result.dispatched).toEqual([{ pr: 2822, kind: 'promote-draft', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(result.refusals).toEqual([]);
   });
 });
@@ -397,7 +397,7 @@ it('xxh4zw8 fresh exact-head reader refuses complete cancelled evidence without 
   const runGh = vi.fn(() => runs.map(row => JSON.stringify(row)).join('\n'));
   const readHeadCheckState = args => defaultReadHeadCheckState({ ...args, runGh, getRequiredChecks: () => ({ checks: required }) });
   expect(readHeadCheckState({ repoSlug: 'web-everything/web-everything', sha })).toMatchObject({ state: 'red', counts: { total: 4, failed: 1 } });
-  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH, readPrLabels: () => [],
+  const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], root: '/repo', checkStaleness: FRESH, readPrLabels: () => [],
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 3336, headRefOid: sha }], refusals: [] }),
     provider: { ready }, readHeadCheckState, clearAwaitingCi: NOOP_STATUS });
   expect(ready).not.toHaveBeenCalled();
@@ -422,7 +422,7 @@ describe('xul2kwr fresh withdrawal guard', () => {
     const calls = [];
     const ready = vi.fn(() => calls.push('ready'));
     const clear = vi.fn();
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [entry], refusals: [] }),
       readHeadCheckState: () => { calls.push('checks'); return ALWAYS_GREEN(); },
@@ -490,7 +490,7 @@ describe('isPromoteCodePath — the declared promote code path (#3806 incident)'
 
 describe('runReconcilePromoteDraftDispatch — a draft that is not promoted says why (#3806 incident)', () => {
   it('reports every non-green draft the plan refused, naming its check state; green and withdrawn are not double-reported', () => {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [],
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [],
       root: '/repo',
       reconcile: () => ({
         dispatch: [],
@@ -515,17 +515,17 @@ describe('runReconcilePromoteDraftDispatch — restore-review-label half (PR #38
   const plan = { dispatch: [{ kind: 'restore-review-label', prNumber: 3830, label: 'review:pending' }], refusals: [] };
   it('adds review:pending to a still-label-less PR and reports it', () => {
     const calls = [];
-    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: (a) => calls.push(a) });
+    const r = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: (a) => calls.push(a) });
     expect(calls).toEqual([expect.objectContaining({ prNumber: 3830, label: 'review:pending' })]);
-    expect(r.dispatched).toEqual([{ pr: 3830, kind: 'restore-review-label', label: 'review:pending' }]);
+    expect(r.dispatched).toEqual([{ pr: 3830, kind: 'restore-review-label', label: 'review:pending', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
   });
   it('re-reads labels and refuses when a review/landing label appeared since the plan', () => {
-    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [{ name: 'ready-to-merge' }], addLabel: () => { throw new Error('must not write'); } });
+    const r = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [{ name: 'ready-to-merge' }], addLabel: () => { throw new Error('must not write'); } });
     expect(r.dispatched).toEqual([]);
     expect(r.refusals).toEqual([expect.objectContaining({ pr: 3830, kind: 'label-already-set' })]);
   });
   it('a failed write is a refusal, never a throw', () => {
-    const r = runReconcilePromoteDraftDispatch({ readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
+    const r = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...base, reconcile: () => plan, readPrLabels: () => [], addLabel: () => { throw new Error('boom'); } });
     expect(r.refusals).toEqual([expect.objectContaining({ kind: 'label-failed' })]);
   });
 });
@@ -534,7 +534,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   let time = 10, inEffect = false;
   const touched = [];
   const now = vi.fn(() => { expect(inEffect).toBe(false); return time; });
-  const options = { readComments: () => [], root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
+  const options = { readClaim: () => null, readComments: () => [], root: '/repo', checkStaleness: FRESH, now, deadlineAt: 10,
     reconcile: () => ({ dispatch: [3, 1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: 'a' })), refusals: [] }),
     readHeadCheckState: () => { inEffect = true; time = 11; return { state: 'green' }; },
     readPrLabels: () => [], provider: { ready: pr => { touched.push(pr); } },
@@ -546,7 +546,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
   // The entry check, then each PR's clock read.
   expect(now).toHaveBeenCalledTimes(3);
   touched.length = 0;
-  const second = runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, cursor: first.nextCursor, deadlineAt: 20 });
+  const second = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...options, cursor: first.nextCursor, deadlineAt: 20 });
   expect(touched).toEqual([2, 3, 1]);
   expect(second).toMatchObject({ handled: 3, deferred: [], nextCursor: null });
 });
@@ -554,7 +554,7 @@ it('yields between complete PR effects and resumes at the cursor with wraparound
 it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and keeps the cursor for next pass', () => {
   const reconcile = vi.fn(() => ({ dispatch: [], refusals: [] }));
   const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
-  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH,
+  const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], root: '/repo', checkStaleness: FRESH,
     now: () => 11, deadlineAt: 10, cursor: 42, reconcile,
     provider: { ready }, readHeadCheckState, readPrLabels,
   });
@@ -565,7 +565,7 @@ it('past deadline with a cursor skips reconcile, uses deferred=[cursor], and kee
 it('past deadline without a cursor skips reconcile and flags deadlineSkipped', () => {
   const reconcile = vi.fn(() => ({ dispatch: [43, 42].map(prNumber => ({ kind: 'promote-draft', prNumber })), refusals: [] }));
   const ready = vi.fn(), readHeadCheckState = vi.fn(), readPrLabels = vi.fn();
-  const result = runReconcilePromoteDraftDispatch({ readComments: () => [], root: '/repo', checkStaleness: FRESH,
+  const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], root: '/repo', checkStaleness: FRESH,
     now: () => 11, deadlineAt: 10, reconcile, provider: { ready }, readHeadCheckState, readPrLabels,
   });
   expect(result).toMatchObject({ handled: 0, deferred: [], nextCursor: null, deadlineSkipped: true });
@@ -581,7 +581,7 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
     provider: { ready: pr => { promoted.push(pr); } }, clearAwaitingCi: () => {} };
   let cursor;
   for (let pass = 0; pass < 2; pass += 1) {
-    const result = runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, deadlineAt: time + 100, cursor });
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...options, deadlineAt: time + 100, cursor });
     expect(result).toMatchObject({ handled: 1, deferred: [pass === 0 ? 6 : 5], nextCursor: pass === 0 ? 6 : 5 });
     cursor = result.nextCursor ?? undefined;
   }
@@ -590,7 +590,7 @@ it('promote-draft: a reconcile that always overruns the budget still handles one
 
 it('capability-off refuses promotion while a withdrawn draft remains held', () => {
   const ready = vi.fn();
-  const options = { readComments: () => [],
+  const options = { readClaim: () => null, readComments: () => [],
     root: '/repo', resolveProfile: () => ({ capabilities: { review: false } }),
     reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 198, headRefOid: 'a'.repeat(40) }], refusals: [] }),
     provider: { ready }, checkStaleness: FRESH, readPrLabels: () => [],
@@ -598,7 +598,7 @@ it('capability-off refuses promotion while a withdrawn draft remains held', () =
   };
   expect(runReconcilePromoteDraftDispatch(options).refusals).toEqual([expect.objectContaining({ kind: 'unsupported-repo' })]);
   expect(ready).not.toHaveBeenCalled();
-  expect(runReconcilePromoteDraftDispatch({ readComments: () => [], ...options, readPrLabels: () => ['review-status:draft-withdrawn'] }).refusals)
+  expect(runReconcilePromoteDraftDispatch({ readClaim: () => null, readComments: () => [], ...options, readPrLabels: () => ['review-status:draft-withdrawn'] }).refusals)
     .toEqual([expect.objectContaining({ kind: 'draft-withdrawn' })]);
   expect(ready).not.toHaveBeenCalled();
 });
@@ -611,7 +611,7 @@ describe('fresh operator park guard', () => {
     let comments = [];
     const ready = vi.fn();
     const readComments = vi.fn(() => comments);
-    const result = runReconcilePromoteDraftDispatch({
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null,
       root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [entry], refusals: [] }),
       readHeadCheckState: () => { comments = [park]; return ALWAYS_GREEN(); },
@@ -626,7 +626,7 @@ describe('fresh operator park guard', () => {
   it.each([undefined, null, {}, 'comments', new Error('unreadable')])(
     'fails closed for fresh comments %j', comments => {
       const ready = vi.fn();
-      const result = runReconcilePromoteDraftDispatch({
+      const result = runReconcilePromoteDraftDispatch({ readClaim: () => null,
         root: '/repo', checkStaleness: FRESH,
         reconcile: () => ({ dispatch: [entry], refusals: [] }),
         readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [],
@@ -643,7 +643,7 @@ describe('fresh operator park guard', () => {
 
 describe('fresh review-status:draft-withdrawn label guard', () => {
   const entry = { kind: 'promote-draft', prNumber: 3432, headRefOid: 'a'.repeat(40) };
-  const run = (readPrLabels, ready) => runReconcilePromoteDraftDispatch({
+  const run = (readPrLabels, ready) => runReconcilePromoteDraftDispatch({ readClaim: () => null,
     root: '/repo', repo: 'plateauapp/plateau-app', checkStaleness: FRESH,
     reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
     readComments: () => [], readPrLabels, provider: { ready }, clearAwaitingCi: NOOP_STATUS,
@@ -663,7 +663,7 @@ describe('fresh review-status:draft-withdrawn label guard', () => {
     const ready = vi.fn();
     let comments = [];
     const calls = [];
-    const result = runReconcilePromoteDraftDispatch({ root: '/repo', checkStaleness: FRESH,
+    const result = runReconcilePromoteDraftDispatch({ readClaim: () => null, root: '/repo', checkStaleness: FRESH,
       reconcile: () => ({ dispatch: [entry], refusals: [] }), readHeadCheckState: ALWAYS_GREEN,
       readComments: () => { calls.push('comments'); return comments; },
       readPrLabels: () => {
@@ -714,7 +714,7 @@ Fix defect`);
   function setup(over = {}) {
     const posted = [];
     const postComment = vi.fn(({ comment }) => posted.push(c('receipt', comment))), rearm = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
-    const options = { root: '/repo', checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm,
+    const options = { root: '/repo', clearAwaitingCi: NOOP_STATUS, addLabel: vi.fn(), closePr: vi.fn(), readCardsOnMain: () => [], checkStaleness: FRESH, provider: { ready: vi.fn() }, reconcile: () => ({ dispatch: [entry], refusals: [] }), readPrLabels: () => ['review:changes'], readThread: () => [...thread(), ...posted], readClaim: () => null, postComment, rearm,
       acquireRearmLock: args => acquireNoCodeRearmLock({ ...args, root: lockRoot }, {
         stamp: () => ({ runnerStart: 'test-process-birth' }), identity: () => ({ alive: true }),
       }), ...over };
@@ -729,7 +729,7 @@ Fix defect`);
       readClaim: () => { overlap = contender.run(); return null; } });
     contender = setup({ ...first.options, readClaim: () => null });
     const result = first.run();
-    expect(result.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(result.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(overlap.dispatched).toEqual([]);
     expect(postComment).toHaveBeenCalledTimes(1);
     expect(rearm).toHaveBeenCalledTimes(1);
@@ -805,7 +805,7 @@ Fix defect`);
     const s = setup({ reconcile, readThread: () => read().comments, readPrLabels: () => read().labels, postComment, rearm: writer });
     const first = s.run();
     expect(first.refusals).toEqual([]);
-    expect(first.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(first.dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(read().labels).toEqual(['review:pending']);
     const after = read();
     expect(s.run().dispatched).toEqual([]);
@@ -840,20 +840,18 @@ Fix defect`);
     });
     const first = s.run();
     expect(first.dispatched).toEqual([]);
-    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
-    expect(writer).toHaveBeenCalledTimes(1);
-    expect(writer.mock.results[0].value.status).toBe(1);
-    expect(writer.mock.results[0].value.stdout).toContain('no change made');
+    expect(first.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(writer).not.toHaveBeenCalled();
     expect(read().labels).toEqual(['review:changes']);
     expect(read().writes.filter(kind => kind === 'labels')).toEqual([]);
     const after = read();
     expect(s.run().dispatched).toEqual([]);
     expect(read()).toEqual(after);
-    expect(writer).toHaveBeenCalledTimes(1);
+    expect(writer).not.toHaveBeenCalled();
     expect(postComment).toHaveBeenCalledTimes(1);
   }, 120000);
   it.each(['red-team:blocked', 'red-team:pending', 'changes verdict', 'stand-down'])(
-    'post-receipt %s permits exactly one extra review through the actual writer', lateEvidence => {
+    'post-receipt %s refuses the writer; ruling spent, zero label writes', lateEvidence => {
       const { read, write, writer, postComment } = actualWriterFixture();
       const s = setup({ readThread: () => read().comments, readPrLabels: () => read().labels, rearm: writer,
         postComment: args => {
@@ -864,16 +862,18 @@ Fix defect`);
           write(state);
         },
       });
-      // Pin the disclosed admission-to-writer window; the receipt still bounds the attempt.
-      expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
-      expect(read().labels).toContain('review:pending');
-      expect(read().labels).not.toContain('review:changes');
+      // Option B rechecks evidence after the receipt and leaves a stale ruling spent.
+      const result = s.run();
+      expect(result.dispatched).toEqual([]);
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+      expect(read().labels).not.toContain('review:pending');
+      expect(read().labels).toContain('review:changes');
       expect(read().labels).not.toContain('review:accepted');
       const after = read();
       expect(s.run().dispatched).toEqual([]);
       expect(read()).toEqual(after);
-      expect(after.writes).toEqual(['receipt', 'labels', 'comment']);
-      expect(writer).toHaveBeenCalledTimes(1);
+      expect(after.writes).toEqual(['receipt']);
+      expect(writer).not.toHaveBeenCalled();
       expect(postComment).toHaveBeenCalledTimes(1);
     }, 120000);
   it.each(['live', 'unreadable'])('fresh %s fix claim refuses with zero writes', mode => {
@@ -934,16 +934,18 @@ Fix defect`);
     if (mode === 'adoption') expect(result.yieldedForAdoption).toBe(true);
     expect(s.options.rearm).toHaveBeenCalledTimes(1);
   });
-  it('rearm loop defers every entry when planning exhausts the deadline', () => {
+  it('past the deadline an admitted call attempts exactly one rearm entry, then names each deferral', () => {
     let time = 0;
-    const s = setup({ now: () => time, deadlineAt: 10, reconcile: () => { time = 11; return { dispatch: [entry], refusals: [] }; } });
-    expect(s.run()).toMatchObject({ handled: 0, deferred: [42] });
-    expect(s.postComment).not.toHaveBeenCalled();
-    expect(s.rearm).not.toHaveBeenCalled();
+    const s = setup({ now: () => time, deadlineAt: 10, reconcile: () => { time = 11; return { dispatch: [entry, { ...entry, prNumber: 43 }, { ...entry, prNumber: 44 }], refusals: [] }; } });
+    const result = s.run();
+    expect(result).toMatchObject({ handled: 1, deferred: [43, 44], nextHalfCursors: { rearm: 'we#42' } });
+    expect(result.refusals.map(r => [r.pr, r.kind])).toEqual([[43, 'rearm-no-code-deferred-budget'], [44, 'rearm-no-code-deferred-budget']]);
+    expect(s.postComment).toHaveBeenCalledTimes(1);
+    expect(s.rearm).toHaveBeenCalledTimes(1);
   });
   it.each(['review:pending', 'review:human'])('confirms exactly once from observed %s and pins the head', label => {
     const s = setup({ rearm: vi.fn(() => ({ status: 0, stdout: `diagnostic\n${json([label])}\n` })) });
-    expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(s.run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
     expect(s.postComment).toHaveBeenCalledTimes(1);
     expect(s.postComment).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 42, comment: NO_CODE_REARM_RECEIPT('answer', head) }));
     expect(s.options.rearm).toHaveBeenCalledTimes(1);
@@ -1050,7 +1052,7 @@ Fix defect`);
   });
   it('default rearm spawns only the head-pinned writer with inert argv and bounded output', () => {
     const spawn = vi.fn(() => ({ status: 0, stdout: json(['review:pending']) }));
-    expect(setup({ rearm: args => defaultNoCodeRearm({ ...args, spawn }) }).run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code' }]);
+    expect(setup({ rearm: args => defaultNoCodeRearm({ ...args, spawn }) }).run().dispatched).toEqual([{ pr: 42, kind: 'rearm-no-code', startedAt: expect.any(String), startedSequence: expect.any(Number) }]);
       expect(spawn).toHaveBeenCalledTimes(1);
       const [file, args, options] = spawn.mock.calls[0];
       expect(file).toBe(process.execPath);
@@ -1070,4 +1072,230 @@ Fix defect`);
     expect(JSON.parse(stdout)).not.toHaveProperty('labelsObserved');
     expect(setup({ rearm: () => ({ status: 0, stdout }) }).run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-unconfirmed' }));
   });
+  it('no starvation: always-overrunning reconcile, three passes feeding cursors back, attempt order 42, 43, 42', () => {
+    let time = 0, halfCursors;
+    const attempts = [];
+    for (let pass = 0; pass < 3; pass++) {
+      const s = setup({ now: () => time, deadlineAt: time + 10, halfCursors,
+        reconcile: () => { time += 11; return { dispatch: [entry, { ...entry, prNumber: 43 }] }; },
+        acquireRearmLock: ({ prNumber }) => { attempts.push(prNumber); throw Error('busy; inspect lock'); } });
+      halfCursors = s.run().nextHalfCursors;
+    }
+    expect(attempts).toEqual([42, 43, 42]);
+  });
+  it('rearm progress is independent of persistent promote deferrals', () => {
+    let time = 0, halfCursors, cursor;
+    const attempts = [];
+    for (let pass = 0; pass < 2; pass++) {
+      const s = setup({ now: () => time, deadlineAt: time + 10, halfCursors, cursor,
+        reconcile: () => { time += 11; return { dispatch: [1, 2].map(prNumber => ({ kind: 'promote-draft', prNumber, headRefOid: head })).concat(entry, { ...entry, prNumber: 43 }) }; },
+        readHeadCheckState: ALWAYS_GREEN, readComments: () => [], clearAwaitingCi: NOOP_STATUS,
+        acquireRearmLock: ({ prNumber }) => { attempts.push(prNumber); if (prNumber === 42) throw Error('busy'); return () => {}; } });
+      const result = s.run(); halfCursors = result.nextHalfCursors; cursor = result.nextCursor;
+      if (pass === 1) expect(result.dispatched).toContainEqual(expect.objectContaining({ pr: 43, kind: 'rearm-no-code' }));
+    }
+    expect(attempts).toEqual([42, 43]);
+  });
+  it('adoption arising during the in-lock admission reads is caught before the receipt; zero receipt, zero child, ruling unspent', () => {
+    let adoption = false;
+    const s = setup({ shouldYield: () => adoption, readPrLabels: () => { adoption = true; return ['review:changes']; } });
+    expect(s.run()).toMatchObject({ yieldedForAdoption: true, refusals: [expect.objectContaining({ kind: 'rearm-no-code-deferred-adoption' })] });
+    expect(s.postComment).not.toHaveBeenCalled(); expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('a fix claim appearing while the receipt posts refuses the writer (rearm-no-code-claimed)', () => {
+    let claimed = false;
+    const s = setup({ readClaim: () => claimed ? { owner: 'fixer' } : null });
+    const post = s.options.postComment;
+    s.options.postComment = args => { post(args); claimed = true; };
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-claimed' }));
+    expect(s.postComment).toHaveBeenCalledOnce(); expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('a stand-down posted during the pre-receipt label read is seen by the comment read that follows it; no receipt', () => {
+    const comments = thread();
+    const s = setup({ readThread: () => comments.slice(), readPrLabels: () => { comments.push({ ...stop, id: 'late' }); return ['review:changes']; } });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({ kind: 'rearm-no-code-stale' }));
+    expect(s.postComment).not.toHaveBeenCalled();
+  });
+  it('adoption arising inside the last rearm child is observed before the close half', () => {
+    let adoption = false;
+    const closePr = vi.fn();
+    const s = setup({ shouldYield: () => adoption, closePr, readCardsOnMain: () => [],
+      reconcile: () => ({ dispatch: [entry, { kind: 'close-superseded', prNumber: 50 }] }),
+      rearm: () => { adoption = true; return { status: 0, stdout: json(['review:pending']) }; } });
+    expect(s.run()).toMatchObject({ yieldedForAdoption: true, nextHalfCursors: { close: null }, refusals: [expect.objectContaining({ pr: 50, kind: 'close-superseded-deferred-adoption' })] });
+    expect(closePr).not.toHaveBeenCalled();
+  });
+  it('adoption during the receipt finishes the committed child, then yields', () => {
+    let adoption = false;
+    const s = setup({ shouldYield: () => adoption }); const post = s.options.postComment;
+    s.options.postComment = args => { post(args); adoption = true; };
+    expect(s.run()).toMatchObject({ yieldedForAdoption: true, dispatched: [expect.objectContaining({ pr: 42 })] });
+    expect(s.rearm).toHaveBeenCalledOnce();
+  });
+  it.each(['commit', 'complete'])('throwing fresh adoption probes fail closed at %s without stranding a committed entry', point => {
+    let posted = false;
+    const s = setup({ shouldYield: o => { if (o?.fresh && (point === 'commit' || posted)) throw Error('unreadable adoption'); return false; } });
+    const post = s.options.postComment; s.options.postComment = args => { post(args); posted = true; };
+    const result = s.run();
+    expect(result.yieldedForAdoption).toBe(true);
+    expect(s.rearm).toHaveBeenCalledTimes(point === 'commit' ? 0 : 1);
+    expect(s.postComment).toHaveBeenCalledTimes(point === 'commit' ? 0 : 1);
+    expect(result.yieldReason).toContain('unreadable adoption');
+  });
+  const halves = [['rearm', 'rearm-no-code'], ['restore', 'restore-review-label'], ['close', 'close-superseded']];
+  const boundaries = [
+    ['unsorted', null, [44,42,43], true, [42], [43,44], 'we#42'],
+    ['unsorted no deadline', null, [44,42,43], false, [42,43,44], [], null],
+    ['removed target', 'we#43', [42,44,45], true, [44], [45,42], 'we#44'],
+    ['wrap', 'we#45', [42,43,45], true, [42], [43,45], 'we#42'],
+    ['exhaustion', 'we#42', [42,43], false, [43,42], [], null],
+    ['foreign', 'plateau#42', [42,43], true, [42], [43], 'we#42'],
+  ];
+  for (const [half, kind] of halves) {
+    it.each(boundaries)(`${half} cursor boundary %s`, (_case, incoming, numbers, late, attempted, deferred, next) => {
+      let time = 0; const calls = [];
+      const s = setup({ now: () => time, deadlineAt: late ? 10 : undefined, halfCursors: { [half]: incoming },
+        reconcile: () => { time = 11; return { dispatch: numbers.map(prNumber => ({ ...entry, kind, prNumber })) }; },
+        acquireRearmLock: ({ prNumber }) => { calls.push(prNumber); throw Error('lock busy'); },
+        readPrLabels: ({ prNumber }) => { calls.push(prNumber); throw Error('labels unavailable'); },
+        readCardsOnMain: ({ prNumber }) => { calls.push(prNumber); throw Error('cards unavailable'); } });
+      const result = s.run(); expect(calls).toEqual(attempted);
+      expect(result.nextHalfCursors[half]).toBe(next);
+      expect(result.refusals.filter(r => r.kind === `${kind}-deferred-budget`).map(r => r.pr)).toEqual(deferred);
+      if (_case === 'foreign') expect(result.refusals).toContainEqual(expect.objectContaining({ pr: null, kind: 'promote-draft-cursor-reset' }));
+    });
+    it(`${half} zero-attempt adoption keeps the incoming cursor and names each deferral`, () => {
+      let adoption = false;
+      const s = setup({ shouldYield: () => adoption, halfCursors: { [half]: 'we#42' },
+        reconcile: () => ({ dispatch: [{ kind: 'promote-draft', prNumber: 1, headRefOid: head }, ...[42,43].map(prNumber => ({ ...entry, kind, prNumber }))] }),
+        readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [], readComments: () => [],
+        clearAwaitingCi: () => { adoption = true; } });
+      const result = s.run(); expect(result.nextHalfCursors[half]).toBe('we#42');
+      expect(result.refusals.filter(r => r.kind === `${kind}-deferred-adoption`).map(r => r.pr)).toEqual([43,42]);
+    });
+  }
+  it.each(['promote-draft','restore-review-label','close-superseded'])('%s refuses live, uncertain and throwing claims with zero writes', kind => {
+    for (const mode of ['live','uncertain','throw']) {
+      const write = vi.fn();
+      const s = setup({ reconcile: () => ({ dispatch: [{ kind, prNumber: 1, headRefOid: head }] }),
+        readClaim: () => { if (mode === 'throw') throw Error('claim IO'); return mode === 'live' ? { owner: 'fix' } : { uncertain: true }; },
+        readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [], readComments: () => [], readThread: () => [stop, c('close', buildOperatorAnswer({ standDownId: 'stop', actor:'chalbert', channel:'chat', reason:'Close as superseded', disposition:'close-superseded' }))],
+        readCardsOnMain: () => [], provider: { ready: write }, addLabel: write, closePr: write });
+      const result = s.run(); expect(write).not.toHaveBeenCalled();
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: `${kind}-${mode === 'live' ? 'claimed' : 'unreadable'}` }));
+    }
+  });
+  it('mixed success-then-yield: first promotion commits; follow-up adoption defers every later half', () => {
+    let time = 0, adoption = false; const calls = [];
+    const s = setup({ now: () => time++, shouldYield: () => adoption,
+      reconcile: () => ({ dispatch: [1,2].map(prNumber => ({ kind:'promote-draft',prNumber,headRefOid:head })).concat({kind:'restore-review-label',prNumber:3},entry,{kind:'close-superseded',prNumber:50}) }),
+      readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [], readComments: () => [],
+      provider: { ready: pr => calls.push(pr) }, clearAwaitingCi: () => { adoption = true; }, addLabel: () => calls.push('label'), closePr: () => calls.push('close') });
+    const result = s.run(); expect(calls).toEqual([1]); expect(result.dispatched).toHaveLength(1);
+    expect(Date.parse(result.dispatched[0].startedAt)).toBeLessThan(Date.parse(result.yieldedAt));
+    expect(result.dispatched[0].startedSequence).toBeLessThan(result.yieldedSequence);
+    expect(result.refusals.map(r => [r.pr,r.kind])).toEqual([[2,'promote-draft-deferred-adoption'],[3,'restore-review-label-deferred-adoption'],[42,'rearm-no-code-deferred-adoption'],[50,'close-superseded-deferred-adoption']]);
+  });
+  it('the first promotion re-probes adoption after planning: zero ready writes', () => {
+    let adoption = false; const ready = vi.fn();
+    const s = setup({ shouldYield: () => adoption, provider: { ready }, readHeadCheckState: ALWAYS_GREEN, readPrLabels: () => [], readComments: () => [],
+      reconcile: () => { adoption = true; return { dispatch: [{ kind:'promote-draft',prNumber:1,headRefOid:head }] }; } });
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({kind:'promote-draft-deferred-adoption'})); expect(ready).not.toHaveBeenCalled();
+  });
+  it('a call not admitted runs no reconcile, returns every cursor unchanged, names itself once', () => {
+    const reconcile = vi.fn();
+    const s = setup({ now: () => 11, deadlineAt: 10, cursor: 2, halfCursors: {rearm:'we#42',restore:'we#43',close:'we#44'}, reconcile });
+    const result = s.run(); expect(reconcile).not.toHaveBeenCalled();
+    expect(result).toMatchObject({nextCursor:2,nextHalfCursors:{rearm:'we#42',restore:'we#43',close:'we#44'},refusals:[{pr:null,kind:'promote-draft-not-admitted',why:expect.stringMatching(/deadline.*cursor/)}]});
+  });
+
+  it.each(['promote-draft','restore-review-label','close-superseded'])('single point: %s writes immediately after its declared fresh evidence and probe', kind => {
+    const events=[], closeAnswer=c('close-answer',buildOperatorAnswer({standDownId:'stop',actor:'chalbert',channel:'chat',reason:'Close as superseded',disposition:'close-superseded'}));
+    const write=()=>events.push('write');
+    const s=setup({reconcile:()=>({dispatch:[{kind,prNumber:1,headRefOid:head}]}),
+      shouldYield:o=>{if(o?.fresh) events.push('probe');return false;},
+      readHeadCheckState:()=>{events.push('checks');return ALWAYS_GREEN();},
+      readPrLabels:()=>{events.push('labels');return [];},readComments:()=>{events.push('comments');return [];},
+      readThread:()=>{events.push('comments');return [stop,closeAnswer];},readClaim:()=>{events.push('claim');return null;},
+      readCardsOnMain:()=>{events.push('cards');return [];},provider:{ready:write},clearAwaitingCi:NOOP_STATUS,addLabel:write,closePr:write});
+    expect(s.run().dispatched).toHaveLength(1);
+    expect(events).toEqual(kind==='promote-draft'?['checks','labels','comments','claim','probe','write','probe']:
+      kind==='restore-review-label'?['labels','claim','probe','write','probe']:['cards','comments','claim','probe','write','probe']);
+  });
+  it.each([['restore','restore-review-label'],['close','close-superseded']])('%s adoption after one write names the rest and saves the last-served cursor', (half,kind) => {
+    let adoption=false;const write=vi.fn(()=>{adoption=true;});
+    const s=setup({halfCursors:{[half]:'we#43'},shouldYield:()=>adoption,reconcile:()=>({dispatch:[42,43].map(prNumber=>({kind,prNumber}))}),
+      readPrLabels:()=>[],readCardsOnMain:()=>[],readThread:()=>[stop,c('close',buildOperatorAnswer({standDownId:'stop',actor:'chalbert',channel:'chat',reason:'Close as superseded',disposition:'close-superseded'}))],addLabel:write,closePr:write});
+    const result=s.run();expect(write).toHaveBeenCalledTimes(1);expect(result.nextHalfCursors[half]).toBe('we#42');
+    expect(result.refusals).toEqual([expect.objectContaining({pr:43,kind:`${kind}-deferred-adoption`})]);
+  });
+  it.each([['restore','restore-review-label'],['close','close-superseded']])('a head entry failing every pass cannot starve later %s entries', (half,kind) => {
+    let time=0, halfCursors;const writes=[];
+    for(let pass=0;pass<2;pass++) {
+      const write=({prNumber})=>{writes.push(prNumber);if(prNumber===42) throw Error('fixture write failure');};
+      const s=setup({now:()=>time,deadlineAt:time+10,halfCursors,reconcile:()=>{time+=11;return {dispatch:[42,43].map(prNumber=>({kind,prNumber}))};},
+        readPrLabels:()=>[],readCardsOnMain:()=>[],readThread:()=>[stop,c('close',buildOperatorAnswer({standDownId:'stop',actor:'chalbert',channel:'chat',reason:'Close as superseded',disposition:'close-superseded'}))],addLabel:write,closePr:write});
+      halfCursors=s.run().nextHalfCursors;
+    }
+    expect(writes).toEqual([42,43]);expect(halfCursors[half]).toBe('we#43');
+  });
+  it('authority-reducing follow-ups finish even if adoption arises in the committed write', () => {
+    let adoption=false;const removeLabel=vi.fn();
+    const s=setup({shouldYield:()=>adoption,reconcile:()=>({dispatch:[{kind:'restore-review-label',prNumber:1,variant:'stuck'}]}),readPrLabels:()=>['ready-to-merge'],
+      addLabel:()=>{adoption=true;},removeLabel});
+    expect(s.run().yieldedForAdoption).toBe(true);expect(removeLabel).toHaveBeenCalledOnce();
+  });
+  it.each(['labels','comments','claim'])('complete-point unreadable %s refuses after receipt with zero child calls', stage => {
+    let posted=false; const s=setup();const post=s.options.postComment, read=s.options.readThread;
+    s.options.postComment=a=>{post(a);posted=true;};
+    s.options.readPrLabels=()=>{if(posted&&stage==='labels') throw Error('labels timed out');return ['review:changes'];};
+    s.options.readThread=(...a)=>{if(posted&&stage==='comments'&&s.options.readThread.calls++>0) throw Error('thread timed out');return read(...a);};s.options.readThread.calls=0;
+    s.options.readClaim=()=>{if(posted&&stage==='claim') throw Error('claim IO');return null;};
+    expect(s.run().refusals).toContainEqual(expect.objectContaining({kind:'rearm-no-code-unreadable'}));expect(s.rearm).not.toHaveBeenCalled();
+  });
+  it('single point: rearm commit and complete have labels, comments, claim before their writes', () => {
+    const events = []; const s = setup({ shouldYield: o => { events.push(o?.fresh ? 'probe' : 'admission'); return false; },
+      readPrLabels: () => { events.push('labels'); return ['review:changes']; }, readClaim: () => { events.push('claim'); return null; } });
+    const read = s.options.readThread, post = s.options.postComment, child = s.options.rearm;
+    s.options.readThread = (...a) => { events.push('comments'); return read(...a); };
+    s.options.postComment = a => { events.push('receipt'); post(a); };
+    s.options.rearm = a => { events.push('writer'); return child(a); };
+    s.run(); expect(events).toEqual(['admission','labels','comments','claim','probe','receipt','comments','labels','comments','claim','writer','probe']);
+  });
+
+});
+
+
+describe('isolated CLI deadline', () => {
+  it.each(['1','0','x','-1','1.5','9007199254740992'])('CLI budget flag: %s plans only for a positive safe integer', async value => {
+    const mod = await import('../promote-draft-pr-dispatch.mjs');
+    const execute = vi.fn(() => ({ok:true}));
+    const call = () => mod.runPromoteDraftCli({argv:[`--budget-ms=${value}`,'--prs-file=one.json'],now:()=>100,execute});
+    if(value === '1') { expect(call()).toEqual({ok:true}); expect(execute).toHaveBeenCalledWith({repo:null,prsFile:'one.json',deadlineAt:101,now:expect.any(Function)}); }
+    else { expect(call).toThrow(/budget-ms/); expect(execute).not.toHaveBeenCalled(); }
+  });
+  it('CLI budget admission before expiry permits planning overrun; pre-admission expiry plans nothing', async () => {
+    const {runPromoteDraftCli} = await import('../promote-draft-pr-dispatch.mjs');
+    for(const expiresBeforeAdmission of [false,true]) {
+      let time=0; const reconcile=vi.fn(()=>{time=2;return {dispatch:[{kind:'restore-review-label',prNumber:42}]};}); const addLabel=vi.fn();
+      const out=runPromoteDraftCli({argv:['--budget-ms=1'],now:()=>time,execute:options=>{
+        if(expiresBeforeAdmission) time=2;
+        return runReconcilePromoteDraftDispatch({ readClaim: () => null,...options,root:'/repo',checkStaleness:FRESH,reconcile,readPrLabels:()=>[],readClaim:()=>null,addLabel});
+      }});
+      expect(reconcile).toHaveBeenCalledTimes(expiresBeforeAdmission?0:1); expect(addLabel).toHaveBeenCalledTimes(expiresBeforeAdmission?0:1);
+      expect(out.handled).toBe(expiresBeforeAdmission?0:1);
+      if(!expiresBeforeAdmission) expect(out.dispatched[0].afterDeadline).toEqual({deadlineAt:new Date(1).toISOString()});
+    }
+  });
+});
+
+
+it('a guard-yielded entry still calls the fresh post-entry observation and keeps the first latch', () => {
+  const shouldYield=vi.fn(o=>o?.fresh===true), ready=vi.fn();
+  const result=runReconcilePromoteDraftDispatch({root:'/repo',checkStaleness:FRESH,now:()=>0,shouldYield,
+    reconcile:()=>({dispatch:[{kind:'promote-draft',prNumber:42,headRefOid:'a'.repeat(40)}]}),
+    readPrLabels:()=>[],readComments:()=>[],readClaim:()=>null,readHeadCheckState:ALWAYS_GREEN,provider:{ready}});
+  expect(ready).not.toHaveBeenCalled(); expect(result.yieldedForAdoption).toBe(true);
+  expect(shouldYield.mock.calls.filter(([o])=>o?.fresh===true)).toHaveLength(2);
+  expect(result.yieldedSequence).toBe(2);
 });

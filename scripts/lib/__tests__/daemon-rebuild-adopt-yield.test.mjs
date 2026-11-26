@@ -121,3 +121,34 @@ describe('createAdoptYieldProbe — S1 fail-closed safe-point signal', () => {
     expect(f.probe()).toBe(false);
   });
 });
+
+
+describe('fresh write-point adoption evidence', () => {
+  it.each(['ENOTDIR','corrupt JSON','invalid fields','ENOENT'])('fresh probe: %s throws except ENOENT, which is clear', mode => {
+    const dir = mkdtempSync(join(tmpdir(), 'adopt-fresh-')); temps.push(dir);
+    const env = { WE_DAEMON_STATE_DIR: join(dir,'state') }, root = join(dir,'clone');
+    const file = readyCandidatePath(root, env);
+    if (mode === 'ENOTDIR') writeFileSync(env.WE_DAEMON_STATE_DIR, 'file');
+    else if (mode !== 'ENOENT') { mkdirSync(dirname(file), {recursive:true}); writeFileSync(file, mode === 'corrupt JSON' ? '{' : JSON.stringify(ready())); }
+    const probe = createAdoptYieldProbe({root, env, bootHead:BOOT});
+    if (mode === 'ENOENT') expect(probe({fresh:true})).toBe(false);
+    else expect(() => probe({fresh:true})).toThrow();
+  });
+  it('fresh probe ignores the throttle: evidence written 1 ms after a throttled false is seen', () => {
+    let candidate = null, time = 0;
+    const readReady = vi.fn(() => candidate), readReadyStrict = vi.fn(() => candidate);
+    const probe = createAdoptYieldProbe({root:'/clone',bootHead:BOOT,readReady,readReadyStrict,now:()=>time});
+    expect(probe()).toBe(false); candidate = ready(); time = 1;
+    expect(probe({fresh:true})).toBe(true); expect(readReadyStrict).toHaveBeenCalledWith('/clone', process.env);
+    expect(probe()).toBe(false); expect(readReady).toHaveBeenCalledTimes(1);
+  });
+  it('an identity yielded on in an earlier pass does not re-yield; a new identity does', () => {
+    let candidate = ready(); const probe = createAdoptYieldProbe({bootHead:BOOT,readReadyStrict:()=>candidate,now:()=>1});
+    expect(probe({fresh:true})).toBe(true); expect(probe({fresh:true})).toBe(false);
+    candidate = ready({passedAt:'2026-11-14T20:02:00Z'}); expect(probe({fresh:true})).toBe(true);
+  });
+  it('strict evidence is read even while swap spacing holds; corruption cannot authorize a write', () => {
+    const probe = createAdoptYieldProbe({bootHead:BOOT,bootAt:0,swapMinIntervalMs:100,now:()=>1,readReadyStrict:()=>{throw Error('corrupt');}});
+    expect(()=>probe({fresh:true})).toThrow('corrupt');
+  });
+});

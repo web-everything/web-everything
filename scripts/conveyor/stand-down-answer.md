@@ -45,6 +45,41 @@ we:scripts/conveyor/__tests__/stand-down-answer.test.mjs verifies the answer-to-
 including the successful `review:pending` label write and durable re-arm comment through local GitHub IO.
 This test does not replace the post-load live proof owed on #7321.
 
+## Mechanical executor: guarded writes and scheduling
+
+Every grant or spend write uses one guard, with no intervening I/O after its decision. It reads
+fresh evidence in this order: promotion reads labels, complete comments, and the fix claim;
+restore-review-label reads labels and the claim; a no-code receipt reads labels, complete comments,
+and the claim; its writer reads labels, complete comments excluding only its own confirmed receipt
+(by string ID), and the claim again; close-superseded reads complete comments and the claim.
+Each guard re-decides from that evidence. Missing, malformed, incomplete or unreadable evidence
+refuses the entry; inspect the named evidence and restore it before retrying. A live claim waits
+for its owner. At the first durable write it also probes adoption fresh; errors latch an adoption
+yield. Once the receipt commits, adoption cannot strand its writer. Late evidence after the receipt
+refuses the writer and leaves the ruling spent; an operator must inspect the handoff before replacing it.
+
+Clearing awaiting-CI status and removing ready-to-merge after a committed write are authority-reducing
+follow-ups. They finish with the entry; failures are reported. Adoption is observed after every attempted
+entry, including refusals and follow-ups. A latched yield defers all later entries and halves.
+
+A call admitted before its deadline attempts at least one entry per half unless adoption has latched.
+Only later entries are bounded by the phase deadline, with at most one late entry in each half.
+Promotion keeps its numeric cursor; rearm, restore and close rotate independently after scalar
+repo-key/PR cursors. Exhaustion clears a cursor; zero attempts preserve it. Every unattempted entry
+and skipped repo is named once, with adoption taking precedence over the deadline. Action timestamps
+and monotonic per-call sequence numbers record execution order even when timestamps tie.
+An unreadable half cursor restarts only that rotation at its lowest PR, with a named reset. Failed
+cursor persistence keeps memory authoritative until restart, which resumes the last successful save.
+
+The isolated CLI accepts --budget-ms=<positive integer>; invalid values refuse before planning.
+The deadline starts at CLI entry. A deterministic injected clock proves both pre-admission expiry
+(zero work) and planning overruns after admission (one attempt per half). Each external operation
+retains its timeout; this bounds attempts, not total wall time. Option B rearm uses three complete
+thread reads, each at most ten pages plus a count query; its writer is bounded to 120 seconds.
+Promotion also reads required checks, check rows, and conditionally merge-gate labels/verdict/freeze
+before its guard. Restore uses one label read and at most two writes; close reads owned cards on
+main before its complete-thread guard. No retry loop is introduced.
+
 The predicate in we:scripts/conveyor/stand-down-answer-core.mjs requires a trusted `author.login`, an
 exact versioned record, and a later answer targeting the specific stand-down. A quoted marker, unrelated
 comment ID, outsider's body, or `viewerDidAuthor` alone cannot clear the hold. Other unresolved stand-downs
@@ -103,6 +138,5 @@ or cap-override budget. Full and abbreviated stand-down SHAs use the same case-i
 Regression coverage: `superseded no-code ruling does not hold a red-team fix` in
 `scripts/conveyor/__tests__/no-code-rearm.test.mjs` combines retirement with both red-team holds;
 `receipted replacement preserves consumed writer budgets` in
-`scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs` exercises the actual writer's
-exhausted waiver and cap-override refusals. The same file's `post-receipt ... permits exactly one
-extra review through the actual writer` cases pin the accepted late-evidence window and its one-attempt bound.
+`scripts/operations/__tests__/promote-draft-pr-dispatch.test.mjs` refuses an exhausted replacement before calling the writer. The same file's `post-receipt ... refuses the writer`
+cases pin the fresh evidence check, spent ruling and zero label writes.

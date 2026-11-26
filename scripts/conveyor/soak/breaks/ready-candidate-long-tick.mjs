@@ -48,6 +48,7 @@ export default {
         },
         checkStaleness: () => ({}), readHeadCheckState: () => ({ state: 'green' }),
         readPrLabels: () => [], readComments: () => [], clearAwaitingCi: () => {},
+        readClaim: () => null, // This replay models an unclaimed PR; claim-store evidence is injected too.
         deadlineAt: 60 * 60_000, now: () => time,
       });
       const report = { result, events };

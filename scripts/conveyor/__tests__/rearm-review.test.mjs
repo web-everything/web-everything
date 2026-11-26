@@ -484,6 +484,13 @@ describe('rearm-review.mjs CLI — the empty-round guard wiring', () => {
     expect(r.calls).toEqual([]);
   });
 
+  it('--expect-head differing from the guard live head refuses with no label write', () => {
+    const r = run(['6798', '--repo=o/r', `--expect-head=${'f'.repeat(40)}`], EMPTY);
+    expect(r.status).toBe(1);
+    expect(r.wrote).toBe(false);
+    expect(r.out).toContain('head');
+  });
+
   it('an empty round is refused with the no-change note posted, and no label write', () => {
     const r = run(['6798', '--repo=o/r', '--actor=fixer'], EMPTY);
     expect(r.status).toBe(1);

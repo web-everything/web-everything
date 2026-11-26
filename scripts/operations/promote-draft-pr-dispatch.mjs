@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import { assertCapability, repoProfile } from '../lib/repo-profile.mjs';
-import { safeAdoptYield } from '../lib/daemon-rebuild/adopt-yield.mjs';
 import { isTerminalStatus } from '../lib/backlog-status.cjs';
 /**
  * @file promote-draft-pr-dispatch.mjs
@@ -65,6 +64,7 @@ import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 import { spawnSync } from 'node:child_process';
+import { stripVTControlCharacters } from 'node:util';
 import { createHash } from 'node:crypto';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { acquireLiveOwnerWatchLock } from '../conveyor/pr-live-owner-lock.mjs';
@@ -83,7 +83,7 @@ import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { readLiveDrainClaim } from '../conveyor/fix-procedure.mjs';
-import { CLOSE_SUPERSEDED_MARKER, noCodeRearmPlan, NO_CODE_REARM_RECEIPT, parseNoCodeRearmReceipt } from '../conveyor/stand-down-answer-core.mjs';
+import { CLOSE_SUPERSEDED_MARKER, answerDisposition, latestOperatorAnswer, latestUnresolvedStandDown, isCloseSupersededExecuted, noCodeRearmPlan, NO_CODE_REARM_RECEIPT, parseNoCodeRearmReceipt } from '../conveyor/stand-down-answer-core.mjs';
 import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -264,7 +264,9 @@ export function ownedCards(cards, view = {}) {
 }
 
 /**
- * Run ONE pass: reconcile, filter `kind:'promote-draft'`, call `gh pr ready` on each. Repo-agnostic, same
+ * Run one guarded pass, with independent per-half progress cursors and fresh fail-closed adoption.
+ * Every write rechecks its declared live evidence; committed entries finish before adoption yields.
+ * Reconcile, filter `kind:'promote-draft'`, call `gh pr ready` on each. Repo-agnostic, same
  * `--repo`/`--prs-file` contract as `ci-heal-pr-dispatch.mjs`'s own `runReconcileCiHealDispatch`.
  * @param {object} [o]
  * @param {string|null} [o.repo] - a constellation repo slug, or `null` for WE (mirrors every sibling dispatcher).
@@ -321,15 +323,37 @@ export function runReconcilePromoteDraftDispatch({
   // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
   // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
   reviewWhileBaseOpen = undefined,
-  deadlineAt, cursor, shouldYield, now = Date.now,
+  deadlineAt, cursor, halfCursors = {}, shouldYield, now = Date.now,
 } = {}) {
-  let yieldedForAdoption = false;
+  let yieldedForAdoption = false, yieldedAt, yieldReason, yieldedSequence, sequence = 0;
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
-  const deadlineResult = () => ({ handled: 0, deferred: cursor == null ? [] : [cursor],
-    nextCursor: cursor ?? null, ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), ...(cursor == null ? { deadlineSkipped: true } : {}),
-    dispatched: [], refusals: [], reconcileRefusals: 0, reconcileRefusalDetails: [] });
-  if ((yieldedForAdoption ||= safeAdoptYield(shouldYield)) || (deadlineAt != null && now() > deadlineAt)) return deadlineResult();
+  const halves = { rearm: 'rearm-no-code', restore: 'restore-review-label', close: 'close-superseded' };
+  const nextHalfCursors = Object.fromEntries(Object.keys(halves).map(half => [half, halfCursors[half] ?? null]));
+  const adoptionResult = () => yieldedForAdoption ? { yieldedForAdoption: true, yieldedAt, yieldReason, yieldedSequence } : {};
+  function observeAdoption(fresh = true) {
+    if (typeof shouldYield !== 'function') return yieldedForAdoption; // CLI explicitly opts out of adoption.
+    let reason = 'ready candidate observed';
+    try {
+      const result = fresh ? shouldYield({ fresh: true }) : shouldYield();
+      if (result === false) return yieldedForAdoption;
+      if (result !== true) throw new Error('ambiguous adoption probe result');
+    } catch (error) { reason = `adoption probe unreadable: ${stripVTControlCharacters(String(error?.message ?? error)).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').split('\n')[0]}`; }
+    if (!yieldedForAdoption) {
+      yieldedForAdoption = true;
+      yieldedAt = new Date(now()).toISOString();
+      yieldedSequence = ++sequence;
+      yieldReason = reason;
+    }
+    return true;
+  }
+  if (observeAdoption(false) || (deadlineAt != null && now() > deadlineAt)) {
+    return { handled: 0, deferred: cursor == null ? [] : [cursor], nextCursor: cursor ?? null, nextHalfCursors,
+      ...adoptionResult(), ...(cursor == null ? { deadlineSkipped: true } : {}), dispatched: [],
+      refusals: [{ pr: null, kind: 'promote-draft-not-admitted',
+        why: `${yieldedForAdoption ? `adoption yield (${yieldReason})` : 'deadline passed'} before admission; incoming cursor ${JSON.stringify({ promote: cursor ?? null, ...nextHalfCursors })}` }],
+      reconcileRefusals: 0, reconcileRefusalDetails: [] };
+  }
   // #x1rr9rh (multi-repo slice 2) — guards THIS dispatching checkout's own import path, same as every sibling
   // mechanical pass (`ci-heal-pr-dispatch.mjs`, `reconcile-fix-dispatch.mjs`) — never the target repo.
   // LIVE INCIDENT 2026-10-03: PR #3806 (the fix for main's red CI) sat green-but-draft for 15+ minutes because
@@ -346,16 +370,87 @@ export function runReconcilePromoteDraftDispatch({
     cwd: root, repo: repoKey === 'we' ? undefined : repoSlug,
   });
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
-  let entries = (reconciled.dispatch ?? []).filter((entry) => entry.kind === 'promote-draft');
-  if (deadlineAt != null || cursor != null) {
-    entries.sort((a, b) => a.prNumber - b.prNumber);
-    const start = entries.findIndex(entry => entry.prNumber >= cursor);
-    if (start > 0) entries = [...entries.slice(start), ...entries.slice(0, start)];
+  let handled = 0, nextCursor = null;
+  const deferred = [], dispatched = [], refusals = [];
+  const lineError = error => stripVTControlCharacters(String(error?.message ?? error)).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '').split('\n')[0];
+  function defer(kind, pr, why, at) {
+    deferred.push(pr);
+    refusals.push({ pr, kind, why, at });
   }
-  let handled = 0;
-  let deferred = [];
-  const dispatched = [];
-  const refusals = [];
+  function adoptionDeferral(kind, pr, unattempted = false) {
+    defer(`${kind}-deferred-adoption`, pr, `daemon adoption yield (${yieldReason}) — ${unattempted ? 'no lock, read or write ran' : 'commit guard stopped before the grant/spend write'}`, yieldedAt);
+  }
+  // One scheduler for every half. Only admission checks the deadline; entries finish together.
+  function runHalf({ kind, entries, rotate, body }) {
+    entries = [...entries].sort((a, b) => a.prNumber - b.prNumber);
+    let incoming = rotate ? nextHalfCursors[rotate] : cursor;
+    if (rotate && incoming != null) {
+      const match = /^([a-z0-9-]+)#([1-9][0-9]*)$/.exec(String(incoming));
+      if (!match || match[1] !== repoKey || !Number.isSafeInteger(Number(match[2]))) {
+        refusals.push({ pr: null, kind: 'promote-draft-cursor-reset', why: `unreadable or foreign ${rotate} cursor; rotation restarts at the lowest PR` });
+        incoming = null;
+      }
+    }
+    const last = rotate ? Number(String(incoming).split('#')[1]) : incoming;
+    const start = entries.findIndex(e => rotate ? e.prNumber > last : e.prNumber >= last);
+    if (start > 0) entries = [...entries.slice(start), ...entries.slice(0, start)];
+    let attempted = 0, lastServed = incoming, unattempted = 0;
+    for (let i = 0; i < entries.length; i++) {
+      const started = yieldedForAdoption ? null : now();
+      if (yieldedForAdoption || (deadlineAt != null && started > deadlineAt && attempted > 0)) {
+        const rest = entries.slice(i);
+        unattempted = rest.length;
+        for (const row of rest) {
+          if (yieldedForAdoption) adoptionDeferral(kind, row.prNumber, true);
+          else defer(`${kind}-deferred-budget`, row.prNumber,
+            `promote-draft deadline ${new Date(deadlineAt).toISOString()} passed after ${attempted} ${kind} attempt(s); resumes after ${lastServed}`, new Date(started).toISOString());
+        }
+        if (!rotate) nextCursor = attempted ? rest[0].prNumber : cursor ?? null;
+        break;
+      }
+      attempted++; handled++;
+      lastServed = rotate ? `${repoKey}#${entries[i].prNumber}` : entries[i].prNumber;
+      const action = { startedAt: new Date(started).toISOString(), startedSequence: ++sequence,
+        ...(deadlineAt != null && started > deadlineAt ? { afterDeadline: { deadlineAt: new Date(deadlineAt).toISOString() } } : {}) };
+      try { body(entries[i], action); }
+      finally { observeAdoption(); }
+    }
+    if (rotate) nextHalfCursors[rotate] = unattempted ? (attempted ? lastServed : incoming) : null;
+  }
+  // The only grant/spend recheck. Reads always follow labels -> comments -> claim -> decide.
+  // Complete points finish a committed receipt and deliberately do not yield for adoption.
+  function guardWrite({ kind, pr, point = 'commit', read = {}, decide = () => null, unreadable }) {
+    if (point === 'commit' && yieldedForAdoption) { adoptionDeferral(kind, pr); return null; }
+    const evidence = {};
+    try {
+      if (read.labels) evidence.labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: pr })).map(l => typeof l === 'string' ? l : l.name);
+      if (read.comments) {
+        evidence.comments = read.comments();
+        if (!Array.isArray(evidence.comments) || !evidence.comments.every(c => c && typeof c.body === 'string')) throw Error('complete PR comments unreadable');
+      }
+    } catch (error) {
+      refusals.push({ pr, kind: unreadable ?? `${kind}-unreadable`, why: `${lineError(error)}; retry next tick after restoring readable evidence; operator must inspect the complete thread and labels` });
+      return null;
+    }
+    try {
+      const claim = readClaim({ repo: repoKey, pr });
+      if (claim === undefined || claim?.uncertain) throw Error('fix claim store unreadable; operator must inspect the claim store');
+      if (claim !== null) {
+        refusals.push({ pr, kind: `${kind}-claimed`, why: 'a live fix claim appeared; wait for its owner to finish' });
+        return null;
+      }
+    } catch (error) {
+      refusals.push({ pr, kind: `${kind}-unreadable`, why: lineError(error) });
+      return null;
+    }
+    let refusal;
+    try { refusal = decide(evidence); }
+    catch (error) { refusal = { kind: unreadable ?? `${kind}-unreadable`, why: `${lineError(error)}; operator must inspect evidence before retrying` }; }
+    if (refusal) { refusals.push({ pr, ...refusal }); return null; }
+    if (point === 'commit' && observeAdoption()) { adoptionDeferral(kind, pr); return null; }
+    return evidence;
+  }
+  const entriesFor = kind => (reconciled.dispatch ?? []).filter(entry => entry.kind === kind);
   // Every open draft the plan did NOT promote says why, once per tick (the log used to carry nothing for a draft
   // the promote half skipped). The reconcile `draft` refusal carries the check state it read.
   for (const r of (reconciled.refusals ?? [])) {
@@ -366,16 +461,7 @@ export function runReconcilePromoteDraftDispatch({
     });
   }
   let stackPolicy;
-  for (const entry of entries) {
-    // Yield only before an entry: its reads and writes must finish together.
-    // Always finish the first entry: when planning alone outlasts the budget, yielding before it would defer
-    // the same PR every pass (reconcile re-runs before the cursor is read) and nothing would ever promote.
-    if (handled > 0) yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if ((deadlineAt != null && now() > deadlineAt && handled > 0) || yieldedForAdoption) {
-      deferred = entries.slice(handled).map(row => row.prNumber);
-      break;
-    }
-    handled += 1;
+  runHalf({ kind: 'promote-draft', entries: entriesFor('promote-draft'), body(entry, action) {
     const sha = entry.headRefOid;
     const stacked = isGithubStacked(entry);
     if (stacked && !(stackPolicy ??= reviewWhileBaseOpen ?? stackReviewWhileBaseOpen())) {
@@ -383,7 +469,7 @@ export function runReconcilePromoteDraftDispatch({
         pr: entry.prNumber, kind: 'stacked-awaiting-base', headSha: sha,
         why: `stacked on ${entry.baseRefName} — stack.reviewWhileBaseOpen is off, so it is promoted once its base lands and the drain retargets it`,
       });
-      continue;
+      return;
     }
     // #2811 — re-verify EVERY required check for the EXACT head sha immediately before the one write this file
     // makes. The plan's own `withPhase.check === 'green'` (see `reconcile-core.mjs`'s `promote-draft` branch) is
@@ -400,7 +486,7 @@ export function runReconcilePromoteDraftDispatch({
         why: `could not re-verify required checks for ${sha} before promoting — refusing rather than acting on `
           + `the reconcile plan's own (by-now-stale) read: ${String((e && e.message) || e).split('\n')[0]}`,
       });
-      continue;
+      return;
     }
     if (fresh.state !== 'green' && !(fresh.state === 'red' && fresh.reviewHoldOnly === true)) {
       refusals.push({
@@ -409,61 +495,26 @@ export function runReconcilePromoteDraftDispatch({
           + `immediately before promoting shows ${fresh.state} (${fresh.why}) — refusing to promote on a `
           + 'stale-green read (#2811); the same entry is re-planned next tick once the checks genuinely settle',
       });
-      continue;
+      return;
     }
-    // Re-read labels before comments; GitHub does not offer an atomic label-check/ready write.
-    let labels;
-    try {
-      labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }));
-    } catch (e) {
-      refusals.push({
-        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read draft hold labels before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
-      });
-      continue;
-    }
-    if (labels.some(label => (typeof label === 'string' ? label : label.name) === WITHDRAWN_LABEL)) {
-      refusals.push({
-        pr: entry.prNumber, kind: 'draft-withdrawn', headSha: sha,
-        why: 'draft PR is withdrawn — explicit release is required before promotion',
-      });
-      continue;
-    }
-    const redTeamHold = labels.map(label => typeof label === 'string' ? label : label.name)
-      .find(label => ['red-team:blocked', 'red-team:pending'].includes(label));
-    if (redTeamHold) {
-      refusals.push({
-        pr: entry.prNumber, kind: redTeamHold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', headSha: sha,
-        why: `${redTeamHold} — a draft held by red team is never promoted`,
-      });
-      continue;
-    }
-    const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
-    if (refusal) { refusals.push({ pr: entry.prNumber, ...refusal }); continue; }
-    // Refresh the complete thread after planning and slow reads; absent evidence never clears a park.
-    let comments;
-    try {
-      comments = readComments(entry.prNumber, { repo: repoSlug });
-      if (!Array.isArray(comments)) throw new Error('PR comments must be an array');
-    } catch (e) {
-      refusals.push({
-        pr: entry.prNumber, kind: 'draft-state-unreadable', headSha: sha,
-        why: `could not read operator park comments before promoting; retry next tick: ${String(e?.message ?? e).split('\n')[0]}`,
-      });
-      continue;
-    }
-    if (isOperatorParked(comments)) {
-      refusals.push({ pr: entry.prNumber, kind: 'operator-parked', headSha: sha,
-        why: 'draft PR is operator-parked — explicit release is required before promotion' });
-      continue;
-    }
+    if (!guardWrite({ kind: 'promote-draft', pr: entry.prNumber, unreadable: 'draft-state-unreadable',
+      read: { labels: true, comments: () => readComments(entry.prNumber, { repo: repoSlug }) },
+      decide: ({ labels, comments }) => {
+        if (labels.includes(WITHDRAWN_LABEL)) return { kind: 'draft-withdrawn', headSha: sha, why: 'draft PR is withdrawn — explicit release is required before promotion' };
+        const redTeamHold = labels.find(l => ['red-team:blocked', 'red-team:pending'].includes(l));
+        if (redTeamHold) return { kind: redTeamHold === 'red-team:blocked' ? 'red-team-blocked' : 'red-team-pending', headSha: sha, why: `${redTeamHold} — a draft held by red team is never promoted` };
+        const refusal = assertCapability(repoSlug, 'review', { resolveProfile });
+        if (refusal) return refusal;
+        if (isOperatorParked(comments)) return { kind: 'operator-parked', headSha: sha, why: 'draft PR is operator-parked — explicit release is required before promotion' };
+        return null;
+      } })) return;
     try {
       ghProvider.ready(entry.prNumber);
-      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...(stacked ? { stackedOn: entry.baseRefName } : {}) });
+      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...action, ...(stacked ? { stackedOn: entry.baseRefName } : {}) });
       try {
         clearAwaitingCi({ pr: entry.prNumber, repo: repoSlug, state: null });
-      } catch {
-        // Best-effort (see the param's own doc) — the periodic review-status sweep still corrects this.
+      } catch (error) {
+        console.error(`promote-draft-follow-up-failed PR #${entry.prNumber} — ${lineError(error)}; periodic review-status sweep must correct awaiting-CI status`);
       }
     } catch (e) {
       // Best-effort, same as every other label/state write in this family (`pr-land.mjs`'s own `applyLabel`):
@@ -471,153 +522,137 @@ export function runReconcilePromoteDraftDispatch({
       // next tick, so a transient failure self-heals within one tick interval rather than needing a retry loop.
       refusals.push({ pr: entry.prNumber, kind: 'ready-failed', why: String((e && e.message) || e).split('\n')[0] });
     }
-  }
-  // ── restore-review-label half: green, open, label-less lane PRs get `review:pending` (see reconcile-core).
-  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'restore-review-label')) {
-    let labels;
-    try {
-      labels = validatePrLabels(readPrLabels({ repoSlug, prNumber: entry.prNumber }))
-        .map(l => (typeof l === 'string' ? l : l.name));
-    } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'label-state-unreadable', why: String(e?.message ?? e).split('\n')[0] });
-      continue;
-    }
-    // #3902 — the STUCK variant is planned FOR a `ready-to-merge` PR, so only a review label stops it there.
+  } });
+  runHalf({ kind: 'restore-review-label', entries: entriesFor('restore-review-label'), rotate: 'restore', body(entry, action) {
     const stuck = entry.variant === 'stuck';
-    if (labels.some(l => l.startsWith('review:') || (!stuck && l === 'ready-to-merge'))) {
-      refusals.push({ pr: entry.prNumber, kind: 'label-already-set', why: 'a review/landing label appeared since the plan was read' });
-      continue;
-    }
+    const evidence = guardWrite({ kind: 'restore-review-label', pr: entry.prNumber, unreadable: 'label-state-unreadable',
+      read: { labels: true }, decide: ({ labels }) => labels.some(l => l.startsWith('review:') || (!stuck && l === 'ready-to-merge'))
+        ? { kind: 'label-already-set', why: 'a review/landing label appeared since the plan was read' } : null });
+    if (!evidence) return;
     try {
       addLabel({ repoSlug, prNumber: entry.prNumber, label: entry.label ?? 'review:pending' });
-      // A review hold and the `ready-to-merge` go-ahead are contradictory (#2832): strip it, best-effort — the
-      // drain's merge gate re-checks the hold either way.
-      if (stuck && labels.includes('ready-to-merge')) {
-        try { removeLabel({ repoSlug, prNumber: entry.prNumber, label: 'ready-to-merge' }); } catch { /* best-effort */ }
+      if (stuck && evidence.labels.includes('ready-to-merge')) {
+        try { removeLabel({ repoSlug, prNumber: entry.prNumber, label: 'ready-to-merge' }); }
+        catch (error) { console.error(`restore-review-label-follow-up-failed PR #${entry.prNumber} — ${lineError(error)}; drain must recheck the review hold`); }
       }
-      dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending' });
-    } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: String((e && e.message) || e).split('\n')[0] });
-    }
-  }
-  // Finish each entry atomically; defer the remaining entries when the tick must yield.
-  const rearmEntries = (reconciled.dispatch ?? []).filter(e => e.kind === 'rearm-no-code');
-  for (const [index, entry] of rearmEntries.entries()) {
-    yieldedForAdoption ||= safeAdoptYield(shouldYield);
-    if (yieldedForAdoption || (deadlineAt != null && now() > deadlineAt)) {
-      deferred.push(...rearmEntries.slice(index).map(row => row.prNumber));
-      break;
-    }
-    handled += 1;
+      dispatched.push({ pr: entry.prNumber, kind: 'restore-review-label', label: entry.label ?? 'review:pending', ...action });
+    } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'label-failed', why: lineError(error) }); }
+  } });
+  runHalf({ kind: 'rearm-no-code', entries: entriesFor('rearm-no-code'), rotate: 'rearm', body(entry, action) {
     const prNumber = entry.prNumber;
     let release;
     try {
       release = acquireRearmLock({ repoSlug, prNumber });
-    } catch (e) {
-      refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-unavailable', why: String(e?.message ?? e).split('\n')[0] });
-      continue;
+      if (typeof release !== 'function') throw Error('lock ownership unreadable; operator must inspect the lock');
+    } catch (error) {
+      refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-unavailable', why: lineError(error) });
+      return;
     }
     try {
-      // Admission is deliberately inside exclusion: a contender must see its predecessor's receipt.
-      let comments, labels;
+      const decide = evidence => {
+        const plan = noCodeRearmPlan({ comments: evidence.comments, labels: evidence.labels, headRefOid: entry.expectHead });
+        return plan.state === 'ready' && plan.answerId === entry.answerId ? null : { kind: 'rearm-no-code-stale', why: `${plan.why}; inspect the handoff before a replacement answer` };
+      };
+      const evidence = guardWrite({ kind: 'rearm-no-code', pr: prNumber, read: { labels: true,
+        comments: () => readThread(prNumber, { repo: repoSlug, maxPages: 10 }) }, decide });
+      if (!evidence) return;
+      let receiptId;
       try {
-        comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-        labels = validatePrLabels(readPrLabels({ repoSlug, prNumber })).map(l => typeof l === 'string' ? l : l.name);
-        if (!Array.isArray(comments)) throw Error('comments unreadable');
-      } catch (e) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: `${String(e?.message ?? e).split('\n')[0]}; operator must inspect the complete thread and labels before a fresh answer` });
-        continue;
-      }
-      const plan = noCodeRearmPlan({ comments, labels, headRefOid: entry.expectHead });
-      if (plan.state !== 'ready' || plan.answerId !== entry.answerId) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-stale', why: plan.why });
-        continue;
-      }
-      try {
-        const claim = readClaim({ repo: repoKey, pr: prNumber });
-        if (claim?.uncertain) {
-          throw Error('fix claim store unreadable; operator must inspect the claim store');
-        }
-        if (claim) {
-          refusals.push({ pr: prNumber, kind: 'rearm-no-code-claimed', why: 'a live fix claim appeared; wait for its owner to finish' });
-          continue;
-        }
-      } catch (e) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unreadable', why: String(e?.message ?? e).split('\n')[0] });
-        continue;
-      }
-      try {
-        const receipt = NO_CODE_REARM_RECEIPT(plan.answerId, entry.expectHead);
-        const priorIds = new Set(comments.map(c => c.id));
+        const receipt = NO_CODE_REARM_RECEIPT(entry.answerId, entry.expectHead);
+        const priorIds = new Set(evidence.comments.map(c => String(c.id)));
         postComment({ repoSlug, prNumber, comment: receipt });
         const posted = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
-        if (!Array.isArray(posted) || !posted.some(c => c.id != null && !priorIds.has(c.id)
-          && c.body === receipt && parseNoCodeRearmReceipt(c)?.answerId === plan.answerId)) {
-          throw Error('receipt author could not be confirmed; operator must inspect the posted receipt');
-        }
-      } catch (e) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: String(e?.message ?? e).split('\n')[0] });
-        continue;
+        if (!Array.isArray(posted)) throw Error('receipt thread unreadable; operator must inspect the posted receipt');
+        const matches = posted.filter(c => c?.id != null && !priorIds.has(String(c.id)) && c.body === receipt
+          && parseNoCodeRearmReceipt(c)?.answerId === entry.answerId);
+        if (matches.length !== 1) throw Error('receipt author could not be confirmed unambiguously; operator must inspect the posted receipt');
+        receiptId = String(matches[0].id);
+      } catch (error) {
+        refusals.push({ pr: prNumber, kind: 'rearm-no-code-receipt-failed', why: lineError(error) });
+        return;
       }
-      let child, observed;
+      // Option B: a receipt spends authority, but never overrides later evidence. Adoption waits until this entry finishes.
+      if (!guardWrite({ kind: 'rearm-no-code', pr: prNumber, point: 'complete', read: { labels: true,
+        comments: () => {
+          const comments = readThread(prNumber, { repo: repoSlug, maxPages: 10 });
+          if (!Array.isArray(comments)) throw Error('complete PR thread unreadable');
+          return comments.filter(c => String(c?.id) !== receiptId);
+        } }, decide })) return;
       try {
-        child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: plan.answerId });
-        observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
+        const child = rearm({ repoSlug, prNumber, expectHead: entry.expectHead, answerId: entry.answerId });
+        const observed = JSON.parse(String(child?.stdout ?? '').trim().split('\n').at(-1));
         if (child.status !== 0 || observed?.ok !== true || observed.labelsObserved !== true
           || !Array.isArray(observed.labels) || !observed.labels.every(l => typeof l === 'string')
-          || observed.labels.includes('review:changes')
-          || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
+          || observed.labels.includes('review:changes') || !observed.labels.some(l => ['review:pending', 'review:human'].includes(l))) {
           throw Error(observed?.reason ?? observed?.error ?? `writer did not positively observe rearm (exit ${child.status})`);
         }
-        dispatched.push({ pr: prNumber, kind: 'rearm-no-code' });
-      } catch (e) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: String(e?.message ?? e).split('\n')[0] });
-      }
+        dispatched.push({ pr: prNumber, kind: 'rearm-no-code', ...action });
+      } catch (error) { refusals.push({ pr: prNumber, kind: 'rearm-no-code-unconfirmed', why: lineError(error) }); }
     } finally {
-      try { release(); } catch (e) {
-        refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-release-failed', why: String(e?.message ?? e).split('\n')[0] });
-      }
+      try { release(); }
+      catch (error) { refusals.push({ pr: prNumber, kind: 'rearm-no-code-lock-release-failed', why: lineError(error) }); }
     }
-  }
-  // ── close-superseded half (#3850): an operator disposition, executed mechanically — never a fixer.
-  for (const entry of (reconciled.dispatch ?? []).filter((e) => e.kind === 'close-superseded')) {
+  } });
+  runHalf({ kind: 'close-superseded', entries: entriesFor('close-superseded'), rotate: 'close', body(entry, action) {
     let onMain;
-    try { onMain = readCardsOnMain({ repoSlug, prNumber: entry.prNumber }); } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'close-unreadable', why: String(e?.message ?? e).split('\n')[0] });
-      continue;
-    }
+    try {
+      onMain = readCardsOnMain({ repoSlug, prNumber: entry.prNumber });
+      if (!Array.isArray(onMain) || !onMain.every(card => typeof card === 'string')) throw Error('owned cards on main unreadable');
+    } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'close-unreadable', why: lineError(error) }); return; }
     if (onMain.length) {
       refusals.push({ pr: entry.prNumber, kind: 'close-card-on-main', why: `card(s) already on main (${onMain.join(', ')}) need a backlog edit before the PR closes` });
-      continue;
+      return;
     }
+    const evidence = guardWrite({ kind: 'close-superseded', pr: entry.prNumber,
+      read: { comments: () => readThread(entry.prNumber, { repo: repoSlug, maxPages: 10 }) },
+      decide: evidence => {
+        evidence.answer = latestOperatorAnswer(evidence.comments);
+        return answerDisposition(evidence.answer) !== 'close-superseded' || isCloseSupersededExecuted(evidence.comments)
+          || latestUnresolvedStandDown(evidence.comments) !== null
+          ? { kind: 'close-superseded-stale', why: 'fresh close disposition is missing, spent or held; operator must inspect the thread' } : null;
+      } });
+    if (!evidence) return;
     try {
-      closePr({ repoSlug, prNumber: entry.prNumber, comment: closeSupersededComment(entry.operatorAnswer) });
-      dispatched.push({ pr: entry.prNumber, kind: 'close-superseded' });
-    } catch (e) {
-      refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: String((e && e.message) || e).split('\n')[0] });
-    }
+      closePr({ repoSlug, prNumber: entry.prNumber, comment: closeSupersededComment(evidence.answer) });
+      dispatched.push({ pr: entry.prNumber, kind: 'close-superseded', ...action });
+    } catch (error) { refusals.push({ pr: entry.prNumber, kind: 'close-failed', why: lineError(error) }); }
+  } });
+  return { ...adoptionResult(), handled, deferred, nextCursor, nextHalfCursors, dispatched, refusals,
+    reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
+}
+
+/** CLI admission clock starts before parsing; invalid budgets perform no planning or external calls. */
+export function runPromoteDraftCli({ argv = process.argv.slice(2), now = Date.now,
+  execute = runReconcilePromoteDraftDispatch } = {}) {
+  const started = now(), flags = {};
+  for (const arg of argv) {
+    if (!arg.startsWith('--')) continue;
+    const eq = arg.indexOf('=');
+    const key = arg.slice(2, eq === -1 ? undefined : eq);
+    if (key === 'budget-ms' && Object.hasOwn(flags, key)) throw Error('--budget-ms must appear once');
+    flags[key] = eq === -1 ? true : arg.slice(eq + 1);
   }
-  return { ...(yieldedForAdoption ? { yieldedForAdoption: true } : {}), handled, deferred, nextCursor: deferred[0] ?? null, dispatched, refusals, reconcileRefusals: reconciled.refusals?.length ?? 0, reconcileRefusalDetails: reconciled.refusals };
+  let deadlineAt;
+  if (Object.hasOwn(flags, 'budget-ms')) {
+    const value = flags['budget-ms'];
+    if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))
+      || !Number.isSafeInteger(started + Number(value)) || started + Number(value) > 8640000000000000) {
+      throw Error('--budget-ms must be a positive safe integer within the clock range; no planning ran');
+    }
+    deadlineAt = started + Number(value);
+  }
+  return execute({ repo: typeof flags.repo === 'string' ? flags.repo : null, prsFile: flags['prs-file'],
+    ...(deadlineAt == null ? {} : { deadlineAt, now }) });
 }
 
 const IS_CLI = process.argv[1] && new URL(import.meta.url).pathname === process.argv[1];
 if (IS_CLI) {
-  // Same self-heal as every sibling CLI in this family — re-execute rather than dispatch on old code if this
-  // checkout was fast-forwarded underneath a long-lived runner.
-  armSelfReexecOnFastForward();
-  const flags = {};
-  for (const a of process.argv.slice(2)) {
-    if (!a.startsWith('--')) continue;
-    const eq = a.indexOf('=');
-    if (eq === -1) flags[a.slice(2)] = true;
-    else flags[a.slice(2, eq)] = a.slice(eq + 1);
-  }
   try {
-    const result = runReconcilePromoteDraftDispatch({
-      repo: typeof flags.repo === 'string' ? flags.repo : null,
-      prsFile: flags['prs-file'],
-    });
-    if (flags.json) {
+    const result = runPromoteDraftCli({ execute: options => {
+      armSelfReexecOnFastForward();
+      return runReconcilePromoteDraftDispatch(options);
+    } });
+    if (process.argv.slice(2).some(arg => arg === '--json' || arg.startsWith('--json='))) {
       process.stdout.write(`${JSON.stringify(result)}\n`);
     } else {
       const lines = [`promote-draft-pr-dispatch — ${result.dispatched.length} promoted, ${result.refusals.length} refusal(s)`];

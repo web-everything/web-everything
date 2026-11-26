@@ -103,3 +103,15 @@ describe('fix daemon — S1 adoption yield', () => {
     expect(result.yieldedForAdoption).not.toBe(true);
   });
 });
+
+
+it('the daemon forwards {fresh:true} to the probe unthrottled and latches the result for the rest of the pass', async () => {
+  const probe = vi.fn(o => o?.fresh === true);
+  let observed, latched, freshLatched;
+  const result = await runTickAllRepos(fixture({ adoptYieldProbe:probe,
+    promoteDraftTick: ({shouldYield}) => { observed = shouldYield({fresh:true}); latched = shouldYield(); freshLatched = shouldYield({fresh:true}); return empty(); } }));
+  expect(probe).toHaveBeenCalledWith({fresh:true});
+  expect([observed, latched, freshLatched]).toEqual([true, true, true]);
+  expect(result.yieldedForAdoption).toBe(true);
+  expect(probe.mock.calls.filter(([o]) => o?.fresh)).toHaveLength(1);
+});
