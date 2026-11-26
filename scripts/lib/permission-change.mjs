@@ -44,6 +44,7 @@ const PROTECTION_PATH_RES = [
   /(^|\/)\.github\/branch-protection[^/]*\.json$/,
   /(^|\/)scripts\/lib\/required-status-checks\.mjs$/,
   /(^|\/)scripts\/lib\/we-only-checks\.json$/,
+  /(^|\/)scripts\/lib\/agent-launch-(guards|approved)\.json$/,
 ];
 
 // Every script-like extension, not just `.mjs`: a grant spelled in `.ts`/`.js`/`.sh` widens a sandbox the same way.
@@ -77,6 +78,7 @@ const MAX_WORKFLOW_LINE_CHARS = 4000;
  * tokens actually present in `scripts/`, so a new sandbox-bearing script forces an update here.
  */
 export const SANDBOX_BEARING_FILES = [
+  'scripts/lib/agent-launch.mjs',
   'scripts/bootstrap-session.mjs',
   'scripts/codex-direct-task.mjs',
   'scripts/conveyor/health-investigate-dispatch.mjs',

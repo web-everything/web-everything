@@ -1720,6 +1720,23 @@ describe('checkFilled — captured dry-run prompt', () => {
       'fix PR #900002: no prompt captured (the stub spawner was never called — a real worker may have been launched)',
     );
   });
+  it.each([
+    [{ held: true, reason: 'fix-claimed' }, 'held:true', 'fix-claimed'],
+    [{ status: 'refused', outcome: 'route unavailable' }, 'refused', 'route unavailable'],
+    [{ wrapped: true, why: 'wrapper selected' }, 'wrapped:true', 'wrapper selected'],
+    [{ result: { refused: true, reason: 'nested refusal' } }, 'returned', 'nested refusal'],
+  ])('includes the returned dispatch evidence: %j', (result, status, reason) => {
+    expect(() => liveSmoke.checkFilled(null, 'fix', s => s, [], result)).toThrow(status);
+    expect(() => liveSmoke.checkFilled(null, 'fix', s => s, [], result)).toThrow(reason);
+  });
+  it('bounds oversized result evidence while retaining the missing-prompt failure', () => {
+    let error;
+    try { liveSmoke.checkFilled(null, 'fix', s => s, [], { held: true, reason: 'x'.repeat(1000) }); }
+    catch (e) { error = e; }
+    expect(error.message).toContain('no prompt captured: dispatchFix returned held:true');
+    expect(error.message.length).toBeLessThan(350);
+    expect(error.message).toContain('…');
+  });
   it('accepts a filled prompt and still refuses required placeholders', () => {
     expect(() => liveSmoke.checkFilled('Fix the issue.', 'fix', s => s.trim(), ['SCOPE'])).not.toThrow();
     expect(() => liveSmoke.checkFilled('Fix {{ SCOPE }}.', 'fix', s => s.trim(), ['SCOPE'])).toThrow(/required placeholder/);
@@ -1848,22 +1865,69 @@ describe('tree-stays-clean — injected runChild', () => {
 });
 
 describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix a6cbfced4 shape (direct dispatch calls only — no GitHub reads)', () => {
+  const REPO_ROOT = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
+  // Both sides run from temp copies: the real checkout may itself be a `lane-N` clone, which the dispatch
+  // functions refuse to start from (`assertNotALaneCheckout`). Only the dirs the dispatch graph reads are
+  // copied, and the pass-level part (live `gh` reads) is skipped — this test needs no GitHub credential.
+  const copyTree = () => {
+    const dest = mkdtempSync(join(tmpdir(), 'dispatch-dry-run-'));
+    for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore']) {
+      cpSync(join(REPO_ROOT, rel), join(dest, rel), {
+        recursive: true,
+        filter: (src) => !src.includes(`${sep}node_modules`) && !src.includes(`${sep}.git${sep}`) && !src.endsWith(`${sep}.git`),
+      });
+    }
+    symlinkSync(join(REPO_ROOT, 'node_modules'), join(dest, 'node_modules'));
+    return dest;
+  };
+
+  it('ignores a real live sentinel fix claim that makes the old smoke fail before spawning', () => {
+    const root = copyTree();
+    try {
+      const env = { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0', WE_WORKER_WRAPPER: 'off',
+        WE_COORDINATION_ROOT: join(root, 'coordination') };
+      // Use the real store and default readLiveFixClaim, in the same native child as the smoke.
+      const seed = `const { acquireFixClaim, readLiveFixClaim } = await load('scripts/conveyor/fix-procedure.mjs');
+if (!readLiveFixClaim({ repo: 'we', pr: 900002 })) {
+  const claim = acquireFixClaim({ repo: 'we', pr: 900002, who: 'smoke-regression' });
+  if (!claim.ok) throw new Error('fixture claim acquisition failed: ' + claim.reason);
+}
+if (!readLiveFixClaim({ repo: 'we', pr: 900002 })) throw new Error('fixture claim is not live');`;
+      const run = script => JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e',
+        script.replace('const results = [];', seed + '\nconst results = [];')],
+        { cwd: root, encoding: 'utf8', env, timeout: 60_000, maxBuffer: 4 * 1024 * 1024 }));
+      // Restore the pre-hardening direct-call options; keep the same production dispatcher and claim.
+      const oldScript = DISPATCH_DRY_RUN_SCRIPT.replace(/    \/\/ Sentinel fix isolation[^\n]*\n[^\n]*\n/, '    },\n');
+      expect(oldScript).not.toBe(DISPATCH_DRY_RUN_SCRIPT);
+      const oldFix = run(oldScript).find(row => row.kind === 'fix');
+      expect(oldFix.ok).toBe(false);
+      expect(oldFix.error).toContain('no prompt captured');
+      const rows = run(DISPATCH_DRY_RUN_SCRIPT);
+      expect(rows.find(row => row.kind === 'fix').ok).toBe(true);
+      expect(rows.filter(row => !row.ok)).toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
+  it.each(['held', 'throws'])('still fails the smoke with the reason when dispatch %s', async mode => {
+    const root = copyTree();
+    try {
+      const script = DISPATCH_DRY_RUN_SCRIPT.replace('const noopAcquire = () => ({ ok: true });',
+        mode === 'held' ? "const noopAcquire = () => ({ ok: false, reason: 'fixture dispatch blocked' });"
+          : "const noopAcquire = () => { throw new Error('fixture dispatch blocked'); };");
+      const result = await dispatchDryRunCheck({ root, budgets: { dispatchDryRunMs: 60_000 },
+        env: { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0', WE_COORDINATION_ROOT: join(root, 'coordination') },
+        runChild: (_cmd, args, opts) => execFileSync(process.execPath,
+          args.map(arg => arg === DISPATCH_DRY_RUN_SCRIPT ? script : arg),
+          { cwd: opts.cwd, env: opts.env, encoding: 'utf8', timeout: opts.timeoutMs, maxBuffer: 4 * 1024 * 1024 }),
+      });
+      expect(result.ok).toBe(false);
+      expect(result.detail).toContain('fix PR #900002');
+      expect(result.detail).toContain('fixture dispatch blocked');
+      if (mode === 'held') expect(result.detail).toContain('dispatchFix returned held:true');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 120_000);
+
   it('fails ci-heal-worst-case on a tree where a6cbfced4 is reverted (SCOPE required again), and passes on the real tree', async () => {
-    const REPO_ROOT = join(fileURLToPath(import.meta.url), '..', '..', '..', '..');
-    // Both sides run from temp copies: the real checkout may itself be a `lane-N` clone, which the dispatch
-    // functions refuse to start from (`assertNotALaneCheckout`). Only the dirs the dispatch graph reads are
-    // copied, and the pass-level part (live `gh` reads) is skipped — this test needs no GitHub credential.
-    const copyTree = () => {
-      const dest = mkdtempSync(join(tmpdir(), 'dispatch-dry-run-'));
-      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'docs/agent/reviewer-expectations.md', 'package.json', '.gitignore']) {
-        cpSync(join(REPO_ROOT, rel), join(dest, rel), {
-          recursive: true,
-          filter: (src) => !src.includes(`${sep}node_modules`) && !src.includes(`${sep}.git${sep}`) && !src.endsWith(`${sep}.git`),
-        });
-      }
-      symlinkSync(join(REPO_ROOT, 'node_modules'), join(dest, 'node_modules'));
-      return dest;
-    };
     const childEnv = { ...process.env, WE_SMOKE_DISPATCH_PASSES: '0' };
     const tmpRoot = copyTree();
     const realRoot = copyTree();

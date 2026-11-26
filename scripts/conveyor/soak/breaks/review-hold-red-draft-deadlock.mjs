@@ -87,10 +87,12 @@ export default {
             readRequired: () => ({ source: 'live', checks: requiredChecks }), readChecks: () => completeCheckRows(statusCheckRollup, HEAD) }),
           checkoutExists: () => true, checkStaleness: () => ({ fresh: true, behind: 0 }), stackCheck: () => ({ base: null }),
           readCompletion: () => null, resolveSettingsEnv: () => ({}),
-          readBrief: () => 'review {{PR}}', mintSessionId: () => 'soak-review-hold-advisory',
-          wrapReview: false, sessionCwdFor: () => dir, ensureSessionCwd: path => path,
-          isolateSession: () => ({ worktreeSettings: {} }),
-          spawnAgent: () => { spawns++; return ''; }, spawnJob: () => { spawns++; return null; },
+          ...(mode === 'session' ? {
+            readBrief: () => 'review {{PR}}', mintSessionId: () => 'soak-review-hold-advisory',
+            wrapReview: false, sessionCwdFor: () => dir, ensureSessionCwd: path => path,
+            isolateSession: () => ({ worktreeSettings: {} }),
+            spawnAgent: () => { spawns++; return ''; },
+          } : { spawnJob: () => { spawns++; return null; } }),
         });
         check(spawns === 1 && !result.skipped, `fast-check fallback ${mode}: ${result.skipped ?? 'did not start'}`);
         log?.(`fast-check fallback ${mode}: spawns=${spawns}, skipped=${result.skipped ?? 'none'}\n`);

@@ -45,6 +45,16 @@ describe('selectScanTests', () => {
     expect(selectScanTests({ changedFiles: ['docs/agent/testing/removed-topic.md'], fileExists: () => false }).full).toEqual([]);
   });
 
+  it('selects the agent launch structure test for any new .mjs launch site under scripts or skills-src', () => {
+    const test = 'scripts/__tests__/agent-launch-structure.test.mjs';
+    for (const path of ['scripts/conveyor/x.mjs', 'scripts/lib/agent-launch.mjs', 'skills-src/conveyor/y.mjs', 'scripts/new.mjs']) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).toContain(test);
+    }
+    for (const path of ['scripts/__tests__/x.test.mjs', 'docs/x.mjs', 'scripts/x.md']) {
+      expect(selectScanTests({ changedFiles: [path] }).full.map(e => e.test), path).not.toContain(test);
+    }
+  });
+
   it('scopes capability admission scans to production sources and widens when the rule changes', () => {
     const test = 'scripts/__tests__/capability-dispatch-only.test.mjs';
     const entry = REPO_SCAN_TESTS.find(e => e.test === test);
@@ -68,6 +78,7 @@ describe('selectScanTests', () => {
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
     // The ownership, sole-writer, review-policy, and sandbox-list guards derive whole-tree facts.
     expect(full.map((e) => [e.test, e.scope])).toEqual([
+      ['scripts/__tests__/agent-launch-structure.test.mjs', 'full'],
       ['scripts/lib/__tests__/constellation-ownership.test.mjs', 'full'],
       ['scripts/conveyor/__tests__/pr-label-mirror.test.mjs', 'full'],
       ['scripts/lib/__tests__/review-policy.conformance.test.mjs', 'full'],

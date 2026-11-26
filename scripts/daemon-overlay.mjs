@@ -125,7 +125,7 @@ import { mergeRefBase, planRetirements, planFetchFailed, resolveOriginRepository
 import { isDeepStrictEqual } from 'node:util';
 import { safeRegistrationRef, validSha } from './operations/prototype-load.mjs';
 import { previewOverlayConflict, writeRebuildRequest } from './lib/daemon-rebuild.mjs';
-import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
+import { overlaySafetySettings, admitHotpatchRef } from './lib/daemon-load-overlay.mjs';
 import { auditEvidenceFor, loadAuditEvidence, mainCovers } from './lib/overlay-audit-evidence.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
@@ -670,6 +670,8 @@ export async function replaceRegistration({ root, ref, old, expectedSha, pr = nu
       process.stderr.write(`daemon-overlay: ${refuse ? 'REFUSED' : 'WARNING'} — ${ref}: ${evidence.detail}. Run codex-audit for this SHA or record a matching operator waiver.\n`);
       if (refuse) return { ok: false, refused: 'no-audit-evidence', containment, check, code: 3 };
     }
+    const hp = await admitHotpatchRef({ root, ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: tip });
+    if (!hp.ok) return { ok: false, refused: hp.reason, containment, check, code: 3 };
     return { ok: true, oldEntry, containment, check };
   };
   if (checkOnly) return prove();
@@ -1034,6 +1036,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         if (asJson) process.stdout.write(`${JSON.stringify({ conflictCheck: check })}\n`);
         process.exitCode = ['sha-moved', 'no-audit-evidence'].includes(check.reason) ? 3 : 1;
         return null;
+      }
+      // RS-HP-3: the same hotpatch door as guardedRegister: admitted sha == candidate sha, or no registration.
+      if (!flags.check) {
+        const hp = await admitHotpatchRef({ root, ref: flags.ref, candSha: check.candSha, env, admitHotpatch: deps.admitHotpatch, tipOf: deps.tip ?? ((r) => remoteTip({ root, ref: r, env })) });
+        if (!hp.ok) {
+          process.stderr.write(`daemon-overlay: REFUSED — ${flags.ref} is a hotpatch ref and ${hp.reason} (needs a bound green CI receipt and an own-sha audit)\n`);
+          process.exitCode = 3;
+          return null;
+        }
       }
       if (!check.clean) {
         const against = check.conflicting.length

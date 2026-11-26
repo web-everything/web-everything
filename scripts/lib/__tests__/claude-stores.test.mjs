@@ -385,8 +385,15 @@ describe('read, aggregate and ownership guarantees', () => {
 
 describe('launch-only account contracts', () => {
   it('inherits the canonical store for an unmapped interactive launch', () => {
-    expect(resolveLaunchAccount({ env: {}, map: { accounts: {}, daemons: {} }, home: HOME, realpath: identity }))
+    const map = { accounts: { a: { configDir: B } }, daemons: {} };
+    expect(isAccountMap(map)).toBe(true);
+    expect(resolveLaunchAccount({ env: {}, map, home: HOME, realpath: identity }))
       .toEqual({ kind: 'inherit', store: A });
+  });
+  it('refuses an empty account map for an interactive launch', () => {
+    const map = { accounts: {}, daemons: {} };
+    const error = refusal(() => resolveLaunchAccount({ env: {}, map, home: HOME, realpath: identity }));
+    expect(error.reason).toBe('map-unavailable');
   });
   it('launches configDir accounts with an absolute selector', () => {
     expect(resolveLaunchAccount(options(fixtures[0].input))).toEqual({ kind: 'account', account: 'b', store: B,

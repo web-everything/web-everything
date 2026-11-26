@@ -15,8 +15,9 @@ import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
-import { overlayFilePath } from '../lib/daemon-overlays.mjs';
+import { withAddGuardLock, stackAwareOverlayCheck, findStackBases, main, replaceRegistration } from '../daemon-overlay.mjs';
+import { overlayFilePath, addOverlay, readOverlays } from '../lib/daemon-overlays.mjs';
+import { admitHotpatchRef, guardedRegister } from '../lib/daemon-load-overlay.mjs';
 import { recordPassingOverlayAudit } from './fixtures/overlay-audit.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -100,6 +101,80 @@ function overlayStateFile(overlayDir, cloneDir) {
   const names = readdirSync(overlayDir).filter((n) => n.endsWith('.json'));
   return names.length ? JSON.parse(readFileSync(join(overlayDir, names[0]), 'utf8')) : null;
 }
+
+describe('daemon-overlay.mjs add — hotpatch/* has one door (RS-HP-3)', () => {
+  it('refuses to register a hotpatch ref that has no admission evidence', () => {
+    const f = makeFixture();
+    pushBranch(f.originDir, 'hotpatch/x', (dir) => writeFile(dir, 'hp.txt', 'hp\n'));
+    const r = runCli(['add', `--clone=${f.cloneDir}`, '--ref=hotpatch/x', '--json'], { ...asGhLogin(f.env, 'nobody'), WE_OVERLAY_NO_PR: 'warn' });
+    expect(r.status).toBe(3);
+    expect(r.stderr).toMatch(/hotpatch-not-admitted/);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+});
+
+describe.each(['guardedRegister', 'add', 'replace', 'replace --check', 'admitHotpatchRef'])('RS-HP-3 %s — production tip reader', (door) => {
+  it.each(['pass', 'fail', 'moved'])('binds admission to the fetched candidate and handles %s', async (outcome) => {
+    const f = makeFixture();
+    const old = 'lane/previous';
+    pushBranch(f.originDir, old, (dir) => writeFile(dir, 'old.txt', 'old\n'));
+    pushBranch(f.originDir, 'lane/candidate', (dir) => writeFile(dir, 'hp.txt', 'hp\n'), { base: `origin/${old}` });
+    const sha = gitOk(f.originDir, ['rev-parse', 'refs/heads/lane/candidate']).trim();
+    const ref = `hotpatch/${sha}`;
+    gitOk(f.originDir, ['update-ref', `refs/heads/${ref}`, sha]);
+    const replacing = door.startsWith('replace');
+    if (replacing) addOverlay(f.cloneDir, { ref: old, pr: 1 }, { env: f.env });
+    const admitHotpatch = vi.fn(async (candidate) => {
+      expect(candidate).toBe(sha);
+      if (outcome === 'moved') {
+        // Move the real origin during admission; the clone's cached ref is unchanged.
+        pushBranch(f.originDir, ref, (dir) => writeFile(dir, 'later.txt', 'later\n'), { base: `origin/${ref}` });
+      }
+      return { outcome: outcome === 'fail' ? 'fail' : 'pass' };
+    });
+    const expectedReason = outcome === 'fail' ? 'hotpatch-not-admitted' : 'hotpatch-sha-moved';
+    const exitCode = process.exitCode;
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      if (door === 'add') {
+        vi.stubEnv('HOME', f.env.HOME);
+        vi.stubEnv('WE_DAEMON_OVERLAY_DIR', f.overlayDir);
+        vi.stubEnv('WE_DAEMON_OVERLAY_STACK_BASES', '{}');
+        process.exitCode = 0;
+        await main(['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, '--pr=2'], {
+          admitHotpatch, pruneStaleOverlayRecords: () => {},
+        });
+        expect(process.exitCode).toBe(outcome === 'pass' ? 0 : 3);
+        if (outcome !== 'pass') expect(stderr.mock.calls.flat().join('')).toContain(expectedReason);
+      } else if (replacing) {
+        const result = await replaceRegistration({ root: f.cloneDir, ref, old, expectedSha: sha,
+          env: f.env, checkOnly: door === 'replace --check', deps: { admitHotpatch } });
+        expect(result.ok).toBe(outcome === 'pass');
+        if (outcome !== 'pass') expect(result.refused).toBe(expectedReason);
+      } else if (door === 'guardedRegister') {
+        const result = await guardedRegister({ root: f.cloneDir, ref, pr: 2, env: f.env, gate: {}, admitHotpatch,
+          register: () => addOverlay(f.cloneDir, { ref, pr: 2 }, { env: f.env }) });
+        expect(result.registered).toBe(outcome === 'pass');
+        if (outcome !== 'pass') expect(result.reason).toBe(expectedReason);
+      } else {
+        const result = await admitHotpatchRef({ root: f.cloneDir, ref, candSha: sha, env: f.env, admitHotpatch });
+        expect(result.ok).toBe(outcome === 'pass');
+        if (outcome !== 'pass') expect(result.reason).toBe(expectedReason);
+      }
+      expect(admitHotpatch).toHaveBeenCalledOnce();
+      expect(admitHotpatch.mock.calls[0][0]).toBe(sha);
+      const writes = door !== 'replace --check' && door !== 'admitHotpatchRef';
+      expect(readOverlays(f.cloneDir, { env: f.env }).map((o) => o.ref))
+        .toEqual(outcome === 'pass' && writes ? [ref] : replacing ? [old] : []);
+    } finally {
+      process.exitCode = exitCode;
+      stdout.mockRestore();
+      stderr.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});
 
 describe('daemon-overlay.mjs add — expected SHA admission', () => {
   it.each([false, true])('refuses an advanced branch before registration (check: %s)', (check) => {

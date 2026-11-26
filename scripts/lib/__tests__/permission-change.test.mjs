@@ -76,6 +76,13 @@ describe('permissionChangeKind', () => {
       expect(permissionChangeKind(f, '')).toBe('branch-protection-config');
     }
   });
+  it('the launcher guard and approved-launch manifests hold on any touch, including with no hunks', () => {
+    for (const f of ['scripts/lib/agent-launch-guards.json', 'scripts/lib/agent-launch-approved.json']) {
+      expect(permissionChangeKind(f, '')).toBe('branch-protection-config');
+      expect(permissionChangeKind(f, null)).toBe('branch-protection-config');
+      expect(permissionChangeKind(f, 'diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n')).toBe('branch-protection-config');
+    }
+  });
   it('sandbox grants: code lines hold, comments and tests do not', () => {
     const h = (l) => `diff --git a/x b/x\n@@ -1 +1 @@\n${l}\n`;
     expect(permissionChangeKind('scripts/lib/isolation-provider.mjs', h('+  writableRoots: [a, b],'))).toBe('sandbox-widening');
