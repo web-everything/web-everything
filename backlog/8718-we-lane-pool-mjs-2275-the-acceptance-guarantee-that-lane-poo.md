@@ -1,4 +1,5 @@
 ---
+bornAs: xm8dy12
 kind: story
 size: 2
 status: open
