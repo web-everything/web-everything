@@ -25,7 +25,7 @@ import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
 import { makeAuditedTipGate } from './audited-tip.mjs';
 import { runBounded } from '../bounded-child.mjs';
-import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript, isEnvTimeoutRow } from '../daemon-live-smoke.mjs';
+import { SMOKE_CHECKS, SMOKE_BUDGET_ENV, resolveSmokeBudgets, isDispatchDryRunScript } from '../daemon-live-smoke.mjs';
 import { readDeclaredSettings } from '../settings-files.mjs';
 import { cascadePolicy } from '../policy-cascade.mjs';
 
@@ -194,31 +194,30 @@ function failedRows(smokeResult) {
  *  test: a failure the last-good build reproduces is not evidence against the candidate's code. */
 export function failsSameChecks(candidateFailed, controlFailed) {
   if (!Array.isArray(candidateFailed) || candidateFailed.length === 0 || !Array.isArray(controlFailed)) return false;
-  // S2a: only a control row that failed AFFIRMATIVELY with executed-check evidence can vouch for a candidate failure.
-  // Budget refusals, skips, timeout-only boots and evidence-less (name-only) rows never do. Boot is compared per entry.
-  const evidenced = controlFailed.filter(controlRowHasFailureEvidence);
+  // S2a (strict, fails closed): a control vouches for a candidate failure ONLY with typed, executed-check evidence
+  // (a failed boot ENTRY whose import failed with a typed error class) AND the same identity: same check, same boot
+  // entry, same normalised error signature. Untyped / textual-only rows, budget refusals, skips, timeouts and
+  // infrastructure errors (spawn ENOENT...) never match. S1's typed ledger will extend this to the other checks.
   return candidateFailed.every((row) => {
-    const control = evidenced.find((r) => r.name === row.name);
+    if (!row || row.name !== 'daemon-entries-boot' || !Array.isArray(row.entries)) return false;
+    const control = controlFailed.find((r) => r && r.name === row.name && r.ok === false && !r.budgetInterrupted && !r.budgetSkipped && Array.isArray(r.entries));
     if (!control) return false;
-    if (!Array.isArray(control.entries)) return true;
-    const failedEntries = (Array.isArray(row.entries) ? row.entries : []).filter((e) => e && !e.ok);
-    if (failedEntries.length === 0) return false;
-    const controlEntries = new Set(control.entries.filter(bootEntryHasFailureEvidence).map((e) => e.entry));
-    return failedEntries.every((e) => controlEntries.has(e.entry));
+    const have = new Set(control.entries.filter(typedBootFailure).map(bootFailureIdentity));
+    const failed = row.entries.filter((e) => e && e.ok === false);
+    return failed.length > 0 && failed.every((e) => typedBootFailure(e) && have.has(bootFailureIdentity(e)));
   });
 }
 
-function bootEntryHasFailureEvidence(entry) {
-  return !!entry && entry.ok === false && typeof entry.entry === 'string' && typeof entry.errorClass === 'string'
-    && entry.errorClass.length > 0 && !/skipped|timed out|output exceeded/.test(String(entry.kind ?? ''));
+/** SHIP-WM-321: a boot entry failure with executed-check evidence: an import that ran and failed with a typed error class. */
+function typedBootFailure(entry) {
+  return !!entry && entry.ok === false && typeof entry.entry === 'string' && entry.kind === 'import failed'
+    && typeof entry.errorClass === 'string' && entry.errorClass.length > 0
+    && !/ENOENT|EACCES|EMFILE|ENOMEM|EAGAIN|spawn|timed out|timeout|budget|skipped/i.test(entry.errorClass);
 }
 
-function controlRowHasFailureEvidence(row) {
-  if (!row || row.ok !== false || row.budgetInterrupted || row.budgetSkipped) return false;
-  if (/^skipped\b/.test(String(row.detail ?? ''))) return false;
-  if (Array.isArray(row.entries)) return row.entries.some(bootEntryHasFailureEvidence);
-  // Typed evidence exists only for boot entries today (S1 adds the ledger): other rows need a real, non-timeout detail.
-  return typeof row.detail === 'string' && row.detail.trim().length > 0 && !isEnvTimeoutRow(row);
+function bootFailureIdentity(entry) {
+  const signature = entry.errorClass.toLowerCase().replace(/0x[0-9a-f]+|\d+/g, '#').replace(/\s+/g, ' ').trim();
+  return `${entry.entry}\u0000${signature}`;
 }
 
 // ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────

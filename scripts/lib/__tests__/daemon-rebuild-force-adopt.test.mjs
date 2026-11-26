@@ -135,7 +135,8 @@ afterEach(() => {
 
 const RULINGS = '## R508 — x\nOperator "Yes": adopt the build even though smoke failed for infra.\n';
 const QUOTE = 'adopt the build even though smoke failed for infra';
-const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false }] } }));
+const TYPED_BOOT_FAILURE = { ok: false, name: 'daemon-entries-boot', detail: 'boom', mayBeTransient: false, entries: [{ entry: 'daemon.mjs', ok: false, kind: 'import failed', errorClass: 'TypeError: boom' }] };
+const failing = () => vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
 const headOf = (dir) => gitOk(dir, ['rev-parse', 'HEAD']).trim();
 const forceEnv = (env, base) => ({ ...env, WE_FORCE_ADOPT_HANDOFF: join(base, 'handoff.md'), WE_FORCE_ADOPT_CORONER: join(base, 'coroner.jsonl'), WE_DAEMON_EVENTS: join(base, 'events.jsonl') });
 
@@ -1166,7 +1167,7 @@ describe('R508 force-adopt: a force-adopted build stays unverified (never the in
     const env = forceEnv(env0, base);
     delete env.WE_DAEMON_HARNESS_BROKEN_ADOPT_NOT_WORSE; // the default: adopt a candidate that fails only what last-good also fails
     const F = advanceMain(originDir, (dir) => writeFile(dir, 'm.txt', 'x\n'));
-    const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name: 'dispatch-dry-run', detail: 'F defect', mayBeTransient: false }] } }));
+    const failAll = vi.fn(async () => ({ verdict: 'code', attempts: 1, smoke: { results: [TYPED_BOOT_FAILURE] } }));
     const r = await tick(cloneDir, env, { runSmoke: failAll, forceWatchProbe: healthy });
     expect(r.reason).toBe('harness-broken-adopted-not-worse');
     expect(headOf(cloneDir)).toBe(F);
