@@ -1653,14 +1653,35 @@ describe('defaultPostConflictFinding / defaultPostConflictStandDown / defaultPos
   it('shells stand-down.mjs with --reason=conflict and --repo', () => {
     let capturedArgv;
     const exec = (cmd, argv) => { capturedArgv = argv; return ''; };
-    defaultPostConflictStandDown({ pr: { number: 1921 }, repo: 'o/n', exec });
+    defaultPostConflictStandDown({ pr: { number: 1921, headRefOid: 'a'.repeat(40) }, repo: 'o/n', exec });
     expect(capturedArgv[0]).toMatch(/stand-down\.mjs$/);
     expect(capturedArgv[1]).toBe('1921');
     expect(capturedArgv).toContain('--reason=conflict');
+    expect(capturedArgv).toContain(`--head=${'a'.repeat(40)}`);
     expect(capturedArgv).toContain('--repo=o/n');
     // Single-sourced from stand-down.mjs — never re-typed here (see WATCHER_STAND_DOWN_ACTOR's own docblock).
     expect(capturedArgv).toContain(`--actor=${WATCHER_STAND_DOWN_ACTOR}`);
   });
+});
+
+it('reads a missing conflict stand-down head through the throttled reader before posting', () => {
+  const head = 'b'.repeat(40), calls = [], reads = [];
+  defaultPostConflictStandDown({ pr: { number: 1921 }, repo: 'o/n',
+    readHead: (file, argv, options) => { reads.push([file, argv, options]); return head; },
+    exec: (file, argv) => { calls.push([file, argv]); },
+  });
+  expect(reads).toEqual([['gh', ['pr', 'view', '1921', '--json', 'headRefOid', '--jq', '.headRefOid', '--repo', 'o/n'],
+    expect.objectContaining({ timeout: 300_000, maxBuffer: 1024 * 1024 })]]);
+  expect(calls).toHaveLength(1);
+  expect(calls[0][1]).toContain(`--head=${head}`);
+});
+
+it.each(['', 'undefined', 'abc1234'])('refuses a conflict stand-down when the missing head read returns %j', value => {
+  const calls = [];
+  expect(() => defaultPostConflictStandDown({ pr: { number: 1921 }, repo: 'o/n',
+    readHead: () => value, exec: (...args) => calls.push(args),
+  })).toThrow(/head/);
+  expect(calls).toEqual([]);
 });
 
 // ── #xu2krte Fork 2 — the review-human statute-amendment exception ─────────────────────────────────────────────

@@ -1301,12 +1301,12 @@ function classifyStatuteConflict(files, {
 export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null } = {}) {
   // #gh-graphql-budget — read the host-shared open-PR snapshot (one right-sized list per repo per TTL for the
   // whole fleet) instead of a private `gh pr list`; null = not applicable (tests, cwd repo) → the direct read below.
-  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
+  if (exec === execFileSyncThrottled) { const shared = readSharedOpenPrs({ repo, fields: 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files', allowDeferred: true }); if (shared) return shared; }
   // `baseRefName` (#3383) — the queued-grace routing below reads it to tell a STACKED PR (base isn't `main`, the
   // drain will never land it regardless of labels) apart from an ordinary conflict against `main`; costs nothing
   // extra since it comes off the same `gh pr list` call this pass already makes.
   const argv = ['pr', 'list', '--state', 'open', '--limit', String(PR_LIST_LIMIT),
-    '--json', 'number,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files'];
+    '--json', 'number,headRefName,baseRefName,mergeable,mergeStateStatus,labels,files'];
   if (repo) argv.push('--repo', repo);
   // #x5n4zn3 — was bare (no timeout).
   const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', throttle: { deferrable: true } });
@@ -1333,9 +1333,21 @@ export function defaultListParkedPrs({ exec = execFileSyncThrottled, repo = null
  * label it carries, until a human clears the marker.
  * @param {{pr:object, repo:string|null, exec?:Function}} o
  */
-export function defaultPostConflictStandDown({ pr, repo, exec = execFileSync }) {
+export function defaultPostConflictStandDown({ pr, repo, exec = execFileSync, readHead = execFileSyncThrottled }) {
+  // Keep discovery's narrow snapshot contract. Older snapshots lack a head; resolve it only
+  // for a PR that actually needs a stand-down, and refuse incomplete evidence before posting.
+  let head = pr?.headRefOid;
+  if (head == null) {
+    const args = ['pr', 'view', String(pr?.number), '--json', 'headRefOid', '--jq', '.headRefOid'];
+    if (repo) args.push('--repo', repo);
+    head = String(readHead('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' })).trim();
+  }
+  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head) || head.length !== 40) {
+    throw new Error('conflict stand-down requires a full PR head; retry the head read before posting');
+  }
   const argv = [join(REPO_ROOT, 'scripts', 'conveyor', 'stand-down.mjs'), String(pr?.number),
-    '--reason=conflict', `--head=${pr?.headRefOid}`, `--actor=${WATCHER_STAND_DOWN_ACTOR}`];
+    '--reason=conflict', `--head=${head}`, `--actor=${WATCHER_STAND_DOWN_ACTOR}`];
   if (repo) argv.push(`--repo=${repo}`);
   // #x5n4zn3 — was bare (no timeout).
   exec('node', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });

@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { planReconcile } from '../../reconcile-core.mjs';
-import { buildStandDownComment } from '../../stand-down.mjs';
+import { legacyStandDownComment } from '../../__tests__/fixtures/legacy-stand-down.mjs';
 import { runStandDownAnswer } from '../../stand-down-answer.mjs';
 import { parseOperatorAnswer, parseNoCodeRearmReceipt } from '../../stand-down-answer-core.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../../operations/promote-draft-pr-dispatch.mjs';
@@ -22,7 +22,7 @@ export default {
       const c = (id, body) => ({ id, body, author: { login: 'chalbert' } });
       const comments = [c('verdict', `🔁 review — changes requested\n\nFix defect\n<!-- reviewed-sha: ${head} -->`),
         c('begin', `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${head}\``),
-        c('stop', buildStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: head.slice(0, length) }))];
+        c('stop', legacyStandDownComment({ reason: 'needs-judgment', detail: 'Code owed?', head: head.slice(0, length) }))];
       let labels = ['review:changes'], answers = 0, receipts = 0, writes = 0, confirms = 0;
       const planned = [];
       const plan = () => {

@@ -360,7 +360,7 @@ it.each(['answered', 'untrusted'])('ignores an %s legacy load-flake hold before 
   assertAuthorizationBoundary(args(rerun, { pr: pr(comments) }), 'auto-proceed');
 });
 it.each([null, 'b'.repeat(40)])('holds an older CI stand-down unbound to the current head (%s)', oldHead => {
-  const older = { ...stand('gate-red', 'OLD'), body: buildStandDownComment({ reason: 'gate-red', head: oldHead }) };
+  const older = { ...stand('gate-red', 'OLD'), body: legacyStandDownComment({ reason: 'gate-red', head: oldHead }) };
   assertAuthorizationBoundary(args(rerun, { pr: pr([older, stand()]) }), 'hold', /unbound stand-down/);
 });
 it.each([

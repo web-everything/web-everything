@@ -136,7 +136,7 @@ it('requires later rulings for every named finding in the same review run', () =
 it('resolves only after separate later rulings cover every waited finding', () => {
   const pr = fixture({ second: true });
   const record = readReferralRecords(pr.comments).records[0];
-  pr.comments[1].body = buildStandDownComment({ reason: 'needs-judgment', head: head.slice(0, 7),
+  pr.comments[1].body = legacyStandDownComment({ reason: 'needs-judgment', head: head.slice(0, 7),
     findingRefs: record.referrals.map(f => ({ runId: record.runId, key: f.key })) });
   expect(planRulingResolvedStandDown(pr, { repo })).toBeNull();
   const ruling = parseOperatorRulingComment(pr.comments[2]).record;

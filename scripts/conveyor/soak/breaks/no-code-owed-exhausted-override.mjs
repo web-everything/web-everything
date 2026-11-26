@@ -9,7 +9,7 @@ import { buildStandDownComment } from '../../stand-down.mjs';
 const HEAD = 'b'.repeat(40);
 const trusted = (id, body) => ({ id, body, author: { login: 'web-everything' }, createdAt: '2026-11-14T10:00:00Z' });
 const begin = trusted('IC_begin', `🔒 conveyor fix-begin — fix claim held\n\n**Branch:** \`lane/x\` at \`${HEAD.slice(0, 9)}\`\n<!-- fix-claim who=fix-1 -->`);
-const stop = id => trusted(id, buildStandDownComment({ reason: 'needs-judgment', detail: 'Is code owed?' }));
+const stop = id => trusted(id, buildStandDownComment({ head: HEAD, reason: 'needs-judgment', detail: 'Is code owed?' }));
 const answer = (id, noCodeOwed = false) => trusted(`IC_answer_${id}`, buildOperatorAnswer({
   standDownId: id, reason: 'No code owed', actor: 'chalbert', channel: 'chat', disposition: 'rearm-review', noCodeOwed,
 }));
