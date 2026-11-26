@@ -923,3 +923,36 @@ it('R746 assigns suspended mandatory referrals to the judge with run and finding
   expect(needsJudgment(facts({ suspendedReferralRun }))).toEqual({ needsJudgment: true, reason: 'suspended-referral-run' });
   expect(buildJudgeSweepBundle({ prs: [facts({ suspendedReferralRun })] }).prs[0].suspendedReferralRun).toEqual(suspendedReferralRun);
 });
+
+
+describe('CONFLICT-OWNER-HARDEN cap routing', () => {
+  it('a round-capped PR with running CI and a young fix loop still requires judgment', () => {
+    expect(needsJudgment(facts({ round: 5, inCi: true, minutesSinceFixLoop: 0 })))
+      .toEqual({ needsJudgment: true, reason: 'at-cap' });
+  });
+  it.each([{ fixerRunning: true }, { inCi: true }, { minutesSinceFixLoop: 59 },
+    { minutesSinceFixLoop: 60 }, { fixerRunning: true, inCi: true, minutesSinceFixLoop: 0 }])(
+    'exposes cap exhaustion through transient activity %j', activity => {
+      for (const cap of [{ round: 5 }, { labels: ['status:cap-exhausted'] },
+        { round: null, redTeam: { state: 'blocked', latestOutcome: 'round-cap' } }]) {
+        const row = buildJudgeSweepBundle({ prs: [facts({ ...activity, ...cap })] }).prs[0];
+        expect(row).toMatchObject({ needsJudgment: true, nextOwner: 'judge' });
+        expect(row.reason).toMatch(/^(at-cap|red-team-blocked-at-cap)$/);
+      }
+    });
+  it('a capped PR with an active worker routes to judgment without competing dispatch', () => {
+    const lease = { token: 'fixture-token', owner: 'fixture-worker', generation: 7 };
+    const leaseStore = { read: vi.fn(() => structuredClone(lease)), write: vi.fn(), release: vi.fn() };
+    const dispatch = vi.fn();
+    const before = leaseStore.read();
+    const row = buildJudgeSweepBundle({ generatedAt: at(0), prs: [facts({ round: 5,
+      inCi: true, minutesSinceFixLoop: 0, fixerRunning: true, owner: before.owner })] }).prs[0];
+    // Consume the emitted route at the existing read-only facts boundary; no worker effects belong here.
+    const route = { owner: row.nextOwner, judgment: row.needsJudgment, reason: row.reason };
+    expect(route).toEqual({ owner: 'judge', judgment: true, reason: 'at-cap' });
+    expect(leaseStore.read()).toEqual(before);
+    expect(leaseStore.write).not.toHaveBeenCalled();
+    expect(leaseStore.release).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+});

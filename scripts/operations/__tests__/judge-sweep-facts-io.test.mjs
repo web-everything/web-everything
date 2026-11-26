@@ -1091,9 +1091,58 @@ it.each([[undefined], [null], ['UNKNOWN']])('an unknown or missing merge state i
     latestVerdict: { accepted: true }, redTeam: { state: 'clear' }, openReferrals: [], openSendBacks: [] }] }).prs[0])
     .toMatchObject({ needsJudgment: true, reason: 'clean-and-owed-approval' });
 });
-it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('records an evidence error for an invalid merge state (%s)', mergeable => {
-  const gh = vi.fn(() => JSON.stringify([pr({ mergeable })]));
-  const row = createJudgeSweepFactsReader(options({ gh }))({ repo }).prs[0];
+it.each([[7], ['BOGUS'], ['unknown'], [''], [false], [{}], [[]]])('assigns explicit operator ownership for an invalid merge state (%s)', mergeable => {
+  const row = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) }).prs[0];
   expect(row.mergeable).toBeNull();
-  expect(row.evidenceErrors).toContain('merge state unavailable; inspect PR mergeability');
+  expect(row.conflictOwnershipError).toBe('Inspect PR mergeability and rerun; merge state is unknown or unreadable.');
+  expect(row.evidenceErrors).toEqual([]);
+  expect(buildJudgeSweepBundle({ prs: [row] }).prs[0]).toMatchObject({
+    needsJudgment: false, nextOwner: 'operator', nextStep: row.conflictOwnershipError,
+  });
+});
+
+
+// All observations and settings IO are private ports; no host files or commands are used.
+const hardenedOptions = extra => options({ env: {}, log: () => {},
+  readFile: () => '{}', readStallThresholds: () => ({}),
+  cardReadable: () => false, shape: () => ({ humanRequired: false }), ...extra });
+const hardenedRead = extra => createJudgeSweepFactsReader(hardenedOptions(extra))({ repo });
+it.each([false, true])('validates unknown merge state on current/fresh paths (fresh=%s)', fresh => {
+  for (const mergeable of [undefined, null, 'UNKNOWN', 'BOGUS']) {
+    const local = hardenedRead({ gh: () => JSON.stringify([pr({ mergeable, isDraft: false })]) });
+    const result = fresh ? hardenedRead({ checkoutState: () => ({ behind: 1 }),
+      readFresh: () => ({ ...local, prs: local.prs.map(({ conflictOwnershipError, ...row }) => row) }) }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner: 'operator',
+      nextStep: expect.stringMatching(/mergeability.*rerun/) });
+  }
+});
+it.each([false, true])('custom hold label replaces the default on current/fresh paths (fresh=%s)', fresh => {
+  for (const [label, nextOwner] of [['custom:fix', 'nobody'], ['hold:fix', 'fixer']]) {
+    const env = { WE_FIX_HOLD_LABEL: 'custom:fix', WE_POLICY_CASCADE_LOG: '1' };
+    const log = vi.fn();
+    const local = hardenedRead({ env, log, gh: () => JSON.stringify([pr({ labels: [{ name: label }],
+      mergeable: 'CONFLICTING', isDraft: false })]) });
+    const result = fresh ? hardenedRead({ env, log, checkoutState: () => ({ behind: 1 }), readFresh: () => local }) : local;
+    expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner });
+    expect(log.mock.calls.flat().join(' ')).toMatch(/custom:fix.*env/);
+  }
+});
+it.each(['', '   ', 'bad\nlabel', 42])('invalid explicit hold environment refuses automatic conflict ownership (%j)', value => {
+  const result = hardenedRead({ env: { WE_FIX_HOLD_LABEL: value },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false })]) });
+  expect(buildJudgeSweepBundle(result).prs[0]).toMatchObject({ nextOwner: 'operator',
+    nextStep: expect.stringMatching(/hold label.*rerun/) });
+});
+it('unreadable hold settings refuse automatic conflict ownership', () => {
+  const result = hardenedRead({ readFile: () => { throw new Error('unreadable'); },
+    gh: () => JSON.stringify([pr({ mergeable: 'CONFLICTING', isDraft: false })]) });
+  expect(buildJudgeSweepBundle(result).prs[0].nextOwner).toBe('operator');
+});
+it('head-changed detail refuses conflict routing without dispatch', () => {
+  const gh = vi.fn(args => JSON.stringify(args[1] === 'list'
+    ? [pr({ mergeable: 'CONFLICTING', isDraft: false })] : pr({ headRefOid: 'f'.repeat(40) })));
+  const row = buildJudgeSweepBundle(hardenedRead({ gh })).prs[0];
+  expect(row).toMatchObject({ nextOwner: 'judge', needsJudgment: true });
+  expect(row.evidenceErrors.join(' ')).toMatch(/head changed/);
+  expect(gh.mock.calls.every(([args]) => args[0] === 'pr' && ['list', 'view'].includes(args[1]))).toBe(true);
 });

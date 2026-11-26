@@ -9,7 +9,7 @@ import { runGhSync } from '../lib/gh-throttle.mjs';
 import { labelNames, listArgv, LIST_LIMIT } from './pr-status-io.mjs';
 import { reduceCheckState } from './pr-status.mjs';
 import { defaultListPrComments } from '../conveyor/pr-comments-list.mjs';
-import { readFixLoopRows } from '../conveyor/fix-loop-ledger.mjs';
+import { FIX_HOLD_LABEL, readFixLoopRows } from '../conveyor/fix-loop-ledger.mjs';
 import { parseLiveJobs } from './pr-sweep-io.mjs';
 import { redTeamRulingRow } from './operator-queue.mjs';
 import { readReviewRound, readReviewRoundAsOf } from './review-pr-io.mjs';
@@ -36,7 +36,7 @@ import { actionResource } from './action-record.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 import { readExitRulingPrs } from './judge-sweep-exit-rulings.mjs';
 import { STALL_DEFAULTS } from './judge-sweep-facts.mjs';
-import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { cascadePolicy, platformPreference, readPlatformPreferences } from '../lib/policy-cascade.mjs';
 export const JUDGE_SWEEP_REPO = CONSTELLATION_REPOS[DEFAULT_REPO_KEY].slug;
 
 const rootDir = () => join(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -58,6 +58,30 @@ export function resolveStallThresholds({ env = process.env, readFile = readFileS
     standard: STALL_DEFAULTS, platform: pick(plat), envValues: pick(envValues), env, log,
     valid: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
   }).value;
+}
+
+/** Resolve the existing hold override once per observation, retaining provenance and refusing incomplete settings. */
+export function resolveFixHoldLabel({ env = process.env, readFile = readFileSync, log } = {}) {
+  const valid = v => typeof v === 'string' && v.trim() === v && v.length > 0 && v.length <= 50
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(v);
+  const { prefs, errors } = readPlatformPreferences({ env, readFile });
+  let tool;
+  try { tool = JSON.parse(String(readFile(new URL('../settings/fix.json', import.meta.url), 'utf8')))?.fix?.holdLabel; }
+  catch (error) { if (error.code !== 'ENOENT') errors.push('hold settings unreadable'); }
+  const resolved = cascadePolicy('fixHoldLabel', tool, { standard: FIX_HOLD_LABEL,
+    platform: prefs.fixHoldLabel, envValues: { '': env.WE_FIX_HOLD_LABEL }, valid, env, log });
+  log?.(`judge-sweep fix hold label=${resolved.value} source=${resolved.sources['']}`);
+  return { ...resolved, error: errors.length || resolved.invalid.length
+    ? 'Inspect the effective fix hold label settings and rerun.' : null };
+}
+
+/** Apply the same ownership validation to in-place and fresh/resumed observations. */
+function validateConflictOwnership(pr, hold) {
+  const conflictOwnershipError = hold.error || (!['MERGEABLE', 'CONFLICTING'].includes(pr.mergeable)
+    ? 'Inspect PR mergeability and rerun; merge state is unknown or unreadable.' : null);
+  return { ...pr, fixHoldLabel: hold.value,
+    ...(conflictOwnershipError ? { conflictOwnershipError } : {}),
+  };
 }
 
 const failure = what => new Error(`judge-sweep-facts: ${what}; inspect PR evidence and rerun a narrower/operator query`);
@@ -174,7 +198,7 @@ export function readFromFreshOrigin({ repo, checkCoverage, root = rootDir(), exe
 }
 
 const validFreshPr = p => p && typeof p === 'object' && Number.isSafeInteger(p.number) && p.number > 0
-  && /^[a-f0-9]{40}$/i.test(p.headSha ?? '') && Array.isArray(p.labels) && Array.isArray(p.evidenceErrors)
+  && /^[a-f0-9]{40}$/i.test(p.headSha ?? '') && Array.isArray(p.labels) && p.labels.every(l => typeof l === 'string') && Array.isArray(p.evidenceErrors)
   && Number.isFinite(p.minutesSinceUpdate);
 const validFreshFacts = facts => facts && typeof facts === 'object' && Array.isArray(facts.prs) && facts.prs.every(validFreshPr);
 
@@ -206,6 +230,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
 } = {}) {
   return ({ repo = JUDGE_SWEEP_REPO, checkCoverage } = {}) => {
     if (repo.length > 200 || !/^[\w.-]+\/[\w.-]+$/.test(repo)) throw failure('repo must be owner/name (at most 200 characters)');
+    const hold = resolveFixHoldLabel({ env, readFile, log });
     // Evidence never depends on this checkout's age: behind origin/main means read from origin/main, else refuse.
     {
       let behind;
@@ -217,11 +242,11 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
           throw staleFailure(behind, `fresh origin/main read failed (${String(error?.message ?? error).slice(0, 200)})`);
         }
         if (!validFreshFacts(facts)) throw staleFailure(behind, 'fresh origin/main read malformed');
-        return facts;
+        return { ...facts, prs: facts.prs.map(pr => validateConflictOwnership(pr, hold)) };
       }
     }
     const start = now();
-    const thresholds = readStallThresholds();
+    const thresholds = readStallThresholds({ env, readFile, log });
     let calls = 0;
     const boundedGh = args => {
       if (++calls > MAX_CALLS) throw failure('128-call budget exhausted');
@@ -265,10 +290,6 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
       const fixerRunning = liveJobs.some(j => ['fix-run', 'ci-heal'].includes(j.kind));
       const owner = p.assignees[0]?.login ?? (liveJobs.length ? liveJobs[0].kind : null);
       const evidenceErrors = [...errors];
-      // GitHub may still be computing mergeability; only malformed states are evidence errors.
-      if (p.mergeable != null && !['MERGEABLE', 'CONFLICTING', 'UNKNOWN'].includes(p.mergeable)) {
-        evidenceErrors.push('merge state unavailable; inspect PR mergeability');
-      }
       const unscopedWorker = jobs.some(j => j.pr === p.number && !j.repo);
       if (unscopedWorker) evidenceErrors.push('worker repository unknown');
       const round = errors.includes('verdict ledger unreadable') ? null
@@ -459,7 +480,7 @@ export function createJudgeSweepFactsReader({ gh = operatorGh, now = () => Date.
             result.humanRequired = human;
           } catch { result.humanRequired = null; evidenceErrors.push('shape unavailable; inspect full diff before delegating'); }
         }
-        return result;
+        return validateConflictOwnership(result, hold);
       };
       return { mustDetail, readDetail, finish };
     });
