@@ -67,7 +67,8 @@ export default {
   id: 'ready-pin-moved-keeps-adopting',
   title: 'a pinned overlay branch moving past its pin does not stale the ready candidate',
   card: 'READY-PIN-STALE-FIX',
-  fixedBy: { sha: 'HEAD', where: 'lane/ready-pin-stale-fix', paths: ['scripts/lib/daemon-rebuild/state.mjs'] },
+  // Undo the follow-up's hunk edit before the original fix so replay also works after merges.
+  fixedBy: { sha: 'ba386547a779cdb1d009da2e9543ad84b4999d73,25b340448853b86062436b97880a6a991387d0a1', where: 'lane/ready-pin-stale-fix', paths: ['scripts/lib/daemon-rebuild/state.mjs'] },
   fixPresent: checkout => probe(checkout).violations.length === 0,
   run: () => probe(root),
   judge: report => report.violations,
