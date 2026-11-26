@@ -163,6 +163,87 @@ test('enqueue command is bound to the live authorized node id and judged head', 
   assert.equal(writes.length, 1);
 });
 
+test('implicit foreign GH_REPO identity reads are refused without binding an enqueue node id', () => {
+  const calls = [];
+  const b = scope.createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo: REPO, num: 7 });
+  const exec = b.exec((file, args) => {
+    calls.push(args);
+    return JSON.stringify({ id: 'FOREIGN_PR7', headRefOid: HEAD, baseRefName: 'main' });
+  });
+  b.authorizeEnqueue(REPO, 7, HEAD);
+  assert.throws(() => exec('gh', ['pr', 'view', '7', '--json', 'id,headRefOid,baseRefName'],
+    { env: { GH_REPO: 'fixture/other' } }), /write-boundary:other-pr/);
+  assert.throws(() => exec('gh', buildEnqueueArgs({ nodeId: 'FOREIGN_PR7', headSha: HEAD })), /write-boundary:graphql/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(b.violations, ['defer-to-pass:write-boundary:other-pr', 'defer-to-pass:write-boundary:graphql']);
+});
+
+test('implicit same-repo GH_REPO identity reads still authorize the pinned enqueue', () => {
+  const calls = [];
+  const b = scope.createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo: REPO, num: 7 });
+  const exec = b.exec((file, args) => {
+    calls.push(args);
+    return JSON.stringify({ id: 'PR7', headRefOid: HEAD, baseRefName: 'main' });
+  });
+  b.authorizeEnqueue(REPO, 7, HEAD);
+  const view = ['pr', 'view', '7', '--json', 'id,headRefOid,baseRefName'];
+  const enqueue = buildEnqueueArgs({ nodeId: 'PR7', headSha: HEAD });
+  exec('gh', view, { env: { GH_REPO: REPO } });
+  exec('gh', enqueue);
+  assert.deepEqual(calls, [view, enqueue]);
+  assert.deepEqual(b.violations, []);
+});
+
+test.each([
+  ['command env overrides process env and cwd', { GH_REPO: REPO }, 'fixture/other', 'fixture/other', [], true],
+  ['foreign command env overrides process env and cwd', { GH_REPO: 'fixture/other' }, REPO, REPO, [], false],
+  ['missing command env uses process env', undefined, REPO, 'fixture/other', [], true],
+  ['foreign process env overrides cwd', undefined, 'fixture/other', REPO, [], false],
+  ['empty command env uses cwd rather than process env', {}, 'fixture/other', REPO, [], true],
+  ['foreign cwd is refused', {}, REPO, 'fixture/other', [], false],
+  ['unresolved repo is refused', {}, REPO, null, [], false],
+  ['explicit long selector overrides env', { GH_REPO: 'fixture/other' }, REPO, null, ['--repo', REPO], true],
+  ['explicit short selector overrides cwd', {}, REPO, 'fixture/other', ['-R', REPO], true],
+  ['explicit equals selector overrides env', { GH_REPO: 'fixture/other' }, REPO, null, [`--repo=${REPO}`], true],
+  ['explicit short equals selector overrides env', { GH_REPO: 'fixture/other' }, REPO, null, [`-R=${REPO}`], true],
+  ['explicit compact selector overrides env', { GH_REPO: 'fixture/other' }, REPO, null, [`-R${REPO}`], true],
+  ['foreign explicit selector overrides same-repo env', { GH_REPO: REPO }, REPO, REPO, ['--repo', 'fixture/other'], false],
+  ['repeated selectors cannot hide a foreign repo', { GH_REPO: REPO }, REPO, REPO, ['-R', 'fixture/other', '--repo', REPO], false],
+])('writes and identity reads share repo resolution: %s', (name, env, processRepo, origin, selector, allowed) => {
+  const priorRepo = process.env.GH_REPO;
+  process.env.GH_REPO = processRepo;
+  try {
+    for (const verb of ['edit', 'view']) {
+      const calls = [];
+      const b = scope.createFastDrainWriteBoundary({ writeScope: 'enqueue-only', repo: REPO, num: 7 });
+      const exec = b.exec((file, args, options) => {
+        if (file === 'git') {
+          assert.equal(options.cwd, '/fixture/checkout');
+          if (!origin) throw new Error('no origin');
+          return 'https://github.com/' + origin + '.git';
+        }
+        calls.push(args);
+        return JSON.stringify({ id: 'PR7', headRefOid: HEAD, baseRefName: 'main' });
+      });
+      b.authorizeEnqueue(REPO, 7, HEAD);
+      const args = ['pr', verb, '7', ...selector,
+        ...(verb === 'edit' ? ['--add-label', 'review:changes'] : ['--json', 'id,headRefOid,baseRefName'])];
+      const run = () => exec('gh', args, { cwd: '/fixture/checkout', ...(env === undefined ? {} : { env }) });
+      if (allowed) {
+        run();
+        if (verb === 'view') exec('gh', buildEnqueueArgs({ nodeId: 'PR7', headSha: HEAD }));
+      } else {
+        assert.throws(run, /write-boundary:other-pr/);
+        if (verb === 'view') assert.throws(() => exec('gh', buildEnqueueArgs({ nodeId: 'PR7', headSha: HEAD })), /write-boundary:graphql/);
+      }
+      assert.equal(calls.length, allowed ? verb === 'view' ? 2 : 1 : 0);
+    }
+  } finally {
+    if (priorRepo === undefined) delete process.env.GH_REPO;
+    else process.env.GH_REPO = priorRepo;
+  }
+});
+
 test('clearance stamp only after a confirmed enqueue', () => {
   const h = strategyFixture();
   assert.equal(h.strategy.enqueue({ num: 7 }, HEAD).enqueued, true);

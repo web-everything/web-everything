@@ -191,6 +191,18 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
     throw Object.assign(new Error(reason), { kind: reason });
   };
   const target = (r, n) => { if (limited && (r !== repo || Number(n) !== Number(num))) refuse('other-pr'); };
+  // Explicit selectors override the command environment/cwd, but every selector must stay in scope.
+  const resolveCommandRepo = (selectors, options, run) => {
+    const repoSelectors = selectors.values.filter(([flag]) => ['--repo', '-R'].includes(flag));
+    let resolvedRepo = (options?.env ?? process.env).GH_REPO;
+    if (!resolvedRepo && !repoSelectors.length) resolvedRepo = localRepoSlug({ cwd: options?.cwd, exec: run });
+    for (const [, r] of repoSelectors) {
+      if (r !== repo) refuse('other-pr');
+      resolvedRepo = r;
+    }
+    if (!resolvedRepo) refuse('other-pr');
+    return resolvedRepo;
+  };
   const allow = kind => { if (limited) log(`fast-drain write: ${repo}#${num} ${kind}`); };
   const labels = (r, n, plan) => {
     if (!limited) return;
@@ -223,6 +235,7 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
     exec: run => (file, args, options) => {
       if (!limited) return run(file, args, options);
       const value = flag => args[args.indexOf(flag) + 1];
+      let bindIdentity = false;
       if (file === 'git') {
         // Net-diff readers pin these inert settings before the verb. Unknown
         // configuration stays closed: stripping arbitrary -c options can run aliases.
@@ -237,14 +250,16 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
         if (verbArgs[0] === 'push') refuse('numbering-push');
         if (!safeGitRead(verbArgs)) refuse('git');
       } else if (file === 'gh') {
+        if (args[0] === 'pr' && args[1] === 'view' && judgedHead && Number(args[2]) === Number(num)) {
+          const selectors = ghOptions(args.slice(3), ['--repo', '-R', '--json', '--jq', '-q']);
+          if (!selectors) refuse('pr');
+          target(resolveCommandRepo(selectors, options, run), args[2]);
+          bindIdentity = true;
+        }
         if (args[0] === 'pr' && !['view', 'list', 'diff', 'checks'].includes(args[1])) {
           const selectors = ghOptions(args.slice(3), ['--repo', '-R', '--add-label', '--remove-label', '--body', '--body-file', '--base', '--title', '-B', '-b', '-F', '-t']);
           if (!selectors) refuse('pr-edit');
-          const repoSelectors = selectors.values.filter(([flag]) => ['--repo', '-R'].includes(flag));
-          let resolvedRepo = (options?.env ?? process.env).GH_REPO;
-          if (!resolvedRepo && !repoSelectors.length) resolvedRepo = localRepoSlug({ cwd: options?.cwd, exec: run });
-          for (const [, r] of repoSelectors) { target(r, args[2]); resolvedRepo = r; }
-          target(resolvedRepo, args[2]);
+          target(resolveCommandRepo(selectors, options, run), args[2]);
           if (args[1] === 'merge') refuse('merge');
           if (args[1] === 'update-branch') refuse('refresh');
           if (args[1] === 'edit') {
@@ -281,14 +296,11 @@ export function createFastDrainWriteBoundary({ writeScope = 'full', repo, num, l
       } else refuse('exec');
       const result = run(file, args, options);
       // Bind only the target's live identity read made after the strategy authorizes the judged head.
-      if (file === 'gh' && args[0] === 'pr' && args[1] === 'view' && judgedHead) {
-        const parsed = ghOptions(args.slice(3), ['--repo', '-R', '--json', '--jq', '-q']);
-        if (Number(args[2]) === Number(num) && parsed && parsed.values.every(([f, v]) => !['--repo', '-R'].includes(f) || v === repo)) {
-          try {
-            const pr = JSON.parse(String(result));
-            nodeId = pr.headRefOid === judgedHead && typeof pr.id === 'string' && pr.id ? pr.id : null;
-          } catch { nodeId = null; }
-        }
+      if (bindIdentity) {
+        try {
+          const pr = JSON.parse(String(result));
+          nodeId = pr.headRefOid === judgedHead && typeof pr.id === 'string' && pr.id ? pr.id : null;
+        } catch { nodeId = null; }
       }
       return result;
     },
